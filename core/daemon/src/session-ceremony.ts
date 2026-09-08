@@ -276,7 +276,7 @@ export interface CeremonyWiringDeps {
    * REQUIRED rather than optional, deliberately: an optional sink is one a call site forgets, and
    * the whole class of defect this unit is closing is a check that quietly stopped being wired.
    */
-  recordSealFailure: (agentName: string, sessionId: string, reason: string) => void;
+  recordSealFailure: (agentName: string, sessionId: string, reason: string, kind: "unresolved" | "refused") => void;
 }
 
 /**
@@ -579,7 +579,7 @@ export function wireSealCeremonyHandler(deps: CeremonyWiringDeps): () => void {
       );
       if (!signer) {
         deps.logger.warn("session.seal.ceremony.abort", { agentName: deps.agentName, sessionId: sidHex, reason: "no_signer" });
-        deps.recordSealFailure(deps.agentName, sidHex, "seal_ceremony_no_signer");
+        deps.recordSealFailure(deps.agentName, sidHex, "seal_ceremony_no_signer", "unresolved");
         return;
       }
       // M7 legibility-TBS-binding: when the directory's seal_verified carries `legibility` (the
@@ -616,7 +616,7 @@ export function wireSealCeremonyHandler(deps: CeremonyWiringDeps): () => void {
           deps.logger.warn("session.seal.ceremony.abort", {
             agentName: deps.agentName, sessionId: sidHex, reason: abortReason,
           });
-          deps.recordSealFailure(deps.agentName, sidHex, abortReason);
+          deps.recordSealFailure(deps.agentName, sidHex, abortReason, "unresolved");
           return;
         }
         if (haveLeaves) {
@@ -636,7 +636,7 @@ export function wireSealCeremonyHandler(deps: CeremonyWiringDeps): () => void {
               reason: inflatedReason,
               ...(inflated ? { party: inflated.party, publishedFrontier: inflated.publishedFrontier, derivedFrontier: inflated.derivedFrontier } : {}),
             });
-            deps.recordSealFailure(deps.agentName, sidHex, inflatedReason);
+            deps.recordSealFailure(deps.agentName, sidHex, inflatedReason, "unresolved");
             return; // refuse to co-sign — the directory gets no signature for an inflated cert
           }
         }
@@ -673,6 +673,7 @@ export function wireSealCeremonyHandler(deps: CeremonyWiringDeps): () => void {
           deps.agentName,
           sidHex,
           rootCheck.verdict === "mismatch" ? "seal_root_mismatch" : "seal_root_unverifiable",
+          "unresolved",
         );
         return; // refuse to co-sign — the directory gets no signature for a root we cannot verify
       }
@@ -691,7 +692,7 @@ export function wireSealCeremonyHandler(deps: CeremonyWiringDeps): () => void {
           sessionId: sidHex,
           detail: extractErrorMessage(err),
         });
-        deps.recordSealFailure(deps.agentName, sidHex, "seal_ceremony_threw");
+        deps.recordSealFailure(deps.agentName, sidHex, "seal_ceremony_threw", "unresolved");
         return;
       }
       if (!frostSignature) {
@@ -730,6 +731,7 @@ export function wireSealCeremonyHandler(deps: CeremonyWiringDeps): () => void {
           cosignRefusals.size > 0
             ? `seal_cosigners_refused:${[...cosignRefusals].sort().join(",")}`
             : "seal_ceremony_threshold_not_met",
+          "unresolved",
         );
         return;
       }

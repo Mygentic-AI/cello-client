@@ -189,8 +189,16 @@ describe("the seal listener set is a BUNDLE — a stream cannot be wired with on
       "session.seal.rejected",
       expect.objectContaining({ sessionId: SESSION, reason: "seal_approval_missing" }),
     );
-    // And the second surface, because the response is gone the moment its caller reads it.
-    expect(recordSealFailure).toHaveBeenCalledWith(AGENT, SESSION, "seal_approval_missing");
+    /**
+     * And the second surface, because the response is gone the moment its caller reads it.
+     *
+     * ⚠️ `"refused"` IS ASSERTED, NOT INCIDENTAL — `DOD-M15-SEALREFUSED-STUCK-1`. That argument is
+     * what makes the entry TERMINAL in the store, and terminal is what stops the escalation's later
+     * `seal_unilateral_timeout` overwriting the directory's real reason and telling both operators
+     * their counterparty never closed. Drop the argument and it silently defaults to `"unresolved"`,
+     * which is the pre-fix behaviour with none of the surfaces changing shape.
+     */
+    expect(recordSealFailure).toHaveBeenCalledWith(AGENT, SESSION, "seal_approval_missing", "refused");
   });
 
   it("★★ the two refusals send the operator to DIFFERENT places, because they accuse different parties", () => {

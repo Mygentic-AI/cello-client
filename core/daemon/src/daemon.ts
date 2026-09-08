@@ -230,10 +230,10 @@ async function startDaemonHoldingLock(
     getKeyProvider: (agentName: string) => keyProviders.get(agentName),
     recoverContent: (agentName: string) => autoRecoverForAgent(agentName, "seal_upgrade_gate"),
     // DOD-M15-SEALPARTIES-1: a directory refusal has to outlive the close call that is waiting on
-    // it — `cello_status` and the receipt surface both read this store, and a close that already
-    // returned has nowhere else to leave the answer.
-    recordSealFailure: (agentName: string, sessionId: string, reason: string) =>
-      sealFailures.record(agentName, sessionId, reason, new Date().toISOString(), "unresolved"),
+    // it — both surfaces read this store, and a close that already returned has nowhere else to
+    // leave the answer. `kind` carries a DIRECTORY REFUSAL through as terminal (see the store).
+    recordSealFailure: (agentName: string, sessionId: string, reason: string, kind: "unresolved" | "refused") =>
+      sealFailures.record(agentName, sessionId, reason, new Date().toISOString(), kind),
   });
 
   // The two seal-initiation flows cello_close_session dispatches into (seal-flows.ts): the
@@ -397,8 +397,8 @@ async function startDaemonHoldingLock(
     getDeclaredNodeCount,
     // DOD-M15-SEALPARTIES-1: the visiting stream runs the seal ceremony too, so it needs the same
     // failure sink — otherwise a cross-node close that dies leaves no trace while a same-node one does.
-    recordSealFailure: (name: string, sid: string, reason: string) =>
-      sealFailures.record(name, sid, reason, new Date().toISOString(), "unresolved"),
+    recordSealFailure: (name: string, sid: string, reason: string, kind: "unresolved" | "refused") =>
+      sealFailures.record(name, sid, reason, new Date().toISOString(), kind),
   });
   // 040-DAEMONROOT unit 7 (phase 4): parked content and every path that gets it moving again — the
   // retry queue, the park timers, the startup sweep and the flush → boot-parked-content.ts.
@@ -797,9 +797,8 @@ async function startDaemonHoldingLock(
     logger,
     sessionNodeManager,
     loadedAgents,
-    // DOD-M15-CLOSEWAIT-1 review HIGH-2: the SAME predicate cello_status uses, so the two surfaces
-    // cannot disagree about whether a ceremony is in flight. Both maps, because either can be the
-    // one running — pendingSealWaiters is the active close, sealInterruptedInProgress the interrupted.
+    // DOD-M15-CLOSEWAIT-1 HIGH-2: the SAME predicate cello_status uses, so the two surfaces cannot
+    // disagree. Both maps — pendingSealWaiters is the active close, the other the interrupted one.
     isSealing: (agentName, sessionId) =>
       pendingSealWaiters.has(sealKey(agentName, sessionId)) ||
       sealInterruptedInProgress.has(sealKey(agentName, sessionId)),

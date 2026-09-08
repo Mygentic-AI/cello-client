@@ -95,8 +95,8 @@ export function registerAgentAdminHandlers(deps: AgentAdminDeps): void {
       logger,
       // DOD-M15-SEALPARTIES-1: where a dead seal ceremony leaves its mark, so `cello_sealed_receipt`
       // can say it FAILED and why instead of falling through to "no receipt yet".
-      recordSealFailure: (name: string, sid: string, reason: string) =>
-        sealFailures.record(name, sid, reason, new Date().toISOString(), "unresolved"),
+      recordSealFailure: (name: string, sid: string, reason: string, kind: "unresolved" | "refused") =>
+        sealFailures.record(name, sid, reason, new Date().toISOString(), kind),
     });
     if (!result.ok) {
       return { ok: false, reason: result.reason, guidance: "Share refresh did not complete — see the daemon log (refresh.ceremony.*) for the cause." };

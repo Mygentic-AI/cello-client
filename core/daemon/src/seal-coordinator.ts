@@ -244,7 +244,7 @@ export interface SealCoordinatorDeps {
    * close call that is waiting on it. Clause 6 asks for the refusal on TWO surfaces — the response
    * and the session record — and the response is gone the moment the caller reads it.
    */
-  recordSealFailure: (agentName: string, sessionId: string, reason: string) => void;
+  recordSealFailure: (agentName: string, sessionId: string, reason: string, kind: "unresolved" | "refused") => void;
 }
 
 /**
@@ -1054,7 +1054,10 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
       });
       // Clause 6's second surface: the response is gone once its caller reads it, and a close that
       // has already returned (or never ran on this side) has nowhere else to leave the answer.
-      recordSealFailure(agentName, sidHex, reason);
+      // `"refused"` — a VERDICT, not a symptom (`DOD-M15-SEALREFUSED-STUCK-1`). It is terminal in
+      // the store, so the escalation's later `seal_unilateral_timeout` cannot overwrite it and tell
+      // both operators their counterparty never closed.
+      recordSealFailure(agentName, sidHex, reason, "refused");
 
       const key = sealKey(agentName, sidHex);
       const waiter = pendingSealWaiters.get(key);

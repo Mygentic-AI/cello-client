@@ -231,8 +231,8 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
       logger,
       // DOD-M15-SEALPARTIES-1: where a dead seal ceremony leaves its mark, so `cello_sealed_receipt`
       // can say it FAILED and why instead of falling through to "no receipt yet".
-      recordSealFailure: (name: string, sid: string, reason: string) =>
-        sealFailures.record(name, sid, reason, new Date().toISOString(), "unresolved"),
+      recordSealFailure: (name: string, sid: string, reason: string, kind: "unresolved" | "refused") =>
+        sealFailures.record(name, sid, reason, new Date().toISOString(), kind),
     });
     // DOD-SPINE-7: coordinate the SEAL FROST ceremony on this agent's stream too.
     wireSealCeremonyHandler({
@@ -251,8 +251,8 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
       logger,
       // DOD-M15-SEALPARTIES-1: where a dead seal ceremony leaves its mark, so `cello_sealed_receipt`
       // can say it FAILED and why instead of falling through to "no receipt yet".
-      recordSealFailure: (name: string, sid: string, reason: string) =>
-        sealFailures.record(name, sid, reason, new Date().toISOString(), "unresolved"),
+      recordSealFailure: (name: string, sid: string, reason: string, kind: "unresolved" | "refused") =>
+        sealFailures.record(name, sid, reason, new Date().toISOString(), kind),
     });
     // DOD-SPINE-7: and resolve session_sealed for this agent's sessions on its own stream.
     registerSealListeners(mgr, agentName, agentPubkeyHex);
@@ -357,8 +357,8 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
       logger,
       // DOD-M15-SEALPARTIES-1: where a dead seal ceremony leaves its mark, so `cello_sealed_receipt`
       // can say it FAILED and why instead of falling through to "no receipt yet".
-      recordSealFailure: (name: string, sid: string, reason: string) =>
-        sealFailures.record(name, sid, reason, new Date().toISOString(), "unresolved"),
+      recordSealFailure: (name: string, sid: string, reason: string, kind: "unresolved" | "refused") =>
+        sealFailures.record(name, sid, reason, new Date().toISOString(), kind),
     });
     wireSealCeremonyHandler({
       agentName: agent.name,
@@ -374,8 +374,8 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
       logger,
       // DOD-M15-SEALPARTIES-1: where a dead seal ceremony leaves its mark, so `cello_sealed_receipt`
       // can say it FAILED and why instead of falling through to "no receipt yet".
-      recordSealFailure: (name: string, sid: string, reason: string) =>
-        sealFailures.record(name, sid, reason, new Date().toISOString(), "unresolved"),
+      recordSealFailure: (name: string, sid: string, reason: string, kind: "unresolved" | "refused") =>
+        sealFailures.record(name, sid, reason, new Date().toISOString(), kind),
     });
     wireSessionOfferHandler({
       agentName: agent.name,

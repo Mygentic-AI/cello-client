@@ -61,7 +61,7 @@ export interface OutboundSessionDeps {
    * seal ceremony too (the cross-node close), so it needs the same sink as a home stream — a
    * refusal recorded on only one of the two paths is a refusal an operator meets at random.
    */
-  recordSealFailure: (agentName: string, sessionId: string, reason: string) => void;
+  recordSealFailure: (agentName: string, sessionId: string, reason: string, kind: "unresolved" | "refused") => void;
   /** The WHOLE seal listener bundle — a visiting stream needs every one of them. */
   registerSealListeners: (signaling: SignalingManager, agentName: string, agentPubkeyHex: string) => () => void;
   sessionNegotiator?: SessionNegotiator;

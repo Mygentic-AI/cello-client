@@ -66,7 +66,19 @@ export interface SealFailure {
    *
    * They get different guidance, because they have different fixes.
    */
-  kind: "unresolved" | "threw";
+  kind: "unresolved" | "threw" | "refused";
+  /**
+   * DOD-M15-SEALREFUSED-STUCK-1 — this reason came from the DIRECTORY and OUTRANKS a later symptom.
+   *
+   * ⚠️ IT DOES NOT MEAN THE CEREMONY IS OVER, and an earlier draft of this said it did. A refused
+   * BILATERAL seal falls through to a SOLO seal — `close-session-handler.ts` logs
+   * `session.seal.refused.escalating` and calls `escalateToUnilateralSeal`, which can still produce
+   * a receipt. Treating the refusal as the end made `cello_sealed_receipt` tell the operator no
+   * receipt would ever exist, while the ceremony that could produce one was still running, and
+   * invited `{ force: true }` on that basis — permanently forfeiting it. This flag governs which
+   * REASON is reported, and nothing else.
+   */
+  fromDirectory?: true;
 }
 
 /**
@@ -87,9 +99,27 @@ export class SealFailureStore {
     return `${agentName}\x1f${sessionId}`;
   }
 
-  /** Record a background ceremony that ended without a receipt — resolved OR thrown. */
+  /**
+   * Record a background ceremony that ended without a receipt — resolved, thrown, or REFUSED.
+   *
+   * ⚠️ **A TERMINAL VERDICT IS NEVER OVERWRITTEN BY A LATER SYMPTOM** — `DOD-M15-SEALREFUSED-STUCK-1`.
+   *
+   * This was a plain `set`, so the last writer won. Measured on session `dab46e16` (2026-09-08):
+   * the directory refused at 09:17:13.834 with `seal_parties_disagree` — the two transcripts do
+   * not match — and at 09:28:52.077 the background escalation, which had never learned of the
+   * refusal, timed out and overwrote it with `seal_unilateral_timeout`. Both operators were then
+   * told their COUNTERPARTY had not closed, about a seal the directory had decided against eleven
+   * minutes earlier. That sends them to ask the one party who did nothing wrong.
+   */
   record(agentName: string, sessionId: string, reason: string, at: string, kind: SealFailure["kind"]): void {
-    this.#failures.set(this.#key(agentName, sessionId), { reason, at, kind });
+    const key = this.#key(agentName, sessionId);
+    if (this.#failures.get(key)?.fromDirectory) return;
+    this.#failures.set(key, { reason, at, kind, ...(kind === "refused" ? { fromDirectory: true as const } : {}) });
+  }
+
+  /** Did this session's recorded reason come from the directory? Read by tests and diagnostics. */
+  isFromDirectory(agentName: string, sessionId: string): boolean {
+    return this.#failures.get(this.#key(agentName, sessionId))?.fromDirectory === true;
   }
 
   /**
@@ -125,6 +155,32 @@ export function describeSealFailed(opts: {
   failure: SealFailure;
 }): Record<string, unknown> {
   const threw = opts.failure.kind === "threw";
+  /**
+   * DOD-M15-SEALREFUSED-STUCK-1 — a REFUSAL is neither of the other two, and the difference decides
+   * what the operator does next. `unresolved` invites them to wait for a counterparty who has not
+   * closed; a refusal means the directory examined the seal and declined it, so waiting achieves
+   * nothing and the counterparty is not the thing to chase.
+   */
+  if (opts.failure.kind === "refused") {
+    return {
+      ok: false,
+      reason: "seal_failed",
+      seal_status: "refused",
+      session_id: opts.sessionId,
+      seal_failure_reason: opts.failure.reason,
+      seal_failed_at: opts.failure.at,
+      guidance:
+        `The DIRECTORY REFUSED to certify the BILATERAL seal at ${opts.failure.at}: ` +
+        `${opts.failure.reason}. That is a verdict about the two-party seal and it will not change ` +
+        "— but it is NOT the end of the ceremony: the close falls through to a SOLO seal over this " +
+        "side's own chain, which can still produce a receipt. Your transcript is UNTOUCHED and " +
+        "nothing was signed with your key. The usual cause is that the two sides' records of the " +
+        "conversation differ, so compare the transcripts (cello_transcript) rather than chasing " +
+        "the network or the counterparty's availability — they are not the problem here. " +
+        "⚠️ Do NOT use { force: true }: a solo seal may still be running or retriable, and forcing " +
+        "PERMANENTLY forfeits the receipt it would produce.",
+    };
+  }
   return {
     ok: false,
     reason: "seal_failed",
