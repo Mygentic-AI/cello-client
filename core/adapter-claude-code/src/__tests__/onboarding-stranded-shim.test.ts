@@ -28,18 +28,46 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-// Cross-package on purpose: this is THE helper for "a real daemon in its own process", and the
-// re-dial cannot be proven against an in-process stub — the shim connects over a unix socket that
-// only a separate process can be holding.
-import { spawnRealDaemon, type SpawnedDaemon } from "../../../daemon/src/__tests__/helpers/spawn-real-daemon.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const BIN = resolve(here, "../../dist/bin/cello-mcp.js");
+const DAEMON_BIN = resolve(here, "../../../daemon/dist/bin/cello-daemon.js");
+
+/**
+ * Spawn the real daemon binary into `celloDir` and resolve once it is accepting connections.
+ *
+ * core/daemon has a richer helper for this, and importing it here is what broke CI: the adapter's
+ * tsconfig sets `rootDir` to its own `src`, so a file from another package is neither under that
+ * root nor in the project's file list. `tsc --build` alone does not see it — the test tsconfigs do
+ * — which is exactly the gap between a narrow local check and the full typecheck.
+ *
+ * Readiness is the SOCKET, not a log line: the socket existing is the thing the shim actually needs,
+ * and asserting on it means this test cannot go green against a daemon that announced itself and
+ * then failed to listen.
+ */
+// ChildProcess, not ChildProcessWithoutNullStreams: stdin is "ignore" here, so its stdin IS null
+// and the narrower type would be a lie the compiler correctly refuses.
+function spawnDaemon(celloDir: string): ChildProcess {
+  return spawn(process.execPath, [DAEMON_BIN], {
+    env: { ...process.env, CELLO_DIR: celloDir },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+}
+
+async function waitForSocket(celloDir: string, timeoutMs = 30_000): Promise<void> {
+  const sock = resolve(celloDir, "daemon.sock");
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(sock)) return;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  throw new Error(`daemon did not create ${sock} within ${timeoutMs}ms`);
+}
 
 interface Shim {
   proc: ChildProcessWithoutNullStreams;
@@ -208,7 +236,7 @@ describe("launch triage item 5 — a plugin install must not dead-end at a missi
      * restart in between.
      */
     const { shim, celloDir, cleanup } = startWithNoDaemon();
-    let daemon: SpawnedDaemon | undefined;
+    let daemon: ChildProcess | undefined;
     try {
       await handshake(shim);
 
@@ -219,8 +247,8 @@ describe("launch triage item 5 — a plugin install must not dead-end at a missi
       expect(beforePayload.reason).toBe("daemon_not_running");
 
       // The one thing the guidance asks the operator to do.
-      daemon = spawnRealDaemon(celloDir);
-      await daemon.waitForEvent("daemon.started");
+      daemon = spawnDaemon(celloDir);
+      await waitForSocket(celloDir);
 
       const after = await shim.rpc("tools/call", { name: "cello_status", arguments: {} }, 3) as {
         result?: { content?: Array<{ text?: string }> };
