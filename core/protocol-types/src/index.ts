@@ -5,6 +5,9 @@ export { encodeCbor, decodeCbor } from "./cbor.js";
 // verification) — M10-D16.
 export {
   TRUST_SIGNAL_DOMAIN,
+  // The one sentence a co-owned endorsement shows a reader. Exported so the portal that mints it
+  // and the client that displays it cannot drift into two wordings for one fact.
+  CO_OWNERSHIP_NOTE,
   encodeTrustSignalEnvelope,
   decodeTrustSignalEnvelope,
   hashTrustSignalEnvelope,

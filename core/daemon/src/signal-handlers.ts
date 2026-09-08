@@ -55,10 +55,8 @@ export interface SignalHandlerDeps {
   keyProviders: Map<string, KeyProvider>;
   /** Read-only: a submission needs its agent ONLINE, and this surface must not change that. */
   onlineAgents: ReadonlySet<string>;
-  /**
-   * Every agent this daemon has loaded — resolves the selected agent's name to its pubkey. It no
-   * longer gates attestations: a CO-OWNED subject is annotated by the portal, not refused here.
-   */
+  /** Resolves the selected agent's name to its pubkey. It no longer gates attestations: a CO-OWNED
+   * subject is annotated by the portal, not refused here. */
   loadedAgents: ReadonlyArray<LoadedAgent>;
   /** Read this connection's agent selection. The READ, not the container. */
   getConnState: (connectionId: string) => SignalConnState | undefined;
@@ -199,6 +197,11 @@ export function registerSignalHandlers(deps: SignalHandlerDeps): void {
       status: row.status,
       default_present: row.defaultPresent,
       consent_state: row.consentState,  // review F4 — see wallet_list_signals
+      // CO-OWNERSHIP. The verb for reading a claim was the one surface that could not say the
+      // endorser and the subject share an owner. DECIDE ON THIS BOOLEAN — it is inside the notarized
+      // hash and always present; the portal's rendered sentence (payload `co_ownership_note`) is
+      // display only and is absent on anything minted before it existed.
+      same_operator: row.sameOperator,
       issued_at: row.issuedAt,
       expires_at: row.expiresAt,
       supersedes_hash: row.supersedesHash,
@@ -683,16 +686,12 @@ export function registerSignalHandlers(deps: SignalHandlerDeps): void {
     // for a reader to weigh and no downstream annotation that rescues it.
     //
     // CO-OWNERSHIP IS NOT REFUSED — it is ANNOTATED. This guard used to reject ANY subject loaded on
-    // this daemon, contradicting the portal, which decides the same question the other way and
-    // deliberately (D-29, `submission-ingress.ts`): an agent-subject same-operator endorsement is
-    // MINTED and FLAGGED `same_operator: true`, because "these two agents are the same operator" is
-    // a true and useful fact for a recipient. The flag is a first-class field in the SIGNED envelope
-    // for that purpose — it caps the claim at the endorser's own tier and keeps it out of any count
-    // floor, which closes the farming hole. Minting it UNFLAGGED is the hole; refusing it discarded
-    // the fact and guaranteed the flagged form could never exist. The daemon stops short of the
-    // verdict because it cannot see account linkage (two agents under one account on different
-    // machines are invisible here) and the portal can — and refusing here closed the path CELLO's
-    // first wedge walks daily: solo multi-agent is the MOST likely way to hit this, not the least.
+    // this daemon, contradicting the portal's D-29 (`submission-ingress.ts`): a same-operator
+    // endorsement is MINTED and FLAGGED, because minting it UNFLAGGED is the farming hole, while
+    // refusing it discards a true and useful fact — and guaranteed the flagged form could never
+    // exist. The daemon cannot see account linkage (two agents under one account on different
+    // machines are invisible here) and the portal can. Refusing here also closed the path the first
+    // wedge walks daily: solo multi-agent is the MOST likely way to hit this, not the least.
     if (subject === sel.pubkey.toLowerCase()) {
       return { ok: false, reason: "self_subject",
         guidance: "An agent cannot issue a trust signal about itself — standing has to come from somebody else." };

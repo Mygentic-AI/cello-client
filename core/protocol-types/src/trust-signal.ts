@@ -92,6 +92,25 @@ export interface TrustSignalEnvelope {
   supersedes_hash: Uint8Array | null;
 }
 
+/**
+ * What `same_operator: true` says to whoever READS the endorsement. Operator-approved copy,
+ * 2026-09-08. Surfaces render it at the end, in brackets, exactly as written.
+ *
+ * IT LIVES HERE so the portal that mints it and the client that displays it cannot drift into two
+ * different sentences for one fact. Both repos already depend on this package.
+ *
+ * It names the fact AND its consequence, because a reader's real question is whether the endorsement
+ * should carry weight, and the fact alone does not answer that. It deliberately does NOT say the
+ * endorser owns the subject: `same_operator` means both agents belong to one owner, which makes them
+ * siblings, not parent and child — wording that claimed ownership between them would assert
+ * something the flag cannot support.
+ *
+ * THE BOOLEAN ABOVE STAYS THE AUTHORITY. This is a sentence for humans and models; every predicate
+ * reads the envelope field, which is inside the notarized hash and cannot be forged.
+ */
+export const CO_OWNERSHIP_NOTE =
+  "[endorsed by an agent with the same owner — does not count toward endorsement minimums]";
+
 /** The preimage field order. THIS ARRAY IS THE WIRE FORMAT — reordering it breaks every hash ever
  *  minted. It also doubles as the closed-set definition used to reject unknown fields. */
 const PREIMAGE_FIELDS = [

@@ -3,6 +3,7 @@
  */
 
 import { join } from "node:path";
+import { CO_OWNERSHIP_NOTE } from "@cello-protocol/protocol-types";
 import {
   connectOrStart,
   connectToDaemon,
@@ -1046,6 +1047,8 @@ export async function trustSignals(
         schema_version?: number;
         status?: string;
         default_present?: boolean;
+        /** Envelope slot 12 — the authority. See the co-ownership line below. */
+        same_operator?: boolean;
         issued_at?: number;
         expires_at?: number | null;
         supersedes_hash?: string | null;
@@ -1071,6 +1074,11 @@ export async function trustSignals(
         `supersedes:      ${result.supersedes_hash ?? "—"}`,
         `payload:         ${JSON.stringify(result.payload, null, 2)}`,
       ];
+      // CO-OWNERSHIP, ON ITS OWN LINE. The portal also writes `co_ownership_note` into the payload,
+      // which prints above — but inside a JSON blob, where the one fact that decides what this
+      // endorsement is worth reads as another key. This line is driven by the ENVELOPE BOOLEAN, not
+      // by the payload note, so it also fires for signals minted before the note existed.
+      if (result.same_operator === true) lines.push(`co-ownership:    ${CO_OWNERSHIP_NOTE}`);
       return { exitCode: 0, output: lines.join("\n") };
     } catch (err: unknown) {
       return { exitCode: 1, output: `Failed to view signal: ${err instanceof Error ? err.message : String(err)}` };
