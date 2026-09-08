@@ -28,6 +28,7 @@ import {
   type KeyProvider,
 } from "@cello-protocol/crypto";
 import { encodeCbor } from "@cello-protocol/protocol-types";
+import { extractErrorMessage } from "./error-message.js";
 import {
   CONTENT_ENCRYPTION_REASONS,
   CONTENT_ENCRYPTION_GUIDANCE,
@@ -347,7 +348,14 @@ export class SessionEphemerals {
       // destroy the only explanation that exists at the only moment anyone reads it.
       this.#ctx.logger.error("session.key.refused", {
         agentName, sessionId, correlationId, reason: "derivation_failed",
-        detail: err instanceof Error ? err.message : String(err),
+        // Review F1: the ternary above this line SILENTLY DESTROYED the wording the comment says
+        // it is here to preserve — `deriveSessionSecrets` throws from `@cello-protocol/crypto`,
+        // the cross-realm case where a throw is not `instanceof Error`, so the operator read
+        // `[object Object]` at the one moment the primitive's explanation existed. Higher stakes
+        // than the announce path this unit was opened for: this branch FREEZES the session.
+        detail: extractErrorMessage(err),
+        errorName: (err as { name?: string } | null)?.name,
+        errorCode: (err as { code?: string } | null)?.code,
       });
       await this.#ctx.freezeSessionForKeyRefusal(agentName, sessionId, "derivation_failed", correlationId);
     }
@@ -390,7 +398,15 @@ export class SessionEphemerals {
    * Fire-and-forget on the connect handler, like the salt: a failed announcement must not turn a
    * peer-connect handler into a rejected promise, and we re-announce on the next connect.
    */
-  async sendEphemeralFrame(agentName: string, sessionId: string, correlationId?: string): Promise<void> {
+  /**
+   * `attempt` is WHICH RETRY THIS IS, and it is a parameter because the catch below is the only
+   * place that can advance it. It was hardcoded to 1 at the retry call site, which made
+   * `SESSION_KEY_ANNOUNCE_RETRIES` unreachable: every failure re-entered the chain at 1, so the
+   * bound was never tested and `session.key.announce.gave_up` was never once logged in production.
+   * Measured 2026-09-08 on session `0646b474`: 49,137 failures, ~17/second, still running eleven
+   * hours after the session went quiet. Do not reintroduce a literal here.
+   */
+  async sendEphemeralFrame(agentName: string, sessionId: string, correlationId?: string, attempt = 0): Promise<void> {
     const entry = this.#ctx.activeEntry(this.#ctx.sessionKey(agentName, sessionId));
     if (!entry) return;
     const ephemeral = this.sessionEphemeralFor(agentName, sessionId);
@@ -439,7 +455,22 @@ export class SessionEphemerals {
       // counterparty on an old build — a re-announce rides the next connect.
       this.#ctx.logger.error("session.key.announce.failed", {
         agentName, sessionId, correlationId, reason: "stream_failed",
-        error: err instanceof Error ? err.message : String(err),
+        // `extractErrorMessage`, not `String(err)`: libp2p errors are not `instanceof Error` in
+        // this realm, so the ternary printed `[object Object]` on every one of the 49,137 lines
+        // this loop produced — the cause was in the throw and none of it reached the log.
+        error: extractErrorMessage(err),
+        /**
+         * Review F3 — `reason: "stream_failed"` names WHERE this surfaced, never why, and
+         * `extractErrorMessage` drops the two fields that name the subsystem. libp2p's `code` IS
+         * the diagnosis and the three common values send an operator to three different places:
+         * `ERR_UNSUPPORTED_PROTOCOL` (counterparty on an old build), `ERR_NO_VALID_ADDRESSES`
+         * (transport), `ERR_TOO_MANY_OUTBOUND_PROTOCOL_STREAMS` (the stream-cap failure this
+         * file's longest comment documents). Without them this line cannot tell them apart, which
+         * is why the 49,137-line loop went unnoticed for eleven hours.
+         */
+        errorName: (err as { name?: string } | null)?.name,
+        errorCode: (err as { code?: string } | null)?.code,
+        attempt,
         impact: "this side's half of the session key never reached the counterparty, so content stays unencrypted by CELLO until a later connect succeeds",
       });
       this.noteContentEncryptionReason(agentName, sessionId, CONTENT_ENCRYPTION_REASONS.OUR_ANNOUNCE_FAILED);
@@ -462,7 +493,7 @@ export class SessionEphemerals {
        * Bounded and self-cancelling: it stops when the session is no longer active, when a key has
        * been agreed, and after `SESSION_KEY_ANNOUNCE_RETRIES` attempts.
        */
-      this.retryEphemeralAnnounce(agentName, sessionId, correlationId, 1);
+      this.retryEphemeralAnnounce(agentName, sessionId, correlationId, attempt + 1);
     }
   }
   /**
@@ -473,8 +504,20 @@ export class SessionEphemerals {
    */
   retryEphemeralAnnounce(agentName: string, sessionId: string, correlationId: string | undefined, attempt: number): void {
     if (attempt > SESSION_KEY_ANNOUNCE_RETRIES) {
-      this.#ctx.logger.warn("session.key.announce.gave_up", {
-        agentName, sessionId, correlationId, attempts: SESSION_KEY_ANNOUNCE_RETRIES,
+      /**
+       * Review F6: `error`, not `warn`. Every TRANSIENT failure on this path logs at error; the
+       * one TERMINAL, actionable line — encryption is now permanently off for this session — was
+       * the quietest of them, so an operator filtering on error read five noisy lines and missed
+       * the conclusion.
+       *
+       * Review F5: `attempts: attempt`, not the constant. Five announce attempts are made (`attempt`
+       * 0 through `SESSION_KEY_ANNOUNCE_RETRIES`) and the constant printed four — a hardcoded
+       * literal standing in for a live value, which is the exact shape this unit exists to remove,
+       * and the same bug `submission-retry.ts:115` records having made before. `attempt` is the
+       * index, `attempts` is the total; that is the difference between the two field names here.
+       */
+      this.#ctx.logger.error("session.key.announce.gave_up", {
+        agentName, sessionId, correlationId, attempts: attempt,
         impact: "this side never managed to send its half of the session key, so every message on this session takes the relay mailbox instead of the direct path",
         guidance: CONTENT_ENCRYPTION_GUIDANCE[CONTENT_ENCRYPTION_REASONS.OUR_ANNOUNCE_FAILED],
       });
@@ -484,7 +527,9 @@ export class SessionEphemerals {
       // Stop if the session went away, or if a key has since been agreed by any route.
       if (this.#ctx.activeEntry(this.#ctx.sessionKey(agentName, sessionId)) === undefined) return;
       if (this.#sessionContentKeys.has(this.#ctx.sessionKey(agentName, sessionId))) return;
-      void this.sendEphemeralFrame(agentName, sessionId, correlationId);
+      // Carry `attempt` INTO the send, so its catch can advance it. Dropping it here is what
+      // pinned the chain at 1 and made the give-up branch dead code.
+      void this.sendEphemeralFrame(agentName, sessionId, correlationId, attempt);
     }, SESSION_KEY_ANNOUNCE_RETRY_MS * attempt);
     // Never hold the process open for a retry.
     if (typeof timer.unref === "function") timer.unref();
