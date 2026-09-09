@@ -270,7 +270,7 @@ async function startDaemonHoldingLock(
   // 040-DAEMONROOT unit 5: per-agent directory signaling → signaling-wiring.ts.
   const {
     perAgentSignaling, getAgentSignaling, waitForSignalingConnected, dropAgentSignaling,
-    signalingFor, sendOver, directorySignalingStatus, stopAllSignaling,
+    signalingFor, sendOver, directorySignalingStatus, stopAllSignaling, registerPickupListener,
   } = createSignalingWiring({
     logger, sessionNodeManager, loadedAgents, keyProviders, sharedSignaling, noSharedDirectoryNode,
     verifiedManifestVersion, getPersistence, onSignalingConnected, resolveConsortiumRoster,
@@ -386,6 +386,7 @@ async function startDaemonHoldingLock(
     getFailoverEndpoint,
     resolveConsortiumRoster,
     registerSealListeners,
+    registerPickupListener,
     sessionNegotiator,
     challengeVerifier,
     getManifestVersion: () => verifiedManifestVersion,

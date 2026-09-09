@@ -13,6 +13,7 @@
 import { SignalingManager, type CelloNode } from "@cello-protocol/transport";
 import { createHash } from "node:crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
+import type { PickupListenerRegistrar } from "./trust-signal-pickup-listener.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { Logger } from "./types.js";
 import type { DirectoryEndpoint } from "./signaling-connect.js";
@@ -64,6 +65,11 @@ export interface OutboundSessionDeps {
   recordSealFailure: (agentName: string, sessionId: string, reason: string, kind: "unresolved" | "refused") => void;
   /** The WHOLE seal listener bundle — a visiting stream needs every one of them. */
   registerSealListeners: (signaling: SignalingManager, agentName: string, agentPubkeyHex: string) => () => void;
+  /**
+   * 043-SIGNALDELIVERY C. Same bundle-not-inline reasoning as registerSealListeners, and the same
+   * bug: a frame type handled only on the home stream is a frame type the visiting stream drops.
+   */
+  registerPickupListener: PickupListenerRegistrar;
   sessionNegotiator?: SessionNegotiator;
   /** Step-6 directory identity proof (undefined on the in-process test path). */
   challengeVerifier?: IDirectoryChallengeVerifier;
@@ -89,7 +95,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
   const {
     logger, sessionNodeManager, getKeyProvider, getPersistence, getAgentSignaling,
     waitForSignalingConnected, getFailoverEndpoint, resolveConsortiumRoster,
-    registerSealListeners, sessionNegotiator, challengeVerifier, getManifestVersion, loadedAgents,
+    registerSealListeners, registerPickupListener, sessionNegotiator, challengeVerifier, getManifestVersion, loadedAgents,
     getUnresolvedNodes, getDeclaredNodeCount, recordSealFailure,
   } = deps;
 
@@ -669,6 +675,13 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
     // carry a seal frame now gets every seal listener — and the coordinator no longer lets it be
     // wired any other way.
     registerSealListeners(mgr, agentName, agentPubkeyHex);
+    // 043-SIGNALDELIVERY C: AND the trust-signal pickups, for exactly the reason the seal listeners
+    // above are here. The directory drains its pickup queue down any authenticated stream, visiting
+    // included — it was pushing them at this connection all along and the daemon had no handler, so
+    // every frame was dropped and re-dropped on the next visit. Nothing was lost (the directory
+    // deletes on ACK, never on send), but nothing arrived either, and the operator's wallet stayed
+    // empty while the portal reported success.
+    registerPickupListener(mgr, agentName, agentKeyProvider);
     logger.info("signaling.visiting.connected", { agentName, node: nodeId, correlationId });
     return {
       mgr,

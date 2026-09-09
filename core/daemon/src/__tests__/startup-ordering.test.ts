@@ -192,7 +192,11 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
      *
      * Raise the number deliberately when a module is added. That is what makes a DROP visible.
      */
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(94);
+    // 94 → 95, 043-SIGNALDELIVERY C: trust-signal-pickup-listener.ts. Raised deliberately, and the
+    // module it counts is one this guard would have caught the absence of — the visiting connection
+    // dropped every trust-signal pickup because its listener was registered inline on one stream
+    // type and nowhere else, which is precisely "a factory that exists and is not wired".
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(95);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",

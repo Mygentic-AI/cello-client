@@ -44,6 +44,7 @@ import type { DirectoryEndpoint } from "./signaling-connect.js";
 import type { SubmissionRetryQueue } from "./submission-retry.js";
 import type { SealFailureStore } from "./seal-failure-store.js";
 import type { KeyProvider } from "@cello-protocol/crypto";
+import { createPickupListenerRegistrar, type TrustSignalPickupHandler } from "./trust-signal-pickup-listener.js";
 import { createSignalingConnect } from "./signaling-connect.js";
 import { wireSessionCeremonyHandler, wireSessionOfferHandler, wireSealCeremonyHandler } from "./session-ceremony.js";
 import { relayOnlyState } from "./relay-only.js";
@@ -84,12 +85,8 @@ export interface SignalingWiringDeps {
    * on its own stream — the exact failure the CONN-001 block below exists to prevent.
    */
   getWirePerAgentSessionInbound: () => (mgr: SignalingManager, agentName: string) => void;
-  getHandleTrustSignalPickup: () => (
-    frame: Record<string, unknown>,
-    keyProvider: KeyProvider,
-    mgr: SignalingManager,
-    agentName: string,
-  ) => void | Promise<void>;
+  /** Resolved at FRAME time: the handler is built after this wiring, so an eager read is undefined. */
+  getHandleTrustSignalPickup: () => TrustSignalPickupHandler;
 }
 
 export function createSignalingWiring(deps: SignalingWiringDeps) {
@@ -100,6 +97,8 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
     challengeVerifier, directoryEndpointResolver, registerSealListeners,
     getWirePerAgentSessionInbound, getHandleTrustSignalPickup,
   } = deps;
+
+  const registerPickupListener = createPickupListenerRegistrar(getHandleTrustSignalPickup);
 
   // ─── Per-agent directory signaling (CONN-001: one signaling stream per agent) ──
   // CELLO-M7-CONN-001 (DOD-CONN-1): the directory routes EVERY signaling frame —
@@ -268,14 +267,10 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
       signaling: mgr,
       logger,
     });
-    // CELLO-M8-TRUST-001: receive sealed trust signals pushed from the directory pickup queue on
-    // THIS agent's stream. Open with k_local, verify the recomputed hash against the directory
-    // anchor, store locally, then ACK (so the directory deletes the ciphertext). The daemon is the
-    // ONLY party that can open the seal (SI-001); a hash mismatch is rejected without storing/ACKing.
-    mgr.registerInboundHandler((frame) => {
-      if (frame["type"] !== "trust_signal_pickup") return;
-      void getHandleTrustSignalPickup()(frame as Record<string, unknown>, agentKeyProvider, mgr, agentName);
-    });
+    // CELLO-M8-TRUST-001: receive sealed trust signals pushed from the directory pickup queue.
+    // Open with k_local, verify the hash against the directory anchor, store, then ACK. Shared
+    // registrar (043-SIGNALDELIVERY C) — the visiting stream needs the identical listener.
+    registerPickupListener(mgr, agentName, agentKeyProvider);
     /**
      * DOD-M15-SEALPARTIES-1 Part 0: take the relay credential off `register_success`.
      *
@@ -454,5 +449,8 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
     sendOver,
     directorySignalingStatus,
     stopAllSignaling,
+    // 043-SIGNALDELIVERY C: handed out so the VISITING connection registers the identical listener.
+    // It had none, so a visited node's pickups were pushed and dropped on every visit.
+    registerPickupListener,
   };
 }
