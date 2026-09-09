@@ -25,13 +25,14 @@ interface FakeConn {
  * One visiting connection per node. `completeOn` decides which nodes send the terminal frame; the
  * rest stay silent, which is what a slow or wedged node looks like from here.
  */
-function harness(opts: { nodes: string[]; completeOn?: string[]; unreachable?: string[] } = { nodes: [] }) {
+function harness(opts: { nodes: string[]; completeOn?: string[]; unreachable?: string[]; neverConnects?: string[] } = { nodes: [] }) {
   const conns = new Map<string, FakeConn>();
   const openVisitingConnection = vi.fn((_agent: string, _kp: unknown, _pub: string, _ep: unknown, _corr: string, nodeId: string) => {
     if (opts.unreachable?.includes(nodeId)) throw new Error(`dial failed: ${nodeId}`);
     const conn: FakeConn = { handlers: [], stopped: false };
     conns.set(nodeId, conn);
     const mgr = {
+      status: opts.neverConnects?.includes(nodeId) ? "reconnecting" : "connected",
       registerInboundHandler(h: (f: Record<string, unknown>) => void) {
         conn.handlers.push(h);
         // A node that completes answers as soon as anyone starts listening.
@@ -200,5 +201,131 @@ describe("043-SIGNALDELIVERY C2 — the sweep is actually triggered on connect",
     onConnected?.();
     expect(sweep).toHaveBeenCalledOnce();
     expect(sweep.mock.calls[0][0]).toBe("alice");
+  });
+
+  it("a sweep that never finishes does not starve the other reconnect work", async () => {
+    // WHAT THIS CAN AND CANNOT PROVE, stated because the first version of this test proved nothing.
+    // The transport calls `onConnected` fire-and-forget (`this._onConnected?.()`, typed `() => void`,
+    // return ignored), so "the sweep does not delay stream auth" is guaranteed by the transport's
+    // own contract and CANNOT be violated from here — asserting it was unfalsifiable.
+    //
+    // What IS falsifiable is the ordering inside the callback: awaiting the sweep before the
+    // submission retry would mean a wedged sweep silently stops sealed submissions being re-sent,
+    // and nothing would say so. That is the real risk and it is what this holds.
+    const transport = await import("@cello-protocol/transport");
+    let onConnected: (() => void) | undefined;
+    const fakeMgr = {
+      registerInboundHandler() {}, stop: async () => {}, send: async () => {},
+      sendRaw: async () => {}, onStatusChange: () => {}, start: async () => {}, status: "connected",
+    };
+    vi.spyOn(transport, "SignalingManager").mockImplementation((opts: never) => {
+      onConnected = (opts as unknown as { onConnected?: () => void }).onConnected;
+      return fakeMgr as never;
+    });
+
+    const { createSignalingWiring } = await import("../signaling-wiring.js");
+    const nop = () => {};
+    const retried = vi.fn();
+    const wiring = createSignalingWiring({
+      // Never settles.
+      getSweepTrustSignals: () => () => new Promise(() => {}),
+      getHandleTrustSignalPickup: () => async () => {},
+      logger: { debug: nop, info: nop, warn: nop, error: nop },
+      loadedAgents: new Map(), keyProviders: new Map(), perAgentSignaling: new Map(),
+      sessionNodeManager: { getSetting: () => undefined, hasDatabase: () => false } as never,
+      getPersistence: () => ({}) as never,
+      resolveConsortiumRoster: async () => [],
+      getFailoverEndpoint: () => ({ url: "http://d", peerId: "p", multiaddr: "/m" }),
+      failoverEndpointResolver: {} as never, directoryEndpointResolver: {} as never,
+      challengeVerifier: {} as never, registerSealListeners: () => () => {},
+      getWirePerAgentSessionInbound: () => () => {},
+      onSignalingConnected: nop, verifiedManifestVersion: 1,
+      sealFailures: {} as never,
+      submissionRetries: { onSignalingConnected: retried } as never,
+      noSharedDirectoryNode: true, sharedSignaling: undefined,
+    } as never);
+
+    (wiring as unknown as { getAgentSignaling: (n: string, k: unknown, p: string) => unknown })
+      .getAgentSignaling("alice", {} as never, "a".repeat(64));
+
+    onConnected?.();
+    // Reverting to `await sweep(...)` placed before this call leaves it at zero, forever.
+    expect(retried).toHaveBeenCalledWith("alice");
+  });
+});
+
+describe("043-SIGNALDELIVERY C2 — review fixes", () => {
+  it("names a DECLARED node that never resolved, which is the only way a dead node shows up", async () => {
+    // The roster is already the REACHABLE SUBSET — a node whose /bootstrap probe failed is dropped
+    // before the sweep sees it. Without asking for the unresolved list, a dead node appeared in no
+    // bucket at all and the sweep reported "visited 2, unreachable 0" on a three-node fleet: the
+    // operator told nothing was waiting when nobody looked.
+    const h = harness({ nodes: [], completeOn: ["b"] });
+    const sweep = createTrustSignalSweep({
+      logger: silent,
+      resolveConsortiumRoster: async () => ROSTER(["a", "b"]),
+      getUnresolvedNodes: () => [{ nodeId: "c", reason: "probe_timeout" }],
+      openVisitingConnection: h.openVisitingConnection as never,
+      ceilingMs: 200,
+    });
+    const result = await sweep("alice", {} as never, "a".repeat(64), "a");
+    expect(result.visited).toEqual(["b"]);
+    expect(result.unreachable).toEqual(["c"]);
+  });
+
+  it("calls a node that never connected UNREACHABLE, not incomplete", async () => {
+    // openVisitingConnection connects asynchronously and does not throw on a dial failure, so this
+    // node sits out the full ceiling. Filing it as "answered but never finished" names the
+    // directory's drain for what is a transport failure — an exit-point label an operator would act
+    // on, sending them to the wrong system.
+    const h = harness({ nodes: [], completeOn: [], neverConnects: ["b"] });
+    const sweep = createTrustSignalSweep({
+      logger: silent,
+      resolveConsortiumRoster: async () => ROSTER(["a", "b"]),
+      openVisitingConnection: h.openVisitingConnection as never,
+      ceilingMs: 20,
+    });
+    const result = await sweep("alice", {} as never, "a".repeat(64), "a");
+    expect(result.unreachable).toEqual(["b"]);
+    expect(result.incomplete).toEqual([]);
+  });
+
+  it("closes the connection even when registering the handler throws", async () => {
+    // A throw between opening and closing leaves an AUTHENTICATED visiting stream open, and the
+    // directory drains its durable notification queue down any such stream — the bug this
+    // connection type has already caused once.
+    let stopped = false;
+    const sweep = createTrustSignalSweep({
+      logger: silent,
+      resolveConsortiumRoster: async () => ROSTER(["a", "b"]),
+      openVisitingConnection: (() => ({
+        mgr: { status: "connected", registerInboundHandler: () => { throw new Error("wiring blew up"); } },
+        stop: async () => { stopped = true; },
+      })) as never,
+      ceilingMs: 50,
+    });
+    await sweep("alice", {} as never, "a".repeat(64), "a").catch(() => {});
+    expect(stopped).toBe(true);
+  });
+
+  it("does not run a second sweep for an agent while one is in flight", async () => {
+    // onConnected fires on every reconnect. A flapping stream would otherwise stack sweeps, each
+    // holding N authenticated visiting streams and re-triggering every node's drain — load arriving
+    // exactly when the network is already struggling.
+    const h = harness({ nodes: [], completeOn: [] });
+    const sweep = createTrustSignalSweep({
+      logger: silent,
+      resolveConsortiumRoster: async () => ROSTER(["a", "b"]),
+      openVisitingConnection: h.openVisitingConnection as never,
+      ceilingMs: 100,
+    });
+    const [first, second] = await Promise.all([
+      sweep("alice", {} as never, "a".repeat(64), "a"),
+      sweep("alice", {} as never, "a".repeat(64), "a"),
+    ]);
+    const opened = h.openVisitingConnection.mock.calls.length;
+    expect(opened).toBe(1);
+    // The one that was turned away says nothing was swept rather than claiming a clean result.
+    expect(first.incomplete.length + second.incomplete.length).toBe(1);
   });
 });

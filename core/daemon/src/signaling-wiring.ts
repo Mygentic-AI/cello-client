@@ -45,6 +45,7 @@ import type { SubmissionRetryQueue } from "./submission-retry.js";
 import type { SealFailureStore } from "./seal-failure-store.js";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { createPickupListenerRegistrar, type TrustSignalPickupHandler } from "./trust-signal-pickup-listener.js";
+import { extractErrorMessage } from "./error-message.js";
 import { createSignalingConnect } from "./signaling-connect.js";
 import { wireSessionCeremonyHandler, wireSessionOfferHandler, wireSealCeremonyHandler } from "./session-ceremony.js";
 import { relayOnlyState } from "./relay-only.js";
@@ -67,7 +68,7 @@ export interface SignalingWiringDeps {
   verifiedManifestVersion: number;
   getPersistence: (agentName: string) => DbRegistrationPersistence;
   onSignalingConnected: (agentName: string) => void | Promise<void>;
-  /** C2, late-bound (built in outbound-sessions, created after this). See trust-signal-sweep.ts. */
+  /** C2, late-bound; built in outbound-sessions. See trust-signal-sweep.ts. */
   getSweepTrustSignals: () => ((n: string, k: KeyProvider, p: string) => Promise<unknown>) | undefined;
   resolveConsortiumRoster: () => Promise<ConsortiumEndpoint[] | null>;
   failoverEndpointResolver: (() => Promise<DirectoryEndpoint | null>) | undefined;
@@ -201,13 +202,12 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
       // is not left until the next agent start. The drain needs the node the ensure builds.
       //
       // AND THIRD, DOD-M15-ENDORSE-RETRY-1: re-send any sealed submission that reached no node.
-      // Outside `createReconnectDrain`'s ensure→drain contract and after it: the drain needs the
-      // standing receiver the ensure rebuilds, a submission needs only the stream that just came up.
+      // After `createReconnectDrain`: the drain needs the receiver the ensure rebuilds; this does not.
       onConnected: () => {
         onSignalingConnected(agentName);
         submissionRetries.onSignalingConnected(agentName);
-        // C2: background, never awaited — collection must not be a cost on the way to connected.
-        void getSweepTrustSignals()?.(agentName, agentKeyProvider, agentPubkeyHex)?.catch(() => {});
+        // C2: background, never awaited; the catch LOGS — silence is what hid this bug for weeks.
+        void getSweepTrustSignals()?.(agentName, agentKeyProvider, agentPubkeyHex)?.catch((e: unknown) => logger.warn("trust_signal.sweep.failed", { agentName, reason: extractErrorMessage(e) }));
       },
     });
     const entry: AgentSignaling = { signaling: mgr, getNode: () => nodeRef };
@@ -269,9 +269,9 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
       signaling: mgr,
       logger,
     });
-    // CELLO-M8-TRUST-001: receive sealed trust signals pushed from the directory pickup queue.
-    // Open with k_local, verify the hash against the directory anchor, store, then ACK. Shared
-    // registrar (043-SIGNALDELIVERY C) — the visiting stream needs the identical listener.
+    // CELLO-M8-TRUST-001: sealed trust signals pushed from the directory pickup queue. Open with
+    // k_local, verify the hash against the anchor, store, ACK. Shared registrar (C) so the visiting
+    // stream gets the identical listener.
     registerPickupListener(mgr, agentName, agentKeyProvider, "home");
     /**
      * DOD-M15-SEALPARTIES-1 Part 0: take the relay credential off `register_success`.

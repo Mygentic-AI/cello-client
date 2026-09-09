@@ -42,6 +42,16 @@ export interface SweepResult {
 export interface TrustSignalSweepDeps {
   logger: Logger;
   resolveConsortiumRoster: () => Promise<ConsortiumEndpoint[] | null>;
+  /**
+   * Nodes the manifest declares that could NOT be resolved this sweep.
+   *
+   * Without this the `unreachable` bucket can never fill, because the roster is already the
+   * REACHABLE SUBSET — `manifestNodesToEndpoints` drops a node whose /bootstrap probe failed. A
+   * dead node therefore appeared in no bucket at all and the sweep reported "visited 2,
+   * unreachable 0" for a three-node fleet, which is exactly the false negative the order forbids:
+   * the operator is told nothing is waiting when nobody looked.
+   */
+  getUnresolvedNodes?: () => ReadonlyArray<{ nodeId: string; reason: string }>;
   openVisitingConnection: (
     agentName: string,
     agentKeyProvider: KeyProvider,
@@ -49,7 +59,14 @@ export interface TrustSignalSweepDeps {
     endpoint: { peerId: string; multiaddr: string },
     correlationId: string,
     nodeId: string,
-  ) => { mgr: { registerInboundHandler: (h: (f: Record<string, unknown>) => void) => void }; stop: (reason: string) => Promise<void> };
+  ) => {
+    mgr: {
+      registerInboundHandler: (h: (f: Record<string, unknown>) => void) => void;
+      /** "connected" once the stream is authenticated; the manager connects asynchronously. */
+      readonly status?: string;
+    };
+    stop: (reason: string) => Promise<void>;
+  };
   /** How long to wait for a node's end-of-drain frame before closing anyway. */
   ceilingMs?: number;
 }
@@ -69,11 +86,44 @@ export type TrustSignalSweep = (
 ) => Promise<SweepResult>;
 
 export function createTrustSignalSweep(deps: TrustSignalSweepDeps): TrustSignalSweep {
-  const { logger, resolveConsortiumRoster, openVisitingConnection } = deps;
+  const { logger, resolveConsortiumRoster, openVisitingConnection, getUnresolvedNodes } = deps;
   const ceilingMs = deps.ceilingMs ?? 10_000;
+  // One sweep per agent at a time. `onConnected` fires on every reconnect, so a flapping stream
+  // would otherwise stack sweeps, each holding up to N authenticated visiting streams and
+  // re-triggering every node's drain. Duplicate delivery is safe — the wallet write is
+  // content-addressed and the drain deletes only on ACK — so this is load, not corruption, but it
+  // is load that arrives exactly when the network is already struggling.
+  const inFlight = new Set<string>();
 
   return async (agentName, agentKeyProvider, agentPubkeyHex, homeNodeId) => {
+    if (inFlight.has(agentName)) {
+      logger.info("trust_signal.sweep.already_running", { agentName });
+      return { visited: [], unreachable: [], incomplete: [], rosterUnavailable: false };
+    }
+    inFlight.add(agentName);
+    try {
+      return await run(agentName, agentKeyProvider, agentPubkeyHex, homeNodeId);
+    } finally {
+      inFlight.delete(agentName);
+    }
+  };
+
+  async function run(
+    agentName: string,
+    agentKeyProvider: KeyProvider,
+    agentPubkeyHex: string,
+    homeNodeId?: string,
+  ): Promise<SweepResult> {
     const result: SweepResult = { visited: [], unreachable: [], incomplete: [], rosterUnavailable: false };
+
+    // Declared-but-unresolvable nodes, named BEFORE any dialling. These never reach the loop below
+    // because the roster excludes them, and saying nothing about them is how one dead node makes
+    // "nothing waiting" look true.
+    for (const n of getUnresolvedNodes?.() ?? []) {
+      if (n.nodeId === homeNodeId) continue;
+      result.unreachable.push(n.nodeId);
+      logger.warn("trust_signal.sweep.node_unreachable", { agentName, node: n.nodeId, reason: n.reason });
+    }
 
     const roster = await resolveConsortiumRoster();
     if (!roster) {
@@ -98,44 +148,62 @@ export function createTrustSignalSweep(deps: TrustSignalSweepDeps): TrustSignalS
           { peerId: node.peerId, multiaddr: node.multiaddr }, correlationId, node.nodeId,
         );
       } catch (err: unknown) {
-        // ONE NODE DOWN MUST NOT END THE SWEEP, and must never read as "nothing waiting" — that
-        // would let a single unreachable node manufacture a false negative, telling the operator
-        // there is nothing to collect when nobody looked.
+        // openVisitingConnection connects ASYNCHRONOUSLY, so in practice it does not throw on a
+        // dial failure — that case is caught after the ceiling instead. This catches a synchronous
+        // fault while it wires the connection up, where `conn` is undefined and there is nothing to
+        // stop. One node failing must never end the sweep.
         result.unreachable.push(node.nodeId);
-        logger.warn("trust_signal.sweep.node_unreachable", {
-          agentName, node: node.nodeId,
-          reason: extractErrorMessage(err),
-        });
+        logger.warn("trust_signal.sweep.node_unreachable", { agentName, node: node.nodeId, reason: extractErrorMessage(err) });
         continue;
       }
 
-      // Wait for the node to say the drain is finished — or give up at the ceiling.
-      //
-      // The terminal frame is what makes this correct: a timer alone truncates a slow drain and
-      // re-drops the remainder on the next sweep, forever, because the directory deletes on ACK and
-      // an un-acked row simply comes back. The ceiling is the backstop for a node that never sends
-      // one, including any directory older than that change.
-      const completed = await new Promise<boolean>((resolve) => {
-        const timer = setTimeout(() => resolve(false), ceilingMs);
-        conn!.mgr.registerInboundHandler((frame) => {
+      // try/finally, because the teardown is not optional. A throw between here and `stop()` would
+      // leave an AUTHENTICATED visiting connection open — and the order names the consequence
+      // directly: the directory drains its durable notification queue down any such stream, which
+      // is a bug this connection type has already caused once.
+      try {
+        // Register BEFORE the promise, so a throw here cannot reject it and skip the teardown.
+        let onComplete: (() => void) | undefined;
+        conn.mgr.registerInboundHandler((frame) => {
           if (frame["type"] !== "trust_signal_drain_complete") return;
-          clearTimeout(timer);
-          resolve(true);
+          onComplete?.();
         });
-      });
 
-      if (completed) result.visited.push(node.nodeId);
-      else {
-        // Answered, but never said it was done. We may have collected everything or only part of
-        // it, and we cannot tell — which is a different answer from a clean sweep and is recorded
-        // as one.
-        result.incomplete.push(node.nodeId);
-        logger.warn("trust_signal.sweep.no_terminal_frame", { agentName, node: node.nodeId, ceilingMs });
+        // Wait for the node to say the drain is finished — or give up at the ceiling.
+        //
+        // The terminal frame is what makes this correct: a timer alone truncates a slow drain and
+        // re-drops the remainder on the next sweep, forever, because the directory deletes on ACK
+        // and an un-acked row simply comes back. The ceiling is the backstop for a node that never
+        // sends one, including any directory older than that change.
+        const completed = await new Promise<boolean>((resolve) => {
+          const timer = setTimeout(() => resolve(false), ceilingMs);
+          // Do not hold the process open waiting on a node that has gone quiet.
+          timer.unref?.();
+          onComplete = () => { clearTimeout(timer); resolve(true); };
+        });
+
+        if (completed) result.visited.push(node.nodeId);
+        else if (conn.mgr.status !== undefined && conn.mgr.status !== "connected") {
+          // NEVER CONNECTED, so this is a transport failure and not a slow drain. Filing it as
+          // `incomplete` would name the directory's drain for something that is the network —
+          // an exit-point label standing in for the real cause, which is the reading an operator
+          // would then act on.
+          result.unreachable.push(node.nodeId);
+          logger.warn("trust_signal.sweep.node_unreachable", {
+            agentName, node: node.nodeId, reason: "never_connected", ceilingMs,
+          });
+        } else {
+          // Connected and answering, but never said it was done. We may have collected everything
+          // or only part of it and cannot tell — a different answer from a clean sweep, recorded
+          // as one.
+          result.incomplete.push(node.nodeId);
+          logger.warn("trust_signal.sweep.no_terminal_frame", { agentName, node: node.nodeId, ceilingMs });
+        }
+      } finally {
+        // `stop` awaits any in-flight pickup handler before tearing the stream down (C1 review), so
+        // a signal still being opened and stored is not cut off by this close.
+        await conn.stop("sweep_finished");
       }
-
-      // `stop` awaits any in-flight pickup handler before tearing the stream down (C1 review), so a
-      // signal still being opened and stored is not cut off by this close.
-      await conn.stop(completed ? "sweep_complete" : "sweep_ceiling");
     }
 
     logger.info("trust_signal.sweep.finished", {
