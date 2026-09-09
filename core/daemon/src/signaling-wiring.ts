@@ -270,7 +270,7 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
     // CELLO-M8-TRUST-001: receive sealed trust signals pushed from the directory pickup queue.
     // Open with k_local, verify the hash against the directory anchor, store, then ACK. Shared
     // registrar (043-SIGNALDELIVERY C) — the visiting stream needs the identical listener.
-    registerPickupListener(mgr, agentName, agentKeyProvider);
+    registerPickupListener(mgr, agentName, agentKeyProvider, "home");
     /**
      * DOD-M15-SEALPARTIES-1 Part 0: take the relay credential off `register_success`.
      *

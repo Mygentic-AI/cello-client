@@ -37,13 +37,14 @@ describe("043-SIGNALDELIVERY C — pickup listener registrar", () => {
     const register = createPickupListenerRegistrar(() => handle);
     const mgr = fakeManager();
 
-    register(mgr as never, "alice", KP);
+    register(mgr as never, "alice", KP, "home");
     mgr.deliver({ type: "trust_signal_pickup", id: "p1" });
 
     expect(handle).toHaveBeenCalledOnce();
-    const [frame, , signaling, agentName] = handle.mock.calls[0] as unknown as [
-      Record<string, unknown>, unknown, unknown, string,
+    const [frame, , signaling, agentName, origin] = handle.mock.calls[0] as unknown as [
+      Record<string, unknown>, unknown, unknown, string, string,
     ];
+    expect(origin).toBe("home");
     expect(frame["id"]).toBe("p1");
     expect(agentName).toBe("alice");
     // The ACK goes back down the SAME stream the pickup arrived on. Acking down the home stream
@@ -57,7 +58,7 @@ describe("043-SIGNALDELIVERY C — pickup listener registrar", () => {
     const register = createPickupListenerRegistrar(() => handle);
     const mgr = fakeManager();
 
-    register(mgr as never, "alice", KP);
+    register(mgr as never, "alice", KP, "home");
     for (const type of ["seal_verified", "session_sealed", "register_success", "auth_ok"]) {
       mgr.deliver({ type });
     }
@@ -72,7 +73,7 @@ describe("043-SIGNALDELIVERY C — pickup listener registrar", () => {
     const mgr = fakeManager();
     const kp = { marker: "alice-kp" } as never;
 
-    register(mgr as never, "alice", kp);
+    register(mgr as never, "alice", kp, "home");
     mgr.deliver({ type: "trust_signal_pickup", id: "p1" });
 
     expect(handle.mock.calls[0][1]).toBe(kp);
@@ -85,7 +86,7 @@ describe("043-SIGNALDELIVERY C — pickup listener registrar", () => {
     let current: ((...a: unknown[]) => Promise<void>) | undefined;
     const register = createPickupListenerRegistrar(() => current as never);
     const mgr = fakeManager();
-    register(mgr as never, "alice", KP);
+    register(mgr as never, "alice", KP, "home");
 
     const late = vi.fn(async () => {});
     current = late as never;
@@ -151,6 +152,105 @@ describe("043-SIGNALDELIVERY C — the VISITING connection registers it", () => 
     // THE REVERT TEST: delete `registerPickupListener(...)` from openVisitingConnection and no
     // handler here responds to the frame — which is exactly today's behaviour, the directory
     // pushing pickups at a stream that drops them.
+    for (const h of registered) h({ type: "trust_signal_pickup", id: "p1" });
+    expect(handle).toHaveBeenCalledOnce();
+  });
+});
+
+describe("043-SIGNALDELIVERY C — the teardown waits, and the home stream still registers", () => {
+  it("lets an in-flight pickup finish before the stream is torn down", async () => {
+    // The handler opens the seal, writes the wallet and only THEN acks. A teardown that wins that
+    // race leaves the visited node's row unacked, so the same pickup is re-sent on every future
+    // visit — and the log names the failed send rather than the teardown that caused it.
+    let acked = false;
+    let release: (() => void) | undefined;
+    const handle = async () => {
+      await new Promise<void>((r) => { release = r; });
+      acked = true;
+    };
+    const register = createPickupListenerRegistrar(() => handle as never);
+    const mgr = fakeManager();
+    const { settle } = register(mgr as never, "alice", KP, "us-east1");
+
+    mgr.deliver({ type: "trust_signal_pickup", id: "p1" });
+    expect(acked).toBe(false);
+
+    const waiting = settle(2_000);
+    release?.();
+    await waiting;
+    expect(acked).toBe(true);
+  });
+
+  it("gives up on a wedged handler rather than blocking the close forever", async () => {
+    // Bounded on purpose: a handler stuck on a slow database must DELAY a teardown, never prevent
+    // one, or a stuck pickup becomes a stuck session close.
+    const register = createPickupListenerRegistrar(() => (async () => {
+      await new Promise(() => {});
+    }) as never);
+    const mgr = fakeManager();
+    const { settle } = register(mgr as never, "alice", KP, "us-east1");
+    mgr.deliver({ type: "trust_signal_pickup", id: "p1" });
+
+    const started = Date.now();
+    await settle(50);
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+
+  it("a rejected handler does not leave the teardown hanging", async () => {
+    const register = createPickupListenerRegistrar(() => (async () => {
+      throw new Error("seal open failed");
+    }) as never);
+    const mgr = fakeManager();
+    const { settle } = register(mgr as never, "alice", KP, "us-east1");
+    mgr.deliver({ type: "trust_signal_pickup", id: "p1" });
+    await expect(settle(2_000)).resolves.toBeUndefined();
+  });
+
+  it("the HOME stream registers the listener too — the path that already worked", async () => {
+    // The refactor's stated risk was a regression on the path that already worked, and nothing
+    // covered it. An earlier version of this test called the registrar straight off the wiring's
+    // return value, which proved the wiring HANDS ONE OUT and not that getAgentSignaling USES it —
+    // deleting the home registration left it green, which is the same hollow shape this unit was
+    // written to fix. It now builds a real manager through getAgentSignaling and feeds it a frame.
+    const transport = await import("@cello-protocol/transport");
+    const registered: ((f: Record<string, unknown>) => void)[] = [];
+    const fakeMgr = {
+      registerInboundHandler(h: (f: Record<string, unknown>) => void) { registered.push(h); },
+      stop: async () => {}, send: async () => {}, sendRaw: async () => {},
+      onStatusChange: () => {}, start: async () => {}, status: "connected",
+    };
+    vi.spyOn(transport, "SignalingManager").mockImplementation(() => fakeMgr as never);
+
+    const { createSignalingWiring } = await import("../signaling-wiring.js");
+    const handle = vi.fn(async () => {});
+    const noop = () => {};
+    const wiring = createSignalingWiring({
+      getHandleTrustSignalPickup: () => handle,
+      logger: { debug: noop, info: noop, warn: noop, error: noop },
+      loadedAgents: new Map(),
+      keyProviders: new Map(),
+      perAgentSignaling: new Map(),
+      sessionNodeManager: { getSetting: () => undefined, hasDatabase: () => false } as never,
+      getPersistence: () => ({}) as never,
+      resolveConsortiumRoster: async () => [],
+      getFailoverEndpoint: () => ({ url: "http://dir", peerId: "p", multiaddr: "/m" }),
+      failoverEndpointResolver: {} as never,
+      directoryEndpointResolver: {} as never,
+      challengeVerifier: {} as never,
+      registerSealListeners: () => () => {},
+      getWirePerAgentSessionInbound: () => () => {},
+      onSignalingConnected: () => {},
+      verifiedManifestVersion: 1,
+      sealFailures: {} as never,
+      submissionRetries: {} as never,
+      noSharedDirectoryNode: true,
+      sharedSignaling: undefined,
+    } as never);
+
+    (wiring as unknown as {
+      getAgentSignaling: (n: string, kp: unknown, pub: string) => unknown;
+    }).getAgentSignaling("alice", {} as never, "a".repeat(64));
+
     for (const h of registered) h({ type: "trust_signal_pickup", id: "p1" });
     expect(handle).toHaveBeenCalledOnce();
   });

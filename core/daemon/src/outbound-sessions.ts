@@ -681,12 +681,17 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
     // every frame was dropped and re-dropped on the next visit. Nothing was lost (the directory
     // deletes on ACK, never on send), but nothing arrived either, and the operator's wallet stayed
     // empty while the portal reported success.
-    registerPickupListener(mgr, agentName, agentKeyProvider);
+    const pickups = registerPickupListener(mgr, agentName, agentKeyProvider, nodeId);
     logger.info("signaling.visiting.connected", { agentName, node: nodeId, correlationId });
     return {
       mgr,
       stop: async (reason: string) => {
         logger.info("signaling.visiting.released", { agentName, node: nodeId, reason, correlationId });
+        // Let an in-flight pickup finish acking before the stream goes. The handler opens the seal,
+        // writes the wallet and only then acks; a teardown that wins that race leaves the visited
+        // node's row unacked, so the same pickup is re-sent on every future visit. Bounded, so a
+        // wedged handler delays this close rather than preventing it.
+        await pickups.settle(2_000);
         await mgr.stop();
       },
     };

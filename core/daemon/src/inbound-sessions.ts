@@ -1643,6 +1643,15 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     keyProvider: import("@cello-protocol/crypto").KeyProvider,
     mgr: SignalingManager,
     agentName: string,
+    /**
+     * 043-SIGNALDELIVERY C: "home", or the node id of the visited directory whose drain sent this.
+     *
+     * Until the visiting connection also handled pickups there was one stream and the events below
+     * were unambiguous. Now the same five fire from two stream types, and without this an operator
+     * reading `open_failed` cannot tell whose queue the signal came out of — which is also what the
+     * fan-out's "collected from node X" reporting has to be built on.
+     */
+    origin = "home",
   ): Promise<void> {
     const id = typeof frame["id"] === "string" ? frame["id"] : null;
     const signalKind = typeof frame["signal_kind"] === "string" ? frame["signal_kind"] : null;
@@ -1651,7 +1660,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     if (!id || !signalKind || !signalHash || !(ciphertext instanceof Uint8Array)) {
       // Neither stores nor ACKs → the directory retains the row and re-delivers. Log it: a PERMANENTLY
       // malformed frame would otherwise be re-delivered forever with zero daemon-side signal (fallback-finder).
-      logger.warn("daemon.trust_signal.malformed", {
+      logger.warn("daemon.trust_signal.malformed", { origin,
         agentName,
         hasId: !!id,
         hasSignalKind: !!signalKind,
@@ -1663,7 +1672,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     if (!keyProvider.openContentSeal) {
       // A session-node stub key cannot open content seals. No ACK → the directory re-delivers; log so a
       // pickup persistently routed to a stub-key agent is visible rather than a silent forever-retry.
-      logger.warn("daemon.trust_signal.no_content_key", { agentName, signalKind, correlationId: id });
+      logger.warn("daemon.trust_signal.no_content_key", { origin, agentName, signalKind, correlationId: id });
       return;
     }
     // The pickup id correlates the directory's deliver/ack with the daemon's receive (TRUST-001 obs).
@@ -1676,7 +1685,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       recovered = null;
     }
     if (!recovered) {
-      logger.warn("daemon.trust_signal.open_failed", { agentName, signalKind, correlationId });
+      logger.warn("daemon.trust_signal.open_failed", { origin, agentName, signalKind, correlationId });
       return;
     }
     // M10-D18 / M10-D22: the recovered bytes are a canonical CBOR trust-signal envelope (NOT the M8
@@ -1689,7 +1698,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     try {
       envelope = decodeTrustSignalEnvelope(recovered);
     } catch (err) {
-      logger.error("daemon.trust_signal.envelope_undecodable", {
+      logger.error("daemon.trust_signal.envelope_undecodable", { origin,
         agentName, signalKind, correlationId, error: extractErrorMessage(err),
       });
       return;
@@ -1700,7 +1709,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     } catch (err) {
       // SignalDeliveryRejected (hash_mismatch / claimed_hash_malformed) or a storage fault: NO ACK, so the
       // directory keeps the pickup for a later retry rather than losing a signal it could not verify here.
-      logger.error("daemon.trust_signal.delivery_rejected", {
+      logger.error("daemon.trust_signal.delivery_rejected", { origin,
         agentName,
         signalKind,
         correlationId,
@@ -1708,12 +1717,12 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       });
       return;
     }
-    logger.info("daemon.trust_signal.received", { agentName, signalKind, verified: true, correlationId });
+    logger.info("daemon.trust_signal.received", { origin, agentName, signalKind, verified: true, correlationId });
     // DOD-SENDRAW-1: sendRaw never throws — a discarded result hid every failed ack, leaving the
     // sender to retransmit against a daemon that believed it had answered.
     const ackRes = await mgr.sendRaw({ type: "trust_signal_ack", id });
     if (!ackRes.ok) {
-      logger.warn("daemon.trust_signal.ack_send_failed", {
+      logger.warn("daemon.trust_signal.ack_send_failed", { origin,
         agentName,
         signalKind,
         correlationId,
