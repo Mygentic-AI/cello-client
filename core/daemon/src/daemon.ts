@@ -282,7 +282,7 @@ async function startDaemonHoldingLock(
     // that goes quiet is `let x;`: still `undefined`, no error. That is unit 4's defect, and this
     // is not it.)
     getWirePerAgentSessionInbound: () => wirePerAgentSessionInbound,
-    getHandleTrustSignalPickup: () => handleTrustSignalPickup,
+    getHandleTrustSignalPickup: () => handleTrustSignalPickup, getSweepTrustSignals: () => sweepTrustSignals,
   });
 
   // CELLO-M7-CONN-001 (DOD-CONN-1, code-review HIGH): in PRODUCTION, bring up EACH loaded agent's OWN
@@ -376,7 +376,7 @@ async function startDaemonHoldingLock(
 
   // The OUTBOUND session path (outbound-sessions.ts): discovery, the session request, and cross-node
   // setup via a transient VISITING connection to the counterparty's home node.
-  const { openVisitingConnection, crossNodeBrokerBySession, resolvedSessionNegotiator, runDiscoveryLookup } = createOutboundSessions({
+  const { openVisitingConnection, crossNodeBrokerBySession, resolvedSessionNegotiator, runDiscoveryLookup, sweepTrustSignals } = createOutboundSessions({
     logger,
     sessionNodeManager,
     getKeyProvider: (agentName: string) => keyProviders.get(agentName),

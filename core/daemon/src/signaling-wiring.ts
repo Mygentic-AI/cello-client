@@ -67,6 +67,8 @@ export interface SignalingWiringDeps {
   verifiedManifestVersion: number;
   getPersistence: (agentName: string) => DbRegistrationPersistence;
   onSignalingConnected: (agentName: string) => void | Promise<void>;
+  /** C2, late-bound (built in outbound-sessions, created after this). See trust-signal-sweep.ts. */
+  getSweepTrustSignals: () => ((n: string, k: KeyProvider, p: string) => Promise<unknown>) | undefined;
   resolveConsortiumRoster: () => Promise<ConsortiumEndpoint[] | null>;
   failoverEndpointResolver: (() => Promise<DirectoryEndpoint | null>) | undefined;
   /** Wired onto each new manager so a seal that arrives on it is heard. */
@@ -95,7 +97,7 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
     verifiedManifestVersion, getPersistence, onSignalingConnected, resolveConsortiumRoster,
     failoverEndpointResolver, getFailoverEndpoint, sealFailures, submissionRetries,
     challengeVerifier, directoryEndpointResolver, registerSealListeners,
-    getWirePerAgentSessionInbound, getHandleTrustSignalPickup,
+    getWirePerAgentSessionInbound, getHandleTrustSignalPickup, getSweepTrustSignals,
   } = deps;
 
   const registerPickupListener = createPickupListenerRegistrar(getHandleTrustSignalPickup);
@@ -196,16 +198,16 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
       //
       // THEN DRAIN (M8C-RELAYWAKE-1, "check relay on wakeup"): re-pull this agent's parked mailbox
       // from every relay it has session history with, so a message parked while signaling was down
-      // is not left until the next agent start. The drain needs the node the ensure builds, which
-      // is why it no longer runs beside it.
+      // is not left until the next agent start. The drain needs the node the ensure builds.
       //
       // AND THIRD, DOD-M15-ENDORSE-RETRY-1: re-send any sealed submission that reached no node.
-      // Deliberately outside `createReconnectDrain`'s ensure→drain contract and after it: that
-      // ordering exists because the drain needs the standing receiver the ensure rebuilds, and a
-      // submission needs neither — it needs only the stream that just came up.
+      // Outside `createReconnectDrain`'s ensure→drain contract and after it: the drain needs the
+      // standing receiver the ensure rebuilds, a submission needs only the stream that just came up.
       onConnected: () => {
         onSignalingConnected(agentName);
         submissionRetries.onSignalingConnected(agentName);
+        // C2: background, never awaited — collection must not be a cost on the way to connected.
+        void getSweepTrustSignals()?.(agentName, agentKeyProvider, agentPubkeyHex)?.catch(() => {});
       },
     });
     const entry: AgentSignaling = { signaling: mgr, getNode: () => nodeRef };

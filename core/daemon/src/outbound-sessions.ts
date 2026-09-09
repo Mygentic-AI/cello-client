@@ -14,6 +14,7 @@ import { SignalingManager, type CelloNode } from "@cello-protocol/transport";
 import { createHash } from "node:crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { PickupListenerRegistrar } from "./trust-signal-pickup-listener.js";
+import { createTrustSignalSweep } from "./trust-signal-sweep.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { Logger } from "./types.js";
 import type { DirectoryEndpoint } from "./signaling-connect.js";
@@ -706,6 +707,16 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
   // Presence of an entry means the session is cross-node (same-node sessions never go through
   // runCrossNodeSetup). In-memory only: a close in the SAME process (the common case) is covered; a close
   // after a daemon restart falls back to the pre-fix behavior (deferred hardening: persist on the row).
+  // 043-SIGNALDELIVERY C2: the background collection sweep. Built HERE because every dep it needs
+  // is already in scope — the roster resolver, the logger, and openVisitingConnection itself, which
+  // is the only way to authenticate at another node and therefore the only thing that makes that
+  // node's drain run. Building it in the composition root would mean threading all three back out.
+  const sweepTrustSignals = createTrustSignalSweep({
+    logger,
+    resolveConsortiumRoster,
+    openVisitingConnection,
+  });
+
   const crossNodeBrokerBySession = new Map<string, string>();
 
   /**
@@ -1075,5 +1086,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
     // a second implementation of that distinction is how the two drift until one starts reporting a
     // directory outage as the peer being offline.
     runDiscoveryLookup,
+    /** 043-SIGNALDELIVERY C2: run in the BACKGROUND after a home stream authenticates. */
+    sweepTrustSignals,
   };
 }

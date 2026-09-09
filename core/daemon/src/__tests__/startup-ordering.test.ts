@@ -192,11 +192,12 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
      *
      * Raise the number deliberately when a module is added. That is what makes a DROP visible.
      */
-    // 94 → 95, 043-SIGNALDELIVERY C: trust-signal-pickup-listener.ts. Raised deliberately, and the
-    // module it counts is one this guard would have caught the absence of — the visiting connection
-    // dropped every trust-signal pickup because its listener was registered inline on one stream
-    // type and nowhere else, which is precisely "a factory that exists and is not wired".
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(95);
+    // 94 → 96 across 043-SIGNALDELIVERY C: trust-signal-pickup-listener.ts (C1) and
+    // trust-signal-sweep.ts (C2). Raised deliberately, and both are modules this guard exists for —
+    // C1's listener was registered inline on one stream type and nowhere else, so the visiting
+    // connection dropped every pickup, and C2's sweep is useless the moment nothing calls it.
+    // "A factory that exists and is not wired" is precisely the defect this order is closing.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(96);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",
