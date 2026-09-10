@@ -396,3 +396,50 @@ describe("048-SWEEPTICK — a steady-state problem is stated once, not every fiv
     expect(warns.filter((e) => e === "trust_signal.sweep.node_unreachable"), "a change still shouts").toHaveLength(1);
   });
 });
+
+describe("048-SWEEPTICK — the sweep's own log names the trigger", () => {
+  it("carries `trigger` on the finished line, defaulting to connect when nobody says", async () => {
+    // The default matters: `signaling-wiring.ts` types the sweep getter as three arguments and
+    // passes nothing, so the connect path relies on it. A default of "tick" there would mislabel
+    // every reconnect sweep as a tick and make the field worse than useless.
+    const lines: { event: string; fields: Record<string, unknown> }[] = [];
+    const logger = {
+      warn: () => {}, error: () => {}, debug: () => {},
+      info: (event: string, fields: Record<string, unknown>) => { lines.push({ event, fields }); },
+    } as never;
+    const h = harness({ nodes: ["a"], completeOn: ["a"] });
+    const sweep = createTrustSignalSweep({
+      logger,
+      resolveConsortiumRoster: async () => ROSTER(["a"]),
+      openVisitingConnection: h.openVisitingConnection as never,
+      ceilingMs: 100,
+    });
+
+    await sweep("alice", {} as never, "a".repeat(64));
+    const first = lines.find((l) => l.event === "trust_signal.sweep.finished");
+    expect(first?.fields, "no trigger given → connect").toMatchObject({ trigger: "connect" });
+
+    lines.length = 0;
+    await sweep("bob", {} as never, "b".repeat(64), undefined, "tick");
+    const second = lines.find((l) => l.event === "trust_signal.sweep.finished");
+    expect(second?.fields, "and a tick says so").toMatchObject({ trigger: "tick" });
+  });
+
+  it("names the trigger on a NODE FAILURE too, so a bad node can be blamed on the right cadence", async () => {
+    const warns: Record<string, unknown>[] = [];
+    const logger = {
+      info: () => {}, error: () => {}, debug: () => {},
+      warn: (_e: string, fields: Record<string, unknown>) => { warns.push(fields); },
+    } as never;
+    const h = harness({ nodes: ["a"], completeOn: ["a"] });
+    const sweep = createTrustSignalSweep({
+      logger,
+      resolveConsortiumRoster: async () => ROSTER(["a"]),
+      openVisitingConnection: h.openVisitingConnection as never,
+      getUnresolvedNodes: () => [{ nodeId: "dead", reason: "bootstrap probe failed" }],
+      ceilingMs: 100,
+    });
+    await sweep("alice", {} as never, "a".repeat(64), undefined, "tick");
+    expect(warns[0]).toMatchObject({ node: "dead", trigger: "tick" });
+  });
+});

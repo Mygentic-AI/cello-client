@@ -246,6 +246,35 @@ describe("048-SWEEPTICK — the tick must not become a second source of log nois
   });
 });
 
+describe("048-SWEEPTICK — a sweep says WHICH trigger fired it", () => {
+  it("the connect sweep says `connect` and the tick says `tick`", async () => {
+    /**
+     * ⚠️ ADDED BECAUSE THE UNIT COULD NOT BE VERIFIED ON A LIVE DAEMON. The two triggers produced
+     * byte-identical log lines, and signaling turns its stream over often enough that a tick's sweep
+     * lands inside a burst of reconnect-driven ones — measured 2026-09-10, sweeps at 19:05:20 and
+     * 19:05:21 sitting inside reconnects at 19:05:16/18/19/20/21. Every candidate observation was
+     * equally explained by the trigger this unit was meant to supplement, so nothing could be shown.
+     *
+     * That is this unit's own defect one level up: 043-C2's sweep was correct and unobservable, so
+     * nobody noticed it ran once per connection.
+     */
+    vi.useFakeTimers();
+    const triggers: (string | undefined)[] = [];
+    const sweep = vi.fn(async (_n: string, _k: unknown, _p: string, _h?: string, trigger?: string) => {
+      triggers.push(trigger); return EMPTY;
+    }) as never;
+    const ticker = createTrustSignalSweepTicker({ logger: silent, sweep, isAgentOnline: () => true });
+
+    await ticker.sweepAndTick("alice", KP, "aa");
+    expect(triggers, "the onConnected path names itself").toEqual(["connect"]);
+
+    await vi.advanceTimersByTimeAsync(SWEEP_TICK_INTERVAL_MS * 2);
+    expect(triggers, "and the two ticks are distinguishable from it").toEqual(["connect", "tick", "tick"]);
+
+    ticker.stopAll();
+  });
+});
+
 describe("048-SWEEPTICK — overlap is the EXISTING guard's job, not a second mechanism", () => {
   it("a tick that lands while a sweep is still running does not start a second one", async () => {
     // Composed over the REAL createTrustSignalSweep, because the property belongs to its in-flight

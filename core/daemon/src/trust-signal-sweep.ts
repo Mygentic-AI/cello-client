@@ -71,6 +71,20 @@ export interface TrustSignalSweepDeps {
   ceilingMs?: number;
 }
 
+/**
+ * WHY THE TRIGGER IS A PARAMETER (048-SWEEPTICK, added after the unit could not be verified).
+ *
+ * The tick and `onConnected` produced byte-identical log lines, so on a live daemon there was no way
+ * to tell which one had swept — and signaling turns its stream over often enough that a tick's sweep
+ * lands inside a burst of reconnect-driven ones. The unit's own live check was therefore impossible:
+ * every candidate observation was equally explained by the trigger it was meant to replace.
+ *
+ * That is the failure this unit exists to prevent, one level up. 043-C2's sweep was correct and
+ * unobservable, so nobody noticed it ran once per connection; 048's tick was correct and
+ * unobservable, so nobody could show it ran at all.
+ */
+export type SweepTrigger = "connect" | "tick";
+
 export type TrustSignalSweep = (
   agentName: string,
   agentKeyProvider: KeyProvider,
@@ -83,6 +97,8 @@ export type TrustSignalSweep = (
    * not a wrong answer. A wasted round trip in the background beats guessing which node to skip.
    */
   homeNodeId?: string,
+  /** What caused this sweep. Defaults to `connect`, which is the only caller that passes nothing. */
+  trigger?: SweepTrigger,
 ) => Promise<SweepResult>;
 
 export function createTrustSignalSweep(deps: TrustSignalSweepDeps): TrustSignalSweep {
@@ -109,14 +125,14 @@ export function createTrustSignalSweep(deps: TrustSignalSweepDeps): TrustSignalS
    */
   const lastProblems = new Map<string, string>();
 
-  return async (agentName, agentKeyProvider, agentPubkeyHex, homeNodeId) => {
+  return async (agentName, agentKeyProvider, agentPubkeyHex, homeNodeId, trigger = "connect") => {
     if (inFlight.has(agentName)) {
-      logger.info("trust_signal.sweep.already_running", { agentName });
+      logger.info("trust_signal.sweep.already_running", { agentName, trigger });
       return { visited: [], unreachable: [], incomplete: [], rosterUnavailable: false };
     }
     inFlight.add(agentName);
     try {
-      return await run(agentName, agentKeyProvider, agentPubkeyHex, homeNodeId);
+      return await run(agentName, agentKeyProvider, agentPubkeyHex, homeNodeId, trigger);
     } finally {
       inFlight.delete(agentName);
     }
@@ -126,7 +142,8 @@ export function createTrustSignalSweep(deps: TrustSignalSweepDeps): TrustSignalS
     agentName: string,
     agentKeyProvider: KeyProvider,
     agentPubkeyHex: string,
-    homeNodeId?: string,
+    homeNodeId: string | undefined,
+    trigger: SweepTrigger,
   ): Promise<SweepResult> {
     const result: SweepResult = { visited: [], unreachable: [], incomplete: [], rosterUnavailable: false };
 
@@ -141,7 +158,7 @@ export function createTrustSignalSweep(deps: TrustSignalSweepDeps): TrustSignalS
     for (const n of getUnresolvedNodes?.() ?? []) {
       if (n.nodeId === homeNodeId) continue;
       result.unreachable.push(n.nodeId);
-      problem(n.nodeId)("trust_signal.sweep.node_unreachable", { agentName, node: n.nodeId, reason: n.reason });
+      problem(n.nodeId)("trust_signal.sweep.node_unreachable", { agentName, node: n.nodeId, reason: n.reason, trigger });
     }
 
     const roster = await resolveConsortiumRoster();
@@ -149,7 +166,7 @@ export function createTrustSignalSweep(deps: TrustSignalSweepDeps): TrustSignalS
       // NOT the same as "nobody had anything". We do not know who to ask, and saying nothing was
       // waiting would be a claim we cannot support.
       result.rosterUnavailable = true;
-      logger.warn("trust_signal.sweep.roster_unavailable", { agentName });
+      logger.warn("trust_signal.sweep.roster_unavailable", { agentName, trigger });
       return result;
     }
 
@@ -172,7 +189,7 @@ export function createTrustSignalSweep(deps: TrustSignalSweepDeps): TrustSignalS
         // fault while it wires the connection up, where `conn` is undefined and there is nothing to
         // stop. One node failing must never end the sweep.
         result.unreachable.push(node.nodeId);
-        problem(node.nodeId)("trust_signal.sweep.node_unreachable", { agentName, node: node.nodeId, reason: extractErrorMessage(err) });
+        problem(node.nodeId)("trust_signal.sweep.node_unreachable", { agentName, node: node.nodeId, reason: extractErrorMessage(err), trigger });
         continue;
       }
 
@@ -209,14 +226,14 @@ export function createTrustSignalSweep(deps: TrustSignalSweepDeps): TrustSignalS
           // would then act on.
           result.unreachable.push(node.nodeId);
           problem(node.nodeId)("trust_signal.sweep.node_unreachable", {
-            agentName, node: node.nodeId, reason: "never_connected", ceilingMs,
+            agentName, node: node.nodeId, reason: "never_connected", ceilingMs, trigger,
           });
         } else {
           // Connected and answering, but never said it was done. We may have collected everything
           // or only part of it and cannot tell — a different answer from a clean sweep, recorded
           // as one.
           result.incomplete.push(node.nodeId);
-          problem(node.nodeId)("trust_signal.sweep.no_terminal_frame", { agentName, node: node.nodeId, ceilingMs });
+          problem(node.nodeId)("trust_signal.sweep.no_terminal_frame", { agentName, node: node.nodeId, ceilingMs, trigger });
         }
       } finally {
         // `stop` awaits any in-flight pickup handler before tearing the stream down (C1 review), so
@@ -231,7 +248,9 @@ export function createTrustSignalSweep(deps: TrustSignalSweepDeps): TrustSignalS
     const changed = lastProblems.get(agentName) !== problems;
     lastProblems.set(agentName, problems);
 
-    const line = { agentName, visited: result.visited.length, unreachable: result.unreachable.length, incomplete: result.incomplete.length };
+    // `trigger` FIRST after the agent, because it is the field that makes this line answer the
+    // question the unit is judged on: did the tick run, or was that a reconnect?
+    const line = { agentName, trigger, visited: result.visited.length, unreachable: result.unreachable.length, incomplete: result.incomplete.length };
     if (changed) logger.info("trust_signal.sweep.finished", line);
     else logger.debug?.("trust_signal.sweep.finished", { ...line, repeat: true });
     return result;

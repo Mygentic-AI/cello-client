@@ -140,7 +140,7 @@ export function createTrustSignalSweepTicker(deps: TrustSignalSweepTickerDeps): 
       // drain already ran is the obvious next optimisation on this exact path, and the moment
       // someone wires it the connect sweep would skip home while every tick visited it, with
       // nothing asserting the divergence.
-      void sweep(agentName, agentKeyProvider, agentPubkeyHex, homeNodeId).catch((err: unknown) => {
+      void sweep(agentName, agentKeyProvider, agentPubkeyHex, homeNodeId, "tick").catch((err: unknown) => {
         logger.warn("trust_signal.sweep.tick_failed", { agentName, reason: extractErrorMessage(err) });
       });
     }, intervalMs);
@@ -153,7 +153,9 @@ export function createTrustSignalSweepTicker(deps: TrustSignalSweepTickerDeps): 
   return {
     sweepAndTick: (agentName, agentKeyProvider, agentPubkeyHex, homeNodeId) => {
       arm(agentName, agentKeyProvider, agentPubkeyHex, homeNodeId);
-      return sweep(agentName, agentKeyProvider, agentPubkeyHex, homeNodeId);
+      // "connect", explicitly. This is the `onConnected` path and its log line has to say so, or the
+      // tick's line cannot be told apart from it — which is exactly why this unit was unverifiable.
+      return sweep(agentName, agentKeyProvider, agentPubkeyHex, homeNodeId, "connect");
     },
     stop: (agentName: string) => {
       const timer = timers.get(agentName);
