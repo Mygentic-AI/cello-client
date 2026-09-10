@@ -328,8 +328,10 @@ export class StandingReceivers {
         let listenTimer: ReturnType<typeof setTimeout> | undefined;
         const listenTimedOut = Symbol("listen_timeout");
         let listenOutcome: "asked" | typeof listenTimedOut = listenTimedOut;
-        listenP = candidate.listenOnCircuit(circuitAddr);
+        // INSIDE the try. A node that cannot take the ask at all throws SYNCHRONOUSLY, and outside
+        // the try that escapes the whole walk instead of failing this one candidate.
         try {
+          listenP = candidate.listenOnCircuit(circuitAddr);
           listenOutcome = await Promise.race([
             listenP.then(() => "asked" as const),
             new Promise<typeof listenTimedOut>((resolve) => {
@@ -960,11 +962,15 @@ export class StandingReceivers {
            * A throw is not fatal — the grant check below is the only thing that decides, and it
            * reads the announced addresses.
            */
-          listenP = candidate.listenOnCircuit(circuitAddr);
-          const asked = await Promise.race([
-            listenP.then(() => true as const),
-            new Promise<false>((res) => setTimeout(() => res(false), REVIVE_RESERVATION_TIMEOUT_MS).unref?.()),
-          ]).catch((err: unknown) => { startError = err; return false as const; });
+          // Wrapped, not bare: a node that cannot take the ask at all throws SYNCHRONOUSLY, and
+          // `.catch()` on the race never sees that — it would escape the revival entirely.
+          const asked = await (async () => {
+            listenP = candidate.listenOnCircuit(circuitAddr);
+            return Promise.race([
+              listenP.then(() => true as const),
+              new Promise<false>((res) => setTimeout(() => res(false), REVIVE_RESERVATION_TIMEOUT_MS).unref?.()),
+            ]);
+          })().catch((err: unknown) => { startError = err; return false as const; });
           if (!asked) {
             this.#ctx.logger.warn("session.revive.reservation.ask_timeout", {
               agentName,
