@@ -41,18 +41,20 @@ export class SessionContentSender {
    * On a dead/missing stream this returns a NAMED, diagnosable failure — never a silent success
    * (which desyncs the two sides). Do not swallow a send error here.
    *
-   * SCOPE / findings #3 + #4 — what this send path does and does NOT do today:
-   *   - #4: it delivers the content over the direct /cello/content/1.0.0 P2P
-   *     stream only. It does NOT also submit a K_local-SIGNED content_hash leaf to
-   *     the RELAY on /cello/relay/1.0.0 (EARS behavior #1). That relay hash-submit
-   *     is MSG-001's scope; AC-001's "relay log shows a hash_submit" evidence is
-   *     produced once MSG-001 lands.
-   *   - #3: because there is no relay yet, the sequence number cello_send returns
-   *     is the LOCAL leaf index, not a relay-assigned canonical global sequence.
-   *     Each daemon appends leaves in its own LOCAL observation order, so two
-   *     daemons' roots agree only under perfectly ping-ponged traffic. Canonical
-   *     cross-process ordering (and thus AC-002 root agreement under concurrent
-   *     bidirectional traffic) requires the relay-assigned sequence from MSG-001.
+   * SCOPE — what this send path does, and the one thing it still does not:
+   *
+   *   - It delivers content over the direct /cello/content/1.0.0 P2P stream AND submits a
+   *     K_local-signed content_hash leaf to the relay (`session.relay.hash.submitted` below).
+   *     Both happen. `witnessed` on the response says whether the relay accepted the leaf.
+   *
+   *   - The `sequence_number` returned is still the LOCAL leaf index, not a relay-assigned global
+   *     one. Each daemon appends in its own observation order, so two roots agree only under
+   *     ping-ponged traffic; concurrent bidirectional sends can still diverge.
+   *
+   * ⚠️ STATED SEPARATELY BECAUSE THEY WENT STALE AT DIFFERENT TIMES. This block once said the relay
+   * hash-submit did not exist and that the sequence was local BECAUSE of that. The first is false
+   * now; the second's CLAIM holds and its REASON did not — correcting both on one verdict would
+   * have deleted a live limitation along with a dead one.
    */
   async sendContent(
     agentName: string,

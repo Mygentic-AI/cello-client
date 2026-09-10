@@ -6,10 +6,11 @@
  * strip (AC-001 / SI-001), confusables normalization (NFKC + script-lookalike map), encoded-
  * payload decode, Shannon-entropy scoring (AC-003), and chat-template/special-token strip (AC-004).
  *
- * The Step-9 injection-pattern match (AC-002) is a SEPARATE concern: it requires a linear-time
- * RE2 engine (no native RegExp — ReDoS). The RE2 binding is a pending decision, so that step is
- * not wired here yet; this module exposes the sanitized text + notes that the pattern matcher and
- * the M9-IN-002 scanner will consume.
+ * The Step-9 injection-pattern match (AC-002) is a SEPARATE concern and lives elsewhere on purpose:
+ * it needs a linear-time RE2 engine (no native RegExp — ReDoS), so it is not done here. It IS wired
+ * — `screen/inbound.ts` calls `scanInjectionPatterns`, and `bin/cello-gateway.ts` calls
+ * `initLinearRegex` at startup. This module's job is to hand that matcher the sanitized text and
+ * notes.
  *
  * THREE texts come out, and which one a caller takes is a security decision. `text` is the delivered
  * form (everything applied). `decodedForScan` is that plus encodings decoded, for detection only.

@@ -798,7 +798,10 @@ export async function verifyUnilateralCertificate(
   const tbs = buildSealTbs(cert.sessionId, cert.sealedRoot, cert.leafCount, cert.closeTimestamp);
 
   if (cert.signatureType !== "frost") {
-    // 'single' (pre-DKG) — verify vs the directory node key from the manifest. Not wired yet.
+    // 'single' is a DOWNGRADE, not an unfinished path. A pre-DKG single-key assignment is refused
+    // by name upstream (`assignment_signature_type_downgraded`, assignment-verify.ts), so a cert
+    // reaching here with one is a shape that should never arrive. Refusing is the correct end state;
+    // there is nothing to wire.
     return { ok: false, reason: "single_key_verification_unsupported" };
   }
 
