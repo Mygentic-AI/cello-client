@@ -691,14 +691,24 @@ export class StandingReceivers {
       reservationsHeld: circuitAddrs,
       correlationId,
     });
+    /**
+     * ⚠️ **`reservation.none` IS NOT EMITTED AT BUILD ANY MORE — 055-ONDEMAND.**
+     *
+     * It means *"this agent is offered relays and holds none, so nobody behind NAT can dial it"* —
+     * a warn that fired 481 times over 17 days and drove a whole retry story. Under on-demand,
+     * holding none at build is the DESIGN: a slot is taken when an offer arrives and given back at
+     * the seal. Leaving the warn here would fire it on every healthy login for every agent, which
+     * is not a smaller version of the old problem but a worse one — an alarm that is wrong every
+     * time trains its reader to ignore the one time it is right.
+     *
+     * The condition it named still has a home. `session.offer.reservation` reports `granted: false`
+     * when an offer could not get a circuit — the moment it actually costs someone something — and
+     * the watchdog's re-take path reports a live session that lost one.
+     */
     if (reservations.addrs.length > 0 && circuitAddrs === 0) {
-      this.#ctx.logger.warn("session.standing_receiver.reservation.none", {
+      this.#ctx.logger.debug("session.standing_receiver.idle_no_reservation", {
         agentName,
-        relaysOffered: reservations.addrs.length,
-        // Zero by this branch's own condition, and stated rather than implied: the event reads
-        // "offered 3, held 0" on its own, without the reader having to find the gate above it.
-        reservationsHeld: circuitAddrs,
-        relayPeerIds: reservations.relayPeerIds,
+        relaysAvailable: reservations.addrs.length,
         correlationId,
       });
     }

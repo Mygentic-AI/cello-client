@@ -204,23 +204,33 @@ describe("R4+R5+R6: SessionNodeManager reservation wiring", () => {
     try {
       await seedRelayEndpoint(manager, "alice", relay.peerId, relay.addr);
       await manager.ensureStandingReceiverForAgent("alice");
+      /**
+       * ⚠️ **THE TITLE'S "AT LOGIN" IS GONE — 055-ONDEMAND — AND THE REST OF IT IS NOT.**
+       *
+       * A persisted relay endpoint no longer BECOMES a reservation when the agent comes up: an idle
+       * agent holds zero, which is the whole capacity change. What survives, and is what this test
+       * was really protecting, is that a persisted endpoint is what the agent reserves ON when it
+       * needs to, and that a healthy relay produces a real circuit address rather than a node that
+       * merely looks started.
+       */
+      expect(
+        manager.getStandingReceiverInfo("alice")?.addrs.some((a) => a.includes("/p2p-circuit")),
+        "an idle agent holds NO circuit — the login walk is gone",
+      ).toBe(false);
+
+      await manager.takeReservationForSession("alice", `${relay.addr}/p2p-circuit`, "test-corr");
+
       const ok = await waitUntil(() => {
         const info = manager.getStandingReceiverInfo("alice");
         return info !== null && info.addrs.some((a) => a.includes("/p2p-circuit"));
       }, 10_000);
-      expect(ok).toBe(true);
-      // 032-RELAYSPREAD part 1 — the reachability event names the two facts separately.
-      // `reservationsRequested` was `reservations.addrs.length`: the size of the CANDIDATE list,
-      // logged under a name that reads as a count of asks. That one field is why "the client
-      // already requests a reservation with every relay it knows" survived an audit.
-      const reach = events.find((e) => e.event === "session.standing_receiver.reachability");
-      expect(reach).toBeDefined();
-      expect(reach!.context).not.toHaveProperty("reservationsRequested");
-      expect(reach!.context.relaysOffered).toBe(1);
-      expect(reach!.context.reservationsHeld).toBe(1);
-      // The reservation settles INSIDE node.start() (the circuit listener awaits
-      // openConnection + reserve), so the healthy path must never fire the
-      // degradation warn — pins the timing against future libp2p upgrades.
+      expect(ok, "and the ask on that endpoint yields a real, announced circuit address").toBe(true);
+      expect(
+        manager.getStandingReceiverRelayIds("alice"),
+        "recorded as ONE relay, deduped — the number the watchdog and cello_status read",
+      ).toEqual([relay.peerId]);
+      // The healthy path must never fire the degradation warn — pins the timing against future
+      // libp2p upgrades.
       expect(events.some((e) => e.event === "session.standing_receiver.reservation.none")).toBe(false);
     } finally {
       await manager.gracefulShutdown();
