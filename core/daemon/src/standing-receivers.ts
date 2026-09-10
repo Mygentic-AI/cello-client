@@ -33,7 +33,6 @@ import { randomBytes, randomUUID } from "node:crypto";
 import {
   relayPeerIdOf,
   heldRelayIdsOf,
-  CIRCUIT_RELAY_ID,
   SR_RESERVATION_MAX_RETRIES,
   REVIVE_RESERVATION_CANDIDATES,
   REVIVE_RESERVATION_TIMEOUT_MS,
@@ -128,420 +127,194 @@ export class StandingReceivers {
     correlationId: string,
   ): Promise<{ node: CelloNode; seed: Uint8Array }> {
     /**
-     * 032-RELAYSPREAD — **ONE SEED FOR THE RECEIVER, REUSED ACROSS RELAYS**, replacing
-     * DOD-M12B-SESSION-SEED-1's seed-per-candidate.
+     * 054-SRSPLIT — **ONE NODE. IT STARTS ON TCP, THEN TAKES ITS RESERVATIONS IN PLACE.**
      *
-     * The agent is ONE identity and must be dialable at ONE peer id through any of its circuits, so
-     * every reservation this walk collects has to belong to the same key. A seed per relay would
-     * give the agent a different peer id down each circuit — N half-agents, none of them the one
-     * the counterparty was told to dial.
+     * This used to be a walk of throwaway PROBE nodes — one built per relay to find out whether that
+     * relay would grant, torn down, and then a FINAL node rebuilt carrying every granted address in
+     * its constructor. The probes existed for exactly one reason: a circuit listener was fixed at
+     * node creation, so the only way to ask a relay anything was to build a node to ask with.
      *
-     * ⚠️ THE RULE THIS REPLACES WAS RIGHT ABOUT ITS OWN CASE, so here is what changed and what did
-     * not. Its hazard is real and survives: a rejected candidate is torn down while its `start()`
-     * may still be in flight, so two nodes can briefly be live on this peer id. Two things bound it
-     * now, and neither existed when that rule was written:
-     *   - **THE ONE THAT CARRIES THE WEIGHT: DOD-M15-ASSIGN-1** made a standing receiver's gater
-     *     admit NOBODY inbound until a session offer names the dialer. The old rule's stated danger
-     *     — "sharing this gater, so it admits dials … an open endpoint under our advertised id" —
-     *     is not true of this gater any more. `#startReceiverNode` has exactly one caller and it
-     *     constructs that gater with `allowedPeerId: null` and an empty reserved set, so an
-     *     overlapping candidate is an endpoint that refuses everyone.
-     *   - the teardown is chained onto the candidate's OWN start promise (the `#buildRevivedNode`
-     *     pattern, verified against libp2p 3.3.2: `stop()` returns immediately unless the status is
-     *     `started`, and through the whole timeout window it is `starting`, so the old unawaited
-     *     `stop()` stopped nothing). ⚠️ This bounds the LEAK, not the OVERLAP — a timed-out
-     *     candidate is not awaited and the walk moves straight to the next one on the same seed, so
-     *     overlap is the normal shape of that case, not a remote possibility. It guarantees the
-     *     loser dies, and nothing more.
-     * `#buildRevivedNode` already runs a fixed identity through this same walk for the same reason.
+     * `listenOnCircuit` (unit 1) removed that constraint, and this is the simplification it unlocks:
+     * build the receiver ONCE, and for each relay prove and ask on the node that will keep it.
+     *
+     * ⚠️ **AND IT CLOSES THE DEFECT UNIT 1 LEFT STANDING, which was recorded here rather than
+     * fixed.** The final node was built with `circuitRelayListenAddrs`, so libp2p asked at start on
+     * a fresh connection that had proved nothing on itself. It worked only because the relay
+     * remembers a proof for `PROVEN_PEER_MEMORY_MS` — two minutes, in the OTHER repo — and when that
+     * memory had expired the original refused-ask collision came back for the one node that IS the
+     * agent's front door. There is no constructor-time ask left, so that dependency is gone, and
+     * `spread.grant_not_bound` — the event that existed to catch the proof expiring between the walk
+     * and the rebuild — has nothing left to report.
+     *
+     * ⚠️ **ONE SEED, and it still matters** (032-RELAYSPREAD). The agent is ONE identity and must be
+     * dialable at ONE peer id through any of its circuits. That is now structural rather than
+     * maintained: there is one node, so there is one key, and a second identity has nowhere to come
+     * from. The old hazard this note used to carry — an abandoned probe still starting on the
+     * receiver's seed — cannot occur, because no probe is built.
      */
     const receiverSeed = randomBytes(32);
-    /** Circuit addresses whose relay ACTUALLY GRANTED this identity a reservation. */
-    const grantedAddrs: string[] = [];
-    // For `spread.grant_not_bound` below: the walk's own duration is measured against the relay's
-    // two-minute proof memory, so it has to be a number rather than an inference.
-    const walkStartedAt = Date.now();
-
-    for (const circuitAddr of candidateCircuitAddrs) {
-      const candidateSeed = receiverSeed;
-
-      /**
-       * DOD-M15-RELAYPROVE-ORDER-1 — **ONE NODE, ONE ASK: prove, then reserve.**
-       *
-       * The relay refuses a reservation from a peer that has not shown it belongs to a registered
-       * agent. This candidate therefore comes up with **no circuit address in its listen set** —
-       * TCP/WS only — so libp2p asks nobody for anything at start. We dial the relay, prove over
-       * `/cello/relay/1.0.0`, and only then ask libp2p's own transport manager to listen on the
-       * circuit. The relay grants on that first ask because it sets `slot.provenForReservation` per
-       * CONNECTION at auth time, and libp2p's reservation store reuses the connection we proved on.
-       *
-       * ⚠️ **THIS REPLACES "ask, be refused, prove, ask again", AND THE CLAIM THAT FORCED IT WAS
-       * FALSE.** The old comment here read: *"It has to be two connections, and that was measured
-       * rather than chosen. Taking the reservation by hand on the same connection as the proof DOES
-       * get a slot — and libp2p then announces no circuit address for it, because it only announces
-       * addresses for reservations its own relay-discovery made."* Its first clause described
-       * taking the slot BY HAND over a raw HOP stream. Asking libp2p's transport manager is a
-       * different act: the reservation is then libp2p's own, and it announces the address. Measured
-       * live 2026-09-08 against the Virginia relay (libp2p 3.3.11, circuit-relay-v2 4.2.13) —
-       * granted on the first ask in 708ms, circuit address announced, no new connection opened.
-       *
-       * What the old shape cost: libp2p's answer to the refused first ask is to restart its
-       * connection manager, closing every connection — including the one the proof was riding — so
-       * the proof had to be retried on a fresh node. Two node builds and four dials per relay,
-       * 5.4–9.3s to a first reservation, against 3.1s dial-to-reachable here.
-       */
-      let candidateGranted = false;
-      // Set when the relay refused the AGENT rather than being unwilling itself: every other relay
-      // in the pool answers identically, so the walk ends here rather than reproducing it N times.
-      let candidateRefusedAgent = false;
-      /**
-       * Whether the proof branch already named this candidate's failure. Without it the generic
-       * rejection below fires a SECOND `relay.rejected` for the same candidate, with a reason
-       * derived from a connection state rather than from the verdict the relay actually gave — the
-       * specific cause overwritten by a generic one, one frame later, which is the exact shape
-       * Invariant 3 forbids.
-       */
-      let rejectionNamed = false;
-      /**
-       * The ask's own promise, when one was made. The abandonment below has to wait on THIS as well
-       * as on `start()`: the reservation is taken here now, so a node torn down while its ask is
-       * still in flight can be granted late and come up on the receiver's advertised peer id with
-       * nothing holding a reference to kill it.
-       */
-      let listenP: Promise<void> | undefined;
-      /** Set when the ask failed for a fault of OURS, so it is not re-described as the relay's. */
-      let askFault: string | undefined;
-      const candidate = await this.createAgentNode(agentName, {
-        sessionId,
-        connectionGater: gater,
-        nodeType: "standing_receiver",
-        // NO `circuitRelayListenAddrs` — that is the whole change. A circuit address here is
-        // libp2p asking the relay before anything has proved, which is the refusal this removes.
-        transportPrivateKey: candidateSeed,
-      });
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const timedOut = Symbol("reservation_timeout");
-      let outcome: "started" | typeof timedOut | "failed" = "failed";
-      let error = "";
-      // KEEP THE START PROMISE. Every candidate now carries the receiver's identity, so an
-      // abandoned one must be reliably torn down rather than best-effort — and only its own start
-      // promise says when it is stoppable (see the seed note above).
-      const startP = candidate.start();
-      try {
-        outcome = await Promise.race([
-          startP.then(() => "started" as const),
-          new Promise<typeof timedOut>((resolve) => {
-            timer = setTimeout(() => resolve(timedOut), this.#ctx.srReservationTimeoutMs);
-          }),
-        ]);
-      } catch (err: unknown) {
-        error = extractErrorMessage(err);
-      } finally {
-        if (timer !== undefined) clearTimeout(timer);
-      }
-
-      /**
-       * The node is up on TCP/WS. Everything below is the relay handshake, in the order that works:
-       * prove, then ask. A failure at any step abandons this candidate and moves to the next relay
-       * — there is no second attempt, because there is no refusal left for one to recover from.
-       */
-      if (outcome === "started") {
-        /**
-         * PROVE. `proveToRelay` dials the relay's base address from THIS node and authenticates
-         * over `/cello/relay/1.0.0`, which is what marks this connection proven at the relay.
-         *
-         * ⚠️ THE NODE STAYS UP. The old shape stopped it here, because the reservation was about to
-         * be asked for by a rebuilt node. Stopping it now would close the very connection the relay
-         * marked proven, and the ask below would be refused — the connection is the thing carrying
-         * the property, not the peer id.
-         */
-        const verdict = await this.#ctx.proveToRelay(agentName, circuitAddr, candidate, correlationId, true);
-
-        /**
-         * ⚠️ **A PROOF THAT NEVER REACHED A VERDICT IS NOT A REFUSAL** — and the ask goes ahead.
-         *
-         * `unavailable` means no relay answer was obtained at all: no relay client is wired, the
-         * dial failed, the stream threw. `proveReservation` already draws exactly this line for its
-         * own retry (*"`true`/`false` are VERDICTS; `transport_failed` means no verdict was reached
-         * and the question is still open"*), and it is the line that matters here for a second
-         * reason: **not every relay gates reservations.** A relay that never asks for a proof
-         * grants on the first ask, and refusing to ask because our own proof machinery was
-         * unavailable would make this client unable to reserve with it at all — a capability lost
-         * to a precaution.
-         *
-         * The cost of asking anyway is one refused ask against a gated relay we could not prove to
-         * — which is what the whole walk used to do on every relay, every time.
-         */
-        if (verdict === "refused_this_agent" || verdict === "refused_try_another_relay") {
-          /**
-           * DOD-M15-RELAYSLOTS-1 clause 9 — **A CLIENT-SIDE REFUSAL ENDS THE WALK.**
-           *
-           * `slot_cap_exceeded` and an expired or missing token are classified `tryAnotherRelay:
-           * false` because they reproduce on every relay in the pool: the cap is per AGENT, and
-           * the token comes from the directory, not from here. Walking on costs a node build and
-           * a dial per remaining relay to arrive at the same answer, and it makes one client-side
-           * fault look like a fleet-wide outage in the logs. The refusal is already recorded where
-           * `cello_status` reads it, so stopping is not silence.
-           *
-           * ⚠️ **THE BOUNDARY THIS BRANCH RESTS ON IS ENFORCED IN `proveToRelay`, NOT HERE.** It
-           * returns `unavailable` whenever no relay verdict was reached — including a proof that
-           * failed for a transport reason, which it used to label `refused_try_another_relay`
-           * (review HIGH-1). Stated as where the property lives rather than asserted as a fact
-           * about this branch: a comment claiming "only a verdict reaches here" is true only for
-           * as long as that producer keeps its side, and the producer is in another file.
-           */
-          const proofReason = verdict === "refused_this_agent" ? "relay_refused_this_agent" : "relay_proof_refused";
-          this.#ctx.srLastRejectionReason.set(agentName, proofReason);
-          this.#ctx.logger.warn("session.standing_receiver.relay.rejected", {
-            agentName,
-            circuitAddr,
-            reason: proofReason,
-            correlationId,
-            impact:
-              proofReason === "relay_refused_this_agent"
-                ? "the relay refused this AGENT rather than this relay being unwilling or " +
-                  "unwell, so every other relay would refuse it identically. Stopped here; " +
-                  "cello_status carries the cause and what to do about it."
-                : "this relay would not take the agent's proof. Moving to the next relay.",
-          });
-          if (verdict === "refused_this_agent") candidateRefusedAgent = true;
-          rejectionNamed = true;
-          try { await candidate.stop(); } catch { /* it may never have finished starting */ }
-        } else {
-        /**
-         * ⚠️ **A PROOF THAT NEVER REACHED A VERDICT IS NOT A REFUSAL** — and the ask goes ahead.
-         *
-         * `unavailable` means no relay answer was obtained at all: no relay client is wired, the
-         * dial failed, the stream threw. `proveReservation` already draws exactly this line for its
-         * own retry (*"`true`/`false` are VERDICTS; `transport_failed` means no verdict was reached
-         * and the question is still open"*), and it matters here for a second reason: **not every
-         * relay gates reservations.** One that never asks for a proof grants on the first ask, and
-         * refusing to ask because our own proof machinery was unavailable would make this client
-         * unable to reserve with it at all — a capability lost to a precaution.
-         *
-         * The cost of asking anyway is one refused ask against a gated relay we could not prove to,
-         * which is what the walk used to spend on every relay, every time.
-         */
-        if (verdict === "unavailable") {
-          this.#ctx.logger.warn("session.standing_receiver.prove.no_verdict", {
-            agentName,
-            circuitAddr,
-            correlationId,
-            impact: "no proof verdict was obtained from this relay — no relay client is wired, or " +
-              "it could not be reached. Asking for the reservation anyway: a relay that does not " +
-              "gate them grants it, and one that does refuses an ask that cost a single dial.",
-          });
-        }
-
-        /**
-         * ASK — ONCE, on the connection we just proved on. Raced against the same budget the whole
-         * candidate used to get, because this is now the only part that talks to the relay.
-         */
-        let listenTimer: ReturnType<typeof setTimeout> | undefined;
-        const listenTimedOut = Symbol("listen_timeout");
-        let listenOutcome: "asked" | typeof listenTimedOut = listenTimedOut;
-        // INSIDE the try. A node that cannot take the ask at all throws SYNCHRONOUSLY, and outside
-        // the try that escapes the whole walk instead of failing this one candidate.
-        try {
-          listenP = candidate.listenOnCircuit(circuitAddr);
-          listenOutcome = await Promise.race([
-            listenP.then(() => "asked" as const),
-            new Promise<typeof listenTimedOut>((resolve) => {
-              listenTimer = setTimeout(() => resolve(listenTimedOut), this.#ctx.srReservationTimeoutMs);
-            }),
-          ]);
-        } catch (err: unknown) {
-          error = extractErrorMessage(err);
-          // Review HIGH-2: a fault of OURS keeps its own name all the way to the operator, instead
-          // of being re-described from the connection state as something the relay did.
-          askFault = clientSideAskFault(err);
-          listenOutcome = listenTimedOut;
-        } finally {
-          if (listenTimer !== undefined) clearTimeout(listenTimer);
-        }
-
-        // The only proof that counts: the relay actually GRANTED the reservation. `listen()`
-        // resolving is not enough — a relay that is out of reservation slots completes the
-        // handshake and simply grants nothing, leaving a node that looks started and is reachable
-        // by nobody.
-        if (listenOutcome === "asked" && holdsCircuit(candidate)) {
-          candidateGranted = true;
-          // The probe has done its job: this relay grants THIS identity. Tear it down and ask the
-          // next relay — the reservation is re-taken by the final node below, which is the only one
-          // that can listen on every granted address at once. AWAITED, because the next probe comes
-          // up on this same peer id.
-          try { await candidate.stop(); } catch { /* it may never have finished starting */ }
-        }
-        }
-      }
-
-      if (!candidateGranted && !rejectionNamed) {
-      const rejectionReason =
-        // A CLIENT-SIDE FAULT KEEPS ITS OWN NAME, and it is checked FIRST because everything below
-        // infers a cause from the relay connection — which is intact and irrelevant when the ask
-        // never left this process (review HIGH-2).
-        askFault !== undefined
-          ? askFault
-          : outcome === "started"
-          ? /**
-             * ⚠️ Review MEDIUM-7 — **"ASKED" DOES NOT MEAN THE RELAY ANSWERED.** A relay that is
-             * simply DOWN yields no circuit address — indistinguishable, here, from a relay that
-             * answered and granted nothing. Reporting that as `relay_granted_no_reservation` sends
-             * the operator to look at relay capacity for what is a network fault. An open
-             * connection to the relay peer is the thing that separates them, and we have one to
-             * ask. (Reachable now only in the narrow case where the proof landed and the
-             * connection died before the ask — the proof branch above owns every other route to a
-             * dead relay, and names it.)
-             */
-            (candidate.getConnections().some((c) => c.peerId === relayPeerIdOf(circuitAddr))
-              ? "relay_granted_no_reservation"
-              : "relay_unreachable")
-          : outcome === "failed"
-            ? "relay_unreachable"
-            : "reservation_did_not_complete_in_time";
-      this.#ctx.srLastRejectionReason.set(agentName, rejectionReason);
-      this.#ctx.logger.warn("session.standing_receiver.relay.rejected", {
-        agentName,
-        circuitAddr,
-        reason: rejectionReason,
-        ...(error !== "" ? { error } : {}),
-        correlationId,
-      });
-      // Abandon it — but on its OWN settlement, never best-effort. `start()` may still be parked on
-      // a dial, and this candidate carries the receiver's identity: an unawaited `stop()` on a node
-      // whose status is still `starting` returns without stopping anything, and the node then goes
-      // live on our peer id with nothing left holding a reference to kill it.
-      //
-      // BOTH promises: the reservation is taken by the ASK now, so a candidate abandoned on the
-      // ask's deadline still has work in flight that `start()` settling says nothing about.
-      stopWhenSettled(candidate, [startP, listenP], this.#ctx.srReservationTimeoutMs * 2);
-      }
-      if (candidateGranted) grantedAddrs.push(circuitAddr);
-      // 032-RELAYSPREAD: DO NOT BREAK ON THE FIRST GRANT. The walk used to stop here, which is why
-      // an agent held exactly one reservation and losing that relay cost it every NAT'd caller for
-      // however long detection happened to take. It now asks every remaining relay.
-      if (candidateRefusedAgent) break;
-    }
 
     /**
-     * THE RECEIVER, listening on EVERY granted circuit address.
-     *
-     * One node per agent, as before — what changed is how many circuits it announces. Each address
-     * here belongs to a relay that granted THIS seed moments ago and therefore still remembers the
-     * identity, so the final node's first ask is the one that succeeds; the two-attempt dance was
-     * already paid per relay in the walk.
-     *
-     * ⚠️ RACED AGAINST A DEADLINE, and that is measured rather than cautious: `#buildRevivedNode`
-     * records a live 2026-08-18 result where a node handed two relay addresses at once with no
-     * deadline never finished starting at all (10,002ms and counting). Its identity was unproven at
-     * both relays, which is not this case — but "not this case" is a prediction, and the standing
-     * receiver is the thing that makes an agent reachable, so it does not wait on one.
-     *
-     * An empty `grantedAddrs` yields the plain TCP floor, exactly as before: reachable by peers
-     * that can dial directly, and loud about it (`session.standing_receiver.reservation.none`).
+     * Relay peers are allowed OUTBOUND before the node starts. Unchanged and load-bearing: our own
+     * gater would otherwise refuse our own dial, and refreshes must keep working after
+     * `setAllowedPeer()` narrows the inbound gate to a session counterparty (DOD-M15-ASSIGN-1).
+     * The gater still admits NOBODY inbound here.
      */
+    for (const addr of candidateCircuitAddrs) {
+      const relayPeerId = relayPeerIdOf(addr);
+      if (relayPeerId) gater.setAllowedOutboundPeer(relayPeerId);
+    }
+
     const node = await this.createAgentNode(agentName, {
       sessionId,
       connectionGater: gater,
       nodeType: "standing_receiver",
-      ...(grantedAddrs.length > 0 ? { circuitRelayListenAddrs: grantedAddrs } : {}),
+      // NO `circuitRelayListenAddrs` — nothing is asked for at start. See the note above.
       transportPrivateKey: receiverSeed,
     });
-    if (grantedAddrs.length === 0) {
-      await node.start();
-      return { node, seed: receiverSeed };
+    await node.start();
+
+    /** Circuit addresses whose relay ACTUALLY GRANTED this identity a reservation. */
+    const grantedAddrs: string[] = [];
+    for (const circuitAddr of candidateCircuitAddrs) {
+      const outcome = await this.#takeReservation(agentName, node, circuitAddr, correlationId);
+      if (outcome === "granted") grantedAddrs.push(circuitAddr);
+      // A refusal about the AGENT reproduces on every relay in the pool — the cap is per agent and
+      // the token comes from the directory — so walking on spends a dial per relay to be told the
+      // same thing, and makes one client-side fault read as a fleet-wide outage.
+      if (outcome === "refused_this_agent") break;
+      // 032-RELAYSPREAD: any other outcome moves to the next relay. DO NOT BREAK ON THE FIRST
+      // GRANT — an agent holding one reservation is one relay's bad day away from unreachable.
     }
+
     /**
-     * ⚠️ SLOW AND FAILED ARE DIFFERENT ANSWERS AND MUST NOT SHARE A BRANCH. Review F1: a single
-     * `.catch(() => false)` around this race collapsed every `start()` REJECTION into the deadline
-     * branch — and `CelloNodeImpl.start()` rejects by design, stopping the node and throwing
-     * `listen_failed` when no direct (non-circuit) listener materialised. That is the guard the
-     * transport keeps precisely so `FaultTolerance.NO_FATAL` cannot mask a real `EADDRINUSE`.
-     *
-     * Swallowed, it installed a STOPPED node as the agent's front door: no addresses to advertise,
-     * `#tryCreateStandingReceiver` never saw a failure so the M8B F14 retry never fired, and the
-     * operator was told the receiver "did not finish binding every circuit inside the deadline" and
-     * "is reachable through those" — sending them to the relay fleet for a port held by an orphan
-     * daemon on their own machine. The rejection is rethrown so it reaches
-     * `session.node.create.failed` with its own cause, exactly as it does on the no-relay path.
+     * DOD-NAT-REACHABILITY-1 observability. Two numbers, two names: `relaysOffered` is how many
+     * relays were candidates, `reservationsHeld` is how many this node actually holds — counted the
+     * only way that proves a grant, which is an ANNOUNCED `/p2p-circuit` address.
      */
-    let deadline: ReturnType<typeof setTimeout> | undefined;
-    let startError: unknown;
-    const started = node.start().then(
-      () => "ok" as const,
-      (err: unknown) => { startError = err; return "failed" as const; },
-    );
-    const outcome = await Promise.race([
-      started,
-      new Promise<"slow">((resolve) => {
-        // Per granted relay: each circuit listener is its own dial and its own reservation, so a
-        // pool of three must not be judged on a budget sized for one.
-        deadline = setTimeout(() => resolve("slow"), this.#ctx.srReservationTimeoutMs * grantedAddrs.length);
-      }),
-    ]);
-    if (deadline !== undefined) clearTimeout(deadline);
-    if (outcome === "failed") throw startError;
-    /**
-     * GRANTED IN THE WALK, REFUSED AT INSTALL — a distinct fact and, until this line, an invisible
-     * one. The receiver would simply report `reservationsHeld: 2` where 3 relays granted, with
-     * nothing naming which relay went missing or why.
-     *
-     * ⚠️ IT HAS A KNOWN CAUSE AND A CROSS-REPO CLOCK. The walk stops the granted candidate and the
-     * node below RE-ASKS, which works because the relay remembers the proof — for
-     * `PROVEN_PEER_MEMORY_MS = 2 minutes` (`relay-connection-gater.ts`, trustless-cello).
-     *
-     * ⚠️ **AND THIS IS WHERE THE ORIGINAL COLLISION STILL LIVES** (review MEDIUM-3). The node built
-     * below carries `circuitRelayListenAddrs`, so libp2p asks at start, on a FRESH connection that
-     * has proved nothing on itself. `DOD-M15-RELAYPROVE-ORDER-1` removed the refused first ask from
-     * the WALK; the installed receiver still depends on the relay's two-minute peer memory, and when
-     * that memory has expired the whole original loop returns for it — refused ask, connection
-     * manager restart, connections closed. **It is mitigated by a cross-repo TTL, not removed.** The
-     * probe/final split is what forces it, and that split is what unit 2 of
-     * `M15-STORY-RESERVATIONS-ON-DEMAND` (splitting the standing receiver) deletes; the fix belongs
-     * there rather than in a second pass here.
-     *
-     * ⚠️ **THE BUDGET ARITHMETIC BELOW IS NOT WHAT IT WAS.** It used to read *"`#srReservationTimeoutMs`
-     * × 2 attempts per relay"* — there is one attempt now, but the wall clock did NOT halve: a
-     * candidate costs `start` + `proveToRelay` + `ask`, and **`proveToRelay` carries no deadline of
-     * its own at either call site**. So a pool of three can still exceed the two-minute memory, and
-     * the ceiling is now harder to state than it was, not easier. That missing deadline is recorded
-     * in `053-FIRSTASK`'s *Newly discovered*.
-     */
-    const boundRelays = new Set(heldRelayIdsOf(node));
-    const grantedButUnbound = grantedAddrs
-      .map((a) => CIRCUIT_RELAY_ID.exec(a)?.[1])
-      .filter((id): id is string => id !== undefined && !boundRelays.has(id));
-    if (grantedButUnbound.length > 0) {
-      this.#ctx.logger.warn("session.standing_receiver.spread.grant_not_bound", {
+    const circuitAddrs = node.listenAddresses().filter((a) => a.split("/").includes("p2p-circuit")).length;
+    this.#ctx.logger.info("session.standing_receiver.reachability", {
+      agentName,
+      relaysOffered: candidateCircuitAddrs.length,
+      reservationsHeld: circuitAddrs,
+      correlationId,
+    });
+    if (candidateCircuitAddrs.length > 0 && circuitAddrs === 0) {
+      this.#ctx.logger.warn("session.standing_receiver.reservation.none", {
         agentName,
-        relayPeerIds: grantedButUnbound,
-        relaysGranted: grantedAddrs.length,
-        reservationsHeld: boundRelays.size,
-        walkMs: Date.now() - walkStartedAt,
+        relaysOffered: candidateCircuitAddrs.length,
+        reservationsHeld: circuitAddrs,
+        relayPeerIds: candidateCircuitAddrs.map((a) => relayPeerIdOf(a)).filter((id): id is string => id !== null),
         correlationId,
-        impact: "these relays granted this agent a reservation during the walk and then bound no " +
-          "circuit on the receiver itself, so the agent is reachable through fewer relays than it " +
-          "earned. The relay remembers a proof for two minutes; if walkMs is near or past that, " +
-          "the proof expired before the receiver asked and the walk is what needs shortening — " +
-          "not the relay fleet.",
-      });
-    }
-    if (outcome === "slow") {
-      // NOT a teardown, and now this line means only what it says: the node is starting and has not
-      // finished. It is installed with whatever circuits did materialise, because some reachability
-      // beats none and the reservation watchdog is what settles the rest.
-      this.#ctx.logger.warn("session.standing_receiver.spread.slow_start", {
-        agentName,
-        relaysGranted: grantedAddrs.length,
-        circuitAddrs: node.listenAddresses().filter((a) => a.includes("/p2p-circuit")).length,
-        budgetMs: this.#ctx.srReservationTimeoutMs * grantedAddrs.length,
-        correlationId,
-        impact: "the receiver did not finish binding every circuit it was granted inside the " +
-          "deadline, so it is being installed with the circuits it has. It is reachable through " +
-          "those; the reservation watchdog re-checks the rest on its next tick.",
+        impact: "this agent holds no relay reservation, so a counterparty behind NAT cannot dial " +
+          "it. Messages still arrive through the relay's store-and-forward; a direct session " +
+          "cannot be opened to it.",
       });
     }
     return { node, seed: receiverSeed };
+  }
+
+  /**
+   * 054-SRSPLIT — **TAKE ONE RESERVATION, ON A NODE THAT IS ALREADY RUNNING.**
+   *
+   * The whole relay handshake for one relay: prove over `/cello/relay/1.0.0` on a connection we
+   * open, then ask libp2p's own transport manager to listen on the circuit. The relay grants on the
+   * first ask because it marks `slot.provenForReservation` per CONNECTION at auth time and libp2p's
+   * reservation store reuses the open connection rather than dialling a new one (measured live
+   * 2026-09-08; `DOD-M15-RELAYPROVE-ORDER-1`).
+   *
+   * ⚠️ **THE NODE IS NOT STOPPED BETWEEN THE PROOF AND THE ASK.** The relay marks the CONNECTION,
+   * not the peer id, so closing it throws away the very thing that makes the ask succeed.
+   */
+  async #takeReservation(
+    agentName: string,
+    node: CelloNode,
+    circuitAddr: string,
+    correlationId: string,
+  ): Promise<"granted" | "refused_this_agent" | "declined"> {
+    const verdict = await this.#ctx.proveToRelay(agentName, circuitAddr, node, correlationId, true);
+    if (verdict === "refused_this_agent" || verdict === "refused_try_another_relay") {
+      const reason = verdict === "refused_this_agent" ? "relay_refused_this_agent" : "relay_proof_refused";
+      this.#ctx.srLastRejectionReason.set(agentName, reason);
+      this.#ctx.logger.warn("session.standing_receiver.relay.rejected", {
+        agentName,
+        circuitAddr,
+        reason,
+        correlationId,
+        impact: verdict === "refused_this_agent"
+          ? "the relay refused this AGENT rather than being unwilling or unwell, so every other " +
+            "relay would refuse it identically. Stopped here; cello_status carries the cause."
+          : "this relay would not take the agent's proof. Moving to the next relay.",
+      });
+      return verdict === "refused_this_agent" ? "refused_this_agent" : "declined";
+    }
+    /**
+     * ⚠️ **A PROOF THAT REACHED NO VERDICT IS NOT A REFUSAL** — `unavailable` means the relay never
+     * answered (no client wired, or unreachable), and NOT every relay gates reservations. Refusing
+     * to ask because our own proof path was unavailable would lose the ability to reserve with an
+     * ungated relay entirely. The boundary is enforced in `proveToRelay`, which returns
+     * `unavailable` for exactly this (review HIGH-1 on unit 1).
+     */
+    if (verdict === "unavailable") {
+      this.#ctx.logger.warn("session.standing_receiver.prove.no_verdict", {
+        agentName,
+        circuitAddr,
+        correlationId,
+        impact: "no proof verdict was obtained from this relay. Asking for the reservation anyway: " +
+          "a relay that does not gate them grants it, and one that does refuses an ask that cost a " +
+          "single dial.",
+      });
+    }
+
+    let askFault: string | undefined;
+    let error = "";
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = Symbol("listen_timeout");
+    let outcome: "asked" | typeof timedOut = timedOut;
+    try {
+      outcome = await Promise.race([
+        node.listenOnCircuit(circuitAddr).then(() => "asked" as const),
+        new Promise<typeof timedOut>((resolve) => {
+          timer = setTimeout(() => resolve(timedOut), this.#ctx.srReservationTimeoutMs);
+        }),
+      ]);
+    } catch (err: unknown) {
+      error = extractErrorMessage(err);
+      // A fault of OURS keeps its own name rather than being re-derived from the relay connection,
+      // which is intact and irrelevant when the ask never left this process (review HIGH-2).
+      askFault = clientSideAskFault(err);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+
+    // The only proof that counts: an ANNOUNCED circuit address on this relay. `listen()` resolving
+    // is not enough — a relay at its slot cap completes the handshake and grants nothing.
+    const relayPeerId = relayPeerIdOf(circuitAddr);
+    if (outcome === "asked" && node.listenAddresses().some(
+      (a) => a.split("/").includes("p2p-circuit") && (relayPeerId === null || a.includes(`/p2p/${relayPeerId}/`)),
+    )) {
+      return "granted";
+    }
+
+    const reason = askFault !== undefined
+      ? askFault
+      : outcome === "asked"
+        // ⚠️ "ASKED" DOES NOT MEAN THE RELAY ANSWERED. A relay that is down yields no circuit
+        // address, indistinguishable here from one that answered and granted nothing. An open
+        // connection to it is what separates them, and we have one to ask.
+        ? (node.getConnections().some((c) => c.peerId === relayPeerId)
+          ? "relay_granted_no_reservation"
+          : "relay_unreachable")
+        : "reservation_did_not_complete_in_time";
+    this.#ctx.srLastRejectionReason.set(agentName, reason);
+    this.#ctx.logger.warn("session.standing_receiver.relay.rejected", {
+      agentName,
+      circuitAddr,
+      reason,
+      ...(error !== "" ? { error } : {}),
+      correlationId,
+    });
+    return "declined";
   }
   /** One standing-receiver create attempt (extracted for the M8B F14 retry loop). */
   async #tryCreateStandingReceiver(

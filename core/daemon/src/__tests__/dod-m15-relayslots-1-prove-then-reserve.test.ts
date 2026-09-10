@@ -193,16 +193,27 @@ function relayClientStub(relay: ScriptedRelay, relayPeerId: string): AgentRelayC
   let lastRefusal: RelayAuthRefusal | null = null;
   return {
     async proveReservation(node: CelloNode): Promise<boolean> {
+      /**
+       * ⚠️ THE DISCRIMINATOR CHANGED WITH 054-SRSPLIT, and the old one silently stopped working.
+       *
+       * It was *"did this node hold ANY circuit address?"* — true only of a delivery proof, back
+       * when each relay got its own throwaway probe node. There is ONE node now, so after the first
+       * relay grants it holds a circuit and every later GATE proof looked like a delivery proof and
+       * was filtered out. The count then read 1 on a two-relay pool.
+       *
+       * The question that survives the change is per RELAY: had THIS relay already granted us a
+       * circuit when we proved to it?
+       */
       relay.timeline.push({
         kind: "prove",
         node,
         relayPeerId,
-        hadCircuit: node.listenAddresses().some((a) => a.includes("/p2p-circuit")),
+        hadCircuit: node.listenAddresses().some((a) => a.includes(`/p2p/${relayPeerId}/p2p-circuit`)),
       });
       relay.proofAttempts.push({
         relayPeerId,
         peerId: node.getPeerId(),
-        hadCircuit: node.listenAddresses().some((a) => a.includes("/p2p-circuit")),
+        hadCircuit: node.listenAddresses().some((a) => a.includes(`/p2p/${relayPeerId}/p2p-circuit`)),
         nodeType: (node as unknown as GatedNode).nodeType,
       });
       /**
@@ -293,15 +304,27 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
      * Restore `circuitRelayListenAddrs: [circuitAddr]` on the probe and this fails immediately,
      * which is the revert test for the whole change.
      */
-    const walkAsks = factory.asks.filter((a) => a.circuits.length > 0 && a.nodeType === "standing_receiver");
+    /**
+     * ⚠️ THIS COUNT WENT FROM ONE TO ZERO WITH 054-SRSPLIT, and the direction is the point.
+     *
+     * Unit 1 removed the constructor-time ask from the PROBES and left it on the installed
+     * receiver, which then depended on the relay remembering a proof for two minutes. There are no
+     * probes now and no rebuild: one node starts on TCP and takes each reservation in place, so
+     * **nothing is ever built carrying a circuit address**. Restore either the probes or the
+     * rebuild and this fails.
+     */
     expect(
-      walkAsks.length,
-      "exactly ONE node is built with circuit addresses — the installed receiver. Every probe " +
-        "before it asks the relay only after its proof has landed.",
+      factory.asks.filter((a) => a.circuits.length > 0).length,
+      "no node is built asking for a reservation — the ask happens on a node that is already " +
+        "running and has already proved itself",
+    ).toBe(0);
+    expect(
+      factory.built.filter((n) => n.nodeType === "standing_receiver").length,
+      "and ONE node serves the whole walk, where the old shape built one per relay plus a final",
     ).toBe(1);
     expect(
-      walkAsks[0]?.circuits,
-      "and that one listens on EVERY granted circuit, not on the first relay that answered",
+      mgr.getStandingReceiverNode("alice")?.listenAddresses().filter((a) => a.includes("/p2p-circuit")).sort(),
+      "that one node ends up listening on EVERY granted circuit",
     ).toEqual([CIRCUIT_A, CIRCUIT_B]);
 
     // The walk still visits both relays (032-RELAYSPREAD) and still does it on ONE identity.
@@ -351,7 +374,15 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
 
     for (const proof of proofs) {
       const provedAt = relay.timeline.indexOf(proof);
-      const askedAt = relay.firstIndex("listen", proof.node);
+      /**
+       * ⚠️ MATCHED PER RELAY, NOT PER NODE — 054-SRSPLIT. There is ONE node now, so "the first
+       * listen by this node" is relay A's ask even when we are checking relay B, and the ordering
+       * assertion silently compared the wrong pair. The node identity is still asserted (the ask
+       * must be BY the proving node), it is just no longer sufficient on its own to say WHICH ask.
+       */
+      const askedAt = relay.timeline.findIndex(
+        (e) => e.kind === "listen" && e.node === proof.node && e.relayPeerId === proof.relayPeerId,
+      );
       const stoppedAt = relay.firstIndex("stop", proof.node);
 
       expect(
@@ -556,8 +587,12 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
         "is retried forever for the life of the process.",
     ).toBe(true);
     expect(mgr.getStandingReceiverNode("alice")?.listenAddresses().some((a) => a.includes("/p2p-circuit"))).toBe(true);
-    expect(factory.asks.filter((a) => a.circuits[0] === CIRCUIT_B && a.nodeType === "standing_receiver").length)
-      .toBeGreaterThan(0);
+    // 054-SRSPLIT: the walk reaching relay B is visible as the ASK to B, not as a node built for it.
+    expect(
+      relay.timeline.filter((e) => e.kind === "listen" && e.relayPeerId === RELAY_B).length,
+      "the walk moved on and actually asked B — 'it proved to B' without 'it asked B' is a proof " +
+        "spent for nothing",
+    ).toBe(1);
   }, 30_000);
 
   it("★★★ a REVIVED session proves itself too, or it comes back dialable by nobody", async () => {
