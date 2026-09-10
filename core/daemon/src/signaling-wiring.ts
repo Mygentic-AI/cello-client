@@ -264,7 +264,7 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
       getStandingReceiverEndpoint: () => sessionNodeManager.getStandingReceiverInfo(agentName),
       admitOfferedDialer: (peerId, sessionIdHex) => sessionNodeManager.admitOfferedDialer(agentName, peerId, sessionIdHex),
       // RELAYONLY-1: tells "relay-only emptied the addresses" from "none yet" — opposite answers.
-      reserveOnDemand: (c, sid) => sessionNodeManager.takeReservationForSession(agentName, c, sid), // 055-ONDEMAND
+      reserveOnDemand: (c, sid) => sessionNodeManager.takeReservationForSession(agentName, c, sid, sid), // 055-ONDEMAND
       isRelayOnly: () => relayOnlyState((key) => sessionNodeManager.getSetting(agentName, key), sessionNodeManager.hasDatabase()) !== "off",
       signaling: mgr,
       logger,
@@ -378,7 +378,7 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
       agentName: agent.name,
       getStandingReceiverEndpoint: () => sessionNodeManager.getStandingReceiverInfo(agent.name),
       admitOfferedDialer: (peerId, sessionIdHex) => sessionNodeManager.admitOfferedDialer(agent.name, peerId, sessionIdHex),
-      reserveOnDemand: (c, sid) => sessionNodeManager.takeReservationForSession(agent.name, c, sid), // 055-ONDEMAND: both sites
+      reserveOnDemand: (c, sid) => sessionNodeManager.takeReservationForSession(agent.name, c, sid, sid), // 055-ONDEMAND: both sites
       isRelayOnly: () => relayOnlyState((key) => sessionNodeManager.getSetting(agent.name, key), sessionNodeManager.hasDatabase()) !== "off",
       signaling: mgr,
       logger,

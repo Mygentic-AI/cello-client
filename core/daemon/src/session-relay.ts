@@ -54,8 +54,12 @@ export interface SessionRelayContext {
 
   readonly records: SessionRecords;
   readonly queries: SessionQueries;
-  /** 055-ONDEMAND: ask a relay for a circuit this agent's live session still needs. */
-  retakeReservation(agentName: string, circuitAddr: string, correlationId: string): Promise<boolean>;
+  /**
+   * 055-ONDEMAND: ask a relay for a circuit a live SESSION still needs, on that session's OWN node.
+   * The node is a parameter because the session's node is not the agent's standing receiver — the
+   * receiver was promoted into the session and replaced.
+   */
+  retakeReservationOn(agentName: string, node: CelloNode, circuitAddr: string, correlationId: string): Promise<boolean>;
   readonly park: ParkRecovery;
   readonly refusals: InboundRefusals;
   readonly leafRecords: SessionLeafRecords;
@@ -1220,13 +1224,24 @@ export class SessionRelay {
          * asks where the budget allows 37.
          */
         if (!this.#retryDue(agentName)) continue;
+        /**
+         * ⚠️ **ON THE SESSION'S OWN NODE, NOT THE IDLE RECEIVER — and the first version got this
+         * wrong in a way that was worse than doing nothing.**
+         *
+         * It called the take path, which reserves on `standingReceivers.get(agentName).node`. That
+         * is the fresh receiver built after the promotion — a DIFFERENT peer id from the one the
+         * counterparty was told to dial. So the circuit it obtained helped no one, and it made an
+         * IDLE receiver hold a relay slot, which is the exact thing this unit exists to stop. It
+         * also set `relayPeerIds` non-empty, hiding the real loss from every later tick.
+         */
         let retook = false;
         for (const entry of liveSessions) {
           const ep = this.#ctx.queries.getPersistedRelayEndpoint(agentName, entry.sessionId);
           if (!ep || ep.relayAddrs.length === 0) continue;
           const base = ep.relayAddrs[0]!;
           const circuitAddr = base.includes(`/p2p/${ep.relayPeerId}`) ? `${base}/p2p-circuit` : `${base}/p2p/${ep.relayPeerId}/p2p-circuit`;
-          if (await this.#ctx.retakeReservation(agentName, circuitAddr, entry.correlationId)) retook = true;
+          if (entry.node.listenAddresses().some((a) => a.split("/").includes("p2p-circuit"))) continue; // still holds one
+          if (await this.#ctx.retakeReservationOn(agentName, entry.node, circuitAddr, entry.correlationId)) retook = true;
         }
         if (retook) continue;
         // …unless one has arrived since. Review F4, same class as the recompute below: the
@@ -1500,8 +1515,22 @@ export class SessionRelay {
    * the seal that triggered it.
    */
   async tellRelayReleased(agentName: string, relayPeerId: string, node: CelloNode, correlationId: string): Promise<void> {
+    /**
+     * ⚠️ **THE NODE IS THE SOURCE OF TRUTH FOR WHERE THIS RELAY IS — review MEDIUM-6.**
+     *
+     * The first version looked the relay up in `directoryRelayEndpoints`. But the reservation was
+     * taken on the relay the OFFER named, whose addresses came off that frame; if the directory's
+     * last announcement does not contain it — a pool relay dropped from the roster, a stale
+     * announcement — the release warns `no_endpoint` and the slot is held to its TTL. The node
+     * announces the circuit it actually holds, so derive the address from that and fall back to the
+     * directory list only when there is nothing to derive from.
+     */
+    const fromNode = node.listenAddresses()
+      .filter((a) => a.split("/").includes("p2p-circuit") && a.includes(`/p2p/${relayPeerId}/`))
+      .map((a) => a.split("/p2p-circuit")[0]!)
+      .filter((a) => a.length > 0);
     const ep = this.#ctx.directoryRelayEndpoints.get(agentName)?.find((e) => e.relayPeerId === relayPeerId);
-    const relayAddrs = ep ? [...ep.relayAddrs] : [];
+    const relayAddrs = fromNode.length > 0 ? [...new Set(fromNode)] : (ep ? [...ep.relayAddrs] : []);
     if (relayAddrs.length === 0) {
       this.#ctx.logger.warn("session.relay.reservation_release.no_endpoint", {
         agentName, relayPeerId, correlationId,
