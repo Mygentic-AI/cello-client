@@ -716,6 +716,10 @@ describe("W: a standing receiver that LOSES its reservation gets another one", (
   /**
    * ⚠️ **W1, W1b AND W1c ARE REPLACED — 055-ONDEMAND DELETED THEIR SUBJECT, WHICH WAS THE SPREAD.**
    *
+   * ⚠️ **FIVE went, not three — review MEDIUM-7.** W2 and W3 also went; W3 is restored above,
+   * because its subject (`agentsWantingReceiver`) is still live and was left uncovered. W2 is
+   * subsumed by the idle test below.
+   *
    * All three were about a receiver MAINTAINING a set of login-time reservations: two relays grant
    * and one dies (do not rebuild), the last one dies (do rebuild), and an idle agent holding fewer
    * than it was offered takes the rest ("no ratchet"). Every one of those describes an agent that
@@ -730,6 +734,47 @@ describe("W: a standing receiver that LOSES its reservation gets another one", (
    * A live session that LOSES its circuit still gets it back; that path has its own coverage in
    * `msg-018-reservation-retry.test.ts`, where the budget and backoff are asserted with it.
    */
+  it("★★★ W3: the watchdog never resurrects a receiver for an agent that went offline", async () => {
+    /**
+     * ⚠️ **RESTORED — review MEDIUM-7.** Five tests were deleted from this block and the replacement
+     * comment accounted for three. W2 is fairly subsumed by the idle test below; **W3 is not.** It
+     * guards `if (!this.#ctx.agentsWantingReceiver.has(agentName)) continue;`, which is still there
+     * and now had no coverage.
+     *
+     * The property is untouched by 055-ONDEMAND and matters as much as ever: an agent the operator
+     * took offline must STAY offline. Resurrecting a receiver for it would put an agent back on the
+     * network after they asked for it to go dark — the one direction a kill switch must never fail.
+     */
+    const relay = await startHopRelay();
+    const { manager } = makeManager("w3.db");
+    await manager.initialize();
+    try {
+      await seedAgents(manager.getDb(), ["alice"]);
+      manager.setDirectoryRelayEndpoints("alice", [{ relayPeerId: relay.peerId, relayAddrs: [relay.addr] }]);
+      await manager.ensureStandingReceiverForAgent("alice");
+      // 055-ONDEMAND: an idle agent holds nothing, so take one — the state this test is about is an
+      // agent that was REACHABLE and then went dark, not one that never was.
+      await manager.takeReservationForSession("alice", `${relay.addr}/p2p-circuit`, "test-corr");
+      await waitUntil(() => {
+        const i = manager.getStandingReceiverInfo("alice");
+        return i !== null && i.addrs.some((a) => a.includes("/p2p-circuit"));
+      }, 10_000);
+
+      await manager.removeStandingReceiverForAgent("alice"); // agent goes dark
+      await relay.node.stop();                                // and the relay dies
+
+      await wait(1_500); // several ticks
+      expect(
+        manager.getStandingReceiverInfo("alice"),
+        "an agent the operator took offline must stay offline — a resurrected receiver puts them " +
+          "back on the network after they asked to go dark",
+      ).toBeNull();
+    } finally {
+      await manager.gracefulShutdown();
+      try { await relay.node.stop(); } catch { /* already stopped */ }
+    }
+  }, 30_000);
+
   it("★★★ the watchdog leaves an IDLE agent alone — no asks for slots it must not hold", async () => {
     const relay = await startHopRelay();
     const { manager, events } = makeManager("sessions-idle-untouched.db", { respreadEveryMs: 100 });
