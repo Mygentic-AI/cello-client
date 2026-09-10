@@ -24,7 +24,7 @@ import { CONTENT_ENCRYPTION_GUIDANCE, SESSION_CONTENT_ENCRYPTION_V1 } from "./co
 import { REFUSAL_KINDS, noteLocalCredentialRefusal, relayAckHashRefusalNotice } from "./refusal-reasons.js";
 import { parkRefusalGuidance } from "./park-envelope.js";
 import { terminalRelayRefusal } from "./session-terminal-refusal.js";
-import { AgentRelayClient, classifyRelayAuthRefusal, isTerminalRelayRefusal, RELAY_AUTH_REFUSAL_IS_LOCAL } from "./session-relay-client.js";
+import { AgentRelayClient, classifyRelayAuthRefusal, isTerminalRelayRefusal, isLocalCredentialRefusal } from "./session-relay-client.js";
 import { REDIAL_COOLDOWN_MS, type ActiveSessionEntry, type SentAuthorship } from "./session-node-types.js";
 import type { SessionContentPipelineContext } from "./session-content-context.js";
 import { extractErrorMessage } from "./error-message.js";
@@ -443,7 +443,7 @@ export class SessionContentSender {
             });
           }
           // DOD-M15-TOKENSTALE-1 — about the AGENT, not this message: see `noteLocalCredentialRefusal`.
-          if (RELAY_AUTH_REFUSAL_IS_LOCAL(witnessed.reason)) noteLocalCredentialRefusal(this.#ctx, agentName, sessionId, correlationId, witnessed.reason, classifyRelayAuthRefusal(witnessed.reason).advice);
+          if (isLocalCredentialRefusal(witnessed.reason)) noteLocalCredentialRefusal(this.#ctx, agentName, sessionId, correlationId, witnessed.reason, classifyRelayAuthRefusal(witnessed.reason).advice);
           relayRefusal = witnessed.reason;
         }
       } catch (relayErr: unknown) {

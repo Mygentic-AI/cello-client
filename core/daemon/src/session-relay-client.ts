@@ -156,7 +156,7 @@ const LOCAL_CREDENTIAL_REFUSALS: ReadonlySet<string> = new Set([
   "online_token_pubkey_mismatch",
 ]);
 
-export function RELAY_AUTH_REFUSAL_IS_LOCAL(reason: string): boolean {
+export function isLocalCredentialRefusal(reason: string): boolean {
   return LOCAL_CREDENTIAL_REFUSALS.has(reason);
 }
 
@@ -606,6 +606,12 @@ export class AgentRelayClient {
    * whether a different relay would do any better.
    */
   #lastAuthRefusal: RelayAuthRefusal | null = null;
+  /**
+   * review F6 — which credential refusal we have already explained in full, so a condition that
+   * lasts until a relogin is explained once rather than on every send. Reset with the refusal
+   * itself, so the next occurrence after a recovery is a first occurrence again.
+   */
+  #loggedCredentialRefusal: string | null = null;
 
   /** The last classified auth refusal from this relay, or null if the last attempt succeeded. */
   getLastAuthRefusal(): RelayAuthRefusal | null {
@@ -621,6 +627,7 @@ export class AgentRelayClient {
    * keeps the declared type and says what the reset is for.
    */
   #clearAuthRefusal(): void {
+    this.#loggedCredentialRefusal = null;
     this.#lastAuthRefusal = null;
   }
 
@@ -1756,6 +1763,22 @@ export class AgentRelayClient {
   }
 
   async #connect(node: CelloNode): Promise<boolean> {
+    /**
+     * ⚠️ DROP THE PREVIOUS ATTEMPT'S VERDICT FIRST — `DOD-M15-TOKENSTALE-1` review F4, and the same
+     * reasoning `#proveReservationOnce` already carries in capitals twelve lines from here.
+     *
+     * `#lastAuthRefusal` is cleared only on auth SUCCESS. Both failure exits below — the dial and
+     * the stream open — are transport failures that never reach a verdict at all, so without this
+     * they return `false` carrying whatever an earlier attempt left behind.
+     *
+     * That was survivable while the submit boundary answered `relay_unavailable` for every `false`.
+     * It is not now: this unit makes that boundary REPORT the stored refusal, so a stale
+     * `online_token_expired` would relabel a relay that is genuinely down as our own dead
+     * credential — sending the operator to restart their daemon over somebody else's outage, and
+     * stripping the seal fallbacks that exist for exactly that outage. Clearing here is what makes
+     * the promotion mean "this attempt's verdict" instead of "some past verdict".
+     */
+    this.#clearAuthRefusal();
     // Best-effort dial: newStream auto-dials a known peer, but the relay's addrs may not
     // be in the peerstore yet, so dial each addr first. One success is enough.
     let dialed = false;
@@ -2359,16 +2382,33 @@ export class AgentRelayClient {
        * degradation for a real outage is untouched.
        */
       const refusal = this.#lastAuthRefusal;
-      if (refusal && RELAY_AUTH_REFUSAL_IS_LOCAL(refusal.reason)) {
-        this.#logger.error("session.relay.submit.local_credential_refusal", {
-          relayPeerId: this.#relayPeerId,
-          reason: refusal.reason,
-          impact:
-            "the relay refused THIS AGENT'S credential, so nothing it sends can be witnessed and no " +
-            "conversation can produce a receipt. This is a fault on this machine and it does not " +
-            "clear on its own — it is NOT the relay being unreachable.",
-          guidance: refusal.advice,
-        });
+      if (refusal && isLocalCredentialRefusal(refusal.reason)) {
+        /**
+         * ⚠️ THE PROSE ONCE PER TRANSITION, THE REASON EVERY TIME — review F6.
+         *
+         * This condition lasts until a relogin by construction, and every send retries it. Logging
+         * several hundred bytes of explanation on each one is the shape `96f3179b` measured four
+         * commits earlier: a 176 MB log that was 95% one already-fixed defect repeating itself,
+         * which hid the defect that produced it for eleven hours. The first occurrence carries
+         * everything; the rest are countable without being unreadable.
+         */
+        const firstOfThisRun = this.#loggedCredentialRefusal !== refusal.reason;
+        this.#loggedCredentialRefusal = refusal.reason;
+        if (firstOfThisRun) {
+          this.#logger.error("session.relay.submit.local_credential_refusal", {
+            relayPeerId: this.#relayPeerId,
+            reason: refusal.reason,
+            impact:
+              "the relay refused THIS AGENT'S credential, so nothing it sends can be witnessed and no " +
+              "conversation can produce a receipt. This is a fault on this machine and it does not " +
+              "clear on its own — it is NOT the relay being unreachable.",
+            guidance: refusal.advice,
+          });
+        } else {
+          this.#logger.warn("session.relay.submit.local_credential_refusal.again", {
+            relayPeerId: this.#relayPeerId, reason: refusal.reason,
+          });
+        }
         return { ok: false, reason: refusal.reason };
       }
       return { ok: false, reason: "relay_unavailable" };

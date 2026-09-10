@@ -32,6 +32,7 @@
  * that is the entire difference from a closure over 73 shared locals.
  */
 import { randomUUID } from "node:crypto";
+import { isLocalCredentialRefusal } from "./session-relay-client.js";
 
 /**
  * DOD-M12B-ABANDON-NOTIFY-1 — how long the courtesy notice may delay a force-abandon.
@@ -1047,6 +1048,16 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
             "relay_unavailable",
             "relay_session_gone",
             "session_not_found",
+            /**
+             * `DOD-M15-TOKENSTALE-1` review F1 — these arrive here ONLY since that unit split the
+             * submit boundary's answer. They used to reach this line as `relay_unavailable` and were
+             * covered by the entry above; naming them keeps this set answering the question it says
+             * it answers ("could the seal already be durable?") rather than the narrower one the
+             * old label happened to encode.
+             */
+            "online_token_expired",
+            "online_token_required",
+            "online_token_pubkey_mismatch",
           ]);
           const localCert =
             SEAL_MAY_ALREADY_BE_DURABLE.has(submit.reason)
@@ -1060,9 +1071,21 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
             return { ok: true, sealed_root: localCert.sealed_root, legibility: localCert.legibility };
           }
 
-          if (submit.reason === "relay_unavailable") {
-            // No relay witness for this session (direct/interrupted) — fall back to the
-            // directory-mediated bilateral-ack seal.
+          /**
+           * ⚠️ THE QUESTION IS "COULD WE NOT USE THE RELAY?", NOT "IS THE RELAY DOWN?" —
+           * `DOD-M15-TOKENSTALE-1` review F1.
+           *
+           * This read `submit.reason === "relay_unavailable"` while that string was the only way a
+           * relay-less submit could be reported. Splitting the boundary so a dead credential names
+           * itself broke that equivalence, and the consequence was the opposite of the unit's
+           * intent: an agent with an expired token has BY DEFINITION no relay witness, which is
+           * precisely the state this fallback exists for — and it would have been the first to stop
+           * taking it, told instead to "retry once the relay is reachable" about a relay that was
+           * never the problem.
+           */
+          if (submit.reason === "relay_unavailable" || isLocalCredentialRefusal(submit.reason)) {
+            // No relay witness for this session (direct/interrupted, or our own credential is dead)
+            // — fall back to the directory-mediated bilateral-ack seal.
             return await handleActiveSealFlow(sessionId, record, correlationId);
           }
           return {

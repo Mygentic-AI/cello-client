@@ -29,9 +29,12 @@
  */
 import { describe, it, expect } from "vitest";
 import { generateKeypair } from "@cello-protocol/crypto";
-import { AgentRelayClient, classifyRelayAuthRefusal, RELAY_AUTH_REFUSAL_IS_LOCAL } from "../session-relay-client.js";
+import { AgentRelayClient, classifyRelayAuthRefusal, isLocalCredentialRefusal } from "../session-relay-client.js";
 import { makeFakeRelay, noopLogger, tick } from "./relay-client-fake.js";
 import { localCredentialRefusalNotice } from "../refusal-reasons.js";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 
 describe("DOD-M15-TOKENSTALE-1: an auth refusal is not a relay outage", () => {
   it("★ an expired token is classified as a LOCAL fault, not a relay one", () => {
@@ -41,9 +44,9 @@ describe("DOD-M15-TOKENSTALE-1: an auth refusal is not a relay outage", () => {
      * elsewhere and IS the relay's answer. So it cannot be reused to mean "this is our fault":
      * it answers a different question and would be right for the wrong reason.
      */
-    expect(RELAY_AUTH_REFUSAL_IS_LOCAL("online_token_expired"), "our credential died — nothing about the relay is wrong").toBe(true);
-    expect(RELAY_AUTH_REFUSAL_IS_LOCAL("online_token_required"), "we never had one; also ours").toBe(true);
-    expect(RELAY_AUTH_REFUSAL_IS_LOCAL("online_token_pubkey_mismatch"), "an identity mix-up on this machine").toBe(true);
+    expect(isLocalCredentialRefusal("online_token_expired"), "our credential died — nothing about the relay is wrong").toBe(true);
+    expect(isLocalCredentialRefusal("online_token_required"), "we never had one; also ours").toBe(true);
+    expect(isLocalCredentialRefusal("online_token_pubkey_mismatch"), "an identity mix-up on this machine").toBe(true);
   });
 
   it("★ a relay-side fault is NOT local — otherwise the flag means nothing", () => {
@@ -52,9 +55,9 @@ describe("DOD-M15-TOKENSTALE-1: an auth refusal is not a relay outage", () => {
      * every relay outage report as a local credential problem, which is the same substitution
      * running the other way.
      */
-    expect(RELAY_AUTH_REFUSAL_IS_LOCAL("online_token_no_directory_key"), "this relay is misconfigured; another one works").toBe(false);
-    expect(RELAY_AUTH_REFUSAL_IS_LOCAL("slot_cap_exceeded"), "the relay's own answer about its own slots").toBe(false);
-    expect(RELAY_AUTH_REFUSAL_IS_LOCAL("throttled"), "the relay asking us to come back later").toBe(false);
+    expect(isLocalCredentialRefusal("online_token_no_directory_key"), "this relay is misconfigured; another one works").toBe(false);
+    expect(isLocalCredentialRefusal("slot_cap_exceeded"), "the relay's own answer about its own slots").toBe(false);
+    expect(isLocalCredentialRefusal("throttled"), "the relay asking us to come back later").toBe(false);
   });
 
   it("★ an unknown reason is NOT assumed local", () => {
@@ -63,7 +66,7 @@ describe("DOD-M15-TOKENSTALE-1: an auth refusal is not a relay outage", () => {
      * silently start telling operators their own machine is broken — and a wrong accusation about
      * the reader's own setup costs more than a vague one about someone else's.
      */
-    expect(RELAY_AUTH_REFUSAL_IS_LOCAL("some_future_relay_reason")).toBe(false);
+    expect(isLocalCredentialRefusal("some_future_relay_reason")).toBe(false);
   });
 
   it("★ the expired-token advice no longer promises a refresh that cannot happen", () => {
@@ -171,8 +174,13 @@ describe("DOD-M15-TOKENSTALE-1: the operator is told without having to ask", () 
     const { impact } = notice();
     expect(impact, "the receipt is the thing at stake").toMatch(/receipt/i);
     expect(impact, "and it must say the messages DO still arrive, or it reads as an outage").toMatch(/still arriv/i);
-    expect(impact.indexOf("witness"), "the loss comes before the mechanism")
-      .toBeLessThan(impact.indexOf("pass from the directory"));
+    // ⚠️ BOTH INDICES ASSERTED PRESENT FIRST — review: `indexOf` returns -1 for a missing needle, so
+    // the ordering comparison alone passes vacuously when the word it is ordering is not there.
+    const lossAt = impact.indexOf("witness");
+    const mechanismAt = impact.indexOf("pass from the directory");
+    expect(lossAt, "the loss must be stated at all").toBeGreaterThanOrEqual(0);
+    expect(mechanismAt, "and so must the mechanism").toBeGreaterThanOrEqual(0);
+    expect(lossAt, "the loss comes before the mechanism").toBeLessThan(mechanismAt);
   });
 
   it("★★ it says this is OURS and permanent — the two facts the old label denied", () => {
@@ -194,5 +202,74 @@ describe("DOD-M15-TOKENSTALE-1: the operator is told without having to ask", () 
     // A dead credential is not per-session: every conversation this agent holds is unwitnessed. An
     // operator told only about this session would close it and open another into the same wall.
     expect(notice().impact).toMatch(/any other one this agent holds|every conversation/i);
+  });
+});
+
+describe("DOD-M15-TOKENSTALE-1: the split did not strip the fallbacks that exist for exactly this state", () => {
+  /**
+   * ⚠️ THE TESTS THAT WERE MISSING, AND THEIR ABSENCE IS THE REVIEW FINDING — F1, F2, F3.
+   *
+   * Every other test in this file stops at the submit boundary's return value. `relay_unavailable`
+   * had FOUR consumers that branched on the exact string, and promoting the real reason silently
+   * took all four away — from the one condition they were built for, because an agent whose
+   * credential is dead has by definition no relay witness. A 3,554-test gate went green over it.
+   *
+   * These read the SOURCE rather than driving each flow, and that is a deliberate trade stated
+   * plainly: driving a close, a restart-resolver sweep and an away auto-seal each needs a live
+   * multi-process rig, and a test that cannot be written does not get written — which is how this
+   * gap opened. A source assertion is weaker than an execution, and it is strictly stronger than
+   * nothing; it fails the moment someone re-narrows a branch back to the bare string.
+   */
+  const SRC = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const read = (f: string): string => readFileSync(join(SRC, f), "utf8");
+
+  it("★★ the close path still falls back to the directory-mediated seal (F1)", () => {
+    const src = read("close-session-handler.ts");
+    expect(
+      src,
+      "an expired credential means NO relay witness — the exact state this fallback is for. Keyed on " +
+      "the bare string it stops being taken, and the operator is told to retry once the relay is " +
+      "reachable about a relay that was never the problem.",
+    ).toMatch(/submit\.reason === "relay_unavailable" \|\| isLocalCredentialRefusal\(submit\.reason\)/);
+  });
+
+  it("★★ a seal that may already be durable is still checked (F1, second hit)", () => {
+    // Same line, different set: the stored certificate is the answer either way and consulting it is
+    // cheap. Dropping out of this set revives the M12-P15 regression its own comment describes.
+    const src = read("close-session-handler.ts");
+    const set = src.slice(src.indexOf("SEAL_MAY_ALREADY_BE_DURABLE"), src.indexOf("const localCert"));
+    for (const reason of ["online_token_expired", "online_token_required", "online_token_pubkey_mismatch"]) {
+      expect(set, `${reason} must still reach the stored-certificate check`).toContain(reason);
+    }
+  });
+
+  it("★★ the restart-seal resolver does not spend its budget on a credential that clears on relogin (F2)", () => {
+    /**
+     * The sharpest of the three. Outside this set the reason consumes attempts and then writes a
+     * DURABLE give-up, removing sessions that hold signed commitments from the only queue that would
+     * ever enumerate them again — the 28-session outcome that set was written to prevent.
+     */
+    const src = read("restart-seal-resolver.ts");
+    const set = src.slice(src.indexOf("LOCAL_PRECONDITION_REFUSALS"), src.indexOf("TERMINAL_SEAL_REFUSALS"));
+    expect(set, "an expired token is a local precondition: it passes after a relogin").toContain("online_token_expired");
+    expect(src.slice(src.indexOf("TERMINAL_SEAL_REFUSALS")), "and it is NEVER terminal — that would forfeit the receipt")
+      .not.toContain("online_token_expired");
+  });
+
+  it("★★ the away auto-seal still falls back, where nobody is watching (F3)", () => {
+    // By construction there is no operator on this path, so the loss would be silent.
+    expect(read("attendance-wiring.ts")).toMatch(/submit\.reason === "relay_unavailable" \|\| isLocalCredentialRefusal\(submit\.reason\)/);
+  });
+
+  it("★★ a stale verdict cannot relabel a genuine relay outage as our credential (F4)", () => {
+    /**
+     * `#lastAuthRefusal` is cleared only on auth SUCCESS. `#connect`'s dial and stream failures never
+     * reach a verdict, so without a clear at entry they return carrying an earlier attempt's refusal
+     * — and the promotion would then blame this machine for somebody else's outage AND strip the
+     * fallbacks above from the case they exist for.
+     */
+    const src = read("session-relay-client.ts");
+    const connect = src.slice(src.indexOf("async #connect(node: CelloNode)"), src.indexOf("async #authenticate"));
+    expect(connect, "the verdict must be dropped before an attempt that may never reach one").toContain("this.#clearAuthRefusal();");
   });
 });

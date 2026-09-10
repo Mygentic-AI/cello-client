@@ -24,7 +24,7 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import type { SecurityGatewayClient } from "@cello-protocol/gateway";
 import { countAttendance, ContentTakeLedger } from "./co-attendance.js";
 import { isOwnAwayAutoReply, markAsAutoReply, isAutoReplyMarked, systemAwayText } from "./away-detection.js";
-import { LEAF_KIND_MSG } from "./session-relay-client.js";
+import { isLocalCredentialRefusal, LEAF_KIND_MSG } from "./session-relay-client.js";
 import { sentAuthorship } from "./session-content-handlers.js";
 import { escalateToUnilateralSeal as runUnilateralEscalation, UNILATERAL_SEAL_TIMEOUT_MS } from "./seal-escalation.js";
 import type { UnilateralResult } from "./seal-coordinator.js";
@@ -253,7 +253,7 @@ export function createAttendanceWiring(deps: AttendanceWiringDeps) {
               const submit = await sessionNodeManager.submitSealLeaf(agentName, sessionId, correlationId);
               if (!submit.ok && submit.reason !== "responder_seal_already_submitted") {
                 pendingSealWaiters.delete(sk);
-                if (submit.reason === "relay_unavailable") {
+                if (submit.reason === "relay_unavailable" || isLocalCredentialRefusal(submit.reason)) { // TOKENSTALE F3
                   const fallback = await handleActiveSealFlow(sessionId, record2, correlationId);
                   if (fallback.ok) {
                     logger.info("session.away.inbox.oneshot.seal_initiated", { agentName, sessionId, path: "signaling_fallback" });
