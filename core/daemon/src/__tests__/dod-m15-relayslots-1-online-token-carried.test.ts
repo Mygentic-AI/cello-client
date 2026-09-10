@@ -177,6 +177,10 @@ describe("DOD-M15-RELAYSLOTS-1: the daemon carries the directory's online token 
     try {
       manager.setDirectoryOnlineToken(agentName, token);
       await manager.ensureStandingReceiverForAgent(agentName);
+      // 055-ONDEMAND: nothing is reserved at login, so the auth this file is about happens when a
+      // reservation is TAKEN — the same seam the offer handler uses. What is carried, refreshed and
+      // refused is unchanged.
+      await manager.takeReservationForSession(agentName, `${relay.addr}/p2p-circuit`, "test-corr");
 
       const sawAuth = await waitUntil(() => relay.tokensSeen.length > 0, 15_000);
       expect(sawAuth, "the standing receiver never authenticated at all").toBe(true);
@@ -201,6 +205,10 @@ describe("DOD-M15-RELAYSLOTS-1: the daemon carries the directory's online token 
     try {
       manager.setDirectoryOnlineToken(agentName, first);
       await manager.ensureStandingReceiverForAgent(agentName);
+      // 055-ONDEMAND: nothing is reserved at login, so the auth this file is about happens when a
+      // reservation is TAKEN — the same seam the offer handler uses. What is carried, refreshed and
+      // refused is unchanged.
+      await manager.takeReservationForSession(agentName, `${relay.addr}/p2p-circuit`, "test-corr");
       await waitUntil(() => relay.tokensSeen.length > 0, 15_000);
 
       // The signaling stream turns over far more often than a relay auth, so by the time a receiver
@@ -209,6 +217,10 @@ describe("DOD-M15-RELAYSLOTS-1: the daemon carries the directory's online token 
       const before = relay.tokensSeen.length;
       await manager.removeStandingReceiverForAgent(agentName);
       await manager.ensureStandingReceiverForAgent(agentName);
+      // 055-ONDEMAND: nothing is reserved at login, so the auth this file is about happens when a
+      // reservation is TAKEN — the same seam the offer handler uses. What is carried, refreshed and
+      // refused is unchanged.
+      await manager.takeReservationForSession(agentName, `${relay.addr}/p2p-circuit`, "test-corr");
 
       const sawSecond = await waitUntil(() => relay.tokensSeen.length > before, 15_000);
       expect(sawSecond, "the rebuilt receiver never authenticated").toBe(true);
@@ -247,6 +259,10 @@ describe("DOD-M15-RELAYSLOTS-1: the daemon carries the directory's online token 
     try {
       manager.setDirectoryOnlineToken(agentName, token);
       await manager.ensureStandingReceiverForAgent(agentName);
+      // 055-ONDEMAND: nothing is reserved at login, so the auth this file is about happens when a
+      // reservation is TAKEN — the same seam the offer handler uses. What is carried, refreshed and
+      // refused is unchanged.
+      await manager.takeReservationForSession(agentName, `${relay.addr}/p2p-circuit`, "test-corr");
       await waitUntil(() => manager.getStandingReceiverRefusal(agentName) !== null, 15_000);
 
       const refusal = manager.getStandingReceiverRefusal(agentName);
@@ -285,6 +301,10 @@ describe("DOD-M15-RELAYSLOTS-1: the daemon carries the directory's online token 
     try {
       manager.setDirectoryOnlineToken(agentName, token);
       await manager.ensureStandingReceiverForAgent(agentName);
+      // 055-ONDEMAND: nothing is reserved at login, so the auth this file is about happens when a
+      // reservation is TAKEN — the same seam the offer handler uses. What is carried, refreshed and
+      // refused is unchanged.
+      await manager.takeReservationForSession(agentName, `${broken.addr}/p2p-circuit`, "test-corr");
 
       const quarantined = await waitUntil(
         () => manager.isRelayQuarantined(agentName, broken.peerId),
@@ -312,6 +332,10 @@ describe("DOD-M15-RELAYSLOTS-1: the daemon carries the directory's online token 
     try {
       manager.setDirectoryOnlineToken(agentName, token);
       await manager.ensureStandingReceiverForAgent(agentName);
+      // 055-ONDEMAND: nothing is reserved at login, so the auth this file is about happens when a
+      // reservation is TAKEN — the same seam the offer handler uses. What is carried, refreshed and
+      // refused is unchanged.
+      await manager.takeReservationForSession(agentName, `${relay.addr}/p2p-circuit`, "test-corr");
       await waitUntil(() => manager.getStandingReceiverRefusal(agentName) !== null, 15_000);
 
       expect(
@@ -333,6 +357,10 @@ describe("DOD-M15-RELAYSLOTS-1: the daemon carries the directory's online token 
     try {
       // No setDirectoryOnlineToken: the directory has not answered yet, or this key is unregistered.
       await manager.ensureStandingReceiverForAgent(agentName);
+      // 055-ONDEMAND: nothing is reserved at login, so the auth this file is about happens when a
+      // reservation is TAKEN — the same seam the offer handler uses. What is carried, refreshed and
+      // refused is unchanged.
+      await manager.takeReservationForSession(agentName, `${relay.addr}/p2p-circuit`, "test-corr");
 
       const sawAuth = await waitUntil(() => relay.tokensSeen.length > 0, 15_000);
       expect(

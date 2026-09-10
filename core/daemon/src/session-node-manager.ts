@@ -1368,6 +1368,9 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       logger: this.#logger,
       records: this.#records,
       queries: this.#queries,
+      // 055-ONDEMAND: the watchdog re-takes a live session's circuit rather than rebuilding a
+      // receiver that would reserve nothing.
+      retakeReservation: (a, c, cid) => this.#receivers.takeReservationForSession(a, c, cid),
       park: this.#park,
       refusals: this.#refusals,
       leafRecords: this.#leafRecords,

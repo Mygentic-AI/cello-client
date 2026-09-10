@@ -129,6 +129,14 @@ describe("A: the parked-content drain rides the standing receiver's life-cycle",
     try {
       await seedRelayEndpoint(manager, "alice", relay.peerId, relay.addr);
       await manager.ensureStandingReceiverForAgent("alice");
+      /**
+       * 055-ONDEMAND — **there is no relay link to die until a session takes one.** An idle agent
+       * holds nothing now, so the flap this test is about needs a reservation to exist first, taken
+       * through the same seam the offer path uses. The property under test is unchanged: when the
+       * link dies, the watchdog rebuild must DRAIN, because content that could not be delivered is
+       * parked on the other side of it.
+       */
+      await manager.takeReservationForSession("alice", `${relay.addr}/p2p-circuit`, "test-corr");
       const reserved = await waitUntil(() => {
         const info = manager.getStandingReceiverInfo("alice");
         return info !== null && info.addrs.some((a) => a.includes("/p2p-circuit"));

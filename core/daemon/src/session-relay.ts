@@ -54,6 +54,8 @@ export interface SessionRelayContext {
 
   readonly records: SessionRecords;
   readonly queries: SessionQueries;
+  /** 055-ONDEMAND: ask a relay for a circuit this agent's live session still needs. */
+  retakeReservation(agentName: string, circuitAddr: string, correlationId: string): Promise<boolean>;
   readonly park: ParkRecovery;
   readonly refusals: InboundRefusals;
   readonly leafRecords: SessionLeafRecords;
@@ -1038,6 +1040,55 @@ export class SessionRelay {
    * ("a circuit listener is fixed at node creation") stopped being true when `listenOnCircuit`
    * landed. A fresh receiver re-runs the whole walk, proof included, which is why it stays.
    */
+  /**
+   * 055-ONDEMAND — is a re-attempt due, and claim it if so.
+   *
+   * ⚠️ **THE SAME LADDER AS `#retryReservationIfDue`, DELIBERATELY, but it does not call it.** That
+   * one REBUILDS the receiver, which under on-demand reserves nothing — running both would spend a
+   * node build per attempt to no effect. This reads and advances the same `srReservationRetry`
+   * state, so the two paths share ONE budget: a reservation is scarce, the relay holds it for its
+   * full TTL even after the client disconnects, and this file's own warning is that churning
+   * attempts across a fleet is how a relay is exhausted.
+   */
+  #retryDue(agentName: string): boolean {
+    const now = Date.now();
+    const state = this.#ctx.srReservationRetry.get(agentName)
+      ?? { attempts: 0, nextAt: now + this.#ctx.srReservationRetryMs, correlationId: randomUUID() };
+    const lastReason = this.#ctx.srLastRejectionReason.get(agentName);
+    if (lastReason !== undefined) state.lastReason = lastReason;
+    if (!this.#ctx.srReservationRetry.has(agentName)) {
+      // First sighting — schedule, do not fire. Something just tried.
+      this.#ctx.srReservationRetry.set(agentName, state);
+      return false;
+    }
+    if (now < state.nextAt) return false;
+    if (state.attempts >= SR_RESERVATION_MAX_RETRIES) {
+      if (state.attempts === SR_RESERVATION_MAX_RETRIES) {
+        state.attempts += 1; // report once
+        this.#ctx.srReservationRetry.set(agentName, state);
+        this.#ctx.logger.error("session.standing_receiver.reservation.gave_up", {
+          agentName,
+          attempts: SR_RESERVATION_MAX_RETRIES,
+          correlationId: state.correlationId,
+          ...(state.lastReason !== undefined ? { lastRejectionReason: state.lastReason } : {}),
+          impact: "a live session lost the circuit its counterparty dials, and no relay would give " +
+            "it back inside the retry budget. Messages still reach this agent through the relay's " +
+            "store-and-forward; a direct dial to it will not connect until the session is rebuilt.",
+        });
+      }
+      return false;
+    }
+    state.attempts += 1;
+    // Doubling, floored at the configured interval — the same shape the rebuild ladder uses, and
+    // for the same reason: a fixed short interval is what exhausts a relay.
+    state.nextAt = now + this.#ctx.srReservationRetryMs * Math.pow(2, state.attempts - 1);
+    this.#ctx.srReservationRetry.set(agentName, state);
+    this.#ctx.logger.info("session.standing_receiver.reservation.retry", {
+      agentName, attempts: state.attempts, correlationId: state.correlationId,
+    });
+    return true;
+  }
+
   #retryReservationIfDue(agentName: string): void {
     const now = Date.now();
     const state = this.#ctx.srReservationRetry.get(agentName)
@@ -1110,7 +1161,7 @@ export class SessionRelay {
     void this.#ctx.receivers.rebuildStandingReceiver(agentName);
   }
 
-  #reservationWatchdogTick(): void {
+  async #reservationWatchdogTick(): Promise<void> {
     if (this.#ctx.shuttingDown) return;
     for (const [agentName, sr] of this.#ctx.standingReceivers) {
       if (!this.#ctx.agentsWantingReceiver.has(agentName)) continue;        // agent went offline
@@ -1130,6 +1181,49 @@ export class SessionRelay {
       // full TTL even after the client disconnects, and churning attempts across a fleet is how a
       // relay is exhausted (`#startReceiverNode` records that hazard).
       if (sr.relayPeerIds.length === 0) {
+        /**
+         * ⚠️ **AN IDLE AGENT HOLDING NOTHING IS THE DESIGN NOW, NOT A DEGRADATION — 055-ONDEMAND.**
+         *
+         * Everything above this line was written when a receiver reserved at login and holding zero
+         * meant an agent dialable by nobody for its whole life. A reservation is taken at OFFER time
+         * now and given back at the seal, so zero is the correct steady state for an agent nobody is
+         * calling — and retrying here would have every idle agent in the fleet asking relays for
+         * slots the design says it must not hold. That is the exact churn the note below warns
+         * about, pointed at the whole fleet instead of one receiver.
+         *
+         * The retry still matters for an agent that HAS a live session and lost the circuit that
+         * session depends on, which is what the condition now says.
+         */
+        const liveSessions = [...this.#ctx.activeNodes.values()].filter((e) => e.agentName === agentName);
+        if (liveSessions.length === 0) continue;
+        /**
+         * ⚠️ **RE-TAKE THE SESSION'S CIRCUIT — REBUILDING THE RECEIVER NO LONGER DOES IT.**
+         *
+         * `#retryReservationIfDue` rebuilds the receiver, and a rebuilt receiver reserves NOTHING
+         * (055-ONDEMAND). So on its own the retry ladder became a no-op by construction: a relay
+         * that flapped mid-session would leave that session permanently un-dialable while the
+         * ladder churned receivers to no effect.
+         *
+         * The circuit a live session needs is the one its ASSIGNMENT named, which is persisted with
+         * the session — so ask for that one back, rather than rebuilding and hoping.
+         */
+        /**
+         * ⚠️ **ON THE SAME BUDGET AND BACKOFF AS THE LADDER IT REPLACES.** A reservation is scarce:
+         * the relay holds it for its full TTL even after the client disconnects, and this file's own
+         * warning is that churning attempts across a fleet is how a relay is exhausted. Asking on
+         * every 30-second tick would be exactly that churn, wearing a new name — measured here as 52
+         * asks where the budget allows 37.
+         */
+        if (!this.#retryDue(agentName)) continue;
+        let retook = false;
+        for (const entry of liveSessions) {
+          const ep = this.#ctx.queries.getPersistedRelayEndpoint(agentName, entry.sessionId);
+          if (!ep || ep.relayAddrs.length === 0) continue;
+          const base = ep.relayAddrs[0]!;
+          const circuitAddr = base.includes(`/p2p/${ep.relayPeerId}`) ? `${base}/p2p-circuit` : `${base}/p2p/${ep.relayPeerId}/p2p-circuit`;
+          if (await this.#ctx.retakeReservation(agentName, circuitAddr, entry.correlationId)) retook = true;
+        }
+        if (retook) continue;
         // …unless one has arrived since. Review F4, same class as the recompute below: the
         // slow-start path installs a receiver before every circuit has bound, so "held nothing at
         // install" is not the same fact as "holds nothing now". Adopting it here is what stops the
@@ -1333,7 +1427,7 @@ export class SessionRelay {
     this.#ctx.park.armBackstopClock(Date.now());
     this.#ctx.reservationWatchdog = setInterval(() => {
       try {
-        this.#reservationWatchdogTick();
+        void this.#reservationWatchdogTick();
         this.#ctx.park.parkedDrainBackstopTick(Date.now());
       } catch (err: unknown) {
         this.#ctx.logger.warn("session.standing_receiver.watchdog.failed", { error: extractErrorMessage(err) });
