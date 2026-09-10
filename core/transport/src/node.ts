@@ -483,6 +483,41 @@ class CelloNodeImpl implements CelloNode {
     await transportManager.listen([multiaddr(circuitAddr)]);
   }
 
+  /**
+   * 054-SRSPLIT. Contract, and why this cannot be per-relay, are on the interface.
+   *
+   * Every circuit listener is closed. libp2p's own listener close cancels the shared reservation
+   * store wholesale, so closing one and leaving the others would leave this node announcing routes
+   * whose refresh timers had been cleared — reachable-looking addresses that stop working when the
+   * relay's TTL runs out.
+   */
+  async releaseAllCircuits(): Promise<boolean> {
+    if (this.#libp2p.status !== "started") {
+      throw { reason: "node_stopped", message: `Node is ${this.#libp2p.status}, not started` };
+    }
+    const transportManager = (
+      this.#libp2p as unknown as {
+        components?: { transportManager?: { getListeners(): Array<{ getAddrs(): Multiaddr[]; close(): Promise<void> }> } };
+      }
+    ).components?.transportManager;
+    if (typeof transportManager?.getListeners !== "function") {
+      throw {
+        reason: "transport_manager_unavailable",
+        message: "libp2p exposes no components.transportManager.getListeners — this node cannot release a reservation",
+      };
+    }
+    let released = false;
+    for (const listener of transportManager.getListeners()) {
+      const isCircuit = listener
+        .getAddrs()
+        .some((ma) => ma.toString().split("/").includes("p2p-circuit"));
+      if (!isCircuit) continue;
+      await listener.close();
+      released = true;
+    }
+    return released;
+  }
+
   async dial(multiaddrStr: string): Promise<{ peerId: string }> {
     if (this.#libp2p.status === "stopped") {
       throw { reason: "node_stopped", message: "Node is stopped" };
