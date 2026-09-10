@@ -649,6 +649,30 @@ export class SessionLifecycle {
       agentName: entry.agentName,
       reason: "sealing",
     });
+    /**
+     * 055-ONDEMAND — **THE SLOT GOES BACK.** This session is sealed and gone from `activeNodes`, so
+     * whatever relays the agent's REMAINING sessions still need is computed from the map as it is
+     * now — a recompute, never a subtraction, because the local release is all-or-nothing (libp2p
+     * shares one reservation store across listeners) and an agent with a second live session would
+     * otherwise lose its circuit silently.
+     *
+     * Awaited but never allowed to throw: giving a slot back must not be able to fail a seal.
+     */
+    const stillNeeded: string[] = [];
+    for (const [, other] of this.#ctx.activeNodes) {
+      if (other.agentName !== agentName) continue;
+      const ep = this.#ctx.queries.getPersistedRelayEndpoint(agentName, other.sessionId);
+      if (!ep || ep.relayAddrs.length === 0) continue;
+      const base = ep.relayAddrs[0]!;
+      stillNeeded.push(base.includes(`/p2p/${ep.relayPeerId}`) ? `${base}/p2p-circuit` : `${base}/p2p/${ep.relayPeerId}/p2p-circuit`);
+    }
+    await this.#ctx.receivers.releaseReservationsAfterSeal(agentName, stillNeeded, entry.correlationId)
+      .catch((err: unknown) => {
+        this.#ctx.logger.warn("session.reservation.release.failed", {
+          agentName, sessionId, error: extractErrorMessage(err),
+          impact: "the relay keeps this slot until its TTL expires. The seal itself is unaffected.",
+        });
+      });
     // M8B F14 (fix 1): same re-arm point as destroySessionNode — the retired node freed its port.
     this.#rearmAfterTeardown(agentName);
   }

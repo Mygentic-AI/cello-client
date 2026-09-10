@@ -263,8 +263,8 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
       agentName,
       getStandingReceiverEndpoint: () => sessionNodeManager.getStandingReceiverInfo(agentName),
       admitOfferedDialer: (peerId, sessionIdHex) => sessionNodeManager.admitOfferedDialer(agentName, peerId, sessionIdHex),
-      // DOD-M15-RELAYONLY-1: lets the handler tell "no addresses because relay-only filtered them"
-      // from "no addresses yet", which need opposite answers — a refusal, and the pre-existing path.
+      // RELAYONLY-1: tells "relay-only emptied the addresses" from "none yet" — opposite answers.
+      reserveOnDemand: (c, sid) => sessionNodeManager.takeReservationForSession(agentName, c, sid), // 055-ONDEMAND
       isRelayOnly: () => relayOnlyState((key) => sessionNodeManager.getSetting(agentName, key), sessionNodeManager.hasDatabase()) !== "off",
       signaling: mgr,
       logger,
@@ -378,7 +378,7 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
       agentName: agent.name,
       getStandingReceiverEndpoint: () => sessionNodeManager.getStandingReceiverInfo(agent.name),
       admitOfferedDialer: (peerId, sessionIdHex) => sessionNodeManager.admitOfferedDialer(agent.name, peerId, sessionIdHex),
-      // DOD-M15-RELAYONLY-1 — see the note on the sibling call site above.
+      reserveOnDemand: (c, sid) => sessionNodeManager.takeReservationForSession(agent.name, c, sid), // 055-ONDEMAND: both sites
       isRelayOnly: () => relayOnlyState((key) => sessionNodeManager.getSetting(agent.name, key), sessionNodeManager.hasDatabase()) !== "off",
       signaling: mgr,
       logger,

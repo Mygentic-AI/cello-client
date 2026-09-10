@@ -1392,6 +1392,45 @@ export class SessionRelay {
    * `tryAnotherRelay: false` precisely so the client STOPS walking the fleet; without the verdict,
    * the loop walked it anyway, turning one client-side fault into what reads as a fleet outage.
    */
+  /**
+   * 055-ONDEMAND — **tell the relay this agent has finished with its slot.**
+   *
+   * The only thing that actually frees one: closing a circuit listener sends the relay nothing, and
+   * the relay reclaims on its own only at the reservation TTL (two hours) or under reaper pressure.
+   * Best-effort by design — an undelivered release costs a slot until that TTL, and must never fail
+   * the seal that triggered it.
+   */
+  async tellRelayReleased(agentName: string, relayPeerId: string, node: CelloNode, correlationId: string): Promise<void> {
+    const ep = this.#ctx.directoryRelayEndpoints.get(agentName)?.find((e) => e.relayPeerId === relayPeerId);
+    const relayAddrs = ep ? [...ep.relayAddrs] : [];
+    if (relayAddrs.length === 0) {
+      this.#ctx.logger.warn("session.relay.reservation_release.no_endpoint", {
+        agentName, relayPeerId, correlationId,
+        impact: "no address is known for this relay, so it cannot be told the slot is free and " +
+          "holds it until the reservation TTL expires.",
+      });
+      return;
+    }
+    let client: AgentRelayClient | undefined;
+    try {
+      client = this.#ctx.detachedRelayClientBuilder?.(agentName, relayPeerId, relayAddrs, {
+        receiptStore: this.#ctx.relayReceiptStore ?? undefined,
+        sealLeafStore: this.#ctx.sealLeafStore ?? undefined,
+        onlineToken: () => this.#ctx.getDirectoryOnlineToken(agentName),
+      });
+      if (!client) return;
+      await client.releaseReservation(node);
+    } catch (err: unknown) {
+      this.#ctx.logger.warn("session.relay.reservation_release.failed", {
+        agentName, relayPeerId, correlationId,
+        error: extractErrorMessage(err),
+        impact: "the relay holds this slot until its TTL expires.",
+      });
+    } finally {
+      client?.close();
+    }
+  }
+
   async proveToRelay(
     agentName: string,
     circuitAddr: string,

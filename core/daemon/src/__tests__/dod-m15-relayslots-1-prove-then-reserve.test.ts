@@ -284,6 +284,29 @@ async function makeManager(
   return m;
 }
 
+/**
+ * 055-ONDEMAND — **THE TRIGGER MOVED, SO THE FIXTURE MOVED WITH IT.**
+ *
+ * These tests used to call `ensureStandingReceiverForAgent` and watch the login WALK visit every
+ * relay. There is no walk: an idle agent holds nothing, and a reservation is taken when an offer
+ * arrives, on the relay the directory named. So the receiver comes up and then this asks for the
+ * relays the test is about — which is exactly what the offer path does, through the same seam.
+ *
+ * ⚠️ The properties below did NOT move. Prove-before-ask, one node, the client-fault vocabulary and
+ * the refusal reaching `cello_status` are all still true and still asserted; what changed is who
+ * decides which relay, and that is now the directory rather than a walk.
+ */
+async function bringUpAndReserve(m: SessionNodeManager, relays: readonly string[] = [CIRCUIT_A, CIRCUIT_B]): Promise<boolean[]> {
+  await m.ensureStandingReceiverForAgent("alice");
+  const took: boolean[] = [];
+  for (const circuitAddr of relays) {
+    took.push(await m.takeReservationForSession("alice", circuitAddr, "test-corr"));
+    // An agent-level refusal reproduces on every relay, so the offer path would not ask a second.
+    if (m.getStandingReceiverRefusal("alice")?.tryAnotherRelay === false) break;
+  }
+  return took;
+}
+
 beforeEach(async () => { tempDir = await mkdtemp(join(tmpdir(), "cello-slots-prove-")); });
 afterEach(async () => {
   await mgr?.gracefulShutdown();
@@ -297,7 +320,7 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
     const factory = new GatedFactory(relay);
     mgr = await makeManager(relay, factory);
 
-    await mgr.ensureStandingReceiverForAgent("alice");
+    await bringUpAndReserve(mgr);
     const node = mgr.getStandingReceiverNode("alice");
 
     expect(
@@ -380,7 +403,7 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
     const factory = new GatedFactory(relay);
     mgr = await makeManager(relay, factory);
 
-    await mgr.ensureStandingReceiverForAgent("alice");
+    await bringUpAndReserve(mgr);
 
     const proofs = relay.gateProofTimeline();
     expect(proofs.length, "one gate proof per relay in the pool").toBe(2);
@@ -433,7 +456,7 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
     relay.grants = (): boolean => true;
     mgr = await makeManager(relay, factory, { noRelayClient: true });
 
-    await mgr.ensureStandingReceiverForAgent("alice");
+    await bringUpAndReserve(mgr);
 
     expect(
       relay.timeline.filter((e) => e.kind === "listen").map((e) => e.relayPeerId),
@@ -468,7 +491,7 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
     relay.grants = (): boolean => true;
     mgr = await makeManager(relay, factory);
 
-    await mgr.ensureStandingReceiverForAgent("alice");
+    await bringUpAndReserve(mgr);
 
     expect(
       relay.gateProofs().length,
@@ -502,7 +525,7 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
       logger: { debug: capture, info: capture, warn: capture, error: capture },
     });
 
-    await mgr.ensureStandingReceiverForAgent("alice");
+    await bringUpAndReserve(mgr);
 
     const rejected = events.filter((e) => e.event === "session.standing_receiver.relay.rejected");
     expect(rejected.length, "every relay in the pool is declined — the fault is ours, not theirs").toBeGreaterThan(0);
@@ -539,19 +562,21 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
       logger: { debug: capture, info: capture, warn: capture, error: capture },
     });
 
-    await mgr.ensureStandingReceiverForAgent("alice");
+    await bringUpAndReserve(mgr);
 
-    const reachEvents = events.filter((e) => e.event === "session.standing_receiver.reachability");
-    const reach = reachEvents.at(-1);
-    expect(reach, "the receiver must report its reachability").toBeDefined();
+    /**
+     * ⚠️ THE SUBJECT MOVED WITH 055-ONDEMAND. The count used to be reported at login, by the walk.
+     * Nothing is held at login now, so the number that matters is the receiver's own record of what
+     * it holds — `relayPeerIds`, which is what the reservation WATCHDOG compares against to decide a
+     * reservation was lost and what `cello_status` reports as reachability.
+     *
+     * Getting it wrong is not cosmetic in either place: a count that can exceed the number of relays
+     * makes a healthy agent and a churning one look identical.
+     */
     expect(
-      reach?.ctx["reservationsHeld"],
-      "two relays granted, so two reservations are held — however many addresses each announces",
-    ).toBe(2);
-    expect(
-      Number(reach?.ctx["reservationsHeld"]),
-      "and it can never exceed what was offered, which is the property that makes it answerable",
-    ).toBeLessThanOrEqual(Number(reach?.ctx["relaysOffered"]));
+      mgr.getStandingReceiverRelayIds("alice"),
+      "two relays granted, so two relays are recorded — however many addresses each announces",
+    ).toEqual([RELAY_A, RELAY_B]);
     /**
      * ⚠️ ONE EMISSION PER RECEIVER BUILD — review MEDIUM-7, and this assertion is why the test above
      * is not hollow. 054-SRSPLIT added a second `reachability` emission inside `#startReceiverNode`
@@ -560,7 +585,15 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
      * test green. `reservation.none` is also the event MSG-018 counted 481 of to justify a retry,
      * and doubling it breaks any comparison against that baseline.
      */
-    expect(reachEvents.length, "the receiver reports its reachability ONCE per build").toBe(1);
+    /**
+     * ONE emission per build — kept from 054-SRSPLIT review MEDIUM-7, where a duplicate
+     * `reachability` line made a count test read the wrong copy of the event and go green against a
+     * defect. The event now reports zero held at login (055-ONDEMAND), and it must still be one line.
+     */
+    expect(
+      events.filter((e) => e.event === "session.standing_receiver.reachability").length,
+      "the receiver reports its reachability ONCE per build",
+    ).toBe(1);
   }, 30_000);
 
   it("★★★ a refusal about THIS AGENT reaches cello_status, and stops the fleet walk", async () => {
@@ -578,7 +611,7 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
     const factory = new GatedFactory(relay);
     mgr = await makeManager(relay, factory);
 
-    await mgr.ensureStandingReceiverForAgent("alice");
+    await bringUpAndReserve(mgr);
 
     const surfaced = mgr.getStandingReceiverRefusal("alice");
     expect(
@@ -610,7 +643,7 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
     const factory = new GatedFactory(relay);
     mgr = await makeManager(relay, factory);
 
-    await mgr.ensureStandingReceiverForAgent("alice");
+    await bringUpAndReserve(mgr);
 
     expect(
       relay.gateProofs().map((p) => p.relayPeerId),
@@ -657,7 +690,7 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
     mgr = await makeManager(relay, factory);
 
     const sid = "93".repeat(32);
-    await mgr.ensureStandingReceiverForAgent("alice");
+    await bringUpAndReserve(mgr);
     const opened = await mgr.createSessionNode(sid, "alice", "bb".repeat(32), COUNTERPARTY_PEER, "corr", true);
     expect(opened.ok, JSON.stringify(opened)).toBe(true);
     await mgr.destroySessionNode("alice", sid, "interrupted");

@@ -418,11 +418,12 @@ export class SessionNodeManager {
   getStandingReceiverReachability(agentName: string): "reserved" | "retrying" | "unreachable" | "absent" { return this.#receivers.getStandingReceiverReachability(agentName); }
   getStandingReceiverAutoNat(): IAutoNatService | null { return this.#receivers.getStandingReceiverAutoNat(); }
   getStandingReceiverAllowedPeer(agentName: string): string | null { return this.#receivers.getStandingReceiverAllowedPeer(agentName); }
-  admitOfferedDialer(agentName: string, initiatorSessionPeerId: string, sessionIdHex: string): "narrowed" | "no_receiver" | "no_peer_named" { return this.#receivers.admitOfferedDialer(agentName, initiatorSessionPeerId, sessionIdHex); }
+  admitOfferedDialer(a: string, p: string, sid: string): "narrowed" | "no_receiver" | "no_peer_named" { return this.#receivers.admitOfferedDialer(a, p, sid); }
+  takeReservationForSession(a: string, c: string, cid: string): Promise<boolean> { return this.#receivers.takeReservationForSession(a, c, cid); } // 055-ONDEMAND
+  getStandingReceiverRelayIds(a: string): string[] { return [...(this.#standingReceivers.get(a)?.relayPeerIds ?? [])]; } // 055-ONDEMAND
   getOfferedDialer(agentName: string, sessionIdHex: string): string | null { return this.#receivers.getOfferedDialer(agentName, sessionIdHex); }
   clearOfferedDialer(agentName: string, sessionIdHex: string): void { return this.#receivers.clearOfferedDialer(agentName, sessionIdHex); }
   revokeOfferedDialer(agentName: string, sessionIdHex: string, offeredPeerId: string | null): void { return this.#receivers.revokeOfferedDialer(agentName, sessionIdHex, offeredPeerId); }
-
   /** ─── DELEGATORS — the leaf-record API other files call ─────────────────────────────── */
 recordSessionGenesis(agentName: string, sessionId: string, participantA: Uint8Array, participantB: Uint8Array, sessionTimestamp: number): void { return this.#leafRecords.recordSessionGenesis(agentName, sessionId, participantA, participantB, sessionTimestamp); }
   setSessionGenesisForTest(agentName: string, sessionId: string, genesis: Uint8Array): void { return this.#leafRecords.setSessionGenesisForTest(agentName, sessionId, genesis); }
@@ -1298,6 +1299,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       srReservationTimeoutMs: this.#srReservationTimeoutMs,
       autoNatProbers: () => this.#autoNatProbers(),
       proveToRelay: (a, circuitAddr, node, cid, surface) => this.#relay.proveToRelay(a, circuitAddr, node, cid, surface),
+      tellRelayReleased: (a, relayPeerId, node, cid) => this.#relay.tellRelayReleased(a, relayPeerId, node, cid),
       reservationCircuitAddrs: (a) => this.#relay.reservationCircuitAddrs(a),
       authenticateStandingReceiver: (a, node, relayPeerId, heldCircuitAddr, cid) => this.#relay.authenticateStandingReceiver(a, node, relayPeerId, heldCircuitAddr, cid),
     });

@@ -36,6 +36,7 @@ import {
   SR_RESERVATION_MAX_RETRIES,
   REVIVE_RESERVATION_CANDIDATES,
   REVIVE_RESERVATION_TIMEOUT_MS,
+  RELEASE_TELL_BUDGET_MS,
   clientSideAskFault,
   holdsCircuit,
   stopWhenSettled,
@@ -80,6 +81,11 @@ export interface StandingReceiverContext {
   /** The AutoNAT prober list, injected by the composition root. */
   autoNatProbers(): string[];
 
+  /**
+   * 055-ONDEMAND — tell a relay this agent is done with its slot. Best-effort: a release that
+   * could not be delivered costs a slot until its TTL and must never fail a seal.
+   */
+  tellRelayReleased(agentName: string, relayPeerId: string, node: CelloNode, correlationId: string): Promise<void>;
   proveToRelay(
     agentName: string,
     circuitAddr: string,
@@ -153,8 +159,6 @@ export class StandingReceivers {
      * receiver's seed — cannot occur, because no probe is built.
      */
     const receiverSeed = randomBytes(32);
-    /** For `spread.granted_then_lost`: how long the walk took, measured rather than inferred. */
-    const walkStartedAt = Date.now();
 
     /**
      * Relay peers are allowed OUTBOUND before the node starts. Unchanged and load-bearing: our own
@@ -176,58 +180,38 @@ export class StandingReceivers {
     });
     await node.start();
 
-    /** Relays that GRANTED during the walk. Compared with what is held at the end — see below. */
-    const grantedRelayIds: string[] = [];
-    for (const circuitAddr of candidateCircuitAddrs) {
-      const outcome = await this.#takeReservation(agentName, node, circuitAddr, correlationId);
-      if (outcome === "granted") {
-        const id = relayPeerIdOf(circuitAddr);
-        if (id) grantedRelayIds.push(id);
-      }
-      // A refusal about the AGENT reproduces on every relay in the pool — the cap is per agent and
-      // the token comes from the directory — so walking on spends a dial per relay to be told the
-      // same thing, and makes one client-side fault read as a fleet-wide outage.
-      if (outcome === "refused_this_agent") break;
-      // 032-RELAYSPREAD: any other outcome moves to the next relay. DO NOT BREAK ON THE FIRST
-      // GRANT — an agent holding one reservation is one relay's bad day away from unreachable.
-    }
-
     /**
-     * ⚠️ **GRANTED EARLY IN THE WALK, GONE BY THE END OF IT** — review LOW-8, and it is the one
-     * condition `spread.grant_not_bound` also covered that the reachability count cannot name.
+     * ⚠️ **THE WALK IS GONE — 055-ONDEMAND, and this is the capacity change itself.**
      *
-     * That event's main case is gone with the rebuild it watched. This one is not: a relay can
-     * grant on the first ask and drop the reservation while the walk is still visiting the others —
-     * a relay restart, a reaper under pressure, a lost connection. The count alone says "2 of 3"
-     * and never says WHICH, which is the difference between an operator looking at a relay and an
-     * operator looking at everything.
+     * The receiver used to visit every relay it had ever heard of and hold a slot on each, for the
+     * life of the login, against the chance that somebody called. Demand was `agents × relays`, so
+     * the tenth relay added a tenth of the fleet's demand and one relay's worth of capacity, and
+     * the ratio `agents / slots-per-relay` never improved however many relays were run.
+     *
+     * **An idle agent now holds ZERO.** A reservation is taken when an offer arrives, on the relay
+     * the directory names (`takeReservationForSession`), and given back at the seal. Demand becomes
+     * `live sessions × 1`.
+     *
+     * **What makes that safe, and it is the reason this is not a reachability regression:**
+     *   - The relay's MAILBOX consults no reservation. Deposit authenticates the depositor by their
+     *     Noise peer id; pull is a signature challenge on the recipient and is an OUTBOUND dial. So
+     *     store-and-forward keeps working with nothing held.
+     *   - The WITNESS is a separate dial on the relay's own protocol. Nothing about the seal, the
+     *     hash chain or the transcript depended on a reservation.
+     *   - A cold call to a LOGGED-OUT agent was already refused with nothing queued, so no
+     *     capability is lost — there was never an answering machine to lose.
+     *
+     * The candidate list is still passed in and still used: it is what the offer path reserves
+     * against when it needs to, and what `cello_status` reports as relays this agent could use.
      */
-    const heldAtEnd = new Set(heldRelayIdsOf(node));
-    const lostDuringWalk = grantedRelayIds.filter((id) => !heldAtEnd.has(id));
-    if (lostDuringWalk.length > 0) {
-      this.#ctx.logger.warn("session.standing_receiver.spread.granted_then_lost", {
-        agentName,
-        relayPeerIds: lostDuringWalk,
-        relaysGranted: grantedRelayIds.length,
-        reservationsHeld: heldAtEnd.size,
-        walkMs: Date.now() - walkStartedAt,
-        correlationId,
-        impact: "these relays granted this agent a reservation during the walk and no longer hold " +
-          "one, so the agent is reachable through fewer relays than it earned. A relay restart, a " +
-          "reaper under pressure, or a lost connection all look like this.",
-      });
-    }
+    this.#ctx.logger.info("session.standing_receiver.idle", {
+      agentName,
+      relaysAvailable: candidateCircuitAddrs.length,
+      correlationId,
+      impact: "this agent holds no relay reservation while idle, by design. One is taken on the " +
+        "relay the directory names when a session is offered, and given back at the seal.",
+    });
 
-    /**
-     * ⚠️ **THE CALLER REPORTS REACHABILITY, NOT THIS FUNCTION** — review MEDIUM-7.
-     *
-     * `#tryCreateStandingReceiver` already emits `session.standing_receiver.reachability` and
-     * `session.standing_receiver.reservation.none` from the same numbers, with a count deduped by
-     * relay. Emitting them here too doubled both. That is not cosmetic: `reservation.none` is the
-     * event MSG-018 counted **481 occurrences of** to justify the reservation retry, so doubling it
-     * breaks every comparison against that baseline — including the live enforcer this unit is
-     * measured by.
-     */
     return { node, seed: receiverSeed };
   }
 
@@ -243,6 +227,133 @@ export class StandingReceivers {
    * ⚠️ **THE NODE IS NOT STOPPED BETWEEN THE PROOF AND THE ASK.** The relay marks the CONNECTION,
    * not the peer id, so closing it throws away the very thing that makes the ask succeed.
    */
+  /**
+   * 055-ONDEMAND — **take a reservation for a SESSION, on the relay the directory named.**
+   *
+   * The public face of `#takeReservation` for the offer path. An idle agent holds nothing, so this
+   * is what makes it dialable, and it lasts only as long as the session that asked for it.
+   *
+   * Returns whether one was granted. A `false` is a degradation, not a failure: the counterparty
+   * can still reach this agent directly, or through the relay's store-and-forward. The one caller
+   * that must treat it as fatal is relay-only mode, which does so at its own guard.
+   */
+  async takeReservationForSession(agentName: string, circuitAddr: string, correlationId: string): Promise<boolean> {
+    const sr = this.#ctx.standingReceivers.get(agentName);
+    if (!sr) {
+      this.#ctx.logger.warn("session.reservation.on_demand.no_receiver", {
+        agentName,
+        circuitAddr,
+        correlationId,
+        impact: "there is no standing receiver to hold a reservation, so this agent cannot be " +
+          "dialled for this session; it is reachable through the relay's store-and-forward only.",
+      });
+      return false;
+    }
+    // The relay must be dialable BEFORE we dial it — our own gater refuses otherwise, which is the
+    // same ordering the login walk uses and the one that cost a whole debugging session when it
+    // was missing.
+    const relayPeerId = relayPeerIdOf(circuitAddr);
+    if (relayPeerId) sr.gater.setAllowedOutboundPeer(relayPeerId);
+    const outcome = await this.#takeReservation(agentName, sr.node, circuitAddr, correlationId);
+    /**
+     * ⚠️ **THE RECEIVER'S RECORD OF WHAT IT HOLDS MUST FOLLOW, or two things go quietly wrong.**
+     * `relayPeerIds` is what the reservation watchdog compares against to decide a reservation was
+     * LOST, and what `cello_status` reports as reachability. Left at its build-time value — empty,
+     * now that nothing is taken at login — the watchdog would see a held circuit it never recorded
+     * and `cello_status` would call a reachable agent unreachable.
+     *
+     * Read from the NODE rather than appended to, and deduped by relay: libp2p announces one
+     * address per relay listen address, so a five-address relay would otherwise count five times.
+     */
+    this.#ctx.standingReceivers.set(agentName, { ...sr, relayPeerIds: heldRelayIdsOf(sr.node) });
+    return outcome === "granted";
+  }
+
+  /**
+   * 055-ONDEMAND — **GIVE THE SLOT BACK AT THE SEAL, BY RECOMPUTING WHAT IS STILL NEEDED.**
+   *
+   * Two things happen, and only the first frees capacity:
+   *   1. **Tell the relay.** `releaseReservation` on the authenticated stream is the ONLY thing that
+   *      returns a slot to the table — a client closing its listener sends the relay nothing, and
+   *      the relay frees one on its own only at the TTL (two hours) or under reaper pressure.
+   *   2. **Recompute the local set.** `releaseAllCircuits()` is all-or-nothing because libp2p gives
+   *      us nothing finer: every listener shares one reservation store, so closing any listener
+   *      clears every entry's refresh timer (054-SRSPLIT review HIGH-2).
+   *
+   * ⚠️ **THAT IS WHY THIS IS A RECOMPUTE AND NOT A SUBTRACTION.** An agent with two live sessions on
+   * two relays that sealed one would otherwise drop the OTHER session's circuit locally while the
+   * relay still held it — a live session whose counterparty can no longer dial back, and no event
+   * anywhere saying so. Dropping everything and re-taking what is still needed cannot drift; the
+   * cost is a prove and an ask per surviving session, about three seconds, and it is idempotent.
+   *
+   * Best-effort throughout: a release that could not be delivered costs a slot until its TTL. It
+   * must never fail a seal, which is why nothing here throws.
+   */
+  async releaseReservationsAfterSeal(
+    agentName: string,
+    stillNeededCircuitAddrs: readonly string[],
+    correlationId: string,
+  ): Promise<void> {
+    const sr = this.#ctx.standingReceivers.get(agentName);
+    if (!sr) return;
+    const heldBefore = heldRelayIdsOf(sr.node);
+    if (heldBefore.length === 0) return;
+
+    // 1. Tell every relay we are done with. Precise, per-relay, and the only thing that frees.
+    const stillNeededRelayIds = new Set(
+      stillNeededCircuitAddrs.map((a) => relayPeerIdOf(a)).filter((id): id is string => id !== null),
+    );
+    for (const relayPeerId of heldBefore) {
+      if (stillNeededRelayIds.has(relayPeerId)) continue;
+      /**
+       * ⚠️ **BOUNDED, BECAUSE THIS RUNS INSIDE A SEAL.** Telling the relay means dialling it, and a
+       * relay that is unreachable would otherwise hold the seal open for as long as its dial takes.
+       * A seal that waits on a courtesy is worse than a slot held until its TTL — measured the hard
+       * way: unbounded, this hung fourteen unrelated suites at 237s each.
+       */
+      await Promise.race([
+        this.#ctx.tellRelayReleased(agentName, relayPeerId, sr.node, correlationId),
+        new Promise<void>((r) => setTimeout(r, RELEASE_TELL_BUDGET_MS).unref?.()),
+      ]);
+    }
+
+    // 2. Recompute locally: drop everything, then re-take what other live sessions still need.
+    try {
+      await sr.node.releaseAllCircuits();
+    } catch (err: unknown) {
+      this.#ctx.logger.warn("session.reservation.release.local_failed", {
+        agentName,
+        correlationId,
+        error: extractErrorMessage(err),
+        impact: "this agent may still announce a circuit it no longer holds at the relay; the " +
+          "watchdog rebuilds the receiver, which restores agreement.",
+      });
+      return;
+    }
+    for (const circuitAddr of stillNeededCircuitAddrs) {
+      const outcome = await this.#takeReservation(agentName, sr.node, circuitAddr, correlationId);
+      if (outcome !== "granted") {
+        this.#ctx.logger.warn("session.reservation.retake.failed", {
+          agentName,
+          circuitAddr,
+          correlationId,
+          impact: "a session that is still live lost its circuit while another sealed, so its " +
+            "counterparty cannot dial back until the receiver is rebuilt. Messages still reach it " +
+            "through the relay's store-and-forward.",
+        });
+      }
+    }
+    // Same reason as the take path: the record follows the node, deduped by relay.
+    const after = this.#ctx.standingReceivers.get(agentName);
+    if (after) this.#ctx.standingReceivers.set(agentName, { ...after, relayPeerIds: heldRelayIdsOf(after.node) });
+    this.#ctx.logger.info("session.reservation.released", {
+      agentName,
+      releasedRelays: heldBefore.filter((id) => !stillNeededRelayIds.has(id)),
+      stillHeld: stillNeededCircuitAddrs.length,
+      correlationId,
+    });
+  }
+
   async #takeReservation(
     agentName: string,
     node: CelloNode,
