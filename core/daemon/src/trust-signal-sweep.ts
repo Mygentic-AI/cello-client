@@ -94,6 +94,20 @@ export function createTrustSignalSweep(deps: TrustSignalSweepDeps): TrustSignalS
   // content-addressed and the drain deletes only on ACK — so this is load, not corruption, but it
   // is load that arrives exactly when the network is already struggling.
   const inFlight = new Set<string>();
+  /**
+   * 048-SWEEPTICK — the problem set this agent reported LAST time, so a steady state is stated once.
+   *
+   * This module was written for a once-per-connection cadence and logs like it: a warn per
+   * unreachable-or-unresolved node per run, plus a `finished` line per run. Since 048 it runs every
+   * five minutes for the life of the daemon, so a node that is delisted but still in the manifest
+   * turned two warns a day into roughly 1,150 — and the next incident is found by grepping
+   * `daemon.log`, which would then return a wall of a condition nobody is going to act on. A warning
+   * that fires on a steady state has stopped being a signal.
+   *
+   * So the CHANGE is warned, the repeat is debugged. Nothing is hidden: the full result is still
+   * returned to the caller and `finished` still carries every count.
+   */
+  const lastProblems = new Map<string, string>();
 
   return async (agentName, agentKeyProvider, agentPubkeyHex, homeNodeId) => {
     if (inFlight.has(agentName)) {
@@ -116,13 +130,18 @@ export function createTrustSignalSweep(deps: TrustSignalSweepDeps): TrustSignalS
   ): Promise<SweepResult> {
     const result: SweepResult = { visited: [], unreachable: [], incomplete: [], rosterUnavailable: false };
 
+    // Which nodes were already a problem last time. A node's FIRST bad sweep warns; the same node
+    // still bad five minutes later is debug. See `lastProblems` — this is the per-node half of it.
+    const previously = new Set((lastProblems.get(agentName) ?? "").split(/[,|]/).filter(Boolean));
+    const problem = (nodeId: string) => (previously.has(nodeId) ? (logger.debug ?? logger.warn) : logger.warn);
+
     // Declared-but-unresolvable nodes, named BEFORE any dialling. These never reach the loop below
     // because the roster excludes them, and saying nothing about them is how one dead node makes
     // "nothing waiting" look true.
     for (const n of getUnresolvedNodes?.() ?? []) {
       if (n.nodeId === homeNodeId) continue;
       result.unreachable.push(n.nodeId);
-      logger.warn("trust_signal.sweep.node_unreachable", { agentName, node: n.nodeId, reason: n.reason });
+      problem(n.nodeId)("trust_signal.sweep.node_unreachable", { agentName, node: n.nodeId, reason: n.reason });
     }
 
     const roster = await resolveConsortiumRoster();
@@ -153,7 +172,7 @@ export function createTrustSignalSweep(deps: TrustSignalSweepDeps): TrustSignalS
         // fault while it wires the connection up, where `conn` is undefined and there is nothing to
         // stop. One node failing must never end the sweep.
         result.unreachable.push(node.nodeId);
-        logger.warn("trust_signal.sweep.node_unreachable", { agentName, node: node.nodeId, reason: extractErrorMessage(err) });
+        problem(node.nodeId)("trust_signal.sweep.node_unreachable", { agentName, node: node.nodeId, reason: extractErrorMessage(err) });
         continue;
       }
 
@@ -189,7 +208,7 @@ export function createTrustSignalSweep(deps: TrustSignalSweepDeps): TrustSignalS
           // an exit-point label standing in for the real cause, which is the reading an operator
           // would then act on.
           result.unreachable.push(node.nodeId);
-          logger.warn("trust_signal.sweep.node_unreachable", {
+          problem(node.nodeId)("trust_signal.sweep.node_unreachable", {
             agentName, node: node.nodeId, reason: "never_connected", ceilingMs,
           });
         } else {
@@ -197,7 +216,7 @@ export function createTrustSignalSweep(deps: TrustSignalSweepDeps): TrustSignalS
           // or only part of it and cannot tell — a different answer from a clean sweep, recorded
           // as one.
           result.incomplete.push(node.nodeId);
-          logger.warn("trust_signal.sweep.no_terminal_frame", { agentName, node: node.nodeId, ceilingMs });
+          problem(node.nodeId)("trust_signal.sweep.no_terminal_frame", { agentName, node: node.nodeId, ceilingMs });
         }
       } finally {
         // `stop` awaits any in-flight pickup handler before tearing the stream down (C1 review), so
@@ -206,12 +225,15 @@ export function createTrustSignalSweep(deps: TrustSignalSweepDeps): TrustSignalS
       }
     }
 
-    logger.info("trust_signal.sweep.finished", {
-      agentName,
-      visited: result.visited.length,
-      unreachable: result.unreachable.length,
-      incomplete: result.incomplete.length,
-    });
+    // The signature of anything an operator might act on. `visited` is deliberately absent: a node
+    // moving from unreachable back to visited changes this string via the other two buckets.
+    const problems = [...result.unreachable].sort().join(",") + "|" + [...result.incomplete].sort().join(",");
+    const changed = lastProblems.get(agentName) !== problems;
+    lastProblems.set(agentName, problems);
+
+    const line = { agentName, visited: result.visited.length, unreachable: result.unreachable.length, incomplete: result.incomplete.length };
+    if (changed) logger.info("trust_signal.sweep.finished", line);
+    else logger.debug?.("trust_signal.sweep.finished", { ...line, repeat: true });
     return result;
   };
 }

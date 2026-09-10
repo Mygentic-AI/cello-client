@@ -100,14 +100,34 @@ export function createTrustSignalSweepTicker(deps: TrustSignalSweepTickerDeps): 
   const intervalMs = deps.intervalMs ?? SWEEP_TICK_INTERVAL_MS;
   const timers = new Map<string, NodeJS.Timeout>();
 
-  function arm(agentName: string, agentKeyProvider: KeyProvider, agentPubkeyHex: string): void {
+  function arm(
+    agentName: string,
+    agentKeyProvider: KeyProvider,
+    agentPubkeyHex: string,
+    homeNodeId: string | undefined,
+  ): void {
     if (timers.has(agentName)) return;
+    // Whether the PREVIOUS tick skipped, so the skip line marks a transition rather than repeating.
+    let wasSkipping = false;
     const timer = setInterval(() => {
       if (!isAgentOnline(agentName)) {
-        // Not an error and not silence: an operator asking why a signal has not arrived needs to be
-        // able to see that we deliberately did not look, and why.
-        logger.info("trust_signal.sweep.tick_skipped", { agentName, reason: "agent_offline" });
+        // ONCE PER OFFLINE STRETCH, not once per tick. An operator asking why a signal has not
+        // arrived needs to see that we deliberately did not look — they need it once. Review
+        // measured the alternative: the tick is armed for EVERY loaded agent at boot, online or
+        // not, so an operator running one of four agents would get three timers writing this line
+        // every five minutes forever — 864 lines a day stating that the system is working as
+        // designed. `daemon.log` reaching 176 MB of one condition talking to itself is a defect
+        // this milestone already has an order open for; adding a second source of it while fixing
+        // a different bug is not a trade worth making.
+        if (!wasSkipping) {
+          logger.info("trust_signal.sweep.tick_skipped", { agentName, reason: "agent_offline" });
+          wasSkipping = true;
+        }
         return;
+      }
+      if (wasSkipping) {
+        logger.info("trust_signal.sweep.tick_resumed", { agentName });
+        wasSkipping = false;
       }
       // Never awaited — nothing here is on a path an operator waits on. The catch LOGS, because a
       // background sweep that fails in silence is how the original defect survived for weeks.
@@ -115,7 +135,12 @@ export function createTrustSignalSweepTicker(deps: TrustSignalSweepTickerDeps): 
       // Failure must not end the tick. This is the only thing running collection for a long-lived
       // daemon, so a swallowed-and-stopped tick would put the agent back to reconnect-only
       // collection after appearing to work — a worse version of the bug, because it starts healthy.
-      void sweep(agentName, agentKeyProvider, agentPubkeyHex).catch((err: unknown) => {
+      // homeNodeId CAPTURED, not dropped. Nothing supplies it today — `signaling-wiring.ts` types
+      // the getter as three arguments — so this is inert. It is here because skipping the node whose
+      // drain already ran is the obvious next optimisation on this exact path, and the moment
+      // someone wires it the connect sweep would skip home while every tick visited it, with
+      // nothing asserting the divergence.
+      void sweep(agentName, agentKeyProvider, agentPubkeyHex, homeNodeId).catch((err: unknown) => {
         logger.warn("trust_signal.sweep.tick_failed", { agentName, reason: extractErrorMessage(err) });
       });
     }, intervalMs);
@@ -127,7 +152,7 @@ export function createTrustSignalSweepTicker(deps: TrustSignalSweepTickerDeps): 
 
   return {
     sweepAndTick: (agentName, agentKeyProvider, agentPubkeyHex, homeNodeId) => {
-      arm(agentName, agentKeyProvider, agentPubkeyHex);
+      arm(agentName, agentKeyProvider, agentPubkeyHex, homeNodeId);
       return sweep(agentName, agentKeyProvider, agentPubkeyHex, homeNodeId);
     },
     stop: (agentName: string) => {

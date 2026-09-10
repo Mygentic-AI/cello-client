@@ -66,10 +66,13 @@ export interface OutboundSessionDeps {
    * root AFTER this factory is called — and because the answer changes while the tick is running,
    * which is the whole reason it is asked per tick rather than once.
    *
-   * Absent means "assume online", which is the in-process test path where there is no online set
-   * and every agent is by definition running.
+   * REQUIRED. It was optional with an "assume online" default, and review was right that the
+   * default pointed the wrong way: absent would have meant "sweep for everyone", while this dep's
+   * whole purpose is that collecting for an agent the operator switched off is the kill switch
+   * failing to switch something off. A future second composition root must not be able to omit it
+   * quietly.
    */
-  getOnlineAgents?: () => ReadonlySet<string>;
+  getOnlineAgents: () => ReadonlySet<string>;
   /**
    * DOD-M15-SEALPARTIES-1: where a dead seal ceremony leaves its mark. A VISITING stream runs the
    * seal ceremony too (the cross-node close), so it needs the same sink as a home stream — a
@@ -737,8 +740,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
   const trustSignalSweepTicker = createTrustSignalSweepTicker({
     logger,
     sweep: sweepTrustSignals,
-    // Absent set ⇒ online. See the dep's docblock: that is the in-process test path, not production.
-    isAgentOnline: (agentName) => getOnlineAgents?.().has(agentName) ?? true,
+    isAgentOnline: (agentName) => getOnlineAgents().has(agentName),
   });
 
   const crossNodeBrokerBySession = new Map<string, string>();
@@ -1110,12 +1112,16 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
     // a second implementation of that distinction is how the two drift until one starts reporting a
     // directory outage as the peer being offline.
     runDiscoveryLookup,
-    /** 043-SIGNALDELIVERY C2: run in the BACKGROUND after a home stream authenticates. */
-    sweepTrustSignals,
     /**
-     * 048-SWEEPTICK: what the signaling wiring actually calls. Sweeps immediately on connect — the
-     * C2 behaviour, unchanged — and arms the five-minute tick that covers a connection which never
-     * drops. `stopAll` on daemon shutdown.
+     * 048-SWEEPTICK: the ONLY sweep that escapes this module, and deliberately so. It sweeps
+     * immediately on connect — the 043 C2 behaviour, unchanged — and arms the five-minute tick that
+     * covers a connection which never drops.
+     *
+     * The bare `sweepTrustSignals` used to be exported beside this "for anything that wants one
+     * collection without arming a timer". Nothing wanted one, and its only live effect was to keep
+     * the exact revert this unit exists to prevent — wiring the un-ticked sweep into
+     * `getSweepTrustSignals` — a one-word edit that a source-text guard then had to defend. Removing
+     * it makes that revert impossible to write rather than checked for.
      */
     sweepTrustSignalsAndTick: trustSignalSweepTicker.sweepAndTick,
     trustSignalSweepTicker,

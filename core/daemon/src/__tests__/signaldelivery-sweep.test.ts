@@ -329,3 +329,70 @@ describe("043-SIGNALDELIVERY C2 — review fixes", () => {
     expect(first.incomplete.length + second.incomplete.length).toBe(1);
   });
 });
+
+describe("048-SWEEPTICK — a steady-state problem is stated once, not every five minutes", () => {
+  it("WARNS a node's first bad sweep and DEBUGS the identical repeat, while the RESULT is unchanged", async () => {
+    /**
+     * This module was written for a once-per-connection cadence. Since 048 it runs every five
+     * minutes for the life of the daemon, so a node that is delisted but still declared in the
+     * manifest went from two warns a day to roughly 1,150 — and the next incident is found by
+     * grepping `daemon.log`. A warning that fires on a steady state has stopped being a signal.
+     *
+     * What must NOT change is the answer: the buckets the caller receives are identical either way.
+     * Demoting a log line is not the same as deciding a node is fine, and that is the whole risk in
+     * this change.
+     */
+    const warns: string[] = [];
+    const debugs: string[] = [];
+    const logger = {
+      info: () => {}, error: () => {},
+      warn: (event: string) => { warns.push(event); },
+      debug: (event: string) => { debugs.push(event); },
+    } as never;
+    const h = harness({ nodes: ["a"], completeOn: ["a"] });
+    const sweep = createTrustSignalSweep({
+      logger,
+      resolveConsortiumRoster: async () => ROSTER(["a"]),
+      openVisitingConnection: h.openVisitingConnection as never,
+      getUnresolvedNodes: () => [{ nodeId: "dead", reason: "bootstrap probe failed" }],
+      ceilingMs: 100,
+    });
+
+    const first = await sweep("alice", {} as never, "a".repeat(64));
+    expect(warns.filter((e) => e === "trust_signal.sweep.node_unreachable"), "first time: warn").toHaveLength(1);
+
+    warns.length = 0; debugs.length = 0;
+    const second = await sweep("alice", {} as never, "a".repeat(64));
+    expect(warns, "same problem five minutes later: nothing at warn").toHaveLength(0);
+    expect(debugs.filter((e) => e === "trust_signal.sweep.node_unreachable"), "still recorded, at debug").toHaveLength(1);
+
+    // THE ANSWER IS THE SAME. The dead node is still reported unreachable to the caller on both
+    // runs — the quieting is about the log, never about the verdict.
+    expect(first.unreachable, "first").toEqual(["dead"]);
+    expect(second.unreachable, "second — a quieter log is not a cleaner result").toEqual(["dead"]);
+  });
+
+  it("warns AGAIN when the problem set changes", async () => {
+    // The dedup keys on the problem set, so a node going bad after a clean run must still shout.
+    const warns: string[] = [];
+    const logger = {
+      info: () => {}, error: () => {}, debug: () => {},
+      warn: (event: string) => { warns.push(event); },
+    } as never;
+    const h = harness({ nodes: ["a"], completeOn: ["a"] });
+    let dead: { nodeId: string; reason: string }[] = [];
+    const sweep = createTrustSignalSweep({
+      logger,
+      resolveConsortiumRoster: async () => ROSTER(["a"]),
+      openVisitingConnection: h.openVisitingConnection as never,
+      getUnresolvedNodes: () => dead,
+      ceilingMs: 100,
+    });
+
+    await sweep("alice", {} as never, "a".repeat(64));          // clean
+    expect(warns).toHaveLength(0);
+    dead = [{ nodeId: "b", reason: "gone" }];
+    await sweep("alice", {} as never, "a".repeat(64));          // newly bad
+    expect(warns.filter((e) => e === "trust_signal.sweep.node_unreachable"), "a change still shouts").toHaveLength(1);
+  });
+});

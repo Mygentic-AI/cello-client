@@ -193,6 +193,59 @@ describe("048-SWEEPTICK — the tick", () => {
   });
 });
 
+describe("048-SWEEPTICK — the tick must not become a second source of log noise", () => {
+  it("says it is skipping ONCE per offline stretch, not once per tick", async () => {
+    // The tick is armed for EVERY loaded agent at boot, online or not. At one info line per tick
+    // that is 288 a day per idle agent, all of them saying the system works as designed — and this
+    // milestone already has an order open because daemon.log reached 176 MB of one condition
+    // talking to itself. The line has to mark the TRANSITION.
+    vi.useFakeTimers();
+    const events: string[] = [];
+    const logger = {
+      debug: noop, warn: noop, error: noop,
+      info: (event: string) => { events.push(event); },
+    } as never;
+    const { sweep } = recordingSweep();
+    let online = false;
+    const ticker = createTrustSignalSweepTicker({ logger, sweep, isAgentOnline: () => online });
+
+    await ticker.sweepAndTick("alice", KP, "aa");
+    events.length = 0;
+
+    await vi.advanceTimersByTimeAsync(SWEEP_TICK_INTERVAL_MS * 5);
+    expect(events.filter((e) => e === "trust_signal.sweep.tick_skipped"), "five ticks, one line").toHaveLength(1);
+
+    online = true;
+    await vi.advanceTimersByTimeAsync(SWEEP_TICK_INTERVAL_MS);
+    expect(events, "and coming back is stated, so the gap in the log has two ends")
+      .toContain("trust_signal.sweep.tick_resumed");
+
+    online = false;
+    await vi.advanceTimersByTimeAsync(SWEEP_TICK_INTERVAL_MS * 3);
+    expect(events.filter((e) => e === "trust_signal.sweep.tick_skipped"), "a NEW stretch says so again").toHaveLength(2);
+
+    ticker.stopAll();
+  });
+
+  it("forwards homeNodeId on every tick, not only on the connect sweep", async () => {
+    // Inert today — nothing supplies it. It is asserted because the two paths diverging silently is
+    // what would happen the moment someone wires it: connect would skip home, every tick would
+    // visit it.
+    vi.useFakeTimers();
+    const seen: (string | undefined)[] = [];
+    const sweep = vi.fn(async (_n: string, _k: unknown, _p: string, homeNodeId?: string) => {
+      seen.push(homeNodeId); return EMPTY;
+    }) as never;
+    const ticker = createTrustSignalSweepTicker({ logger: silent, sweep, isAgentOnline: () => true });
+
+    await ticker.sweepAndTick("alice", KP, "aa", "gcp-use1");
+    await vi.advanceTimersByTimeAsync(SWEEP_TICK_INTERVAL_MS * 2);
+    expect(seen).toEqual(["gcp-use1", "gcp-use1", "gcp-use1"]);
+
+    ticker.stopAll();
+  });
+});
+
 describe("048-SWEEPTICK — overlap is the EXISTING guard's job, not a second mechanism", () => {
   it("a tick that lands while a sweep is still running does not start a second one", async () => {
     // Composed over the REAL createTrustSignalSweep, because the property belongs to its in-flight
