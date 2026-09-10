@@ -281,8 +281,23 @@ export interface CelloNode {
   listenOnCircuit(circuitAddr: string): Promise<void>;
 
   /**
-   * 054-SRSPLIT — stop listening on a circuit taken with `listenOnCircuit`. Resolves `true` if one
-   * was held.
+   * 054-SRSPLIT — stop listening on **every** circuit this node holds. Resolves `true` if it held
+   * any.
+   *
+   * ⚠️ **IT IS ALL OF THEM, NOT ONE, AND THAT IS LIBP2P'S SHAPE RATHER THAN A CHOICE.** Measured in
+   * `@libp2p/circuit-relay-v2@4.2.5`: `transport/index.js` hands **one shared `reservationStore`**
+   * to every listener it creates, and `listener.close()` calls `reservationStore
+   * .cancelReservations()`, which is `clearTimeout` over EVERY entry then `reservations.clear()`.
+   * So closing the listener for relay A cancels the refresh timers for B and C too.
+   *
+   * An earlier version of this method took one address and closed the listener that announced it.
+   * It looked per-relay and was not: the other relays' listeners kept their own `listeningAddrs`,
+   * so the node went on ANNOUNCING circuits nobody would renew — routes that die at the relay's TTL
+   * while `cello status` still says `reserved`. Naming the method for what it does is the fix;
+   * pretending otherwise is how that gets rebuilt.
+   *
+   * There is no per-relay release in libp2p's client: `#removeReservation` is private and reached
+   * only by its own expiry signal.
    *
    * ⚠️ **THIS IS THE LOCAL HALF, AND ON ITS OWN IT FREES NOTHING AT THE RELAY.** Measured in
    * `@libp2p/circuit-relay-v2@4.2.5`: closing the listener runs `reservationStore
@@ -302,7 +317,7 @@ export interface CelloNode {
    *   { reason: 'node_stopped', message }
    *   { reason: 'transport_manager_unavailable', message }
    */
-  releaseCircuit(circuitAddr: string): Promise<boolean>;
+  releaseAllCircuits(): Promise<boolean>;
 
   /**
    * Connect to a remote peer by multiaddr string.

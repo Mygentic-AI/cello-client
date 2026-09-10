@@ -102,7 +102,7 @@ describe("DOD-M15-RELAYPROVE-ORDER-1: listenOnCircuit", () => {
   }, 20_000);
 });
 
-describe("054-SRSPLIT: releaseCircuit — giving a reservation back", () => {
+describe("054-SRSPLIT: releaseAllCircuits — giving reservations back", () => {
   const nodes: CelloNode[] = [];
   afterEach(async () => {
     for (const n of nodes.splice(0)) { try { await n.stop(); } catch { /* cleanup */ } }
@@ -117,7 +117,7 @@ describe("054-SRSPLIT: releaseCircuit — giving a reservation back", () => {
      * circuit-relay-v2 has no unreserve message. The relay's server frees a reservation only when
      * its TTL aborts — two hours by default — and has no disconnect listener.
      *
-     * So `releaseCircuit` is the LOCAL half: it stops us advertising a route we can no longer be
+     * So `releaseAllCircuits` is the LOCAL half: it stops us advertising a route we can no longer be
      * reached on. **It does not free capacity**, and the second assertion pins that so nobody later
      * reads this method as a release and builds "released at seal" on top of it. The verb that
      * frees the slot lives on `/cello/relay/1.0.0` (054-SRSPLIT part A2), in the relay.
@@ -142,7 +142,7 @@ describe("054-SRSPLIT: releaseCircuit — giving a reservation back", () => {
       "precondition: a reservation must be HELD before releasing it can mean anything",
     ).toBe(true);
 
-    const released = await client.releaseCircuit(`${relayAddr!}/p2p-circuit`);
+    const released = await client.releaseAllCircuits();
 
     expect(released, "it reports having held one").toBe(true);
     expect(
@@ -152,7 +152,7 @@ describe("054-SRSPLIT: releaseCircuit — giving a reservation back", () => {
     ).toBe(false);
     expect(
       relay.releaseRelayReservation(client.getPeerId()),
-      "⚠️ TRUE MEANS THE RELAY STILL HELD IT. That is not a bug in releaseCircuit — it is the reason " +
+      "⚠️ TRUE MEANS THE RELAY STILL HELD IT. That is not a bug in releaseAllCircuits — it is the reason " +
         "the relay needs a release VERB. If this ever goes false, libp2p has started telling the " +
         "relay, and the verb can go.",
     ).toBe(true);
@@ -164,15 +164,55 @@ describe("054-SRSPLIT: releaseCircuit — giving a reservation back", () => {
     const node = await createNode({ keyProvider: generateKeypair(), listenAddresses: ["/ip4/127.0.0.1/tcp/0"] });
     nodes.push(node);
     await node.start();
-    await expect(node.releaseCircuit("/ip4/127.0.0.1/tcp/4001/p2p-circuit")).resolves.toBe(false);
+    await expect(node.releaseAllCircuits()).resolves.toBe(false);
   }, 20_000);
 
-  it("refuses a non-circuit address by name, exactly as listenOnCircuit does", async () => {
-    const node = await createNode({ keyProvider: generateKeypair(), listenAddresses: ["/ip4/127.0.0.1/tcp/0"] });
-    nodes.push(node);
-    await node.start();
-    await expect(node.releaseCircuit("/ip4/127.0.0.1/tcp/4001")).rejects.toMatchObject({
-      reason: "not_a_circuit_address",
-    });
-  }, 20_000);
+  it("★★★ releasing gives back EVERY circuit, and the caller must not expect otherwise", async () => {
+    /**
+     * ⚠️ THE ASSERTION THAT KEEPS THE NAME HONEST — review HIGH-2, which this method's first version
+     * got wrong in the most expensive way available.
+     *
+     * It took ONE address and closed the listener announcing it. Measured in
+     * `@libp2p/circuit-relay-v2@4.2.5`: every listener shares ONE `reservationStore`, and
+     * `listener.close()` calls `cancelReservations()` — `clearTimeout` over every entry, then
+     * `reservations.clear()`. So closing relay A's listener cleared the refresh timers for B and C
+     * while their listeners kept announcing their addresses. The agent went on advertising circuits
+     * nobody would renew: routes that die at the relay's TTL while `cello status` still reads
+     * `reserved`.
+     *
+     * A one-circuit fixture cannot see that — which is why the original test passed. Two relays can.
+     */
+    const relays = await Promise.all([0, 1].map(async () => {
+      const r = await createNode({
+        keyProvider: generateKeypair(),
+        listenAddresses: ["/ip4/127.0.0.1/tcp/0"],
+        relayServer: { enabled: true, reservations: { maxReservations: 64, applyDefaultLimit: false } },
+      });
+      nodes.push(r);
+      await r.start();
+      return r.listenAddresses().find((a) => a.includes("/tcp/"))!;
+    }));
+
+    const client = await createNode({ keyProvider: generateKeypair(), listenAddresses: ["/ip4/127.0.0.1/tcp/0"] });
+    nodes.push(client);
+    await client.start();
+    for (const relayAddr of relays) {
+      await client.dial(relayAddr);
+      await client.listenOnCircuit(`${relayAddr}/p2p-circuit`);
+    }
+    expect(
+      new Set(client.listenAddresses()
+        .filter((a) => a.split("/").includes("p2p-circuit"))
+        .map((a) => /\/p2p\/([^/]+)\/p2p-circuit/.exec(a)?.[1])).size,
+      "precondition: two relays must actually be held, or this measures nothing",
+    ).toBe(2);
+
+    await client.releaseAllCircuits();
+
+    expect(
+      client.listenAddresses().filter((a) => a.split("/").includes("p2p-circuit")),
+      "NOTHING is left announced. Leaving one advertised while its refresh timer has been cleared " +
+        "is the silent failure: it reads as reachable until the relay's TTL runs out.",
+    ).toEqual([]);
+  }, 40_000);
 });

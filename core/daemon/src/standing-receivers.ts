@@ -153,6 +153,8 @@ export class StandingReceivers {
      * receiver's seed — cannot occur, because no probe is built.
      */
     const receiverSeed = randomBytes(32);
+    /** For `spread.granted_then_lost`: how long the walk took, measured rather than inferred. */
+    const walkStartedAt = Date.now();
 
     /**
      * Relay peers are allowed OUTBOUND before the node starts. Unchanged and load-bearing: our own
@@ -174,11 +176,14 @@ export class StandingReceivers {
     });
     await node.start();
 
-    /** Circuit addresses whose relay ACTUALLY GRANTED this identity a reservation. */
-    const grantedAddrs: string[] = [];
+    /** Relays that GRANTED during the walk. Compared with what is held at the end — see below. */
+    const grantedRelayIds: string[] = [];
     for (const circuitAddr of candidateCircuitAddrs) {
       const outcome = await this.#takeReservation(agentName, node, circuitAddr, correlationId);
-      if (outcome === "granted") grantedAddrs.push(circuitAddr);
+      if (outcome === "granted") {
+        const id = relayPeerIdOf(circuitAddr);
+        if (id) grantedRelayIds.push(id);
+      }
       // A refusal about the AGENT reproduces on every relay in the pool — the cap is per agent and
       // the token comes from the directory — so walking on spends a dial per relay to be told the
       // same thing, and makes one client-side fault read as a fleet-wide outage.
@@ -188,29 +193,41 @@ export class StandingReceivers {
     }
 
     /**
-     * DOD-NAT-REACHABILITY-1 observability. Two numbers, two names: `relaysOffered` is how many
-     * relays were candidates, `reservationsHeld` is how many this node actually holds — counted the
-     * only way that proves a grant, which is an ANNOUNCED `/p2p-circuit` address.
+     * ⚠️ **GRANTED EARLY IN THE WALK, GONE BY THE END OF IT** — review LOW-8, and it is the one
+     * condition `spread.grant_not_bound` also covered that the reachability count cannot name.
+     *
+     * That event's main case is gone with the rebuild it watched. This one is not: a relay can
+     * grant on the first ask and drop the reservation while the walk is still visiting the others —
+     * a relay restart, a reaper under pressure, a lost connection. The count alone says "2 of 3"
+     * and never says WHICH, which is the difference between an operator looking at a relay and an
+     * operator looking at everything.
      */
-    const circuitAddrs = node.listenAddresses().filter((a) => a.split("/").includes("p2p-circuit")).length;
-    this.#ctx.logger.info("session.standing_receiver.reachability", {
-      agentName,
-      relaysOffered: candidateCircuitAddrs.length,
-      reservationsHeld: circuitAddrs,
-      correlationId,
-    });
-    if (candidateCircuitAddrs.length > 0 && circuitAddrs === 0) {
-      this.#ctx.logger.warn("session.standing_receiver.reservation.none", {
+    const heldAtEnd = new Set(heldRelayIdsOf(node));
+    const lostDuringWalk = grantedRelayIds.filter((id) => !heldAtEnd.has(id));
+    if (lostDuringWalk.length > 0) {
+      this.#ctx.logger.warn("session.standing_receiver.spread.granted_then_lost", {
         agentName,
-        relaysOffered: candidateCircuitAddrs.length,
-        reservationsHeld: circuitAddrs,
-        relayPeerIds: candidateCircuitAddrs.map((a) => relayPeerIdOf(a)).filter((id): id is string => id !== null),
+        relayPeerIds: lostDuringWalk,
+        relaysGranted: grantedRelayIds.length,
+        reservationsHeld: heldAtEnd.size,
+        walkMs: Date.now() - walkStartedAt,
         correlationId,
-        impact: "this agent holds no relay reservation, so a counterparty behind NAT cannot dial " +
-          "it. Messages still arrive through the relay's store-and-forward; a direct session " +
-          "cannot be opened to it.",
+        impact: "these relays granted this agent a reservation during the walk and no longer hold " +
+          "one, so the agent is reachable through fewer relays than it earned. A relay restart, a " +
+          "reaper under pressure, or a lost connection all look like this.",
       });
     }
+
+    /**
+     * ⚠️ **THE CALLER REPORTS REACHABILITY, NOT THIS FUNCTION** — review MEDIUM-7.
+     *
+     * `#tryCreateStandingReceiver` already emits `session.standing_receiver.reachability` and
+     * `session.standing_receiver.reservation.none` from the same numbers, with a count deduped by
+     * relay. Emitting them here too doubled both. That is not cosmetic: `reservation.none` is the
+     * event MSG-018 counted **481 occurrences of** to justify the reservation retry, so doubling it
+     * breaks every comparison against that baseline — including the live enforcer this unit is
+     * measured by.
+     */
     return { node, seed: receiverSeed };
   }
 
@@ -272,12 +289,46 @@ export class StandingReceivers {
     const timedOut = Symbol("listen_timeout");
     let outcome: "asked" | typeof timedOut = timedOut;
     try {
+      /**
+       * ⚠️ **AN ABANDONED ASK NOW LANDS ON A NODE THAT LIVES ON** — review MEDIUM-5, and it is the
+       * mirror image of the hazard the old probe teardown existed for.
+       *
+       * When a probe timed out it was destroyed, so a grant arriving late died with it. There is
+       * one long-lived node now: a late grant ADDS a circuit address after the walk has counted
+       * what it holds, so the receiver would advertise a relay that is in neither `sr.relayPeerIds`
+       * nor the gater's reserved set — the ledger and the advertised addresses disagreeing, which
+       * is what the watchdog then churns on.
+       *
+       * So a late grant is GIVEN BACK rather than kept. Releasing costs a dial; keeping it costs a
+       * disagreement no operator can see, and a slot on a relay we already decided against.
+       */
+      const askP = node.listenOnCircuit(circuitAddr).then(() => "asked" as const);
+      void askP.catch(() => { /* the race below reports it; this only stops an unhandled rejection */ });
       outcome = await Promise.race([
-        node.listenOnCircuit(circuitAddr).then(() => "asked" as const),
+        askP,
         new Promise<typeof timedOut>((resolve) => {
           timer = setTimeout(() => resolve(timedOut), this.#ctx.srReservationTimeoutMs);
         }),
       ]);
+      if (outcome === timedOut) {
+        void askP.then(
+          () => {
+            this.#ctx.logger.warn("session.standing_receiver.reservation.late_grant_released", {
+              agentName,
+              circuitAddr,
+              correlationId,
+              impact: "this relay answered after the walk had moved on, so its circuit was not " +
+                "counted or advertised. Given back rather than held: a slot nobody knows about is " +
+                "one the relay cannot reuse and this agent cannot rely on. ⚠️ This drops EVERY " +
+                "circuit — libp2p's reservation store is shared across listeners and cannot " +
+                "release one — so the receiver is rebuilt by the watchdog, which is the correct " +
+                "outcome: a walk whose result is already wrong should be redone, not patched.",
+            });
+            return node.releaseAllCircuits().catch(() => false);
+          },
+          () => { /* it failed rather than arriving late; the rejection is already reported */ },
+        );
+      }
     } catch (err: unknown) {
       error = extractErrorMessage(err);
       // A fault of OURS keeps its own name rather than being re-derived from the relay connection,
@@ -296,16 +347,26 @@ export class StandingReceivers {
       return "granted";
     }
 
+    /**
+     * ⚠️ **THE CONNECTION CHECK APPLIES TO BOTH OUTCOMES** — review MEDIUM-6.
+     *
+     * "Asked" does not mean the relay answered: a relay that is down yields no circuit address,
+     * indistinguishable here from one that answered and granted nothing. An open connection is what
+     * separates them, and we have one to ask.
+     *
+     * The first version of this rewrite applied that check only to the `asked` branch, so a HUNG
+     * ask short-circuited to `reservation_did_not_complete_in_time` — latency — when the relay was
+     * simply gone. That is a name for where the failure surfaced, not for what went wrong, in a
+     * unit whose headline is that behaviour does not change.
+     */
+    const connectedToRelay = node.getConnections().some((c) => c.peerId === relayPeerId);
     const reason = askFault !== undefined
       ? askFault
-      : outcome === "asked"
-        // ⚠️ "ASKED" DOES NOT MEAN THE RELAY ANSWERED. A relay that is down yields no circuit
-        // address, indistinguishable here from one that answered and granted nothing. An open
-        // connection to it is what separates them, and we have one to ask.
-        ? (node.getConnections().some((c) => c.peerId === relayPeerId)
+      : !connectedToRelay
+        ? "relay_unreachable"
+        : outcome === "asked"
           ? "relay_granted_no_reservation"
-          : "relay_unreachable")
-        : "reservation_did_not_complete_in_time";
+          : "reservation_did_not_complete_in_time";
     this.#ctx.srLastRejectionReason.set(agentName, reason);
     this.#ctx.logger.warn("session.standing_receiver.relay.rejected", {
       agentName,

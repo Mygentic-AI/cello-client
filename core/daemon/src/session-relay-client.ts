@@ -627,6 +627,11 @@ export class AgentRelayClient {
    * the same `#submitChain` as submits, guaranteeing no overlap.
    */
   #pendingRecord: ((result: "ok" | "rejected" | "closed") => void) | null = null;
+  /**
+   * 054-SRSPLIT — the in-flight `relay_release_reservation`. At most one: releases are rare and
+   * serialized on the shared stream, exactly like `#pendingRecord`, whose ack also carries no id.
+   */
+  #pendingRelease: ((released: boolean) => void) | null = null;
   /** Serializes submits so only one is in flight at a time across all sessions. */
   #submitChain: Promise<unknown> = Promise.resolve();
   /** session_id hex → { the live node to (re)dial from, inbound leaf handler, Option-B assignment to present }. */
@@ -1092,6 +1097,11 @@ export class AgentRelayClient {
         ...(detail ? { detail } : {}),
         ...(retry_after_ms !== undefined ? { retry_after_ms } : {}),
       });
+    } else if (type === "relay_release_ok") {
+      // 054-SRSPLIT. `released` is the relay's own answer to "did I actually hold one?" — a
+      // release of a slot we never had is a true `false`, not a failure, and the caller says so.
+      const r = this.#pendingRelease; this.#pendingRelease = null;
+      if (r) r(frame["released"] === true);
     } else if (type === "assignment_ok") {
       // The relay verified + recorded our client-presented assignment.
       const r = this.#pendingRecord; this.#pendingRecord = null; if (r) r("ok");
@@ -1619,74 +1629,75 @@ export class AgentRelayClient {
   /**
    * 054-SRSPLIT — **TELL THE RELAY WE ARE DONE WITH OUR SLOT.**
    *
-   * Resolves whether the relay confirmed it freed one. `false` covers both "we held none" and "we
-   * could not reach the relay to say so", and the caller must not read it as failure: releasing is
-   * tidy-up, and a release that could not be delivered costs a slot until its TTL rather than
-   * breaking anything the agent is doing.
+   * Resolves whether the relay confirmed it freed one. `false` covers "we held none" and "we could
+   * not reach the relay to say so" alike, and the caller must not read it as failure: releasing is
+   * tidy-up, and one that could not be delivered costs a slot until its TTL rather than breaking
+   * anything the agent is doing. Every path that returns false says why.
    *
-   * ⚠️ **`releaseCircuit` ON THE NODE IS NOT THIS, AND NEITHER IS ENOUGH ALONE.** That one closes
-   * our listener so we stop advertising a route — measured in `@libp2p/circuit-relay-v2`, it runs
-   * `cancelReservations()`, which clears our own timers and map and sends the relay nothing. THIS
-   * is what returns the slot. Do both: stop advertising, then hand it back.
+   * ⚠️ **IT GOES ON THE LONG-LIVED DELIVERY STREAM, NOT A RESERVATION-PURPOSE ONE, AND THAT IS NOT
+   * A STYLE CHOICE.** The first version opened a fresh stream and authenticated with
+   * `purpose: "reservation"` — mirroring the proof. The relay's handler treats that purpose as a
+   * proof and nothing else: it answers `relay_auth_ok`, **closes the stream and returns without
+   * entering the message loop**. So the release frame went into a stream nobody was reading, the
+   * reply never came, and the verb was inert while every test passed. Found in review, not by the
+   * suite.
    *
    * ⚠️ **THE FRAME CARRIES NO PEER ID, deliberately.** The relay frees the peer this connection
-   * authenticated as. A peer id on the wire would let any registered agent free another's
-   * reservation.
+   * authenticated as. A peer id on the wire would let any registered agent free another's.
    */
   async releaseReservation(node: CelloNode): Promise<boolean> {
     if (this.#closed) return false;
-    for (const addr of this.#relayAddrs) {
-      try { await node.dial(addr); break; } catch { /* try the next; newStream may still succeed */ }
-    }
-    let stream: Stream;
-    try {
-      stream = await node.newStream(this.#relayPeerId, RELAY_PROTOCOL_ID);
-    } catch (err: unknown) {
-      const raw = (err ?? {}) as { reason?: unknown };
+    if (!(await this.#ensureConnected(node))) {
       this.#logger.warn("session.relay.reservation_release.failed", {
         relayPeerId: this.#relayPeerId,
-        reason: typeof raw.reason === "string" ? raw.reason : "stream",
-        error: extractErrorMessage(err),
+        reason: "not_connected",
         impact: "this relay was not told the slot is free, so it holds it until the reservation " +
-          "TTL expires. Nothing the agent is doing is affected; the relay is carrying a slot it " +
-          "could have had back.",
+          "TTL expires. Nothing the agent is doing is affected.",
       });
       return false;
     }
+    const stream = this.#stream;
+    if (!stream) return false;
+
+    let resolveRel!: (released: boolean) => void;
+    const relPromise = new Promise<boolean>((r) => { resolveRel = r; });
+    this.#pendingRelease = resolveRel;
     try {
-      const iter = (lp.decode(stream as unknown as AsyncIterable<Uint8Array>) as AsyncIterable<unknown>)[
-        Symbol.asyncIterator
-      ]() as AsyncIterator<Uint8Array>;
-      if (!(await this.#authenticate(stream, iter, "reservation"))) {
-        this.#logger.warn("session.relay.reservation_release.failed", {
-          relayPeerId: this.#relayPeerId,
-          reason: this.#lastAuthRefusal?.reason ?? "no_relay_verdict",
-          impact: "could not authenticate to say the slot is free, so the relay holds it until its " +
-            "TTL expires.",
-        });
-        return false;
-      }
       stream.send(lp.encode.single(encodeCbor({ type: "relay_release_reservation" })));
-      const res = await nextWithTimeout(iter, RELAY_AUTH_TIMEOUT_MS);
-      if (res.done || res.value === undefined) return false;
-      const reply = decode(toU8(res.value)) as Record<string, unknown>;
-      const released = reply["type"] === "relay_release_ok" && reply["released"] === true;
-      this.#logger.info("session.relay.reservation_release.result", {
-        relayPeerId: this.#relayPeerId,
-        nodePeerId: node.getPeerId(),
-        released,
-      });
-      return released;
     } catch (err: unknown) {
+      if (this.#pendingRelease === resolveRel) this.#pendingRelease = null;
       this.#logger.warn("session.relay.reservation_release.failed", {
         relayPeerId: this.#relayPeerId,
-        reason: "stream",
+        reason: "send",
         error: extractErrorMessage(err),
         impact: "the relay holds the slot until its TTL expires.",
       });
       return false;
+    }
+    let timer!: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<"timeout">((r) => { timer = setTimeout(() => r("timeout"), HASH_SUBMIT_TIMEOUT_MS); });
+    try {
+      const result = await Promise.race([relPromise, timeout]);
+      if (result === "timeout") {
+        // NOT a stream reset. A release is not ordered against anything — no ack of a later frame
+        // can be settled by a late reply to this one, because the reader clears the resolver — so
+        // tearing the stream down would cost sibling sessions their in-flight submits for a tidy-up.
+        this.#logger.warn("session.relay.reservation_release.failed", {
+          relayPeerId: this.#relayPeerId,
+          reason: "no_reply",
+          impact: "the relay did not answer, so it holds the slot until its TTL expires.",
+        });
+        return false;
+      }
+      this.#logger.info("session.relay.reservation_release.result", {
+        relayPeerId: this.#relayPeerId,
+        nodePeerId: node.getPeerId(),
+        released: result,
+      });
+      return result;
     } finally {
-      await stream.close().catch(() => {});
+      clearTimeout(timer);
+      if (this.#pendingRelease === resolveRel) this.#pendingRelease = null;
     }
   }
 
@@ -1913,6 +1924,9 @@ export class AgentRelayClient {
         // wait the full timeout on a dropped stream. "closed" is transient (not a directory rejection) ⇒
         // recorded stays false and it is retried after reconnect.
         { const r = this.#pendingRecord; this.#pendingRecord = null; if (r) r("closed"); }
+        // 054-SRSPLIT: settle an in-flight release too, so it does not wait its full timeout on a
+        // stream that is already gone. `false` is honest — the relay was not told.
+        { const r = this.#pendingRelease; this.#pendingRelease = null; if (r) r(false); }
         // A pure-receiver session issues no submit, so it would never trigger a re-dial
         // after the node that owned the stream is torn down. If sessions remain, proactively
         // re-establish from any still-live registered session node so queued leaf_delivers

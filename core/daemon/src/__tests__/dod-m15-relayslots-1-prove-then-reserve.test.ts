@@ -83,6 +83,8 @@ class ScriptedRelay {
   askThrows = false;
   /** When set, every proof fails on TRANSPORT — false with no refusal, i.e. no verdict was reached. */
   proofTransportFails = false;
+  /** How many circuit addresses each relay announces. Real relays announce several; see `GatedNode`. */
+  addressesPerRelay = 1;
 
   /**
    * DOD-M15-RELAYPROVE-ORDER-1 — **an ORDERED log, because the defect is an ORDER.**
@@ -156,6 +158,17 @@ class GatedNode extends FakeNode {
    */
   override async listenOnCircuit(circuitAddr: string): Promise<void> {
     this.relay.timeline.push({ kind: "listen", node: this, relayPeerId: /\/p2p\/([^/]+)\/p2p-circuit/.exec(circuitAddr)?.[1] });
+    /**
+     * ⚠️ ONE RELAY ANNOUNCES SEVERAL ADDRESSES, and the fixture has to say so or it cannot see the
+     * defect this models. libp2p builds one circuit address per LISTEN ADDRESS the relay holds, so
+     * a two-relay pool routinely yields ten `/p2p-circuit` entries. Measured live 2026-09-10: the
+     * receiver reported `relaysOffered: 2, reservationsHeld: 10`.
+     */
+    if (this.relay.addressesPerRelay > 1 && this.started && this.relay.grants(this.#id)) {
+      for (let extra = 1; extra < this.relay.addressesPerRelay; extra++) {
+        this.takenCircuits.push(circuitAddr.replace("/tcp/4001", `/tcp/${4001 + extra}`));
+      }
+    }
     /**
      * The CLIENT-SIDE fault: this node cannot take a reservation at all — libp2p renamed
      * `components.transportManager`, say. It throws SYNCHRONOUSLY, which is what the real
@@ -505,6 +518,49 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
       "and the agent still gets a receiver on the plain TCP floor — a client fault must degrade " +
         "reachability, not remove the receiver",
     ).toBe(true);
+  }, 30_000);
+
+  it("★★★ reservationsHeld counts RELAYS, not announced addresses", async () => {
+    /**
+     * ⚠️ A LIVE-MEASURED REGRESSION, not a hypothetical. Rewriting the walk (054-SRSPLIT) replaced a
+     * deduping count with `listenAddresses().filter(isCircuit).length`, and the receiver reported
+     * `relaysOffered: 2, reservationsHeld: 10` against the real GCP relays.
+     *
+     * It is not cosmetic. The watchdog and `cello_status` read this number to decide whether an
+     * agent has LOST reachability, and a count that can exceed the number of relays offered cannot
+     * answer that question — it makes a healthy agent and a churning one look the same.
+     */
+    const relay = new ScriptedRelay();
+    relay.addressesPerRelay = 5; // what a relay with five listen addresses actually announces
+    const factory = new GatedFactory(relay);
+    const events: Array<{ event: string; ctx: Record<string, unknown> }> = [];
+    const capture = (event: string, ctx?: Record<string, unknown>): void => { events.push({ event, ctx: ctx ?? {} }); };
+    mgr = await makeManager(relay, factory, {
+      logger: { debug: capture, info: capture, warn: capture, error: capture },
+    });
+
+    await mgr.ensureStandingReceiverForAgent("alice");
+
+    const reachEvents = events.filter((e) => e.event === "session.standing_receiver.reachability");
+    const reach = reachEvents.at(-1);
+    expect(reach, "the receiver must report its reachability").toBeDefined();
+    expect(
+      reach?.ctx["reservationsHeld"],
+      "two relays granted, so two reservations are held — however many addresses each announces",
+    ).toBe(2);
+    expect(
+      Number(reach?.ctx["reservationsHeld"]),
+      "and it can never exceed what was offered, which is the property that makes it answerable",
+    ).toBeLessThanOrEqual(Number(reach?.ctx["relaysOffered"]));
+    /**
+     * ⚠️ ONE EMISSION PER RECEIVER BUILD — review MEDIUM-7, and this assertion is why the test above
+     * is not hollow. 054-SRSPLIT added a second `reachability` emission inside `#startReceiverNode`
+     * while the caller already emitted one. `.at(-1)` then read the CALLER's event, which counts
+     * correctly, so a wrong count in the inner one was invisible: mutating the inner count left this
+     * test green. `reservation.none` is also the event MSG-018 counted 481 of to justify a retry,
+     * and doubling it breaks any comparison against that baseline.
+     */
+    expect(reachEvents.length, "the receiver reports its reachability ONCE per build").toBe(1);
   }, 30_000);
 
   it("★★★ a refusal about THIS AGENT reaches cello_status, and stops the fleet walk", async () => {
