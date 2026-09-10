@@ -353,6 +353,27 @@ describe("M8B F16: counterparty-gone surfaces on cello_receive and cello_status"
   it("DOD-M12B-ACK-1: a session whose sends are failing returns delivery_impaired, and says only what is known", async () => {
     const { A, clientA, clientB } = await establishSession();
     try {
+      // SEND ONE MESSAGE SUCCESSFULLY FIRST, and that is a precondition rather than a warm-up.
+      //
+      // `sendContent` preflights the content-encryption key and throws `content_not_encryptable`
+      // BEFORE it opens a stream. So a send issued before the key exchange has settled never
+      // reaches the transport: the impairment comes back with cause `content_key`, and the
+      // assertion below fails naming a stage the code never entered.
+      //
+      // Session establishment and the content-key exchange complete independently, so
+      // `establishSession()` returning does not mean a message can be sealed yet. That gap is
+      // invisible on a fast laptop and wide enough to matter on a loaded CI runner — this test
+      // passed locally and failed in CI on identical code (2026-09-10), which is the shape that
+      // gets mislabelled as flakiness.
+      //
+      // A send that SUCCEEDS proves the key is there, using only the public API. Waiting on an
+      // internal accessor instead would have meant growing the session-node-manager god file past
+      // its line ratchet, which exists precisely to stop that.
+      const primer = (await clientA.send("cello_send", {
+        session_id: SID_HEX, content: "primer — proves the content key is established", signal: "over",
+      })) as Record<string, unknown>;
+      expect(primer.error, `the primer send must succeed, or the transport stage is unreachable (got ${JSON.stringify(primer)})`).toBeUndefined();
+
       // One real failed send over a real connection — the fault is injected after the stream opens,
       // so libp2p fires no disconnect and the old code left this session reporting `alive`.
       A.getSessionNodeManager().injectSendFault(1);
