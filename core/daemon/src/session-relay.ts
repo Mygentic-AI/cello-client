@@ -1034,8 +1034,15 @@ export class SessionRelay {
   /**
    * DOD-M12B-RESERVATION-RETRY-1 — ask again for a reservation the relay refused.
    *
-   * The rebuild is the re-attempt: a circuit listener is fixed at node creation, so the only way to
-   * obtain a reservation is to build a new node asking for one.
+   * The rebuild is the re-attempt.
+   *
+   * ⚠️ **ITS ORIGINAL JUSTIFICATION IS NO LONGER TRUE — review LOW-6.** It read: *"a circuit
+   * listener is fixed at node creation, so the only way to obtain a reservation is to build a new
+   * node asking for one."* `CelloNode.listenOnCircuit` (DOD-M15-RELAYPROVE-ORDER-1) is exactly the
+   * other way: a running node can take a reservation on demand. Rebuilding is still CORRECT here —
+   * a fresh receiver re-runs the whole walk, including the proof each relay needs — but it is now a
+   * choice rather than the only option, and a running node could be topped up in place instead.
+   * Corrected rather than deleted, because the sentence is the kind that gets trusted next time.
    */
   #retryReservationIfDue(agentName: string): void {
     const now = Date.now();
@@ -1280,7 +1287,8 @@ export class SessionRelay {
    * 032-RELAYSPREAD — **AN IDLE AGENT MUST NOT RATCHET ITSELF BACK DOWN TO ONE RELAY.**
    *
    * Spreading happens when a receiver is BUILT, and between builds the count only falls: a lost
-   * circuit cannot be retaken by a running node (a circuit listener is fixed at node creation), and
+   * circuit cannot be retaken by a running node TODAY — `listenOnCircuit` now makes that possible,
+   * and nothing calls it from here yet (review LOW-6) — and
    * a relay the directory announces later is skipped while any circuit is held. An agent in
    * conversation re-spreads constantly — the receiver is handed into each session and a fresh one
    * is built behind it — so this is about the agent nobody has talked to for a day. It loses relays
@@ -1482,6 +1490,23 @@ export class SessionRelay {
       if (refusal?.tryAnotherRelay && !this.#ctx.shuttingDown) {
         this.#quarantineRelay(agentName, relayPeerId, refusal.reason);
       }
+      /**
+       * ⚠️ **NO REFUSAL MEANS NO VERDICT — SAY SO, rather than labelling it a refusal.** Review
+       * HIGH-1 (DOD-M15-RELAYPROVE-ORDER-1).
+       *
+       * `#proveReservationOnce` clears `#lastAuthRefusal` at its head and sets it only when the
+       * relay refuses ON THE MERITS, so a `null` refusal here means the proof failed for a
+       * TRANSPORT reason — a failed dial, a reset stream, a dead muxer — and the relay said
+       * nothing. The log line directly above already prints exactly that (`no_relay_verdict`,
+       * *"which is what a transport failure mid-handshake looks like"*) and this line then returned
+       * `refused_try_another_relay` anyway, which is a verdict this relay never gave.
+       *
+       * It became load-bearing when the caller started deciding whether to ASK on the strength of
+       * it: a relay whose proof stream got reset was recorded as having refused the agent's proof,
+       * and the ask that a no-verdict is supposed to allow never happened. A function that knows it
+       * reached no verdict must not hand back a refusal label.
+       */
+      if (!refusal) return "unavailable";
       return "refused_try_another_relay";
     } catch (err: unknown) {
       this.#ctx.logger.warn("session.standing_receiver.prove.failed", {

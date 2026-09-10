@@ -79,6 +79,10 @@ class ScriptedRelay {
     return this.proofAttempts.filter((a) => !a.hadCircuit);
   }
   grants(peerId: string): boolean { return this.proven.has(peerId); }
+  /** When set, every node's reservation ask throws a CLIENT-side fault (see `GatedNode`). */
+  askThrows = false;
+  /** When set, every proof fails on TRANSPORT — false with no refusal, i.e. no verdict was reached. */
+  proofTransportFails = false;
 
   /**
    * DOD-M15-RELAYPROVE-ORDER-1 — **an ORDERED log, because the defect is an ORDER.**
@@ -152,6 +156,14 @@ class GatedNode extends FakeNode {
    */
   override async listenOnCircuit(circuitAddr: string): Promise<void> {
     this.relay.timeline.push({ kind: "listen", node: this, relayPeerId: /\/p2p\/([^/]+)\/p2p-circuit/.exec(circuitAddr)?.[1] });
+    /**
+     * The CLIENT-SIDE fault: this node cannot take a reservation at all — libp2p renamed
+     * `components.transportManager`, say. It throws SYNCHRONOUSLY, which is what the real
+     * `listenOnCircuit` does and what the containment has to survive.
+     */
+    if (this.relay.askThrows) {
+      throw { reason: "transport_manager_unavailable", message: "libp2p exposes no components.transportManager.listen" };
+    }
     if (this.started && this.relay.grants(this.#id)) this.takenCircuits.push(circuitAddr);
   }
 
@@ -193,6 +205,16 @@ function relayClientStub(relay: ScriptedRelay, relayPeerId: string): AgentRelayC
         hadCircuit: node.listenAddresses().some((a) => a.includes("/p2p-circuit")),
         nodeType: (node as unknown as GatedNode).nodeType,
       });
+      /**
+       * ⚠️ THE NO-VERDICT SHAPE, and it is NOT the same as a refusal — review HIGH-1.
+       *
+       * `proveReservation` returns false with `getLastAuthRefusal()` NULL when the proof failed for
+       * a TRANSPORT reason: a failed dial, a reset stream, a dead muxer. The relay said nothing.
+       * `#proveReservationOnce` clears the refusal at its head precisely so this case leaves none
+       * behind, and the production log calls it `no_relay_verdict`. This is the dominant real case,
+       * and it used to be labelled `refused_try_another_relay` one layer up.
+       */
+      if (relay.proofTransportFails) { lastRefusal = null; return false; }
       const refusal = relay.refusals.get(relayPeerId);
       if (refusal) { lastRefusal = refusal; return false; }
       relay.proven.add(node.getPeerId());
@@ -208,11 +230,20 @@ const silent: Logger = { debug: () => {}, info: () => {}, warn: () => {}, error:
 let tempDir: string;
 let mgr: SessionNodeManager | undefined;
 
-async function makeManager(relay: ScriptedRelay, factory: GatedFactory): Promise<SessionNodeManager> {
+async function makeManager(
+  relay: ScriptedRelay,
+  factory: GatedFactory,
+  /**
+   * Non-breaking `opts`, per the fixture rule. `noRelayClient` models a daemon whose proof path is
+   * unavailable — no builder wired — which is one of the ways `proveToRelay` reaches no verdict.
+   * `logger` lets a case read the refusal reasons the walk emits.
+   */
+  opts: { noRelayClient?: boolean; logger?: Logger } = {},
+): Promise<SessionNodeManager> {
   const m = new SessionNodeManager({
     securityGateway: new PassthroughGatewayClient(),
     factory,
-    logger: silent,
+    logger: opts.logger ?? silent,
     dbPath: join(tempDir, "sessions.db"),
   });
   await m.initialize();
@@ -221,7 +252,11 @@ async function makeManager(relay: ScriptedRelay, factory: GatedFactory): Promise
     { relayPeerId: RELAY_A, relayAddrs: [`/ip4/10.0.0.1/tcp/4001/p2p/${RELAY_A}`] },
     { relayPeerId: RELAY_B, relayAddrs: [`/ip4/10.0.0.2/tcp/4001/p2p/${RELAY_B}`] },
   ]);
-  m.setDetachedRelayClientBuilder((_agent, relayPeerId) => relayClientStub(relay, relayPeerId));
+  // `undefined` is what a daemon with no relay client wired actually hands back, and it is the
+  // production shape of "the proof could not even be attempted".
+  m.setDetachedRelayClientBuilder((_agent, relayPeerId) =>
+    opts.noRelayClient === true ? undefined : relayClientStub(relay, relayPeerId),
+  );
   return m;
 }
 
@@ -331,6 +366,114 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
           "closes the connection the relay marked proven, and the reservation is refused",
       ).toBe(true);
     }
+  }, 30_000);
+
+  it("★★★ a proof that reached NO VERDICT still asks — a refusal declines, silence does not", async () => {
+    /**
+     * ⚠️ REVIEW HIGH-1. The clause: `unavailable` (no relay verdict was obtained — no client wired,
+     * or the relay unreachable) must NOT decline the candidate, because **not every relay gates
+     * reservations**. One that never asks for a proof grants on the first ask, and refusing to ask
+     * because OUR proof path was unavailable would lose the ability to reserve with it at all.
+     *
+     * This is the clause that had no test, and it is why the review found the boundary was drawn in
+     * the wrong place: `proveToRelay` was returning `refused_try_another_relay` for a proof that
+     * failed on transport, so the ask this asserts never happened.
+     *
+     * The relay here grants without any proof, which is exactly what an ungated relay does.
+     */
+    const relay = new ScriptedRelay();
+    const factory = new GatedFactory(relay);
+    // An UNGATED relay: it grants whoever asks, having been told nothing.
+    relay.proven.add("*");
+    const originalGrants = relay.grants.bind(relay);
+    relay.grants = (): boolean => true;
+    mgr = await makeManager(relay, factory, { noRelayClient: true });
+
+    await mgr.ensureStandingReceiverForAgent("alice");
+
+    expect(
+      relay.timeline.filter((e) => e.kind === "listen").map((e) => e.relayPeerId),
+      "with no proof path available the walk must still ASK every relay — treating silence as a " +
+        "refusal makes this client unable to reserve with an ungated relay at all",
+    ).toEqual([RELAY_A, RELAY_B]);
+    expect(
+      mgr.getStandingReceiverNode("alice")?.listenAddresses().some((a) => a.includes("/p2p-circuit")),
+      "and the reservation it was granted is held",
+    ).toBe(true);
+    expect(relay.gateProofs(), "no proof could be made — that is the premise, not a side effect").toHaveLength(0);
+    relay.grants = originalGrants;
+  }, 30_000);
+
+  it("★★★ a proof that FAILED ON TRANSPORT is no verdict either — and it is the case that actually happens", async () => {
+    /**
+     * ⚠️ REVIEW HIGH-1, AND THIS IS THE VARIANT THAT MATTERS. The case above ("no relay client
+     * wired") already returned `unavailable` before the review. The DOMINANT real case did not: a
+     * proof whose dial failed or whose stream was reset returns `false` with NO refusal recorded —
+     * `#proveReservationOnce` clears the refusal at its head precisely so a transport failure leaves
+     * no verdict behind — and `proveToRelay` labelled that `refused_try_another_relay` anyway.
+     *
+     * Under that label the ask never happened, so a relay whose proof stream got reset was recorded
+     * as having refused this agent's proof, and an UNGATED relay that would have granted was never
+     * asked. The producer now says `unavailable`, which is what its own log line already said.
+     */
+    const relay = new ScriptedRelay();
+    relay.proofTransportFails = true;
+    const factory = new GatedFactory(relay);
+    // Ungated: it grants whoever asks. The point is that we never find out unless we ask.
+    const originalGrants = relay.grants.bind(relay);
+    relay.grants = (): boolean => true;
+    mgr = await makeManager(relay, factory);
+
+    await mgr.ensureStandingReceiverForAgent("alice");
+
+    expect(
+      relay.gateProofs().length,
+      "the proof was ATTEMPTED — this is a transport failure, not an absent proof path",
+    ).toBeGreaterThan(0);
+    expect(
+      relay.timeline.filter((e) => e.kind === "listen").map((e) => e.relayPeerId),
+      "a proof that reached no verdict must not decline the candidate: the relay refused nothing, " +
+        "and one that does not gate reservations would have granted",
+    ).toEqual([RELAY_A, RELAY_B]);
+    relay.grants = originalGrants;
+  }, 30_000);
+
+  it("★★★ a fault of OURS is not reported in the relay's vocabulary", async () => {
+    /**
+     * ⚠️ REVIEW HIGH-2, and the failure it prevents is a wild goose chase rather than a broken
+     * session. `listenOnCircuit` throws `transport_manager_unavailable` when libp2p renames
+     * `components.transportManager`. The generic decline infers its reason from the relay
+     * connection — which is open and irrelevant, because the ask never left this process — and so
+     * reported `relay_granted_no_reservation` on EVERY relay in the pool. In this daemon's own
+     * taxonomy that string means *"relay CAPACITY, a trustless-cello problem"*, so a client-side API
+     * change would send an operator into the relay fleet while the real cause survived only as an
+     * `error` field on a warn line nothing surfaces.
+     */
+    const relay = new ScriptedRelay();
+    relay.askThrows = true;
+    const factory = new GatedFactory(relay);
+    const events: Array<{ event: string; ctx: Record<string, unknown> }> = [];
+    const capture = (event: string, ctx?: Record<string, unknown>): void => { events.push({ event, ctx: ctx ?? {} }); };
+    mgr = await makeManager(relay, factory, {
+      logger: { debug: capture, info: capture, warn: capture, error: capture },
+    });
+
+    await mgr.ensureStandingReceiverForAgent("alice");
+
+    const rejected = events.filter((e) => e.event === "session.standing_receiver.relay.rejected");
+    expect(rejected.length, "every relay in the pool is declined — the fault is ours, not theirs").toBeGreaterThan(0);
+    for (const r of rejected) {
+      expect(
+        r.ctx["reason"],
+        "the transport named this fault; re-deriving it from the relay connection turns a client-side " +
+          "API change into a fleet-wide capacity outage",
+      ).toBe("transport_manager_unavailable");
+    }
+    expect(
+      mgr.getStandingReceiverReady("alice"),
+      "and the agent still gets a receiver on the plain TCP floor — a client fault must degrade " +
+        "reachability, not remove the receiver",
+    ).toBe(true);
   }, 30_000);
 
   it("★★★ a refusal about THIS AGENT reaches cello_status, and stops the fleet walk", async () => {

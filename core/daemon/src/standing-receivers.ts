@@ -40,8 +40,60 @@ import {
   type SessionNodeConfig,
 } from "./session-node-types.js";
 import { STANDING_RECEIVER_AGENT_NAME } from "./types.js";
+
+/**
+ * Wait for an abandoned candidate's outstanding work to settle, then stop it — but never wait
+ * forever.
+ *
+ * ⚠️ **REVIEW MEDIUM-4 — `allSettled` ON A PROMISE THAT CANNOT SETTLE NEVER RUNS THE TEARDOWN.**
+ * The teardown is chained onto the candidate's own work because `libp2p.stop()` returns immediately
+ * unless the node is `started`, so stopping a node mid-flight stops nothing. But a relay that
+ * accepts the stream and never answers leaves `listen()` pending forever — that is exactly the case
+ * `msg-027`'s fixture models — and the chained stop would then never fire at all, leaving a live
+ * node on the receiver's seed while the walk builds more nodes on that same seed.
+ *
+ * So: settle OR expire. The grace is generous relative to the ask's own deadline, because the point
+ * is to bound the wait, not to race it — a node that finishes at the last moment must still be
+ * stopped by its own settlement rather than while it is starting.
+ */
+function stopWhenSettled(node: CelloNode, work: Array<Promise<unknown> | undefined>, graceMs: number): void {
+  const pending = work.filter((p): p is Promise<unknown> => p !== undefined);
+  const settled = Promise.allSettled(pending);
+  const bounded = new Promise<void>((resolve) => { setTimeout(resolve, graceMs).unref?.(); });
+  void Promise.race([settled, bounded]).then(() => node.stop().catch(() => { /* best-effort */ }));
+}
 import type { SessionRecords } from "./session-records.js";
 import type { ParkRecovery } from "./park-recovery.js";
+
+/**
+ * A reservation ask that failed for a CLIENT-SIDE reason, named by the transport.
+ *
+ * ⚠️ **REVIEW HIGH-2 — WITHOUT THIS, A LIBP2P RENAME READS AS A CAPACITY OUTAGE.** When
+ * `listenOnCircuit` throws `transport_manager_unavailable`, the ask never reached the relay at all —
+ * but the generic decline below infers its reason from the connection state, finds the proof
+ * connection still open, and reports `relay_granted_no_reservation` on every relay in the pool. That
+ * string means *"relay CAPACITY, a trustless-cello problem"* in this daemon's own taxonomy, so an
+ * upstream API change would send an operator into the relay fleet while the real cause survived only
+ * as an `error` field on a warn line nothing surfaces.
+ *
+ * These faults are ours. They must be described in our vocabulary, not the relay's.
+ */
+const CLIENT_SIDE_ASK_FAULTS = new Set(["transport_manager_unavailable", "not_a_circuit_address"]);
+function clientSideAskFault(err: unknown): string | undefined {
+  const reason = (err as { reason?: unknown } | null)?.reason;
+  return typeof reason === "string" && CLIENT_SIDE_ASK_FAULTS.has(reason) ? reason : undefined;
+}
+
+/**
+ * Whether this node holds a granted reservation — i.e. announces a circuit address.
+ *
+ * Review LOW-5: `p2p-circuit` is read as a SEGMENT, the same rule `listenOnCircuit` applies to its
+ * own input. A substring test also matches a host or peer id that happens to contain the text, and
+ * the file should not argue one rule and apply another two lines later.
+ */
+function holdsCircuit(node: CelloNode): boolean {
+  return node.listenAddresses().some((a) => a.split("/").includes("p2p-circuit"));
+}
 
 /** What the standing receiver needs from the manager. */
 export interface StandingReceiverContext {
@@ -204,6 +256,8 @@ export class StandingReceivers {
        * nothing holding a reference to kill it.
        */
       let listenP: Promise<void> | undefined;
+      /** Set when the ask failed for a fault of OURS, so it is not re-described as the relay's. */
+      let askFault: string | undefined;
       const candidate = await this.createAgentNode(agentName, {
         sessionId,
         connectionGater: gater,
@@ -276,7 +330,12 @@ export class StandingReceivers {
            * fault look like a fleet-wide outage in the logs. The refusal is already recorded where
            * `cello_status` reads it, so stopping is not silence.
            *
-           * ⚠️ ONLY A VERDICT REACHES THIS BRANCH — see the `unavailable` note below.
+           * ⚠️ **THE BOUNDARY THIS BRANCH RESTS ON IS ENFORCED IN `proveToRelay`, NOT HERE.** It
+           * returns `unavailable` whenever no relay verdict was reached — including a proof that
+           * failed for a transport reason, which it used to label `refused_try_another_relay`
+           * (review HIGH-1). Stated as where the property lives rather than asserted as a fact
+           * about this branch: a comment claiming "only a verdict reaches here" is true only for
+           * as long as that producer keeps its side, and the producer is in another file.
            */
           const proofReason = verdict === "refused_this_agent" ? "relay_refused_this_agent" : "relay_proof_refused";
           this.#ctx.srLastRejectionReason.set(agentName, proofReason);
@@ -340,6 +399,9 @@ export class StandingReceivers {
           ]);
         } catch (err: unknown) {
           error = extractErrorMessage(err);
+          // Review HIGH-2: a fault of OURS keeps its own name all the way to the operator, instead
+          // of being re-described from the connection state as something the relay did.
+          askFault = clientSideAskFault(err);
           listenOutcome = listenTimedOut;
         } finally {
           if (listenTimer !== undefined) clearTimeout(listenTimer);
@@ -349,7 +411,7 @@ export class StandingReceivers {
         // resolving is not enough — a relay that is out of reservation slots completes the
         // handshake and simply grants nothing, leaving a node that looks started and is reachable
         // by nobody.
-        if (listenOutcome === "asked" && candidate.listenAddresses().some((a) => a.includes("/p2p-circuit"))) {
+        if (listenOutcome === "asked" && holdsCircuit(candidate)) {
           candidateGranted = true;
           // The probe has done its job: this relay grants THIS identity. Tear it down and ask the
           // next relay — the reservation is re-taken by the final node below, which is the only one
@@ -362,7 +424,12 @@ export class StandingReceivers {
 
       if (!candidateGranted && !rejectionNamed) {
       const rejectionReason =
-        outcome === "started"
+        // A CLIENT-SIDE FAULT KEEPS ITS OWN NAME, and it is checked FIRST because everything below
+        // infers a cause from the relay connection — which is intact and irrelevant when the ask
+        // never left this process (review HIGH-2).
+        askFault !== undefined
+          ? askFault
+          : outcome === "started"
           ? /**
              * ⚠️ Review MEDIUM-7 — **"ASKED" DOES NOT MEAN THE RELAY ANSWERED.** A relay that is
              * simply DOWN yields no circuit address — indistinguishable, here, from a relay that
@@ -394,9 +461,7 @@ export class StandingReceivers {
       //
       // BOTH promises: the reservation is taken by the ASK now, so a candidate abandoned on the
       // ask's deadline still has work in flight that `start()` settling says nothing about.
-      void Promise.allSettled([startP, ...(listenP !== undefined ? [listenP] : [])]).then(
-        () => candidate.stop().catch(() => { /* best-effort once it has settled */ }),
-      );
+      stopWhenSettled(candidate, [startP, listenP], this.#ctx.srReservationTimeoutMs * 2);
       }
       if (candidateGranted) grantedAddrs.push(circuitAddr);
       // 032-RELAYSPREAD: DO NOT BREAK ON THE FIRST GRANT. The walk used to stop here, which is why
@@ -470,10 +535,24 @@ export class StandingReceivers {
      *
      * ⚠️ IT HAS A KNOWN CAUSE AND A CROSS-REPO CLOCK. The walk stops the granted candidate and the
      * node below RE-ASKS, which works because the relay remembers the proof — for
-     * `PROVEN_PEER_MEMORY_MS = 2 minutes` (`relay-connection-gater.ts`, trustless-cello). The walk
-     * costs up to `#srReservationTimeoutMs` × 2 attempts per relay, so a pool of three at the
-     * 15s default can spend 90 seconds before the final node asks relay 1 again. The earliest
-     * proof can expire before it is used, and that is what this event catches.
+     * `PROVEN_PEER_MEMORY_MS = 2 minutes` (`relay-connection-gater.ts`, trustless-cello).
+     *
+     * ⚠️ **AND THIS IS WHERE THE ORIGINAL COLLISION STILL LIVES** (review MEDIUM-3). The node built
+     * below carries `circuitRelayListenAddrs`, so libp2p asks at start, on a FRESH connection that
+     * has proved nothing on itself. `DOD-M15-RELAYPROVE-ORDER-1` removed the refused first ask from
+     * the WALK; the installed receiver still depends on the relay's two-minute peer memory, and when
+     * that memory has expired the whole original loop returns for it — refused ask, connection
+     * manager restart, connections closed. **It is mitigated by a cross-repo TTL, not removed.** The
+     * probe/final split is what forces it, and that split is what unit 2 of
+     * `M15-STORY-RESERVATIONS-ON-DEMAND` (splitting the standing receiver) deletes; the fix belongs
+     * there rather than in a second pass here.
+     *
+     * ⚠️ **THE BUDGET ARITHMETIC BELOW IS NOT WHAT IT WAS.** It used to read *"`#srReservationTimeoutMs`
+     * × 2 attempts per relay"* — there is one attempt now, but the wall clock did NOT halve: a
+     * candidate costs `start` + `proveToRelay` + `ask`, and **`proveToRelay` carries no deadline of
+     * its own at either call site**. So a pool of three can still exceed the two-minute memory, and
+     * the ceiling is now harder to state than it was, not easier. That missing deadline is recorded
+     * in `053-FIRSTASK`'s *Newly discovered*.
      */
     const boundRelays = new Set(heldRelayIdsOf(node));
     const grantedButUnbound = grantedAddrs
@@ -925,6 +1004,8 @@ export class StandingReceivers {
        * start-promise note describes.
        */
       let listenP: Promise<void> | undefined;
+      /** Set when the ask failed for a fault of OURS, so it is not re-described as the relay's. */
+      let askFault: string | undefined;
       if (started) {
         const verdict = await this.#ctx.proveToRelay(agentName, circuitAddr, candidate, sessionId, false);
         // A VERDICT DECLINES; NO VERDICT DOES NOT. `unavailable` means the relay never answered —
@@ -970,8 +1051,13 @@ export class StandingReceivers {
               listenP.then(() => true as const),
               new Promise<false>((res) => setTimeout(() => res(false), REVIVE_RESERVATION_TIMEOUT_MS).unref?.()),
             ]);
-          })().catch((err: unknown) => { startError = err; return false as const; });
-          if (!asked) {
+          })().catch((err: unknown) => {
+            startError = err;
+            // Review HIGH-2, same rule as the receiver walk: a fault of OURS keeps its own name.
+            askFault = clientSideAskFault(err);
+            return false as const;
+          });
+          if (!asked && askFault === undefined) {
             this.#ctx.logger.warn("session.revive.reservation.ask_timeout", {
               agentName,
               sessionId,
@@ -985,7 +1071,7 @@ export class StandingReceivers {
         }
       }
 
-      if (!proofDeclined && started && candidate.listenAddresses().some((a) => a.includes("/p2p-circuit"))) {
+      if (!proofDeclined && started && holdsCircuit(candidate)) {
         this.#ctx.logger.info("session.revive.reservation.granted", { agentName, sessionId });
         revivedNode = candidate;
         break;
@@ -997,14 +1083,18 @@ export class StandingReceivers {
       // "declined" alone stood for a relay that is full, a relay that is unreachable, and a relay
       // that is merely slow — three different problems with three different responses, and the
       // thrown error was discarded entirely.
-      const declineReason = !started
+      const declineReason = askFault !== undefined
+        // A client-side fault, checked FIRST: everything below infers a cause from the relay, and
+        // the relay had nothing to do with an ask that never left this process (review HIGH-2).
+        ? askFault
+        : !started
         ? startError !== undefined
           ? "relay_unreachable"
           : "reservation_did_not_complete_in_time"
         : // Started, proved, asked — and the ask is where a slow relay now shows up. An ask still in
           // flight is "did not complete in time"; one that returned with nothing is a relay that
           // answered and granted nothing.
-          listenP !== undefined && !candidate.listenAddresses().some((a) => a.includes("/p2p-circuit"))
+          listenP !== undefined && !holdsCircuit(candidate)
           ? "relay_granted_no_reservation"
           : "reservation_did_not_complete_in_time";
       const isLast = circuitAddr === candidateAddrs.slice(0, REVIVE_RESERVATION_CANDIDATES).at(-1);
@@ -1031,9 +1121,7 @@ export class StandingReceivers {
        * content handler and nothing holding a reference to kill it. That is the open endpoint
        * review HIGH-3 exists to prevent, reintroduced through a different promise.
        */
-      void Promise.allSettled([startP, ...(listenP !== undefined ? [listenP] : [])]).then(
-        () => candidate.stop().catch(() => { /* best-effort */ }),
-      );
+      stopWhenSettled(candidate, [startP, listenP], REVIVE_RESERVATION_TIMEOUT_MS * 2);
       }
       }
       if (revivedNode) return revivedNode;
