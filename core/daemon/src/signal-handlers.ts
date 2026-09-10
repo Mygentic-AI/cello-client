@@ -21,6 +21,7 @@
  * hand this surface power to mutate connection state. Same narrowing as `contact-handlers.ts`.
  */
 import { randomUUID } from "node:crypto";
+import { checkAttestationBody, normalizeAttestationBody } from "./attestation-body.js";
 import { decodeCbor } from "@cello-protocol/protocol-types";
 import type { SignalSubjectKind, SubmissionOp, ConsortiumManifest } from "@cello-protocol/protocol-types";
 import type { KeyProvider } from "@cello-protocol/crypto";
@@ -677,21 +678,21 @@ export function registerSignalHandlers(deps: SignalHandlerDeps): void {
       return { ok: false, reason: "invalid_subject",
         guidance: "subject_pubkey must be the counterparty's 32-byte public key as 64 hex characters — run cello_contacts to see the peers you know." };
     }
-    const body = typeof params?.body === "string" ? params.body.trim() : "";
+    // Normalised then checked locally — see attestation-body.ts (047-ENDORSETEXT). The portal
+    // stays the authority; this only spares an honest mistake a round trip.
+    const body = normalizeAttestationBody(typeof params?.body === "string" ? params.body : "");
     if (body.length === 0) {
       return { ok: false, reason: "empty_body",
         guidance: "An issued signal needs text — it is the claim you are making about them, in your own words." };
     }
-    // AN AGENT ABOUT ITSELF IS REFUSED. Issuer and subject are one identity, so there is no fact
-    // for a reader to weigh and no downstream annotation that rescues it.
+    const bodyRefusal = checkAttestationBody(body);
+    if (bodyRefusal) return { ok: false, ...bodyRefusal };
+    // SELF is refused: issuer and subject are one identity, so there is no fact to weigh.
     //
-    // CO-OWNERSHIP IS NOT REFUSED — it is ANNOTATED. This guard used to reject ANY subject loaded on
-    // this daemon, contradicting the portal's D-29 (`submission-ingress.ts`): a same-operator
-    // endorsement is MINTED and FLAGGED, because minting it UNFLAGGED is the farming hole, while
-    // refusing it discards a true and useful fact — and guaranteed the flagged form could never
-    // exist. The daemon cannot see account linkage (two agents under one account on different
-    // machines are invisible here) and the portal can. Refusing here also closed the path the first
-    // wedge walks daily: solo multi-agent is the MOST likely way to hit this, not the least.
+    // CO-OWNERSHIP IS NOT — it is ANNOTATED (portal D-29). Minting it unflagged is the farming hole;
+    // refusing it discards a true fact AND closes the path the first wedge walks daily, since solo
+    // multi-agent is the most likely way to hit this. The daemon cannot see account linkage anyway
+    // — two agents under one account on different machines are invisible here — and the portal can.
     if (subject === sel.pubkey.toLowerCase()) {
       return { ok: false, reason: "self_subject",
         guidance: "An agent cannot issue a trust signal about itself — standing has to come from somebody else." };

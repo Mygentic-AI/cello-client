@@ -344,7 +344,7 @@ server.tool("cello_contact_set_tier", "Set a contact's reachability tier: 0=bloc
 
 server.tool("cello_attestations_issue", "ATTEST to something about another agent — your own words vouching for something you have seen them do. This is the person-to-person primitive: trust signals are what the NETWORK verifies about you (GitHub age, phone, email), an attestation is what a PERSON says about a person. It is submitted to the CELLO portal (sealed; the directory cannot read it), scanned, and minted; the SUBJECT must then accept it before anyone else can see it, so nothing here is final until they decide. You cannot issue one about yourself.", {
   subject_pubkey: z.string().describe("The counterparty's public key, 64 hex characters — see cello_contacts"),
-  body: z.string().describe("What you are vouching for, in your own words. Scanned at intake; it reaches readers quoted and attributed to you, never restated in CELLO's voice."),
+  body: z.string().describe("What you are vouching for, in your own words. MAXIMUM 500 CHARACTERS — an endorsement is a testimonial, not a document. Line breaks are fine; no other control characters and no < or >. Scanned at intake; it reaches readers quoted and attributed to you, never restated in CELLO's voice."),
 }, async ({ subject_pubkey, body }) => {
   const result = await proxy.call("cello_attestations_issue", { subject_pubkey, body });
   return jsonText(result);

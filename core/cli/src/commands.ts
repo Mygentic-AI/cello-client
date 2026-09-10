@@ -902,6 +902,9 @@ export async function attestations(
         output:
           "Usage: cello attestations issue <subject-pubkey> <what you are endorsing them for…>\n" +
           "\n" +
+          "The text: MAXIMUM 500 CHARACTERS — a testimonial, not a document. Line breaks are fine;\n" +
+          "no other control characters, and no < or >.\n" +
+          "\n" +
           "If your text contains something that looks like a flag (a leading '-', or '-h'), put `--`\n" +
           "before it so it is read as text:\n" +
           "  cello attestations issue <pubkey> -- cut p99 by -30ms on the auth path",
