@@ -567,7 +567,7 @@ async function startDaemonHoldingLock(
     perConnectionState,
     getAgentsForConnection,
     startAgentInternal,
-    dropAgentSignaling,
+    dropAgentSignaling, stopSweepTick: (n: string) => trustSignalSweepTicker.stop(n),
     awayAckSent,
     keyProviders,
     loadedAgents,

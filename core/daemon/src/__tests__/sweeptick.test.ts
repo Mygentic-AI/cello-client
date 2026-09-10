@@ -255,5 +255,48 @@ describe("048-SWEEPTICK — the wiring, because a unit test cannot see the compo
     expect(src, "the bare sweep must not be the thing wired in").not.toContain("getSweepTrustSignals: () => sweepTrustSignals,");
     // And the ticks must be stopped on shutdown, or the daemon keeps sweeping while tearing down.
     expect(src).toContain("trustSignalSweepTicker.stopAll()");
+    // The per-agent stop must actually reach the handlers, or `stop` is a method nothing calls.
+    expect(src).toContain("stopSweepTick: (n: string) => trustSignalSweepTicker.stop(n)");
+  });
+
+  it("a REMOVED agent's tick is stopped — and an OFFLINE agent's deliberately is not", async () => {
+    /**
+     * The asymmetry is the finding, not an oversight, and it is asserted so nobody "fixes" it.
+     *
+     * Offline: the tick is already inert (it checks `isAgentOnline` before every sweep), and
+     * cancelling it there would be a one-way door — `cello_set_agent_offline` leaves the signaling
+     * manager connected, so a later `cello_start_agent` hits `getAgentSignaling`'s cached-entry
+     * early return and fires no `onConnected`. Nothing would re-arm it.
+     *
+     * Removed: the agent is never coming back, so the timer should genuinely end rather than skip
+     * every five minutes for a name that no longer exists.
+     */
+    const { readFile } = await import("node:fs/promises");
+    const src = await readFile(new URL("../agent-handlers.ts", import.meta.url), "utf8");
+
+    // Positive control: prove the read reached the file and found both handlers.
+    expect(src, "positive control — removal handler").toContain("cello_remove_agent");
+    expect(src, "positive control — offline handler").toContain("cello_set_agent_offline");
+
+    // ⚠️ SLICED FROM THE HANDLER REGISTRATIONS, not from the first mention of each name — and the
+    // first version of this got it wrong in the way that matters. It sliced between the two NAMES,
+    // but `cello_remove_agent` is registered ABOVE `cello_set_agent_offline`, so the slice came out
+    // EMPTY and `.not.toContain(...)` passed against nothing. Adding the call to the offline handler
+    // on purpose left the test green. An empty search result is evidence only once the search has
+    // been shown capable of finding something, which is what the two controls below do.
+    const removeAt = src.indexOf('handlers.set("cello_remove_agent"');
+    const offlineAt = src.indexOf('handlers.set("cello_set_agent_offline"');
+    expect(removeAt, "positive control — removal handler is registered").toBeGreaterThan(-1);
+    expect(offlineAt, "positive control — offline handler is registered").toBeGreaterThan(-1);
+
+    const removal = src.slice(removeAt, offlineAt);
+    const offline = src.slice(offlineAt);
+    // Controls ON THE SLICES: each must contain something only that handler has, or the slice is
+    // not the region it is named for and neither assertion below means anything.
+    expect(removal, "control — the removal slice really is the removal handler").toContain("agent.removal.signaling_teardown_failed");
+    expect(offline, "control — the offline slice really is the offline handler").toContain("agent.stop.receiver_teardown_failed");
+
+    expect(removal, "removal stops the tick").toContain("stopSweepTick(name)");
+    expect(offline, "offline does NOT — see the dep's docblock in agent-handlers.ts").not.toContain("stopSweepTick(");
   });
 });

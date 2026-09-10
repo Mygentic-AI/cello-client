@@ -51,6 +51,18 @@ export interface AgentHandlerDeps {
    */
   startAgentInternal: (name: string) => StartAgentResult;
   dropAgentSignaling: (agentName: string) => Promise<void>;
+  /**
+   * 048-SWEEPTICK: end this agent's collection tick. Wired to REMOVAL, deliberately not to offline.
+   *
+   * An offline agent's tick is already inert — it checks `isAgentOnline` before every sweep and does
+   * no round trips — and cancelling it there would be wrong rather than tidy: `cello_set_agent_offline`
+   * leaves the signaling manager connected, so a later `cello_start_agent` finds the cached manager
+   * and fires no `onConnected` (start-agent.ts:92 → getAgentSignaling's early return). Nothing would
+   * ever re-arm it, and the agent would silently drop back to collect-on-reconnect.
+   *
+   * A REMOVED agent is never coming back, so its timer is the one that should genuinely stop.
+   */
+  stopSweepTick: (agentName: string) => void;
   awayAckSent: Set<string>;
   keyProviders: Map<string, KeyProvider>;
   loadedAgents: LoadedAgent[];
@@ -63,7 +75,7 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
   const {
     handlers, logger, sessionNodeManager, agents, onlineAgents, explicitlyOfflineAgents, getNotificationDispatcher,
     getConnState, perConnectionState, getAgentsForConnection, startAgentInternal,
-    dropAgentSignaling, awayAckSent, keyProviders, loadedAgents, getAgentSignaling,
+    dropAgentSignaling, stopSweepTick, awayAckSent, keyProviders, loadedAgents, getAgentSignaling,
     waitForSignalingConnected, perAgentSignaling,
   } = deps;
 
@@ -257,6 +269,9 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
       await dropAgentSignaling(name).catch((err) => {
         logger.warn("agent.removal.signaling_teardown_failed", { agentName: name, agentId, error: extractErrorMessage(err) });
       });
+      // 048-SWEEPTICK: and its collection tick, which would otherwise outlive the agent for the life
+      // of the daemon — skipping every five minutes for a name that no longer exists.
+      stopSweepTick(name);
       keyProviders.delete(name);
       const li = loadedAgents.findIndex((a) => a.name === name);
       if (li >= 0) loadedAgents.splice(li, 1);
