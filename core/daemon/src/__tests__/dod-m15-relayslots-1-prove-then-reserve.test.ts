@@ -453,10 +453,21 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
         "both directions is forced through the relay park route.",
     ).toHaveLength(1);
 
-    const revivedAsks = factory.asks
-      .slice(asksBefore)
-      .filter((a) => a.nodeType === "session" && a.circuits.length > 0);
-    expect(revivedAsks.length, "one refused ask, one granted, on one relay").toBe(2);
+    /**
+     * ⚠️ MOVED WITH THE BEHAVIOUR (DOD-M15-RELAYPROVE-ORDER-1). This used to require exactly TWO
+     * node builds carrying a circuit address — "one refused ask, one granted, on one relay". The
+     * revival now proves on a node built with no circuit address and asks once, so the
+     * constructor-time count is zero and the ask is counted where it now happens.
+     */
+    expect(
+      factory.asks.slice(asksBefore).filter((a) => a.nodeType === "session" && a.circuits.length > 0).length,
+      "a revived session no longer asks before it has proved — nothing is built holding a circuit " +
+        "address it has not earned",
+    ).toBe(0);
+    const revivedListens = relay.timeline
+      .filter((e) => e.kind === "listen")
+      .filter((e) => (e.node as unknown as GatedNode).nodeType === "session");
+    expect(revivedListens.length, "one ask, on one relay, after the proof").toBe(1);
     expect(
       factory.built.filter(
         (n) => n.nodeType === "session" && n.listenAddresses().some((a) => a.includes("/p2p-circuit")),

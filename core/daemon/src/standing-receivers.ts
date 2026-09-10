@@ -243,7 +243,22 @@ export class StandingReceivers {
          */
         const verdict = await this.#ctx.proveToRelay(agentName, circuitAddr, candidate, correlationId, true);
 
-        if (verdict !== "proven") {
+        /**
+         * ⚠️ **A PROOF THAT NEVER REACHED A VERDICT IS NOT A REFUSAL** — and the ask goes ahead.
+         *
+         * `unavailable` means no relay answer was obtained at all: no relay client is wired, the
+         * dial failed, the stream threw. `proveReservation` already draws exactly this line for its
+         * own retry (*"`true`/`false` are VERDICTS; `transport_failed` means no verdict was reached
+         * and the question is still open"*), and it is the line that matters here for a second
+         * reason: **not every relay gates reservations.** A relay that never asks for a proof
+         * grants on the first ask, and refusing to ask because our own proof machinery was
+         * unavailable would make this client unable to reserve with it at all — a capability lost
+         * to a precaution.
+         *
+         * The cost of asking anyway is one refused ask against a gated relay we could not prove to
+         * — which is what the whole walk used to do on every relay, every time.
+         */
+        if (verdict === "refused_this_agent" || verdict === "refused_try_another_relay") {
           /**
            * DOD-M15-RELAYSLOTS-1 clause 9 — **A CLIENT-SIDE REFUSAL ENDS THE WALK.**
            *
@@ -254,18 +269,9 @@ export class StandingReceivers {
            * fault look like a fleet-wide outage in the logs. The refusal is already recorded where
            * `cello_status` reads it, so stopping is not silence.
            *
-           * ⚠️ THREE VERDICTS, THREE REASONS — Invariant 3, and the mapping is new. The old code
-           * reported `relay_proof_refused` for everything that was not `proven`, so a relay that
-           * was simply UNREACHABLE (`unavailable`, a failed dial) was reported as one that had
-           * considered this agent's proof and turned it down. That sends an operator to the
-           * directory and the agent's slot count for what is a dead host.
+           * ⚠️ ONLY A VERDICT REACHES THIS BRANCH — see the `unavailable` note below.
            */
-          const proofReason =
-            verdict === "refused_this_agent"
-              ? "relay_refused_this_agent"
-              : verdict === "unavailable"
-                ? "relay_unreachable"
-                : "relay_proof_refused";
+          const proofReason = verdict === "refused_this_agent" ? "relay_refused_this_agent" : "relay_proof_refused";
           this.#ctx.srLastRejectionReason.set(agentName, proofReason);
           this.#ctx.logger.warn("session.standing_receiver.relay.rejected", {
             agentName,
@@ -277,15 +283,36 @@ export class StandingReceivers {
                 ? "the relay refused this AGENT rather than this relay being unwilling or " +
                   "unwell, so every other relay would refuse it identically. Stopped here; " +
                   "cello_status carries the cause and what to do about it."
-                : proofReason === "relay_unreachable"
-                  ? "no connection to this relay could be opened, so it never saw a proof and " +
-                    "never answered. Moving to the next relay; this says nothing about the agent."
-                  : "this relay would not take the agent's proof. Moving to the next relay.",
+                : "this relay would not take the agent's proof. Moving to the next relay.",
           });
           if (verdict === "refused_this_agent") candidateRefusedAgent = true;
           rejectionNamed = true;
           try { await candidate.stop(); } catch { /* it may never have finished starting */ }
         } else {
+        /**
+         * ⚠️ **A PROOF THAT NEVER REACHED A VERDICT IS NOT A REFUSAL** — and the ask goes ahead.
+         *
+         * `unavailable` means no relay answer was obtained at all: no relay client is wired, the
+         * dial failed, the stream threw. `proveReservation` already draws exactly this line for its
+         * own retry (*"`true`/`false` are VERDICTS; `transport_failed` means no verdict was reached
+         * and the question is still open"*), and it matters here for a second reason: **not every
+         * relay gates reservations.** One that never asks for a proof grants on the first ask, and
+         * refusing to ask because our own proof machinery was unavailable would make this client
+         * unable to reserve with it at all — a capability lost to a precaution.
+         *
+         * The cost of asking anyway is one refused ask against a gated relay we could not prove to,
+         * which is what the walk used to spend on every relay, every time.
+         */
+        if (verdict === "unavailable") {
+          this.#ctx.logger.warn("session.standing_receiver.prove.no_verdict", {
+            agentName,
+            circuitAddr,
+            correlationId,
+            impact: "no proof verdict was obtained from this relay — no relay client is wired, or " +
+              "it could not be reached. Asking for the reservation anyway: a relay that does not " +
+              "gate them grants it, and one that does refuses an ask that cost a single dial.",
+          });
+        }
 
         /**
          * ASK — ONCE, on the connection we just proved on. Raced against the same budget the whole
@@ -830,21 +857,27 @@ export class StandingReceivers {
        * candidate and came up on the plain floor: alive, `active`, and dialable by nobody, with
        * every message in both directions forced through the relay park route.
        *
-       * Two attempts, exactly as `#startReceiverNode` does it, and for the same measured reason:
-       * a reservation taken by hand on the same connection as the proof yields no dialable address.
-       * The seed is fixed here — that is what a revival IS — so the second attempt necessarily
-       * carries the identity the relay just recorded.
+       * ⚠️ DOD-M15-RELAYPROVE-ORDER-1 — **ONE ATTEMPT NOW, exactly as `#startReceiverNode` does
+       * it.** This used to be two: ask, be refused, prove, ask again, justified by *"a reservation
+       * taken by hand on the same connection as the proof yields no dialable address."* That
+       * described taking the slot over a raw HOP stream; asking libp2p's own transport manager
+       * after the proof makes the reservation libp2p's own, and it announces the address. Measured
+       * live 2026-09-08. So the candidate comes up with no circuit address, proves, and asks once.
+       *
+       * The seed is fixed here — that is what a revival IS — so this node carries the identity the
+       * relay records, and it must STAY UP between the proof and the ask: the relay marks the
+       * CONNECTION proven, and stopping the node closes it.
        */
       let revivedNode: CelloNode | undefined;
       let terminalRefusal = false;
-      for (let attempt = 0; attempt < 2 && !terminalRefusal; attempt++) {
+      {
       const candidate = await this.createAgentNode(agentName, {
         sessionId,
         connectionGater: gater,
         nodeType: "session",
         inboundReachable: true,
         transportPrivateKey: seed,
-        circuitRelayListenAddrs: [circuitAddr],
+        // NO `circuitRelayListenAddrs` — libp2p must not ask before the proof below has landed.
       });
       // KEEP THE START PROMISE. Review HIGH-3: `libp2p.stop()` opens with
       // `if (this.status !== 'started') return`, and during the whole timeout window the status is
@@ -860,53 +893,59 @@ export class StandingReceivers {
         new Promise<false>((res) => setTimeout(() => res(false), REVIVE_RESERVATION_TIMEOUT_MS).unref?.()),
       ]).catch((err: unknown) => { startError = err; return false as const; });
 
-      if (started && candidate.listenAddresses().some((a) => a.includes("/p2p-circuit"))) {
-        this.#ctx.logger.info("session.revive.reservation.granted", { agentName, sessionId, attempts: attempt + 1 });
+      /**
+       * PROVE, THEN ASK — the same order as `#startReceiverNode`, for the same reason.
+       *
+       * `started` gates it because `libp2p.stop()` opens with `if (this.status !== 'started')
+       * return`, so a timed-out candidate cannot be torn down here; that case falls through to the
+       * settlement-chained teardown below, which is the only thing that reliably kills a
+       * still-starting node.
+       *
+       * ⚠️ THE CANDIDATE IS NOT STOPPED BETWEEN THE PROOF AND THE ASK. It used to be, because the
+       * ask came from a rebuilt node. The relay marks the CONNECTION proven, so stopping here
+       * would throw away the very thing that makes the next line succeed.
+       */
+      let proofDeclined = false;
+      if (started) {
+        const verdict = await this.#ctx.proveToRelay(agentName, circuitAddr, candidate, sessionId, false);
+        // A VERDICT DECLINES; NO VERDICT DOES NOT. `unavailable` means the relay never answered —
+        // no client wired, or unreachable — and not every relay gates reservations, so the ask
+        // still goes ahead. Same rule and same reasoning as `#startReceiverNode`.
+        if (verdict === "refused_this_agent" || verdict === "refused_try_another_relay") {
+          proofDeclined = true;
+          // The agent-level refusal is about this AGENT, so the remaining candidates answer
+          // identically.
+          if (verdict === "refused_this_agent") terminalRefusal = true;
+          this.#ctx.logger.warn("session.revive.reservation.declined", {
+            agentName,
+            sessionId,
+            circuitAddr,
+            reason: verdict === "refused_this_agent" ? "relay_refused_this_agent" : "relay_proof_refused",
+            impact:
+              verdict === "refused_this_agent"
+                ? "the relay refused this agent rather than being unwilling or unwell, so every " +
+                  "other relay refuses it the same way. The session comes up reachable only via " +
+                  "the relay park route; cello_status carries the cause."
+                : "this relay would not take the agent's proof. Trying the next relay.",
+          });
+          try { await candidate.stop(); } catch { /* best-effort */ }
+        } else {
+          // ASK — once, on the connection the proof was made on. A throw here is not fatal: the
+          // grant check below is the only thing that decides, and it reads the announced addresses.
+          try {
+            await candidate.listenOnCircuit(circuitAddr);
+          } catch (err: unknown) {
+            startError = err;
+          }
+        }
+      }
+
+      if (!proofDeclined && started && candidate.listenAddresses().some((a) => a.includes("/p2p-circuit"))) {
+        this.#ctx.logger.info("session.revive.reservation.granted", { agentName, sessionId });
         revivedNode = candidate;
         break;
       }
-
-      /**
-       * No reservation on the first attempt is the EXPECTED answer for a peer whose proof has
-       * aged out. Prove and go round once more.
-       *
-       * Only when `started` is true: `libp2p.stop()` opens with `if (this.status !== 'started')
-       * return`, so a timed-out candidate cannot be torn down here and rebuilding on its seed
-       * would put two live nodes on one peer id. That case falls through to the settlement-chained
-       * teardown below, which is the only thing that reliably kills a still-starting node.
-       */
-      if (attempt === 0 && started) {
-        const verdict = await this.#ctx.proveToRelay(agentName, circuitAddr, candidate, sessionId, false);
-        try { await candidate.stop(); } catch { /* best-effort */ }
-        if (verdict === "refused_this_agent") {
-          // The refusal is about this AGENT, so the remaining candidates would answer identically.
-          terminalRefusal = true;
-          this.#ctx.logger.warn("session.revive.reservation.declined", {
-            agentName,
-            sessionId,
-            circuitAddr,
-            reason: "relay_refused_this_agent",
-            impact: "the relay refused this agent rather than being unwilling or unwell, so every " +
-              "other relay refuses it the same way. The session comes up reachable only via the " +
-              "relay park route; cello_status carries the cause.",
-          });
-          break;
-        }
-        // Only a landed proof earns the retry — see the same rule in `#startReceiverNode`.
-        if (verdict !== "proven") {
-          this.#ctx.logger.warn("session.revive.reservation.declined", {
-            agentName,
-            sessionId,
-            circuitAddr,
-            reason: "relay_proof_refused",
-            impact: "this relay would not take the agent's proof, so asking it again would be " +
-              "refused the same way. Trying the next relay.",
-          });
-          break;
-        }
-        continue;
-      }
-
+      if (!proofDeclined) {
       // Started but granted nothing, or never started. Either way this node is not the one.
       //
       // Review MEDIUM-5: name WHICH of the three causes this was, the way `#startReceiverNode` does.
@@ -937,7 +976,7 @@ export class StandingReceivers {
         () => candidate.stop().catch(() => { /* best-effort */ }),
         () => { /* never started; nothing bound */ },
       );
-      break;
+      }
       }
       if (revivedNode) return revivedNode;
       if (terminalRefusal) break;

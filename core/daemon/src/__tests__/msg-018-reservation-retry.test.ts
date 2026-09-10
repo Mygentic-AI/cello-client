@@ -40,6 +40,7 @@ import { seedAgents } from "./helpers/seed-agents.js";
 import { FakeNode } from "./helpers/two-connection-fixture.js";
 import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
+import type { AgentRelayClient } from "../session-relay-client.js";
 
 interface LogEvent { event: string; ctx: Record<string, unknown> }
 
@@ -55,7 +56,21 @@ function makeLogger(): { logger: Logger; events: LogEvent[] } {
  * completing the handshake.
  */
 class ReservationNode extends FakeNode {
-  constructor(private readonly granted: boolean) { super(); }
+  constructor(private granted: boolean, private readonly onAsk?: () => boolean) { super(); }
+  /**
+   * DOD-M15-RELAYPROVE-ORDER-1 — **THE ASK MOVED, SO THE FIXTURE'S COUNTER MOVED WITH IT.**
+   *
+   * A reservation used to be requested by libp2p at start, from the circuit address the
+   * constructor was given, so counting node builds that carried one counted the asks. The walk now
+   * proves first and asks HERE, on a node that was built with no circuit address at all — the old
+   * counter reads zero for a walk that asks on every relay.
+   *
+   * `onAsk` returns whether this relay grants, so the "refused, refused, then granted" script this
+   * file is built on is unchanged; only where it is applied moved.
+   */
+  override async listenOnCircuit(_circuitAddr: string): Promise<void> {
+    if (this.onAsk?.() === true) this.granted = true;
+  }
   override listenAddresses(): string[] {
     return this.granted
       ? ["/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWRelay/p2p-circuit"]
@@ -82,16 +97,30 @@ class ReservationNode extends FakeNode {
   }
 }
 
-/** Refuses every reservation until `grantFrom` calls have been made, then grants. */
+/**
+ * Refuses every reservation until `grantFrom` asks have been made, then grants.
+ *
+ * ⚠️ `circuitAttempts` COUNTS ASKS, FROM BOTH SEAMS, and that is the whole of the
+ * DOD-M15-RELAYPROVE-ORDER-1 fixture change. A probe now asks through `listenOnCircuit` after its
+ * proof lands; the installed receiver still asks at construction, from the addresses the walk
+ * collected. Counting only the second reads zero for every walk and would make this file green
+ * against a daemon that never asks for a reservation at all.
+ */
 class SlotStarvedFactory implements ISessionNodeFactory {
   calls = 0;
   circuitAttempts = 0;
   constructor(private readonly grantFrom = Number.POSITIVE_INFINITY) {}
+  #ask(): boolean {
+    this.circuitAttempts += 1;
+    return this.circuitAttempts >= this.grantFrom;
+  }
   async createNode(c: SessionNodeConfig): Promise<CelloNode> {
     this.calls += 1;
     const wantsRelay = (c.circuitRelayListenAddrs?.length ?? 0) > 0;
-    if (wantsRelay) this.circuitAttempts += 1;
-    return new ReservationNode(wantsRelay && this.circuitAttempts >= this.grantFrom) as unknown as CelloNode;
+    // Built WITH circuit addresses: libp2p asks at start, so the ask is counted here.
+    const grantedAtStart = wantsRelay && this.#ask();
+    // Built WITHOUT: this is a probe, and it asks only once its proof has landed.
+    return new ReservationNode(grantedAtStart, wantsRelay ? undefined : () => this.#ask()) as unknown as CelloNode;
   }
 }
 
@@ -109,6 +138,18 @@ async function makeManager(opts: { factory: ISessionNodeFactory; logger: Logger;
   await snm.initialize();
   await seedAgents(snm.getDb(), ["alice"]);
   snm.setDirectoryRelayEndpoints("alice", [{ relayPeerId: "12D3KooWRelay", relayAddrs: ["/ip4/127.0.0.1/tcp/4001"] }]);
+  /**
+   * DOD-M15-RELAYPROVE-ORDER-1 — **A PROOF IS NOW A PRECONDITION OF THE ASK**, so a fixture with no
+   * relay client never reaches the ask at all and this file would measure a walk that stops one
+   * step earlier than the one it is about. This stub always proves; what is under test here is what
+   * happens when a relay takes the proof and then grants NO SLOT, which is the measured
+   * `relay_granted_no_reservation` shape (2,215 times over 17 days).
+   */
+  snm.setDetachedRelayClientBuilder(() => ({
+    async proveReservation(): Promise<boolean> { return true; },
+    getLastAuthRefusal(): null { return null; },
+    close(): void { /* nothing held */ },
+  } as unknown as AgentRelayClient));
   return { snm, dir };
 }
 
