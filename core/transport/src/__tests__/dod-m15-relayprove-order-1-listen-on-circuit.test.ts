@@ -101,3 +101,78 @@ describe("DOD-M15-RELAYPROVE-ORDER-1: listenOnCircuit", () => {
     });
   }, 20_000);
 });
+
+describe("054-SRSPLIT: releaseCircuit — giving a reservation back", () => {
+  const nodes: CelloNode[] = [];
+  afterEach(async () => {
+    for (const n of nodes.splice(0)) { try { await n.stop(); } catch { /* cleanup */ } }
+  });
+
+  it("★★★ a released circuit stops being announced — AND the relay still holds the slot", async () => {
+    /**
+     * ⚠️ **BOTH HALVES OF THIS ASSERTION ARE THE POINT, AND THE SECOND IS THE SURPRISING ONE.**
+     *
+     * Closing the local listener runs `reservationStore.cancelReservations()`, whose entire body is
+     * `clearTimeout` on each entry and `this.reservations.clear()`. It sends the relay NOTHING, and
+     * circuit-relay-v2 has no unreserve message. The relay's server frees a reservation only when
+     * its TTL aborts — two hours by default — and has no disconnect listener.
+     *
+     * So `releaseCircuit` is the LOCAL half: it stops us advertising a route we can no longer be
+     * reached on. **It does not free capacity**, and the second assertion pins that so nobody later
+     * reads this method as a release and builds "released at seal" on top of it. The verb that
+     * frees the slot lives on `/cello/relay/1.0.0` (054-SRSPLIT part A2), in the relay.
+     */
+    const relay = await createNode({
+      keyProvider: generateKeypair(),
+      listenAddresses: ["/ip4/127.0.0.1/tcp/0"],
+      relayServer: { enabled: true, reservations: { maxReservations: 64, applyDefaultLimit: false } },
+    });
+    nodes.push(relay);
+    await relay.start();
+    const relayAddr = relay.listenAddresses().find((a) => a.includes("/tcp/"));
+    expect(relayAddr, "the relay must be listening for this test to mean anything").toBeDefined();
+
+    const client = await createNode({ keyProvider: generateKeypair(), listenAddresses: ["/ip4/127.0.0.1/tcp/0"] });
+    nodes.push(client);
+    await client.start();
+    await client.dial(relayAddr!);
+    await client.listenOnCircuit(`${relayAddr!}/p2p-circuit`);
+    expect(
+      client.listenAddresses().some((a) => a.includes("/p2p-circuit")),
+      "precondition: a reservation must be HELD before releasing it can mean anything",
+    ).toBe(true);
+
+    const released = await client.releaseCircuit(`${relayAddr!}/p2p-circuit`);
+
+    expect(released, "it reports having held one").toBe(true);
+    expect(
+      client.listenAddresses().some((a) => a.includes("/p2p-circuit")),
+      "we stop advertising an address we can no longer be reached on — otherwise a counterparty is " +
+        "handed a route to a circuit that will refuse them",
+    ).toBe(false);
+    expect(
+      relay.releaseRelayReservation(client.getPeerId()),
+      "⚠️ TRUE MEANS THE RELAY STILL HELD IT. That is not a bug in releaseCircuit — it is the reason " +
+        "the relay needs a release VERB. If this ever goes false, libp2p has started telling the " +
+        "relay, and the verb can go.",
+    ).toBe(true);
+  }, 30_000);
+
+  it("releasing a circuit that was never held is a named no-op, not a throw", async () => {
+    // The seal path will call this whether or not a reservation was ever taken — an offer that went
+    // quiet never took one. Throwing there would turn a tidy-up into a failed seal.
+    const node = await createNode({ keyProvider: generateKeypair(), listenAddresses: ["/ip4/127.0.0.1/tcp/0"] });
+    nodes.push(node);
+    await node.start();
+    await expect(node.releaseCircuit("/ip4/127.0.0.1/tcp/4001/p2p-circuit")).resolves.toBe(false);
+  }, 20_000);
+
+  it("refuses a non-circuit address by name, exactly as listenOnCircuit does", async () => {
+    const node = await createNode({ keyProvider: generateKeypair(), listenAddresses: ["/ip4/127.0.0.1/tcp/0"] });
+    nodes.push(node);
+    await node.start();
+    await expect(node.releaseCircuit("/ip4/127.0.0.1/tcp/4001")).rejects.toMatchObject({
+      reason: "not_a_circuit_address",
+    });
+  }, 20_000);
+});

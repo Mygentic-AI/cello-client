@@ -483,6 +483,52 @@ class CelloNodeImpl implements CelloNode {
     await transportManager.listen([multiaddr(circuitAddr)]);
   }
 
+  /**
+   * 054-SRSPLIT. Contract and the load-bearing caveat are on the interface; the mechanics are here.
+   *
+   * A circuit listener is found by the address it announces rather than by the address it was given:
+   * libp2p builds the announced form (`…/p2p/<relay>/p2p-circuit/p2p/<self>`) by encapsulating the
+   * relay's own multiaddrs, so it is NOT string-equal to what `listenOnCircuit` was handed. Matching
+   * on the relay peer id is what makes the two ends of this pair line up.
+   */
+  async releaseCircuit(circuitAddr: string): Promise<boolean> {
+    if (!circuitAddr.split("/").includes("p2p-circuit")) {
+      throw {
+        reason: "not_a_circuit_address",
+        addr: circuitAddr,
+        message: "releaseCircuit takes a /p2p-circuit address",
+      };
+    }
+    if (this.#libp2p.status !== "started") {
+      throw { reason: "node_stopped", message: `Node is ${this.#libp2p.status}, not started` };
+    }
+    const transportManager = (
+      this.#libp2p as unknown as {
+        components?: { transportManager?: { getListeners(): Array<{ getAddrs(): Multiaddr[]; close(): Promise<void> }> } };
+      }
+    ).components?.transportManager;
+    if (typeof transportManager?.getListeners !== "function") {
+      throw {
+        reason: "transport_manager_unavailable",
+        message: "libp2p exposes no components.transportManager.getListeners — this node cannot release a reservation",
+      };
+    }
+    // The relay this address names. `undefined` only for a bare `/p2p-circuit` discovery address,
+    // which this daemon never listens on.
+    const relayPeerId = /\/p2p\/([^/]+)\/p2p-circuit/.exec(circuitAddr)?.[1];
+    let released = false;
+    for (const listener of transportManager.getListeners()) {
+      const addrs = listener.getAddrs().map((ma) => ma.toString());
+      const isOurs = addrs.some(
+        (a) => a.split("/").includes("p2p-circuit") && (relayPeerId === undefined || a.includes(`/p2p/${relayPeerId}/`)),
+      );
+      if (!isOurs) continue;
+      await listener.close();
+      released = true;
+    }
+    return released;
+  }
+
   async dial(multiaddrStr: string): Promise<{ peerId: string }> {
     if (this.#libp2p.status === "stopped") {
       throw { reason: "node_stopped", message: "Node is stopped" };
