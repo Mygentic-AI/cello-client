@@ -266,6 +266,31 @@ export class StandingReceivers {
      * address per relay listen address, so a five-address relay would otherwise count five times.
      */
     this.#ctx.standingReceivers.set(agentName, { ...sr, relayPeerIds: heldRelayIdsOf(sr.node) });
+
+    /**
+     * ⚠️ **DOD-M15-RELAYAUTH-1 STILL APPLIES, AND IT NO LONGER FIRES ON ITS OWN.**
+     *
+     * That auth is a SECOND proof, over the DELIVERY path, and it is what keeps the relay from
+     * revoking a reservation whose holder has not proven key possession to it — the grace window is
+     * about fifteen seconds. It used to run in the receiver build, over the circuits the login walk
+     * had just collected. Nothing is collected there any more, so without this line an on-demand
+     * reservation would be taken and then quietly revoked mid-session, and the agent would go
+     * unreachable while every log said the reservation was granted.
+     *
+     * Best-effort and unawaited, exactly as it is in the build path: a failure here costs the
+     * relay's own grace-window revoke, which the watchdog already treats as an ordinary loss.
+     */
+    if (outcome === "granted" && relayPeerId) {
+      void this.#ctx.authenticateStandingReceiver(agentName, sr.node, relayPeerId, circuitAddr, correlationId)
+        .catch((err: unknown) => {
+          this.#ctx.logger.warn("session.standing_receiver.relay_auth.failed", {
+            agentName, relayPeerId, correlationId,
+            error: extractErrorMessage(err),
+            impact: "this agent has a reservation the relay may revoke within its grace window, " +
+              "because key possession was not proven over the delivery path.",
+          });
+        });
+    }
     return outcome === "granted";
   }
 

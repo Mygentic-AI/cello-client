@@ -188,6 +188,13 @@ describe("DOD-M15-RELAYAUTH-1: the standing receiver authenticates to its reserv
       ).run(randomUUID().replaceAll("-", ""), ids.get("alice")!, "cc".repeat(32), now, now, relay.peerId, JSON.stringify([relay.addr]));
 
       await manager.ensureStandingReceiverForAgent("alice");
+      /**
+       * 055-ONDEMAND — **the receiver holds nothing until somebody calls**, so the reservation this
+       * file is about is now taken at OFFER time, on the relay the directory named. The seam is the
+       * same one the offer handler uses. What is under test — that the receiver authenticates to its
+       * reservation relay proactively rather than waiting for a session — is unchanged.
+       */
+      await manager.takeReservationForSession("alice", `${relay.addr}/p2p-circuit`, "test-corr");
 
       const reserved = await waitUntil(() => {
         const info = manager.getStandingReceiverInfo("alice");
@@ -280,6 +287,9 @@ describe("DOD-M15-RELAYAUTH-1: the standing receiver authenticates to its reserv
       ).run(randomUUID().replaceAll("-", ""), ids.get("alice")!, "cc".repeat(32), now, now, relay.peerId, JSON.stringify([relay.addr]));
 
       await manager.ensureStandingReceiverForAgent("alice");
+      // 055-ONDEMAND: an idle receiver holds nothing; the reservation is taken at OFFER time, on
+      // the relay the directory named. Same seam the offer handler uses.
+      await manager.takeReservationForSession("alice", `${relay.addr}/p2p-circuit`, "test-corr");
       await waitUntil(() => {
         const info = manager.getStandingReceiverInfo("alice");
         return info !== null && info.addrs.some((a) => a.includes("/p2p-circuit"));
@@ -305,6 +315,16 @@ describe("DOD-M15-RELAYAUTH-1: the standing receiver authenticates to its reserv
       }, 15_000);
       expect(rebuilt, "precondition: a replacement receiver must be built after the promotion").toBe(true);
       const secondPeerId = manager.getStandingReceiverInfo("alice")!.peerId;
+
+      /**
+       * ⚠️ 055-ONDEMAND MOVED WHEN, NOT WHETHER. The replacement receiver holds nothing while idle —
+       * that is the whole capacity change — so it proves itself when it TAKES a reservation, which
+       * is when the next offer arrives. The property this test exists for is unchanged and is the
+       * one asserted below: the replacement proves from its OWN transport identity, not the
+       * promoted receiver's. A shared relay client silently skipping that is what left an agent
+       * unreachable to anyone starting a new session while an existing one was open.
+       */
+      await manager.takeReservationForSession("alice", `${relay.addr}/p2p-circuit`, "test-corr-2");
 
       const secondProven = await waitUntil(() => relay.authenticatedPeerIds.includes(secondPeerId), 15_000);
       expect(
@@ -366,6 +386,9 @@ describe("DOD-M15-RELAYAUTH-1: the standing receiver authenticates to its reserv
       ).run(randomUUID().replaceAll("-", ""), ids.get("alice")!, "cc".repeat(32), now, now, reservationRelay.peerId, JSON.stringify([reservationRelay.addr]));
 
       await manager.ensureStandingReceiverForAgent("alice");
+      // 055-ONDEMAND: an idle receiver holds nothing; the reservation is taken at OFFER time, on
+      // the relay the directory named. Same seam the offer handler uses.
+      await manager.takeReservationForSession("alice", `${reservationRelay.addr}/p2p-circuit`, "test-corr");
       const reserved = await waitUntil(() => {
         const info = manager.getStandingReceiverInfo("alice");
         return info !== null && info.addrs.some((a) => a.includes("/p2p-circuit"));
