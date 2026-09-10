@@ -197,6 +197,13 @@ export class StandingReceivers {
        * Invariant 3 forbids.
        */
       let rejectionNamed = false;
+      /**
+       * The ask's own promise, when one was made. The abandonment below has to wait on THIS as well
+       * as on `start()`: the reservation is taken here now, so a node torn down while its ask is
+       * still in flight can be granted late and come up on the receiver's advertised peer id with
+       * nothing holding a reference to kill it.
+       */
+      let listenP: Promise<void> | undefined;
       const candidate = await this.createAgentNode(agentName, {
         sessionId,
         connectionGater: gater,
@@ -321,9 +328,10 @@ export class StandingReceivers {
         let listenTimer: ReturnType<typeof setTimeout> | undefined;
         const listenTimedOut = Symbol("listen_timeout");
         let listenOutcome: "asked" | typeof listenTimedOut = listenTimedOut;
+        listenP = candidate.listenOnCircuit(circuitAddr);
         try {
           listenOutcome = await Promise.race([
-            candidate.listenOnCircuit(circuitAddr).then(() => "asked" as const),
+            listenP.then(() => "asked" as const),
             new Promise<typeof listenTimedOut>((resolve) => {
               listenTimer = setTimeout(() => resolve(listenTimedOut), this.#ctx.srReservationTimeoutMs);
             }),
@@ -381,9 +389,11 @@ export class StandingReceivers {
       // a dial, and this candidate carries the receiver's identity: an unawaited `stop()` on a node
       // whose status is still `starting` returns without stopping anything, and the node then goes
       // live on our peer id with nothing left holding a reference to kill it.
-      void startP.then(
+      //
+      // BOTH promises: the reservation is taken by the ASK now, so a candidate abandoned on the
+      // ask's deadline still has work in flight that `start()` settling says nothing about.
+      void Promise.allSettled([startP, ...(listenP !== undefined ? [listenP] : [])]).then(
         () => candidate.stop().catch(() => { /* best-effort once it has settled */ }),
-        () => { /* never started; nothing bound */ },
       );
       }
       if (candidateGranted) grantedAddrs.push(circuitAddr);
@@ -906,6 +916,13 @@ export class StandingReceivers {
        * would throw away the very thing that makes the next line succeed.
        */
       let proofDeclined = false;
+      /**
+       * The ask's own promise, when one was made. The teardown below has to wait on THIS as well as
+       * on `start()`: the node whose reservation is still in flight is the one that can come up
+       * late holding this session's peer id, and `stop()` on a node mid-ask is the same no-op the
+       * start-promise note describes.
+       */
+      let listenP: Promise<void> | undefined;
       if (started) {
         const verdict = await this.#ctx.proveToRelay(agentName, circuitAddr, candidate, sessionId, false);
         // A VERDICT DECLINES; NO VERDICT DOES NOT. `unavailable` means the relay never answered —
@@ -930,12 +947,34 @@ export class StandingReceivers {
           });
           try { await candidate.stop(); } catch { /* best-effort */ }
         } else {
-          // ASK — once, on the connection the proof was made on. A throw here is not fatal: the
-          // grant check below is the only thing that decides, and it reads the announced addresses.
-          try {
-            await candidate.listenOnCircuit(circuitAddr);
-          } catch (err: unknown) {
-            startError = err;
+          /**
+           * ASK — once, on the connection the proof was made on.
+           *
+           * ⚠️ **RACED AGAINST THE SAME DEADLINE `start()` USED TO CARRY, AND IT HAS TO BE.** The
+           * measured production failure this whole loop exists for — 10,002ms and still waiting —
+           * was a relay that never answered a reservation. That used to park `start()`, because a
+           * circuit address in the constructor made start the moment libp2p asked. The ask is here
+           * now, so a bare await here is the same hang with a new address: the revival never
+           * returns and every send on that session is refused forever.
+           *
+           * A throw is not fatal — the grant check below is the only thing that decides, and it
+           * reads the announced addresses.
+           */
+          listenP = candidate.listenOnCircuit(circuitAddr);
+          const asked = await Promise.race([
+            listenP.then(() => true as const),
+            new Promise<false>((res) => setTimeout(() => res(false), REVIVE_RESERVATION_TIMEOUT_MS).unref?.()),
+          ]).catch((err: unknown) => { startError = err; return false as const; });
+          if (!asked) {
+            this.#ctx.logger.warn("session.revive.reservation.ask_timeout", {
+              agentName,
+              sessionId,
+              circuitAddr,
+              budgetMs: REVIVE_RESERVATION_TIMEOUT_MS,
+              impact: "this relay took the proof and then never answered the reservation. Abandoned " +
+                "on the deadline and trying the next relay — a relay that does not answer must not " +
+                "be able to hold a session down.",
+            });
           }
         }
       }
@@ -952,10 +991,15 @@ export class StandingReceivers {
       // "declined" alone stood for a relay that is full, a relay that is unreachable, and a relay
       // that is merely slow — three different problems with three different responses, and the
       // thrown error was discarded entirely.
-      const declineReason = started
-        ? "relay_granted_no_reservation"
-        : startError !== undefined
+      const declineReason = !started
+        ? startError !== undefined
           ? "relay_unreachable"
+          : "reservation_did_not_complete_in_time"
+        : // Started, proved, asked — and the ask is where a slow relay now shows up. An ask still in
+          // flight is "did not complete in time"; one that returned with nothing is a relay that
+          // answered and granted nothing.
+          listenP !== undefined && !candidate.listenAddresses().some((a) => a.includes("/p2p-circuit"))
+          ? "relay_granted_no_reservation"
           : "reservation_did_not_complete_in_time";
       const isLast = circuitAddr === candidateAddrs.slice(0, REVIVE_RESERVATION_CANDIDATES).at(-1);
       this.#ctx.logger.warn("session.revive.reservation.declined", {
@@ -968,13 +1012,21 @@ export class StandingReceivers {
           ? "no relay granted; the session comes up reachable only via the relay park route"
           : "trying the next relay",
       });
-      // Teardown at SETTLEMENT, not now: a `stop()` issued while the node is still starting is a
-      // no-op (see above), so the only way to guarantee this node dies is to wait for its own start
-      // to finish first. Not awaited, so a hung start cannot hold the revival up — the point is that
-      // the teardown eventually happens, not that it happens before the next candidate.
-      void startP.then(
+      /**
+       * Teardown at SETTLEMENT, not now: a `stop()` issued while the node is still starting is a
+       * no-op (see above), so the only way to guarantee this node dies is to wait for its own work
+       * to finish first. Not awaited, so a hung relay cannot hold the revival up — the point is that
+       * the teardown eventually happens, not that it happens before the next candidate.
+       *
+       * ⚠️ **BOTH PROMISES, and the second one is new.** The abandoned candidate's outstanding work
+       * used to be `start()`, because that is where the reservation was taken. It is the ASK now, so
+       * waiting only on `start()` tears the node down while its reservation is still in flight —
+       * and a late grant then brings a node up on THIS SESSION'S peer id, sharing the gater, with no
+       * content handler and nothing holding a reference to kill it. That is the open endpoint
+       * review HIGH-3 exists to prevent, reintroduced through a different promise.
+       */
+      void Promise.allSettled([startP, ...(listenP !== undefined ? [listenP] : [])]).then(
         () => candidate.stop().catch(() => { /* best-effort */ }),
-        () => { /* never started; nothing bound */ },
       );
       }
       }
