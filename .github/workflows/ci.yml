@@ -279,18 +279,36 @@ jobs:
         run: pnpm run build
 
       # Checkout trustless-cello for interfaces publish
+      # ⚠️ NON-FATAL ON PURPOSE (2026-09-10). `Mygentic-AI/CELLO` is PRIVATE, and the default
+      # GITHUB_TOKEN is scoped to the repository running the workflow — it cannot clone a different
+      # private repo, which surfaces as `Not Found`, not as a permission error. Setting that repo's
+      # `actions/permissions/access` to `organization` does NOT fix it: that policy governs reusable
+      # workflows and actions, not `git clone`. A cross-repo private checkout needs a PAT or a
+      # GitHub App token in a secret, and the only secret this repo holds is NPM_TOKEN.
+      #
+      # Without `continue-on-error` this step FAILS THE WHOLE PUBLISH JOB, so a package that has not
+      # changed in months blocks the release of the seven that did — which is what happened to
+      # v0.0.290 and v0.0.291. The interfaces publish below is already `|| true`, so the job's intent
+      # was always that it be optional; the checkout simply was not.
+      #
+      # To restore it: add a PAT with read access to Mygentic-AI/CELLO as a secret and pass it here
+      # as `token:`. Until then a CHANGED interfaces must be published by hand from trustless-cello,
+      # and this job will not tell you it was skipped — that is the cost.
       - name: Checkout trustless-cello (for interfaces publish)
         uses: actions/checkout@v4
+        continue-on-error: true
         with:
           repository: Mygentic-AI/CELLO
           path: trustless-cello
 
       - name: Install trustless-cello interfaces dependencies (for publish)
         working-directory: trustless-cello/packages/interfaces
+        continue-on-error: true
         run: pnpm install --ignore-workspace
 
       - name: Build @cello-protocol/interfaces (for publish)
         working-directory: trustless-cello/packages/interfaces
+        continue-on-error: true
         run: |
           pnpm run typecheck
           test -d dist && test "$(ls -A dist)" || (echo "ERROR: dist/ is empty after build" && exit 1)
@@ -487,18 +505,36 @@ jobs:
       - name: Build
         run: pnpm run build
 
+      # ⚠️ NON-FATAL ON PURPOSE (2026-09-10). `Mygentic-AI/CELLO` is PRIVATE, and the default
+      # GITHUB_TOKEN is scoped to the repository running the workflow — it cannot clone a different
+      # private repo, which surfaces as `Not Found`, not as a permission error. Setting that repo's
+      # `actions/permissions/access` to `organization` does NOT fix it: that policy governs reusable
+      # workflows and actions, not `git clone`. A cross-repo private checkout needs a PAT or a
+      # GitHub App token in a secret, and the only secret this repo holds is NPM_TOKEN.
+      #
+      # Without `continue-on-error` this step FAILS THE WHOLE PUBLISH JOB, so a package that has not
+      # changed in months blocks the release of the seven that did — which is what happened to
+      # v0.0.290 and v0.0.291. The interfaces publish below is already `|| true`, so the job's intent
+      # was always that it be optional; the checkout simply was not.
+      #
+      # To restore it: add a PAT with read access to Mygentic-AI/CELLO as a secret and pass it here
+      # as `token:`. Until then a CHANGED interfaces must be published by hand from trustless-cello,
+      # and this job will not tell you it was skipped — that is the cost.
       - name: Checkout trustless-cello (for interfaces publish)
         uses: actions/checkout@v4
+        continue-on-error: true
         with:
           repository: Mygentic-AI/CELLO
           path: trustless-cello
 
       - name: Install trustless-cello interfaces dependencies (for publish)
         working-directory: trustless-cello/packages/interfaces
+        continue-on-error: true
         run: pnpm install --ignore-workspace
 
       - name: Build @cello-protocol/interfaces (for publish)
         working-directory: trustless-cello/packages/interfaces
+        continue-on-error: true
         run: |
           pnpm run typecheck
           test -d dist && test "$(ls -A dist)" || (echo "ERROR: dist/ is empty after build" && exit 1)
