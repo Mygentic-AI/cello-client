@@ -1043,10 +1043,16 @@ export class SessionContentSender {
           "authority has no copy of it. The counterparty's tree cannot gain this leaf from the " +
           "relay, so the two records may no longer agree — and a bilateral seal needs them to.",
         guidance:
-          "Usually the relay was briefly unreachable and the next send re-establishes ordering. If " +
-          "it repeats, the relay is not carrying this session: check connectivity before closing, " +
-          "because sealing on a record the counterparty cannot match produces a receipt only one " +
-          "side can verify.",
+          // ⚠️ DO NOT REINSTATE "the next send re-establishes ordering". It is false and it is the
+          // opposite of the remedy: an unwitnessed append leaves this tree one leaf ahead of the
+          // relay's, so the next WITNESSED send takes the divergence branch and makes the session
+          // permanently unsealable. The response guidance in session-content-handlers.ts was
+          // corrected for exactly this and calls the old sentence the most damaging one in the unit
+          // that added it; this copy was missed and kept telling the operator to keep talking.
+          "Delivered and in your transcript, but the relay did not witness it — neither side has " +
+          "independent proof you sent it. Do NOT resend, and do not keep sending: your record is " +
+          "now one leaf ahead of the relay's, so the next witnessed message reports this session " +
+          "as diverged and a diverged session can never be sealed. If the receipt matters, close now.",
       });
       /**
        * ─── `016-RELAYLOSS`: CARRIED TO THE CALLER, because the log is not a consumer ────────────
