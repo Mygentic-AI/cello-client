@@ -37,63 +37,16 @@ import {
   SR_RESERVATION_MAX_RETRIES,
   REVIVE_RESERVATION_CANDIDATES,
   REVIVE_RESERVATION_TIMEOUT_MS,
+  clientSideAskFault,
+  holdsCircuit,
+  stopWhenSettled,
   type SessionNodeConfig,
 } from "./session-node-types.js";
 import { STANDING_RECEIVER_AGENT_NAME } from "./types.js";
 
-/**
- * Wait for an abandoned candidate's outstanding work to settle, then stop it — but never wait
- * forever.
- *
- * ⚠️ **REVIEW MEDIUM-4 — `allSettled` ON A PROMISE THAT CANNOT SETTLE NEVER RUNS THE TEARDOWN.**
- * The teardown is chained onto the candidate's own work because `libp2p.stop()` returns immediately
- * unless the node is `started`, so stopping a node mid-flight stops nothing. But a relay that
- * accepts the stream and never answers leaves `listen()` pending forever — that is exactly the case
- * `msg-027`'s fixture models — and the chained stop would then never fire at all, leaving a live
- * node on the receiver's seed while the walk builds more nodes on that same seed.
- *
- * So: settle OR expire. The grace is generous relative to the ask's own deadline, because the point
- * is to bound the wait, not to race it — a node that finishes at the last moment must still be
- * stopped by its own settlement rather than while it is starting.
- */
-function stopWhenSettled(node: CelloNode, work: Array<Promise<unknown> | undefined>, graceMs: number): void {
-  const pending = work.filter((p): p is Promise<unknown> => p !== undefined);
-  const settled = Promise.allSettled(pending);
-  const bounded = new Promise<void>((resolve) => { setTimeout(resolve, graceMs).unref?.(); });
-  void Promise.race([settled, bounded]).then(() => node.stop().catch(() => { /* best-effort */ }));
-}
 import type { SessionRecords } from "./session-records.js";
 import type { ParkRecovery } from "./park-recovery.js";
 
-/**
- * A reservation ask that failed for a CLIENT-SIDE reason, named by the transport.
- *
- * ⚠️ **REVIEW HIGH-2 — WITHOUT THIS, A LIBP2P RENAME READS AS A CAPACITY OUTAGE.** When
- * `listenOnCircuit` throws `transport_manager_unavailable`, the ask never reached the relay at all —
- * but the generic decline below infers its reason from the connection state, finds the proof
- * connection still open, and reports `relay_granted_no_reservation` on every relay in the pool. That
- * string means *"relay CAPACITY, a trustless-cello problem"* in this daemon's own taxonomy, so an
- * upstream API change would send an operator into the relay fleet while the real cause survived only
- * as an `error` field on a warn line nothing surfaces.
- *
- * These faults are ours. They must be described in our vocabulary, not the relay's.
- */
-const CLIENT_SIDE_ASK_FAULTS = new Set(["transport_manager_unavailable", "not_a_circuit_address"]);
-function clientSideAskFault(err: unknown): string | undefined {
-  const reason = (err as { reason?: unknown } | null)?.reason;
-  return typeof reason === "string" && CLIENT_SIDE_ASK_FAULTS.has(reason) ? reason : undefined;
-}
-
-/**
- * Whether this node holds a granted reservation — i.e. announces a circuit address.
- *
- * Review LOW-5: `p2p-circuit` is read as a SEGMENT, the same rule `listenOnCircuit` applies to its
- * own input. A substring test also matches a host or peer id that happens to contain the text, and
- * the file should not argue one rule and apply another two lines later.
- */
-function holdsCircuit(node: CelloNode): boolean {
-  return node.listenAddresses().some((a) => a.split("/").includes("p2p-circuit"));
-}
 
 /** What the standing receiver needs from the manager. */
 export interface StandingReceiverContext {
