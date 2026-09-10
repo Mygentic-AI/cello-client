@@ -27,6 +27,7 @@ import { contentHashFor, resolveContentHashAlg } from "./wire-content-hash.js";
 import { SALT_ADOPTION_LABEL_MAX } from "./session-salt-agreement.js";
 import { CONTENT_ENCRYPTION_INBOUND_GUIDANCE, SESSION_CONTENT_ENCRYPTION_V1 } from "./content-encryption-status.js";
 import { REFUSAL_KINDS } from "./refusal-reasons.js";
+import { refuseIfSessionClosed } from "./session-closed.js";
 import { triageOrphanedContent } from "./orphan-triage.js";
 import { extractErrorMessage } from "./error-message.js";
 import { retentionSentence } from "./quarantine-framing.js";
@@ -284,45 +285,8 @@ export class SessionContentIngest {
     // `currentStatus` carries the real status onward: the content-park disposition and the operator
     // must be able to tell an abandoned session from a sealed one, and `session_committed` alone is
     // the exit point, not the cause.
-    if (
-      record.status === "sealed" ||
-      record.status === "seal_interrupted_pending" ||
-      record.status === "abandoned"
-    ) {
-      this.#ctx.logger.warn("session.content.cross_check.failed", {
-        sessionId,
-        reason: "session_committed",
-        currentStatus: record.status,
-        correlationId,
-      });
-      // DOD-M15-REFUSEDEVIDENCE-1 — RETAINED. A post-seal straggler on the DIRECT path kept nothing
-      // before this: `sealed_session_annex` covers the park-drain and held-drift routes, not this
-      // exit. Something arriving into a signed, closed conversation is exactly the kind of thing an
-      // operator later wants to produce.
-      const retainedSeq = this.#ctx.refusals.quarantineRefusedContent(agentName, sessionId, "session_committed", content, contentHashHex, {
-        senderPubkeyHex: record.counterparty_pubkey ?? null, correlationId,
-      });
-      /**
-       * DOD-M15-REFUSALTERMINAL-1 — the retention call above is also what STOPS THE WORK: it runs
-       * the terminal funnel, and `session_committed` is the one reason in it.
-       *
-       * Without that, the relay's next redelivery of the witness leaf armed another park fetch,
-       * which drained, verified, arrived here, and was refused again — measured at ~2 per second
-       * for 62 hours on one message. `#markContentResolved` could not be reused: this content did
-       * not land, and saying that it did is a lie a future reader would act on.
-       */
-      // DOD-M15-NO-SILENT-REFUSAL-1. `currentStatus` on the log line carries the REAL status —
-      // sealed, seal_interrupted_pending or abandoned — and the notice must not flatten those into
-      // one claim, so it names the record as frozen rather than asserting which way it ended.
-      this.#ctx.notices.noteContentRefusal(agentName, sessionId, "session_committed", {
-        kind: REFUSAL_KINDS.REFUSED,
-        impact:
-          `This conversation is closed (it ended as "${record.status}"), so the message could not be delivered and neither can anything else they send to it. A closed conversation is signed and cannot be added to — that is what closing it means. Nothing is wrong on your side.`,
-        guidance:
-          "There is nothing to repair here. If they still have something to say, ask them to start a NEW conversation — a closed one cannot be reopened, and it is worth telling them, because they may not realise it ended. Read what was said before it closed with cello_transcript.",
-      });
-      return { ok: false, reason: "session_committed", retained: retainedSeq !== null };
-    }
+    const closed = refuseIfSessionClosed(this.#ctx, agentName, sessionId, content, contentHashHex, correlationId);
+    if (closed.refused) return { ok: false, reason: "session_committed", retained: closed.retained };
 
     /**
      * DOD-M15-SEALWIRE-1 part B1 — VERIFY UNDER THE ALGORITHM THE SENDER NAMED.
@@ -1979,6 +1943,33 @@ export class SessionContentIngest {
         return;
       }
       plaintextBody = opened;
+      /**
+       * ─── THE CONVERSATION IS OVER, AND THAT OUTRANKS EVERY QUESTION BELOW IT ──────────────────
+       * `DOD-M15-CLOSEDSESSION-1`.
+       *
+       * Placed HERE — after the decrypt, before the authorship claim — for two reasons, and both
+       * are load-bearing:
+       *
+       *  - AFTER the decrypt, because refusing retains the bytes, and the bytes worth retaining are
+       *    the message. Refusing a line earlier would quarantine ciphertext nobody can read.
+       *  - BEFORE the authorship claim, because that is what was answering. A message composed
+       *    after the seal acknowledges content our frozen record does not hold, so
+       *    `verifyAuthorshipClaim` returned `ack_hash_unknown_content` and the status was never
+       *    consulted at all. Measured live on session `9d253bce…`.
+       *
+       * ⚠️ THIS IS A REORDER, NOT A REMOVAL. The acknowledgement check still runs, and still
+       * refuses, for every session that is not closed — which is the state it exists for. What it
+       * no longer does is describe a hash where the situation is that there is nothing left to
+       * acknowledge.
+       *
+       * The peer gate above has already established this frame came from THIS session's
+       * counterparty peer, and the session key opened it. So nothing is attributed on the strength
+       * of an unverified signature: the quarantine row records the counterparty from local session
+       * state, exactly as the park route's refusal does.
+       */
+      if (refuseIfSessionClosed(this.#ctx, agentName, sessionId, plaintextBody, Buffer.from(contentHash).toString("hex"), correlationId).refused) {
+        return;
+      }
       // DOD-MSG-4 (self-ordering content frame): if the frame carries the relay's signed ordering
       // record, verify the sender signature and record the canonical sequence FROM THE FRAME, BEFORE
       // ingest — so the strict-in-order gate has the position without waiting on the separate

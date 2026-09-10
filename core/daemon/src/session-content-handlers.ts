@@ -27,6 +27,7 @@ import type { ContentTakeLedger } from "./co-attendance.js";
 import { isAutoReplyMarked } from "./away-detection.js";
 import { REFUSAL_COUNT_GUIDANCE, REFUSAL_KIND_GUIDANCE, type RefusalKind } from "./refusal-reasons.js";
 import { extractErrorMessage } from "./error-message.js";
+import { SESSION_CLOSED_GUIDANCE, SESSION_CLOSED_REASON, SESSION_SEALING_IMPACT, closedSessionImpact, isClosedStatus } from "./session-closed.js";
 
 /**
  * DOD-M12B-AWAY-MARK-1 — what a reader needs to know the moment it sees a marked message.
@@ -324,6 +325,42 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     }
     if (record.agent_name !== agentName) {
       return { ok: false, reason: "session_not_owned", guidance: "This session belongs to a different agent. Call cello_use_agent to switch to the agent that owns it, then retry." };
+    }
+    /**
+     * ─── A CLOSED CONVERSATION CANNOT BE ADDED TO — `DOD-M15-CLOSEDSESSION-1` ───────────────────
+     *
+     * BEFORE THE WIRE, BEFORE THE REVIVAL, BEFORE THE SCREENING. Nothing is placed, nothing reaches
+     * the relay, and nothing reports `delivered`.
+     *
+     * **Why it sits ahead of the revival rather than inside it.** `reviveIfNeededForSend` already
+     * refuses a sealed row — as `session_terminal`, a name about resurrection — but it is reached
+     * only through `record.status !== "active"`, and the case measured live had a row that still
+     * read `active`. Session `9d253bce…`: this side's own seal leaf was submitted and
+     * auto-acknowledged, the ceremony's status write had not happened yet, and the send sailed past
+     * every status check in the daemon. The relay had retired the session at the seal, so the hash
+     * submit failed `relay_session_gone`, the leaf was appended unwitnessed, and the operator was
+     * handed a paragraph about relay witnessing and ordering divergence — all true, none of it the
+     * point, and the counterparty refused the bytes as `ack_hash_unknown_content`.
+     *
+     * **Two facts, one refusal, and only local state is consulted.** The status row and this side's
+     * own seal commitment are both unambiguous and both ours. `relay_session_gone` is deliberately
+     * NOT one of them: `delivery-session-suspects.ts` refuses to make it terminal on evidence — the
+     * relay defaults to an in-memory store, so a restart tells every client the same string for
+     * sessions that are perfectly alive.
+     */
+    if (isClosedStatus(record.status)) {
+      logger.info("session.send.refused_closed", {
+        sessionId, agentName, status: record.status, trigger: "status",
+        impact: closedSessionImpact(record.status),
+      });
+      return { ok: false, reason: SESSION_CLOSED_REASON, impact: closedSessionImpact(record.status), guidance: SESSION_CLOSED_GUIDANCE };
+    }
+    if (sessionNodeManager.hasCommittedSealLeaf(agentName, sessionId)) {
+      logger.info("session.send.refused_closed", {
+        sessionId, agentName, status: record.status, trigger: "seal_committed",
+        impact: SESSION_SEALING_IMPACT,
+      });
+      return { ok: false, reason: SESSION_CLOSED_REASON, impact: SESSION_SEALING_IMPACT, guidance: SESSION_CLOSED_GUIDANCE };
     }
     if (record.status !== "active") {
       /**

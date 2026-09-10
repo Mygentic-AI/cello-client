@@ -162,6 +162,10 @@ export interface TwoConnectionFixture {
    *  eleven minutes, without waiting eleven minutes. Marks the real waiter map the status surface
    *  reads, and emits the same start-of-wait log the close emits. */
   markSealInFlightForTest(agent: string, sessionId: string): void;
+  /** DOD-M15-CLOSEDSESSION-1: commit THIS side's half of the seal — the state that defeats every
+   *  status check, because the row still reads `active` until the ceremony's tail writes it.
+   *  Marks the real map `cello_send` consults, not a flag of the fixture's own. */
+  markSealLeafCommittedForTest(agent: string, sessionId: string): void;
   cleanup(): Promise<void>;
 }
 
@@ -312,6 +316,9 @@ export async function startTwoConnectionFixture(
     },
     markSealInFlightForTest(agent, sessionId) {
       handle.markSealInFlightForTest(agent, sessionId);
+    },
+    markSealLeafCommittedForTest(agent, sessionId) {
+      handle.getSessionNodeManager().markSealLeafCommittedForTest(agent, sessionId);
     },
     eventsNamed(event) {
       return events.filter((e) => e.event === event);

@@ -584,6 +584,11 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
   getEndedUnread(agentName: string): Array<{ session_id: string; unread_count: number; last_seq: number; status: string }> { return this.#records.getEndedUnread(agentName); }
   getUnreadReceivedCount(agentName: string, sessionId: string): number { return this.#records.getUnreadReceivedCount(agentName, sessionId); }
   markSessionDiverged(agentName: string, sessionId: string): void { return this.#records.markSessionDiverged(agentName, sessionId); }
+
+  /** DOD-M15-CLOSEDSESSION-1 — has THIS side committed its half of the seal? The state a status row cannot show; the reasoning is in `session-closed.ts`. */
+  hasCommittedSealLeaf(agentName: string, sessionId: string): boolean { return this.#responderSealSubmitted.has(this.#k(agentName, sessionId)); }
+  /** DOD-M15-CLOSEDSESSION-1 test seam: commit this side's half with no relay, by marking the REAL map production reads. */
+  markSealLeafCommittedForTest(agentName: string, sessionId: string): void { this.#responderSealSubmitted.set(this.#k(agentName, sessionId), null); }
   isSessionDiverged(agentName: string, sessionId: string): boolean { return this.#records.isSessionDiverged(agentName, sessionId); }
 
   /** DOD-M12B-LEAF-TRIGGERS-FETCH-1: content hashes this session has actually resolved — ingested,
@@ -2338,17 +2343,12 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     return this.#life.reviveSessionNode(...args);
   }
 
-  reviveIfNeededForSend(
-    ...args: Parameters<SessionLifecycle["reviveIfNeededForSend"]>
-  ): ReturnType<SessionLifecycle["reviveIfNeededForSend"]> {
-    return this.#life.reviveIfNeededForSend(...args);
-  }
+  // Collapsed to the one-line delegator form this file already uses (`markSessionDiverged`) to pay
+  // for `hasCommittedSealLeaf` above without moving the ratchet: it only ever shrinks. Signatures
+  // stay DERIVED, so neither can drift from the method it forwards to.
+  reviveIfNeededForSend(...args: Parameters<SessionLifecycle["reviveIfNeededForSend"]>): ReturnType<SessionLifecycle["reviveIfNeededForSend"]> { return this.#life.reviveIfNeededForSend(...args); }
 
-  reviveIfNeededForRead(
-    ...args: Parameters<SessionLifecycle["reviveIfNeededForRead"]>
-  ): ReturnType<SessionLifecycle["reviveIfNeededForRead"]> {
-    return this.#life.reviveIfNeededForRead(...args);
-  }
+  reviveIfNeededForRead(...args: Parameters<SessionLifecycle["reviveIfNeededForRead"]>): ReturnType<SessionLifecycle["reviveIfNeededForRead"]> { return this.#life.reviveIfNeededForRead(...args); }
 
   abandonSession(
     ...args: Parameters<SessionLifecycle["abandonSession"]>
