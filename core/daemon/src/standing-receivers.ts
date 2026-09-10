@@ -265,7 +265,21 @@ export class StandingReceivers {
      * Read from the NODE rather than appended to, and deduped by relay: libp2p announces one
      * address per relay listen address, so a five-address relay would otherwise count five times.
      */
-    this.#ctx.standingReceivers.set(agentName, { ...sr, relayPeerIds: heldRelayIdsOf(sr.node) });
+    const heldNow = heldRelayIdsOf(sr.node);
+    this.#ctx.standingReceivers.set(agentName, { ...sr, relayPeerIds: heldNow });
+    /**
+     * ⚠️ **A RELAY THAT GRANTED MUST BE ADMITTED INBOUND, OR THE RESERVATION BUYS NOTHING.**
+     *
+     * The gater's inbound carve-out is the security-sensitive half of a reservation: only relays
+     * whose own grant is confirmed earn it, so a directory that merely NAMES a relay cannot dial us
+     * through it. That set was built once from what the login walk held — empty now — so an
+     * on-demand reservation would have been taken, announced, and then refused by OUR OWN gater
+     * when the counterparty dialled through it.
+     *
+     * Recomputed from what the node HOLDS, never from what was asked: being named by the directory
+     * must not buy a foothold, and under on-demand the directory is what names the relay.
+     */
+    sr.gater.setReservedRelayPeers(heldNow);
 
     /**
      * ⚠️ **DOD-M15-RELAYAUTH-1 STILL APPLIES, AND IT NO LONGER FIRES ON ITS OWN.**
@@ -370,7 +384,13 @@ export class StandingReceivers {
     }
     // Same reason as the take path: the record follows the node, deduped by relay.
     const after = this.#ctx.standingReceivers.get(agentName);
-    if (after) this.#ctx.standingReceivers.set(agentName, { ...after, relayPeerIds: heldRelayIdsOf(after.node) });
+    if (after) {
+      const held = heldRelayIdsOf(after.node);
+      this.#ctx.standingReceivers.set(agentName, { ...after, relayPeerIds: held });
+      // The carve-out follows what is HELD, in both directions: a relay we gave back must stop being
+      // admitted inbound, or releasing the slot would leave the door open behind it.
+      after.gater.setReservedRelayPeers(held);
+    }
     this.#ctx.logger.info("session.reservation.released", {
       agentName,
       releasedRelays: heldBefore.filter((id) => !stillNeededRelayIds.has(id)),

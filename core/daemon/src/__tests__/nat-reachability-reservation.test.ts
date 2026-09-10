@@ -238,24 +238,40 @@ describe("R4+R5+R6: SessionNodeManager reservation wiring", () => {
     }
   }, 20_000);
 
-  it("R5: a dead relay endpoint degrades LOUDLY but does not kill the receiver", async () => {
+  it("R5: a dead relay degrades LOUDLY at the moment it costs something, and never kills the receiver", async () => {
+    /**
+     * ⚠️ **REWRITTEN FOR 055-ONDEMAND, AND THE "LOUDLY" MOVED RATHER THAN GOING AWAY.**
+     *
+     * This used to assert `reservation.none` at WARN when the login walk failed. Nothing is asked at
+     * login now, so that warn was removed: firing it on every healthy login would make an alarm that
+     * means "nobody can dial this agent" wrong every single time.
+     *
+     * The loudness belongs where the failure costs someone something — the ask itself. That is what
+     * is asserted here: a dead relay makes the ask fail, says so with a named reason on the surface
+     * `cello_status` reads, and leaves the receiver up on its TCP floor.
+     */
     const { manager, events } = await makeManager();
     try {
       await seedRelayEndpoint(manager, "alice", DEAD_RELAY_PEER_ID, "/ip4/127.0.0.1/tcp/59987");
       await manager.ensureStandingReceiverForAgent("alice");
+
+      const took = await manager.takeReservationForSession(
+        "alice", `/ip4/127.0.0.1/tcp/59987/p2p/${DEAD_RELAY_PEER_ID}/p2p-circuit`, "test-corr",
+      );
+
+      expect(took, "a dead relay grants nothing, and the caller is told so rather than left to guess").toBe(false);
       const info = manager.getStandingReceiverInfo("alice");
-      expect(info).not.toBeNull();
+      expect(info, "the receiver is still up — a bad relay must never cost the agent its front door").not.toBeNull();
       expect(info!.addrs.length).toBeGreaterThan(0);
       expect(info!.addrs.every((a) => !a.includes("/p2p-circuit"))).toBe(true);
-      const none = events.find((e) => e.event === "session.standing_receiver.reservation.none");
-      expect(none).toBeDefined();
-      expect(none!.level).toBe("warn");
-      // Offered one, held none. The two numbers DIVERGE here, which is the whole point of splitting
-      // the field: under the old name this event said "1" and a reader could not tell whether that
-      // meant one relay asked or one reservation obtained.
-      expect(none!.context).not.toHaveProperty("reservationsRequested");
-      expect(none!.context.relaysOffered).toBe(1);
-      expect(none!.context.reservationsHeld).toBe(0);
+      const rejected = events.find((e) => e.event === "session.standing_receiver.relay.rejected");
+      expect(rejected, "the refusal is reported, with a cause").toBeDefined();
+      expect(rejected!.level).toBe("warn");
+      expect(
+        rejected!.context.reason,
+        "and it names the RELAY being unreachable, not a generic failure — the operator has to know " +
+          "which of the three (capacity, network, latency) they are looking at",
+      ).toBe("relay_unreachable");
     } finally {
       await manager.gracefulShutdown();
     }
@@ -272,15 +288,32 @@ describe("R4+R5+R6: SessionNodeManager reservation wiring", () => {
       await seedRelayEndpoint(manager, "alice", relay.peerId, relay.addr);
       await seedRelayEndpoint(manager, "alice", DEAD_RELAY_PEER_ID, "/ip4/127.0.0.1/tcp/59987");
       await manager.ensureStandingReceiverForAgent("alice");
-      const ok = await waitUntil(() => {
-        const info = manager.getStandingReceiverInfo("alice");
-        return info !== null && info.addrs.some((a) => a.includes("/p2p-circuit"));
-      }, 15_000);
-      expect(ok).toBe(true);
-      const reach = events.find((e) => e.event === "session.standing_receiver.reachability");
-      expect(reach).toBeDefined();
-      expect(reach!.context.relaysOffered).toBe(2);
-      expect(reach!.context.reservationsHeld).toBe(1);
+      /**
+       * ⚠️ **THE COUNTING HALF OF THIS TEST IS GONE WITH THE LOGIN WALK (055-ONDEMAND); THE
+       * SECURITY HALF BELOW IS WHY THE TEST SURVIVES, AND IT MATTERS MORE NOW.**
+       *
+       * It used to assert `relaysOffered: 2, reservationsHeld: 1` from the walk's reachability
+       * event. Nothing is offered or held at login any more. What is unchanged — and is now the
+       * whole point — is that being NAMED buys no foothold: under on-demand the directory names the
+       * relay, so "named by the directory" and "granted us a slot" are further apart than ever.
+       *
+       * One relay grants, one is dead. Both were asked; only one is admitted inbound.
+       */
+      expect(
+        await manager.takeReservationForSession("alice", `${relay.addr}/p2p-circuit`, "test-corr"),
+        "the healthy relay grants",
+      ).toBe(true);
+      expect(
+        await manager.takeReservationForSession(
+          "alice", `/ip4/127.0.0.1/tcp/59987/p2p/${DEAD_RELAY_PEER_ID}/p2p-circuit`, "test-corr",
+        ),
+        "the dead one does not",
+      ).toBe(false);
+      expect(
+        manager.getStandingReceiverRelayIds("alice"),
+        "and only the one that granted is recorded as held",
+      ).toEqual([relay.peerId]);
+      void events;
 
       /**
        * ⚠️ THE WIRING, WHICH IS THE SECURITY-SENSITIVE HALF AND WAS THE HOLLOW ONE.
