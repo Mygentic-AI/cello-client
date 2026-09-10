@@ -282,7 +282,7 @@ async function startDaemonHoldingLock(
     // that goes quiet is `let x;`: still `undefined`, no error. That is unit 4's defect, and this
     // is not it.)
     getWirePerAgentSessionInbound: () => wirePerAgentSessionInbound,
-    getHandleTrustSignalPickup: () => handleTrustSignalPickup, getSweepTrustSignals: () => sweepTrustSignals,
+    getHandleTrustSignalPickup: () => handleTrustSignalPickup, getSweepTrustSignals: () => sweepTrustSignalsAndTick,
   });
 
   // CELLO-M7-CONN-001 (DOD-CONN-1, code-review HIGH): in PRODUCTION, bring up EACH loaded agent's OWN
@@ -376,7 +376,7 @@ async function startDaemonHoldingLock(
 
   // The OUTBOUND session path (outbound-sessions.ts): discovery, the session request, and cross-node
   // setup via a transient VISITING connection to the counterparty's home node.
-  const { openVisitingConnection, crossNodeBrokerBySession, resolvedSessionNegotiator, runDiscoveryLookup, sweepTrustSignals } = createOutboundSessions({
+  const { openVisitingConnection, crossNodeBrokerBySession, resolvedSessionNegotiator, runDiscoveryLookup, sweepTrustSignalsAndTick, trustSignalSweepTicker } = createOutboundSessions({
     logger,
     sessionNodeManager,
     getKeyProvider: (agentName: string) => keyProviders.get(agentName),
@@ -395,7 +395,7 @@ async function startDaemonHoldingLock(
     // unreachable", which is very often the actual cause and was reported nowhere the operator
     // was looking.
     getUnresolvedNodes,
-    getDeclaredNodeCount,
+    getDeclaredNodeCount, getOnlineAgents: () => onlineAgents,
     // DOD-M15-SEALPARTIES-1: the visiting stream runs the seal ceremony too, so it needs the same
     // failure sink — otherwise a cross-node close that dies leaves no trace while a same-node one does.
     recordSealFailure: (name: string, sid: string, reason: string, kind: "unresolved" | "refused") =>
@@ -1147,7 +1147,7 @@ async function startDaemonHoldingLock(
       // stopAllSignaling() stops the shared manager AND every per-agent manager (best-effort). Do
       // not add a separate per-agent stop loop beside it: it would be redundant, and an unguarded
       // second stop() that throws would abort the rest of shutdown.
-      await stopAllSignaling();
+      trustSignalSweepTicker.stopAll(); await stopAllSignaling();
       // Gracefully mark active sessions interrupted (AC-009) before stopping IPC
       await sessionNodeManager.gracefulShutdown();
       await ipcServer.stop();

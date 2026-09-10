@@ -197,7 +197,14 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // C1's listener was registered inline on one stream type and nowhere else, so the visiting
     // connection dropped every pickup, and C2's sweep is useless the moment nothing calls it.
     // "A factory that exists and is not wired" is precisely the defect this order is closing.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(96);
+    //
+    // 96 → 97 for 048-SWEEPTICK's trust-signal-sweep-tick.ts, and this guard caught the addition on
+    // the first full run. The module is the single most on-point occupant of this corpus: C2's sweep
+    // WAS wired, to one trigger, and the defect was that nothing ran it often enough to matter — so
+    // a ticker that exists and is not reached from the composition root would restore the exact bug
+    // it was written to remove. `sweeptick.test.ts` carries the companion assertion that daemon.ts
+    // hands the wiring the TICKING sweep rather than the bare one.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(97);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",

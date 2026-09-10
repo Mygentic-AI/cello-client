@@ -15,6 +15,7 @@ import { createHash } from "node:crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { PickupListenerRegistrar } from "./trust-signal-pickup-listener.js";
 import { createTrustSignalSweep } from "./trust-signal-sweep.js";
+import { createTrustSignalSweepTicker } from "./trust-signal-sweep-tick.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { Logger } from "./types.js";
 import type { DirectoryEndpoint } from "./signaling-connect.js";
@@ -59,6 +60,17 @@ export interface OutboundSessionDeps {
    */
   getDeclaredNodeCount?: () => number | null;
   /**
+   * 048-SWEEPTICK: which agents are ONLINE, read fresh on every tick.
+   *
+   * A getter over the live set rather than a value, because the set is built in the composition
+   * root AFTER this factory is called — and because the answer changes while the tick is running,
+   * which is the whole reason it is asked per tick rather than once.
+   *
+   * Absent means "assume online", which is the in-process test path where there is no online set
+   * and every agent is by definition running.
+   */
+  getOnlineAgents?: () => ReadonlySet<string>;
+  /**
    * DOD-M15-SEALPARTIES-1: where a dead seal ceremony leaves its mark. A VISITING stream runs the
    * seal ceremony too (the cross-node close), so it needs the same sink as a home stream — a
    * refusal recorded on only one of the two paths is a refusal an operator meets at random.
@@ -97,7 +109,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
     logger, sessionNodeManager, getKeyProvider, getPersistence, getAgentSignaling,
     waitForSignalingConnected, getFailoverEndpoint, resolveConsortiumRoster,
     registerSealListeners, registerPickupListener, sessionNegotiator, challengeVerifier, getManifestVersion, loadedAgents,
-    getUnresolvedNodes, getDeclaredNodeCount, recordSealFailure,
+    getUnresolvedNodes, getDeclaredNodeCount, getOnlineAgents, recordSealFailure,
   } = deps;
 
   /**
@@ -717,6 +729,18 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
     openVisitingConnection,
   });
 
+  // 048-SWEEPTICK: the sweep above was wired to `onConnected` and to nothing else, so a daemon that
+  // stayed connected never collected again — an endorsement sat 23 minutes at a node it was not
+  // attached to and arrived only on restart. The ticker wraps it: sweep on connect exactly as
+  // before, AND every five minutes after. `sweepTrustSignalsAndTick` is what the wiring calls; the
+  // bare sweep is still exported for anything that wants one collection without arming a timer.
+  const trustSignalSweepTicker = createTrustSignalSweepTicker({
+    logger,
+    sweep: sweepTrustSignals,
+    // Absent set ⇒ online. See the dep's docblock: that is the in-process test path, not production.
+    isAgentOnline: (agentName) => getOnlineAgents?.().has(agentName) ?? true,
+  });
+
   const crossNodeBrokerBySession = new Map<string, string>();
 
   /**
@@ -1088,5 +1112,12 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
     runDiscoveryLookup,
     /** 043-SIGNALDELIVERY C2: run in the BACKGROUND after a home stream authenticates. */
     sweepTrustSignals,
+    /**
+     * 048-SWEEPTICK: what the signaling wiring actually calls. Sweeps immediately on connect — the
+     * C2 behaviour, unchanged — and arms the five-minute tick that covers a connection which never
+     * drops. `stopAll` on daemon shutdown.
+     */
+    sweepTrustSignalsAndTick: trustSignalSweepTicker.sweepAndTick,
+    trustSignalSweepTicker,
   };
 }
