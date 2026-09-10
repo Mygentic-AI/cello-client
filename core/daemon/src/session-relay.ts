@@ -1034,8 +1034,9 @@ export class SessionRelay {
   /**
    * DOD-M12B-RESERVATION-RETRY-1 — ask again for a reservation the relay refused.
    *
-   * The rebuild is the re-attempt: a circuit listener is fixed at node creation, so the only way to
-   * obtain a reservation is to build a new node asking for one.
+   * The rebuild is the re-attempt. ⚠️ It is a CHOICE, not the only option: its old justification
+   * ("a circuit listener is fixed at node creation") stopped being true when `listenOnCircuit`
+   * landed. A fresh receiver re-runs the whole walk, proof included, which is why it stays.
    */
   #retryReservationIfDue(agentName: string): void {
     const now = Date.now();
@@ -1280,8 +1281,8 @@ export class SessionRelay {
    * 032-RELAYSPREAD — **AN IDLE AGENT MUST NOT RATCHET ITSELF BACK DOWN TO ONE RELAY.**
    *
    * Spreading happens when a receiver is BUILT, and between builds the count only falls: a lost
-   * circuit cannot be retaken by a running node (a circuit listener is fixed at node creation), and
-   * a relay the directory announces later is skipped while any circuit is held. An agent in
+   * circuit is not retaken from here (`listenOnCircuit` could; nothing does), and a relay the
+   * directory announces later is skipped while any circuit is held. An agent in
    * conversation re-spreads constantly — the receiver is handed into each session and a fresh one
    * is built behind it — so this is about the agent nobody has talked to for a day. It loses relays
    * one at a time, nothing pulls it back up, and it ends up exactly where this unit found it:
@@ -1452,12 +1453,9 @@ export class SessionRelay {
         return "proven";
       }
 
-      /**
-       * The same two lines `authenticateStandingReceiver` runs, for the same reason. The `else`
-       * matters as much as the `if`: `proveReservation` also fails for transport reasons, which
-       * leave `getLastAuthRefusal()` null, and leaving a PREVIOUS refusal in the map would have
-       * `cello_status` explaining a cause that is no longer what is wrong.
-       */
+      // ⚠️ A NULL REFUSAL IS A TRANSPORT FAILURE, NOT A VERDICT (review HIGH-1): set only on a
+      // refusal ON THE MERITS, so the `else` clears a stale one `cello_status` would misreport, and
+      // the RETURN below says `unavailable` — the caller decides whether to ask on it.
       const refusal = client.getLastAuthRefusal();
       if (surfaceAsReceiverRefusal) {
         if (refusal) {
@@ -1475,13 +1473,14 @@ export class SessionRelay {
         tryAnotherRelay: refusal?.tryAnotherRelay ?? true,
         correlationId,
         impact: refusal?.advice ??
-          "the relay would not accept this agent's proof and said nothing about why, which is what " +
-          "a transport failure mid-handshake looks like. The candidate loop moves on to the next relay.",
+          "the relay said nothing about why, which is what a transport failure mid-handshake looks " +
+          "like. No verdict was reached, so the reservation is still asked for.",
       });
       if (refusal && !refusal.tryAnotherRelay) return "refused_this_agent";
       if (refusal?.tryAnotherRelay && !this.#ctx.shuttingDown) {
         this.#quarantineRelay(agentName, relayPeerId, refusal.reason);
       }
+      if (!refusal) return "unavailable"; // no verdict — see the refusal note above.
       return "refused_try_another_relay";
     } catch (err: unknown) {
       this.#ctx.logger.warn("session.standing_receiver.prove.failed", {

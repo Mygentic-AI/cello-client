@@ -45,12 +45,47 @@ class ScriptedNode extends FakeNode {
   stopped = false;
   started = false;
   readonly #id: string;
-  constructor(seed: Uint8Array | undefined, private readonly b: Behaviour, private readonly circuit: string | undefined) {
+  constructor(
+    seed: Uint8Array | undefined,
+    private readonly script: (circuit: string | undefined) => Behaviour,
+    private circuit: string | undefined,
+    /** Fires when this node ASKS for a reservation, which is where the ask now happens. */
+    private readonly onAsk?: (circuitAddr: string) => void,
+  ) {
     super();
     this.#id = seed ? `12D3KooW${createHash("sha256").update(seed).digest("hex").slice(0, 40)}` : "random";
   }
+  /** The relay's scripted behaviour, resolved for whichever circuit this node is dealing with. */
+  private get b(): Behaviour { return this.script(this.circuit); }
+
+  /**
+   * DOD-M15-RELAYPROVE-ORDER-1 — **THE ASK MOVED OFF THE CONSTRUCTOR, AND SO DID THE DELAY.**
+   *
+   * A revival now builds a node with no circuit address, proves, and asks here. Two things had to
+   * move with it, not one:
+   *   - **the ask itself**, or `asks` counts zero for a revival that asks on every candidate, and
+   *     this file would go green against a daemon that walks to a second relay after the first one
+   *     granted — the exact property it is named for;
+   *   - **the relay's timing**, because a dead or slow relay used to show up as a `start()` that
+   *     never settled. A probe is TCP-only and starts instantly whatever the relay is doing, so
+   *     `startAfterMs` belongs on the ask now or the per-candidate deadline is never exercised.
+   */
+  override async listenOnCircuit(circuitAddr: string): Promise<void> {
+    this.onAsk?.(circuitAddr);
+    const b = this.script(circuitAddr);
+    if (b.startAfterMs === "never") {
+      // A relay that never answers the reservation. Unref'd so it cannot hold the process open.
+      await new Promise<void>(() => { /* never */ });
+      return;
+    }
+    await new Promise<void>((res) => { setTimeout(res, b.startAfterMs as number).unref?.(); });
+    if (b.grants) this.circuit = circuitAddr;
+  }
   override getPeerId(): string { return this.#id; }
   override async start(): Promise<void> {
+    // A node built WITHOUT a circuit address is TCP-only: it starts immediately, whatever the relay
+    // is doing. Its relay behaviour is applied in `listenOnCircuit` instead.
+    if (this.circuit === undefined) { this.started = true; return; }
     if (this.b.startAfterMs === "never") {
       // A relay that never answers. The point of the deadline is that this promise never settles;
       // an unref'd handle keeps it from holding the process open.
@@ -86,8 +121,13 @@ class ScriptedFactory implements ISessionNodeFactory {
   constructor(private readonly script: (circuit: string | undefined) => Behaviour) {}
   async createNode(config: SessionNodeConfig): Promise<CelloNode> {
     const circuit = config.circuitRelayListenAddrs?.[0];
-    this.asks.push({ circuits: config.circuitRelayListenAddrs ?? [], nodeType: config.nodeType });
-    const node = new ScriptedNode(config.transportPrivateKey, this.script(circuit), circuit);
+    const ask = { circuits: config.circuitRelayListenAddrs ?? [], nodeType: config.nodeType };
+    this.asks.push(ask);
+    // A probe carries no circuit at construction; the relay it ends up asking is recorded on the
+    // SAME entry, so `asks` stays one row per node however the ask reaches it.
+    const node = new ScriptedNode(config.transportPrivateKey, this.script, circuit, (asked) => {
+      if (!ask.circuits.includes(asked)) ask.circuits.push(asked);
+    });
     this.built.push(node);
     return node as unknown as CelloNode;
   }

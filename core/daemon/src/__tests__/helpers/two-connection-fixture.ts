@@ -49,6 +49,20 @@ export class FakeNode implements Partial<CelloNode> {
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
   getPeerId(): string { return this.#peerId; }
+  /**
+   * DOD-M15-RELAYPROVE-ORDER-1 — the standing-receiver walk asks for its reservation HERE now,
+   * after proving, rather than through a circuit address handed to the constructor.
+   *
+   * The default GRANTS NOTHING, which is what `listenAddresses()` below already says: this fixture
+   * describes a node with no reservation. A test that wants one overrides both, together — a
+   * fixture that returned a circuit address from one and not the other would describe a node that
+   * cannot exist.
+   *
+   * It exists on the base so every fixture in the suite inherits a real method. Without it the call
+   * is `undefined(...)`, which throws SYNCHRONOUSLY out of the walk — not the failure any of those
+   * tests are about, and it cost seven suites a 21-second retry storm before this was added.
+   */
+  async listenOnCircuit(_circuitAddr: string): Promise<void> {}
   listenAddresses(): string[] { return ["/ip4/127.0.0.1/tcp/0"]; }
   async dial(_a: string): Promise<{ peerId: string }> { return { peerId: "remote" }; }
   async handle(_p: string, _h: unknown): Promise<void> {}

@@ -1,15 +1,30 @@
 /**
- * DOD-M15-RELAYSLOTS-1 (client half) — **ASK, BE REFUSED, PROVE, ASK AGAIN.**
+ * DOD-M15-RELAYSLOTS-1 (client half) — **PROVE FIRST, THEN ASK ONCE.**
  *
- * The relay now refuses a circuit reservation from any peer that has not shown, over CELLO's own
- * auth stream, that it belongs to a registered agent. That gate is the whole of this order — three
- * earlier designs tried to guess from a peer id alone which caller looked like an attacker, and a
- * botnet walks through guesses.
+ * The relay refuses a circuit reservation from any peer that has not shown, over CELLO's own auth
+ * stream, that it belongs to a registered agent. That gate is the whole of the original order —
+ * three earlier designs tried to guess from a peer id alone which caller looked like an attacker,
+ * and a botnet walks through guesses.
  *
- * The cost lands here. A reservation taken on the SAME connection as the proof yields a slot with
- * no dialable address (libp2p announces circuit addresses only for reservations its own discovery
- * made), so a receiver has to build, be refused, prove itself, drop the connection, and rebuild on
- * the same transport identity. `#startReceiverNode` and `#buildRevivedNode` both run that loop.
+ * ─── ⚠️ THIS FILE'S ORIGINAL PREMISE WAS FALSIFIED — kept, corrected, not deleted ──────────────
+ *
+ * It read: *"A reservation taken on the SAME connection as the proof yields a slot with no dialable
+ * address (libp2p announces circuit addresses only for reservations its own discovery made), so a
+ * receiver has to build, be refused, prove itself, drop the connection, and rebuild on the same
+ * transport identity."* Every test below was written to that shape.
+ *
+ * **The second clause is false, and it was measured** (spike 2, 2026-09-08, live against the
+ * Virginia relay on libp2p 3.3.11 / circuit-relay-v2 4.2.13; script kept in the M15 tools
+ * directory). Asking libp2p's OWN transport manager to listen on the circuit after the proof makes
+ * the reservation libp2p's own — so it announces the address exactly as it does for one its
+ * discovery made. What the original claim actually described was taking the slot by hand, over a
+ * raw HOP stream, which is a different act.
+ *
+ * The correction it is kept for: **libp2p opened no new connection** for that reservation. Its
+ * store calls `openConnection(peerId)` without `force`, which returns the already-open connection —
+ * the one the proof was made on — and the relay sets `slot.provenForReservation` per CONNECTION at
+ * auth time. So the first ask succeeds, and `DOD-M15-RELAYPROVE-ORDER-1` removes the ask-refuse-
+ * rebuild dance rather than surviving it. `#startReceiverNode` and `#buildRevivedNode` both changed.
  *
  * ─── Why this file exists ─────────────────────────────────────────────────────────────────────
  *
@@ -64,6 +79,36 @@ class ScriptedRelay {
     return this.proofAttempts.filter((a) => !a.hadCircuit);
   }
   grants(peerId: string): boolean { return this.proven.has(peerId); }
+  /** When set, every node's reservation ask throws a CLIENT-side fault (see `GatedNode`). */
+  askThrows = false;
+  /** When set, every proof fails on TRANSPORT — false with no refusal, i.e. no verdict was reached. */
+  proofTransportFails = false;
+
+  /**
+   * DOD-M15-RELAYPROVE-ORDER-1 — **an ORDERED log, because the defect is an ORDER.**
+   *
+   * Counting proofs and counting reservations cannot express "the proof came first, on this node,
+   * and nothing tore it down in between" — and that sentence is the whole property. Each entry
+   * carries the NODE OBJECT, not its peer id: a receiver reuses one seed across every relay, so
+   * peer id cannot tell "the node that proved" from "a different node built on the same identity",
+   * which is exactly the rebuild this order removes.
+   */
+  readonly timeline: Array<{ kind: "prove" | "listen" | "stop"; node: object; relayPeerId?: string; hadCircuit?: boolean }> = [];
+  /**
+   * The proofs made to GET a reservation, in timeline order.
+   *
+   * ⚠️ FILTERED THE SAME WAY `gateProofs()` IS, and for the same reason: once a receiver holds a
+   * reservation, `#authenticateStandingReceiver` proves AGAIN over the delivery path. That is
+   * pre-existing, correct, and not this order's subject — counting it here made "one proof per
+   * relay" read as three on a two-relay pool.
+   */
+  gateProofTimeline(): Array<{ kind: string; node: object; relayPeerId?: string }> {
+    return this.timeline.filter((e) => e.kind === "prove" && e.hadCircuit === false);
+  }
+  /** Index into `timeline` of the first entry matching, or -1. */
+  firstIndex(kind: "prove" | "listen" | "stop", node: object): number {
+    return this.timeline.findIndex((e) => e.kind === kind && e.node === node);
+  }
 }
 
 class GatedNode extends FakeNode {
@@ -88,13 +133,45 @@ class GatedNode extends FakeNode {
   }
   override getPeerId(): string { return this.#id; }
   override async start(): Promise<void> { this.started = true; }
-  override async stop(): Promise<void> { if (this.started) this.stopped = true; }
+  override async stop(): Promise<void> {
+    if (this.started) this.stopped = true;
+    this.relay.timeline.push({ kind: "stop", node: this });
+  }
+
+  /**
+   * Circuits this node took AFTER start, by asking. Separate from the constructor's `circuit`
+   * because they are different acts: the constructor's is libp2p asking on its own at start (the
+   * ordering that gets refused), this one is the caller asking once the proof has landed.
+   */
+  readonly takenCircuits: string[] = [];
+
+  /**
+   * DOD-M15-RELAYPROVE-ORDER-1 — the relay's gate, applied at the moment of the ask.
+   *
+   * Grants only if the relay holds a proof for this peer id, which is what
+   * `denyInboundRelayReservation` decides. It does NOT throw when refused: a relay at its slot cap
+   * completes the handshake and grants nothing, and the code under test must not read a resolved
+   * `listen()` as a reservation — `listenAddresses()` is the only proof. A fixture that threw here
+   * would let a caller pass by catching nothing.
+   */
+  override async listenOnCircuit(circuitAddr: string): Promise<void> {
+    this.relay.timeline.push({ kind: "listen", node: this, relayPeerId: /\/p2p\/([^/]+)\/p2p-circuit/.exec(circuitAddr)?.[1] });
+    /**
+     * The CLIENT-SIDE fault: this node cannot take a reservation at all — libp2p renamed
+     * `components.transportManager`, say. It throws SYNCHRONOUSLY, which is what the real
+     * `listenOnCircuit` does and what the containment has to survive.
+     */
+    if (this.relay.askThrows) {
+      throw { reason: "transport_manager_unavailable", message: "libp2p exposes no components.transportManager.listen" };
+    }
+    if (this.started && this.relay.grants(this.#id)) this.takenCircuits.push(circuitAddr);
+  }
+
   override listenAddresses(): string[] {
     // THE GATE. A circuit address appears only for a peer id the relay has a proof for — which is
-    // exactly what the relay's `denyInboundRelayReservation` decides, and why the first ask fails.
-    return this.started && this.circuit !== undefined && this.relay.grants(this.#id)
-      ? [this.circuit, "/ip4/127.0.0.1/tcp/1"]
-      : ["/ip4/127.0.0.1/tcp/1"];
+    // exactly what the relay's `denyInboundRelayReservation` decides.
+    const atStart = this.started && this.circuit !== undefined && this.relay.grants(this.#id) ? [this.circuit] : [];
+    return [...atStart, ...(this.started ? this.takenCircuits : []), "/ip4/127.0.0.1/tcp/1"];
   }
 }
 
@@ -116,12 +193,28 @@ function relayClientStub(relay: ScriptedRelay, relayPeerId: string): AgentRelayC
   let lastRefusal: RelayAuthRefusal | null = null;
   return {
     async proveReservation(node: CelloNode): Promise<boolean> {
+      relay.timeline.push({
+        kind: "prove",
+        node,
+        relayPeerId,
+        hadCircuit: node.listenAddresses().some((a) => a.includes("/p2p-circuit")),
+      });
       relay.proofAttempts.push({
         relayPeerId,
         peerId: node.getPeerId(),
         hadCircuit: node.listenAddresses().some((a) => a.includes("/p2p-circuit")),
         nodeType: (node as unknown as GatedNode).nodeType,
       });
+      /**
+       * ⚠️ THE NO-VERDICT SHAPE, and it is NOT the same as a refusal — review HIGH-1.
+       *
+       * `proveReservation` returns false with `getLastAuthRefusal()` NULL when the proof failed for
+       * a TRANSPORT reason: a failed dial, a reset stream, a dead muxer. The relay said nothing.
+       * `#proveReservationOnce` clears the refusal at its head precisely so this case leaves none
+       * behind, and the production log calls it `no_relay_verdict`. This is the dominant real case,
+       * and it used to be labelled `refused_try_another_relay` one layer up.
+       */
+      if (relay.proofTransportFails) { lastRefusal = null; return false; }
       const refusal = relay.refusals.get(relayPeerId);
       if (refusal) { lastRefusal = refusal; return false; }
       relay.proven.add(node.getPeerId());
@@ -137,11 +230,20 @@ const silent: Logger = { debug: () => {}, info: () => {}, warn: () => {}, error:
 let tempDir: string;
 let mgr: SessionNodeManager | undefined;
 
-async function makeManager(relay: ScriptedRelay, factory: GatedFactory): Promise<SessionNodeManager> {
+async function makeManager(
+  relay: ScriptedRelay,
+  factory: GatedFactory,
+  /**
+   * Non-breaking `opts`, per the fixture rule. `noRelayClient` models a daemon whose proof path is
+   * unavailable — no builder wired — which is one of the ways `proveToRelay` reaches no verdict.
+   * `logger` lets a case read the refusal reasons the walk emits.
+   */
+  opts: { noRelayClient?: boolean; logger?: Logger } = {},
+): Promise<SessionNodeManager> {
   const m = new SessionNodeManager({
     securityGateway: new PassthroughGatewayClient(),
     factory,
-    logger: silent,
+    logger: opts.logger ?? silent,
     dbPath: join(tempDir, "sessions.db"),
   });
   await m.initialize();
@@ -150,7 +252,11 @@ async function makeManager(relay: ScriptedRelay, factory: GatedFactory): Promise
     { relayPeerId: RELAY_A, relayAddrs: [`/ip4/10.0.0.1/tcp/4001/p2p/${RELAY_A}`] },
     { relayPeerId: RELAY_B, relayAddrs: [`/ip4/10.0.0.2/tcp/4001/p2p/${RELAY_B}`] },
   ]);
-  m.setDetachedRelayClientBuilder((_agent, relayPeerId) => relayClientStub(relay, relayPeerId));
+  // `undefined` is what a daemon with no relay client wired actually hands back, and it is the
+  // production shape of "the proof could not even be attempted".
+  m.setDetachedRelayClientBuilder((_agent, relayPeerId) =>
+    opts.noRelayClient === true ? undefined : relayClientStub(relay, relayPeerId),
+  );
   return m;
 }
 
@@ -162,7 +268,7 @@ afterEach(async () => {
 });
 
 describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", () => {
-  it("★★★ refused on the first ask, granted on the second — SAME transport identity", async () => {
+  it("★★★ granted on the FIRST ask, because the proof went first — DOD-M15-RELAYPROVE-ORDER-1", async () => {
     const relay = new ScriptedRelay();
     const factory = new GatedFactory(relay);
     mgr = await makeManager(relay, factory);
@@ -172,50 +278,202 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
 
     expect(
       node?.listenAddresses().some((a) => a.includes("/p2p-circuit")),
-      "delete the two-attempt loop and this is false: the relay refuses every unproven peer, so " +
-        "the receiver comes up with no circuit address and the agent is reachable by nobody.",
+      "the relay refuses every unproven peer, so a receiver that never proves comes up with no " +
+        "circuit address and the agent is reachable by nobody.",
     ).toBe(true);
 
-    const asks = factory.asks.filter((a) => a.circuits.length > 0);
     /**
-     * THE DANCE IS PER RELAY, and that is what this test is for. The FIRST TWO asks are both
-     * relay A: refused because this transport identity has proved nothing, then granted after the
-     * proof lands. Asserting the first two by position, rather than asserting the total, is what
-     * keeps the property pinned independently of how many relays the walk goes on to visit.
+     * ⚠️ THE ASSERTION THAT CARRIES THIS ORDER, and it is about what was NOT done.
      *
-     * 032-RELAYSPREAD: the walk no longer STOPS at the first grant — an agent that holds one
-     * reservation is unreachable by every NAT'd peer the moment that relay goes away — so relay B
-     * is asked too, and the receiver is then built on every address that granted. The old
-     * `toBe(2)` was pinning "we stop at the first relay", which was never this test's subject.
+     * A probe node built with a circuit address in its listen set is libp2p asking the relay before
+     * anything has proved — the refusal that costs the connection the proof rides on. The walk must
+     * now build probes with NO circuit listen address and ask afterwards, so the count of
+     * constructor-time circuit asks during the walk is ZERO.
+     *
+     * Restore `circuitRelayListenAddrs: [circuitAddr]` on the probe and this fails immediately,
+     * which is the revert test for the whole change.
      */
-    expect(asks.length, "at least the two-attempt dance with relay A").toBeGreaterThanOrEqual(2);
+    const walkAsks = factory.asks.filter((a) => a.circuits.length > 0 && a.nodeType === "standing_receiver");
     expect(
-      asks.slice(0, 2).map((a) => a.circuits[0]),
-      "the first two asks go to the SAME relay — the second is a retry, not a walk to the next candidate",
-    ).toEqual([CIRCUIT_A, CIRCUIT_A]);
+      walkAsks.length,
+      "exactly ONE node is built with circuit addresses — the installed receiver. Every probe " +
+        "before it asks the relay only after its proof has landed.",
+    ).toBe(1);
     expect(
-      asks[0]?.peerId,
-      "⚠️ THE SAME PEER ID BOTH TIMES. The relay remembers the proof against a transport identity, " +
-        "so a retry on a fresh identity would be refused exactly like the first ask — the seed is " +
-        "reused for precisely this reason.",
-    ).toBe(asks[1]?.peerId);
-    // …and the walk went on to relay B rather than stopping, then built the receiver on the
-    // addresses that granted. Both halves, because "it asked B" without "it listens on B" is the
-    // slot-nobody-can-dial failure this file's own header describes.
-    expect(
-      asks.some((a) => a.circuits[0] === CIRCUIT_B),
-      "the walk must CONTINUE past the first grant — one reservation is one relay away from unreachable",
-    ).toBe(true);
-    expect(
-      asks.at(-1)?.circuits,
-      "the installed receiver listens on EVERY granted circuit, not on the first one that answered",
+      walkAsks[0]?.circuits,
+      "and that one listens on EVERY granted circuit, not on the first relay that answered",
     ).toEqual([CIRCUIT_A, CIRCUIT_B]);
+
+    // The walk still visits both relays (032-RELAYSPREAD) and still does it on ONE identity.
     expect(
-      new Set(asks.map((a) => a.peerId)).size,
+      relay.gateProofs().map((p) => p.relayPeerId),
+      "the walk must CONTINUE past the first grant — one reservation is one relay away from unreachable",
+    ).toEqual([RELAY_A, RELAY_B]);
+    expect(
+      new Set(factory.asks.map((a) => a.peerId)).size,
       "ONE identity across every relay: an agent is dialable at ONE peer id through any of its circuits",
     ).toBe(1);
-    expect(relay.gateProofs()).toHaveLength(1);
-    expect(relay.gateProofs()[0]?.peerId).toBe(asks[0]?.peerId);
+
+    /**
+     * ONE ASK PER RELAY. The old shape asked A twice — refused, then granted after the proof. Two
+     * asks per relay is the cost this order removes, and counting them is how a silent regression
+     * back to the dance would be caught.
+     */
+    const listensPerRelay = relay.timeline.filter((e) => e.kind === "listen");
+    expect(
+      listensPerRelay.map((e) => e.relayPeerId),
+      "one reservation ask per relay, in walk order",
+    ).toEqual([RELAY_A, RELAY_B]);
+  }, 30_000);
+
+  it("★★★ the proof and the reservation happen on the SAME node, with no teardown between them", async () => {
+    /**
+     * ⚠️ THE TEETH, and the reason the assertion above is not enough.
+     *
+     * "A reservation appeared" is satisfied by the OLD code too — it also ends with a receiver
+     * holding a circuit address. The property that is actually new is that the ask rides the
+     * connection the proof was made on, and in production that is guaranteed by one measured fact:
+     * libp2p's reservation store calls `openConnection(peerId)` without `force`, so it reuses the
+     * open connection instead of dialling. **That only holds if nothing closed it in between.**
+     *
+     * So this asserts the node OBJECT, not the peer id — the receiver reuses one seed across every
+     * relay, so peer id cannot distinguish "the node that proved" from "a rebuild on the same
+     * identity", which is exactly what the old dance did.
+     */
+    const relay = new ScriptedRelay();
+    const factory = new GatedFactory(relay);
+    mgr = await makeManager(relay, factory);
+
+    await mgr.ensureStandingReceiverForAgent("alice");
+
+    const proofs = relay.gateProofTimeline();
+    expect(proofs.length, "one gate proof per relay in the pool").toBe(2);
+
+    for (const proof of proofs) {
+      const provedAt = relay.timeline.indexOf(proof);
+      const askedAt = relay.firstIndex("listen", proof.node);
+      const stoppedAt = relay.firstIndex("stop", proof.node);
+
+      expect(
+        askedAt,
+        `relay ${proof.relayPeerId}: the node that proved must be the node that asks — a rebuild in ` +
+          "between is the refused-first-ask dance wearing different clothes",
+      ).toBeGreaterThan(-1);
+      expect(askedAt, `relay ${proof.relayPeerId}: the proof must come BEFORE the ask`).toBeGreaterThan(provedAt);
+      expect(
+        stoppedAt === -1 || stoppedAt > askedAt,
+        `relay ${proof.relayPeerId}: the proving node must still be up when it asks — stopping it ` +
+          "closes the connection the relay marked proven, and the reservation is refused",
+      ).toBe(true);
+    }
+  }, 30_000);
+
+  it("★★★ a proof that reached NO VERDICT still asks — a refusal declines, silence does not", async () => {
+    /**
+     * ⚠️ REVIEW HIGH-1. The clause: `unavailable` (no relay verdict was obtained — no client wired,
+     * or the relay unreachable) must NOT decline the candidate, because **not every relay gates
+     * reservations**. One that never asks for a proof grants on the first ask, and refusing to ask
+     * because OUR proof path was unavailable would lose the ability to reserve with it at all.
+     *
+     * This is the clause that had no test, and it is why the review found the boundary was drawn in
+     * the wrong place: `proveToRelay` was returning `refused_try_another_relay` for a proof that
+     * failed on transport, so the ask this asserts never happened.
+     *
+     * The relay here grants without any proof, which is exactly what an ungated relay does.
+     */
+    const relay = new ScriptedRelay();
+    const factory = new GatedFactory(relay);
+    // An UNGATED relay: it grants whoever asks, having been told nothing.
+    relay.proven.add("*");
+    const originalGrants = relay.grants.bind(relay);
+    relay.grants = (): boolean => true;
+    mgr = await makeManager(relay, factory, { noRelayClient: true });
+
+    await mgr.ensureStandingReceiverForAgent("alice");
+
+    expect(
+      relay.timeline.filter((e) => e.kind === "listen").map((e) => e.relayPeerId),
+      "with no proof path available the walk must still ASK every relay — treating silence as a " +
+        "refusal makes this client unable to reserve with an ungated relay at all",
+    ).toEqual([RELAY_A, RELAY_B]);
+    expect(
+      mgr.getStandingReceiverNode("alice")?.listenAddresses().some((a) => a.includes("/p2p-circuit")),
+      "and the reservation it was granted is held",
+    ).toBe(true);
+    expect(relay.gateProofs(), "no proof could be made — that is the premise, not a side effect").toHaveLength(0);
+    relay.grants = originalGrants;
+  }, 30_000);
+
+  it("★★★ a proof that FAILED ON TRANSPORT is no verdict either — and it is the case that actually happens", async () => {
+    /**
+     * ⚠️ REVIEW HIGH-1, AND THIS IS THE VARIANT THAT MATTERS. The case above ("no relay client
+     * wired") already returned `unavailable` before the review. The DOMINANT real case did not: a
+     * proof whose dial failed or whose stream was reset returns `false` with NO refusal recorded —
+     * `#proveReservationOnce` clears the refusal at its head precisely so a transport failure leaves
+     * no verdict behind — and `proveToRelay` labelled that `refused_try_another_relay` anyway.
+     *
+     * Under that label the ask never happened, so a relay whose proof stream got reset was recorded
+     * as having refused this agent's proof, and an UNGATED relay that would have granted was never
+     * asked. The producer now says `unavailable`, which is what its own log line already said.
+     */
+    const relay = new ScriptedRelay();
+    relay.proofTransportFails = true;
+    const factory = new GatedFactory(relay);
+    // Ungated: it grants whoever asks. The point is that we never find out unless we ask.
+    const originalGrants = relay.grants.bind(relay);
+    relay.grants = (): boolean => true;
+    mgr = await makeManager(relay, factory);
+
+    await mgr.ensureStandingReceiverForAgent("alice");
+
+    expect(
+      relay.gateProofs().length,
+      "the proof was ATTEMPTED — this is a transport failure, not an absent proof path",
+    ).toBeGreaterThan(0);
+    expect(
+      relay.timeline.filter((e) => e.kind === "listen").map((e) => e.relayPeerId),
+      "a proof that reached no verdict must not decline the candidate: the relay refused nothing, " +
+        "and one that does not gate reservations would have granted",
+    ).toEqual([RELAY_A, RELAY_B]);
+    relay.grants = originalGrants;
+  }, 30_000);
+
+  it("★★★ a fault of OURS is not reported in the relay's vocabulary", async () => {
+    /**
+     * ⚠️ REVIEW HIGH-2, and the failure it prevents is a wild goose chase rather than a broken
+     * session. `listenOnCircuit` throws `transport_manager_unavailable` when libp2p renames
+     * `components.transportManager`. The generic decline infers its reason from the relay
+     * connection — which is open and irrelevant, because the ask never left this process — and so
+     * reported `relay_granted_no_reservation` on EVERY relay in the pool. In this daemon's own
+     * taxonomy that string means *"relay CAPACITY, a trustless-cello problem"*, so a client-side API
+     * change would send an operator into the relay fleet while the real cause survived only as an
+     * `error` field on a warn line nothing surfaces.
+     */
+    const relay = new ScriptedRelay();
+    relay.askThrows = true;
+    const factory = new GatedFactory(relay);
+    const events: Array<{ event: string; ctx: Record<string, unknown> }> = [];
+    const capture = (event: string, ctx?: Record<string, unknown>): void => { events.push({ event, ctx: ctx ?? {} }); };
+    mgr = await makeManager(relay, factory, {
+      logger: { debug: capture, info: capture, warn: capture, error: capture },
+    });
+
+    await mgr.ensureStandingReceiverForAgent("alice");
+
+    const rejected = events.filter((e) => e.event === "session.standing_receiver.relay.rejected");
+    expect(rejected.length, "every relay in the pool is declined — the fault is ours, not theirs").toBeGreaterThan(0);
+    for (const r of rejected) {
+      expect(
+        r.ctx["reason"],
+        "the transport named this fault; re-deriving it from the relay connection turns a client-side " +
+          "API change into a fleet-wide capacity outage",
+      ).toBe("transport_manager_unavailable");
+    }
+    expect(
+      mgr.getStandingReceiverReady("alice"),
+      "and the agent still gets a receiver on the plain TCP floor — a client fault must degrade " +
+        "reachability, not remove the receiver",
+    ).toBe(true);
   }, 30_000);
 
   it("★★★ a refusal about THIS AGENT reaches cello_status, and stops the fleet walk", async () => {
@@ -272,10 +530,25 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
       "a relay-side fault is the one case where the next relay genuinely helps — and A is asked " +
         "ONCE, because the retry exists only to use a proof that landed, and this one did not",
     ).toEqual([RELAY_A, RELAY_B]);
+    /**
+     * ⚠️ THIS ASSERTION MOVED WITH THE BEHAVIOUR (DOD-M15-RELAYPROVE-ORDER-1). It used to count
+     * NODE BUILDS carrying relay A's circuit address and require exactly one — "retrying a relay
+     * that refused the proof spends a build and a dial to be refused identically". Probes no
+     * longer carry a circuit address at all, so that count is now zero for every relay and the old
+     * form would pass for a walk that asked A ten times.
+     *
+     * The property is unchanged and is now stated where it actually lives: **relay A is never
+     * asked for a reservation.** Its proof was refused, so the ask that follows a proof never
+     * happens — and asking anyway is precisely the wasted dial the original assertion guarded.
+     */
     expect(
-      factory.asks.filter((a) => a.circuits[0] === CIRCUIT_A).length,
-      "one node build for A, not two: retrying a relay that refused the proof spends a build and a " +
-        "dial to be refused identically",
+      relay.timeline.filter((e) => e.kind === "listen" && e.relayPeerId === RELAY_A).length,
+      "a relay that refused the proof is never asked for a reservation — the ask is what the proof " +
+        "is a precondition for",
+    ).toBe(0);
+    expect(
+      relay.timeline.filter((e) => e.kind === "listen" && e.relayPeerId === RELAY_B).length,
+      "and the relay that DID take the proof is asked exactly once",
     ).toBe(1);
     expect(
       mgr.isRelayQuarantined("alice", RELAY_A),
@@ -323,10 +596,21 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
         "both directions is forced through the relay park route.",
     ).toHaveLength(1);
 
-    const revivedAsks = factory.asks
-      .slice(asksBefore)
-      .filter((a) => a.nodeType === "session" && a.circuits.length > 0);
-    expect(revivedAsks.length, "one refused ask, one granted, on one relay").toBe(2);
+    /**
+     * ⚠️ MOVED WITH THE BEHAVIOUR (DOD-M15-RELAYPROVE-ORDER-1). This used to require exactly TWO
+     * node builds carrying a circuit address — "one refused ask, one granted, on one relay". The
+     * revival now proves on a node built with no circuit address and asks once, so the
+     * constructor-time count is zero and the ask is counted where it now happens.
+     */
+    expect(
+      factory.asks.slice(asksBefore).filter((a) => a.nodeType === "session" && a.circuits.length > 0).length,
+      "a revived session no longer asks before it has proved — nothing is built holding a circuit " +
+        "address it has not earned",
+    ).toBe(0);
+    const revivedListens = relay.timeline
+      .filter((e) => e.kind === "listen")
+      .filter((e) => (e.node as unknown as GatedNode).nodeType === "session");
+    expect(revivedListens.length, "one ask, on one relay, after the proof").toBe(1);
     expect(
       factory.built.filter(
         (n) => n.nodeType === "session" && n.listenAddresses().some((a) => a.includes("/p2p-circuit")),
