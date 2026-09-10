@@ -438,6 +438,51 @@ class CelloNodeImpl implements CelloNode {
     return this.#libp2p.getMultiaddrs().map((ma) => ma.toString());
   }
 
+  /**
+   * DOD-M15-RELAYPROVE-ORDER-1. Contract and rationale on the interface; the mechanics are here.
+   *
+   * `components.transportManager` is not on libp2p's PUBLIC `Libp2p` type — it is reached through
+   * the `components` bag, which is why this needs a cast. The cast is narrowed to the one method
+   * being called rather than to `any`, and its absence is a THROWN, NAMED failure: an upstream
+   * rename must surface as a refusal the caller reports, never as a receiver that quietly holds no
+   * reservation and reads as healthy.
+   *
+   * ⚠️ MEASURED, not assumed (spike 2, 2026-09-08, libp2p 3.3.11 / circuit-relay-v2 4.2.13, live
+   * against the Virginia relay): libp2p's reservation store calls `openConnection(peerId)` WITHOUT
+   * `force`, which returns an already-open connection. So the reservation is taken on the very
+   * connection the proof was made on — that is why the relay's `slot.provenForReservation`, which
+   * it sets per CONNECTION at auth time, is still true when `denyInboundRelayReservation` reads it.
+   * There is nothing here that arranges that; it is a property of the call above, and the
+   * connection to the relay must therefore still be OPEN when this is called.
+   */
+  async listenOnCircuit(circuitAddr: string): Promise<void> {
+    // Segment-wise, never `includes("/p2p-circuit")`: the marker sits in the MIDDLE of a full
+    // circuit address (`…/p2p/<relay>/p2p-circuit/p2p/<self>`), and a substring test also matches a
+    // host or peer id that happens to contain the text.
+    if (!circuitAddr.split("/").includes("p2p-circuit")) {
+      throw {
+        reason: "not_a_circuit_address",
+        addr: circuitAddr,
+        message: "listenOnCircuit takes a /p2p-circuit address; a direct listen address belongs in createNode",
+      };
+    }
+    if (this.#libp2p.status !== "started") {
+      throw { reason: "node_stopped", message: `Node is ${this.#libp2p.status}, not started` };
+    }
+    const transportManager = (
+      this.#libp2p as unknown as {
+        components?: { transportManager?: { listen(addrs: Multiaddr[]): Promise<void> } };
+      }
+    ).components?.transportManager;
+    if (typeof transportManager?.listen !== "function") {
+      throw {
+        reason: "transport_manager_unavailable",
+        message: "libp2p exposes no components.transportManager.listen — this node cannot take a reservation after start",
+      };
+    }
+    await transportManager.listen([multiaddr(circuitAddr)]);
+  }
+
   async dial(multiaddrStr: string): Promise<{ peerId: string }> {
     if (this.#libp2p.status === "stopped") {
       throw { reason: "node_stopped", message: "Node is stopped" };

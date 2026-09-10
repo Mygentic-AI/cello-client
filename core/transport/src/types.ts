@@ -249,6 +249,38 @@ export interface CelloNode {
   listenAddresses(): string[];
 
   /**
+   * DOD-M15-RELAYPROVE-ORDER-1 — ask a RUNNING node to take a circuit reservation, now.
+   *
+   * The reason this exists at all is an ORDERING. A circuit address in the constructor's listen set
+   * makes libp2p ask the relay for a reservation the instant the node starts — before any CELLO
+   * code has presented the directory-signed online token — and the relay correctly refuses an
+   * unproven peer. libp2p's answer to a refused reservation is to restart its connection manager,
+   * closing every connection, including the one carrying the proof. This method is the seam that
+   * lets the caller put the proof FIRST: start with TCP/WS only, dial the relay, prove on that
+   * connection, then ask here.
+   *
+   * ⚠️ DELIBERATELY NARROW, AND IT MUST STAY NARROW. This is the one libp2p operation the daemon
+   * needs after start; it is not an accessor for the transport manager. Widening it into
+   * `getLibp2p()` would hand every caller the internals this class exists to own, and the reason
+   * `#libp2p` is private is that a caller reaching past it can silently undo a security property
+   * decided here (the announce filter, the gater, the connection limits).
+   *
+   * Refuses anything that is not a circuit address, because nothing else has this ordering problem
+   * and a direct listen address belongs in the constructor where `start()` can still fail loudly
+   * on it.
+   *
+   * Structured errors (thrown as plain objects):
+   *   { reason: 'not_a_circuit_address', addr, message }
+   *   { reason: 'node_stopped', message }
+   *   { reason: 'transport_manager_unavailable', message }
+   *
+   * Resolving does NOT mean a reservation was granted — a relay at its slot cap completes the
+   * handshake and grants nothing. `listenAddresses()` is the only proof, exactly as it is for a
+   * reservation taken at start.
+   */
+  listenOnCircuit(circuitAddr: string): Promise<void>;
+
+  /**
    * Connect to a remote peer by multiaddr string.
    * Returns the remote peer's transport PeerId as a string.
    * Fails with node_stopped if called after stop().
