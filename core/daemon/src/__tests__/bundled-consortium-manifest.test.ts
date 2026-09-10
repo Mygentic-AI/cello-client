@@ -64,13 +64,24 @@ describe("FINDING-4: bundled consortium manifest constant", () => {
     for (const node of BUNDLED_CONSORTIUM_MANIFEST.nodes) {
       expect(String(node["pubkey"])).toMatch(/^[0-9a-f]{64}$/);
       expect(node["provider"]).toBe("gcp");
-      // The HTTP port that serves /bootstrap. 8080 speaks the libp2p WebSocket upgrade and answers
-      // plain HTTP with 400, which resolves as zero reachable nodes from a valid manifest — so the
-      // port is asserted, not just the scheme.
-      expect(String(node["endpoint"])).toMatch(/^http:\/\/[\d.]+:9090$/);
-      // The dial address is STATED, not derived from `endpoint`: they are different listeners on
-      // different ports, and inferring one from the other is how anti-entropy broke.
-      expect(String(node["multiaddr"])).toMatch(/^\/ip4\/[\d.]+\/tcp\/8080\/ws$/);
+      // HTTPS on the node's own name, terminated by that region's load balancer (2026-09-10).
+      // The scheme is asserted, not just the host: an `http://` endpoint that still reaches the
+      // node would work and would silently give up the metadata privacy the cutover bought.
+      expect(String(node["endpoint"])).toMatch(
+        /^https:\/\/directory-[a-z0-9]+\.cello\.mygentic\.ai$/,
+      );
+      // The dial address is STATED, not derived from `endpoint`: they are consumed by different
+      // code, and inferring one from the other is how anti-entropy broke. Both are port 443 on the
+      // same name now, which makes the temptation to derive it stronger, not weaker.
+      expect(String(node["multiaddr"])).toMatch(
+        /^\/dns4\/directory-[a-z0-9]+\.cello\.mygentic\.ai\/tcp\/443\/tls\/ws$/,
+      );
+      // The name in the multiaddr must be the SAME name as the endpoint. A mismatch would leave
+      // /bootstrap resolving to one node and the dial to another, which reads as a peer-id mismatch
+      // three hops away from the cause.
+      expect(String(node["multiaddr"])).toContain(
+        String(node["endpoint"]).replace("https://", ""),
+      );
       expect(String(node["peerId"])).toMatch(/^12D3Koo/);
       // nodeId is `<cloud>-<region>` and the region is its second segment — step-6 looks up by
       // nodeId, so a node whose id and region disagree is unaddressable.
@@ -204,7 +215,10 @@ describe("FINDING-4: buildManifestDeps default (bundled) vs override (env) path"
   });
 
   it("with no env but CELLO_DIRECTORY_URL pointed at a bundled node: loads the bundle", () => {
-    process.env.CELLO_DIRECTORY_URL = "http://34.34.166.245:9090"; // gcp-euw1, as it appears in the bundle
+    // gcp-euw1, byte for byte as it appears in the bundle. That exactness is the whole point of the
+    // test: the raw address this used to be still REACHES the same node, and after the 2026-09-10
+    // TLS cutover it no longer matches, so step 6 would be skipped while everything still worked.
+    process.env.CELLO_DIRECTORY_URL = "https://directory-euw1.cello.mygentic.ai";
     const deps = buildManifestDeps(nullLogger());
     expect(deps.manifestProvider).toBeDefined();
     expect(deps.challengeVerifier).toBeDefined();

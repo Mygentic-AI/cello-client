@@ -31,15 +31,17 @@ import { extractErrorMessage } from "./error-message.js";
  * defense against a MITM redirecting /bootstrap to a rogue directory. It fails open and quietly,
  * which is why the requirement is stated here rather than left to be rediscovered.
  *
- * Hence an address and not a name: the manifest carries addresses, and the manifest is signed. Those
- * addresses are reserved (`google_compute_address`, held across instance replacement), so they are
- * stable by construction rather than by luck. `directory-use1.cello.mygentic.ai` also resolves here
- * and is fine for humans and curl — it just cannot be this constant until the manifest carries names.
+ * A NAME as of 2026-09-10, and the condition the previous comment set is exactly what changed: it
+ * said this "cannot be this constant until the manifest carries names", and the manifest now carries
+ * names. Every node sits behind its own regional load balancer terminating TLS, and the bundled
+ * roster moved to `https://directory-<region>.cello.mygentic.ai` in the same change. The two are
+ * only ever correct together.
  *
- * Port 9090 serves /bootstrap. 8080 speaks the libp2p WebSocket upgrade and answers plain HTTP with
- * 400, which resolves as zero reachable nodes from a perfectly valid manifest.
+ * No port: 443, and the balancer's URL map routes /bootstrap, /manifest, /health, /agent-lookup and
+ * /registry to the node's HTTP listener while everything else — the libp2p WebSocket upgrade — goes
+ * to the protocol listener. One port now serves what needed two.
  */
-export const PRODUCTION_DIRECTORY_URL = "http://34.75.172.108:9090";
+export const PRODUCTION_DIRECTORY_URL = "https://directory-use1.cello.mygentic.ai";
 
 /**
  * The bundled manifest's endpoint list, used by resolveDirectoryUrl to distribute cold-boot
