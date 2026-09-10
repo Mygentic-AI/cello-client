@@ -108,6 +108,47 @@ export function countClaimWords(text: string): number {
 
 export const ADJUDICATED: AdjudicatedClaim[] = [
   {
+    surface: "SECURITY.md",
+    claim: "Conversation content is end-to-end encrypted and the nodes never hold plaintext",
+    /**
+     * The WHOLE paragraph, though only its first line carries vocabulary. The other two lines are
+     * what the claim is FOR — telling a researcher they do not need to touch someone else's
+     * conversation to demonstrate a finding — and a row that quoted the promise without the purpose
+     * would leave the next reader unable to judge whether the promise was worth making.
+     */
+    excerpts: [
+      "Conversation content is end-to-end encrypted between the participating agents and the nodes never",
+      "hold plaintext, so there is rarely a reason to touch someone else's session in order to demonstrate",
+      "a finding. If you believe there is, stop and tell us first — we will help you construct a safe test.",
+    ],
+    verdict: "true",
+    /**
+     * STRUCTURAL, and the bound is worth stating rather than leaving to be discovered.
+     *
+     * There is no wire field that carries plaintext to a node. The relay is handed a content HASH
+     * and, for an offline recipient, a blob already sealed to that recipient's public key; the
+     * directory is handed neither. So this is not a node choosing to discard something it could
+     * have kept — there is nothing for it to keep.
+     *
+     * What it does NOT claim: that a participant cannot leak their own conversation. Either party
+     * holds the plaintext by definition and can do as they like with it. The sentence is scoped to
+     * what a researcher would otherwise have to break into, which is the question it is answering.
+     */
+    enforcedBy: "structural",
+    evidence:
+      "Outbound: `session-content-send.ts` reads the session key immediately before the seal and " +
+      "THROWS `content_not_encryptable` if it is gone, then ships `sealSessionContent(key, content)` " +
+      "under `content_encryption: SESSION_CONTENT_ENCRYPTION_V1`. There is no branch that puts a body " +
+      "on the wire unsealed. Inbound: `session-content-ingest.ts` refuses a frame whose " +
+      "`content_encryption` is absent or unknown (`content_encryption_absent_or_unknown`) rather than " +
+      "reading it raw, refuses when no key is agreed (`no_session_key`), and refuses a failed open " +
+      "(`decrypt_failed`) — an absent marker is a refusal, not a downgrade. Offline delivery: " +
+      "`park-envelope.ts` `sealParkEnvelope` is the only producer and wraps the entry with " +
+      "`sealToRecipient(recipientPubkey, …)` before deposit, so the relay holds ciphertext on that " +
+      "route too. Adjudicated 2026-09-10 while closing DOD-M15-CLOSEDSESSION-1, which read every one " +
+      "of these paths.",
+  },
+  {
     surface: "core/adapter-claude-code/SKILL.md",
     claim: "Handing someone a proof also hands them this session's salt",
     // The WHOLE paragraph, line by line — it carries four claim words, not one. A row that quotes
