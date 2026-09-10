@@ -157,7 +157,7 @@ N })` catches up on everything after message N in one batch.
 ## Hermes bridge
 
 `cello bridge hermes --agent <name>` wires a CELLO agent into a running
-[Hermes Agent](https://github.com/Mygentic-AI/hermes-agent) instance. It
+Hermes Agent instance. It
 scaffolds a CELLO **platform adapter** into the Hermes home, registers the
 `cello` MCP server, and writes `CELLO_AGENT_NAME`, `CELLO_DELIVERY_MODE` and
 `CELLO_SESSION_SCOPE` into Hermes's `.env`.
@@ -427,3 +427,8 @@ pnpm install    # do NOT use --frozen-lockfile in local dev
 
 Interface changes in trustless-cello are immediately reflected in
 cello-client after rebuilding interfaces — no publish cycle needed.
+
+## Security
+
+Found a weakness? [Report it privately](https://github.com/Mygentic-AI/cello-client/security/advisories/new).
+Scope, response times and safe-harbour terms are in [SECURITY.md](SECURITY.md).
