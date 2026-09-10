@@ -35,7 +35,7 @@
  *
  * The scripted relay below models the gate itself: it grants only to a peer id that has proved.
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -83,6 +83,8 @@ class ScriptedRelay {
   askThrows = false;
   /** When set, every proof fails on TRANSPORT — false with no refusal, i.e. no verdict was reached. */
   proofTransportFails = false;
+  /** Relay peer ids this agent told us it was finished with. */
+  readonly released: string[] = [];
   /** How many circuit addresses each relay announces. Real relays announce several; see `GatedNode`. */
   addressesPerRelay = 1;
 
@@ -246,6 +248,10 @@ function relayClientStub(relay: ScriptedRelay, relayPeerId: string): AgentRelayC
       return true;
     },
     getLastAuthRefusal(): RelayAuthRefusal | null { return lastRefusal; },
+    // 055-ONDEMAND — the relay's own record of being told a slot is free. Asserting on THIS rather
+    // than on our local addresses is the difference between "we stopped advertising" and "the slot
+    // is back in the table", and only the second is what the story is about.
+    async releaseReservation(): Promise<boolean> { relay.released.push(relayPeerId); return true; },
     close(): void { /* nothing held */ },
   } as unknown as AgentRelayClient;
 }
@@ -284,6 +290,29 @@ async function makeManager(
   return m;
 }
 
+/**
+ * 055-ONDEMAND — **THE TRIGGER MOVED, SO THE FIXTURE MOVED WITH IT.**
+ *
+ * These tests used to call `ensureStandingReceiverForAgent` and watch the login WALK visit every
+ * relay. There is no walk: an idle agent holds nothing, and a reservation is taken when an offer
+ * arrives, on the relay the directory named. So the receiver comes up and then this asks for the
+ * relays the test is about — which is exactly what the offer path does, through the same seam.
+ *
+ * ⚠️ The properties below did NOT move. Prove-before-ask, one node, the client-fault vocabulary and
+ * the refusal reaching `cello_status` are all still true and still asserted; what changed is who
+ * decides which relay, and that is now the directory rather than a walk.
+ */
+async function bringUpAndReserve(m: SessionNodeManager, relays: readonly string[] = [CIRCUIT_A, CIRCUIT_B]): Promise<boolean[]> {
+  await m.ensureStandingReceiverForAgent("alice");
+  const took: boolean[] = [];
+  for (const circuitAddr of relays) {
+    took.push(await m.takeReservationForSession("alice", circuitAddr, "test-corr"));
+    // An agent-level refusal reproduces on every relay, so the offer path would not ask a second.
+    if (m.getStandingReceiverRefusal("alice")?.tryAnotherRelay === false) break;
+  }
+  return took;
+}
+
 beforeEach(async () => { tempDir = await mkdtemp(join(tmpdir(), "cello-slots-prove-")); });
 afterEach(async () => {
   await mgr?.gracefulShutdown();
@@ -297,7 +326,7 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
     const factory = new GatedFactory(relay);
     mgr = await makeManager(relay, factory);
 
-    await mgr.ensureStandingReceiverForAgent("alice");
+    await bringUpAndReserve(mgr);
     const node = mgr.getStandingReceiverNode("alice");
 
     expect(
@@ -380,7 +409,7 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
     const factory = new GatedFactory(relay);
     mgr = await makeManager(relay, factory);
 
-    await mgr.ensureStandingReceiverForAgent("alice");
+    await bringUpAndReserve(mgr);
 
     const proofs = relay.gateProofTimeline();
     expect(proofs.length, "one gate proof per relay in the pool").toBe(2);
@@ -433,7 +462,7 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
     relay.grants = (): boolean => true;
     mgr = await makeManager(relay, factory, { noRelayClient: true });
 
-    await mgr.ensureStandingReceiverForAgent("alice");
+    await bringUpAndReserve(mgr);
 
     expect(
       relay.timeline.filter((e) => e.kind === "listen").map((e) => e.relayPeerId),
@@ -468,7 +497,7 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
     relay.grants = (): boolean => true;
     mgr = await makeManager(relay, factory);
 
-    await mgr.ensureStandingReceiverForAgent("alice");
+    await bringUpAndReserve(mgr);
 
     expect(
       relay.gateProofs().length,
@@ -502,7 +531,7 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
       logger: { debug: capture, info: capture, warn: capture, error: capture },
     });
 
-    await mgr.ensureStandingReceiverForAgent("alice");
+    await bringUpAndReserve(mgr);
 
     const rejected = events.filter((e) => e.event === "session.standing_receiver.relay.rejected");
     expect(rejected.length, "every relay in the pool is declined — the fault is ours, not theirs").toBeGreaterThan(0);
@@ -539,19 +568,21 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
       logger: { debug: capture, info: capture, warn: capture, error: capture },
     });
 
-    await mgr.ensureStandingReceiverForAgent("alice");
+    await bringUpAndReserve(mgr);
 
-    const reachEvents = events.filter((e) => e.event === "session.standing_receiver.reachability");
-    const reach = reachEvents.at(-1);
-    expect(reach, "the receiver must report its reachability").toBeDefined();
+    /**
+     * ⚠️ THE SUBJECT MOVED WITH 055-ONDEMAND. The count used to be reported at login, by the walk.
+     * Nothing is held at login now, so the number that matters is the receiver's own record of what
+     * it holds — `relayPeerIds`, which is what the reservation WATCHDOG compares against to decide a
+     * reservation was lost and what `cello_status` reports as reachability.
+     *
+     * Getting it wrong is not cosmetic in either place: a count that can exceed the number of relays
+     * makes a healthy agent and a churning one look identical.
+     */
     expect(
-      reach?.ctx["reservationsHeld"],
-      "two relays granted, so two reservations are held — however many addresses each announces",
-    ).toBe(2);
-    expect(
-      Number(reach?.ctx["reservationsHeld"]),
-      "and it can never exceed what was offered, which is the property that makes it answerable",
-    ).toBeLessThanOrEqual(Number(reach?.ctx["relaysOffered"]));
+      mgr.getStandingReceiverRelayIds("alice"),
+      "two relays granted, so two relays are recorded — however many addresses each announces",
+    ).toEqual([RELAY_A, RELAY_B]);
     /**
      * ⚠️ ONE EMISSION PER RECEIVER BUILD — review MEDIUM-7, and this assertion is why the test above
      * is not hollow. 054-SRSPLIT added a second `reachability` emission inside `#startReceiverNode`
@@ -560,7 +591,182 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
      * test green. `reservation.none` is also the event MSG-018 counted 481 of to justify a retry,
      * and doubling it breaks any comparison against that baseline.
      */
-    expect(reachEvents.length, "the receiver reports its reachability ONCE per build").toBe(1);
+    /**
+     * ONE emission per build — kept from 054-SRSPLIT review MEDIUM-7, where a duplicate
+     * `reachability` line made a count test read the wrong copy of the event and go green against a
+     * defect. The event now reports zero held at login (055-ONDEMAND), and it must still be one line.
+     */
+    expect(
+      events.filter((e) => e.event === "session.standing_receiver.reachability").length,
+      "the receiver reports its reachability ONCE per build",
+    ).toBe(1);
+  }, 30_000);
+
+  it("★★★ an offer that goes QUIET gives its slot back — DOD-M15-OFFER-EXPIRY-1, relocated", async () => {
+    /**
+     * ⚠️ **THE STORY PREDICTED THIS EXACT DEFECT AND NAMED THIS UNIT AS ITS OWNER.**
+     *
+     * Units 2 and 3 removed the permanently-open door `OFFER-EXPIRY-1` wanted a timer on — and the
+     * defect moved somewhere more expensive rather than going away. The responder reserves the
+     * moment an offer arrives; an initiator that never dials leaves a slot held on a SHARED relay
+     * until its TTL, two hours by default. "Released at seal" cannot cover it, because there is no
+     * seal.
+     *
+     * ⚠️ AND THE BUDGET IS THE POINT: it is NOT the directory's 2-second accept clock. The accept
+     * only starts the ceremony — the assignment still has to be FROST-signed and delivered before
+     * either side builds a session. Releasing on 2 s would take the slot out from under a session
+     * that was about to begin.
+     */
+    vi.useFakeTimers();
+    try {
+      const relay = new ScriptedRelay();
+      const factory = new GatedFactory(relay);
+      const evs: Array<{ event: string }> = [];
+      const cap = (event: string): void => { evs.push({ event }); };
+      mgr = await makeManager(relay, factory, { logger: { debug: cap, info: cap, warn: cap, error: cap } });
+      await mgr.ensureStandingReceiverForAgent("alice");
+
+      const sessionIdHex = "ab".repeat(16);
+      await mgr.takeReservationForSession("alice", CIRCUIT_A, "corr", sessionIdHex);
+      expect(
+        mgr.getStandingReceiverRelayIds("alice"),
+        "precondition: the offer took a slot, which is what makes it abandonable",
+      ).toEqual([RELAY_A]);
+
+      // The ceremony is still plausibly running here — nothing may be released yet.
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(
+        evs.some((e) => e.event === "session.reservation.offer_abandoned"),
+        "⚠️ NOT released at 30s. A FROST-signed assignment still has to reach both parties; " +
+          "releasing inside that window breaks sessions that were about to start.",
+      ).toBe(false);
+
+      // Past the grace, with no session ever created for that id.
+      await vi.advanceTimersByTimeAsync(40_000);
+      await vi.runOnlyPendingTimersAsync();
+
+      expect(
+        evs.some((e) => e.event === "session.reservation.offer_abandoned"),
+        "the slot is given back rather than held for the relay's two-hour TTL",
+      ).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 30_000);
+
+  it("★★★ an offer that BECOMES a session keeps its slot — the release must not fire under a live session", async () => {
+    /**
+     * The other half, and the one that decides whether the timer above is safe to ship. A release
+     * that fired on a healthy session would be far worse than the leak it prevents: the
+     * counterparty holds a route that stops working mid-conversation, and nothing says why.
+     */
+    vi.useFakeTimers();
+    try {
+      const relay = new ScriptedRelay();
+      const factory = new GatedFactory(relay);
+      mgr = await makeManager(relay, factory);
+      await mgr.ensureStandingReceiverForAgent("alice");
+
+      const sessionIdHex = "cd".repeat(16);
+      await mgr.takeReservationForSession("alice", CIRCUIT_A, "corr", sessionIdHex);
+      const created = await mgr.createSessionNode(sessionIdHex, "alice", "bb".repeat(32), COUNTERPARTY_PEER, "corr", true);
+      expect(created.ok, JSON.stringify(created)).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(120_000);
+      await vi.runOnlyPendingTimersAsync();
+
+      /**
+       * ⚠️ READ THROUGH `cello_status`, NOT THE RECEIVER. The circuit lives on the SESSION's node —
+       * the receiver was promoted into it and replaced — so checking the receiver reports a fault
+       * on a perfectly healthy conversation. That is exactly the defect the reachability read had
+       * before this unit fixed it, and asserting through the operator's own surface is what stops
+       * it coming back.
+       */
+      expect(
+        mgr.getStandingReceiverReachability("alice"),
+        "a live session keeps the circuit its counterparty was told to dial, and the operator's " +
+          "surface says so",
+      ).toBe("reserved");
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 30_000);
+
+  it("★★★ TWO live sessions, one seals: the other keeps its circuit — the order's mandated test", async () => {
+    /**
+     * ⚠️ **THE ORDER SAID THIS TEST MUST EXIST BEFORE THE CODE, AND IT DID NOT.** Review HIGH-5. Its
+     * absence is why the release half shipped in a state where it could never run: nothing in the
+     * suite went red when `releaseSessionReservation` returned without doing anything.
+     *
+     * ⚠️ AND THE ANSWER IT PINS IS NOT THE ONE THE ORDER EXPECTED. The order feared that sealing one
+     * session would clear the other's refresh timers, because libp2p shares a `reservationStore`
+     * across listeners — so it prescribed a recompute. That store is shared **within one node**, and
+     * each live session owns its OWN node. Sealing one cannot touch another's. The recompute was
+     * aimed at an object that does not exist, and re-deriving it removed a whole class of drift
+     * rather than managing it.
+     */
+    const relay = new ScriptedRelay();
+    const factory = new GatedFactory(relay);
+    mgr = await makeManager(relay, factory);
+    await mgr.ensureStandingReceiverForAgent("alice");
+
+    const sidA = "11".repeat(16);
+    await mgr.takeReservationForSession("alice", CIRCUIT_A, "corrA", sidA);
+    const openedA = await mgr.createSessionNode(sidA, "alice", "aa".repeat(32), COUNTERPARTY_PEER, "corrA", true);
+    expect(openedA.ok, JSON.stringify(openedA)).toBe(true);
+
+    await mgr.ensureStandingReceiverForAgent("alice");
+    const sidB = "22".repeat(16);
+    await mgr.takeReservationForSession("alice", CIRCUIT_B, "corrB", sidB);
+    const openedB = await mgr.createSessionNode(sidB, "alice", "bb".repeat(32), COUNTERPARTY_PEER, "corrB", true);
+    expect(openedB.ok, JSON.stringify(openedB)).toBe(true);
+
+    const nodeB = mgr.getSessionNodeForTest("alice", sidB);
+    const bHeldBefore = (nodeB?.listenAddresses() ?? []).filter((a) => a.includes("/p2p-circuit")).length;
+    expect(bHeldBefore, "precondition: session B holds a circuit, or this measures nothing").toBeGreaterThan(0);
+
+    await mgr.destroySessionNode("alice", sidA, "sealed");
+
+    expect(
+      (nodeB?.listenAddresses() ?? []).filter((a) => a.includes("/p2p-circuit")).length,
+      "⚠️ session B still announces its circuit. Sealing A must not cost B the route its " +
+        "counterparty was told to dial — a live session losing inbound with no event is the worst " +
+        "shape this unit could ship.",
+    ).toBe(bHeldBefore);
+    expect(
+      mgr.getStandingReceiverReachability("alice"),
+      "and the operator's surface still says the agent is reachable",
+    ).toBe("reserved");
+  }, 30_000);
+
+  it("★★★ the seal TELLS the relay — the only thing that actually frees a slot", async () => {
+    /**
+     * Review HIGH-1/HIGH-2: the release used to look the node up by agent name, which after the
+     * promotion is the fresh EMPTY receiver — so it read zero circuits and returned having told the
+     * relay nothing, while logging success. And it only ran on `retireSessionNode`, which is the
+     * CLOSER's path; the responder, which is the party that reserved, tears down through
+     * `destroySessionNode`.
+     *
+     * Both are asserted here, on the responder's path, through the relay's own record of being told.
+     */
+    const relay = new ScriptedRelay();
+    const factory = new GatedFactory(relay);
+    mgr = await makeManager(relay, factory);
+    await mgr.ensureStandingReceiverForAgent("alice");
+
+    const sid = "33".repeat(16);
+    await mgr.takeReservationForSession("alice", CIRCUIT_A, "corr", sid);
+    const opened = await mgr.createSessionNode(sid, "alice", "aa".repeat(32), COUNTERPARTY_PEER, "corr", true);
+    expect(opened.ok, JSON.stringify(opened)).toBe(true);
+    expect(relay.released, "precondition: nothing released yet").toEqual([]);
+
+    await mgr.destroySessionNode("alice", sid, "sealed");
+
+    expect(
+      relay.released,
+      "the relay is TOLD. Closing a listener sends it nothing and its own reaper waits on pressure, " +
+        "so without this the slot is held for its full TTL — two hours — after the session ended.",
+    ).toEqual([RELAY_A]);
   }, 30_000);
 
   it("★★★ a refusal about THIS AGENT reaches cello_status, and stops the fleet walk", async () => {
@@ -578,7 +784,7 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
     const factory = new GatedFactory(relay);
     mgr = await makeManager(relay, factory);
 
-    await mgr.ensureStandingReceiverForAgent("alice");
+    await bringUpAndReserve(mgr);
 
     const surfaced = mgr.getStandingReceiverRefusal("alice");
     expect(
@@ -610,7 +816,7 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
     const factory = new GatedFactory(relay);
     mgr = await makeManager(relay, factory);
 
-    await mgr.ensureStandingReceiverForAgent("alice");
+    await bringUpAndReserve(mgr);
 
     expect(
       relay.gateProofs().map((p) => p.relayPeerId),
@@ -657,7 +863,7 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
     mgr = await makeManager(relay, factory);
 
     const sid = "93".repeat(32);
-    await mgr.ensureStandingReceiverForAgent("alice");
+    await bringUpAndReserve(mgr);
     const opened = await mgr.createSessionNode(sid, "alice", "bb".repeat(32), COUNTERPARTY_PEER, "corr", true);
     expect(opened.ok, JSON.stringify(opened)).toBe(true);
     await mgr.destroySessionNode("alice", sid, "interrupted");

@@ -686,6 +686,26 @@ export const REVIVAL_BOUND_SWEEP_MS = 60 * 60 * 1000;
 /** DOD-M12B-SESSION-SEED-1: per-relay deadline when a revived node asks for a circuit reservation.
  *  Three seconds — a relay that has a slot answers well inside it, and one that does not never
  *  answers at all (measured: 10,002ms and still waiting). */
+/**
+ * 055-ONDEMAND — how long a seal will wait to TELL a relay its slot is free.
+ *
+ * Short on purpose. Releasing is a courtesy that frees capacity; a seal is the thing the operator
+ * is waiting for. An undelivered release costs one slot until its reservation TTL, and that is a
+ * far better trade than a seal that waits on an unreachable relay's dial.
+ */
+export const RELEASE_TELL_BUDGET_MS = 3_000;
+
+/**
+ * 055-ONDEMAND — how long a slot taken to answer an OFFER may sit before the offer is called dead.
+ *
+ * ⚠️ **NOT the directory's 2-second accept clock.** The accept only starts the ceremony: the
+ * assignment still has to be FROST-signed by a threshold of directory nodes and delivered to both
+ * parties before either builds a session node. Releasing on 2 s would take the slot out from under
+ * a session that was about to begin, turning a rare abandoned offer into a common broken session.
+ * Sixty seconds is far past any healthy ceremony and far short of the relay's two-hour TTL.
+ */
+export const OFFER_RESERVATION_GRACE_MS = 60_000;
+
 export const REVIVE_RESERVATION_TIMEOUT_MS = 3_000;
 
 /** How many relays a revival will ask before settling for a plain node. Two: the worst case is then

@@ -153,6 +153,32 @@ async function makeManager(opts: { factory: ISessionNodeFactory; logger: Logger;
   return { snm, dir };
 }
 
+/**
+ * 055-ONDEMAND — **AN IDLE AGENT HOLDING NOTHING IS NO LONGER THE DEFECT THIS FILE IS ABOUT.**
+ *
+ * The measurement that produced this file — 481 `reservation.none` and 2,215 `relay.rejected` over
+ * 17 days — was of receivers that reserved AT LOGIN and, when refused, spent their whole lives as
+ * plain TCP nodes dialable by nobody. A reservation is taken at OFFER time now and given back at
+ * the seal, so an idle agent holding zero is the design, and retrying for one would have every idle
+ * agent in the fleet asking relays for slots it must not hold.
+ *
+ * **The property that survives is the one that always mattered: an agent whose LIVE SESSION lost
+ * the circuit it depends on is retried, on a backoff, and bounded.** That is what these tests now
+ * set up — a session exists, so there is something the reservation is for.
+ */
+async function openSession(m: SessionNodeManager, sessionId = "aa".repeat(16)): Promise<void> {
+  const res = await m.createSessionNode(sessionId, "alice", "bb".repeat(32), "12D3KooWCounterpartyPeerForRetryTests000000", "corr", true);
+  if (!res.ok) throw new Error(JSON.stringify(res));
+  /**
+   * ⚠️ THE SESSION'S OWN RELAY, because that is what the retry re-takes. A session's circuit is the
+   * one its ASSIGNMENT named — the relay admits a dial by checking that assignment — so the watchdog
+   * asks for THAT relay back rather than any relay the directory happens to know. A session row
+   * without one is a DIRECT-mode session, which legitimately needs no circuit at all.
+   */
+  m.getDb().prepare("UPDATE sessions SET relay_peer_id = ?, relay_addrs = ? WHERE session_id = ?")
+    .run("12D3KooWRelay", JSON.stringify(["/ip4/127.0.0.1/tcp/4001"]), sessionId);
+}
+
 describe("DOD-M12B-RESERVATION-RETRY-1: a receiver with no reservation is tried again", () => {
   let cleanup: (() => Promise<void>) | null = null;
   afterEach(async () => { if (cleanup) await cleanup(); cleanup = null; });
@@ -165,14 +191,20 @@ describe("DOD-M12B-RESERVATION-RETRY-1: a receiver with no reservation is tried 
     cleanup = async () => { await snm.gracefulShutdown(); await rm(dir, { recursive: true, force: true }); };
 
     await snm.ensureStandingReceiverForAgent("alice");
+    await openSession(snm); // 055-ONDEMAND: the retry is for a session's circuit, not an idle agent's
+    /**
+     * ⚠️ **NO ATTEMPT AT CREATION ANY MORE, AND THAT IS THE CHANGE, NOT A REGRESSION.** The receiver
+     * comes up holding nothing (055-ONDEMAND). What this test is for survives intact: a relay out of
+     * slots when the session opened may have one minutes later, and NOTHING EVER ASKED AGAIN — so
+     * what is asserted is that attempts keep coming, not that one happened at build.
+     */
     const afterFirst = factory.circuitAttempts;
-    expect(afterFirst, "the first attempt happens at creation").toBeGreaterThan(0);
 
     await new Promise((r) => setTimeout(r, 400));
 
     expect(
       factory.circuitAttempts,
-      "a relay out of slots at boot may have one minutes later — nothing ever asked again",
+      "a relay out of slots when the session opened may have one minutes later — nothing ever asked again",
     ).toBeGreaterThan(afterFirst);
     expect(
       events.filter((e) => e.event === "session.standing_receiver.reservation.retry").length,
@@ -190,6 +222,7 @@ describe("DOD-M12B-RESERVATION-RETRY-1: a receiver with no reservation is tried 
     cleanup = async () => { await snm.gracefulShutdown(); await rm(dir, { recursive: true, force: true }); };
 
     await snm.ensureStandingReceiverForAgent("alice");
+    await openSession(snm); // 055-ONDEMAND: the retry is for a session's circuit, not an idle agent's
     await new Promise((r) => setTimeout(r, 800));
 
     const gaveUp = events.filter((e) => e.event === "session.standing_receiver.reservation.gave_up");
@@ -218,8 +251,10 @@ describe("DOD-M12B-RESERVATION-RETRY-1: a receiver with no reservation is tried 
     cleanup = async () => { await snm.gracefulShutdown(); await rm(dir, { recursive: true, force: true }); };
 
     await snm.ensureStandingReceiverForAgent("alice");
+    await openSession(snm); // 055-ONDEMAND: the retry is for a session's circuit, not an idle agent's
     await new Promise((r) => setTimeout(r, 400));
     const settled = factory.circuitAttempts;
+    // Three ASKS, all from the retry ladder now — the build makes none (055-ONDEMAND).
     expect(settled, "it should have kept trying until one was granted").toBeGreaterThanOrEqual(3);
 
     await new Promise((r) => setTimeout(r, 300));
@@ -284,6 +319,7 @@ describe("DOD-M12B-RESERVATION-RETRY-1: the backoff and the budget", () => {
     cleanup = async () => { await snm.gracefulShutdown(); await rm(dir, { recursive: true, force: true }); };
 
     await snm.ensureStandingReceiverForAgent("alice");
+    await openSession(snm); // 055-ONDEMAND: the retry is for a session's circuit, not an idle agent's
     await new Promise((r) => setTimeout(r, 200));
 
     expect(
@@ -305,6 +341,7 @@ describe("DOD-M12B-RESERVATION-RETRY-1: the backoff and the budget", () => {
     cleanup = async () => { await snm.gracefulShutdown(); await rm(dir, { recursive: true, force: true }); };
 
     await snm.ensureStandingReceiverForAgent("alice");
+    await openSession(snm); // 055-ONDEMAND: the retry is for a session's circuit, not an idle agent's
     const at: number[] = [];
     const started = Date.now();
     // Record when each retry fires, by watching the event count change.
@@ -338,6 +375,7 @@ describe("DOD-M12B-RESERVATION-RETRY-1: the backoff and the budget", () => {
     cleanup = async () => { await snm.gracefulShutdown(); await rm(dir, { recursive: true, force: true }); };
 
     await snm.ensureStandingReceiverForAgent("alice");
+    await openSession(snm); // 055-ONDEMAND: the retry is for a session's circuit, not an idle agent's
     await new Promise((r) => setTimeout(r, 800));
     expect(
       events.filter((e) => e.event === "session.standing_receiver.reservation.gave_up").length,
@@ -347,6 +385,9 @@ describe("DOD-M12B-RESERVATION-RETRY-1: the backoff and the budget", () => {
     await snm.removeStandingReceiverForAgent("alice");
     const before = events.filter((e) => e.event === "session.standing_receiver.reservation.retry").length;
     await snm.ensureStandingReceiverForAgent("alice");
+    // A DIFFERENT session id: the first one still owns its row, and a duplicate is refused
+    // (`session_persist_failed`) — which would fail this test for a reason that is not its subject.
+    await openSession(snm, "cc".repeat(16));
     await new Promise((r) => setTimeout(r, 300));
 
     expect(

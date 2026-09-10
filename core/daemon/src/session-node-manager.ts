@@ -418,11 +418,14 @@ export class SessionNodeManager {
   getStandingReceiverReachability(agentName: string): "reserved" | "retrying" | "unreachable" | "absent" { return this.#receivers.getStandingReceiverReachability(agentName); }
   getStandingReceiverAutoNat(): IAutoNatService | null { return this.#receivers.getStandingReceiverAutoNat(); }
   getStandingReceiverAllowedPeer(agentName: string): string | null { return this.#receivers.getStandingReceiverAllowedPeer(agentName); }
-  admitOfferedDialer(agentName: string, initiatorSessionPeerId: string, sessionIdHex: string): "narrowed" | "no_receiver" | "no_peer_named" { return this.#receivers.admitOfferedDialer(agentName, initiatorSessionPeerId, sessionIdHex); }
+  admitOfferedDialer(a: string, p: string, sid: string): "narrowed" | "no_receiver" | "no_peer_named" { return this.#receivers.admitOfferedDialer(a, p, sid); }
+  takeReservationForSession(a: string, c: string, cid: string, offerSid?: string): Promise<boolean> { return this.#receivers.takeReservationForSession(a, c, cid, offerSid); } // 055-ONDEMAND
+  getStandingReceiverRelayIds(a: string): string[] { return [...(this.#standingReceivers.get(a)?.relayPeerIds ?? [])]; } // 055-ONDEMAND
+  /** 055-ONDEMAND — a live session's own node. Its circuit is not the receiver's; see the release path. */
+  getSessionNodeForTest(a: string, sid: string): CelloNode | null { return this.#activeNodes.get(this.#k(a, sid))?.node ?? null; }
   getOfferedDialer(agentName: string, sessionIdHex: string): string | null { return this.#receivers.getOfferedDialer(agentName, sessionIdHex); }
   clearOfferedDialer(agentName: string, sessionIdHex: string): void { return this.#receivers.clearOfferedDialer(agentName, sessionIdHex); }
   revokeOfferedDialer(agentName: string, sessionIdHex: string, offeredPeerId: string | null): void { return this.#receivers.revokeOfferedDialer(agentName, sessionIdHex, offeredPeerId); }
-
   /** ─── DELEGATORS — the leaf-record API other files call ─────────────────────────────── */
 recordSessionGenesis(agentName: string, sessionId: string, participantA: Uint8Array, participantB: Uint8Array, sessionTimestamp: number): void { return this.#leafRecords.recordSessionGenesis(agentName, sessionId, participantA, participantB, sessionTimestamp); }
   setSessionGenesisForTest(agentName: string, sessionId: string, genesis: Uint8Array): void { return this.#leafRecords.setSessionGenesisForTest(agentName, sessionId, genesis); }
@@ -1298,7 +1301,13 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       srReservationTimeoutMs: this.#srReservationTimeoutMs,
       autoNatProbers: () => this.#autoNatProbers(),
       proveToRelay: (a, circuitAddr, node, cid, surface) => this.#relay.proveToRelay(a, circuitAddr, node, cid, surface),
+      tellRelayReleased: (a, relayPeerId, node, cid) => this.#relay.tellRelayReleased(a, relayPeerId, node, cid),
       reservationCircuitAddrs: (a) => this.#relay.reservationCircuitAddrs(a),
+      // 055-ONDEMAND — the abandoned-offer release asks these two: did the session this offer was
+      // for actually start, and what do the agent's remaining live sessions still need?
+      sessionIsLive: (a, sid) => this.#activeNodes.has(this.#k(a, sid)),
+      anyLiveSessionHoldsCircuit: (a) => [...this.#activeNodes.values()]
+        .some((e) => e.agentName === a && e.node.listenAddresses().some((ad) => ad.split("/").includes("p2p-circuit"))),
       authenticateStandingReceiver: (a, node, relayPeerId, heldCircuitAddr, cid) => this.#relay.authenticateStandingReceiver(a, node, relayPeerId, heldCircuitAddr, cid),
     });
 
@@ -1366,6 +1375,9 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       logger: this.#logger,
       records: this.#records,
       queries: this.#queries,
+      // 055-ONDEMAND: the watchdog re-takes a live session's circuit rather than rebuilding a
+      // receiver that would reserve nothing.
+      retakeReservationOn: (a, node, c, cid) => this.#receivers.retakeReservationOn(a, node, c, cid),
       park: this.#park,
       refusals: this.#refusals,
       leafRecords: this.#leafRecords,

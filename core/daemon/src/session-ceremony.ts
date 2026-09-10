@@ -61,6 +61,16 @@ export function wireSessionOfferHandler(deps: {
    * setting is what emptied the address list, never when a receiver simply has none yet.
    */
   isRelayOnly?: () => boolean;
+  /**
+   * 055-ONDEMAND — **take a reservation on the relay the directory named, right now.**
+   *
+   * An idle agent holds none, so this is what gives it a circuit address to advertise in the
+   * accept. Resolves whether one was granted; a `false` is not fatal — the agent can still be
+   * reached directly, and relay-only is the one mode where it is not (see the guard below).
+   *
+   * Optional, defaulting to a no-op, so every existing caller and test keeps its exact behaviour.
+   */
+  reserveOnDemand?: (circuitAddr: string, sessionIdHex: string) => Promise<boolean>;
   signaling: SignalingSeam;
   logger: Logger;
 }): () => void {
@@ -109,11 +119,52 @@ export function wireSessionOfferHandler(deps: {
         await sendOfferReject(null, "no_session_id");
         return;
       }
-      const sr = deps.getStandingReceiverEndpoint();
+      let sr = deps.getStandingReceiverEndpoint();
       if (!sr) {
         deps.logger.warn("session.offer.abort", { agentName: deps.agentName, reason: "standing_receiver_unavailable" });
         await sendOfferReject(sessionId, "standing_receiver_unavailable");
         return;
+      }
+
+      /**
+       * 055-ONDEMAND — **RESERVE NOW, BECAUSE AN IDLE AGENT HOLDS NOTHING.**
+       *
+       * This is the whole of the capacity change, seen from the receiving end. The agent no longer
+       * carries a slot on every relay against the chance that somebody calls; it takes ONE, on the
+       * relay this offer names, at the moment somebody does. The accept below then advertises the
+       * circuit address that came back.
+       *
+       * ⚠️ **THE RELAY IS THE DIRECTORY'S CHOICE, NOT OURS.** The assignment the relay will check
+       * names the same relay, from the same variable on the directory's side. Reserving on one we
+       * picked ourselves would leave us holding a slot the relay will not route through.
+       *
+       * ⚠️ **A FAILURE HERE IS NOT FATAL BY ITSELF.** Without a circuit we are still reachable by a
+       * peer that can dial us directly; it is relay-only that turns this into a refusal, and that
+       * check is deliberately BELOW this line rather than above it — see its own note.
+       */
+      const offeredRelay = frame["relay_endpoint"] as { peer_id?: unknown; multiaddrs?: unknown } | undefined;
+      const relayPeerId = typeof offeredRelay?.peer_id === "string" ? offeredRelay.peer_id : null;
+      const relayAddrs = Array.isArray(offeredRelay?.multiaddrs)
+        ? (offeredRelay.multiaddrs as unknown[]).filter((a): a is string => typeof a === "string")
+        : [];
+      if (relayPeerId && relayAddrs.length > 0 && deps.reserveOnDemand) {
+        const base = relayAddrs[0]!;
+        // The circuit address form the walk uses: the relay's own address with `/p2p-circuit`.
+        const circuitAddr = base.includes(`/p2p/${relayPeerId}`)
+          ? `${base}/p2p-circuit`
+          : `${base}/p2p/${relayPeerId}/p2p-circuit`;
+        const took = await deps.reserveOnDemand(circuitAddr, Buffer.from(sessionId).toString("hex"));
+        deps.logger.info("session.offer.reservation", {
+          agentName: deps.agentName,
+          relayPeerId,
+          granted: took,
+          impact: took
+            ? "this agent is dialable through the relay the directory named, for the life of this session"
+            : "no reservation on the offered relay — a counterparty behind NAT cannot dial this " +
+              "agent for this session, and it will be reached over the relay's store-and-forward",
+        });
+        // Re-read: the endpoint we advertise has to include the circuit we just took.
+        sr = deps.getStandingReceiverEndpoint() ?? sr;
       }
       // DOD-M15-RELAYONLY-1: ANSWER, never publish an empty address list — **but only when
       // relay-only is what emptied it.**
@@ -130,6 +181,14 @@ export function wireSessionOfferHandler(deps: {
       // `counterparty_unavailable`: a lie about our state, produced by our setting. Rejecting
       // explicitly keeps the failure attributable to the side that caused it, and is the same
       // answer-never-vanish contract the reject path above already implements.
+      /**
+       * ⚠️ **AFTER THE ON-DEMAND RESERVE, NOT BEFORE IT — 055-ONDEMAND.** An idle agent holds no
+       * reservation by design now, so this guard sitting above the reserve would fire on EVERY
+       * inbound offer and take `DOD-M15-RELAYONLY-1` — the control that stops a session revealing
+       * the operator's IP — to a 100% refusal rate. Down here it means what it has always meant:
+       * relay-only is on and we could not get a circuit, so there is nothing we are willing to
+       * advertise.
+       */
       if (sr.addrs.length === 0 && (deps.isRelayOnly?.() ?? false)) {
         deps.logger.warn("session.offer.abort", {
           agentName: deps.agentName,

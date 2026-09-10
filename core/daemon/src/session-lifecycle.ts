@@ -583,6 +583,26 @@ export class SessionLifecycle {
     // The counterparty did nothing, so they must not be charged a cap slot for it.
     this.updateSessionStatus(agentName, sessionId, dbStatus, dbStatus === "interrupted" ? "local" : undefined);
 
+    /**
+     * 055-ONDEMAND — **THE SLOT GOES BACK HERE TOO, AND THIS IS THE PATH THAT MATTERS MOST.**
+     *
+     * The first version put the release only in `retireSessionNode`. The comment at the top of THIS
+     * function says which side goes where: *"The receiver (the party that races the seal on
+     * `cello_receive`) is torn down through THIS path; the closer goes through
+     * retireSessionNode."* The receiver is exactly the party that took the on-demand reservation —
+     * it reserved to answer the offer. So whenever the INITIATOR closes, which is the ordinary
+     * case, the responder's slot was never released at all.
+     *
+     * Both paths now release, from the session's own node. Awaited, never allowed to throw.
+     */
+    await this.#ctx.receivers.releaseSessionReservation(agentName, entry.node, sessionId, entry.correlationId)
+      .catch((err: unknown) => {
+        this.#ctx.logger.warn("session.reservation.release.failed", {
+          agentName, sessionId, error: extractErrorMessage(err),
+          impact: "the relay keeps this slot until its TTL expires. The teardown itself is unaffected.",
+        });
+      });
+
     this.#ctx.activeNodes.delete(this.#ctx.sessionKey(agentName, sessionId));
     // Evict the in-memory per-session caches on teardown. The tree is durable in
     // SQLite (getSessionTree reloads it on demand), and the received-content buffer
@@ -649,6 +669,23 @@ export class SessionLifecycle {
       agentName: entry.agentName,
       reason: "sealing",
     });
+    /**
+     * 055-ONDEMAND — **THE SLOT GOES BACK, FROM THIS SESSION'S OWN NODE.**
+     *
+     * `entry.node` is the node that actually holds the circuit — the standing receiver was PROMOTED
+     * into it when the session opened, and a fresh empty receiver was built behind it. Looking the
+     * node up by agent name (the first version) always found that empty replacement, read zero
+     * circuits, and returned having told the relay nothing.
+     *
+     * Awaited but never allowed to throw: giving a slot back must not be able to fail a seal.
+     */
+    await this.#ctx.receivers.releaseSessionReservation(agentName, entry.node, sessionId, entry.correlationId)
+      .catch((err: unknown) => {
+        this.#ctx.logger.warn("session.reservation.release.failed", {
+          agentName, sessionId, error: extractErrorMessage(err),
+          impact: "the relay keeps this slot until its TTL expires. The seal itself is unaffected.",
+        });
+      });
     // M8B F14 (fix 1): same re-arm point as destroySessionNode — the retired node freed its port.
     this.#rearmAfterTeardown(agentName);
   }

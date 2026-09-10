@@ -54,6 +54,12 @@ export interface SessionRelayContext {
 
   readonly records: SessionRecords;
   readonly queries: SessionQueries;
+  /**
+   * 055-ONDEMAND: ask a relay for a circuit a live SESSION still needs, on that session's OWN node.
+   * The node is a parameter because the session's node is not the agent's standing receiver — the
+   * receiver was promoted into the session and replaced.
+   */
+  retakeReservationOn(agentName: string, node: CelloNode, circuitAddr: string, correlationId: string): Promise<boolean>;
   readonly park: ParkRecovery;
   readonly refusals: InboundRefusals;
   readonly leafRecords: SessionLeafRecords;
@@ -896,15 +902,20 @@ export class SessionRelay {
       this.#ctx.srReservationRetry.delete(agentName);
       this.#ctx.srLastRejectionReason.delete(agentName);
     }
-    if (endpoints.length === 0 || this.#ctx.shuttingDown) return;
-    const sr = this.#ctx.standingReceivers.get(agentName);
-    if (!sr) return; // not ensured yet — the coming ensure reads the map
-    if (sr.node.listenAddresses().some((a) => a.includes("/p2p-circuit"))) return; // already reserved
-    this.#ctx.logger.info("session.standing_receiver.reservation.rebuild", {
-      agentName,
-      relayPeerIds: endpoints.map((e) => e.relayPeerId),
-    });
-    void this.#ctx.receivers.rebuildStandingReceiver(agentName);
+    /**
+     * ⚠️ **ENDPOINTS ARRIVING NO LONGER REBUILD THE RECEIVER — 055-ONDEMAND.**
+     *
+     * This used to rebuild so the new node could reserve with the relays that had just been
+     * announced, because reservations were fixed at node creation and acquired at login. Neither is
+     * true now: nothing is reserved at login, and a running node can take one on demand.
+     *
+     * So a rebuild here would buy nothing and cost something real. The receiver it replaces may be
+     * holding the circuit a LIVE SESSION's counterparty was told to dial — throwing that away in
+     * response to a routine directory announcement would drop the route silently, at both ends.
+     *
+     * The endpoints are still recorded above, which is all they were ever needed for: they are the
+     * candidate list an offer reserves against.
+     */
   }
 
   /**
@@ -1038,6 +1049,55 @@ export class SessionRelay {
    * ("a circuit listener is fixed at node creation") stopped being true when `listenOnCircuit`
    * landed. A fresh receiver re-runs the whole walk, proof included, which is why it stays.
    */
+  /**
+   * 055-ONDEMAND — is a re-attempt due, and claim it if so.
+   *
+   * ⚠️ **THE SAME LADDER AS `#retryReservationIfDue`, DELIBERATELY, but it does not call it.** That
+   * one REBUILDS the receiver, which under on-demand reserves nothing — running both would spend a
+   * node build per attempt to no effect. This reads and advances the same `srReservationRetry`
+   * state, so the two paths share ONE budget: a reservation is scarce, the relay holds it for its
+   * full TTL even after the client disconnects, and this file's own warning is that churning
+   * attempts across a fleet is how a relay is exhausted.
+   */
+  #retryDue(agentName: string): boolean {
+    const now = Date.now();
+    const state = this.#ctx.srReservationRetry.get(agentName)
+      ?? { attempts: 0, nextAt: now + this.#ctx.srReservationRetryMs, correlationId: randomUUID() };
+    const lastReason = this.#ctx.srLastRejectionReason.get(agentName);
+    if (lastReason !== undefined) state.lastReason = lastReason;
+    if (!this.#ctx.srReservationRetry.has(agentName)) {
+      // First sighting — schedule, do not fire. Something just tried.
+      this.#ctx.srReservationRetry.set(agentName, state);
+      return false;
+    }
+    if (now < state.nextAt) return false;
+    if (state.attempts >= SR_RESERVATION_MAX_RETRIES) {
+      if (state.attempts === SR_RESERVATION_MAX_RETRIES) {
+        state.attempts += 1; // report once
+        this.#ctx.srReservationRetry.set(agentName, state);
+        this.#ctx.logger.error("session.standing_receiver.reservation.gave_up", {
+          agentName,
+          attempts: SR_RESERVATION_MAX_RETRIES,
+          correlationId: state.correlationId,
+          ...(state.lastReason !== undefined ? { lastRejectionReason: state.lastReason } : {}),
+          impact: "a live session lost the circuit its counterparty dials, and no relay would give " +
+            "it back inside the retry budget. Messages still reach this agent through the relay's " +
+            "store-and-forward; a direct dial to it will not connect until the session is rebuilt.",
+        });
+      }
+      return false;
+    }
+    state.attempts += 1;
+    // Doubling, floored at the configured interval — the same shape the rebuild ladder uses, and
+    // for the same reason: a fixed short interval is what exhausts a relay.
+    state.nextAt = now + this.#ctx.srReservationRetryMs * Math.pow(2, state.attempts - 1);
+    this.#ctx.srReservationRetry.set(agentName, state);
+    this.#ctx.logger.info("session.standing_receiver.reservation.retry", {
+      agentName, attempts: state.attempts, correlationId: state.correlationId,
+    });
+    return true;
+  }
+
   #retryReservationIfDue(agentName: string): void {
     const now = Date.now();
     const state = this.#ctx.srReservationRetry.get(agentName)
@@ -1110,7 +1170,7 @@ export class SessionRelay {
     void this.#ctx.receivers.rebuildStandingReceiver(agentName);
   }
 
-  #reservationWatchdogTick(): void {
+  async #reservationWatchdogTick(): Promise<void> {
     if (this.#ctx.shuttingDown) return;
     for (const [agentName, sr] of this.#ctx.standingReceivers) {
       if (!this.#ctx.agentsWantingReceiver.has(agentName)) continue;        // agent went offline
@@ -1130,6 +1190,60 @@ export class SessionRelay {
       // full TTL even after the client disconnects, and churning attempts across a fleet is how a
       // relay is exhausted (`#startReceiverNode` records that hazard).
       if (sr.relayPeerIds.length === 0) {
+        /**
+         * ⚠️ **AN IDLE AGENT HOLDING NOTHING IS THE DESIGN NOW, NOT A DEGRADATION — 055-ONDEMAND.**
+         *
+         * Everything above this line was written when a receiver reserved at login and holding zero
+         * meant an agent dialable by nobody for its whole life. A reservation is taken at OFFER time
+         * now and given back at the seal, so zero is the correct steady state for an agent nobody is
+         * calling — and retrying here would have every idle agent in the fleet asking relays for
+         * slots the design says it must not hold. That is the exact churn the note below warns
+         * about, pointed at the whole fleet instead of one receiver.
+         *
+         * The retry still matters for an agent that HAS a live session and lost the circuit that
+         * session depends on, which is what the condition now says.
+         */
+        const liveSessions = [...this.#ctx.activeNodes.values()].filter((e) => e.agentName === agentName);
+        if (liveSessions.length === 0) continue;
+        /**
+         * ⚠️ **RE-TAKE THE SESSION'S CIRCUIT — REBUILDING THE RECEIVER NO LONGER DOES IT.**
+         *
+         * `#retryReservationIfDue` rebuilds the receiver, and a rebuilt receiver reserves NOTHING
+         * (055-ONDEMAND). So on its own the retry ladder became a no-op by construction: a relay
+         * that flapped mid-session would leave that session permanently un-dialable while the
+         * ladder churned receivers to no effect.
+         *
+         * The circuit a live session needs is the one its ASSIGNMENT named, which is persisted with
+         * the session — so ask for that one back, rather than rebuilding and hoping.
+         */
+        /**
+         * ⚠️ **ON THE SAME BUDGET AND BACKOFF AS THE LADDER IT REPLACES.** A reservation is scarce:
+         * the relay holds it for its full TTL even after the client disconnects, and this file's own
+         * warning is that churning attempts across a fleet is how a relay is exhausted. Asking on
+         * every 30-second tick would be exactly that churn, wearing a new name — measured here as 52
+         * asks where the budget allows 37.
+         */
+        if (!this.#retryDue(agentName)) continue;
+        /**
+         * ⚠️ **ON THE SESSION'S OWN NODE, NOT THE IDLE RECEIVER — and the first version got this
+         * wrong in a way that was worse than doing nothing.**
+         *
+         * It called the take path, which reserves on `standingReceivers.get(agentName).node`. That
+         * is the fresh receiver built after the promotion — a DIFFERENT peer id from the one the
+         * counterparty was told to dial. So the circuit it obtained helped no one, and it made an
+         * IDLE receiver hold a relay slot, which is the exact thing this unit exists to stop. It
+         * also set `relayPeerIds` non-empty, hiding the real loss from every later tick.
+         */
+        let retook = false;
+        for (const entry of liveSessions) {
+          const ep = this.#ctx.queries.getPersistedRelayEndpoint(agentName, entry.sessionId);
+          if (!ep || ep.relayAddrs.length === 0) continue;
+          const base = ep.relayAddrs[0]!;
+          const circuitAddr = base.includes(`/p2p/${ep.relayPeerId}`) ? `${base}/p2p-circuit` : `${base}/p2p/${ep.relayPeerId}/p2p-circuit`;
+          if (entry.node.listenAddresses().some((a) => a.split("/").includes("p2p-circuit"))) continue; // still holds one
+          if (await this.#ctx.retakeReservationOn(agentName, entry.node, circuitAddr, entry.correlationId)) retook = true;
+        }
+        if (retook) continue;
         // …unless one has arrived since. Review F4, same class as the recompute below: the
         // slow-start path installs a receiver before every circuit has bound, so "held nothing at
         // install" is not the same fact as "holds nothing now". Adopting it here is what stops the
@@ -1217,7 +1331,15 @@ export class SessionRelay {
         // client for this (agent, relay) pair kept the error that ended its reader; that is the
         // nearest thing to an upstream cause available here, and its absence is how 2,061 of these
         // went untraced.
-        const upstreamReason = this.#ctx.relayClients.get(`${agentName}::${relayPeerId}`)?.getLastReaderError();
+        /**
+         * ⚠️ **A DIAGNOSTIC MUST NOT BE ABLE TO KILL THE WATCHDOG TICK.** This is optional-chained on
+         * the map lookup but the METHOD was called unguarded, so a client without it threw — an
+         * unhandled rejection inside the tick, which takes the rest of the sweep with it. Surfaced
+         * when 055-ONDEMAND made this branch reachable in more cases. The cause line is worth
+         * having; it is not worth the loss detection it rides on.
+         */
+        const client = this.#ctx.relayClients.get(`${agentName}::${relayPeerId}`);
+        const upstreamReason = typeof client?.getLastReaderError === "function" ? client.getLastReaderError() : null;
         this.#ctx.logger.warn("session.standing_receiver.reservation.lost", {
           agentName,
           relayPeerId,
@@ -1333,7 +1455,7 @@ export class SessionRelay {
     this.#ctx.park.armBackstopClock(Date.now());
     this.#ctx.reservationWatchdog = setInterval(() => {
       try {
-        this.#reservationWatchdogTick();
+        void this.#reservationWatchdogTick();
         this.#ctx.park.parkedDrainBackstopTick(Date.now());
       } catch (err: unknown) {
         this.#ctx.logger.warn("session.standing_receiver.watchdog.failed", { error: extractErrorMessage(err) });
@@ -1392,6 +1514,59 @@ export class SessionRelay {
    * `tryAnotherRelay: false` precisely so the client STOPS walking the fleet; without the verdict,
    * the loop walked it anyway, turning one client-side fault into what reads as a fleet outage.
    */
+  /**
+   * 055-ONDEMAND — **tell the relay this agent has finished with its slot.**
+   *
+   * The only thing that actually frees one: closing a circuit listener sends the relay nothing, and
+   * the relay reclaims on its own only at the reservation TTL (two hours) or under reaper pressure.
+   * Best-effort by design — an undelivered release costs a slot until that TTL, and must never fail
+   * the seal that triggered it.
+   */
+  async tellRelayReleased(agentName: string, relayPeerId: string, node: CelloNode, correlationId: string): Promise<void> {
+    /**
+     * ⚠️ **THE NODE IS THE SOURCE OF TRUTH FOR WHERE THIS RELAY IS — review MEDIUM-6.**
+     *
+     * The first version looked the relay up in `directoryRelayEndpoints`. But the reservation was
+     * taken on the relay the OFFER named, whose addresses came off that frame; if the directory's
+     * last announcement does not contain it — a pool relay dropped from the roster, a stale
+     * announcement — the release warns `no_endpoint` and the slot is held to its TTL. The node
+     * announces the circuit it actually holds, so derive the address from that and fall back to the
+     * directory list only when there is nothing to derive from.
+     */
+    const fromNode = node.listenAddresses()
+      .filter((a) => a.split("/").includes("p2p-circuit") && a.includes(`/p2p/${relayPeerId}/`))
+      .map((a) => a.split("/p2p-circuit")[0]!)
+      .filter((a) => a.length > 0);
+    const ep = this.#ctx.directoryRelayEndpoints.get(agentName)?.find((e) => e.relayPeerId === relayPeerId);
+    const relayAddrs = fromNode.length > 0 ? [...new Set(fromNode)] : (ep ? [...ep.relayAddrs] : []);
+    if (relayAddrs.length === 0) {
+      this.#ctx.logger.warn("session.relay.reservation_release.no_endpoint", {
+        agentName, relayPeerId, correlationId,
+        impact: "no address is known for this relay, so it cannot be told the slot is free and " +
+          "holds it until the reservation TTL expires.",
+      });
+      return;
+    }
+    let client: AgentRelayClient | undefined;
+    try {
+      client = this.#ctx.detachedRelayClientBuilder?.(agentName, relayPeerId, relayAddrs, {
+        receiptStore: this.#ctx.relayReceiptStore ?? undefined,
+        sealLeafStore: this.#ctx.sealLeafStore ?? undefined,
+        onlineToken: () => this.#ctx.getDirectoryOnlineToken(agentName),
+      });
+      if (!client) return;
+      await client.releaseReservation(node);
+    } catch (err: unknown) {
+      this.#ctx.logger.warn("session.relay.reservation_release.failed", {
+        agentName, relayPeerId, correlationId,
+        error: extractErrorMessage(err),
+        impact: "the relay holds this slot until its TTL expires.",
+      });
+    } finally {
+      client?.close();
+    }
+  }
+
   async proveToRelay(
     agentName: string,
     circuitAddr: string,
