@@ -275,16 +275,8 @@ export class SessionContentIngest {
       });
       return { ok: false, reason: "session_orphaned" };
     }
-    // DOD-TERMINAL-WAKE-1 (review F1): `abandoned` belongs here too. It is terminal and, unlike
-    // `interrupted`, can NEVER complete — there is nothing left to append to and no seal to join.
-    // Without it, late content for a force-abandoned session was accepted: a leaf was written, the
-    // `cello_message` doorbell rang, the away-response and Telegram doorbell fired, and
-    // `cello_receive` handed it over as live work. That is the same "agent obeys a directive out of
-    // a conversation that has ended" harm as the sealed case, reached with no restart at all.
-    //
-    // `currentStatus` carries the real status onward: the content-park disposition and the operator
-    // must be able to tell an abandoned session from a sealed one, and `session_committed` alone is
-    // the exit point, not the cause.
+    // The PARK-recovery route's door into the closed check. `session-closed.ts` holds the whole
+    // reasoning — the three statuses, why `abandoned` is one of them, and what the refusal retains.
     const closed = refuseIfSessionClosed(this.#ctx, agentName, sessionId, content, contentHashHex, correlationId);
     if (closed.refused) return { ok: false, reason: "session_committed", retained: closed.retained };
 
@@ -1968,6 +1960,20 @@ export class SessionContentIngest {
        * state, exactly as the park route's refusal does.
        */
       if (refuseIfSessionClosed(this.#ctx, agentName, sessionId, plaintextBody, Buffer.from(contentHash).toString("hex"), correlationId).refused) {
+        /**
+         * ⚠️ ONE SIGNAL IS DELIBERATELY GIVEN UP, AND IT IS NAMED RATHER THAN LOST — review F4. A
+         * frame signed by a key that is NOT the counterparty's used to reach
+         * `session.content.authorship.refuted` here. The FREEZE it triggers is moot on a session
+         * that is already terminal, and verifying a signature purely to log it is work an attacker
+         * can ask for by volume — so what survives is whether a proof was carried at all. The bytes
+         * are retained either way, so the signature is still there to be examined.
+         */
+        this.#ctx.logger.info("session.content.closed.frame_proof", {
+          agentName, sessionId, correlationId,
+          hasStructure1: frame["structure1_cbor"] instanceof Uint8Array,
+          hasSenderSignature: frame["sender_signature"] instanceof Uint8Array,
+          impact: "the message was refused because this conversation is closed, so its authorship proof was NOT verified and no identity verdict was reached about it. The bytes are retained and readable.",
+        });
         return;
       }
       // DOD-MSG-4 (self-ordering content frame): if the frame carries the relay's signed ordering

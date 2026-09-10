@@ -69,6 +69,15 @@ export interface SessionContentPipelineContext {
   readonly salts: SessionSalts;
   readonly queries: SessionQueries;
   readonly notices: RefusalNotices;
+  /**
+   * DOD-M15-CLOSEDSESSION-1 — has THIS side committed its half of the seal?
+   *
+   * A FUNCTION rather than the raw mark map, deliberately: the answer falls back to durable
+   * evidence when the in-memory mark is gone (a restart between the ctrl-leaf submit and the
+   * status write), and a context holding the map would let a second caller re-derive the answer
+   * without that fallback. One definition, on the manager. See `session-closed.ts`.
+   */
+  readonly hasCommittedSealLeaf: (agentName: string, sessionId: string) => boolean;
   readonly ephemerals: SessionEphemerals;
   readonly liveness: SessionLiveness;
   readonly held: HeldContent;

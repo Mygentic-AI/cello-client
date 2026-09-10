@@ -130,6 +130,10 @@ describe("DOD-M15-CLOSEDSESSION-1: a send into a closed session is refused by th
 
     const res = (await conn.send("cello_send", { session_id: SID, content: "one more thing" })) as Record<string, unknown>;
     const guidance = String(res.guidance);
+    // BOTH FIELDS. The shim JSON-stringifies the whole result, so a relay paragraph re-appearing in
+    // `impact` reaches the reader exactly as it did before — asserting on `guidance` alone leaves
+    // the defect a door.
+    const everythingTheReaderSees = `${guidance} ${String(res.impact)}`;
 
     expect(guidance, "the operator's own sentence: this session is closed, it cannot be added to")
       .toMatch(/closed and cannot be added to/i);
@@ -137,7 +141,7 @@ describe("DOD-M15-CLOSEDSESSION-1: a send into a closed session is refused by th
     // THE POINT OF THE UNIT. Every one of these was in the answer that prompted it, and every one
     // of them belongs to a DIFFERENT condition that this session is not in.
     for (const wrongSubject of [/relay/i, /witness/i, /diverg/i, /ordering/i, /receipt/i]) {
-      expect(guidance, `the wrong subject leaked back into the answer: ${String(wrongSubject)}`)
+      expect(everythingTheReaderSees, `the wrong subject leaked back into the answer: ${String(wrongSubject)}`)
         .not.toMatch(wrongSubject);
     }
     // One sentence of fact plus one of remedy. A paragraph is the defect.
@@ -224,6 +228,41 @@ describe("DOD-M15-CLOSEDSESSION-1: the receiving side says the same thing", () =
   it("...and for an ABANDONED one too — the status is what decides, not which one it is", async () => {
     const { reason } = await deliverAfterClose("abandoned");
     expect(reason).toBe("session_committed");
+  }, 60_000);
+
+  it("the refused message is RETAINED, in plaintext — the evidence an operator later wants to produce", async () => {
+    /**
+     * ⚠️ NEW BEHAVIOUR ON THIS PATH, and it was untested. Before this unit a post-seal straggler
+     * arriving on the DIRECT stream kept nothing — `sealed_session_annex` covers the park-drain and
+     * held-drift routes, not this exit. Two wrong implementations pass every other test in this
+     * file: one that refuses without quarantining at all, and one that runs the check a line
+     * EARLIER, before the decrypt, and so retains ciphertext nobody can read. Both are caught here
+     * and only here.
+     */
+    await deliverAfterClose("sealed");
+    const retained = fx!.snm.readQuarantined("alice", SID);
+    expect(retained.length, "something arriving into a signed conversation must be keepable").toBeGreaterThanOrEqual(1);
+    // THE PLAINTEXT, not the sealed bytes — which is what pins the check to its position AFTER the
+    // decrypt. A pre-decrypt refusal stores the ciphertext and this comparison goes red.
+    expect(Buffer.from(retained[0]!.content).equals(Buffer.from(BODY)), "the retained bytes must be the message, not the ciphertext").toBe(true);
+    expect(retained[0]!.reason).toBe("session_committed");
+  }, 60_000);
+
+  it("the refusal is TERMINAL — the same content is never worked on again", async () => {
+    /**
+     * The retention call is also what STOPS THE WORK: `quarantineRefusedContent` runs the terminal
+     * funnel, and `session_committed` is the one reason in it. Without that the relay's next
+     * redelivery re-armed a park fetch that drained, verified, arrived and was refused again —
+     * measured at ~2 per second for 62 hours on one message. The direct path reaches that funnel
+     * for the first time in this unit, so it is asserted here.
+     */
+    await deliverAfterClose("sealed");
+    const agentId = fx!.snm.getDb().prepare("SELECT agent_id FROM sessions WHERE session_id = ?").get(SID) as { agent_id: string };
+    const row = fx!.snm.getDb()
+      .prepare("SELECT reason FROM terminal_content_refusals WHERE agent_id = ? AND session_id = ? AND content_hash = ?")
+      .get(agentId.agent_id, SID, Buffer.from(wireContentHash(BODY)).toString("hex")) as { reason: string } | undefined;
+    expect(row, "a refusal that can never succeed must be marked terminal, or it is retried forever").toBeDefined();
+    expect(row!.reason).toBe("session_committed");
   }, 60_000);
 
   it("the check that WAS firing is still there for a live session — this is a reorder, not a removal", async () => {

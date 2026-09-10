@@ -38,14 +38,27 @@ import type { SessionStatus } from "./types.js";
  * DIFFERENCE between them is carried in the message (`closedSessionImpact` names the status), never
  * in whether the send is refused.
  */
-const CLOSED_STATUSES: ReadonlySet<SessionStatus> = new Set<SessionStatus>([
-  "sealed",
-  "seal_interrupted_pending",
-  "abandoned",
-]);
+/**
+ * ⚠️ EVERY STATUS IS LISTED, and that is the point of the shape rather than a style choice.
+ *
+ * A `Set` of the three closed ones reads the same and behaves differently: a sixth `SessionStatus`
+ * added later would default to "not closed" and this gate would silently stop covering it, with
+ * nothing going red. `satisfies Record<SessionStatus, boolean>` makes the omission a COMPILE error
+ * — the next person adding a status has to decide, in this file, whether a conversation in it can
+ * still be added to.
+ */
+const CLOSED_BY_STATUS = {
+  active: false,
+  // Revivable, not terminal: an `interrupted` session is the one the demand edge rebuilds, and its
+  // local transcript may still be INCOMPLETE (parked content not yet recovered). Nothing is signed.
+  interrupted: false,
+  sealed: true,
+  seal_interrupted_pending: true,
+  abandoned: true,
+} satisfies Record<SessionStatus, boolean>;
 
 export function isClosedStatus(status: SessionStatus): boolean {
-  return CLOSED_STATUSES.has(status);
+  return CLOSED_BY_STATUS[status];
 }
 
 /** The one name a send into a closed conversation is refused by. */
@@ -101,6 +114,10 @@ export const SESSION_SEALING_IMPACT =
  * runs the terminal funnel (`DOD-M15-REFUSALTERMINAL-1`) — without it the relay's next redelivery
  * re-armed a park fetch that drained, verified, arrived and was refused again, measured at ~2 per
  * second for 62 hours on one message.
+ *
+ * **And `markContentResolved` cannot be reused to stop that loop instead.** This content did NOT
+ * land, and saying that it did is a lie a future reader would act on. The quarantine is the only
+ * call that both stops the work and keeps the evidence, which is why it is the one made here.
  */
 export function refuseIfSessionClosed(
   ctx: SessionContentPipelineContext,
@@ -122,14 +139,24 @@ export function refuseIfSessionClosed(
   // NO RECORD IS NOT CLOSED. A missing row is the ORPHAN case, which has its own triage and its
   // own retention a few lines below the caller — answering it here would take that message's
   // evidence away and tell the operator the wrong thing about it.
-  if (!record || !isClosedStatus(record.status)) return { refused: false };
+  //
+  // ⚠️ **BOTH FACTS, NOT JUST THE STATUS — review F1.** The send half consulted the seal commitment
+  // and this half did not, which left the same window open through the other door: in it, the
+  // counterparty's message is ingested, a leaf is appended AFTER our own seal commitment, the
+  // doorbell rings and the away auto-responder appends a second one. That is the identical
+  // leaf-count divergence measured on `9d253bce…`, arriving inbound instead of outbound.
+  if (!record) return { refused: false };
+  const sealCommitted = ctx.hasCommittedSealLeaf(agentName, sessionId);
+  if (!sessionClosedState(record.status, sealCommitted).closed) return { refused: false };
   // `currentStatus` carries the real status onward: the content-park disposition and the operator
   // must be able to tell an abandoned session from a sealed one, and `session_committed` alone is
-  // the exit point, not the cause.
+  // the exit point, not the cause. `trigger` says WHICH fact fired, which is the field that tells
+  // an ordinary post-seal straggler apart from the ceremony-window race.
   ctx.logger.warn("session.content.cross_check.failed", {
     sessionId,
     reason: "session_committed",
     currentStatus: record.status,
+    trigger: isClosedStatus(record.status) ? "status" : "seal_committed",
     correlationId,
   });
   // DOD-M15-REFUSEDEVIDENCE-1 — RETAINED. A post-seal straggler on the DIRECT path kept nothing
@@ -143,10 +170,38 @@ export function refuseIfSessionClosed(
   // so it names the record as frozen rather than asserting which way it ended.
   ctx.notices.noteContentRefusal(agentName, sessionId, "session_committed", {
     kind: REFUSAL_KINDS.REFUSED,
-    impact:
-      `This conversation is closed (it ended as "${record.status}"), so the message could not be delivered and neither can anything else they send to it. A closed conversation is signed and cannot be added to — that is what closing it means. Nothing is wrong on your side.`,
+    // NEVER `it ended as "active"`. On the ceremony-window path the row has not been written yet,
+    // and asserting a status the record does not hold is the kind of small false claim an operator
+    // later builds a wrong conclusion on.
+    impact: isClosedStatus(record.status)
+      ? `This conversation is closed (it ended as "${record.status}"), so the message could not be delivered and neither can anything else they send to it. A closed conversation is signed and cannot be added to — that is what closing it means. Nothing is wrong on your side.`
+      : "This conversation is being closed right now — this side has already committed its half of the seal, and a seal signs the conversation as it stood at that moment. So the message could not be delivered and neither can anything else they send to it. Nothing is wrong on your side.",
     guidance:
       "There is nothing to repair here. If they still have something to say, ask them to start a NEW conversation — a closed one cannot be reopened, and it is worth telling them, because they may not realise it ended. Read what was said before it closed with cello_transcript.",
   });
   return { refused: true, retained: retainedSeq !== null };
+}
+
+/**
+ * ─── THE TWO FACTS, IN ONE PLACE ───────────────────────────────────────────────────────────────
+ *
+ * Pure, so every gate can reach it: the send choke point, the `cello_send` handler that shapes the
+ * operator's sentence, and the inbound refusal. They pass the two facts in; nothing here knows how
+ * they were obtained.
+ *
+ * ⚠️ **THE SECOND FACT IS NOT OPTIONAL, and asking only the first is the defect this unit closes.**
+ * The status row is written by the seal ceremony's TAIL, so between committing our half and that
+ * write there is a window in which the row says `active` and the conversation is already signed.
+ * A gate that reads status alone is correct-looking and open exactly when it matters — which is how
+ * session `9d253bce…` placed a sixth leaf into a five-leaf seal.
+ */
+export function sessionClosedState(
+  status: SessionStatus | null,
+  sealCommitted: boolean,
+): { closed: true; impact: string } | { closed: false } {
+  // A MISSING ROW IS NOT CLOSED. That is the orphan case, which has its own triage, its own
+  // evidence and its own guidance; answering it here would take that message's evidence away.
+  if (status !== null && isClosedStatus(status)) return { closed: true, impact: closedSessionImpact(status) };
+  if (sealCommitted) return { closed: true, impact: SESSION_SEALING_IMPACT };
+  return { closed: false };
 }
