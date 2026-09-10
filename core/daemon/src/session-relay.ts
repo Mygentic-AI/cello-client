@@ -1331,7 +1331,15 @@ export class SessionRelay {
         // client for this (agent, relay) pair kept the error that ended its reader; that is the
         // nearest thing to an upstream cause available here, and its absence is how 2,061 of these
         // went untraced.
-        const upstreamReason = this.#ctx.relayClients.get(`${agentName}::${relayPeerId}`)?.getLastReaderError();
+        /**
+         * ⚠️ **A DIAGNOSTIC MUST NOT BE ABLE TO KILL THE WATCHDOG TICK.** This is optional-chained on
+         * the map lookup but the METHOD was called unguarded, so a client without it threw — an
+         * unhandled rejection inside the tick, which takes the rest of the sweep with it. Surfaced
+         * when 055-ONDEMAND made this branch reachable in more cases. The cause line is worth
+         * having; it is not worth the loss detection it rides on.
+         */
+        const client = this.#ctx.relayClients.get(`${agentName}::${relayPeerId}`);
+        const upstreamReason = typeof client?.getLastReaderError === "function" ? client.getLastReaderError() : null;
         this.#ctx.logger.warn("session.standing_receiver.reservation.lost", {
           agentName,
           relayPeerId,

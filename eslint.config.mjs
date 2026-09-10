@@ -73,7 +73,7 @@ const SENDRAW_SELECTORS = [
  * watchdog's idle condition, and the re-take path that replaced a rebuild ladder which had become a
  * no-op), `session-lifecycle.ts` +24 (the seal-time release), and `session-node-manager.ts` +5
  * (three delegators). **Re-measured after the unit review**, which found the release half could
- * never run in production and rewrote it: `session-relay.ts` +166, `session-lifecycle.ts` +37,
+ * never run in production and rewrote it: `session-relay.ts` +174, `session-lifecycle.ts` +37,
  * `session-node-manager.ts` +16.
  *
  * **Why this is a move and not an erosion.** The alternative tried first was paying for each line
@@ -418,7 +418,7 @@ export default [
   },
   {
     files: ["core/daemon/src/session-relay.ts"],
-    rules: { "max-lines": ["error", { max: 1790, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 1798, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/session-content-send.ts"],
