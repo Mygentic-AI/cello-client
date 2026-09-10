@@ -898,15 +898,20 @@ export class SessionRelay {
       this.#ctx.srReservationRetry.delete(agentName);
       this.#ctx.srLastRejectionReason.delete(agentName);
     }
-    if (endpoints.length === 0 || this.#ctx.shuttingDown) return;
-    const sr = this.#ctx.standingReceivers.get(agentName);
-    if (!sr) return; // not ensured yet — the coming ensure reads the map
-    if (sr.node.listenAddresses().some((a) => a.includes("/p2p-circuit"))) return; // already reserved
-    this.#ctx.logger.info("session.standing_receiver.reservation.rebuild", {
-      agentName,
-      relayPeerIds: endpoints.map((e) => e.relayPeerId),
-    });
-    void this.#ctx.receivers.rebuildStandingReceiver(agentName);
+    /**
+     * ⚠️ **ENDPOINTS ARRIVING NO LONGER REBUILD THE RECEIVER — 055-ONDEMAND.**
+     *
+     * This used to rebuild so the new node could reserve with the relays that had just been
+     * announced, because reservations were fixed at node creation and acquired at login. Neither is
+     * true now: nothing is reserved at login, and a running node can take one on demand.
+     *
+     * So a rebuild here would buy nothing and cost something real. The receiver it replaces may be
+     * holding the circuit a LIVE SESSION's counterparty was told to dial — throwing that away in
+     * response to a routine directory announcement would drop the route silently, at both ends.
+     *
+     * The endpoints are still recorded above, which is all they were ever needed for: they are the
+     * candidate list an offer reserves against.
+     */
   }
 
   /**

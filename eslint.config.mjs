@@ -69,9 +69,10 @@ const SENDRAW_SELECTORS = [
  *
  * ⚠️ **THREE MOVED AGAIN ON 2026-09-10, FOR `055-ONDEMAND`, AND THE SAME BOUND APPLIES.** The
  * reservations story rewrites how a relay slot is acquired and released, which is feature work in
- * exactly the files the ratchets pin: `session-relay.ts` +53 (the release verb's client half and
- * the watchdog's new idle condition), `session-lifecycle.ts` +24 (the seal-time release), and
- * `session-node-manager.ts` +2 (two delegators).
+ * exactly the files the ratchets pin: `session-relay.ts` +137 (the release verb's client half, the
+ * watchdog's idle condition, and the re-take path that replaced a rebuild ladder which had become a
+ * no-op), `session-lifecycle.ts` +24 (the seal-time release), and `session-node-manager.ts` +5
+ * (three delegators).
  *
  * **Why this is a move and not an erosion.** The alternative tried first was paying for each line
  * by compressing comments in the same files — done four times in one night before it was obvious
@@ -269,7 +270,7 @@ export default [
     files: ["core/daemon/src/session-node-manager.ts"],
     // 3,392 → 3,296 (DOD-M15-CLOSEDSESSION-1): thirty-seven trivial delegators collapsed to the
     // one-line form. A ratchet only ever shrinks, so it comes down with the file.
-    rules: { "max-lines": ["error", { max: 3298, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 3301, skipBlankLines: false, skipComments: false }] },
   },
   {
     // 040-DAEMONROOT, lowered every unit; the target is under 1,000 and this pin is what stops the
@@ -415,7 +416,7 @@ export default [
   },
   {
     files: ["core/daemon/src/session-relay.ts"],
-    rules: { "max-lines": ["error", { max: 1677, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 1761, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/session-content-send.ts"],

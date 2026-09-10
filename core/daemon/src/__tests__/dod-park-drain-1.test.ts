@@ -158,17 +158,45 @@ describe("A: the parked-content drain rides the standing receiver's life-cycle",
     }
   }, 40_000);
 
-  it("A3: the auth_ok rebuild (directory relay endpoints arriving late) drains too", async () => {
+  it("★★★ A3: endpoints arriving late neither rebuild the receiver nor strand parked content", async () => {
+    /**
+     * ⚠️ **REWRITTEN, AND WHAT IT ASSERTS IS THE OPPOSITE OF WHAT IT DID — 055-ONDEMAND.**
+     *
+     * It used to require a SECOND drain when directory endpoints arrived, because their arrival
+     * rebuilt the receiver so the new node could reserve with them. That rebuild is gone: nothing is
+     * reserved at login, and rebuilding would throw away a circuit a LIVE session's counterparty was
+     * told to dial.
+     *
+     * **Nothing is stranded by removing it, and that is the fact worth pinning.** The drain exists so
+     * parked content is collected once the agent can collect it — and collecting is a PULL, which is
+     * an outbound dial that consults no reservation (verified in the relay source; story §4). The
+     * agent could already pull before those endpoints arrived. The drain was riding a rebuild that
+     * only ever existed for reservations.
+     *
+     * So: no rebuild, no churn, and the mailbox still drains on the triggers that remain — install
+     * (A1), the watchdog rebuild after a real loss (A2), the signalling reconnect (B), and the
+     * periodic backstop (A4).
+     */
     const relay = await startHopRelay();
     const { manager, drains } = await makeManager();
     try {
       await seedAgents(manager.getDb(), ["alice"]);
-      await manager.ensureStandingReceiverForAgent("alice"); // comes up with no reservation
-      expect(drains.length).toBe(1);
+      await manager.ensureStandingReceiverForAgent("alice");
+      expect(drains.length, "the install drain fires, as it always has").toBe(1);
+      const peerBefore = manager.getStandingReceiverInfo("alice")?.peerId;
 
       manager.setDirectoryRelayEndpoints("alice", [{ relayPeerId: relay.peerId, relayAddrs: [relay.addr] }]);
-      const rebuilt = await waitUntil(() => drains.length >= 2, 15_000);
-      expect(rebuilt).toBe(true);
+      await wait(1_000);
+
+      expect(
+        manager.getStandingReceiverInfo("alice")?.peerId,
+        "no rebuild — a routine directory announcement must not cost a live session its route",
+      ).toBe(peerBefore);
+      expect(
+        drains.length,
+        "and no extra drain, because nothing changed about the agent's ability to pull: a pull is " +
+          "an outbound dial and never needed a reservation",
+      ).toBe(1);
     } finally {
       await manager.gracefulShutdown();
       await relay.node.stop();
