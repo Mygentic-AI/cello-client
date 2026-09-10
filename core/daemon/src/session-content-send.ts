@@ -21,10 +21,10 @@ import { CELLO_CONTENT_PROTOCOL_ID, type CelloNode } from "@cello-protocol/trans
 import type { Stream } from "@libp2p/interface";
 import type { WritableSessionTreeLeafKind } from "./session-tree.js";
 import { CONTENT_ENCRYPTION_GUIDANCE, SESSION_CONTENT_ENCRYPTION_V1 } from "./content-encryption-status.js";
-import { REFUSAL_KINDS, relayAckHashRefusalNotice } from "./refusal-reasons.js";
+import { REFUSAL_KINDS, noteLocalCredentialRefusal, relayAckHashRefusalNotice } from "./refusal-reasons.js";
 import { parkRefusalGuidance } from "./park-envelope.js";
 import { terminalRelayRefusal } from "./session-terminal-refusal.js";
-import { AgentRelayClient, isTerminalRelayRefusal } from "./session-relay-client.js";
+import { AgentRelayClient, classifyRelayAuthRefusal, isTerminalRelayRefusal, RELAY_AUTH_REFUSAL_IS_LOCAL } from "./session-relay-client.js";
 import { REDIAL_COOLDOWN_MS, type ActiveSessionEntry, type SentAuthorship } from "./session-node-types.js";
 import type { SessionContentPipelineContext } from "./session-content-context.js";
 import { extractErrorMessage } from "./error-message.js";
@@ -426,14 +426,13 @@ export class SessionContentSender {
            * itself, at the moment it happens, instead of discovering it at the seal.
            */
           if (witnessed.reason === "ack_hash_mismatch" || witnessed.reason === "ack_hash_unverifiable") {
-            const relayFault = witnessed.reason === "ack_hash_unverifiable";
             /**
              * THE SENTENCES LIVE IN `refusal-reasons.ts` — 033-ACKEMIT review F6. They were inline
              * here, behind a real relay answering a real refusal, so nothing could test them; and
              * the one that was wrong (a remedy naming a relay handover this system does not have)
              * was wrong for as long as that lasted.
              */
-            const { impact, guidance } = relayAckHashRefusalNotice(relayFault, this.#ctx.mailboxRouteAvailable(agentName));
+            const { impact, guidance } = relayAckHashRefusalNotice(witnessed.reason === "ack_hash_unverifiable", this.#ctx.mailboxRouteAvailable(agentName));
             this.#ctx.logger.error("session.relay.ack_hash.refused", {
               agentName, sessionId, correlationId, reason: witnessed.reason,
               ...(witnessed.detail === undefined ? {} : { detail: witnessed.detail }),
@@ -443,11 +442,12 @@ export class SessionContentSender {
               kind: REFUSAL_KINDS.REFUSED, impact, guidance,
             });
           }
+          // DOD-M15-TOKENSTALE-1 — about the AGENT, not this message: see `noteLocalCredentialRefusal`.
+          if (RELAY_AUTH_REFUSAL_IS_LOCAL(witnessed.reason)) noteLocalCredentialRefusal(this.#ctx, agentName, sessionId, correlationId, witnessed.reason, classifyRelayAuthRefusal(witnessed.reason).advice);
           relayRefusal = witnessed.reason;
         }
       } catch (relayErr: unknown) {
-        this.#ctx.logger.warn("session.relay.hash.submit.failed", {
-          sessionId,
+        this.#ctx.logger.warn("session.relay.hash.submit.failed", { sessionId,
           reason: extractErrorMessage(relayErr),
           correlationId,
         });

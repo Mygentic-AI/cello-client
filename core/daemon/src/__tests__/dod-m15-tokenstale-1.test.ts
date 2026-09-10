@@ -31,6 +31,7 @@ import { describe, it, expect } from "vitest";
 import { generateKeypair } from "@cello-protocol/crypto";
 import { AgentRelayClient, classifyRelayAuthRefusal, RELAY_AUTH_REFUSAL_IS_LOCAL } from "../session-relay-client.js";
 import { makeFakeRelay, noopLogger, tick } from "./relay-client-fake.js";
+import { localCredentialRefusalNotice } from "../refusal-reasons.js";
 
 describe("DOD-M15-TOKENSTALE-1: an auth refusal is not a relay outage", () => {
   it("★ an expired token is classified as a LOCAL fault, not a relay one", () => {
@@ -155,4 +156,43 @@ describe("DOD-M15-TOKENSTALE-1: the submit boundary stops substituting", () => {
     expect(res.ok).toBe(false);
     expect(res.reason, "a relay fault must not be re-labelled as our credential").toBe("relay_unavailable");
   }, 20_000);
+});
+
+describe("DOD-M15-TOKENSTALE-1: the operator is told without having to ask", () => {
+  const notice = () =>
+    localCredentialRefusalNotice("online_token_expired", classifyRelayAuthRefusal("online_token_expired").advice);
+
+  it("★★ the impact leads with what is LOST, not with the credential", () => {
+    /**
+     * The reader arrives here having just been told their message was delivered. A sentence about a
+     * token reads as housekeeping and gets skipped; the fact that has to land is that nothing they
+     * say is being recorded as proof.
+     */
+    const { impact } = notice();
+    expect(impact, "the receipt is the thing at stake").toMatch(/receipt/i);
+    expect(impact, "and it must say the messages DO still arrive, or it reads as an outage").toMatch(/still arriv/i);
+    expect(impact.indexOf("witness"), "the loss comes before the mechanism")
+      .toBeLessThan(impact.indexOf("pass from the directory"));
+  });
+
+  it("★★ it says this is OURS and permanent — the two facts the old label denied", () => {
+    const { impact } = notice();
+    expect(impact, "not the relay being unreachable").toMatch(/not the relay being unreachable/i);
+    expect(impact, "and it will not clear on its own").toMatch(/does not clear on its own/i);
+  });
+
+  it("★★ the inbox and cello status cannot give two different remedies", () => {
+    /**
+     * The guidance is the SAME string `classifyRelayAuthRefusal` produces, by construction rather
+     * than by two authors agreeing. One condition with two remedies is how an operator learns to
+     * trust neither.
+     */
+    expect(notice().guidance).toBe(classifyRelayAuthRefusal("online_token_expired").advice);
+  });
+
+  it("★ it scopes the damage to the AGENT, not to one conversation", () => {
+    // A dead credential is not per-session: every conversation this agent holds is unwitnessed. An
+    // operator told only about this session would close it and open another into the same wall.
+    expect(notice().impact).toMatch(/any other one this agent holds|every conversation/i);
+  });
 });
