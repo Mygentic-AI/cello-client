@@ -1616,6 +1616,80 @@ export class AgentRelayClient {
     }
   }
 
+  /**
+   * 054-SRSPLIT — **TELL THE RELAY WE ARE DONE WITH OUR SLOT.**
+   *
+   * Resolves whether the relay confirmed it freed one. `false` covers both "we held none" and "we
+   * could not reach the relay to say so", and the caller must not read it as failure: releasing is
+   * tidy-up, and a release that could not be delivered costs a slot until its TTL rather than
+   * breaking anything the agent is doing.
+   *
+   * ⚠️ **`releaseCircuit` ON THE NODE IS NOT THIS, AND NEITHER IS ENOUGH ALONE.** That one closes
+   * our listener so we stop advertising a route — measured in `@libp2p/circuit-relay-v2`, it runs
+   * `cancelReservations()`, which clears our own timers and map and sends the relay nothing. THIS
+   * is what returns the slot. Do both: stop advertising, then hand it back.
+   *
+   * ⚠️ **THE FRAME CARRIES NO PEER ID, deliberately.** The relay frees the peer this connection
+   * authenticated as. A peer id on the wire would let any registered agent free another's
+   * reservation.
+   */
+  async releaseReservation(node: CelloNode): Promise<boolean> {
+    if (this.#closed) return false;
+    for (const addr of this.#relayAddrs) {
+      try { await node.dial(addr); break; } catch { /* try the next; newStream may still succeed */ }
+    }
+    let stream: Stream;
+    try {
+      stream = await node.newStream(this.#relayPeerId, RELAY_PROTOCOL_ID);
+    } catch (err: unknown) {
+      const raw = (err ?? {}) as { reason?: unknown };
+      this.#logger.warn("session.relay.reservation_release.failed", {
+        relayPeerId: this.#relayPeerId,
+        reason: typeof raw.reason === "string" ? raw.reason : "stream",
+        error: extractErrorMessage(err),
+        impact: "this relay was not told the slot is free, so it holds it until the reservation " +
+          "TTL expires. Nothing the agent is doing is affected; the relay is carrying a slot it " +
+          "could have had back.",
+      });
+      return false;
+    }
+    try {
+      const iter = (lp.decode(stream as unknown as AsyncIterable<Uint8Array>) as AsyncIterable<unknown>)[
+        Symbol.asyncIterator
+      ]() as AsyncIterator<Uint8Array>;
+      if (!(await this.#authenticate(stream, iter, "reservation"))) {
+        this.#logger.warn("session.relay.reservation_release.failed", {
+          relayPeerId: this.#relayPeerId,
+          reason: this.#lastAuthRefusal?.reason ?? "no_relay_verdict",
+          impact: "could not authenticate to say the slot is free, so the relay holds it until its " +
+            "TTL expires.",
+        });
+        return false;
+      }
+      stream.send(lp.encode.single(encodeCbor({ type: "relay_release_reservation" })));
+      const res = await nextWithTimeout(iter, RELAY_AUTH_TIMEOUT_MS);
+      if (res.done || res.value === undefined) return false;
+      const reply = decode(toU8(res.value)) as Record<string, unknown>;
+      const released = reply["type"] === "relay_release_ok" && reply["released"] === true;
+      this.#logger.info("session.relay.reservation_release.result", {
+        relayPeerId: this.#relayPeerId,
+        nodePeerId: node.getPeerId(),
+        released,
+      });
+      return released;
+    } catch (err: unknown) {
+      this.#logger.warn("session.relay.reservation_release.failed", {
+        relayPeerId: this.#relayPeerId,
+        reason: "stream",
+        error: extractErrorMessage(err),
+        impact: "the relay holds the slot until its TTL expires.",
+      });
+      return false;
+    } finally {
+      await stream.close().catch(() => {});
+    }
+  }
+
   /** Ensure an authenticated stream exists, (re)dialing from `node` if needed. */
   async #ensureConnected(node: CelloNode): Promise<boolean> {
     if (this.#closed) return false;
