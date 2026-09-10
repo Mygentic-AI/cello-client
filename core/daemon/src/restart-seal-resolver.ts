@@ -147,6 +147,19 @@ const LOCAL_PRECONDITION_REFUSALS: ReadonlySet<string> = new Set([
   "relay_unavailable",
   "directory_unreachable",
   "transport_unavailable",
+  /**
+   * `DOD-M15-TOKENSTALE-1` review F2 — the textbook member of this set, and it only started arriving
+   * under its own name when that unit split the submit boundary. Before, it was `relay_unavailable`
+   * and was already covered.
+   *
+   * It clears on a relogin, so it is exactly the "local precondition that will pass later" this set
+   * is for. Left out, it consumes the attempt budget and then writes a DURABLE give-up — removing
+   * sessions holding signed commitments from the only queue that would ever enumerate them again,
+   * which is the 28-session outcome the comment above records.
+   */
+  "online_token_expired",
+  "online_token_required",
+  "online_token_pubkey_mismatch",
 ]);
 
 const TERMINAL_SEAL_REFUSALS: ReadonlySet<string> = new Set([

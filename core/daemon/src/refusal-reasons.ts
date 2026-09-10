@@ -338,6 +338,66 @@ export const REFUSAL_GUIDANCE: Record<RefusalReason, string> = {
  * from a mismatch for that reason — sending an operator to ask their counterparty about a problem
  * the witness caused spends their attention on the wrong party.
  */
+/**
+ * ─── THE OPERATOR IS TOLD THEIR OWN PASS HAS EXPIRED — `DOD-M15-TOKENSTALE-1`, item C ──────────
+ *
+ * `cello status` has always known this: it prints `standing_receiver_refusal: online_token_expired`.
+ * Nothing PUSHED it, so it was reachable only by someone who already suspected something — and the
+ * whole defect is that nothing looks wrong. On the box this was found on, every send answered
+ * `ok:true, delivered:true` for two days.
+ *
+ * The sentences live here rather than at the call site for the reason the neighbouring helper gives:
+ * inline, behind a real relay giving a real refusal, nothing could test them, and the one that was
+ * wrong stayed wrong for as long as that lasted.
+ *
+ * ⚠️ IT IS ABOUT THE AGENT, NOT THIS MESSAGE, and that is why it rides the same
+ * `noteContentRefusal` surface as the per-message refusals beside it in `session-content-send.ts`
+ * rather than getting a channel of its own. Its neighbours there say "this message was not
+ * witnessed"; this one says "nothing this agent sends will be, and no conversation it holds can
+ * produce a receipt". The operator already looks at that surface for "something was rejected and
+ * here is why" — and a second channel for one more condition is how a surface stops being the place
+ * people look.
+ *
+ * ⚠️ IMPACT LEADS WITH WHAT IS LOST, NOT WITH THE TOKEN. A reader who has just been told their
+ * message was delivered does not care that a credential expired; they care that nothing they say is
+ * being recorded as proof. Naming the mechanism first would read as housekeeping and be skipped.
+ */
+/**
+ * Emit it — the log line AND the operator notice, together, because they are one event.
+ *
+ * A caller that had to remember both would eventually do one: the neighbouring ack-hash case exists
+ * precisely because a `logger.warn` and a bare assignment were once considered "handled".
+ */
+export function noteLocalCredentialRefusal(
+  ctx: {
+    logger: { error: (event: string, fields: Record<string, unknown>) => void };
+    notices: { noteContentRefusal: (a: string, s: string, r: string, d: { kind: RefusalKind; impact: string; guidance: string }) => void };
+  },
+  agentName: string,
+  sessionId: string,
+  correlationId: string | undefined,
+  reason: string,
+  advice: string,
+): void {
+  const { impact, guidance } = localCredentialRefusalNotice(reason, advice);
+  ctx.logger.error("session.relay.credential.refused", { agentName, sessionId, correlationId, reason, impact, guidance });
+  ctx.notices.noteContentRefusal(agentName, sessionId, reason, { kind: REFUSAL_KINDS.REFUSED, impact, guidance });
+}
+
+export function localCredentialRefusalNotice(reason: string, advice: string): {
+  impact: string;
+  guidance: string;
+} {
+  const impact =
+    "your messages are still arriving, but NONE of them is being witnessed, so this conversation " +
+    "cannot produce a receipt and neither can any other one this agent holds. The relay refused " +
+    `this agent's own pass from the directory (${reason}) — this is a fault on this machine, not ` +
+    "the relay being unreachable, and it does not clear on its own.";
+  // The advice comes from `classifyRelayAuthRefusal`, so the inbox and `cello status` cannot give
+  // two different remedies for one condition.
+  return { impact, guidance: advice };
+}
+
 export function relayAckHashRefusalNotice(relayFault: boolean, mailboxRouteAvailable: boolean): {
   impact: string;
   guidance: string;

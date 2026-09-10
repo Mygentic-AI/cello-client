@@ -131,6 +131,36 @@ const RELAY_SIDE_REFUSALS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * ─── WHOSE FAULT IS IT? — `DOD-M15-TOKENSTALE-1` ───────────────────────────────────────────────
+ *
+ * A SECOND question about the same refusal, and it is deliberately not `tryAnotherRelay` inverted.
+ * That one asks "would another relay help?"; this asks "is the broken thing ours?". They disagree
+ * on the case that matters: a slot cap is not worth failing over AND is entirely the relay's own
+ * answer about its own table — so reusing the failover flag to mean "our fault" would be right for
+ * the wrong reason, and would start telling operators their machine is broken when it is not.
+ *
+ * The consumer is the submit boundary. `#ensureConnected` returns a BOOLEAN, so every refusal below
+ * used to collapse into `relay_unavailable` — "the relay is unreachable", which is transient,
+ * somebody else's, and the documented reason a send degrades to an unwitnessed leaf and still
+ * reports success. An expired token is none of those. Measured live 2026-09-10: an agent reported
+ * `ok:true, delivered:true` on every send for over two days while the relay refused all thirteen
+ * authentications, and no conversation it held could produce a receipt.
+ *
+ * ⚠️ AN UNKNOWN REASON IS NOT LOCAL, and the direction of that default is a real choice. A future
+ * relay-side reason defaulting to "local" would accuse the reader's own machine, and a wrong
+ * accusation about your own setup costs more than a vague one about someone else's.
+ */
+const LOCAL_CREDENTIAL_REFUSALS: ReadonlySet<string> = new Set([
+  "online_token_required",
+  "online_token_expired",
+  "online_token_pubkey_mismatch",
+]);
+
+export function isLocalCredentialRefusal(reason: string): boolean {
+  return LOCAL_CREDENTIAL_REFUSALS.has(reason);
+}
+
+/**
  * Classify a relay's auth refusal: what to tell the operator, and whether another relay would help.
  *
  * Everything not in `RELAY_SIDE_REFUSALS` defaults to "do not try another", and that default is the
@@ -152,8 +182,23 @@ export function classifyRelayAuthRefusal(
         "it persists, the agent is not reaching any directory — check that first, not the relay.";
       break;
     case "online_token_expired":
-      advice = "The online token has expired and is refreshed on the next directory connection. If " +
-        "it keeps expiring, this machine's clock or its directory connection is the thing to look at.";
+      /**
+       * ⚠️ THIS SENTENCE USED TO PROMISE A REFRESH THAT DOES NOT HAPPEN, and the promise is why the
+       * condition survived for days. It read: *"refreshed on the next directory connection"*. True,
+       * and useless — the token is issued only in the directory handshake, it lasts ONE HOUR, and a
+       * healthy agent does not make another connection. Measured on one box: a token at
+       * 2026-09-08 09:06 and the next over two days later.
+       *
+       * It now leads with the CONSEQUENCE, because the operator arrives here having been told every
+       * send succeeded, and names the one action that works today. The automatic refresh is
+       * `DOD-M15-TOKENSTALE-1` unit 2 and needs a directory frame that does not exist yet.
+       */
+      advice = "This agent's pass from the directory has expired, so the relay is refusing to " +
+        "witness anything it sends: messages still arrive, but nothing is being recorded as proof " +
+        "and no conversation can produce a receipt until this clears. It is NOT refreshed while the " +
+        "daemon keeps running — restart it (cello logout, then cello login) and the next session " +
+        "will be witnessed again. If it comes back within the hour, this machine's clock or its " +
+        "directory connection is the thing to look at.";
       break;
     case "online_token_signature_invalid":
     case "online_token_malformed":
@@ -561,6 +606,12 @@ export class AgentRelayClient {
    * whether a different relay would do any better.
    */
   #lastAuthRefusal: RelayAuthRefusal | null = null;
+  /**
+   * review F6 — which credential refusal we have already explained in full, so a condition that
+   * lasts until a relogin is explained once rather than on every send. Reset with the refusal
+   * itself, so the next occurrence after a recovery is a first occurrence again.
+   */
+  #loggedCredentialRefusal: string | null = null;
 
   /** The last classified auth refusal from this relay, or null if the last attempt succeeded. */
   getLastAuthRefusal(): RelayAuthRefusal | null {
@@ -576,6 +627,7 @@ export class AgentRelayClient {
    * keeps the declared type and says what the reset is for.
    */
   #clearAuthRefusal(): void {
+    this.#loggedCredentialRefusal = null;
     this.#lastAuthRefusal = null;
   }
 
@@ -1711,6 +1763,22 @@ export class AgentRelayClient {
   }
 
   async #connect(node: CelloNode): Promise<boolean> {
+    /**
+     * ⚠️ DROP THE PREVIOUS ATTEMPT'S VERDICT FIRST — `DOD-M15-TOKENSTALE-1` review F4, and the same
+     * reasoning `#proveReservationOnce` already carries in capitals twelve lines from here.
+     *
+     * `#lastAuthRefusal` is cleared only on auth SUCCESS. Both failure exits below — the dial and
+     * the stream open — are transport failures that never reach a verdict at all, so without this
+     * they return `false` carrying whatever an earlier attempt left behind.
+     *
+     * That was survivable while the submit boundary answered `relay_unavailable` for every `false`.
+     * It is not now: this unit makes that boundary REPORT the stored refusal, so a stale
+     * `online_token_expired` would relabel a relay that is genuinely down as our own dead
+     * credential — sending the operator to restart their daemon over somebody else's outage, and
+     * stripping the seal fallbacks that exist for exactly that outage. Clearing here is what makes
+     * the promotion mean "this attempt's verdict" instead of "some past verdict".
+     */
+    this.#clearAuthRefusal();
     // Best-effort dial: newStream auto-dials a known peer, but the relay's addrs may not
     // be in the peerstore yet, so dial each addr first. One success is enough.
     let dialed = false;
@@ -2293,7 +2361,58 @@ export class AgentRelayClient {
 
   async #doSubmitOnce(node: CelloNode, sessionId: Uint8Array, contentHash: Uint8Array, leafKind: number, contentBytes: Uint8Array | null, carried?: CarriedLeafClaim): Promise<SubmitResult> {
     if (this.#closed) return { ok: false, reason: "relay_client_closed" };
-    if (!(await this.#ensureConnected(node))) return { ok: false, reason: "relay_unavailable" };
+    if (!(await this.#ensureConnected(node))) {
+      /**
+       * ─── OUR OWN DEAD CREDENTIAL IS NOT A RELAY OUTAGE — `DOD-M15-TOKENSTALE-1` ───────────────
+       *
+       * `#ensureConnected` answers with a BOOLEAN, so every reason a relay ever gave for refusing
+       * us arrived here as `false` and left as `relay_unavailable`. That word is a claim about the
+       * RELAY: unreachable, transient, someone else's, and the documented grounds on which a send
+       * appends an unwitnessed leaf and still reports success.
+       *
+       * An expired online token is the opposite on all four counts, and the cost of the mislabel is
+       * not cosmetic. Measured live 2026-09-10: an agent ran for over two days answering
+       * `ok:true, delivered:true` to every send while the relay refused all thirteen of its
+       * authentications. Nothing it said in that time could ever produce a receipt, and no surface
+       * anywhere said so — because the one place that knew called it a relay problem.
+       *
+       * `#lastAuthRefusal` already held the truth (`cello status` reads it); the submit path simply
+       * never looked. Only LOCAL refusals are promoted: a genuine relay fault keeps
+       * `relay_unavailable`, so this is a split rather than a rename, and the caller's existing
+       * degradation for a real outage is untouched.
+       */
+      const refusal = this.#lastAuthRefusal;
+      if (refusal && isLocalCredentialRefusal(refusal.reason)) {
+        /**
+         * ⚠️ THE PROSE ONCE PER TRANSITION, THE REASON EVERY TIME — review F6.
+         *
+         * This condition lasts until a relogin by construction, and every send retries it. Logging
+         * several hundred bytes of explanation on each one is the shape `96f3179b` measured four
+         * commits earlier: a 176 MB log that was 95% one already-fixed defect repeating itself,
+         * which hid the defect that produced it for eleven hours. The first occurrence carries
+         * everything; the rest are countable without being unreadable.
+         */
+        const firstOfThisRun = this.#loggedCredentialRefusal !== refusal.reason;
+        this.#loggedCredentialRefusal = refusal.reason;
+        if (firstOfThisRun) {
+          this.#logger.error("session.relay.submit.local_credential_refusal", {
+            relayPeerId: this.#relayPeerId,
+            reason: refusal.reason,
+            impact:
+              "the relay refused THIS AGENT'S credential, so nothing it sends can be witnessed and no " +
+              "conversation can produce a receipt. This is a fault on this machine and it does not " +
+              "clear on its own — it is NOT the relay being unreachable.",
+            guidance: refusal.advice,
+          });
+        } else {
+          this.#logger.warn("session.relay.submit.local_credential_refusal.again", {
+            relayPeerId: this.#relayPeerId, reason: refusal.reason,
+          });
+        }
+        return { ok: false, reason: refusal.reason };
+      }
+      return { ok: false, reason: "relay_unavailable" };
+    }
 
     const sessionIdHex = Buffer.from(sessionId).toString("hex");
     // The relay records the session from the CLIENT-presented assignment. It MUST be recorded BEFORE
