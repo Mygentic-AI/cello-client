@@ -173,6 +173,22 @@ describe("DOD-M15-LOGBOUND-1 A: what IS suppressed, and how it reports itself", 
     expect(lines.length).toBeGreaterThan(STORM_BURST);
   });
 
+  it("a milestone carries the MOST RECENT payload, so a field that changed mid-fold is visible", () => {
+    const { sink, lines } = recorder();
+    let clock = 0;
+    const log = createCollapsingLogger(sink, () => clock);
+
+    for (let attempt = 0; attempt < 200; attempt++) {
+      clock += 50;
+      log.error("session.key.announce.failed", { ...STORM, attempt });
+    }
+
+    // This is the documented mitigation for keying on event+session+reason rather than the whole
+    // payload: the varying field is not lost, it is republished at each milestone.
+    const milestone = lines.filter((l) => typeof l.ctx["repeatedCount"] === "number").pop();
+    expect(milestone?.ctx["attempt"]).toBeGreaterThan(100);
+  });
+
   it("an `attempt` counter in the payload does NOT defeat the collapse", () => {
     const { sink, lines } = recorder();
     let clock = 0;
@@ -202,6 +218,40 @@ describe("DOD-M15-LOGBOUND-1 A: what IS suppressed, and how it reports itself", 
     const tripped = lines[lines.length - 1];
     expect(tripped?.ctx["repeatsCollapsing"]).toBe(true);
     expect(tripped?.ctx["repeatRatePerWindow"]).toBeGreaterThan(STORM_BURST);
+  });
+
+  it("the closing line's window is the FLOOD, not the flood plus the silence that ended it", () => {
+    const { sink, lines } = recorder();
+    let clock = 0;
+    const log = createCollapsingLogger(sink, () => clock);
+
+    // 500 lines at 50ms — 20/second, over 25 seconds.
+    for (let i = 0; i < 500; i++) { clock += 50; log.error("e", { sessionId: "s", reason: "r" }); }
+    clock += 6 * 60 * 60 * 1000; // six hours of silence
+    log.error("e", { sessionId: "s", reason: "r" });
+
+    // Fold the idle gap into the elapsed time and 19 lines/second is reported as 1.3 an hour —
+    // a trickle, when it was the storm. This is the one line the redesign added for diagnosis.
+    const closing = lines.find((l) => l.ctx["repeatEnded"] === true);
+    expect(closing?.ctx["repeatWindowMs"] as number).toBeLessThan(30_000);
+  });
+
+  it("suppression does NOT latch — a flood that backs off starts printing again", () => {
+    const { sink, lines } = recorder();
+    let clock = 0;
+    const log = createCollapsingLogger(sink, () => clock);
+
+    // Trip the gate fast.
+    for (let i = 0; i < 30; i++) { clock += 100; log.error("e", { sessionId: "s", reason: "r" }); }
+    const afterBurst = lines.length;
+
+    // Then back off to one every nine seconds — never idle for a full window, so the only exit
+    // from suppression would be silence that never comes. Under a latching gate these 200
+    // occurrences over half an hour produce two or three lines: the chronic-failure silence this
+    // redesign exists to remove, re-entered through a different door.
+    for (let i = 0; i < 200; i++) { clock += 9_000; log.error("e", { sessionId: "s", reason: "r" }); }
+
+    expect(lines.length - afterBurst).toBeGreaterThan(100);
   });
 
   it("every milestone names the count so far AND how long the run has been going (Done When 1)", () => {
@@ -259,15 +309,42 @@ describe("DOD-M15-LOGBOUND-1 A: what IS suppressed, and how it reports itself", 
 });
 
 describe("DOD-M15-LOGBOUND-1 A: the table cannot become the thing it removes", () => {
-  it("the collapse table is BOUNDED", () => {
+  it("the collapse table is BOUNDED — an overrun forgets the oldest run", () => {
     const { sink, lines } = recorder();
-    const log = createCollapsingLogger(sink, () => 0);
+    let clock = 0;
+    const log = createCollapsingLogger(sink, () => clock);
 
-    for (let i = 0; i < LOG_COLLAPSE_MAX_KEYS * 3; i++) {
-      log.error("event.with.many.keys", { sessionId: `s-${i}`, reason: "r" });
+    // Put one key into a fold, then overrun the table with keys that never repeat.
+    for (let i = 0; i <= STORM_BURST * 2; i++) { clock += 50; log.error("victim", { sessionId: "v", reason: "r" }); }
+    for (let i = 0; i < LOG_COLLAPSE_MAX_KEYS * 2; i++) {
+      clock += 1;
+      log.error("filler", { sessionId: `s-${i}`, reason: "r" });
+    }
+    const before = lines.filter((l) => l.event === "victim").length;
+    log.error("victim", { sessionId: "v", reason: "r" });
+
+    // The observable consequence of the bound: the victim's run is gone, so its next occurrence
+    // is a FIRST occurrence again — written in full, not folded. Without eviction it would still
+    // be suppressed and this line would not appear.
+    const after = lines.filter((l) => l.event === "victim");
+    expect(after.length).toBe(before + 1);
+    expect(after[after.length - 1]?.ctx["repeatedCount"]).toBeUndefined();
+  });
+
+  it("a run evicted MID-FOLD reports its total rather than taking it away", () => {
+    const { sink, lines } = recorder();
+    let clock = 0;
+    const log = createCollapsingLogger(sink, () => clock);
+
+    for (let i = 0; i < 500; i++) { clock += 20; log.error("victim", { sessionId: "v", reason: "r" }); }
+    for (let i = 0; i < LOG_COLLAPSE_MAX_KEYS * 2; i++) {
+      clock += 1;
+      log.error("filler", { sessionId: `s-${i}`, reason: "r" });
     }
 
-    expect(lines.length).toBe(LOG_COLLAPSE_MAX_KEYS * 3);
+    const closing = lines.find((l) => l.event === "victim" && l.ctx["repeatEnded"] === true);
+    expect(closing).toBeDefined();
+    expect(closing?.ctx["repeatedCount"]).toBeGreaterThan(400);
   });
 
   it("eviction is LRU, so a FLOODING key survives a stream of single-use keys", () => {
@@ -295,16 +372,20 @@ describe("DOD-M15-LOGBOUND-1 A: the table cannot become the thing it removes", (
     expect(counts).toEqual([...counts].sort((a, b) => a - b));
   });
 
-  it("evicting a key re-reports the next occurrence as a first, never silently drops it", () => {
+  it("a fold that simply STOPS is closed out without needing its own next occurrence", () => {
     const { sink, lines } = recorder();
-    const log = createCollapsingLogger(sink, () => 0);
+    let clock = 0;
+    const log = createCollapsingLogger(sink, () => clock);
 
-    log.error("storm", { ...STORM });
-    for (let i = 0; i < LOG_COLLAPSE_MAX_KEYS; i++) log.error("filler", { sessionId: `f-${i}`, reason: "r" });
-    const before = lines.length;
-    log.error("storm", { ...STORM });
+    for (let i = 0; i < 500; i++) { clock += 20; log.error("dead.storm", { sessionId: "d", reason: "r" }); }
+    // The cause is fixed and that key never fires again. Some OTHER key keeps logging.
+    clock += STORM_WINDOW_MS * 2;
+    for (let i = 0; i < 3; i++) { clock += 100; log.info("something.else", { sessionId: `o-${i}`, reason: "r" }); }
 
-    // Over-reporting on eviction is the safe direction; silence is not.
-    expect(lines.length).toBe(before + 1);
+    // Without the amortised sweep the last word on the measured 413,590-line storm would have been
+    // repeatedCount: 100000 — understating it fourfold, with nothing saying it had ended.
+    const closing = lines.find((l) => l.event === "dead.storm" && l.ctx["repeatEnded"] === true);
+    expect(closing).toBeDefined();
+    expect(closing?.ctx["repeatedCount"]).toBeGreaterThan(400);
   });
 });

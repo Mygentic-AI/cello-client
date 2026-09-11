@@ -65,6 +65,9 @@ export const LOG_COLLAPSE_MAX_KEYS = 2048;
 const SEP = String.fromCharCode(31);
 
 interface Run {
+  /** Carried so a run can be closed out by something other than its own next occurrence. */
+  level: "debug" | "info" | "warn" | "error";
+  event: string;
   /** Start of the current rate window. */
   windowStartMs: number;
   /** The previous occurrence, so a gap longer than a window can END a flood. */
@@ -77,7 +80,13 @@ interface Run {
   suppressStartMs: number;
   /** Occurrences folded since suppression began. */
   suppressedCount: number;
-  /** The most recent payload, so a milestone and the closing summary carry current context. */
+  /**
+   * The most recent payload, so a milestone and the closing summary carry current context.
+   *
+   * Written ONLY while suppressing. Holding a reference to every caller's context object for the
+   * life of the process would pin up to 2,048 payloads, some carrying error objects with stacks,
+   * to keep a field that only a closing line ever reads.
+   */
   lastCtx: Record<string, unknown>;
 }
 
@@ -133,6 +142,44 @@ function isMilestone(count: number): boolean {
 export function createCollapsingLogger(sink: Logger, now: () => number = Date.now): Logger {
   const runs = new Map<string, Run>();
 
+  /**
+   * Report a fold that has ended: how many lines it swallowed, and over how long.
+   *
+   * ⚠️ **THE WINDOW IS MEASURED TO THE LAST OCCURRENCE, NOT TO NOW**, and getting that wrong made
+   * this line state the opposite of what happened. A flood of 479 lines over 25 seconds — 19 a
+   * second — was reported as `repeatWindowMs: 21623950`, six hours, because the idle gap that
+   * proved the flood was over had already been folded into the elapsed time. An operator dividing
+   * those two numbers reads 1.3 an hour: a trickle, when it was the storm.
+   */
+  function closeRun(run: Run): void {
+    sink[run.level](run.event, {
+      ...run.lastCtx,
+      repeatedCount: run.suppressedCount,
+      repeatWindowMs: Math.max(0, run.lastAtMs - run.suppressStartMs),
+      repeatEnded: true,
+    });
+    run.suppressing = false;
+    run.suppressedCount = 0;
+  }
+
+  /**
+   * One amortised look at the oldest run per line written.
+   *
+   * Without it a fold that simply STOPS is never reported: the closing line is emitted by the
+   * key's own next occurrence, and a storm whose cause is fixed — or whose daemon is shut down —
+   * has no next occurrence. The measured 413,590-line storm would have ended on
+   * `repeatedCount: 100000`, understating itself fourfold, with nothing saying it had finished.
+   */
+  function sweepOldest(at: number, currentKey: string): void {
+    const oldest = runs.entries().next();
+    if (oldest.done) return;
+    const [key, run] = oldest.value;
+    if (key === currentKey) return;
+    if (at - run.lastAtMs < STORM_WINDOW_MS) return;
+    if (run.suppressing) closeRun(run);
+    runs.delete(key);
+  }
+
   function emit(level: "debug" | "info" | "warn" | "error", event: string, ctx: Record<string, unknown>): void {
     const key = collapseKey(level, event, ctx);
     if (key === null) {
@@ -140,16 +187,23 @@ export function createCollapsingLogger(sink: Logger, now: () => number = Date.no
       return;
     }
 
+    const at = now();
+    sweepOldest(at, key);
+
     const existing = runs.get(key);
     if (existing === undefined) {
       if (runs.size >= LOG_COLLAPSE_MAX_KEYS) {
-        const oldest = runs.keys().next();
-        if (!oldest.done) runs.delete(oldest.value);
+        const oldest = runs.entries().next();
+        if (!oldest.done) {
+          // Evicting a run mid-fold would take its total with it and restart the next occurrence
+          // from one. Over-reporting is the safe direction; losing the count is not.
+          if (oldest.value[1].suppressing) closeRun(oldest.value[1]);
+          runs.delete(oldest.value[0]);
+        }
       }
-      const startedAt = now();
       runs.set(key, {
-        windowStartMs: startedAt, lastAtMs: startedAt, windowCount: 1, suppressing: false,
-        suppressStartMs: 0, suppressedCount: 0, lastCtx: ctx,
+        level, event, windowStartMs: at, lastAtMs: at, windowCount: 1,
+        suppressing: false, suppressStartMs: 0, suppressedCount: 0, lastCtx: ctx,
       });
       sink[level](event, ctx);
       return;
@@ -158,46 +212,46 @@ export function createCollapsingLogger(sink: Logger, now: () => number = Date.no
     // Least-recently-USED: re-inserting moves this key to the young end of the eviction order.
     runs.delete(key);
     runs.set(key, existing);
-    existing.lastCtx = ctx;
 
-    const at = now();
     /**
-     * A gap longer than a window means the flood has STOPPED — and that has to be measured from
-     * the previous occurrence, not from the window's own tally. Reading the tally instead was the
-     * first version of this and it never ended a storm: during one, the count carried over from
-     * the last window is high by definition, so the "has it died down" test could never be true.
+     * A gap longer than a window means the flood has stopped — measured from the PREVIOUS
+     * occurrence, never from the window's own tally. Reading the tally was the first version of
+     * this and it could never end a storm: during one, the count carried over from the last
+     * window is high by definition, so the "has it died down" test was never true.
      */
     const idle = at - existing.lastAtMs >= STORM_WINDOW_MS;
-    existing.lastAtMs = at;
 
     if (idle) {
-      if (existing.suppressing) {
-        // The trailing count, which a purely count-based gate can never produce: an operator who
-        // sees the fold start is also told how big it got and how long it lasted.
-        sink[level](event, {
-          ...existing.lastCtx,
-          repeatedCount: existing.suppressedCount,
-          repeatWindowMs: at - existing.suppressStartMs,
-          repeatEnded: true,
-        });
-        existing.suppressing = false;
-        existing.suppressedCount = 0;
-      }
+      if (existing.suppressing) closeRun(existing);
       existing.windowStartMs = at;
       existing.windowCount = 0;
     } else if (at - existing.windowStartMs >= STORM_WINDOW_MS) {
+      /**
+       * ⚠️ A FULL WINDOW PASSED WITH TRAFFIC — so re-test the RATE, do not just roll the window.
+       * Without this, `suppressing` latches: the only exit is a ten-second silence, so a retry
+       * that starts fast and backs off to anything under one line per ten seconds stays folded
+       * forever. Measured on the built module: 30 lines in 3 seconds trips the gate, and the next
+       * 1,200 occurrences spread over three hours produce three lines. That is the chronic-failure
+       * silence this redesign was written to remove, re-entered through a different door.
+       */
+      if (existing.suppressing && existing.windowCount <= STORM_BURST) closeRun(existing);
       existing.windowStartMs = at;
       existing.windowCount = 0;
     }
+
+    existing.lastAtMs = at;
     existing.windowCount += 1;
 
     if (existing.suppressing) {
+      existing.lastCtx = ctx;
       existing.suppressedCount += 1;
-      if (!isMilestone(existing.suppressedCount)) return;
+      // The 1st suppressed occurrence is not a milestone worth printing — the line that tripped
+      // the gate, immediately above it, already said the fold had started.
+      if (existing.suppressedCount === 1 || !isMilestone(existing.suppressedCount)) return;
       sink[level](event, {
         ...ctx,
         repeatedCount: existing.suppressedCount,
-        repeatWindowMs: at - existing.suppressStartMs,
+        repeatWindowMs: Math.max(0, at - existing.suppressStartMs),
       });
       return;
     }
@@ -208,6 +262,7 @@ export function createCollapsingLogger(sink: Logger, now: () => number = Date.no
       existing.suppressing = true;
       existing.suppressStartMs = at;
       existing.suppressedCount = 0;
+      existing.lastCtx = ctx;
       sink[level](event, { ...ctx, repeatsCollapsing: true, repeatRatePerWindow: existing.windowCount });
       return;
     }
