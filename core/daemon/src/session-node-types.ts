@@ -449,6 +449,14 @@ export type ParkedDrainReason =
    * nothing was installed, so `standing_receiver_ready` was the wrong word for it.
    */
   | "reservation_lost"
+  /**
+   * ⚠️ **THE OTHER HALF OF `reservation_lost`, and without it that trigger aims at a dead relay —
+   * 056-SLOTDEAD, review F4.** The loss fires while the link is DOWN, so the pull it starts cannot
+   * succeed. This fires when a circuit comes back, which is the first moment a pull can work. The
+   * pair is the point: one notices the outage, the other notices the recovery, and the slow
+   * periodic backstop stops being the only thing that closes the gap between them.
+   */
+  | "reservation_regained"
   | "periodic_backstop"
   /**
    * DOD-M12B-SESSION-SEED-1 (case B): a session that was interrupted has just been revived, so the

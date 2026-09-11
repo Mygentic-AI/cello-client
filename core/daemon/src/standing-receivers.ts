@@ -316,6 +316,25 @@ export class StandingReceivers {
     const relayPeerId = relayPeerIdOf(circuitAddr);
     const outcome = await this.#takeReservation(agentName, node, circuitAddr, correlationId);
     if (outcome !== "granted") return false;
+    /**
+     * ⚠️ **THE OTHER HALF OF `reservation_lost` — 056-SLOTDEAD, review F4.**
+     *
+     * The loss trigger fires the moment a reservation goes, which is exactly when the relay link is
+     * down, so the pull it starts is aimed at a relay that cannot answer. Without something on the
+     * recovery, content the counterparty parked during the outage waits for the slow periodic
+     * backstop while the relay is healthy and this agent is connected to it again.
+     *
+     * **This path, and not the two that look like it.** The watchdog's `gained` branch was the
+     * first attempt and never fired — a take records the new circuit on the receiver itself, so by
+     * the next tick there is nothing left for the watchdog to see as gained; a test caught it, which
+     * is the only reason it is not still in the tree looking correct. `takeReservationForSession`
+     * was the second, and it double-drains: on a first login it fires moments after the install
+     * drain, for the same empty mailbox.
+     *
+     * A re-take is unambiguous. It happens only when a session that HAD a circuit lost it, which is
+     * exactly the outage whose recovery this is.
+     */
+    this.#ctx.park.fireParkedDrain(agentName, "reservation_regained");
     if (relayPeerId) {
       void this.#ctx.authenticateStandingReceiver(agentName, node, relayPeerId, circuitAddr, correlationId)
         .catch((err: unknown) => {

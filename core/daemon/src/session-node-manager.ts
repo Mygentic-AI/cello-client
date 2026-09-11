@@ -420,6 +420,11 @@ export class SessionNodeManager {
   getStandingReceiverAllowedPeer(agentName: string): string | null { return this.#receivers.getStandingReceiverAllowedPeer(agentName); }
   admitOfferedDialer(a: string, p: string, sid: string): "narrowed" | "no_receiver" | "no_peer_named" { return this.#receivers.admitOfferedDialer(a, p, sid); }
   takeReservationForSession(a: string, c: string, cid: string, offerSid?: string): Promise<boolean> { return this.#receivers.takeReservationForSession(a, c, cid, offerSid); } // 055-ONDEMAND
+
+  // 056-SLOTDEAD — the RE-TAKE, for a live session whose circuit died. On the manager alongside its
+  // sibling so the outage-and-recovery path can be driven end to end: a suite that could only drive
+  // the offer path was measuring the wrong half of the pair.
+  retakeReservationOn(a: string, node: CelloNode, c: string, cid: string): Promise<boolean> { return this.#receivers.retakeReservationOn(a, node, c, cid); }
   getStandingReceiverRelayIds(a: string): string[] { return [...(this.#standingReceivers.get(a)?.relayPeerIds ?? [])]; } // 055-ONDEMAND
   /** 055-ONDEMAND — a live session's own node. Its circuit is not the receiver's; see the release path. */
   getSessionNodeForTest(a: string, sid: string): CelloNode | null { return this.#activeNodes.get(this.#k(a, sid))?.node ?? null; }

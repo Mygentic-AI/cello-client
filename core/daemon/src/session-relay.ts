@@ -1293,13 +1293,24 @@ export class SessionRelay {
           reason: open.includes(relayPeerId) ? "circuit_address_vanished" : "relay_connection_gone",
           ...(upstreamReason ? { upstreamReason } : {}),
           reservationsHeld: stillHeld.length,
-          // The line an operator reads, and the two cases are not the same event at all.
+          /**
+           * The line an operator reads, and the two cases are not the same event at all.
+           *
+           * ⚠️ **THE ZERO CASE PROMISED A REPAIR THAT NO LONGER HAPPENS — 056-SLOTDEAD, review F3.**
+           * It ended "The receiver is being rebuilt against the rest of the pool", which was true
+           * when this branch rebuilt. Nothing rebuilds now. An operator reading the old line would
+           * wait for a recovery that was never coming, and the only thing that WOULD have told them
+           * otherwise is a `zero_held` line at debug level they are not reading. Both branches now
+           * say what actually happens next and who owns it.
+           */
           impact: stillHeld.length > 0
             ? "this agent still holds " + stillHeld.length + " other circuit reservation(s), so it "
-              + "stays dialable from behind NAT and the receiver is NOT rebuilt. Losing one relay "
-              + "costs this agent nothing it can feel."
-            : "this agent now holds NO circuit reservation, so nobody behind a home router can "
-              + "reach it. The receiver is being rebuilt against the rest of the pool.",
+              + "stays dialable from behind NAT. Losing one relay costs this agent nothing it can feel."
+            : "this agent now holds NO circuit reservation. If it has no live session that is the "
+              + "normal idle state and costs nothing — a slot is taken when someone calls. If it "
+              + "DOES have a live session, that session's counterparty can no longer dial it, and "
+              + "the re-take above is what gets it back, on a bounded budget. Nothing rebuilds the "
+              + "receiver any more, so do not wait for one.",
         });
       }
       /**
