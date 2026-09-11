@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, closeSync, statSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, closeSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { rotateLogIfOversized, openLogHandle, LOG_ROTATE_CAP_BYTES } from "../log-rotate.js";
@@ -22,8 +22,9 @@ let dir: string;
 let logPath: string;
 let rotatedPath: string;
 
+/** A real log ends in a newline, so the notice lands on its own line rather than appended to one. */
 function oversized(extra = 1): string {
-  return "x".repeat(CAP + extra);
+  return "x".repeat(CAP + extra - 1) + "\n";
 }
 
 beforeEach(() => {
@@ -66,17 +67,18 @@ describe("DOD-M15-LOGBOUND-1 B: rotate at spawn", () => {
     expect(existsSync(join(dir, "daemon.log.2"))).toBe(false);
   });
 
-  it("will NOT let a smaller file replace a larger kept generation", () => {
-    // The damaging race: two spawners both probe the lock as free, A rotates and opens a fresh
-    // file, and B — which stat'd the old oversized file — renames A's near-empty file over the
-    // 64 MB that was just retained. The tail rotation exists to keep would be gone.
+  it("the cap does NOT ratchet upward when the kept generation is larger", () => {
+    // A guard refusing to let a smaller file replace a larger `.1` was written and removed. It
+    // made the KEPT file the effective cap: rotate a 180 MB log once and the live file then has
+    // to pass 180 MB — then more — before it will ever rotate again. The 128 MB ceiling this unit
+    // ships would not have existed on the first machine it ran on, and nothing would have said so.
     writeFileSync(rotatedPath, "y".repeat(CAP * 4));
     writeFileSync(logPath, oversized());
 
     const outcome = rotateLogIfOversized(logPath, CAP);
 
-    expect(outcome).toEqual({ rotated: false, reason: "raced" });
-    expect(statSync(rotatedPath).size).toBe(CAP * 4);
+    expect(outcome.rotated).toBe(true);
+    expect(statSync(rotatedPath).size).toBe(CAP + 1);
   });
 
   it("a missing log is not an error — the first ever spawn has nothing to rotate", () => {
@@ -133,15 +135,34 @@ describe("DOD-M15-LOGBOUND-1 B: a rotation says so, in the file an operator will
 
   it("a FAILED rotation says the bound does not exist on this machine", () => {
     writeFileSync(logPath, oversized());
-    // A directory in the way of the rename is the shape of a read-only or wrong-owner ~/.cello.
-    rmSync(rotatedPath, { force: true });
-    writeFileSync(join(dir, "blocker"), "");
-    const blocked = join(dir, "blocker", "daemon.log");
-    writeFileSync(logPath, oversized());
+    // Make the RENAME fail, which is the realistic shape — a read-only or wrong-owner ~/.cello.
+    // A NON-EMPTY DIRECTORY at the target cannot be replaced by a rename (ENOTEMPTY), where an
+    // earlier version of this test put a regular file in the PATH and got ENOTDIR out of the
+    // stat instead: it passed on the "absent" branch and never reached the failure branch at all,
+    // leaving the whole `daemon.log.rotate.failed` notice untested.
+    mkdirSync(rotatedPath);
+    writeFileSync(join(rotatedPath, "occupied"), "x");
 
-    // The realistic failure is on the rename, not the open; assert the contract that matters —
-    // it never throws, and an unreachable path is reported rather than swallowed as success.
-    expect(rotateLogIfOversized(blocked, CAP).rotated).toBe(false);
+    const outcome = rotateLogIfOversized(logPath, CAP);
+
+    expect(outcome).toMatchObject({ rotated: false, reason: "failed" });
+    expect(existsSync(logPath)).toBe(true);
+  });
+
+  it("the FAILED notice reaches the log an operator will be sent", () => {
+    writeFileSync(logPath, oversized());
+    mkdirSync(rotatedPath);
+    writeFileSync(join(rotatedPath, "occupied"), "x");
+
+    closeSync(openLogHandle(logPath, CAP));
+
+    // The bound this unit ships does not exist on this machine, and this line is the only thing
+    // that will ever say so.
+    const lines = readFileSync(logPath, "utf8").trim().split("\n");
+    const notice = JSON.parse(lines[lines.length - 1] ?? "{}");
+    expect(notice.event).toBe("daemon.log.rotate.failed");
+    expect(notice.level).toBe("warn");
+    expect(String(notice.impact)).toContain("unbounded");
   });
 });
 

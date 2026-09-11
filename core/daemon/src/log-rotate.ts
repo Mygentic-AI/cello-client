@@ -80,10 +80,15 @@ export function rotateLogIfOversized(logPath: string, capBytes: number = LOG_ROT
   const stillOversized = sizeOf(logPath);
   if (stillOversized === null || stillOversized <= capBytes) return { rotated: false, reason: "raced" };
 
-  // And never let a smaller file replace a larger kept generation, whatever the reason.
-  const kept = sizeOf(rotatedPathFor(logPath));
-  if (kept !== null && kept > stillOversized) return { rotated: false, reason: "raced" };
-
+  /**
+   * ⚠️ **THERE IS DELIBERATELY NO "don't let a smaller file replace a larger kept one" GUARD.** It
+   * was written, it looked prudent, and it silently turned the cap into a RATCHET: the kept file
+   * becomes the effective threshold, so once a 180 MB log has been rotated once, the live file has
+   * to exceed 180 MB — then more — before it will ever rotate again. The 128 MB ceiling this unit
+   * ships would not have existed on the first machine it ran on. The re-stat above already covers
+   * the race that guard was written for: in that interleaving the loser re-stats, finds the fresh
+   * near-empty file under the cap, and returns `raced` without renaming anything.
+   */
   try {
     renameSync(logPath, rotatedPathFor(logPath));
     return { rotated: true, bytes: stillOversized, rotatedTo: rotatedPathFor(logPath) };
