@@ -340,25 +340,61 @@ jobs:
 
       - name: Verify all published versions match local
         run: |
-          # Each package is retried for up to ~60s because npm view can lag behind a
-          # just-completed publish (read-after-write propagation). Without the retry this
-          # step false-fails (local=0.0.6 beta=0.0.5) on a publish that actually succeeded.
-          check() {
-            name="$1"; local_ver="$2"
+          # ⚠️ ASK FOR THE VERSION, NEVER THE DIST-TAG.
+          #
+          # This used to read `npm view @pkg@beta version` — the CACHED dist-tag — and retry for
+          # 60s. That read goes stale per package, so the step could not tell a slow cache from a
+          # publish that genuinely did not persist, and it got BOTH wrong in one day (2026-09-11):
+          # it false-failed on protocol-types, which had published, while daemon really was absent.
+          #
+          # The registry's own `time` map is the authoritative answer: a version that published has
+          # a timestamp. Nothing about a packument is harder to misread, and it is not tag-cached.
+          # The retry stays only for read-after-write on the packument itself.
+          exists() {
+            name="$1"; want="$2"
             for attempt in $(seq 1 6); do
-              npm_ver=$(npm view "@cello-protocol/$name@beta" version 2>/dev/null || echo "missing")
-              if [ "$local_ver" = "$npm_ver" ]; then echo "OK: @cello-protocol/$name@$local_ver"; return 0; fi
-              echo "… @cello-protocol/$name beta=$npm_ver expected=$local_ver (attempt $attempt/6) — waiting for npm propagation"
+              if curl -s -H 'Cache-Control: no-cache' "https://registry.npmjs.org/@cello-protocol%2f$name" \
+                   | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.exit(JSON.parse(d).time?.['$want']?0:1)}catch{process.exit(1)}})"; then
+                echo "OK: @cello-protocol/$name@$want is on the registry"; return 0
+              fi
+              echo "… @cello-protocol/$name@$want not on the registry yet (attempt $attempt/6)"
               sleep 10
             done
-            echo "FAIL: @cello-protocol/$name local=$local_ver beta=$npm_ver after retries — bump the version before tagging"
+            echo "FAIL: @cello-protocol/$name@$want ABSENT from the registry after retries."
+            echo "      The publish did not persist. The version is NOT burned — re-run this job."
             return 1
           }
           FAILED=0
           for pkg in protocol-types crypto transport daemon cli gateway; do
-            check "$pkg" "$(node -p "require('./core/$pkg/package.json').version")" || FAILED=1
+            exists "$pkg" "$(node -p "require('./core/$pkg/package.json').version")" || FAILED=1
           done
-          check "connect" "$(node -p "require('./core/adapter-claude-code/package.json').version")" || FAILED=1
+          exists "connect" "$(node -p "require('./core/adapter-claude-code/package.json').version")" || FAILED=1
+
+          # ⚠️ THE CROSS-PIN CHECK — the one that would have caught the state that actually hurts.
+          #
+          # `cli` pins `daemon` at an EXACT version. On 2026-09-10 and again on 2026-09-11, `cli`
+          # published while `daemon` did not, so a published `cli` pointed at a daemon that did not
+          # exist and `npm i -g @cello-protocol/cli@<ver>` would have failed outright for anyone who
+          # ran it. Only the unmoved `latest` tag stopped that reaching an operator, twice.
+          #
+          # A package whose dependency does not exist is a broken package, whatever the publish log
+          # said. Assert every cross-pin resolves before this job is allowed to go green.
+          CLI_VER=$(node -p "require('./core/cli/package.json').version")
+          for dep in daemon crypto transport protocol-types gateway; do
+            pin=$(npm view "@cello-protocol/cli@$CLI_VER" "dependencies.@cello-protocol/$dep" 2>/dev/null || echo "")
+            [ -z "$pin" ] && continue
+            case "$pin" in workspace:*)
+              echo "FAIL: cli@$CLI_VER ships a raw '$pin' for $dep — that package is broken on npm"; FAILED=1; continue;;
+            esac
+            clean=${pin#^}; clean=${clean#~}
+            if exists "$dep" "$clean" >/dev/null 2>&1; then
+              echo "OK: cli@$CLI_VER -> $dep@$pin resolves"
+            else
+              echo "FAIL: cli@$CLI_VER pins $dep@$pin and THAT VERSION IS NOT ON THE REGISTRY."
+              echo "      Installing this cli would fail outright. Re-run the publish job."
+              FAILED=1
+            fi
+          done
           exit $FAILED
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -569,25 +605,61 @@ jobs:
 
       - name: Verify all published versions match local
         run: |
-          # Each package is retried for up to ~60s because npm view can lag behind a
-          # just-completed publish (read-after-write propagation). Without the retry this
-          # step false-fails (local=0.0.6 beta=0.0.5) on a publish that actually succeeded.
-          check() {
-            name="$1"; local_ver="$2"
+          # ⚠️ ASK FOR THE VERSION, NEVER THE DIST-TAG.
+          #
+          # This used to read `npm view @pkg@beta version` — the CACHED dist-tag — and retry for
+          # 60s. That read goes stale per package, so the step could not tell a slow cache from a
+          # publish that genuinely did not persist, and it got BOTH wrong in one day (2026-09-11):
+          # it false-failed on protocol-types, which had published, while daemon really was absent.
+          #
+          # The registry's own `time` map is the authoritative answer: a version that published has
+          # a timestamp. Nothing about a packument is harder to misread, and it is not tag-cached.
+          # The retry stays only for read-after-write on the packument itself.
+          exists() {
+            name="$1"; want="$2"
             for attempt in $(seq 1 6); do
-              npm_ver=$(npm view "@cello-protocol/$name@beta" version 2>/dev/null || echo "missing")
-              if [ "$local_ver" = "$npm_ver" ]; then echo "OK: @cello-protocol/$name@$local_ver"; return 0; fi
-              echo "… @cello-protocol/$name beta=$npm_ver expected=$local_ver (attempt $attempt/6) — waiting for npm propagation"
+              if curl -s -H 'Cache-Control: no-cache' "https://registry.npmjs.org/@cello-protocol%2f$name" \
+                   | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.exit(JSON.parse(d).time?.['$want']?0:1)}catch{process.exit(1)}})"; then
+                echo "OK: @cello-protocol/$name@$want is on the registry"; return 0
+              fi
+              echo "… @cello-protocol/$name@$want not on the registry yet (attempt $attempt/6)"
               sleep 10
             done
-            echo "FAIL: @cello-protocol/$name local=$local_ver beta=$npm_ver after retries — bump the version before tagging"
+            echo "FAIL: @cello-protocol/$name@$want ABSENT from the registry after retries."
+            echo "      The publish did not persist. The version is NOT burned — re-run this job."
             return 1
           }
           FAILED=0
           for pkg in protocol-types crypto transport daemon cli gateway; do
-            check "$pkg" "$(node -p "require('./core/$pkg/package.json').version")" || FAILED=1
+            exists "$pkg" "$(node -p "require('./core/$pkg/package.json').version")" || FAILED=1
           done
-          check "connect" "$(node -p "require('./core/adapter-claude-code/package.json').version")" || FAILED=1
+          exists "connect" "$(node -p "require('./core/adapter-claude-code/package.json').version")" || FAILED=1
+
+          # ⚠️ THE CROSS-PIN CHECK — the one that would have caught the state that actually hurts.
+          #
+          # `cli` pins `daemon` at an EXACT version. On 2026-09-10 and again on 2026-09-11, `cli`
+          # published while `daemon` did not, so a published `cli` pointed at a daemon that did not
+          # exist and `npm i -g @cello-protocol/cli@<ver>` would have failed outright for anyone who
+          # ran it. Only the unmoved `latest` tag stopped that reaching an operator, twice.
+          #
+          # A package whose dependency does not exist is a broken package, whatever the publish log
+          # said. Assert every cross-pin resolves before this job is allowed to go green.
+          CLI_VER=$(node -p "require('./core/cli/package.json').version")
+          for dep in daemon crypto transport protocol-types gateway; do
+            pin=$(npm view "@cello-protocol/cli@$CLI_VER" "dependencies.@cello-protocol/$dep" 2>/dev/null || echo "")
+            [ -z "$pin" ] && continue
+            case "$pin" in workspace:*)
+              echo "FAIL: cli@$CLI_VER ships a raw '$pin' for $dep — that package is broken on npm"; FAILED=1; continue;;
+            esac
+            clean=${pin#^}; clean=${clean#~}
+            if exists "$dep" "$clean" >/dev/null 2>&1; then
+              echo "OK: cli@$CLI_VER -> $dep@$pin resolves"
+            else
+              echo "FAIL: cli@$CLI_VER pins $dep@$pin and THAT VERSION IS NOT ON THE REGISTRY."
+              echo "      Installing this cli would fail outright. Re-run the publish job."
+              FAILED=1
+            fi
+          done
           exit $FAILED
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
