@@ -15,10 +15,15 @@
  *   - the ordering against `relay_only_no_reservation`, the guard that would refuse 100% of inbound
  *     offers if it sat above the reserve instead of below it.
  *
- * Worse, the dep is OPTIONAL (`reserveOnDemand?`), so every fixture that omitted it skipped the
+ * Worse, the dep WAS OPTIONAL (`reserveOnDemand?`), so every fixture that omitted it skipped the
  * block entirely and stayed green. A handler that never reserved at all passed the whole suite.
  * That is a hollow shape, not a gap: the tests could not have told the working version from the
  * broken one.
+ *
+ * ⚠️ **056-SLOTDEAD review F14 — the first version of this file DESCRIBED that hollow shape and left
+ * it standing**, complete with an unused `noReserveDep` knob for reproducing it. Naming a trap is
+ * not closing it. The dep is required now, so the compiler names any caller that would skip the
+ * reserve, and this file is in `tsconfig.test.json` so the compiler actually reads it.
  *
  * These tests drive the handler through its deps seam — no daemon, no network, no relay.
  */
@@ -46,8 +51,6 @@ const SESSION_ID = new Uint8Array([1, 2, 3, 4]);
 interface HarnessOpts {
   /** What the relay says when asked. Defaults to granting. */
   grant?: boolean;
-  /** Omit the dep entirely — the shape every pre-existing fixture had. */
-  noReserveDep?: boolean;
   /** What the offer frame carries as `relay_endpoint`. */
   relayEndpoint?: unknown;
   relayOnly?: boolean;
@@ -95,14 +98,12 @@ function harness(opts: HarnessOpts = {}) {
       return peerId === "" ? "no_peer_named" : "narrowed";
     },
     ...(opts.relayOnly === undefined ? {} : { isRelayOnly: () => opts.relayOnly! }),
-    ...(opts.noReserveDep === true ? {} : {
-      reserveOnDemand: async (circuitAddr: string, sessionIdHex: string) => {
-        asked.push({ circuitAddr, sessionIdHex });
-        sequence.push(`reserved:${circuitAddr}`);
-        granted = opts.grant ?? true;
-        return granted;
-      },
-    }),
+    reserveOnDemand: async (circuitAddr: string, sessionIdHex: string) => {
+      asked.push({ circuitAddr, sessionIdHex });
+      sequence.push(`reserved:${circuitAddr}`);
+      granted = opts.grant ?? true;
+      return granted;
+    },
     signaling,
     logger,
   });
@@ -141,6 +142,19 @@ describe("DOD-M15-RESERVE-CAPACITY-1: an inbound offer takes ONE slot, on the re
       h.sequence.indexOf(`reserved:${RELAY_ADDR}/p2p/${RELAY_ID}/p2p-circuit`),
       "reserve BEFORE the accept — an accept sent first advertises addresses from before the circuit existed",
     ).toBeLessThan(h.sequence.indexOf("sent:session_offer_accept"));
+    /**
+     * ⚠️ **THE SESSION ID FORMAT IS LOAD-BEARING AND WAS UNASSERTED — review F13.** The harness
+     * recorded this value and nothing checked it, so changing the encoding (base64, uppercase hex,
+     * anything) left every test in this file green.
+     *
+     * It is not a label. It keys the abandoned-offer release timer, whose only guard is
+     * `sessionIsLive(agentName, sessionIdHex)` — a lookup in `activeNodes`, which is keyed with
+     * `Buffer.from(assignment.session_id).toString("hex")` by the path that creates the session. Two
+     * encodings of the same id therefore never match, the guard misses every time, and the timer
+     * releases the circuit out from under a conversation that is running. Lowercase hex of the raw
+     * frame bytes, and it has to stay that.
+     */
+    expect(h.asked[0]!.sessionIdHex).toBe(Buffer.from(SESSION_ID).toString("hex"));
   });
 
   it("★★★ the accept advertises the circuit the reserve just took — the endpoint is RE-READ", async () => {

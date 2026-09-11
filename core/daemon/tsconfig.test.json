@@ -98,6 +98,29 @@
     // that positive control I would have read a green gate as evidence the API was already there.
     "src/__tests__/dod-m15-relayslots-1-online-token-carried.test.ts",
     "src/__tests__/dod-m15-relayslots-1-refusal-surfaced.test.ts",
+    // `056-SLOTDEAD`'s own file. New and clean on creation, which is this list's admission criterion
+    // — and the trap written four times above caught me AGAIN, in the exact shape it describes.
+    //
+    // ⚠️ IT WAS NOT FREE, AND THE POSITIVE CONTROL IS THE POINT. This unit made
+    // `reserveOnDemand` a REQUIRED dep of `wireSessionOfferHandler` precisely so no fixture could
+    // silently skip the reserve — and `pnpm run typecheck` reported exit 0 with THREE existing test
+    // files still calling that handler without it. Not because they were fixed: because no config
+    // reads them. A required parameter that no compiler checks is a comment, which is the sentence
+    // already written above this list about somebody else's file.
+    "src/__tests__/dod-m15-reserve-capacity-1-offer-reserves.test.ts",
+    // The other fixture that drives `wireSessionOfferHandler`, added in the same breath as the
+    // required dep above. Leaving it out would have meant exactly the state this unit is against: a
+    // parameter the signature calls required, in a file where nothing checks it.
+    "src/__tests__/dod-m15-assign-1-receiver-gate.test.ts",
+    // ⚠️ `session-ceremony-verify.test.ts` ALSO drives that handler and is NOT here, measured rather
+    // than assumed: adding it surfaces a PRE-EXISTING error with nothing to do with this unit — its
+    // `wireSessionCeremonyHandler` deps omit `verifyCertifiedRoot` and `recordSealFailure`, both
+    // required on `CeremonyWiringDeps`. That belongs to `DOD-M12B-TESTS-NOT-TYPECHECKED-1`; fixing
+    // someone else's file to widen my own guard is how a unit stops being reviewable.
+    //
+    // SAY THE COST OUT LOUD, per the same note further down about `m12-p14-seal-readiness`: the
+    // `reserveOnDemand` this unit added to that file is therefore correct by inspection only. No
+    // compiler reads it, so it is one of the calls that LOOKS checked in a file nothing checks.
     // DOD-M15-NO-SILENT-REFUSAL-1's own file. New and clean on creation, which is this list's
     // admission criterion — and its predecessor is the argument for it: two calls in
     // `dod-m15-refused-inbound-silent-1.test.ts` omit `takeContentRefusals`' REQUIRED third

@@ -68,9 +68,16 @@ export function wireSessionOfferHandler(deps: {
    * accept. Resolves whether one was granted; a `false` is not fatal — the agent can still be
    * reached directly, and relay-only is the one mode where it is not (see the guard below).
    *
-   * Optional, defaulting to a no-op, so every existing caller and test keeps its exact behaviour.
+   * ⚠️ **REQUIRED, AND IT WAS OPTIONAL — 056-SLOTDEAD, review F14.** "Optional, defaulting to a
+   * no-op, so every existing caller and test keeps its exact behaviour" is how it shipped, and the
+   * cost was not behaviour: it was that a fixture omitting this dep skipped the reserve ENTIRELY
+   * and still went green. The reserve is the capacity change — the one thing unit 3 exists to do —
+   * so a handler that never performed it passed the whole suite, and the next fixture written
+   * without the dep would have done the same thing silently. Required, the type checker names
+   * every caller that has to think about it, and there is no version of this handler that quietly
+   * does not reserve.
    */
-  reserveOnDemand?: (circuitAddr: string, sessionIdHex: string) => Promise<boolean>;
+  reserveOnDemand: (circuitAddr: string, sessionIdHex: string) => Promise<boolean>;
   signaling: SignalingSeam;
   logger: Logger;
 }): () => void {
@@ -147,7 +154,7 @@ export function wireSessionOfferHandler(deps: {
       const relayAddrs = Array.isArray(offeredRelay?.multiaddrs)
         ? (offeredRelay.multiaddrs as unknown[]).filter((a): a is string => typeof a === "string")
         : [];
-      if (relayPeerId && relayAddrs.length > 0 && deps.reserveOnDemand) {
+      if (relayPeerId && relayAddrs.length > 0) {
         const base = relayAddrs[0]!;
         // The circuit address form the walk uses: the relay's own address with `/p2p-circuit`.
         const circuitAddr = base.includes(`/p2p/${relayPeerId}`)

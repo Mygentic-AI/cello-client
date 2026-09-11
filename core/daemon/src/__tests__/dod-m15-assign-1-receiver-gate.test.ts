@@ -270,6 +270,14 @@ describe("DOD-M15-ASSIGN-1 (b) — the offer narrows the gate before advertising
     wireSessionOfferHandler({
       agentName: "Responder",
       getStandingReceiverEndpoint: () => ({ peerId: "12D3KooReceiver", addrs: ["/ip4/10.0.0.1/tcp/4001"] }),
+      /**
+       * 056-SLOTDEAD review F14 — `reserveOnDemand` is REQUIRED now, so a fixture cannot silently
+       * skip the reserve. This one is not about reservations, so it records nothing and grants
+       * nothing: the offers it fires carry no `relay_endpoint`, so it is never called. Stating that
+       * is the point — an explicit "not exercised here" beats an absent dep that reads as "no
+       * reserve happens", which is what made the whole suite green on a handler that never reserved.
+       */
+      reserveOnDemand: async () => false,
       admitOfferedDialer: (peerId) => {
         admitted.push(peerId);
         sequence.push(`narrowed:${peerId}`);

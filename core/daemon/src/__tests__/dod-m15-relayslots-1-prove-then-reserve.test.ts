@@ -158,7 +158,17 @@ class GatedNode extends FakeNode {
    * `listen()` as a reservation — `listenAddresses()` is the only proof. A fixture that threw here
    * would let a caller pass by catching nothing.
    */
+  /**
+   * 056-SLOTDEAD review F5 — did this node ever ASK? The replacement for the deleted `asks` record,
+   * and it observes the node rather than the config it was built from: a circuit announced without
+   * this ever having been true is a constructor-time reservation, which is the thing that must
+   * never come back.
+   */
+  #asked = false;
+  hasAsked(): boolean { return this.#asked; }
+
   override async listenOnCircuit(circuitAddr: string): Promise<void> {
+    this.#asked = true;
     this.relay.timeline.push({ kind: "listen", node: this, relayPeerId: /\/p2p\/([^/]+)\/p2p-circuit/.exec(circuitAddr)?.[1] });
     /**
      * ⚠️ ONE RELAY ANNOUNCES SEVERAL ADDRESSES, and the fixture has to say so or it cannot see the
@@ -217,13 +227,25 @@ class GatedNode extends FakeNode {
 }
 
 class GatedFactory implements ISessionNodeFactory {
-  readonly asks: Array<{ circuits: string[]; nodeType: string | undefined; peerId: string }> = [];
   readonly built: GatedNode[] = [];
   constructor(private readonly relay: ScriptedRelay) {}
+  /**
+   * ⚠️ **`asks` IS GONE, AND SO IS THE `circuit` IT WAS BUILT FROM — 056-SLOTDEAD, review F5.**
+   *
+   * This recorded `config.circuitRelayListenAddrs`, the field that made a node ask a relay for a
+   * slot at construction, so a test could assert nothing is ever built that way. 055-ONDEMAND
+   * deleted the field. `tsconfig.json` excludes `src/__tests__`, so reading it here was not a type
+   * error — it was silently `undefined`, every recorded `circuits` was `[]`, and the assertion
+   * counting them was vacuous. It read as the revert test for the whole change and could not fail.
+   *
+   * **The property it guarded is now enforced by the type system instead, which is strictly
+   * stronger.** There is no field to pass, so no caller can build a node carrying a circuit
+   * address; re-introducing one is a change to `SessionNodeConfig`, not a slip. What still has
+   * teeth is the node's own state, asserted below: a node announces a circuit only after it has
+   * asked and been granted, never at construction.
+   */
   async createNode(config: SessionNodeConfig): Promise<CelloNode> {
-    const circuit = config.circuitRelayListenAddrs?.[0];
-    const node = new GatedNode(config.transportPrivateKey, this.relay, circuit, config.nodeType);
-    this.asks.push({ circuits: config.circuitRelayListenAddrs ?? [], nodeType: config.nodeType, peerId: node.getPeerId() });
+    const node = new GatedNode(config.transportPrivateKey, this.relay, undefined, config.nodeType);
     this.built.push(node);
     return node as unknown as CelloNode;
   }
@@ -393,9 +415,20 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
      * **nothing is ever built carrying a circuit address**. Restore either the probes or the
      * rebuild and this fails.
      */
+    /**
+     * ⚠️ **THIS COUNTED A FIELD THAT NO LONGER EXISTS, SO IT COULD NOT FAIL — 056-SLOTDEAD, F5.**
+     * It was `factory.asks.filter((a) => a.circuits.length > 0).length === 0`, and `circuits` came
+     * from the deleted `circuitRelayListenAddrs`, so every entry was `[]`. The claim above it —
+     * "restore either the probes or the rebuild and this fails" — had stopped being true.
+     *
+     * The replacement observes the node instead of the config, which is what the property was
+     * always about: a node that has been BUILT but has not yet asked announces no circuit. A
+     * constructor-time ask would put one there, and this would go red.
+     */
     expect(
-      factory.asks.filter((a) => a.circuits.length > 0).length,
-      "no node is built asking for a reservation — the ask happens on a node that is already " +
+      factory.built.filter((n) => n.listenAddresses().some((a) => a.includes("/p2p-circuit"))
+        && !n.hasAsked()).length,
+      "no node announces a circuit it never asked for — the ask happens on a node that is already " +
         "running and has already proved itself",
     ).toBe(0);
     expect(
@@ -412,8 +445,9 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
       relay.gateProofs().map((p) => p.relayPeerId),
       "the walk must CONTINUE past the first grant — one reservation is one relay away from unreachable",
     ).toEqual([RELAY_A, RELAY_B]);
+    // 056-SLOTDEAD F5: read off the nodes actually built, not the deleted `asks` record. Same claim.
     expect(
-      new Set(factory.asks.map((a) => a.peerId)).size,
+      new Set(factory.built.map((n) => n.getPeerId())).size,
       "ONE identity across every relay: an agent is dialable at ONE peer id through any of its circuits",
     ).toBe(1);
 
@@ -964,7 +998,7 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
      * the receiver proved.
      */
     relay.proven.clear();
-    const asksBefore = factory.asks.length;
+    const builtBefore = factory.built.length;
 
     const revived = await mgr.reviveSessionNode("alice", sid);
     expect(revived.ok, JSON.stringify(revived)).toBe(true);
@@ -985,11 +1019,18 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
     /**
      * ⚠️ MOVED WITH THE BEHAVIOUR (DOD-M15-RELAYPROVE-ORDER-1). This used to require exactly TWO
      * node builds carrying a circuit address — "one refused ask, one granted, on one relay". The
-     * revival now proves on a node built with no circuit address and asks once, so the
-     * constructor-time count is zero and the ask is counted where it now happens.
+     * revival now proves on a node built with no circuit address and asks once.
+     *
+     * ⚠️ AND IT COUNTED A DELETED FIELD, so it could not fail — 056-SLOTDEAD, review F5. It read
+     * `a.circuits.length > 0` off `circuitRelayListenAddrs`, which 055-ONDEMAND removed; every
+     * entry was `[]` and the zero was arithmetic, not evidence. Asserted on the node now: a revived
+     * session node that announces a circuit without ever having asked is the defect.
      */
     expect(
-      factory.asks.slice(asksBefore).filter((a) => a.nodeType === "session" && a.circuits.length > 0).length,
+      factory.built.slice(builtBefore)
+        .filter((n) => n.nodeType === "session"
+          && n.listenAddresses().some((a) => a.includes("/p2p-circuit"))
+          && !n.hasAsked()).length,
       "a revived session no longer asks before it has proved — nothing is built holding a circuit " +
         "address it has not earned",
     ).toBe(0);

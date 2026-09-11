@@ -550,32 +550,28 @@ describe("R11: an unreachable relay must NOT prevent the standing receiver from 
   /**
    * A factory whose RESERVATION never completes — the live failure.
    *
-   * ⚠️ DOD-M15-RELAYPROVE-ORDER-1 MOVED WHERE A RESERVATION IS ASKED FOR, so this fixture hangs in
-   * two places rather than one. It used to hang only `start()`, because a circuit address in the
-   * constructor made start() the moment libp2p asked. The walk now builds probes with NO circuit
-   * address and asks afterwards through `listenOnCircuit` — so hanging start() alone models a
-   * reservation that completes instantly, and the deadline this test is about is never reached.
+   * ⚠️ **IT HANGS IN ONE PLACE NOW, AND THE OTHER HALF WAS ALREADY DEAD — 056-SLOTDEAD, review F5.**
    *
-   * Both are kept: `listenOnCircuit` is the probe's ask, and `start()` is still the installed
-   * receiver's, since it is built from the addresses the walk collected.
+   * This used to hang in two: `start()`, for a node BUILT carrying a circuit address, and
+   * `listenOnCircuit`, for one that asks afterwards. The comment said "both are kept". They were
+   * not — 055-ONDEMAND deleted `circuitRelayListenAddrs`, so the `start()` branch was guarded on a
+   * field that nothing sets. Because `tsconfig.json` excludes `src/__tests__`, reading a deleted
+   * field is not a type error here: it is silently `undefined`, the guard is permanently false, and
+   * the branch was unreachable while the comment above it asserted otherwise.
+   *
+   * There is one way to hang now, and it is the real one: a node starts on TCP and parks on the
+   * ask. That is the deadline this test is about.
    */
   class HangingCircuitFactory extends ProductionSessionNodeFactory {
     override async createNode(config: Parameters<ProductionSessionNodeFactory["createNode"]>[0]) {
-      const node = await super.createNode({ ...config, circuitRelayListenAddrs: undefined });
+      const node = await super.createNode(config);
       /**
-       * ⚠️ ASSIGNED, NOT SPREAD. `{...node, start}` copies own enumerable properties only, and
-       * `CelloNode`'s methods live on the PROTOTYPE — so the spread returned an object with no
-       * `listenAddresses`, no `stop`, no `getConnections`. That was invisible while `start()` hung
-       * forever, because nothing else was ever called on it. The probe below DOES get called, and
-       * the spread turned "the reservation hangs" into "every method is missing".
+       * ⚠️ ASSIGNED, NOT SPREAD. `{...node, listenOnCircuit}` copies own enumerable properties only,
+       * and `CelloNode`'s methods live on the PROTOTYPE — so the spread returned an object with no
+       * `listenAddresses`, no `stop`, no `getConnections`. That was invisible while the hang was on
+       * `start()` and nothing else was ever called on it.
        */
       const hang = (): Promise<void> => new Promise<void>(() => {});
-      if (config.circuitRelayListenAddrs && config.circuitRelayListenAddrs.length > 0) {
-        // Mimic libp2p: start() parks forever waiting on a relay that never answers.
-        (node as unknown as { start: () => Promise<void> }).start = hang;
-        return node;
-      }
-      // The probe. It starts fine — it is only TCP — and parks on the ask.
       (node as unknown as { listenOnCircuit: () => Promise<void> }).listenOnCircuit = hang;
       return node;
     }
