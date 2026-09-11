@@ -720,6 +720,14 @@ export class SignalingManager {
     this._currentDirectoryNodeId = result.directoryNodeId;
     this._status = "connected";
 
+    /**
+     * ⚠️ **THE STATE TRANSITION, AND THE ONLY EMITTER OF THIS NAME — 058-LOGNAME.** The daemon's
+     * handshake used to log `directory.signaling.connected` as well, with a completely different
+     * payload, in the same millisecond. Counting connections was therefore impossible and a real
+     * investigation was sent an hour in the wrong direction by the doubled number. The daemon's is
+     * now `directory.signaling.authenticated`. Do not merge them back: this one says the manager is
+     * connected, that one says whose handshake succeeded and whether the challenge verified.
+     */
     this._logger.info("directory.signaling.connected", {
       directoryNodeId: result.directoryNodeId,
       manifestVersion: result.manifestVersion,

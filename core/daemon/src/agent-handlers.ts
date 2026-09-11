@@ -128,7 +128,8 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
       // the already-present shared manager (no-op).
       getAgentSignaling(name, keyProvider, pubkeyHex);
       // "initiated" not "established": getAgentSignaling starts the connection but does not await it
-      // (the SignalingManager emits directory.signaling.connected when it actually authenticates).
+      // (the SignalingManager emits directory.signaling.connected on the state transition; the
+      // handshake itself is directory.signaling.authenticated — 058-LOGNAME).
       logger.info("agent.directory.connection.initiated", { agentName: name, agentPubkey: pubkeyHex });
     } catch (err: unknown) {
       logger.error("persist.identity.persist.failed", { agentName: name, error: extractErrorMessage(err) });

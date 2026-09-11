@@ -525,7 +525,24 @@ export function createSignalingConnect(deps: SignalingConnectDeps): () => Promis
       }) as Uint8Array;
       sigStream.send(lp.encode.single(peerInfo));
 
-      deps.logger.info("directory.signaling.connected", {
+      /**
+       * ⚠️ **RENAMED FROM `directory.signaling.connected` — 058-LOGNAME, AND THE OLD NAME COST AN
+       * HOUR OF THE WRONG INVESTIGATION.**
+       *
+       * `SignalingManager.runConnectedPhase` logs `directory.signaling.connected` too, for a
+       * different fact: the manager has entered the connected STATE, carrying `manifestVersion`.
+       * This line is about the HANDSHAKE — who it was for, and whether the directory's challenge
+       * verified. Two meanings, one name, emitted in the same millisecond, so the event could not be
+       * counted at all.
+       *
+       * What that cost, concretely: reading 361 `directory.signaling.connected` in 90 minutes off a
+       * real daemon and spending an hour on connection churn, when the number was doubled by this
+       * collision and the actual defect was a credential that never refreshed (057-STALECRED).
+       *
+       * Keep them distinct. `connected` is the transport's state transition; `authenticated` is this
+       * — the daemon's per-agent handshake result, and the only one of the two that knows WHO.
+       */
+      deps.logger.info("directory.signaling.authenticated", {
         directoryNodeId,
         agentPubkey: identity.pubkeyHex,
         verified: !!verifier,
