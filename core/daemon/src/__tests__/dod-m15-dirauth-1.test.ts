@@ -16,7 +16,7 @@
  *             connect and every reconnect.
  *
  * **Correction (review F4).** This header first claimed nothing was logged at that site. False, and
- * falsifiable in one grep: `directory.signaling.connected` carries `verified: !!verifier` six lines
+ * falsifiable in one grep: `directory.signaling.authenticated` carries `verified: !!verifier` six lines
  * later, every connect and every reconnect. The skip is logged twice over. The reason this unit
  * exists is not an absent log — it is that **a log is not a control**: an agent reading
  * `cello_status` cannot grep `daemon.log`, and the agent-facing surface said nothing either way.

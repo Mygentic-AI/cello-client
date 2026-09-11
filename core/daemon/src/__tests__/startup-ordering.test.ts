@@ -6,7 +6,7 @@
  * The bug they exist to prevent (introduced by the 2026-07-13 daemon decomposition, caught in
  * review, fixed in 5f2dfad): the eager per-agent directory connect got moved BELOW
  * `await flushAwaitingContent()`. That await does real relay network I/O, sequentially, for every
- * parked item. Below it, every agent's directory handshake — `directory.signaling.connected`,
+ * parked item. Below it, every agent's directory handshake — `directory.signaling.authenticated`,
  * `agent.online`, the standing receiver — is serialized behind the entire drain. On a daemon
  * booting with parked content and a slow or unreachable relay, agents come online late and NOTHING
  * in the log says the relay is the reason. Above it, the two overlap, as they always did.
