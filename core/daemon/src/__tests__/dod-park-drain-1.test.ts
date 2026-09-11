@@ -9,10 +9,15 @@
  *
  * Pinned here:
  *  A1 — the drain fires on the FIRST standing-receiver install.
- *  A2 — it fires again on the watchdog REBUILD after the relay link dies. This is the defect:
- *       parking and rebuilding are the same event, so the drain has to ride the rebuild. Proven
- *       against a real in-process relay that is killed mid-life — a deliberately flapping link.
- *  A3 — it fires on the auth_ok rebuild (setDirectoryRelayEndpoints).
+ *  A2 — it fires again when a reservation is LOST. This is the defect: content parks because the
+ *       relay link died, so the drain has to ride that event. Proven against a real in-process
+ *       relay that is killed mid-life — a deliberately flapping link.
+ *       ⚠️ 056-SLOTDEAD: it used to ride the watchdog REBUILD, one step downstream of the loss.
+ *       The rebuild is gone (it reserved nothing and could destroy an in-flight offer's slot), so
+ *       the trigger moved onto the cause itself.
+ *  A2b — and again when a circuit comes BACK, because the loss trigger fires while the relay is
+ *       down and the pull it starts cannot succeed. The pair is what closes the gap.
+ *  A3 — endpoints arriving late neither rebuild the receiver nor strand parked content.
  *  A4 — a slow periodic backstop fires with no rebuild at all, so no future missed trigger can
  *       strand content indefinitely.
  *  A5 — a throwing drain hook costs the drain, never the standing receiver.
@@ -123,7 +128,7 @@ describe("A: the parked-content drain rides the standing receiver's life-cycle",
     }
   }, 20_000);
 
-  it("A2: a relay link that DIES mid-life drains again on the watchdog rebuild — no daemon restart", async () => {
+  it("A2: a relay link that DIES mid-life drains again on the loss itself — no daemon restart", async () => {
     const relay = await startHopRelay();
     const { manager, events, drains } = await makeManager({ watchdogMs: 250 });
     try {
@@ -148,15 +153,91 @@ describe("A: the parked-content drain rides the standing receiver's life-cycle",
       // content it could not deliver is sitting parked on the other side of this link.
       await relay.node.stop();
 
-      const rebuilt = await waitUntil(() => drains.length >= 2, 15_000);
-      expect(rebuilt, "the watchdog rebuild must drain — this is the trigger the defect was missing").toBe(true);
-      expect(drains[1]).toEqual({ agentName: "alice", reason: "standing_receiver_ready" });
+      /**
+       * 056-SLOTDEAD — the REASON changed and the property did not. The drain used to be a side
+       * effect of the watchdog rebuilding the receiver; the rebuild is gone (it reserved nothing and
+       * could destroy an in-flight offer's slot), so the drain now fires on the loss that caused the
+       * parking in the first place. Asserting the reason, not just the count, is what would catch it
+       * silently reverting to the periodic backstop — which drains too, eventually, and would make a
+       * broken trigger look green.
+       */
+      const drained = await waitUntil(() => drains.length >= 2, 15_000);
+      expect(drained, "losing the reservation must drain — this is the trigger the defect was missing").toBe(true);
+      expect(drains[1]).toEqual({ agentName: "alice", reason: "reservation_lost" });
       expect(events.some((e) => e.event === "session.standing_receiver.reservation.lost")).toBe(true);
     } finally {
       await manager.gracefulShutdown();
       await relay.node.stop().catch(() => { /* already stopped */ });
     }
   }, 40_000);
+
+  it("★★★ A2b: the relay COMES BACK and drains again — the loss trigger alone aims at a dead relay", async () => {
+    /**
+     * ⚠️ **THE OTHER HALF OF A2, AND WITHOUT IT A2 IS A DRAIN THAT CANNOT SUCCEED — review F4.**
+     *
+     * A2 pins that losing a reservation drains. But the loss is noticed precisely because the relay
+     * link is down, so the pull that drain starts is aimed at a relay that cannot answer. If nothing
+     * fires when the link returns, the counterparty's parked content — the whole reason the drain
+     * exists — waits for the slow periodic backstop while the relay is healthy and the agent is
+     * connected to it again.
+     *
+     * The two triggers are a pair: one notices the outage, the other notices the recovery. This
+     * test exists because deleting either one leaves a suite that still looks complete.
+     */
+    const relay = await startHopRelay();
+    const { manager, drains } = await makeManager({ watchdogMs: 250 });
+    try {
+      await seedRelayEndpoint(manager, "alice", relay.peerId, relay.addr);
+      await manager.ensureStandingReceiverForAgent("alice");
+      await manager.takeReservationForSession("alice", `${relay.addr}/p2p-circuit`, "test-corr");
+      const reserved = await waitUntil(() => {
+        const info = manager.getStandingReceiverInfo("alice");
+        return info !== null && info.addrs.some((a) => a.includes("/p2p-circuit"));
+      }, 10_000);
+      expect(reserved, "precondition: the agent must hold a circuit to lose one").toBe(true);
+      const beforeLoss = drains.length;
+
+      // Lose it, and wait for the loss trigger — that is A2's property, restated as this one's
+      // precondition so a regression in A2 cannot silently make this test vacuous.
+      await relay.node.stop();
+      expect(await waitUntil(() => drains.length > beforeLoss, 15_000)).toBe(true);
+      expect(drains.at(-1)).toEqual({ agentName: "alice", reason: "reservation_lost" });
+      const afterLoss = drains.length;
+
+      /**
+       * A CIRCUIT COMES BACK, THROUGH THE RE-TAKE — the path a live session that lost its circuit
+       * actually travels. A second relay rather than resurrecting the first, because that is both
+       * simpler and the more faithful recovery: the agent re-takes against whatever it is given
+       * next, which need not be the relay that died.
+       *
+       * Driven through `retakeReservationOn` deliberately. The drain does NOT hang off
+       * `takeReservationForSession`, because on a first login that fires moments after the install
+       * drain for the same empty mailbox — and it does not hang off the watchdog's `gained` branch,
+       * because a take records the circuit on the receiver itself and the watchdog never sees a
+       * gain. Both were tried; this test is what rejected them.
+       */
+      const revived = await startHopRelay();
+      try {
+        const node = manager.getStandingReceiverNode("alice")!;
+        await manager.retakeReservationOn("alice", node, `${revived.addr}/p2p-circuit`, "test-corr-2");
+        const regained = await waitUntil(
+          () => drains.length > afterLoss && drains.at(-1)?.reason === "reservation_regained",
+          15_000,
+        );
+        expect(
+          regained,
+          "a circuit coming back is the FIRST moment a pull can actually succeed — without a drain " +
+            "here, content parked during the outage waits for the periodic backstop with the relay " +
+            "healthy and the agent connected to it",
+        ).toBe(true);
+      } finally {
+        await revived.node.stop().catch(() => { /* already stopped */ });
+      }
+    } finally {
+      await manager.gracefulShutdown();
+      await relay.node.stop().catch(() => { /* already stopped */ });
+    }
+  }, 60_000);
 
   it("★★★ A3: endpoints arriving late neither rebuild the receiver nor strand parked content", async () => {
     /**
@@ -174,8 +255,8 @@ describe("A: the parked-content drain rides the standing receiver's life-cycle",
      * only ever existed for reservations.
      *
      * So: no rebuild, no churn, and the mailbox still drains on the triggers that remain — install
-     * (A1), the watchdog rebuild after a real loss (A2), the signalling reconnect (B), and the
-     * periodic backstop (A4).
+     * (A1), a reservation LOST and a reservation REGAINED (A2, A2b), the signalling reconnect (B),
+     * and the periodic backstop (A4).
      */
     const relay = await startHopRelay();
     const { manager, drains } = await makeManager();

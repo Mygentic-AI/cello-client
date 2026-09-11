@@ -157,10 +157,10 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
       publishNode: (n) => {
         nodeRef = n;
       },
-      // DOD-NAT-REACHABILITY-1 (Phase 2): the directory's relay pool arrives with
-      // signaling_auth_ok — feed it to the session node manager so this agent's
-      // standing receiver reserves with those relays (and rebuilds if it came up
-      // deaf because agent-online raced ahead of this connect).
+      // DOD-NAT-REACHABILITY-1 (Phase 2): the directory's relay pool arrives with signaling_auth_ok.
+      // 056-SLOTDEAD — this used to say the receiver "reserves with those relays (and rebuilds if it
+      // came up deaf)". It does neither since 055-ONDEMAND: the pool is a CANDIDATE LIST, and a slot
+      // is taken at offer time. Nothing is reserved on receipt of it.
       onRelayEndpoints: (endpoints) => {
         sessionNodeManager.setDirectoryRelayEndpoints(
           agentName,

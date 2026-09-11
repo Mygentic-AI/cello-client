@@ -114,13 +114,11 @@ class SlotStarvedFactory implements ISessionNodeFactory {
     this.circuitAttempts += 1;
     return this.circuitAttempts >= this.grantFrom;
   }
-  async createNode(c: SessionNodeConfig): Promise<CelloNode> {
+  async createNode(_c: SessionNodeConfig): Promise<CelloNode> {
     this.calls += 1;
-    const wantsRelay = (c.circuitRelayListenAddrs?.length ?? 0) > 0;
-    // Built WITH circuit addresses: libp2p asks at start, so the ask is counted here.
-    const grantedAtStart = wantsRelay && this.#ask();
-    // Built WITHOUT: this is a probe, and it asks only once its proof has landed.
-    return new ReservationNode(grantedAtStart, wantsRelay ? undefined : () => this.#ask()) as unknown as CelloNode;
+    // 056-SLOTDEAD: no node is built carrying circuit addresses any more, so there is one shape —
+    // a node that holds nothing until it ASKS. The `wantsRelay` branch was dead input.
+    return new ReservationNode(false, () => this.#ask()) as unknown as CelloNode;
   }
 }
 
@@ -311,8 +309,10 @@ describe("DOD-M12B-RESERVATION-RETRY-1: the backoff and the budget", () => {
     const { logger } = makeLogger();
     const factory: ISessionNodeFactory = {
       async createNode(c: SessionNodeConfig): Promise<CelloNode> {
-        const wantsRelay = (c.circuitRelayListenAddrs?.length ?? 0) > 0;
-        return (wantsRelay ? new IdlessCircuitNode(true) : new ReservationNode(false)) as unknown as CelloNode;
+        // 056-SLOTDEAD: one shape now — a node that holds nothing until it asks. This test is about
+        // what happens when the ask yields a circuit address with no relay id in it.
+        void c;
+        return new IdlessCircuitNode(true) as unknown as CelloNode;
       },
     };
     const { snm, dir } = await makeManager({ factory, logger, retryMs: 30 });

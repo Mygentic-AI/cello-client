@@ -217,6 +217,14 @@ describe("DOD-OFFER-REJECT-1: wireSessionOfferHandler answers with session_offer
     wireSessionOfferHandler({
       agentName: "bob",
       getStandingReceiverEndpoint: () => deps.sr,
+      /**
+       * 056-SLOTDEAD review F14 — `reserveOnDemand` is REQUIRED now, so a fixture cannot silently
+       * skip the reserve. This one is not about reservations, so it records nothing and grants
+       * nothing: the offers it fires carry no `relay_endpoint`, so it is never called. Stating that
+       * is the point — an explicit "not exercised here" beats an absent dep that reads as "no
+       * reserve happens", which is what made the whole suite green on a handler that never reserved.
+       */
+      reserveOnDemand: async () => false,
       // DOD-M15-ASSIGN-1: the receiver is narrowed to the offered dialer before the accept goes
       // out. These tests are about the REJECT contract, so the narrowing succeeds and stays out of
       // their way; the narrowing itself is pinned in dod-m15-assign-1-receiver-gate.test.ts.

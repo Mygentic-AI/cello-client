@@ -456,9 +456,11 @@ export function createSignalingConnect(deps: SignalingConnectDeps): () => Promis
       }
 
       // DOD-NAT-REACHABILITY-1 (Phase 2): the directory's relay pool rides
-      // signaling_auth_ok so the standing receiver can reserve BEFORE any
-      // session exists. Surfaced via callback; parse failures drop entries,
-      // never the handshake.
+      // signaling_auth_ok, so an agent knows WHERE it could reserve before any
+      // session exists. 056-SLOTDEAD: it used to say the receiver reserves here;
+      // since 055-ONDEMAND this is a candidate list and the slot is taken at
+      // offer time. Surfaced via callback; parse failures drop entries, never
+      // the handshake.
       if (deps.onRelayEndpoints) {
         const endpoints = parseRelayEndpoints(ackFrame["relay_endpoints"]);
         if (endpoints.length > 0) {

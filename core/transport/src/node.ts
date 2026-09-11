@@ -1212,6 +1212,15 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
    * `listener.listen(addr)` into a single `tasks` array awaited together. That parallelism is what
    * puts relay 2 in the queue while relay 1 is running; listen them serially and there would be
    * nothing queued to wipe.
+   *
+   * ⚠️ **NO CELLO PRODUCTION CALLER TAKES THIS PATH ANY MORE — 056-SLOTDEAD, and it is KEPT
+   * DELIBERATELY.** Every node the daemon builds now starts on TCP/WS and asks for its circuit
+   * afterwards via `listenOnCircuit`, so `circuitListenCount` is 0 and this resolves to libp2p's own
+   * default. It was considered for deletion as a fossil and that would have been wrong: listening on
+   * an explicit relay address at construction is a supported input of this package, the relay's
+   * slot-limit tests in `trustless-cello` use it, and removing the workaround would hand that input
+   * a `start()` that hangs forever rather than an error. Dead for our callers is not dead for the
+   * library.
    */
   const circuitListenCount = opts.listenAddresses.filter((a) => a.includes("/p2p-circuit")).length;
 

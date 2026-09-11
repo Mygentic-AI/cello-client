@@ -115,15 +115,15 @@ export async function startBootAgents(deps: BootAgentsDeps) {
     contentPark.autoRecoverForAgent(agentName, trigger);
 
   // DOD-PARK-DRAIN-1: drain where the parking actually happens. Content parks when the RELAY link
-  // drops; the manager tells us the moment this agent has a receiver again (first ensure, watchdog
-  // rebuild, auth_ok rebuild) and on its slow backstop sweep. Before this, a message that hit a
-  // relay churn gap sat parked until a human restarted the receiving daemon.
+  // drops, and the manager tells us on every event that changes this agent's ability to pull — the
+  // first ensure, a reservation LOST, a reservation REGAINED, the slow backstop sweep. (056-SLOTDEAD:
+  // was "watchdog rebuild, auth_ok rebuild"; neither exists, and the pair names the cause instead.)
   sessionNodeManager.setParkedDrainHook((agentName: string, reason: string) => {
     // M12-P12 (review F1): the SENDER half of the same event. A refused park deposit leaves a
     // durable retry_queue row, and until this call existed the only things that drained it were a
     // daemon restart and cello_start_agent — so the fix made a lost message restart-recoverable
-    // while the DoD line promises "no restart". The watchdog rebuild is where parking actually
-    // happens, so it is where the re-park has to fire too.
+    // while the DoD line promises "no restart". A lost reservation is where parking actually happens,
+    // so it is where the re-park fires (056-SLOTDEAD: was "the watchdog rebuild", now deleted).
     void getFlushAwaitingContent()(agentName).catch((err: unknown) => {
       logger.warn("content.park.flush.failed", { agentName, trigger: reason, stage: "drain_hook", error: extractErrorMessage(err) });
     });

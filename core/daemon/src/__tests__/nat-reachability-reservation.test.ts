@@ -15,8 +15,9 @@
  *  R2 — ProductionSessionNodeFactory: standing receiver defaults to a ROUTABLE
  *       listen (/ip4/0.0.0.0/tcp/0), CELLO_LISTEN_ADDR still overrides, and
  *       ephemeral session nodes stay on loopback.
- *  R3 — the factory forwards circuitRelayListenAddrs so the receiver reserves
- *       with the relay (circuit addr appears in listenAddresses()).
+ *  R3 — a receiver that asks (listenOnCircuit) reserves with the relay, and the
+ *       circuit addr appears in listenAddresses(). 056-SLOTDEAD moved the ask out
+ *       of node construction; the property being pinned is unchanged.
  *  R4 — SessionNodeManager wires persisted relay endpoints (sessions rows) into
  *       the standing receiver's reservation set.
  *  R5 — a DEAD relay endpoint must not kill the receiver: it installs TCP-only
@@ -144,8 +145,17 @@ describe("R2: ProductionSessionNodeFactory listen defaults", () => {
   });
 });
 
-describe("R3: the factory forwards circuit-relay listen addresses", () => {
-  it("a standing receiver created with circuitRelayListenAddrs reserves with the relay", async () => {
+/**
+ * ⚠️ **THIS USED TO BE "the factory forwards circuit-relay listen addresses" — 056-SLOTDEAD.**
+ * The property is the same and it is the one that matters: a standing receiver ends up announcing a
+ * real circuit through a real relay. Only the MECHANISM moved. A node was once BUILT carrying the
+ * relay's address (`circuitRelayListenAddrs`), so the reservation was a side effect of `start()`;
+ * it now starts on TCP and asks afterwards, through `listenOnCircuit`, so that the ask can happen
+ * when a session needs it rather than at login. Deleting the test with the field would have deleted
+ * the only live proof that a reservation is obtainable at all.
+ */
+describe("R3: a standing receiver takes a circuit reservation on demand", () => {
+  it("listenOnCircuit reserves with the relay and the node announces the circuit", async () => {
     const relay = await startHopRelay();
     process.env["CELLO_LISTEN_ADDR"] = "/ip4/127.0.0.1/tcp/0";
     try {
@@ -153,9 +163,9 @@ describe("R3: the factory forwards circuit-relay listen addresses", () => {
       const node = await factory.createNode({
         sessionId: "sr-circuit",
         nodeType: "standing_receiver",
-        circuitRelayListenAddrs: [`${relay.addr}/p2p-circuit`],
       });
       await node.start();
+      await node.listenOnCircuit(`${relay.addr}/p2p-circuit`);
       try {
         const ok = await waitUntil(() => node.listenAddresses().some((a) => a.includes("/p2p-circuit")), 10_000);
         expect(ok).toBe(true);
@@ -413,7 +423,8 @@ describe("R7+R8: directory-provided relay endpoints (Phase 2 client half)", () =
    */
   it("★★★ directory endpoints are usable whenever they arrive, and their arrival never churns the receiver", async () => {
     const relay = await startHopRelay();
-    const { manager, events } = await makeManager();
+    // 056-SLOTDEAD F15: `events` is gone with the vacuous rebuild-event assertion it was read for.
+    const { manager } = await makeManager();
     try {
       await seedAgents(manager.getDb(), ["alice"]); // agent exists; NO sessions rows
       await manager.ensureStandingReceiverForAgent("alice"); // endpoints not known yet
@@ -434,7 +445,15 @@ describe("R7+R8: directory-provided relay endpoints (Phase 2 client half)", () =
           "would throw away circuits a LIVE session is depending on, and its counterparty would " +
           "silently lose the route it was given.",
       ).toBe(before!.peerId);
-      expect(events.some((e) => e.event === "session.standing_receiver.reservation.rebuild")).toBe(false);
+      /**
+       * ⚠️ **THIS ASSERTED THE ABSENCE OF AN EVENT NOTHING HAS EVER EMITTED — 056-SLOTDEAD, F15.**
+       * `session.standing_receiver.reservation.rebuild` is not a name any code uses; only
+       * `…rebuild.failed` ever existed. So the line was vacuously true and always had been, and the
+       * whole weight of "no churn" rested on the peer-id comparison above it. Removed rather than
+       * corrected to `…rebuild.failed`: that event is gone too, and the peer id IS the observable —
+       * a rebuild mints a new transport identity, which is exactly what costs a live session its
+       * route. Asserting the identity is unchanged asserts the thing that matters.
+       */
 
       // And they are usable the moment an offer needs them — whenever they turned up.
       expect(
@@ -540,32 +559,28 @@ describe("R11: an unreachable relay must NOT prevent the standing receiver from 
   /**
    * A factory whose RESERVATION never completes — the live failure.
    *
-   * ⚠️ DOD-M15-RELAYPROVE-ORDER-1 MOVED WHERE A RESERVATION IS ASKED FOR, so this fixture hangs in
-   * two places rather than one. It used to hang only `start()`, because a circuit address in the
-   * constructor made start() the moment libp2p asked. The walk now builds probes with NO circuit
-   * address and asks afterwards through `listenOnCircuit` — so hanging start() alone models a
-   * reservation that completes instantly, and the deadline this test is about is never reached.
+   * ⚠️ **IT HANGS IN ONE PLACE NOW, AND THE OTHER HALF WAS ALREADY DEAD — 056-SLOTDEAD, review F5.**
    *
-   * Both are kept: `listenOnCircuit` is the probe's ask, and `start()` is still the installed
-   * receiver's, since it is built from the addresses the walk collected.
+   * This used to hang in two: `start()`, for a node BUILT carrying a circuit address, and
+   * `listenOnCircuit`, for one that asks afterwards. The comment said "both are kept". They were
+   * not — 055-ONDEMAND deleted `circuitRelayListenAddrs`, so the `start()` branch was guarded on a
+   * field that nothing sets. Because `tsconfig.json` excludes `src/__tests__`, reading a deleted
+   * field is not a type error here: it is silently `undefined`, the guard is permanently false, and
+   * the branch was unreachable while the comment above it asserted otherwise.
+   *
+   * There is one way to hang now, and it is the real one: a node starts on TCP and parks on the
+   * ask. That is the deadline this test is about.
    */
   class HangingCircuitFactory extends ProductionSessionNodeFactory {
     override async createNode(config: Parameters<ProductionSessionNodeFactory["createNode"]>[0]) {
-      const node = await super.createNode({ ...config, circuitRelayListenAddrs: undefined });
+      const node = await super.createNode(config);
       /**
-       * ⚠️ ASSIGNED, NOT SPREAD. `{...node, start}` copies own enumerable properties only, and
-       * `CelloNode`'s methods live on the PROTOTYPE — so the spread returned an object with no
-       * `listenAddresses`, no `stop`, no `getConnections`. That was invisible while `start()` hung
-       * forever, because nothing else was ever called on it. The probe below DOES get called, and
-       * the spread turned "the reservation hangs" into "every method is missing".
+       * ⚠️ ASSIGNED, NOT SPREAD. `{...node, listenOnCircuit}` copies own enumerable properties only,
+       * and `CelloNode`'s methods live on the PROTOTYPE — so the spread returned an object with no
+       * `listenAddresses`, no `stop`, no `getConnections`. That was invisible while the hang was on
+       * `start()` and nothing else was ever called on it.
        */
       const hang = (): Promise<void> => new Promise<void>(() => {});
-      if (config.circuitRelayListenAddrs && config.circuitRelayListenAddrs.length > 0) {
-        // Mimic libp2p: start() parks forever waiting on a relay that never answers.
-        (node as unknown as { start: () => Promise<void> }).start = hang;
-        return node;
-      }
-      // The probe. It starts fine — it is only TCP — and parks on the ask.
       (node as unknown as { listenOnCircuit: () => Promise<void> }).listenOnCircuit = hang;
       return node;
     }
@@ -801,10 +816,14 @@ describe("W: a standing receiver that LOSES its reservation gets another one", (
         events.filter((e) => e.event === "session.standing_receiver.reservation.retry"),
         "no retry ladder for an agent that wants nothing",
       ).toEqual([]);
-      expect(
-        events.filter((e) => e.event === "session.standing_receiver.reservation.rebuild"),
-        "and no rebuild",
-      ).toEqual([]);
+      /**
+       * ⚠️ **A THIRD ASSERTION USED TO SIT HERE AND WAS VACUOUS — 056-SLOTDEAD, review F15.** It
+       * filtered events for `session.standing_receiver.reservation.rebuild`, a name no code has
+       * ever logged (only `…rebuild.failed` existed), so "and no rebuild" was arithmetic on an
+       * empty list and green however the code behaved. Not replaced, because the assertion three
+       * lines above already makes the real check: a rebuild replaces the receiver's transport
+       * identity, so an unchanged peer id IS "no rebuild", observed rather than named.
+       */
     } finally {
       await manager.gracefulShutdown();
       await relay.node.stop();

@@ -90,7 +90,7 @@ import { type SecurityGatewayClient } from "@cello-protocol/gateway";
  * `(witness relay, session)`, so a repeated observation raises `occurrences` rather than taking
  * another slot in a bounded list.
  */
-import { ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL, PARKED_DRAIN_BACKSTOP_DEFAULT_MS, type ActiveSessionEntry, SALT_AGREEMENT_WAIT_MS, type AwaitingAckEntry, CONTENT_MAX_INBOUND_STREAMS, type ISessionNodeFactory, LEAF_FETCH_GRACE_MS, type ParkedDrainReason, type QuarantinedRecord, type ReceivedContentEntry, type RefusalNotice, type SessionImpairment, type SessionRevivalIdentity, type TranscriptEntry, type WitnessAlertNotice } from "./session-node-types.js";
+import { ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL, heldRelayIdsOf, PARKED_DRAIN_BACKSTOP_DEFAULT_MS, type ActiveSessionEntry, SALT_AGREEMENT_WAIT_MS, type AwaitingAckEntry, CONTENT_MAX_INBOUND_STREAMS, type ISessionNodeFactory, LEAF_FETCH_GRACE_MS, type ParkedDrainReason, type QuarantinedRecord, type ReceivedContentEntry, type RefusalNotice, type SessionImpairment, type SessionRevivalIdentity, type TranscriptEntry, type WitnessAlertNotice } from "./session-node-types.js";
 
 // Re-exported so this module's public surface is unchanged by the split: every existing
 // importer of session-node-manager.js keeps working, and no test moves an import path.
@@ -420,6 +420,10 @@ export class SessionNodeManager {
   getStandingReceiverAllowedPeer(agentName: string): string | null { return this.#receivers.getStandingReceiverAllowedPeer(agentName); }
   admitOfferedDialer(a: string, p: string, sid: string): "narrowed" | "no_receiver" | "no_peer_named" { return this.#receivers.admitOfferedDialer(a, p, sid); }
   takeReservationForSession(a: string, c: string, cid: string, offerSid?: string): Promise<boolean> { return this.#receivers.takeReservationForSession(a, c, cid, offerSid); } // 055-ONDEMAND
+
+  // 056-SLOTDEAD — the RE-TAKE, for a live session whose circuit died. Exposed so the outage-and-
+  // recovery path can be driven end to end; the offer path alone is the wrong half of the pair.
+  retakeReservationOn(a: string, node: CelloNode, c: string, cid: string): Promise<boolean> { return this.#receivers.retakeReservationOn(a, node, c, cid); }
   getStandingReceiverRelayIds(a: string): string[] { return [...(this.#standingReceivers.get(a)?.relayPeerIds ?? [])]; } // 055-ONDEMAND
   /** 055-ONDEMAND — a live session's own node. Its circuit is not the receiver's; see the release path. */
   getSessionNodeForTest(a: string, sid: string): CelloNode | null { return this.#activeNodes.get(this.#k(a, sid))?.node ?? null; }
@@ -646,7 +650,6 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
    *  the retry and give-up can name a CAUSE instead of only their own exit point. */
   readonly #srLastRejectionReason = new Map<string, string>();
   /** 032-RELAYSPREAD: when this agent's receiver was last re-spread, so it never rides the 30s grid. */
-  readonly #srLastRespreadAt = new Map<string, number>();
   readonly #srReservationRetry = new Map<string, { attempts: number; nextAt: number; correlationId: string; lastReason?: string }>();
   #reservationWatchdog: ReturnType<typeof setInterval> | null = null;
 
@@ -1294,7 +1297,6 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       agentsWantingReceiver: this.#agentsWantingReceiver,
       srReservationRetry: this.#srReservationRetry,
       srLastRejectionReason: this.#srLastRejectionReason,
-      srLastRespreadAt: this.#srLastRespreadAt,
       directoryRelayEndpoints: this.#directoryRelayEndpoints,
       standingReceiverRemoving: this.#standingReceiverRemoving,
       srRetryDelaysMs: this.#srRetryDelaysMs,
@@ -1306,8 +1308,12 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       // 055-ONDEMAND — the abandoned-offer release asks these two: did the session this offer was
       // for actually start, and what do the agent's remaining live sessions still need?
       sessionIsLive: (a, sid) => this.#activeNodes.has(this.#k(a, sid)),
+      // ⚠️ `heldRelayIdsOf`, NOT a substring test — 056-SLOTDEAD. This shipped asking only whether an
+      // address contains `p2p-circuit`, a looser definition than the rest of the daemon's. One that
+      // does not NAME its relay cannot be watched, proved to, or admitted inbound (`msg-018` says so),
+      // yet this reported `reserved` — an undialable agent looking healthy where an operator looks first.
       anyLiveSessionHoldsCircuit: (a) => [...this.#activeNodes.values()]
-        .some((e) => e.agentName === a && e.node.listenAddresses().some((ad) => ad.split("/").includes("p2p-circuit"))),
+        .some((e) => e.agentName === a && heldRelayIdsOf(e.node).length > 0),
       authenticateStandingReceiver: (a, node, relayPeerId, heldCircuitAddr, cid) => this.#relay.authenticateStandingReceiver(a, node, relayPeerId, heldCircuitAddr, cid),
     });
 
@@ -1394,7 +1400,6 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       relayQuarantine: this.#relayQuarantine,
       srReservationRetry: this.#srReservationRetry,
       srLastRejectionReason: this.#srLastRejectionReason,
-      srLastRespreadAt: this.#srLastRespreadAt,
       srRelayRefusal: this.#srRelayRefusal,
 
       get shuttingDown() { return mgr.#shuttingDown; },
@@ -2203,7 +2208,6 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     this.#standingReceivers.clear();
     this.#srReservationRetry.clear();
     this.#srLastRejectionReason.clear();
-    this.#srLastRespreadAt.clear();
 
     // Release the SQLite handle so the DB file is no longer held open after shutdown
     // (review L5). Queries guard on `#db === null` and degrade to empty/null.

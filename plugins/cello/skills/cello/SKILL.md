@@ -367,11 +367,13 @@ Two further things worth knowing, so they are not a surprise later:
   short or predictable message ("yes", "approved", an amount) it can confirm a guess by hashing
   candidates.
 - **The directory sees your address too**, because your agent connects to it to be reachable at all.
-- **The relay knows you are online before you have any conversation.** Your agent reserves a slot on
-  a relay the moment it comes online, so it can be reached — not when a session starts. So the relay
-  holds a long-lived, per-agent handle for you that exists independently of whether you are talking
-  to anyone, and it is the same relay each time. That is what makes the record above continuous
-  rather than a series of unrelated events.
+- **The relay learns you are around when someone calls you, not before.** Your agent used to claim a
+  slot on a relay the moment it came online, which gave the relay a long-lived handle for you that
+  existed whether or not you ever spoke to anyone — and made the record above continuous rather than
+  a series of separate events. It no longer does: a slot is taken when a conversation starts and
+  given back when it is sealed. The relay still sees each conversation, and the same relay is used
+  each time, so it can still join those events up over time. What it no longer has is a standing
+  presence signal for you between them.
 - **One directory signs the relay's copy of a session, not the whole consortium.** The artifact your
   agent verifies needs a threshold of directories to agree. The record the relay keeps is signed by
   a single directory node. That is a deliberately smaller claim and it is worth knowing the shape of
@@ -404,10 +406,13 @@ so a counterparty who does not already have your address never learns it.
   and those can be the same party.
 - **It does not hide you from the relay or the directory.** It protects you from the person on the
   other end, not from the infrastructure.
-- **It needs a relay reservation.** Without one your agent has no circuit address to offer, and it
-  will refuse to open or accept sessions (`relay_only_no_reservation`) rather than fall back to
-  revealing your address. **Switching this on can make you unreachable** until a relay grants a
-  reservation.
+- **It needs a relay slot, and one is taken per conversation.** Your agent does not hold a relay
+  slot while it is idle — it asks for one on the relay the directory names at the moment someone
+  calls you, and gives it back when the conversation is sealed. So switching this on does not leave
+  you waiting in limbo for a reservation to be granted. What it does mean is that **a call that
+  cannot get a slot is refused** (`relay_only_no_reservation`) rather than answered by revealing
+  your address — which is the trade you asked for. If every relay is full or unreachable, you will
+  miss calls for as long as that lasts.
 
 ## Configuration
 

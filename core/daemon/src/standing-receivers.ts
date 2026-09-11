@@ -82,7 +82,6 @@ export interface StandingReceiverContext {
   readonly standingReceiverRemoving: Set<string>;
   readonly srReservationRetry: Map<string, { attempts: number; nextAt: number; correlationId: string; lastReason?: string }>;
   readonly srLastRejectionReason: Map<string, string>;
-  readonly srLastRespreadAt: Map<string, number>;
   readonly directoryRelayEndpoints: Map<string, Array<{ relayPeerId: string; relayAddrs: string[] }>>;
   readonly srRetryDelaysMs: number[];
   readonly srReservationTimeoutMs: number;
@@ -317,6 +316,25 @@ export class StandingReceivers {
     const relayPeerId = relayPeerIdOf(circuitAddr);
     const outcome = await this.#takeReservation(agentName, node, circuitAddr, correlationId);
     if (outcome !== "granted") return false;
+    /**
+     * ⚠️ **THE OTHER HALF OF `reservation_lost` — 056-SLOTDEAD, review F4.**
+     *
+     * The loss trigger fires the moment a reservation goes, which is exactly when the relay link is
+     * down, so the pull it starts is aimed at a relay that cannot answer. Without something on the
+     * recovery, content the counterparty parked during the outage waits for the slow periodic
+     * backstop while the relay is healthy and this agent is connected to it again.
+     *
+     * **This path, and not the two that look like it.** The watchdog's `gained` branch was the
+     * first attempt and never fired — a take records the new circuit on the receiver itself, so by
+     * the next tick there is nothing left for the watchdog to see as gained; a test caught it, which
+     * is the only reason it is not still in the tree looking correct. `takeReservationForSession`
+     * was the second, and it double-drains: on a first login it fires moments after the install
+     * drain, for the same empty mailbox.
+     *
+     * A re-take is unambiguous. It happens only when a session that HAD a circuit lost it, which is
+     * exactly the outage whose recovery this is.
+     */
+    this.#ctx.park.fireParkedDrain(agentName, "reservation_regained");
     if (relayPeerId) {
       void this.#ctx.authenticateStandingReceiver(agentName, node, relayPeerId, circuitAddr, correlationId)
         .catch((err: unknown) => {
@@ -701,43 +719,28 @@ export class StandingReceivers {
     autoNat.emitInitialResult();
 
     /**
-     * EVERY RELAY THE NODE ACTUALLY HOLDS A CIRCUIT WITH — derived from the addresses the node
-     * holds, never from `reservations.addrs`.
+     * ⚠️ **A RECEIVER IS INSTALLED HOLDING NOTHING, AND THAT IS NOW A CONSTANT — 056-SLOTDEAD.**
      *
-     * The old code read `reservations.addrs[0]`'s relay id as a fallback, and its own comment
-     * called the hazard "dormant while the pool is size 1; the pool is designed to be larger."
-     * THIS UNIT IS WHAT MAKES THE POOL LARGER, so the dormant case wakes up: candidate 0 refusing
-     * while candidate 1 grants recorded a relay we are not connected to, the watchdog found it
-     * absent on every tick forever, and it rebuilt on the 30-second grid — churning the very
-     * reservations this unit exists to conserve. A candidate is a relay we ASKED; only a held
-     * address is a relay that ANSWERED, and the fallback conflated the two.
+     * This block used to derive what the node had come up holding: `heldRelayIdsOf(node)`, the
+     * matching circuit addresses, the count for the reachability line, and the gater's inbound
+     * carve-out. Every one of those read the result of the login walk. `#startReceiverNode` returns
+     * a TCP-only node now (055-ONDEMAND), so all four were computing `[]` — reachable, referenced,
+     * and unable to produce a different answer on any input.
      *
-     * The fallback's own stated worry stands, and is answered by the count rather than by the
-     * candidate list: if a transport ever reports a circuit address without the relay's peer id in
-     * `/p2p/<id>/p2p-circuit` form, that address yields no id and is not counted as held — so the
-     * receiver reads as degraded and gets rebuilt, instead of reading as healthy against a relay
-     * nobody is connected to. Degrading toward "rebuild" is the safe direction; the other one is
-     * the silent unreachability this whole file exists to kill.
+     * The distinction the deleted comment was defending — a CANDIDATE is a relay we asked, a HELD
+     * address is one that answered — is still the rule, and it still lives in `heldRelayIdsOf`. It
+     * is enforced where a reservation is actually taken (`takeReservationForSession`) and where one
+     * is checked (the watchdog), which is where it belongs. Nothing is held here to check.
+     *
+     * The gater is left as constructed: its reserved set starts empty, and `takeReservationForSession`
+     * widens it for the one relay that grants. Setting it to `[]` here only restated that.
      */
-    const heldRelayPeerIds = heldRelayIdsOf(node);
-    const circuitAddrs = heldRelayPeerIds.length;
-    const heldCircuitAddrs = node.listenAddresses().filter((a) => a.includes("/p2p-circuit"));
-    // DOD-M15-ASSIGN-1 review N3, widened by 032-RELAYSPREAD: the relays this receiver actually
-    // reserved with earn the inbound AutoNAT carve-out — nothing else does. Populated only from
-    // reservations that genuinely completed, so a directory that merely NAMES a relay cannot dial
-    // in behind it, however many relays it names.
-    gater.setReservedRelayPeers(heldRelayPeerIds);
-    // The re-spread clock starts HERE, at the build, not at the epoch. Otherwise the first decay
-    // re-spreads instantly — undoing the "a lost relay does not rebuild the receiver" rule seconds
-    // after it fires, and changing the peer id of an agent that just lost one relay of three. The
-    // ratchet this guards against runs over hours; nothing about it needs answering in a second.
-    this.#ctx.srLastRespreadAt.set(agentName, Date.now());
     this.#ctx.standingReceivers.set(agentName, {
       node,
       gater,
       autoNat,
       seed,
-      relayPeerIds: heldRelayPeerIds,
+      relayPeerIds: [],
     });
     this.#ctx.logger.info("session.node.created", {
       sessionId,
@@ -746,51 +749,42 @@ export class StandingReceivers {
       correlationId,
     });
 
-    // DOD-M15-RELAYAUTH-1: authenticate to the reservation relay NOW, not when a session first
-    // needs one. The relay times out a reservation nobody has proven key possession for
-    // (relay-connection-gater.ts, trustless-cello) — proving it here, instead of waiting for a
-    // real session to exist, is what keeps this reservation alive past that grace window.
-    // Best-effort and unawaited: a failure here costs nothing beyond the relay's own grace-window
-    // revoke, which the reservation watchdog already treats as an ordinary lost reservation.
-    // ONCE PER HELD RELAY. Each relay revokes independently — it times out the reservation of any
-    // peer that has not proven key possession TO IT — so proving to one of three and calling the
-    // receiver authenticated would lose the other two circuits about fifteen seconds later, which
-    // is the same silent unreachability with two more relays paying for it.
-    for (const relayPeerId of heldRelayPeerIds) {
-      const heldCircuitAddr = heldCircuitAddrs.find((a) => a.includes(`/p2p/${relayPeerId}/p2p-circuit`));
-      if (heldCircuitAddr === undefined) continue;
-      void this.#ctx.authenticateStandingReceiver(agentName, node, relayPeerId, heldCircuitAddr, correlationId)
-        .catch((err: unknown) => {
-          this.#ctx.logger.warn("session.standing_receiver.relay_auth.failed", {
-            agentName,
-            relayPeerId,
-            error: extractErrorMessage(err),
-            correlationId,
-          });
-        });
-    }
+    /**
+     * ⚠️ **DOD-M15-RELAYAUTH-1'S INSTALL-TIME PROOF IS GONE — 056-SLOTDEAD, and it could not have
+     * run since 055-ONDEMAND.**
+     *
+     * It read: *"authenticate to the reservation relay NOW, not when a session first needs one"* —
+     * because the relay revokes a reservation whose holder has not proven key possession to it, and
+     * a login-time slot had to survive that grace window with no session in sight. It looped over
+     * the relays this receiver held. It holds none, so the loop's body never executed.
+     *
+     * **The requirement it served is not gone; it moved, and it moved to the stronger place.** A
+     * reservation is now taken by `takeReservationForSession`, which proves FIRST and asks second on
+     * the same connection (`DOD-M15-RELAYPROVE-ORDER-1`). "Proven before the slot exists" is
+     * structural there, rather than a second best-effort call racing a grace window.
+     */
 
-    // DOD-NAT-REACHABILITY-1 observability: how reachable did this receiver come up? Zero held
-    // while relays were offered means every relay refused or was unreachable — the agent is deaf
-    // to NAT'd initiators (public ones can still connect directly). That must be LOUD, not a quiet
-    // shrug.
-    //
-    // 032-RELAYSPREAD — TWO NUMBERS, SO TWO NAMES. Both events used to carry one field,
-    // `reservationsRequested`, holding `reservations.addrs.length` — the size of the CANDIDATE
-    // list, under a name that reads as a count of asks. That is why "the client already requests a
-    // reservation with every relay it knows" read as true in an audit: the outcome was one and the
-    // request was one too, and a single field could report neither.
-    //   relaysOffered    — how many relays were in the candidate list (deduped by relay peer id in
-    //                      `#reservationCircuitAddrs`, so it counts relays, not addresses).
-    //   reservationsHeld — how many reservations this node actually holds, counted the only way
-    //                      that proves a grant: ANNOUNCED /p2p-circuit listen addresses. `start()`
-    //                      resolving is not enough — a relay out of reservation slots completes the
-    //                      handshake, grants nothing, and leaves a node that looks started and is
-    //                      dialable by nobody.
+    /**
+     * DOD-NAT-REACHABILITY-1 observability: what did this receiver come up able to use?
+     *
+     * ⚠️ **`reservationsHeld` WAS DROPPED, NOT RENAMED — 056-SLOTDEAD.** It carried
+     * `heldRelayIdsOf(node).length` and was the one number in this line an operator would act on.
+     * Since 055-ONDEMAND a receiver is installed holding nothing by design, so it reported `0` on
+     * every healthy login for every agent — a measurement that had become a constant while still
+     * reading as a measurement. That is worse than not reporting it: the number an operator trusts
+     * to mean "this agent is deaf" now means nothing at all.
+     *
+     * `relaysOffered` stays and is still a real count: how many relays are in the candidate list
+     * (deduped by relay peer id in `reservationCircuitAddrs`, so it counts relays, not addresses).
+     * **Zero of them is the condition worth seeing here** — an agent with no candidate cannot take a
+     * slot when an offer arrives, and will refuse the call.
+     *
+     * What an agent actually holds is reported where it is now decided: `session.offer.reservation`
+     * at the moment a slot is asked for, and `getStandingReceiverReachability` for `cello_status`.
+     */
     this.#ctx.logger.info("session.standing_receiver.reachability", {
       agentName,
       relaysOffered: reservations.addrs.length,
-      reservationsHeld: circuitAddrs,
       correlationId,
     });
     /**
@@ -806,20 +800,25 @@ export class StandingReceivers {
      * The condition it named still has a home. `session.offer.reservation` reports `granted: false`
      * when an offer could not get a circuit — the moment it actually costs someone something — and
      * the watchdog's re-take path reports a live session that lost one.
+     *
+     * ⚠️ **AND ITS DEBUG-LEVEL REPLACEMENT WENT TOO — 056-SLOTDEAD, review F10.** A
+     * `session.standing_receiver.idle_no_reservation` line survived here, guarded on
+     * `reservations.addrs.length > 0 && circuitAddrs === 0`. The second term was always true once
+     * the login walk was deleted, so the guard was really just "this agent has candidates" and the
+     * line fired on every healthy install for every agent — a second event, under a name that reads
+     * as a fault, asserting the same by-design state the `idle` line above already reports with its
+     * `relaysAvailable` count. Two lines per install saying "normal" is how a log stops being read.
      */
-    if (reservations.addrs.length > 0 && circuitAddrs === 0) {
-      this.#ctx.logger.debug("session.standing_receiver.idle_no_reservation", {
-        agentName,
-        relaysAvailable: reservations.addrs.length,
-        correlationId,
-      });
-    }
 
     // DOD-PARK-DRAIN-1: this agent has a receiver again — drain whatever parked while it did not.
-    // Fired from the ONE place every path converges on (first ensure, the watchdog rebuild after a
-    // lost reservation, and the auth_ok rebuild), because the defect this closes was a trigger
-    // hooked to the wrong connection: content parks when the RELAY link dies, and the drain was
-    // waiting on DIRECTORY SIGNALING to reconnect — which it never had to, having never dropped.
+    // The defect this closes was a trigger hooked to the wrong connection: content parks when the
+    // RELAY link dies, and the drain was waiting on DIRECTORY SIGNALING to reconnect — which it
+    // never had to, having never dropped.
+    //
+    // 056-SLOTDEAD: this used to be the ONE place every path converged on, because a lost
+    // reservation rebuilt the receiver and arrived back here. The rebuilds are gone, so this now
+    // covers the INSTALL only, and the loss has its own trigger (`reservation_lost`) at the point
+    // the loss is noticed.
     this.#ctx.park.fireParkedDrain(agentName, "standing_receiver_ready");
     return { outcome: "installed" };
   }
@@ -869,69 +868,6 @@ export class StandingReceivers {
       });
     } finally {
       this.#ctx.standingReceiverCreating.delete(agentName);
-    }
-  }
-  /**
-   * Replace an agent's reservation-less standing receiver with one that reserves.
-   *
-   * Deliberately NOT removeStandingReceiverForAgent()+ensureStandingReceiverForAgent():
-   * the public remove CLEARS #agentsWantingReceiver, so a cello_set_agent_offline landing in
-   * the window while node.stop() is awaited would find no map entry and no creating
-   * marker, leave no tombstone, and the re-ensure would then RESURRECT a receiver for
-   * an agent that asked to go dark — accepting inbound sessions for an offline agent.
-   * Here the want-flag is left intact and re-checked after the stop: a concurrent stop
-   * clears it, and the rebuild correctly no-ops.
-   */
-  async rebuildStandingReceiver(agentName: string): Promise<void> {
-    try {
-      const sr = this.#ctx.standingReceivers.get(agentName);
-      if (sr) {
-        this.#ctx.standingReceivers.delete(agentName);
-        /**
-         * DOD-M12B-SESSION-SEED-1 (review F8): drop it zeroed, like every other seed.
-         *
-         * (review F7, STILL DECIDED AGAINST — deliberately NOT reusing this seed for the
-         * replacement — but its stated blocker is GONE and the reason has changed. Restated rather
-         * than reworded, because a decision whose premise has been reversed is a decision nobody
-         * has actually made.)
-         *
-         * Reuse is attractive: this receiver's peer id may already be inside a `session_offer_accept`
-         * the counterparty is acting on, and a rebuild in that window is the documented "we record
-         * an identity that no longer exists… every send in this direction parks forever" defect.
-         *
-         * The old blocker was that a preserved identity would reach the candidate loop, whose
-         * rejected candidates were stopped WITHOUT awaiting `start()`, putting two live nodes on one
-         * advertised peer id. **032-RELAYSPREAD already crossed that line**: the walk now runs one
-         * shared seed through every candidate, with a settlement-chained teardown, and it is safe
-         * there because the receiver's gater admits nobody inbound.
-         *
-         * What still stops reuse HERE is different and is about the OLD node, not the new one. This
-         * rebuild path awaits `sr.node.stop()`, but a stop can hang on a stuck libp2p teardown, and
-         * handing the replacement the same identity before the previous receiver is provably dead
-         * would put two nodes on a peer id a COUNTERPARTY has been told to dial — which is not the
-         * candidate case at all: that node has a content handler and can be promoted. Doing it
-         * safely needs a bounded, verified teardown first. Still follow-on work.
-         */
-        sr.seed.fill(0);
-        try {
-          sr.autoNat.stop();
-          await sr.node.stop();
-        } catch (err: unknown) {
-          this.#ctx.logger.warn("session.standing_receiver.teardown.failed", {
-            agentName,
-            error: extractErrorMessage(err),
-          });
-        }
-      }
-      // The agent may have gone offline while we were stopping the old node. Its
-      // want-flag is the authority — never resurrect a receiver it disowned.
-      if (!this.#ctx.agentsWantingReceiver.has(agentName) || this.#ctx.shuttingDown()) return;
-      await this.ensureStandingReceiver(agentName);
-    } catch (err: unknown) {
-      this.#ctx.logger.warn("session.standing_receiver.reservation.rebuild.failed", {
-        agentName,
-        error: extractErrorMessage(err),
-      });
     }
   }
   /**

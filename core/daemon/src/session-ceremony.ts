@@ -68,9 +68,16 @@ export function wireSessionOfferHandler(deps: {
    * accept. Resolves whether one was granted; a `false` is not fatal — the agent can still be
    * reached directly, and relay-only is the one mode where it is not (see the guard below).
    *
-   * Optional, defaulting to a no-op, so every existing caller and test keeps its exact behaviour.
+   * ⚠️ **REQUIRED, AND IT WAS OPTIONAL — 056-SLOTDEAD, review F14.** "Optional, defaulting to a
+   * no-op, so every existing caller and test keeps its exact behaviour" is how it shipped, and the
+   * cost was not behaviour: it was that a fixture omitting this dep skipped the reserve ENTIRELY
+   * and still went green. The reserve is the capacity change — the one thing unit 3 exists to do —
+   * so a handler that never performed it passed the whole suite, and the next fixture written
+   * without the dep would have done the same thing silently. Required, the type checker names
+   * every caller that has to think about it, and there is no version of this handler that quietly
+   * does not reserve.
    */
-  reserveOnDemand?: (circuitAddr: string, sessionIdHex: string) => Promise<boolean>;
+  reserveOnDemand: (circuitAddr: string, sessionIdHex: string) => Promise<boolean>;
   signaling: SignalingSeam;
   logger: Logger;
 }): () => void {
@@ -147,7 +154,7 @@ export function wireSessionOfferHandler(deps: {
       const relayAddrs = Array.isArray(offeredRelay?.multiaddrs)
         ? (offeredRelay.multiaddrs as unknown[]).filter((a): a is string => typeof a === "string")
         : [];
-      if (relayPeerId && relayAddrs.length > 0 && deps.reserveOnDemand) {
+      if (relayPeerId && relayAddrs.length > 0) {
         const base = relayAddrs[0]!;
         // The circuit address form the walk uses: the relay's own address with `/p2p-circuit`.
         const circuitAddr = base.includes(`/p2p/${relayPeerId}`)
@@ -165,6 +172,33 @@ export function wireSessionOfferHandler(deps: {
         });
         // Re-read: the endpoint we advertise has to include the circuit we just took.
         sr = deps.getStandingReceiverEndpoint() ?? sr;
+      } else {
+        /**
+         * ⚠️ **AN OFFER THAT NAMES NO RELAY USED TO ASK NOBODY AND SAY NOTHING — 056-SLOTDEAD, F8.**
+         *
+         * `session.offer.reservation` only fires when a relay WAS named, so this branch was silent.
+         * The failure that makes silence expensive: if the directory stops naming a relay — an old
+         * node in the pool, a bad roll, a regression in `pickRelay` — a relay-only agent refuses
+         * every inbound call with `relay_only_no_reservation`. That reason reads as "no relay would
+         * grant me a slot", so the operator goes and looks at relay capacity, and the fault is on
+         * the directory and has nothing to do with slots. One line makes that a grep.
+         *
+         * INFO, not WARN: against a directory that has not rolled yet this is the expected shape,
+         * and the agent degrades correctly to its direct address. It is loud enough to find, and it
+         * says which of the two states it is.
+         */
+        deps.logger.info("session.offer.reservation.not_offered", {
+          agentName: deps.agentName,
+          hasRelayEndpoint: offeredRelay !== undefined,
+          impact: offeredRelay === undefined
+            ? "the directory's offer named no relay, so this agent asked nobody for a slot and will " +
+              "answer with the addresses it already has. Expected against a directory that predates " +
+              "on-demand reservations; unexpected otherwise, and under relay-only it means the call " +
+              "is about to be refused for a reason that points at the wrong side."
+            : "the offer carried a relay_endpoint this agent could not read — no usable peer id or " +
+              "no multiaddrs — so no slot was asked for. That is a malformed frame from the " +
+              "directory, not a relay at capacity.",
+        });
       }
       // DOD-M15-RELAYONLY-1: ANSWER, never publish an empty address list — **but only when
       // relay-only is what emptied it.**
