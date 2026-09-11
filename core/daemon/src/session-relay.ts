@@ -1044,26 +1044,27 @@ export class SessionRelay {
    * That is precisely the silent-loss-of-inbound failure this whole story exists to
    * kill, so it cannot be left to chance: we watch for it and re-pick a relay.
    *
-   * Only receivers that HAD a reservation are watched. One that never got one is
-   * already degraded and already loud (reservation.none / reservation.timeout);
-   * rebuilding it on a timer would just thrash against relays we know are refusing.
+   * ⚠️ 056-SLOTDEAD: this paragraph used to end "Only receivers that HAD a reservation are watched.
+   * One that never got one is already degraded and already loud (reservation.none /
+   * reservation.timeout); rebuilding it on a timer would just thrash against relays we know are
+   * refusing." Every clause of that is now false — an idle receiver holds nothing BY DESIGN so
+   * "degraded" is the normal state, `reservation.none` is not emitted at build any more, and
+   * nothing rebuilds. What is watched is a receiver whose recorded set has shrunk, and what
+   * happens is a re-take in place for a LIVE session, never a rebuild.
    */
   /**
-   * DOD-M12B-RESERVATION-RETRY-1 — ask again for a reservation the relay refused.
+   * DOD-M12B-RESERVATION-RETRY-1 / 055-ONDEMAND — is a re-attempt due, and claim it if so.
    *
-   * The rebuild is the re-attempt. ⚠️ It is a CHOICE, not the only option: its old justification
-   * ("a circuit listener is fixed at node creation") stopped being true when `listenOnCircuit`
-   * landed. A fresh receiver re-runs the whole walk, proof included, which is why it stays.
-   */
-  /**
-   * 055-ONDEMAND — is a re-attempt due, and claim it if so.
+   * ⚠️ **TWO DOC BLOCKS DESCRIBING `#retryReservationIfDue` USED TO SIT HERE — 056-SLOTDEAD, review
+   * F7.** That function is deleted. One of them said "the rebuild is the re-attempt … which is why
+   * it stays", so a reader following the comment landed on this function and concluded a rebuild
+   * ladder was still running. There is no rebuild anywhere in this file.
    *
-   * ⚠️ **THE SAME LADDER AS `#retryReservationIfDue`, DELIBERATELY, but it does not call it.** That
-   * one REBUILDS the receiver, which under on-demand reserves nothing — running both would spend a
-   * node build per attempt to no effect. This reads and advances the same `srReservationRetry`
-   * state, so the two paths share ONE budget: a reservation is scarce, the relay holds it for its
-   * full TTL even after the client disconnects, and this file's own warning is that churning
-   * attempts across a fleet is how a relay is exhausted.
+   * What this does: a live session that lost its circuit re-takes it IN PLACE, on the node that
+   * already has the session, and this owns whether it is allowed to try yet. ONE ladder — a
+   * reservation is scarce, the relay holds it for its full TTL even after the client disconnects,
+   * and this file's own warning is that churning attempts across a fleet is how a relay is
+   * exhausted.
    */
   #retryDue(agentName: string): boolean {
     const now = Date.now();
@@ -1085,7 +1086,27 @@ export class SessionRelay {
           agentName,
           attempts: SR_RESERVATION_MAX_RETRIES,
           correlationId: state.correlationId,
+          // WHY, not just the consequence. Three different problems reach this one message and they
+          // need three different responses: `relay_granted_no_reservation` is relay CAPACITY (and a
+          // trustless-cello problem), `relay_unreachable` is the NETWORK, and
+          // `reservation_did_not_complete_in_time` is LATENCY.
           ...(state.lastReason !== undefined ? { lastRejectionReason: state.lastReason } : {}),
+          /**
+           * ⚠️ **THESE TWO CAME BACK — 056-SLOTDEAD, review F9.** The deleted emitter of this SAME
+           * event name carried them; the surviving one did not, so the fields quietly vanished from
+           * an operator's view while the event kept appearing.
+           *
+           * "No relay would grant" and "there was no relay to ask" are different facts that lead to
+           * different places — the first at relay capacity, the second at this agent's directory
+           * connection. Without them they are the same sentence.
+           *
+           * `hadRelayToAsk` reads the directory pool alone; `relaysOffered` is the merged,
+           * quarantine-filtered candidate list the re-take actually walks. Two populations, so two
+           * names — the mis-naming that made `reservationsRequested` unreadable is the reason this
+           * note exists.
+           */
+          hadRelayToAsk: (this.#ctx.directoryRelayEndpoints.get(agentName)?.length ?? 0) > 0,
+          relaysOffered: this.reservationCircuitAddrs(agentName).addrs.length,
           impact: "a live session lost the circuit its counterparty dials, and no relay would give " +
             "it back inside the retry budget. Messages still reach this agent through the relay's " +
             "store-and-forward; a direct dial to it will not connect until the session is rebuilt.",
@@ -1094,8 +1115,9 @@ export class SessionRelay {
       return false;
     }
     state.attempts += 1;
-    // Doubling, floored at the configured interval — the same shape the rebuild ladder uses, and
-    // for the same reason: a fixed short interval is what exhausts a relay.
+    // Doubling, floored at the configured interval. 056-SLOTDEAD: this said "the same shape the
+    // rebuild ladder uses" — there is no rebuild ladder any more, this IS the ladder. The reason is
+    // unchanged: a fixed short interval is what exhausts a relay.
     state.nextAt = now + this.#ctx.srReservationRetryMs * Math.pow(2, state.attempts - 1);
     this.#ctx.srReservationRetry.set(agentName, state);
     this.#ctx.logger.info("session.standing_receiver.reservation.retry", {

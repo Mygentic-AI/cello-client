@@ -216,6 +216,15 @@ describe("DOD-M15-RESERVE-CAPACITY-1: an inbound offer takes ONE slot, on the re
     expect(h.asked.length).toBe(0);
     const accept = h.sent.find((f) => f["type"] === "session_offer_accept");
     expect(accept!["counterparty_session_addrs"]).toEqual([DIRECT_ADDR]);
+    /**
+     * ⚠️ **AND IT SAYS SO — review F8.** This branch was silent, because `session.offer.reservation`
+     * only fires when a relay was named. Under relay-only the same silence ends in a
+     * `relay_only_no_reservation` refusal, which reads as "no relay would grant me a slot" and sends
+     * the operator to look at relay capacity for a directory-side fault.
+     */
+    const line = h.events.find((e) => e.event === "session.offer.reservation.not_offered");
+    expect(line, "an offer that names no relay must say so").toBeDefined();
+    expect(line!.context["hasRelayEndpoint"]).toBe(false);
   });
 
   it("a malformed relay_endpoint asks nobody rather than asking a garbage address", async () => {
@@ -229,6 +238,11 @@ describe("DOD-M15-RESERVE-CAPACITY-1: an inbound offer takes ONE slot, on the re
       await h.fire();
       expect(h.asked.length, `relay_endpoint ${JSON.stringify(bad)} must not produce an ask`).toBe(0);
       expect(h.sent.find((f) => f["type"] === "session_offer_accept")).toBeDefined();
+      // Review F8: an unreadable relay_endpoint is a MALFORMED FRAME FROM THE DIRECTORY, and must be
+      // distinguishable from the directory simply not naming one — different causes, different fix.
+      const line = h.events.find((e) => e.event === "session.offer.reservation.not_offered");
+      expect(line, `${JSON.stringify(bad)} must be reported`).toBeDefined();
+      expect(line!.context["hasRelayEndpoint"]).toBe(true);
     }
   });
 

@@ -423,7 +423,8 @@ describe("R7+R8: directory-provided relay endpoints (Phase 2 client half)", () =
    */
   it("★★★ directory endpoints are usable whenever they arrive, and their arrival never churns the receiver", async () => {
     const relay = await startHopRelay();
-    const { manager, events } = await makeManager();
+    // 056-SLOTDEAD F15: `events` is gone with the vacuous rebuild-event assertion it was read for.
+    const { manager } = await makeManager();
     try {
       await seedAgents(manager.getDb(), ["alice"]); // agent exists; NO sessions rows
       await manager.ensureStandingReceiverForAgent("alice"); // endpoints not known yet
@@ -444,7 +445,15 @@ describe("R7+R8: directory-provided relay endpoints (Phase 2 client half)", () =
           "would throw away circuits a LIVE session is depending on, and its counterparty would " +
           "silently lose the route it was given.",
       ).toBe(before!.peerId);
-      expect(events.some((e) => e.event === "session.standing_receiver.reservation.rebuild")).toBe(false);
+      /**
+       * ⚠️ **THIS ASSERTED THE ABSENCE OF AN EVENT NOTHING HAS EVER EMITTED — 056-SLOTDEAD, F15.**
+       * `session.standing_receiver.reservation.rebuild` is not a name any code uses; only
+       * `…rebuild.failed` ever existed. So the line was vacuously true and always had been, and the
+       * whole weight of "no churn" rested on the peer-id comparison above it. Removed rather than
+       * corrected to `…rebuild.failed`: that event is gone too, and the peer id IS the observable —
+       * a rebuild mints a new transport identity, which is exactly what costs a live session its
+       * route. Asserting the identity is unchanged asserts the thing that matters.
+       */
 
       // And they are usable the moment an offer needs them — whenever they turned up.
       expect(
@@ -807,10 +816,14 @@ describe("W: a standing receiver that LOSES its reservation gets another one", (
         events.filter((e) => e.event === "session.standing_receiver.reservation.retry"),
         "no retry ladder for an agent that wants nothing",
       ).toEqual([]);
-      expect(
-        events.filter((e) => e.event === "session.standing_receiver.reservation.rebuild"),
-        "and no rebuild",
-      ).toEqual([]);
+      /**
+       * ⚠️ **A THIRD ASSERTION USED TO SIT HERE AND WAS VACUOUS — 056-SLOTDEAD, review F15.** It
+       * filtered events for `session.standing_receiver.reservation.rebuild`, a name no code has
+       * ever logged (only `…rebuild.failed` existed), so "and no rebuild" was arithmetic on an
+       * empty list and green however the code behaved. Not replaced, because the assertion three
+       * lines above already makes the real check: a rebuild replaces the receiver's transport
+       * identity, so an unchanged peer id IS "no rebuild", observed rather than named.
+       */
     } finally {
       await manager.gracefulShutdown();
       await relay.node.stop();

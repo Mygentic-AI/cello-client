@@ -172,6 +172,33 @@ export function wireSessionOfferHandler(deps: {
         });
         // Re-read: the endpoint we advertise has to include the circuit we just took.
         sr = deps.getStandingReceiverEndpoint() ?? sr;
+      } else {
+        /**
+         * ⚠️ **AN OFFER THAT NAMES NO RELAY USED TO ASK NOBODY AND SAY NOTHING — 056-SLOTDEAD, F8.**
+         *
+         * `session.offer.reservation` only fires when a relay WAS named, so this branch was silent.
+         * The failure that makes silence expensive: if the directory stops naming a relay — an old
+         * node in the pool, a bad roll, a regression in `pickRelay` — a relay-only agent refuses
+         * every inbound call with `relay_only_no_reservation`. That reason reads as "no relay would
+         * grant me a slot", so the operator goes and looks at relay capacity, and the fault is on
+         * the directory and has nothing to do with slots. One line makes that a grep.
+         *
+         * INFO, not WARN: against a directory that has not rolled yet this is the expected shape,
+         * and the agent degrades correctly to its direct address. It is loud enough to find, and it
+         * says which of the two states it is.
+         */
+        deps.logger.info("session.offer.reservation.not_offered", {
+          agentName: deps.agentName,
+          hasRelayEndpoint: offeredRelay !== undefined,
+          impact: offeredRelay === undefined
+            ? "the directory's offer named no relay, so this agent asked nobody for a slot and will " +
+              "answer with the addresses it already has. Expected against a directory that predates " +
+              "on-demand reservations; unexpected otherwise, and under relay-only it means the call " +
+              "is about to be refused for a reason that points at the wrong side."
+            : "the offer carried a relay_endpoint this agent could not read — no usable peer id or " +
+              "no multiaddrs — so no slot was asked for. That is a malformed frame from the " +
+              "directory, not a relay at capacity.",
+        });
       }
       // DOD-M15-RELAYONLY-1: ANSWER, never publish an empty address list — **but only when
       // relay-only is what emptied it.**

@@ -678,8 +678,9 @@ export class ParkRecovery {
    * DOD-PARK-DRAIN-1: the backstop sweep — every agent holding a standing receiver gets a drain
    * every #parkedDrainBackstopMs, whether or not anything happened.
    *
-   * The trigger-driven drains (agent start, receiver rebuild, signaling reconnect) are what
-   * actually deliver. This exists because the incident was a MISSING trigger, and a missing
+   * The trigger-driven drains (agent start, receiver install, a reservation lost or regained,
+   * signaling reconnect) are what actually deliver. 056-SLOTDEAD: "receiver rebuild" was one of
+   * them and there is no rebuild any more. This exists because the incident was a MISSING trigger, and a missing
    * trigger is invisible: the daemon looked healthy, the content was intact on the relay, and the
    * only thing that ever moved it was a human restarting the daemon. With the sweep, the worst a
    * future gap in trigger coverage can cost is one interval of latency. Safe by construction —

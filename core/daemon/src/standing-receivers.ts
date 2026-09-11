@@ -801,18 +801,14 @@ export class StandingReceivers {
      * when an offer could not get a circuit — the moment it actually costs someone something — and
      * the watchdog's re-take path reports a live session that lost one.
      *
-     * ⚠️ **AND THE `&& circuitAddrs === 0` HALF OF THIS GUARD WENT WITH IT — 056-SLOTDEAD.** A
-     * receiver is installed holding nothing, so that term was always true and the condition was
-     * really just "this agent has candidates". Leaving it in read as though the line still told two
-     * states apart.
+     * ⚠️ **AND ITS DEBUG-LEVEL REPLACEMENT WENT TOO — 056-SLOTDEAD, review F10.** A
+     * `session.standing_receiver.idle_no_reservation` line survived here, guarded on
+     * `reservations.addrs.length > 0 && circuitAddrs === 0`. The second term was always true once
+     * the login walk was deleted, so the guard was really just "this agent has candidates" and the
+     * line fired on every healthy install for every agent — a second event, under a name that reads
+     * as a fault, asserting the same by-design state the `idle` line above already reports with its
+     * `relaysAvailable` count. Two lines per install saying "normal" is how a log stops being read.
      */
-    if (reservations.addrs.length > 0) {
-      this.#ctx.logger.debug("session.standing_receiver.idle_no_reservation", {
-        agentName,
-        relaysAvailable: reservations.addrs.length,
-        correlationId,
-      });
-    }
 
     // DOD-PARK-DRAIN-1: this agent has a receiver again — drain whatever parked while it did not.
     // The defect this closes was a trigger hooked to the wrong connection: content parks when the

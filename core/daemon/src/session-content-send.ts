@@ -725,11 +725,11 @@ export class SessionContentSender {
       // like a protocol mystery for a night.
       //
       // `counterpartySessionPeerId` is the load-bearing field. It is recorded ONCE at session
-      // establishment and never refreshed. (CORRECTED 2026-08-18: this used to say a standing
-      // receiver is rebuilt "on every signaling reconnect" — it is not. `ensureStandingReceiverForAgent`
-      // no-ops on a healthy receiver; the only rebuild triggers are a LOST RELAY RESERVATION and the
-      // one-shot upgrade when relay endpoints first arrive.) If the two ever cross, every send goes
-      // one-way forever and nothing says so. With this line that becomes a single grep instead of a
+      // establishment and never refreshed. (CORRECTED 2026-08-18: it does NOT rebuild "on every
+      // signaling reconnect". CORRECTED AGAIN, 056-SLOTDEAD: the rebuild triggers that correction
+      // named are gone too — NOTHING rebuilds a standing receiver now; a lost reservation is
+      // re-taken in place, and only promotion into a session changes a receiver's identity.)
+      // If the two ever cross, every send goes one-way forever and nothing says so. With this line that becomes a single grep instead of a
       // night.
       this.#ctx.logger.warn("session.content.direct.send.failed", {
         agentName,

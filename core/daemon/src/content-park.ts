@@ -860,9 +860,11 @@ export function createContentPark(deps: ContentParkDeps) {
   /**
    * DOD-PARK-DRAIN-1 (review F1): one drain per agent at a time, and at most one re-run queued.
    *
-   * The drain used to have two triggers; it now has five (agent start, receiver install, every
-   * watchdog rebuild, signaling reconnect, the periodic backstop), and under the relay churn this
-   * unit exists to survive, rebuilds arrive faster than a drain completes. Concurrent drains are
+   * The drain used to have two triggers; it now has five (agent start, receiver install, a
+   * reservation LOST, a reservation REGAINED, signaling reconnect, the periodic backstop — the
+   * middle pair replaced "every watchdog rebuild" in 056-SLOTDEAD, which is where the count came
+   * from). Under the relay churn this unit exists to survive, those arrive faster than a drain
+   * completes. Concurrent drains are
    * NOT safe by dedup alone: ingestReceivedContent decides "already present" synchronously from
    * the in-memory tree and then AWAITS the security gateway before appending, so two drains that
    * pull the same parked entry can both pass that check and both append — a duplicate leaf, the
