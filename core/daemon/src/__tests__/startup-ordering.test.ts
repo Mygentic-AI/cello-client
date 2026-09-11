@@ -204,7 +204,15 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // a ticker that exists and is not reached from the composition root would restore the exact bug
     // it was written to remove. `sweeptick.test.ts` carries the companion assertion that daemon.ts
     // hands the wiring the TICKING sweep rather than the bare one.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(97);
+    //
+    // 97 → 99 for 051-LOGBOUND: `createCollapsingLogger` (log-collapse.ts) and `openLogHandle`
+    // (log-rotate.ts). This guard caught both on the first full run, and for this unit that is
+    // more than bookkeeping — BOTH of them are silent when unwired. A collapser that is built and
+    // not wrapped around the composition root leaves the log growing exactly as before, and a
+    // rotate-then-open that is written but never reached at spawn leaves the file unbounded; in
+    // neither case does anything fail, warn, or look different until someone measures the file
+    // months later. That is the shape this corpus exists to catch.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(99);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",
