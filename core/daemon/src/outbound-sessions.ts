@@ -646,6 +646,34 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
       getManifestVersion,
       visiting: true, // cross-node item 3: the directory must NOT write presence for this connection
       publishNode: (n) => { nodeRef = n; },
+      /**
+       * ⚠️ **DOD-M15-TOKENRACE-1 — THIS CONNECTION IS NOW LOAD-BEARING FOR RELAY ACCESS, NOT ONLY
+       * FOR TRUST SIGNALS.**
+       *
+       * The relay refuses to talk to an agent at all without a directory-signed online token — one
+       * gate on the general auth path, so it covers taking a slot, sending a message, sealing, and
+       * parked mail alike. The directory mints one onto `signaling_auth_ok`, which is the HANDSHAKE,
+       * and it lives one hour. The signaling heartbeat keeps the home stream alive and reconnects
+       * when it dies, and it works — so a healthy connection never handshakes again and never gets
+       * another token. **The better the connection, the staler the credential.** Measured on a real
+       * daemon: 18 gaps over the one-hour lifetime in four days, worst case 8.4 hours, with no
+       * disconnect inside that window at all.
+       *
+       * This connection already authenticates to every other node every five minutes, and the
+       * directory issues a token on that auth_ok unconditionally — `#issueOnlineToken` is gated only
+       * on the agent having a profile at that node, not on `visiting` and not on presence. The token
+       * was arriving all along and being parsed, logged and dropped. Storing it is the whole fix: no
+       * new frame, no directory change, no deploy ordering.
+       *
+       * ⚠️ **AND THE COUPLING IS DELIBERATE, SO IT IS SAID OUT LOUD.** Credential freshness now
+       * depends on `SWEEP_TICK_INTERVAL_MS` continuing to be well under
+       * `ONLINE_TOKEN_ISSUE_LIFETIME_MS` — five minutes against sixty, a twelvefold margin. That is
+       * the same shape as a mailbox drain riding a receiver rebuild, which 056-SLOTDEAD spent a day
+       * removing, so it is pinned by a test rather than trusted. If the sweep is ever removed or
+       * slowed past the margin, this needs the durable version: the directory pushing a fresh
+       * credential down the live stream before the old one expires.
+       */
+      onOnlineToken: (token) => { sessionNodeManager.setDirectoryOnlineToken(agentName, token); },
     });
     // maxReconnectAttempts: 1 — a transient connection should fail fast, not reconnect-loop forever.
     const mgr = new SignalingManager({ connect, logger, maxReconnectAttempts: 1, maxBackoffMs: 3_000 });

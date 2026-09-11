@@ -62,6 +62,21 @@ import { extractErrorMessage } from "./error-message.js";
  *
  * Five minutes puts the worst case an order of magnitude under what was observed while keeping the
  * steady-state cost at a handful of connections an hour per agent. Move it knowingly.
+ *
+ * ⚠️ **AND SOMETHING ELSE DEPENDS ON THIS CADENCE NOW — DOD-M15-TOKENRACE-1.**
+ *
+ * The visiting connection each tick opens is authenticated, so the directory hands it a fresh relay
+ * credential on `signaling_auth_ok`. Since `057-STALECRED` that credential is STORED, and it is what
+ * keeps an agent able to reach a relay at all — for taking a slot, for sending, for sealing, and for
+ * parked mail. The reason it has to come from somewhere is that the credential rides the HANDSHAKE
+ * and lives one hour, while a healthy home stream never handshakes again: measured at 8.4 hours
+ * between credentials with no disconnect in between.
+ *
+ * So the margin is load-bearing: **five minutes against a sixty-minute lifetime**. Raising this
+ * interval past that lifetime, or removing the tick, silently expires every agent's relay access
+ * while every connection still reports healthy. `dod-m15-tokenrace-1-visiting-refreshes-credential`
+ * pins the wiring; nothing pins this number, so this note is what stands between it and a change
+ * made for trust-signal reasons alone.
  */
 export const SWEEP_TICK_INTERVAL_MS = 5 * 60_000;
 
