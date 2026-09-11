@@ -1161,7 +1161,30 @@ export class SessionRelay {
          * session depends on, which is what the condition now says.
          */
         const liveSessions = [...this.#ctx.activeNodes.values()].filter((e) => e.agentName === agentName);
-        if (liveSessions.length === 0) continue;
+        if (liveSessions.length === 0) {
+          /**
+           * ⚠️ **AN AGENT WITH NO SESSION HAS NOTHING TO RETRY, SO IT MUST NOT LOOK LIKE IT DOES —
+           * `DOD-M15-IDLERETRY-1`, second half.**
+           *
+           * 061 stopped the ladder being OPENED for a session that needs nothing. It did not clear
+           * one that was legitimately opened and is now moot. A ladder exists to get a LIVE session
+           * its circuit back; when that session ends there is nothing left to get, and the entry is
+           * the only thing `getStandingReceiverReachability` consults — so a perfectly idle agent
+           * went on reporting `retrying`, and eventually `unreachable`, until the daemon restarted.
+           *
+           * Observed on the shipped 0.0.217 build: an agent with no live session at all, reading
+           * `retrying`. That can only happen through a stale entry, which is what sent this back for
+           * a second pass.
+           *
+           * Cleared HERE rather than at teardown on purpose: this is the one place that already
+           * knows, every tick, that an agent holds nothing and wants nothing. A teardown hook would
+           * be a second thing to keep in step with session lifecycle, and the whole class of defect
+           * in this file is two things drifting apart.
+           */
+          this.#ctx.srReservationRetry.delete(agentName);
+          this.#ctx.srLastRejectionReason.delete(agentName);
+          continue;
+        }
         /**
          * ⚠️ **RE-TAKE THE SESSION'S CIRCUIT — REBUILDING THE RECEIVER NO LONGER DOES IT.**
          *
