@@ -147,8 +147,25 @@ export interface AgentInfo {
    * `standing_receiver_ready` only says a receiver EXISTS — it is true for a plain TCP node no relay
    * would give a circuit reservation to, which behind NAT is reachable by nobody. That difference
    * was visible only in the log, where it appeared 481 times and nobody acted.
+   *
+   * ⚠️ **`ready` IS THE HEALTHY RESTING STATE, AND IT IS THE ONE AN OPERATOR SEES MOST —
+   * DOD-M15-IDLE-READY-1.** The five values, and what each one licenses:
+   *
+   *   `reserved`    — a relay slot is HELD. Somebody behind a home router can dial this agent right
+   *                   now. True during a live session, and while an offer's slot is in flight.
+   *   `ready`       — a receiver is standing by holding nothing, which is correct: since
+   *                   055-ONDEMAND a slot is taken when somebody calls and given back at the seal.
+   *                   **Not a degraded `reserved`.** Nothing is wrong and nothing is being retried.
+   *   `retrying`    — this agent WANTS a slot for a live session, cannot get one, and is still
+   *                   trying on a bounded budget. A real fault, in progress.
+   *   `unreachable` — the retry budget is spent. A NAT'd counterparty cannot reach it at all.
+   *   `absent`      — there is no receiver. The agent cannot accept anything.
+   *
+   * `ready` exists because without it `retrying` was the fallback for both "healthy and idle" and
+   * "genuinely cannot get a slot", so the field could not tell an operator which one they had —
+   * and a status that reads the same whether or not anything is wrong is not a status.
    */
-  standing_receiver_reachability?: "reserved" | "retrying" | "unreachable" | "absent";
+  standing_receiver_reachability?: "reserved" | "ready" | "retrying" | "unreachable" | "absent";
   /**
    * Whether THIS agent is the current (selected) agent for the requesting connection. Kept SEPARATE
    * from `state` — `state` must not overload the value "current", or two equally healthy agents read

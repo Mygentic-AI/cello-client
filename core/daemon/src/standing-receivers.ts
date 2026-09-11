@@ -1265,7 +1265,7 @@ export class StandingReceivers {
    *                 have never tried is new information.
    *   absent      — no receiver at all (the agent is not online).
    */
-  getStandingReceiverReachability(agentName: string): "reserved" | "retrying" | "unreachable" | "absent" {
+  getStandingReceiverReachability(agentName: string): "reserved" | "ready" | "retrying" | "unreachable" | "absent" {
     const sr = this.#ctx.standingReceivers.get(agentName);
     if (!sr) return "absent";
     // AT LEAST ONE. Holding two circuits and losing one leaves the agent perfectly dialable, so it
@@ -1282,7 +1282,31 @@ export class StandingReceivers {
      */
     if (this.#ctx.anyLiveSessionHoldsCircuit(agentName)) return "reserved";
     const retry = this.#ctx.srReservationRetry.get(agentName);
-    return retry !== undefined && retry.attempts > SR_RESERVATION_MAX_RETRIES ? "unreachable" : "retrying";
+    if (retry === undefined) {
+      /**
+       * ⚠️ **IDLE AND READY — DOD-M15-IDLE-READY-1, AND `retrying` HERE WAS NOT MERELY THE WRONG
+       * WORD.**
+       *
+       * Reaching this line means: a receiver exists, it holds no circuit, no live session holds one
+       * either, and **nothing has ever asked for one** — no retry state was recorded. Before
+       * 055-ONDEMAND that combination was rare and meant a real problem: an agent that wanted a slot
+       * at login and could not get one. An agent takes a slot when somebody calls now, so this is
+       * the ordinary resting state of every healthy idle agent on the fleet.
+       *
+       * Leaving it as `retrying` cost the field its only job. `retrying` said "we want a slot, we
+       * cannot get one, we are still trying" — and once every healthy agent says it, an agent that
+       * genuinely cannot get a slot is indistinguishable from one that is perfectly fine. A status
+       * that reads the same whether or not anything is wrong is not a status. Observed on two live
+       * agents the same afternoon: `reserved` on the published build, `retrying` on this one, with
+       * nothing different about whether anyone could reach them.
+       *
+       * ⚠️ **AND IT IS NOT `reserved`, which was the tempting one-liner.** `reserved` is a claim an
+       * operator acts on — a slot is held, so a counterparty behind a home router can dial in right
+       * now. That is false for an idle agent. Two different facts, so two different words.
+       */
+      return "ready";
+    }
+    return retry.attempts > SR_RESERVATION_MAX_RETRIES ? "unreachable" : "retrying";
   }
   /**
    * CELLO-M7-TRANSPORT-001: the AutoNAT service wrapping the current standing

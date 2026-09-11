@@ -1408,13 +1408,12 @@ Trigger: /cello-bridge-setup, or "install the CELLO bridge".
    caller shares one conversation, so two customers' problems land in one context.
    Omitting a flag on a re-run RESETS it to the default — it does not keep the old value.
 5. **Restart the gateway:** \`hermes gateway restart\`.
-6. **Verify.** Call the \`cello_status\` MCP tool and report the bound agent's state and
-   \`standing_receiver_ready\`. The bridge is live when the agent shows online and the receiver is
-   ready. **Do NOT wait for \`standing_receiver_reachability\` to read \`reserved\` — an idle agent
-   holds no relay slot on purpose, so it never will, and treating that as a failure would report
-   every healthy bridge as broken.** A slot is taken when someone calls and given back at the seal,
-   so that field means something during a conversation, not before one. \`unreachable\` is the one
-   value worth acting on: it means only peers that can connect directly will get in.
+6. **Verify.** Call the \`cello_status\` MCP tool and report the bound agent's state,
+   \`standing_receiver_ready\` and \`standing_receiver_reachability\`. The bridge is live when the
+   agent shows online and reachability reads \`ready\` — an idle agent holds no relay slot on
+   purpose, so \`ready\` IS the healthy answer and \`reserved\` only appears once a conversation is
+   running. **Do not treat \`ready\` as a failure or wait for \`reserved\`.** \`unreachable\` is the
+   one value worth acting on: only peers that can connect directly will get in.
 
 ## How to operate CELLO (after setup)
 
