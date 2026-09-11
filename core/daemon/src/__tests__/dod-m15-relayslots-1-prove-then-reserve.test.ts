@@ -294,7 +294,7 @@ async function makeManager(
    * unavailable — no builder wired — which is one of the ways `proveToRelay` reaches no verdict.
    * `logger` lets a case read the refusal reasons the walk emits.
    */
-  opts: { noRelayClient?: boolean; logger?: Logger; watchdogMs?: number } = {},
+  opts: { noRelayClient?: boolean; logger?: Logger; watchdogMs?: number; reservationRetryMs?: number } = {},
 ): Promise<SessionNodeManager> {
   const m = new SessionNodeManager({
     securityGateway: new PassthroughGatewayClient(),
@@ -303,6 +303,16 @@ async function makeManager(
     dbPath: join(tempDir, "sessions.db"),
     // 056-SLOTDEAD: a fast watchdog so a tick actually lands inside the window under test.
     ...(opts.watchdogMs !== undefined ? { standingReceiverWatchdogIntervalMs: opts.watchdogMs } : {}),
+    /**
+     * 056-SLOTDEAD review F12 — **THE RESPREAD CLOCK, AND WITHOUT IT THE TEST BELOW PROVED
+     * NOTHING.** `srLastRespreadAt` is stamped when the receiver is BUILT and only re-stamped when
+     * a respread fires, so the guard `now - last < srReservationRetryMs` blocks a receiver younger
+     * than the interval — which, at the default five minutes, is every receiver a test builds.
+     * Leaving it at the default made the revert test green with the respread RESTORED, which is how
+     * a live defect got recorded as inert. A tiny interval reproduces the production case: an agent
+     * that has been logged in longer than the interval, which is every real agent.
+     */
+    ...(opts.reservationRetryMs !== undefined ? { standingReceiverReservationRetryMs: opts.reservationRetryMs } : {}),
   });
   await m.initialize();
   await seedAgents(m.getDb(), ["alice"]);
@@ -799,7 +809,7 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
 
   it("★★★ an offer's reservation survives a watchdog tick taken BEFORE the session exists", async () => {
     /**
-     * ⚠️ **THE DEFECT 055-ONDEMAND LEFT BEHIND — 056-SLOTDEAD (A).**
+     * ⚠️ **THE DEFECT 055-ONDEMAND LEFT BEHIND — 056-SLOTDEAD (A), AND THE CLOCK IS THE WHOLE TEST.**
      *
      * `#respreadIfDecayed` existed to top up an IDLE agent's login-time spread. Its guards were
      * written for a world where the standing receiver held reservations, and unit 3 created a state
@@ -808,17 +818,25 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
      *   - `relayPeerIds.length === 0`?  No — the offer just took one.
      *   - in `activeNodes`?             No — the assignment has not arrived, so no session yet.
      *   - `held >= offered`?            No — one held, two offered.
-     *   - respread clock due?           Yes — `srLastRespreadAt` is 0 on the first offer after login.
+     *   - respread clock due?           Yes, for any agent logged in longer than the interval.
      *
      * A watchdog tick in that window REBUILDS the receiver, discarding the reservation the offer
      * just took — and the accept then advertises a circuit that no longer exists. The counterparty
      * is handed a route to nothing, and nothing anywhere says so.
      *
+     * ⚠️ **THE FOURTH GUARD IS WHY THIS FILE PREVIOUSLY LIED, review F12.** The first version of
+     * this test said the clock is due because `srLastRespreadAt` is 0 on the first offer. It is not
+     * 0 — it is stamped when the receiver is BUILT — so at the default five-minute interval the
+     * guard blocked, the revert test stayed GREEN with the respread restored, and a live defect was
+     * written down as inert. `reservationRetryMs: 1` is not a convenience here: it is the only way
+     * to reproduce the production state, which is an agent that logged in more than five minutes
+     * ago. That describes every real agent and no test receiver.
+     *
      * Not a race: a reachable state, and the four guards are the whole argument.
      */
     const relay = new ScriptedRelay();
     const factory = new GatedFactory(relay);
-    mgr = await makeManager(relay, factory, { watchdogMs: 60 });
+    mgr = await makeManager(relay, factory, { watchdogMs: 60, reservationRetryMs: 1 });
     await mgr.ensureStandingReceiverForAgent("alice");
 
     // The offer reserves. The session does NOT exist yet — the assignment is still in flight.
