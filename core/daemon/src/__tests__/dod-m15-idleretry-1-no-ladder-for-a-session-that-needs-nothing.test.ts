@@ -114,6 +114,50 @@ describe("DOD-M15-IDLERETRY-1: a tick with nothing to re-take leaves no trace", 
     ).toEqual([]);
   }, 30_000);
 
+  it("★★★ a ladder that was legitimately opened is CLEARED when the session ends", async () => {
+    /**
+     * ⚠️ **THE SECOND HALF, AND 061 SHIPPED WITHOUT IT.** 061 stopped a ladder being OPENED for a
+     * session that needs nothing. A ladder opened for a session that genuinely DID need its circuit
+     * back is correct — and becomes moot the moment that session ends. Nothing cleared it, and the
+     * entry is the only thing the status field consults, so the agent went on reporting `retrying`
+     * and eventually `unreachable` with no session at all.
+     *
+     * Caught on the shipped 0.0.217 build: an agent with zero live sessions reading `retrying`,
+     * which is only reachable through a stale entry.
+     */
+    const { logger } = makeLogger();
+    manager = await makeManager(logger);
+    await manager.ensureStandingReceiverForAgent("alice");
+
+    // A session that DOES want a circuit: a persisted relay endpoint and a node holding none.
+    // ⚠️ The endpoint is written AFTER the node exists — `createSessionNode` is what inserts the
+    // row, so an UPDATE before it silently matches nothing. The first version of this test did
+    // exactly that, never opened a ladder, and therefore passed with the fix REMOVED. The
+    // precondition below is what makes that impossible to repeat.
+    const sid = "bb".repeat(16);
+    const opened = await manager.createSessionNode(sid, "alice", "cc".repeat(32), "12D3KooWCp", "corr", false);
+    expect(opened.ok, JSON.stringify(opened)).toBe(true);
+    manager.getDb().prepare(
+      `UPDATE sessions SET relay_peer_id = ?, relay_addrs = ? WHERE session_id = ?`,
+    ).run("12D3KooWRelayX", JSON.stringify(["/ip4/127.0.0.1/tcp/4001"]), sid);
+
+    await new Promise((r) => setTimeout(r, 500));
+    expect(
+      manager.getStandingReceiverReachability("alice"),
+      "PRECONDITION: a ladder must actually be open, or this test proves nothing about clearing one",
+    ).not.toBe("ready");
+
+    // End it. From here the agent wants nothing at all.
+    await manager.destroySessionNode("alice", sid, "sealed");
+    await new Promise((r) => setTimeout(r, 500)); // several ticks with no session
+
+    expect(
+      manager.getStandingReceiverReachability("alice"),
+      "with no session there is nothing to retry, so a ladder left over from one that ended must " +
+        "not keep the agent looking broken — it survived a restart-or-nothing before this",
+    ).toBe("ready");
+  }, 30_000);
+
   it("an agent with NO live session is untouched by the watchdog, as before", async () => {
     const { logger, events } = makeLogger();
     manager = await makeManager(logger);
