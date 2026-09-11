@@ -17,8 +17,8 @@
  */
 
 import { spawn } from "node:child_process";
-import { openSync } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
+import { openLogHandle } from "./log-rotate.js";
 import { join } from "node:path";
 import { readLock, removeLock } from "./lock-file.js";
 import { probeSingletonLock, SINGLETON_LOCK_FILENAME, EXIT_ALREADY_RUNNING } from "./singleton-lock.js";
@@ -144,7 +144,13 @@ async function spawnDaemon(
   // then hits a broken pipe and, with no stdout 'error' handler, EPIPE-crashes it. The
   // daemon would "start" and die a second later → ECONNREFUSED on the socket. Writing to
   // a file also gives operators a durable ~/.cello/daemon.log to debug from.
-  const out = openSync(logPath, "a");
+  //
+  // DOD-M15-LOGBOUND-1: and it is rotated HERE, immediately before the handle is taken, because
+  // this is the only moment nothing holds it. The daemon writes to the descriptor below, not to
+  // the path, so once the child has it a rename moves the name and nothing else. `openLogHandle`
+  // keeps the rotate and the open in one call for that reason — splitting them is how the order
+  // gets reversed later by someone who cannot see why it mattered.
+  const out = openLogHandle(logPath);
   const child = spawn(process.execPath, [daemonBin], {
     detached: true,
     stdio: ["ignore", out, out],

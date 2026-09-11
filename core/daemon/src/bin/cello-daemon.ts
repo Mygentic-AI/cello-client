@@ -24,6 +24,7 @@ import { RandomizedPollScheduler } from "../manifest-poll-scheduler.js";
 // rather than written down twice.
 import { DaemonAlreadyRunningError, EXIT_ALREADY_RUNNING } from "../singleton-lock.js";
 import type { Logger } from "../types.js";
+import { createCollapsingLogger } from "../log-collapse.js";
 import { extractErrorMessage } from "../error-message.js";
 
 const MAX_CONNECTIONS = 16;
@@ -36,7 +37,7 @@ const REGISTRY_POLL_MIN_MS = 5 * 60_000;  // 5 minutes
 const REGISTRY_POLL_MAX_MS = 15 * 60_000; // 15 minutes
 
 // Composition root: stdout JSON logger
-const logger: Logger = {
+const stdoutLogger: Logger = {
   debug(event: string, context: Record<string, unknown>): void {
     const line = JSON.stringify({ level: "debug", event, ...context, ts: new Date().toISOString() });
     process.stdout.write(line + "\n");
@@ -54,6 +55,16 @@ const logger: Logger = {
     process.stdout.write(line + "\n");
   },
 };
+
+/**
+ * DOD-M15-LOGBOUND-1: every line the daemon writes goes through the repeat collapser.
+ *
+ * It is wrapped at the composition root rather than at call sites, because a discipline every
+ * call site has to remember is not a property. The measured cost of not having it was 168 MB of
+ * one sentence, and eleven hours in which the loop producing it was invisible inside its own
+ * output.
+ */
+const logger: Logger = createCollapsingLogger(stdoutLogger);
 
 const celloDir = process.env.CELLO_DIR || join(homedir(), ".cello");
 const socketPath = join(celloDir, "daemon.sock");
