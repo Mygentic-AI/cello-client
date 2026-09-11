@@ -421,9 +421,8 @@ export class SessionNodeManager {
   admitOfferedDialer(a: string, p: string, sid: string): "narrowed" | "no_receiver" | "no_peer_named" { return this.#receivers.admitOfferedDialer(a, p, sid); }
   takeReservationForSession(a: string, c: string, cid: string, offerSid?: string): Promise<boolean> { return this.#receivers.takeReservationForSession(a, c, cid, offerSid); } // 055-ONDEMAND
 
-  // 056-SLOTDEAD — the RE-TAKE, for a live session whose circuit died. On the manager alongside its
-  // sibling so the outage-and-recovery path can be driven end to end: a suite that could only drive
-  // the offer path was measuring the wrong half of the pair.
+  // 056-SLOTDEAD — the RE-TAKE, for a live session whose circuit died. Exposed so the outage-and-
+  // recovery path can be driven end to end; the offer path alone is the wrong half of the pair.
   retakeReservationOn(a: string, node: CelloNode, c: string, cid: string): Promise<boolean> { return this.#receivers.retakeReservationOn(a, node, c, cid); }
   getStandingReceiverRelayIds(a: string): string[] { return [...(this.#standingReceivers.get(a)?.relayPeerIds ?? [])]; } // 055-ONDEMAND
   /** 055-ONDEMAND — a live session's own node. Its circuit is not the receiver's; see the release path. */
@@ -1309,14 +1308,10 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       // 055-ONDEMAND — the abandoned-offer release asks these two: did the session this offer was
       // for actually start, and what do the agent's remaining live sessions still need?
       sessionIsLive: (a, sid) => this.#activeNodes.has(this.#k(a, sid)),
-      /**
-       * ⚠️ **`heldRelayIdsOf`, NOT a substring test — 056-SLOTDEAD.** This shipped asking only
-       * whether an announced address contains `p2p-circuit`, which is a LOOSER definition of "holds
-       * a reservation" than the one the rest of the daemon uses. A circuit address that does not
-       * name its relay cannot be watched, proved to, or admitted inbound — `msg-018` exists to say
-       * so — yet this path reported the agent `reserved`. That is the shape where an undialable
-       * agent looks healthy on the surface an operator checks first.
-       */
+      // ⚠️ `heldRelayIdsOf`, NOT a substring test — 056-SLOTDEAD. This shipped asking only whether an
+      // address contains `p2p-circuit`, a looser definition than the rest of the daemon's. One that
+      // does not NAME its relay cannot be watched, proved to, or admitted inbound (`msg-018` says so),
+      // yet this reported `reserved` — an undialable agent looking healthy where an operator looks first.
       anyLiveSessionHoldsCircuit: (a) => [...this.#activeNodes.values()]
         .some((e) => e.agentName === a && heldRelayIdsOf(e.node).length > 0),
       authenticateStandingReceiver: (a, node, relayPeerId, heldCircuitAddr, cid) => this.#relay.authenticateStandingReceiver(a, node, relayPeerId, heldCircuitAddr, cid),
