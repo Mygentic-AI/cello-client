@@ -82,7 +82,6 @@ export interface StandingReceiverContext {
   readonly standingReceiverRemoving: Set<string>;
   readonly srReservationRetry: Map<string, { attempts: number; nextAt: number; correlationId: string; lastReason?: string }>;
   readonly srLastRejectionReason: Map<string, string>;
-  readonly srLastRespreadAt: Map<string, number>;
   readonly directoryRelayEndpoints: Map<string, Array<{ relayPeerId: string; relayAddrs: string[] }>>;
   readonly srRetryDelaysMs: number[];
   readonly srReservationTimeoutMs: number;
@@ -727,11 +726,6 @@ export class StandingReceivers {
     // reservations that genuinely completed, so a directory that merely NAMES a relay cannot dial
     // in behind it, however many relays it names.
     gater.setReservedRelayPeers(heldRelayPeerIds);
-    // The re-spread clock starts HERE, at the build, not at the epoch. Otherwise the first decay
-    // re-spreads instantly — undoing the "a lost relay does not rebuild the receiver" rule seconds
-    // after it fires, and changing the peer id of an agent that just lost one relay of three. The
-    // ratchet this guards against runs over hours; nothing about it needs answering in a second.
-    this.#ctx.srLastRespreadAt.set(agentName, Date.now());
     this.#ctx.standingReceivers.set(agentName, {
       node,
       gater,
@@ -869,69 +863,6 @@ export class StandingReceivers {
       });
     } finally {
       this.#ctx.standingReceiverCreating.delete(agentName);
-    }
-  }
-  /**
-   * Replace an agent's reservation-less standing receiver with one that reserves.
-   *
-   * Deliberately NOT removeStandingReceiverForAgent()+ensureStandingReceiverForAgent():
-   * the public remove CLEARS #agentsWantingReceiver, so a cello_set_agent_offline landing in
-   * the window while node.stop() is awaited would find no map entry and no creating
-   * marker, leave no tombstone, and the re-ensure would then RESURRECT a receiver for
-   * an agent that asked to go dark — accepting inbound sessions for an offline agent.
-   * Here the want-flag is left intact and re-checked after the stop: a concurrent stop
-   * clears it, and the rebuild correctly no-ops.
-   */
-  async rebuildStandingReceiver(agentName: string): Promise<void> {
-    try {
-      const sr = this.#ctx.standingReceivers.get(agentName);
-      if (sr) {
-        this.#ctx.standingReceivers.delete(agentName);
-        /**
-         * DOD-M12B-SESSION-SEED-1 (review F8): drop it zeroed, like every other seed.
-         *
-         * (review F7, STILL DECIDED AGAINST — deliberately NOT reusing this seed for the
-         * replacement — but its stated blocker is GONE and the reason has changed. Restated rather
-         * than reworded, because a decision whose premise has been reversed is a decision nobody
-         * has actually made.)
-         *
-         * Reuse is attractive: this receiver's peer id may already be inside a `session_offer_accept`
-         * the counterparty is acting on, and a rebuild in that window is the documented "we record
-         * an identity that no longer exists… every send in this direction parks forever" defect.
-         *
-         * The old blocker was that a preserved identity would reach the candidate loop, whose
-         * rejected candidates were stopped WITHOUT awaiting `start()`, putting two live nodes on one
-         * advertised peer id. **032-RELAYSPREAD already crossed that line**: the walk now runs one
-         * shared seed through every candidate, with a settlement-chained teardown, and it is safe
-         * there because the receiver's gater admits nobody inbound.
-         *
-         * What still stops reuse HERE is different and is about the OLD node, not the new one. This
-         * rebuild path awaits `sr.node.stop()`, but a stop can hang on a stuck libp2p teardown, and
-         * handing the replacement the same identity before the previous receiver is provably dead
-         * would put two nodes on a peer id a COUNTERPARTY has been told to dial — which is not the
-         * candidate case at all: that node has a content handler and can be promoted. Doing it
-         * safely needs a bounded, verified teardown first. Still follow-on work.
-         */
-        sr.seed.fill(0);
-        try {
-          sr.autoNat.stop();
-          await sr.node.stop();
-        } catch (err: unknown) {
-          this.#ctx.logger.warn("session.standing_receiver.teardown.failed", {
-            agentName,
-            error: extractErrorMessage(err),
-          });
-        }
-      }
-      // The agent may have gone offline while we were stopping the old node. Its
-      // want-flag is the authority — never resurrect a receiver it disowned.
-      if (!this.#ctx.agentsWantingReceiver.has(agentName) || this.#ctx.shuttingDown()) return;
-      await this.ensureStandingReceiver(agentName);
-    } catch (err: unknown) {
-      this.#ctx.logger.warn("session.standing_receiver.reservation.rebuild.failed", {
-        agentName,
-        error: extractErrorMessage(err),
-      });
     }
   }
   /**

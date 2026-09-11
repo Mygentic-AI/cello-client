@@ -430,15 +430,25 @@ export interface RelayConnectParams {
 /**
  * DOD-PARK-DRAIN-1: why the parked-mailbox drain is being asked to run.
  *
- * `standing_receiver_ready` — a receiver was just installed, first time or rebuilt. The rebuild is
- * the case that matters: content parks precisely because the relay link died, and the watchdog
- * rebuild is that same event seen from the client side.
+ * `standing_receiver_ready` — a receiver was just installed. First time only, now: 056-SLOTDEAD
+ * deleted the watchdog rebuild, and `reservation_lost` below carries the case that used to ride it.
  * `periodic_backstop` — nothing happened; this is the slow sweep that keeps a missed trigger from
  * stranding content until someone restarts the daemon. Drains are deduped and delete-on-confirm,
  * so an extra one costs a pull.
  */
 export type ParkedDrainReason =
   | "standing_receiver_ready"
+  /**
+   * ⚠️ **THE DRAIN THAT USED TO BE A SIDE EFFECT OF A REBUILD — 056-SLOTDEAD.**
+   *
+   * Content parks precisely because a relay link died, so the moment worth draining on is the loss.
+   * That was never what the code said: it drained because losing every reservation REBUILT the
+   * receiver, and the new receiver announced itself ready. Deleting the rebuild would therefore have
+   * silently taken the drain with it — the agent would have waited for the periodic backstop, which
+   * is the strand this trigger exists to prevent. Naming the real cause also fixes a smaller lie:
+   * nothing was installed, so `standing_receiver_ready` was the wrong word for it.
+   */
+  | "reservation_lost"
   | "periodic_backstop"
   /**
    * DOD-M12B-SESSION-SEED-1 (case B): a session that was interrupted has just been revived, so the
@@ -492,15 +502,6 @@ export interface SessionNodeConfig {
    * window. Factories should forward this to createNode({ keepAliveIntervalMs }).
    */
   keepAliveIntervalMs?: number;
-  /**
-   * DOD-NAT-REACHABILITY-1: circuit-relay listen addresses
-   * (`<relay-multiaddr>/p2p/<relay-peer-id>/p2p-circuit`) the node should take
-   * reservations on. Each entry makes libp2p reserve a slot with that relay and
-   * advertise the relayed address via getMultiaddrs() — which is what makes a
-   * NAT'd standing receiver dialable at all. A dead relay in this list degrades
-   * (no reservation, WARN) — it never fails node creation.
-   */
-  circuitRelayListenAddrs?: string[];
   /**
    * DOD-M12B-SESSION-SEED-1: the 32-byte Ed25519 seed this node's transport identity is derived
    * from, so a node that is torn down can be rebuilt at the SAME peer id.

@@ -120,8 +120,9 @@ class ScriptedFactory implements ISessionNodeFactory {
   readonly asks: Array<{ circuits: string[]; nodeType: string | undefined }> = [];
   constructor(private readonly script: (circuit: string | undefined) => Behaviour) {}
   async createNode(config: SessionNodeConfig): Promise<CelloNode> {
-    const circuit = config.circuitRelayListenAddrs?.[0];
-    const ask = { circuits: config.circuitRelayListenAddrs ?? [], nodeType: config.nodeType };
+    // 056-SLOTDEAD: nothing is built carrying a circuit address; the ask is recorded when it happens.
+    const circuit = undefined;
+    const ask = { circuits: [] as string[], nodeType: config.nodeType };
     this.asks.push(ask);
     // A probe carries no circuit at construction; the relay it ends up asking is recorded on the
     // SAME entry, so `asks` stays one row per node however the ask reaches it.

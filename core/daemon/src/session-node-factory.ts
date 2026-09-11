@@ -64,10 +64,10 @@ export class ProductionSessionNodeFactory implements ISessionNodeFactory {
         : undefined;
     return createNode({
       keyProvider: SESSION_NODE_KEY_STUB,
-      // Circuit-relay listen entries (reservations) ride alongside the TCP
-      // listener; the transport tolerates a dead relay (NO_FATAL) but still
-      // fails loudly if the TCP bind itself is lost.
-      listenAddresses: [listenAddr, ...(config.circuitRelayListenAddrs ?? [])],
+      // ⚠️ NO CIRCUIT ADDRESSES — 056-SLOTDEAD. A node used to be BUILT already asking relays for
+      // slots (`circuitRelayListenAddrs`). Nothing sets that now: it starts on TCP/WS and takes a
+      // reservation, if it needs one, via `listenOnCircuit` after proving (DOD-M15-RELAYPROVE-ORDER-1).
+      listenAddresses: [listenAddr],
       ...(announce ? { announceAddresses: announce } : {}),
       connectionGater: config.connectionGater,
       // DOD-M15-RELAYONLY-1: an agent that asked never to be directly reachable must not hole-punch

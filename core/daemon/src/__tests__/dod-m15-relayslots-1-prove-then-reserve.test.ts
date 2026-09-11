@@ -182,6 +182,32 @@ class GatedNode extends FakeNode {
     if (this.started && this.relay.grants(this.#id)) this.takenCircuits.push(circuitAddr);
   }
 
+  /**
+   * ⚠️ **A GRANTED RESERVATION IMPLIES A LIVE CONNECTION TO THE RELAY**, and a fixture that says
+   * otherwise makes the watchdog read every held reservation as LOST on its next tick — rebuilding
+   * the receiver forever. That is the fixture lying, not the code churning; `msg-018`'s
+   * `ReservationNode` carries the same note for the same reason.
+   *
+   * OUTBOUND, because a reservation is this node dialling the relay and holding that open.
+   */
+  override getConnections(): Array<{
+    id: string;
+    peerId: string;
+    encryption: string | undefined;
+    status: string;
+    direction: "inbound" | "outbound";
+    openedAt: number;
+    streamCount: number;
+  }> {
+    return this.listenAddresses()
+      .map((a) => /\/p2p\/([^/]+)\/p2p-circuit/.exec(a)?.[1])
+      .filter((id): id is string => id !== undefined)
+      .map((peerId) => ({
+        id: `conn-${peerId}`, peerId, encryption: "noise", status: "open",
+        direction: "outbound" as const, openedAt: 0, streamCount: 0,
+      }));
+  }
+
   override listenAddresses(): string[] {
     // THE GATE. A circuit address appears only for a peer id the relay has a proof for — which is
     // exactly what the relay's `denyInboundRelayReservation` decides.
@@ -268,13 +294,15 @@ async function makeManager(
    * unavailable — no builder wired — which is one of the ways `proveToRelay` reaches no verdict.
    * `logger` lets a case read the refusal reasons the walk emits.
    */
-  opts: { noRelayClient?: boolean; logger?: Logger } = {},
+  opts: { noRelayClient?: boolean; logger?: Logger; watchdogMs?: number } = {},
 ): Promise<SessionNodeManager> {
   const m = new SessionNodeManager({
     securityGateway: new PassthroughGatewayClient(),
     factory,
     logger: opts.logger ?? silent,
     dbPath: join(tempDir, "sessions.db"),
+    // 056-SLOTDEAD: a fast watchdog so a tick actually lands inside the window under test.
+    ...(opts.watchdogMs !== undefined ? { standingReceiverWatchdogIntervalMs: opts.watchdogMs } : {}),
   });
   await m.initialize();
   await seedAgents(m.getDb(), ["alice"]);
@@ -766,6 +794,49 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
       relay.released,
       "the relay is TOLD. Closing a listener sends it nothing and its own reaper waits on pressure, " +
         "so without this the slot is held for its full TTL — two hours — after the session ended.",
+    ).toEqual([RELAY_A]);
+  }, 30_000);
+
+  it("★★★ an offer's reservation survives a watchdog tick taken BEFORE the session exists", async () => {
+    /**
+     * ⚠️ **THE DEFECT 055-ONDEMAND LEFT BEHIND — 056-SLOTDEAD (A).**
+     *
+     * `#respreadIfDecayed` existed to top up an IDLE agent's login-time spread. Its guards were
+     * written for a world where the standing receiver held reservations, and unit 3 created a state
+     * that passes every one of them:
+     *
+     *   - `relayPeerIds.length === 0`?  No — the offer just took one.
+     *   - in `activeNodes`?             No — the assignment has not arrived, so no session yet.
+     *   - `held >= offered`?            No — one held, two offered.
+     *   - respread clock due?           Yes — `srLastRespreadAt` is 0 on the first offer after login.
+     *
+     * A watchdog tick in that window REBUILDS the receiver, discarding the reservation the offer
+     * just took — and the accept then advertises a circuit that no longer exists. The counterparty
+     * is handed a route to nothing, and nothing anywhere says so.
+     *
+     * Not a race: a reachable state, and the four guards are the whole argument.
+     */
+    const relay = new ScriptedRelay();
+    const factory = new GatedFactory(relay);
+    mgr = await makeManager(relay, factory, { watchdogMs: 60 });
+    await mgr.ensureStandingReceiverForAgent("alice");
+
+    // The offer reserves. The session does NOT exist yet — the assignment is still in flight.
+    await mgr.takeReservationForSession("alice", CIRCUIT_A, "corr", "ef".repeat(16));
+    const peerBefore = mgr.getStandingReceiverInfo("alice")?.peerId;
+    expect(mgr.getStandingReceiverRelayIds("alice"), "precondition: the offer took a slot").toEqual([RELAY_A]);
+
+    // Several watchdog ticks land in the window between the reserve and the session.
+    await new Promise((r) => setTimeout(r, 500));
+
+    expect(
+      mgr.getStandingReceiverInfo("alice")?.peerId,
+      "the receiver must NOT be rebuilt while an offer's reservation is in flight — a rebuild " +
+        "discards it, and the accept then advertises a circuit that does not exist",
+    ).toBe(peerBefore);
+    expect(
+      mgr.getStandingReceiverRelayIds("alice"),
+      "and the reservation is still held",
     ).toEqual([RELAY_A]);
   }, 30_000);
 

@@ -89,7 +89,6 @@ export interface SessionRelayContext {
    */
   readonly srReservationRetry: Map<string, { attempts: number; nextAt: number; correlationId: string; lastReason?: string }>;
   readonly srLastRejectionReason: Map<string, string>;
-  readonly srLastRespreadAt: Map<string, number>;
   /**
    * ⚠️ THE REFUSAL OBJECT, not a reason string. It carries WHICH relay refused alongside why, and
    * dropping the peer id would leave an operator with "a relay refused your key" and no way to know
@@ -263,8 +262,15 @@ export class SessionRelay {
        * what looks like a fleet-wide outage.
        */
       if (refusal?.tryAnotherRelay && !this.#ctx.shuttingDown) {
+        /**
+         * ⚠️ **THE QUARANTINE ACTS; THE REBUILD USED TO AND NO LONGER CAN — 056-SLOTDEAD.**
+         *
+         * This used to `rebuildStandingReceiver` so the new node would reserve against the rest of
+         * the pool. A rebuilt receiver reserves NOTHING now (055-ONDEMAND), so the rebuild bought
+         * nothing and cost the agent its transport identity. The quarantine is the half that still
+         * does the work: the next offer reserves against the pool minus this relay.
+         */
         this.#quarantineRelay(agentName, relayPeerId, refusal.reason);
-        void this.#ctx.receivers.rebuildStandingReceiver(agentName);
       }
     } else {
       this.#ctx.srRelayRefusal.delete(agentName);
@@ -1098,77 +1104,6 @@ export class SessionRelay {
     return true;
   }
 
-  #retryReservationIfDue(agentName: string): void {
-    const now = Date.now();
-    const state = this.#ctx.srReservationRetry.get(agentName)
-      ?? { attempts: 0, nextAt: now + this.#ctx.srReservationRetryMs, correlationId: randomUUID() };
-    // The reason the LAST attempt was refused, captured where it is actually known.
-    const lastReason = this.#ctx.srLastRejectionReason.get(agentName);
-    if (lastReason !== undefined) state.lastReason = lastReason;
-    if (state.attempts === 0 && !this.#ctx.srReservationRetry.has(agentName)) {
-      // First sighting — schedule, do not fire. The creation attempt just happened.
-      this.#ctx.srReservationRetry.set(agentName, state);
-      return;
-    }
-    if (now < state.nextAt) return;
-
-    if (state.attempts >= SR_RESERVATION_MAX_RETRIES) {
-      if (state.attempts === SR_RESERVATION_MAX_RETRIES) {
-        state.attempts += 1; // mark as reported, so this fires exactly once
-        this.#ctx.srReservationRetry.set(agentName, state);
-        this.#ctx.logger.error("session.standing_receiver.reservation.gave_up", {
-          agentName,
-          attempts: SR_RESERVATION_MAX_RETRIES,
-          correlationId: state.correlationId,
-          // WHY, not just the consequence. Three different problems reach this one message and they
-          // need three different responses: `relay_granted_no_reservation` is relay CAPACITY (and a
-          // trustless-cello problem), `relay_unreachable` is the NETWORK, and
-          // `reservation_did_not_complete_in_time` is LATENCY — and the only one of the three that
-          // can pin a slot it never uses, so its appearance is also the signal that this retry
-          // budget needs tightening.
-          ...(state.lastReason !== undefined ? { lastRejectionReason: state.lastReason } : {}),
-          // "No relay would grant" and "there was no relay to ask" are different facts and lead to
-          // different places — the first at relay capacity, the second at this agent's directory
-          // connection. Without this they are the same sentence.
-          //
-          // 032-RELAYSPREAD: this was also called `reservationsRequested` — the same mis-naming as
-          // the reachability events, in its worst form, because here the value is a BOOLEAN under a
-          // name that reads as a count. It is NOT `relaysOffered`: that field counts the merged
-          // candidate list the walk actually asks (directory pool + persisted endpoints, minus
-          // quarantine), and this reads the directory pool alone. Two populations must not share
-          // one field name, so this one is named for what it measures.
-          hadRelayToAsk: (this.#ctx.directoryRelayEndpoints.get(agentName)?.length ?? 0) > 0,
-          // …and HOW MANY the walk actually asks, so this event stands on its own instead of
-          // needing the last reachability line to be read beside it. Same population and same
-          // meaning as `relaysOffered` everywhere else: the merged, quarantine-filtered candidate
-          // list.
-          relaysOffered: this.reservationCircuitAddrs(agentName).addrs.length,
-          impact:
-            "no relay would grant this agent a circuit reservation, so anyone behind NAT cannot reach or dial it — inbound sessions will only arrive from peers that can connect directly, and everything else falls back to the relay's store-and-forward",
-        });
-      }
-      return;
-    }
-
-    state.attempts += 1;
-    // The FINAL attempt gets a fixed settle window rather than another doubled wait: at the top of
-    // the ladder that would be 80 minutes of silence after the last thing we did, which is a long
-    // time to tell an operator nothing. Every earlier attempt doubles, which is what keeps a fleet
-    // off a scarce relay.
-    state.nextAt = now + (state.attempts >= SR_RESERVATION_MAX_RETRIES
-      ? this.#ctx.srReservationRetryMs
-      : this.#ctx.srReservationRetryMs * 2 ** (state.attempts - 1));
-    this.#ctx.srReservationRetry.set(agentName, state);
-    this.#ctx.logger.warn("session.standing_receiver.reservation.retry", {
-      agentName,
-      attempt: state.attempts,
-      maxAttempts: SR_RESERVATION_MAX_RETRIES,
-      correlationId: state.correlationId,
-      ...(state.lastReason !== undefined ? { lastRejectionReason: state.lastReason } : {}),
-      impact: "this agent currently holds no circuit reservation, so a NAT'd peer cannot dial it",
-    });
-    void this.#ctx.receivers.rebuildStandingReceiver(agentName);
-  }
 
   async #reservationWatchdogTick(): Promise<void> {
     if (this.#ctx.shuttingDown) return;
@@ -1251,7 +1186,19 @@ export class SessionRelay {
         const arrived = heldRelayIdsOf(sr.node)
           .filter((id) => sr.node.getConnections().some((c) => c.peerId === id && c.status === "open"));
         if (arrived.length === 0) {
-          this.#retryReservationIfDue(agentName);
+          /**
+           * ⚠️ **`#retryReservationIfDue` WAS CALLED HERE AND COULD NEVER DO ANYTHING — 056-SLOTDEAD.**
+           *
+           * It guards on `now < state.nextAt`, and `#retryDue` above advances that same state on
+           * this very tick, so the second call always returned immediately. Reachable, referenced,
+           * and inert — the shape a reference scan cannot find.
+           *
+           * *(The first version of this order claimed it DOUBLE-ADVANCED the budget and triggered a
+           * useless rebuild. That was wrong, and it was wrong because it was reasoned rather than
+           * run. It was a no-op.)*
+           *
+           * Nothing replaces it: `#retryDue` owns the budget and the re-take above owns the work.
+           */
           continue;
         }
         sr.relayPeerIds = arrived;
@@ -1355,97 +1302,42 @@ export class SessionRelay {
               + "reach it. The receiver is being rebuilt against the rest of the pool.",
         });
       }
+      /**
+       * ⚠️ **DRAIN ON THE LOSS ITSELF — 056-SLOTDEAD.** This used to happen one step downstream, as
+       * a side effect of the rebuild below: lose every reservation → rebuild → the new receiver
+       * reports ready → drain. Deleting the rebuild would have deleted the drain with it, leaving
+       * content the counterparty parked to sit until the periodic backstop. The loss is the cause
+       * and always was; the rebuild was only where it happened to be noticed.
+       */
+      this.#ctx.park.fireParkedDrain(agentName, "reservation_lost");
       if (stillHeld.length === 0) {
-        // ZERO HELD IS STILL THE LOUD, STRUCTURAL CASE — the agent is unreachable behind NAT and
-        // only a new node can take a new reservation, because a circuit listener is fixed at node
-        // creation.
-        void this.#ctx.receivers.rebuildStandingReceiver(agentName);
+        /**
+         * ⚠️ **THIS REBUILT THE RECEIVER ON A JUSTIFICATION THAT STOPPED BEING TRUE IN UNIT 1, AND
+         * UNDER ON-DEMAND IT DESTROYS AN IN-FLIGHT OFFER'S RESERVATION — 056-SLOTDEAD.**
+         *
+         * It read: *"only a new node can take a new reservation, because a circuit listener is fixed
+         * at node creation."* `listenOnCircuit` removed that constraint (`DOD-M15-RELAYPROVE-ORDER-1`),
+         * and a rebuilt receiver now reserves nothing at all.
+         *
+         * The state it fires in is the dangerous one: between an offer taking a reservation and the
+         * session being created, the receiver holds exactly one circuit. Lose the connection in that
+         * window and this rebuilt the node — discarding the slot the offer just took, after the
+         * accept may already have advertised it. **Observed**, not reasoned: a fixture that reported
+         * no relay connection drove this path and the test caught the rebuild.
+         *
+         * Nothing replaces it here. An idle agent holding zero is the design; a LIVE session that
+         * lost its circuit is re-taken on its own node by the branch above, on a bounded budget.
+         */
+        this.#ctx.logger.debug("session.standing_receiver.reservation.zero_held", {
+          agentName,
+          impact: "this agent holds no circuit. If it has no live session that is the idle steady " +
+            "state; if it does, the re-take above owns getting it back.",
+        });
         continue;
       }
-      /**
-       * STILL REACHABLE, SO THE RECEIVER STANDS, AND NOTHING ELSE HAPPENS HERE. That second half is
-       * the part worth reading, because the obvious next line is wrong twice over.
-       *
-       * **A LOST CONFIGURED CIRCUIT CANNOT BE RETAKEN BY THIS NODE.** Read out of
-       * `@libp2p/circuit-relay-v2@4.2.5`, not assumed: for an explicit relay address
-       * `transport/listener.js#listen()` is a ONE-SHOT — it reserves once and nothing calls it
-       * again; `reservation-store.js#removeReservation()` clears the refresh timeout and deletes
-       * the entry; and the listener's `_onAddRelayPeer` returns early for `type === 'configured'`,
-       * so even a later reservation would not be announced. A circuit listener is fixed at node
-       * creation, and the only thing that takes a new one is a NEW NODE — which is exactly the
-       * rebuild this branch exists to refuse.
-       *
-       * **AND RE-PROVING TO THE LOST RELAY WOULD REBUILD THE RECEIVER ANYWAY.** Review F3: an
-       * earlier version called `authenticateStandingReceiver` here to "remove the relay-side
-       * reason for the revocation". That function ends with `if (refusal?.tryAnotherRelay) { …
-       * void this.#ctx.receivers.rebuildStandingReceiver(agentName); }` — and a dead or misconfigured relay is
-       * precisely the one that answers that way. So the common case was: lose relay A while
-       * holding B, decline to rebuild, prove to A, A refuses, rebuild the whole receiver and throw
-       * B's healthy reservation away. The churn engine, re-entered through the back door.
-       *
-       * **THE BOUND, STATED PLAINLY BECAUSE IT IS A REAL SHORTFALL AGAINST THE DoD:** a lost
-       * circuit is gone until the receiver is next rebuilt for another reason. What the agent buys
-       * is that it never STOPS BEING REACHABLE while that is true — the surviving relays carry it,
-       * the loss is named in the log with its cause, and the lost relay's inbound carve-out is
-       * revoked above. That is availability, not restoration in place.
-       *
-       * WHICH LEAVES A RATCHET, and `#respreadIfDecayed` below is what stops it: relays are only
-       * ever lost between rebuilds, never regained, so an agent nobody talks to walks itself back
-       * down to one relay — the exact state this unit exists to get it out of.
-       */
-    }
-    for (const agentName of this.#ctx.standingReceivers.keys()) {
-      if (this.#ctx.agentsWantingReceiver.has(agentName)) this.#respreadIfDecayed(agentName);
     }
   }
 
-  /**
-   * 032-RELAYSPREAD — **AN IDLE AGENT MUST NOT RATCHET ITSELF BACK DOWN TO ONE RELAY.**
-   *
-   * Spreading happens when a receiver is BUILT, and between builds the count only falls: a lost
-   * circuit is not retaken from here (`listenOnCircuit` could; nothing does), and a relay the
-   * directory announces later is skipped while any circuit is held. An agent in
-   * conversation re-spreads constantly — the receiver is handed into each session and a fresh one
-   * is built behind it — so this is about the agent nobody has talked to for a day. It loses relays
-   * one at a time, nothing pulls it back up, and it ends up exactly where this unit found it:
-   * reachable through one relay, one relay away from being reachable through none.
-   *
-   * **THE COST OF FIXING IT IS A NEW PEER ID**, which is why it is fenced three ways rather than
-   * simply rebuilding on sight:
-   *   - **ONLY WHEN IDLE.** A rebuild replaces the receiver's transport identity, and a counterparty
-   *     may be holding the old one from a `session_offer_accept`. With a live session for this agent
-   *     we leave it alone — a degraded spread costs redundancy, a changed peer id mid-conversation
-   *     costs the conversation.
-   *   - **ONLY WHEN THERE IS SOMETHING TO GAIN.** Holding every relay that was offered is not decay.
-   *   - **ON ITS OWN SLOW CLOCK**, never the watchdog's 30-second grid. A reservation is scarce —
-   *     the relay holds it for its full TTL even after we disconnect — so this reuses the
-   *     reservation retry interval rather than inventing a faster one.
-   */
-  #respreadIfDecayed(agentName: string): void {
-    if (this.#ctx.shuttingDown) return;
-    const sr = this.#ctx.standingReceivers.get(agentName);
-    if (!sr || sr.relayPeerIds.length === 0) return;                    // zero held is the loud path
-    for (const entry of this.#ctx.activeNodes.values()) {
-      if (entry.agentName === agentName) return;                        // in conversation — hands off
-    }
-    const offered = this.reservationCircuitAddrs(agentName).addrs.length;
-    if (sr.relayPeerIds.length >= offered) return;                      // nothing to gain
-    const now = Date.now();
-    const last = this.#ctx.srLastRespreadAt.get(agentName) ?? 0;
-    if (now - last < this.#ctx.srReservationRetryMs) return;
-    this.#ctx.srLastRespreadAt.set(agentName, now);
-    this.#ctx.logger.info("session.standing_receiver.respread", {
-      agentName,
-      reservationsHeld: sr.relayPeerIds.length,
-      relaysOffered: offered,
-      impact: "this agent is idle and holds fewer relay reservations than it was offered, so its " +
-        "receiver is being rebuilt to take the rest. Without this it can only lose relays between " +
-        "rebuilds, and an agent nobody talks to drifts back down to a single relay — one relay " +
-        "away from being unreachable behind NAT, which is the state this whole mechanism exists " +
-        "to keep it out of.",
-    });
-    void this.#ctx.receivers.rebuildStandingReceiver(agentName);
-  }
 
   /** Start the reservation watchdog (idempotent). Stopped by gracefulShutdown. */
   startReservationWatchdog(): void {

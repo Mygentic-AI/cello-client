@@ -123,7 +123,7 @@ describe("A: the parked-content drain rides the standing receiver's life-cycle",
     }
   }, 20_000);
 
-  it("A2: a relay link that DIES mid-life drains again on the watchdog rebuild — no daemon restart", async () => {
+  it("A2: a relay link that DIES mid-life drains again on the loss itself — no daemon restart", async () => {
     const relay = await startHopRelay();
     const { manager, events, drains } = await makeManager({ watchdogMs: 250 });
     try {
@@ -148,9 +148,17 @@ describe("A: the parked-content drain rides the standing receiver's life-cycle",
       // content it could not deliver is sitting parked on the other side of this link.
       await relay.node.stop();
 
-      const rebuilt = await waitUntil(() => drains.length >= 2, 15_000);
-      expect(rebuilt, "the watchdog rebuild must drain — this is the trigger the defect was missing").toBe(true);
-      expect(drains[1]).toEqual({ agentName: "alice", reason: "standing_receiver_ready" });
+      /**
+       * 056-SLOTDEAD — the REASON changed and the property did not. The drain used to be a side
+       * effect of the watchdog rebuilding the receiver; the rebuild is gone (it reserved nothing and
+       * could destroy an in-flight offer's slot), so the drain now fires on the loss that caused the
+       * parking in the first place. Asserting the reason, not just the count, is what would catch it
+       * silently reverting to the periodic backstop — which drains too, eventually, and would make a
+       * broken trigger look green.
+       */
+      const drained = await waitUntil(() => drains.length >= 2, 15_000);
+      expect(drained, "losing the reservation must drain — this is the trigger the defect was missing").toBe(true);
+      expect(drains[1]).toEqual({ agentName: "alice", reason: "reservation_lost" });
       expect(events.some((e) => e.event === "session.standing_receiver.reservation.lost")).toBe(true);
     } finally {
       await manager.gracefulShutdown();

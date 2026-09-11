@@ -15,8 +15,9 @@
  *  R2 — ProductionSessionNodeFactory: standing receiver defaults to a ROUTABLE
  *       listen (/ip4/0.0.0.0/tcp/0), CELLO_LISTEN_ADDR still overrides, and
  *       ephemeral session nodes stay on loopback.
- *  R3 — the factory forwards circuitRelayListenAddrs so the receiver reserves
- *       with the relay (circuit addr appears in listenAddresses()).
+ *  R3 — a receiver that asks (listenOnCircuit) reserves with the relay, and the
+ *       circuit addr appears in listenAddresses(). 056-SLOTDEAD moved the ask out
+ *       of node construction; the property being pinned is unchanged.
  *  R4 — SessionNodeManager wires persisted relay endpoints (sessions rows) into
  *       the standing receiver's reservation set.
  *  R5 — a DEAD relay endpoint must not kill the receiver: it installs TCP-only
@@ -144,8 +145,17 @@ describe("R2: ProductionSessionNodeFactory listen defaults", () => {
   });
 });
 
-describe("R3: the factory forwards circuit-relay listen addresses", () => {
-  it("a standing receiver created with circuitRelayListenAddrs reserves with the relay", async () => {
+/**
+ * ⚠️ **THIS USED TO BE "the factory forwards circuit-relay listen addresses" — 056-SLOTDEAD.**
+ * The property is the same and it is the one that matters: a standing receiver ends up announcing a
+ * real circuit through a real relay. Only the MECHANISM moved. A node was once BUILT carrying the
+ * relay's address (`circuitRelayListenAddrs`), so the reservation was a side effect of `start()`;
+ * it now starts on TCP and asks afterwards, through `listenOnCircuit`, so that the ask can happen
+ * when a session needs it rather than at login. Deleting the test with the field would have deleted
+ * the only live proof that a reservation is obtainable at all.
+ */
+describe("R3: a standing receiver takes a circuit reservation on demand", () => {
+  it("listenOnCircuit reserves with the relay and the node announces the circuit", async () => {
     const relay = await startHopRelay();
     process.env["CELLO_LISTEN_ADDR"] = "/ip4/127.0.0.1/tcp/0";
     try {
@@ -153,9 +163,9 @@ describe("R3: the factory forwards circuit-relay listen addresses", () => {
       const node = await factory.createNode({
         sessionId: "sr-circuit",
         nodeType: "standing_receiver",
-        circuitRelayListenAddrs: [`${relay.addr}/p2p-circuit`],
       });
       await node.start();
+      await node.listenOnCircuit(`${relay.addr}/p2p-circuit`);
       try {
         const ok = await waitUntil(() => node.listenAddresses().some((a) => a.includes("/p2p-circuit")), 10_000);
         expect(ok).toBe(true);
