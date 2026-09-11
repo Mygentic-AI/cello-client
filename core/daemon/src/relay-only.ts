@@ -167,8 +167,15 @@ export function publishableEndpoint<T extends PublishableEndpoint>(
 /**
  * Can a relay-only agent actually be reached with what it is about to publish?
  *
- * FALSE means it holds **no relay reservation yet**, so the circuit-only subset is empty. That must
- * become a LOUD LOCAL REFUSAL rather than an empty publish: an empty publish is refused by the
+ * FALSE means it holds **no relay reservation**, so the circuit-only subset is empty.
+ *
+ * ⚠️ **"YET" WAS DROPPED FROM THAT SENTENCE ON PURPOSE — 056-SLOTDEAD.** It meant "the login walk
+ * has not got there yet", i.e. wait and it will become true on its own. Since 055-ONDEMAND an idle
+ * agent holds none and never will: the slot is taken at offer time, so this is asked AFTER the
+ * on-demand reserve and a FALSE here means that reserve genuinely failed. Reading it as "not yet"
+ * would argue for retrying rather than refusing, on a call that is waiting for an answer now.
+ *
+ * That must be a LOUD LOCAL REFUSAL rather than an empty publish: an empty publish is refused by the
  * directory as malformed and surfaces to the operator as "the counterparty is offline", which is a
  * lie about someone else's state caused by a setting on this machine.
  */

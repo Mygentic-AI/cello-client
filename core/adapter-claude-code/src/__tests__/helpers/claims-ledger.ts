@@ -270,6 +270,33 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   },
   {
     surface: "plugins/cello/skills/cello/SKILL.md",
+    claim: "Under relay-only, a call that cannot get a relay slot is REFUSED rather than answered by revealing your address",
+    excerpts: [
+      "cannot get a slot is refused** (`relay_only_no_reservation`) rather than answered by revealing",
+    ],
+    verdict: "true",
+    enforcedBy: "daemon-local",
+    /**
+     * 056-SLOTDEAD wrote this sentence, so it is adjudicated in the same change rather than added to
+     * the backlog. It REPLACES a claim that had quietly become false: the old text said relay-only
+     * "can make you unreachable until a relay grants a reservation", which described waiting for a
+     * login-time reservation that 055-ONDEMAND deleted. An operator reading it would have expected a
+     * limbo that no longer exists, and would not have expected the thing that DOES happen — an
+     * individual call being refused.
+     */
+    evidence:
+      "MEASURED, in `dod-m15-reserve-capacity-1-offer-reserves.test.ts`, which drives the offer " +
+      "handler with relay-only on and the relay refusing: no `session_offer_accept` is sent and a " +
+      "`session_offer_reject` carries `relay_only_no_reservation`. The same test drives the granted " +
+      "case and asserts the opposite, because a control that refuses everything is not a control. " +
+      "`daemon-local` is the correct strength and the weaker half of the claim: it is this " +
+      "operator's own daemon declining to publish their address, in `session-ceremony.ts`, guarded " +
+      "by `relayOnlyReachable` — nothing outside this machine enforces it. What stops the address " +
+      "leaking is that the refusal happens BEFORE the accept is built, which is structural in the " +
+      "ordering rather than a check that could be skipped.",
+  },
+  {
+    surface: "plugins/cello/skills/cello/SKILL.md",
     claim: "Backup, restore and message-level proof are all live, and the verifier needs no daemon access",
     excerpts: [
       "estore, and message-level proof are all live",
