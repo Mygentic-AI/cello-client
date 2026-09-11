@@ -264,14 +264,15 @@ systemctl --user restart hermes-gateway
 ```
 
 Verify from a Hermes chat by calling the `cello_status` MCP tool — the bound
-agent should show online with `standing_receiver_ready`.
+agent should show online with `standing_receiver_ready`, and
+`standing_receiver_reachability` should read `ready`.
 
-> **An idle agent holds no relay reservation, and that is correct.** This page used to tell you to
-> check that `standing_receiver_reachability` reads `reserved`. It will not, for an agent that is
-> simply sitting there waiting: a relay slot is now taken when someone actually calls, and given
-> back when the conversation is sealed, so that idle agents do not each occupy a slot on every relay
-> for nothing. Looking for `reserved` on an idle agent would send you hunting a fault that is not
-> there. Check it during a live session instead, where it does mean what it says.
+> **`ready` is the healthy answer for an idle agent, and `reserved` is not what you are waiting
+> for.** A relay slot is taken when somebody actually calls and given back when the conversation is
+> sealed, so that idle agents do not each occupy a slot on every relay for nothing. An agent sitting
+> waiting therefore holds none, and says `ready`. You will see `reserved` during a live
+> conversation. The one to act on is `unreachable`: the agent tried, ran out of attempts, and only
+> peers that can reach it directly will get in.
 
 ## Try it — connect to the CELLO demo agent
 

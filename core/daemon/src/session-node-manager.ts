@@ -415,7 +415,7 @@ export class SessionNodeManager {
   getStandingReceiverInfo(agentName: string): { peerId: string; addrs: string[] } | null { return this.#receivers.getStandingReceiverInfo(agentName); }
   getStandingReceiverReady(agentName?: string): boolean { return this.#receivers.getStandingReceiverReady(agentName); }
   getStandingReceiverNode(agentName?: string): CelloNode | null { return this.#receivers.getStandingReceiverNode(agentName); }
-  getStandingReceiverReachability(agentName: string): "reserved" | "retrying" | "unreachable" | "absent" { return this.#receivers.getStandingReceiverReachability(agentName); }
+  getStandingReceiverReachability(agentName: string): "reserved" | "ready" | "retrying" | "unreachable" | "absent" { return this.#receivers.getStandingReceiverReachability(agentName); }
   getStandingReceiverAutoNat(): IAutoNatService | null { return this.#receivers.getStandingReceiverAutoNat(); }
   getStandingReceiverAllowedPeer(agentName: string): string | null { return this.#receivers.getStandingReceiverAllowedPeer(agentName); }
   admitOfferedDialer(a: string, p: string, sid: string): "narrowed" | "no_receiver" | "no_peer_named" { return this.#receivers.admitOfferedDialer(a, p, sid); }
