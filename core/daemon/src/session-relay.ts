@@ -1180,6 +1180,41 @@ export class SessionRelay {
          * every 30-second tick would be exactly that churn, wearing a new name — measured here as 52
          * asks where the budget allows 37.
          */
+        /**
+         * ⚠️ **WHAT ACTUALLY NEEDS A CIRCUIT, DECIDED BEFORE THE BUDGET IS TOUCHED —
+         * `DOD-M15-IDLERETRY-1`.**
+         *
+         * `#retryDue` was called FIRST, and it does not merely answer a question: on an agent it has
+         * not seen before it WRITES a retry entry and returns false. So simply having a live session
+         * while holding no circuit was enough to open a retry ladder — and for the INITIATOR of a
+         * call that state is permanent and wrong, because an initiator DIALS OUT and never needs to
+         * be dialable (055-ONDEMAND narrowed the reservation to the party being dialed, deliberately).
+         *
+         * Two things followed, and both were measured live on 2026-09-11 rather than reasoned:
+         *   - `cello_status` reported `retrying` for a healthy agent from its first call onward,
+         *     cleared only by a daemon restart — the same "a broken agent looks like a fine one"
+         *     defect 060-READY had just fixed, in a case it did not cover;
+         *   - worse, it is not cosmetic. Held past the retry interval, both agents emitted a real
+         *     `session.standing_receiver.reservation.retry` — the daemon asking relays for slots on
+         *     behalf of sessions that need none. That is churn against the scarce resource this
+         *     whole story exists to conserve.
+         *
+         * So the question "is there anything to re-take?" is answered from the SESSION NODES first.
+         * A session that already holds its circuit, or has no relay endpoint recorded, needs
+         * nothing. If none needs anything, this tick is a no-op and must leave no trace.
+         */
+        const needRetake = liveSessions.filter((entry) => {
+          const ep = this.#ctx.queries.getPersistedRelayEndpoint(agentName, entry.sessionId);
+          if (!ep || ep.relayAddrs.length === 0) return false;
+          /**
+           * ⚠️ `heldRelayIdsOf`, NOT a substring test — the same distinction 056-SLOTDEAD had to
+           * make one layer up. A circuit address that does not NAME its relay cannot be dialled
+           * through, so a session announcing one holds nothing usable and DOES need a re-take.
+           * A substring test counts it as held and leaves that session silently unreachable.
+           */
+          return heldRelayIdsOf(entry.node).length === 0;
+        });
+        if (needRetake.length === 0) continue;
         if (!this.#retryDue(agentName)) continue;
         /**
          * ⚠️ **ON THE SESSION'S OWN NODE, NOT THE IDLE RECEIVER — and the first version got this
@@ -1192,12 +1227,10 @@ export class SessionRelay {
          * also set `relayPeerIds` non-empty, hiding the real loss from every later tick.
          */
         let retook = false;
-        for (const entry of liveSessions) {
-          const ep = this.#ctx.queries.getPersistedRelayEndpoint(agentName, entry.sessionId);
-          if (!ep || ep.relayAddrs.length === 0) continue;
+        for (const entry of needRetake) {
+          const ep = this.#ctx.queries.getPersistedRelayEndpoint(agentName, entry.sessionId)!;
           const base = ep.relayAddrs[0]!;
           const circuitAddr = base.includes(`/p2p/${ep.relayPeerId}`) ? `${base}/p2p-circuit` : `${base}/p2p/${ep.relayPeerId}/p2p-circuit`;
-          if (entry.node.listenAddresses().some((a) => a.split("/").includes("p2p-circuit"))) continue; // still holds one
           if (await this.#ctx.retakeReservationOn(agentName, entry.node, circuitAddr, entry.correlationId)) retook = true;
         }
         if (retook) continue;

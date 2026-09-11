@@ -116,6 +116,8 @@
     "src/__tests__/dod-m15-lognames-1-connected-is-not-authenticated.test.ts",
     // `060-READY`'s own file. New and clean on creation, this list's admission criterion.
     "src/__tests__/dod-m15-idle-ready-1-status-says-ready.test.ts",
+    // `061-IDLERETRY`'s own file. New and clean on creation, this list's admission criterion.
+    "src/__tests__/dod-m15-idleretry-1-no-ladder-for-a-session-that-needs-nothing.test.ts",
     // The other fixture that drives `wireSessionOfferHandler`, added in the same breath as the
     // required dep above. Leaving it out would have meant exactly the state this unit is against: a
     // parameter the signature calls required, in a file where nothing checks it.
