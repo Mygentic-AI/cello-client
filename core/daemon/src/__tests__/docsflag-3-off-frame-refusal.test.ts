@@ -147,13 +147,19 @@ describe("074-DOCSFLAG — an inbound document frame with the layer OFF", () => 
   /**
    * The content hash the receiver recomputes: sha256(0x00 ‖ content).
    *
-   * ⚠️ THE 0x00 PREFIX IS RIGHT EVEN THOUGH THIS IS A DOCUMENT FRAME, and getting it wrong is what
-   * made the first version of this test assert nothing. The 0x04 LEAF kind is chosen downstream, by
-   * the document fork, from the hook's verdict. The cross-check that runs BEFORE the fork verifies the
-   * bytes against the hash the sender committed, and that hash is domain-separated by 0x00 for every
-   * frame regardless of kind. Hash it as 0x04 and the ingest quarantines on the cross-check and never
-   * reaches the fork — the events were `session.content.cross_check.failed`, a transcript row, and a
-   * quarantine, with no document event at all.
+   * ⚠️ THE 0x00 PREFIX IS RIGHT EVEN THOUGH THIS IS A DOCUMENT FRAME, and it is not a guess.
+   * `wire-content-hash.ts` names the constant `CONTENT_HASH_DOMAIN`, fixes it at `0x00` "for ALL
+   * content frames", and its comment states outright that this is NOT the leaf kind. The `0x04` LEAF
+   * kind is chosen downstream, by the document fork, from the hook's verdict.
+   *
+   * Reproduced here rather than imported, so this test cannot pass merely by agreeing with the same
+   * function the code under test uses.
+   *
+   * Measured, because getting it wrong fails in the direction that matters. Hashed as `0x04`, the
+   * ingest quarantines on the cross-check and never reaches the fork — the events were
+   * `session.content.cross_check.failed`, a transcript row, and a quarantine, with no document event
+   * anywhere. That is what the first version of this test did, and it would have reported the frame as
+   * refused while it was in fact being filed as conversation.
    */
   function contentHash(content: Uint8Array): Uint8Array {
     return new Uint8Array(
