@@ -124,6 +124,9 @@ export function registerAgentAdminHandlers(deps: AgentAdminDeps): void {
       sequence_number: r.sequenceNumber,
       timestamp: r.timestamp,
       signature_hex: r.signatureHex,
+      // 069-ORDERPROOF: part of the signed statement, so a caller re-verifying the attestation from
+      // the outside cannot rebuild the bytes without it. Absent on rows written before this order.
+      running_root_hex: r.runningRootHex,
     }));
     return { ok: true, receipts };
   });

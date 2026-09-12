@@ -430,7 +430,9 @@ export default [
   },
   {
     files: ["core/daemon/src/agent-admin-handlers.ts"],
-    rules: { "max-lines": ["error", { max: 130, skipBlankLines: false, skipComments: false }] },
+    // 130 → 133 (069-ORDERPROOF, +3): the relay-receipts surface returns the running root, without
+    // which a caller re-verifying an attestation from outside cannot rebuild the signed bytes.
+    rules: { "max-lines": ["error", { max: 133, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/status-handler.ts"],
