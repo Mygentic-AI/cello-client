@@ -244,8 +244,12 @@ const REKEY_TARGETS: readonly RekeyTarget[] = [
      * it — that mechanism is real and is what the header at the top of this file warns about. It is
      * unreachable for this table only because `RetryQueue`'s constructor, which owns those
      * `ALTER TABLE`s, runs AFTER `initialize()` — so at the moment this DDL executes, the columns do
-     * not exist to be copied. `daemon.ts` builds the queue roughly 1,400 lines after it calls
-     * `initialize()`, and nothing enforces that distance but a comment saying not to reorder.
+     * not exist to be copied. `daemon.ts` builds the queue long after it calls `initialize()`, and
+     * the source of that ordering is a convention (`retry-queue.ts`, "Do not reorder"), not a
+     * runtime check. `DOD-M15-MIGRATION-GUARD-1` is what stops the convention failing silently: it
+     * replays the inline ALTERs in the real boot order across all seven rebuilt tables, so a column
+     * this DDL omits shows up as a failing test rather than as an empty column on an operator's
+     * machine. Keep the two together — the list below and that replay are one guard in two halves.
      *
      * So the columns are listed here anyway. They cost nothing while the order holds, and they are
      * the difference between a silent loss and no loss on the day someone moves the construction up.
