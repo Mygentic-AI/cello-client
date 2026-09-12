@@ -25,7 +25,7 @@
  *
  * Crypto: Ed25519 (RFC 8032), SHA-256 (FIPS 180-4).
  */
-import { timingSafeEqual } from "node:crypto";
+import { timingSafeEqual, createHash } from "node:crypto";
 import { decode as cborDecode } from "cbor-x";
 import { encodeCbor } from "@cello-protocol/protocol-types";
 import { verify, sealToRecipient, type KeyProvider } from "@cello-protocol/crypto";
@@ -57,6 +57,105 @@ export function pubkeyMatchesHex(pubkey: Uint8Array, storedHex: string | undefin
   // Buffer.from ignores trailing garbage rather than throwing, so a length check is the real guard.
   if (stored.length === 0 || stored.length !== pubkey.length) return false;
   return timingSafeEqual(Buffer.from(pubkey), stored);
+}
+
+/**
+ * DOD-M15-DELIVERYACK-1 unit 1 — WHAT A PARKED ENTRY IS, SAID WHERE THE RELAY CANNOT READ IT.
+ *
+ * The relay's mailbox holds opaque ciphertext and has no idea what is inside. An acknowledgement
+ * parked there would arrive at the recipient's content-recovery path and be ingested as a MESSAGE —
+ * which is why the acknowledgement could not use that path at all, and why an acknowledgement sent
+ * while the sender's daemon was down was simply lost.
+ *
+ * So the discriminator rides INSIDE the seal. Consequences, and all three are the point:
+ *  - the relay needs NO change and learns nothing new — it stays a blind custodian (INV-3);
+ *  - the relay cannot strip the tag to make an acknowledgement be ingested as content, nor add one
+ *    to make a message disappear into the evidence store;
+ *  - the envelope's existing SEC-1 gate still runs first, so a parked acknowledgement is
+ *    authenticated as coming from this session's counterparty BEFORE anything looks at what it says.
+ *
+ * ⚠️ THE TAG IS A WIRE VALUE. The string is the contract; renaming the constant is free, changing
+ * its value breaks every parked acknowledgement already sitting in a mailbox.
+ */
+export const PARKED_DELIVERY_ACK_TAG = "cello/park/delivery-ack/v1";
+
+/** Domain separator for the mailbox slot an acknowledgement is filed under. */
+const PARKED_DELIVERY_ACK_SLOT_DOMAIN = "CELLO-PARK-DELIVERY-ACK-SLOT-v1";
+
+/**
+ * The relay mailbox slot a parked acknowledgement occupies.
+ *
+ * ⚠️ NOT the hash it acknowledges, and that is a correctness requirement rather than tidiness. The
+ * relay files entries by `(recipient_pubkey, content_hash)`. Filing an acknowledgement under the
+ * hash it is about would put it in the same slot a parked copy of that very message occupies, so
+ * one could evict or be mistaken for the other. A labelled derivation puts it somewhere no
+ * message's content hash can land, by accident or by construction.
+ *
+ * DETERMINISTIC on purpose: re-parking the same acknowledgement lands on the same slot, so the
+ * relay's own `INSERT OR IGNORE`-shaped dedup absorbs a repeat instead of growing the mailbox.
+ *
+ * SHA-256 — FIPS 180-4.
+ */
+export function parkedDeliveryAckMailboxHash(sessionIdHex: string, contentHash: Uint8Array): Uint8Array {
+  return new Uint8Array(
+    createHash("sha256")
+      .update(Buffer.from(PARKED_DELIVERY_ACK_SLOT_DOMAIN, "utf8"))
+      .update(Buffer.from(sessionIdHex, "hex"))
+      .update(Buffer.from(contentHash))
+      .digest(),
+  );
+}
+
+/** A parked delivery acknowledgement, as it sits inside the seal. */
+export interface ParkedDeliveryAck {
+  sessionIdHex: string;
+  /** The content hash being acknowledged — the MESSAGE's hash, not the mailbox slot. */
+  contentHash: Uint8Array;
+  /** The acknowledging agent's Ed25519 signature over the canonical delivery-ack statement. */
+  ackSig: Uint8Array;
+  /** Who claims to have signed it. VERIFIED against the session's recorded key, never trusted from here. */
+  signerPubkey: Uint8Array;
+}
+
+/**
+ * Encode a parked acknowledgement. This becomes the park envelope's `content`, so the envelope's
+ * signature covers it and the seal hides it.
+ */
+export function encodeParkedDeliveryAck(ack: ParkedDeliveryAck): Uint8Array {
+  return encodeCbor([
+    PARKED_DELIVERY_ACK_TAG,
+    ack.sessionIdHex,
+    ack.contentHash,
+    ack.ackSig,
+    ack.signerPubkey,
+  ]) as Uint8Array;
+}
+
+/**
+ * Is this park envelope's content a delivery acknowledgement? `null` means no — which is the answer
+ * for every ordinary message, and must stay the answer for every ordinary message.
+ *
+ * 🚨 STRICT ON PURPOSE, AND IT REFUSES RATHER THAN REPAIRS. A malformed acknowledgement answers
+ * `null`, which routes it to the content path where the envelope gate has already vouched for the
+ * depositor and ingest will judge it on its own terms. There is no half-accepted acknowledgement:
+ * the widths are exact, the tag is in the first slot only, and a hex session id that is not hex is
+ * refused. A tolerant decode here would let a crafted message be filed as proof of its own delivery.
+ */
+export function decodeParkedDeliveryAck(content: Uint8Array): ParkedDeliveryAck | null {
+  let arr: unknown;
+  try {
+    arr = cborDecode(content);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(arr) || arr.length !== 5) return null;
+  const [tag, sessionIdHex, contentHash, ackSig, signerPubkey] = arr as unknown[];
+  if (tag !== PARKED_DELIVERY_ACK_TAG) return null;
+  if (typeof sessionIdHex !== "string" || !/^[0-9a-fA-F]+$/.test(sessionIdHex) || sessionIdHex.length % 2 !== 0) return null;
+  if (!(contentHash instanceof Uint8Array) || contentHash.length !== 32) return null;
+  if (!(ackSig instanceof Uint8Array) || ackSig.length !== 64) return null;
+  if (!(signerPubkey instanceof Uint8Array) || signerPubkey.length !== 32) return null;
+  return { sessionIdHex, contentHash, ackSig, signerPubkey };
 }
 
 /** Current envelope version. v1 (unsigned) is decodable but NEVER acceptable — see authenticate(). */

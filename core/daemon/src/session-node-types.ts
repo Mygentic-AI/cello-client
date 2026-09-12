@@ -864,6 +864,17 @@ export interface AwaitingAckEntry {
   contentHashAlg?: string;
   structure1Signature?: Uint8Array;
   leafKind?: number;
+  /**
+   * DOD-M15-DELIVERYACK-1: has a REFUSED acknowledgement for this message already been logged loudly?
+   *
+   * The awaiting entry survives a refusal — it must, because a bad acknowledgement has to leave the
+   * message in exactly the state no acknowledgement would. So without this a counterparty can send
+   * the same malformed acknowledgement ten thousand times and get ten thousand WARN lines out of
+   * this machine. It lives HERE rather than in a map of its own so it is freed with the entry, and
+   * because an entry exists only for a message THIS side sent: the other party cannot spend a
+   * budget they cannot create. Nothing reads it but the choice of log level.
+   */
+  ackRefusalLogged?: boolean;
 }
 
 /**

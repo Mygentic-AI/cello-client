@@ -40,6 +40,7 @@ describe("content-delivery types (MSG-001)", () => {
       session_id: new Uint8Array([1, 2, 3]),
       content_hash: new Uint8Array(32),
       level: "persisted",
+      ack_sig: new Uint8Array(64),
     };
     expect(isContentDeliveryAck(ack)).toBe(true);
     expect(isContentDeliveryAck({ type: "content_frame" })).toBe(false);
@@ -47,14 +48,26 @@ describe("content-delivery types (MSG-001)", () => {
     expect(isContentDeliveryAck({ type: "content_delivery_ack" })).toBe(false); // missing fields
   });
 
-  it("the delivery ack carries no signature field (D-c — unsigned, transport-authenticated)", () => {
-    const ack: ContentDeliveryAck = {
+  /**
+   * ⚠️ THIS TEST USED TO BE "the delivery ack carries no signature field (D-c — unsigned,
+   * transport-authenticated)", and it asserted `"signature" in ack === false`.
+   *
+   * `DOD-M15-DELIVERYACK-1` reversed it. The session channel authenticates the HOP and dies with
+   * the connection, so an unsigned acknowledgement left the sender holding nothing it could show a
+   * third party — "it never reached me" was unanswerable in both directions. Rewritten rather than
+   * deleted: the old assertion is precisely what would tell a later reader the frame is unsigned by
+   * design. Note the old form would STILL PASS against the new field, since it named `signature`
+   * and the field is `ack_sig` — a green test asserting a property the code had abandoned.
+   */
+  it("a delivery ack with NO signature is not a delivery ack — the guard fails it at the shape check", () => {
+    const unsigned = {
       type: "content_delivery_ack",
       session_id: new Uint8Array([9]),
       content_hash: new Uint8Array(32),
       level: "persisted",
     };
-    expect("signature" in ack).toBe(false);
+    expect(isContentDeliveryAck(unsigned)).toBe(false);
+    expect(isContentDeliveryAck({ ...unsigned, ack_sig: new Uint8Array(64) })).toBe(true);
   });
 
   it("isContentResendRequest recognizes the recovery reverse-channel frame", () => {
