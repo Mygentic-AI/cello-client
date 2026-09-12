@@ -444,8 +444,13 @@ export interface AgentRelayClientOpts {
 
 /**
  * What ONE relay observed. Deliberately not a verdict, and the field names say so: this establishes
- * that this relay saw and refused that submission, and nothing about who sent it. Corroboration
- * would need several relays reporting the same hash sequence, which does not exist yet.
+ * that this relay saw and refused that submission, and nothing about who sent it.
+ *
+ * ONE witness is not corroboration, and the type is shaped to stop a reader forgetting it.
+ * `DOD-M15-CORROBORATE-1` closed the other half — this relay verifies every submitted hash as it
+ * arrives rather than at seal time, so an alert does not depend on the accusing client reporting
+ * anything. What is still open is BREADTH: several relays reporting the same hash sequence, which
+ * is `DOD-M15-MULTIWITNESS-1`. Until that lands, treat an alert as one machine's account.
  */
 export interface RelayWitnessAlert {
   sessionIdHex: string;
