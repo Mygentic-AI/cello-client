@@ -764,7 +764,7 @@ export class TrustSignalStore {
    * condition. Comparing case-insensitively is the correct equality for hex, not a fallback that
    * papers over a mismatch.
    *
-   * Note the residual, because it is NOT closed here: the directory's
+   * Note the residual, because it is NOT closed here — it is `DOD-M15-HEXCASE-MINT-1`: the directory's
    * `JOIN agent_profiles ap ON ap.k_local_pubkey = sr.subject` is case-sensitive too, so an
    * uppercase-hex subject that ever got minted would still be invisible THERE. Closing that means
    * constraining the value where it is produced (the portal's mint) — which spans three components
@@ -775,7 +775,9 @@ export class TrustSignalStore {
    * production code, so there is nothing to compare against and inventing one is a separate
    * decision (M10B fourth review F5). Today's behavior for account rows is therefore unchanged:
    * every agent on the daemon may present them, which is also what M10-D5 says for agents under the
-   * same account. It becomes wrong only when one daemon holds agents of two different accounts.
+   * same account. It becomes wrong only when one daemon holds agents of two different accounts,
+   * and that trigger is the whole of `DOD-M15-ACCOUNT-SCOPE-1` — which is where this gets closed,
+   * not by inventing a daemon-side `accountId` to satisfy the predicate.
    *
    * Default behavior: returns only signals where `default_present = 1`.
    * `include` overrides the default — only the listed types are returned regardless of `default_present`.
