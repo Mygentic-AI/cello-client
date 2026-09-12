@@ -994,7 +994,6 @@ export class DocumentStore {
     return Number(info.changes) > 0;
   }
 
-  /** How many rejections this document has RECEIVED — the publishing side's retry round. */
   /**
    * DOD-DOC-SCREEN-1 (§16.7-16) — SENDER ADOPTS THE RECEIVER'S RULE.
    *
