@@ -950,18 +950,16 @@ export async function verifyUnilateralCertificate(
  * primary value is OUT-OF-BAND (any holder of the signer's primary — e.g. an arbitrator — can verify
  * an exported cert's legibility).
  *
- * SYMMETRY STATUS: SYMMETRIC as of 038-KEYBIND, and the old text is worth stating because it names
- * what was broken. It read: *"The missing half is the INITIATOR-records-RESPONDER direction: an
- * initiator never learns the responder's primary, so when the responder closes first, the initiator
- * cannot verify locally and accepts with reason `signer_key_not_held`."* That was exactly right,
- * and it is now closed: the session assignment carries `participant_b_primary_pubkey` alongside a
- * binding signed by participant_b's own K_local, the initiator verifies that binding before it will
- * accept the assignment at all, and `initiate-session-handler.ts` records the result. Both closing
- * orders verify locally.
+ * SYMMETRY: both closing orders verify locally, and the property must stay that way. Each party
+ * learns the other's primary from the session assignment — `participant_b_primary_pubkey` with a
+ * binding signed by participant_b's own K_local, verified before the assignment is accepted at all
+ * (`assignment-verify.ts`), recorded by `initiate-session-handler.ts`. The binding is the
+ * load-bearing part: carrying the group key alone would let a directory name a key of its choosing,
+ * so a change that keeps the key and drops the binding breaks verification while appearing to work.
  *
- * `signer_key_not_held` therefore no longer describes an ordinary responder-first close. It remains
- * reachable — a session row that predates the recording, or one whose assignment never reached this
- * path — and it is still the honest answer in those cases, which is why the branch stays.
+ * `signer_key_not_held` is therefore NOT the ordinary responder-first outcome. It remains reachable
+ * for a session row that predates the recording, or one whose assignment never reached this path,
+ * and it is the honest answer there, which is why the branch stays.
  *
  * `legibility` MUST be the AS-RECEIVED wire object (not a normalised copy) — the directory signed
  * over the canonical hash of exactly what it sent.
@@ -1018,7 +1016,9 @@ export async function verifyBilateralSealCertificate(
   } else {
     // We do not hold the signer's key (no counterparty primary recorded) → cannot verify; accept
     // (the live frame arrived over the authenticated Noise channel; the binding aids out-of-band).
-    // This is the initiator-when-responder-closed-first case F2-b would close.
+    // Reachable only for a session whose assignment never carried (or never recorded) the
+    // counterparty's bound primary — a pre-038-KEYBIND row. A CURRENT session reaching here means
+    // the recording above it did not run, which is a defect, not a normal close order.
     return { ok: true, verified: false, reason: "signer_key_not_held" };
   }
 
