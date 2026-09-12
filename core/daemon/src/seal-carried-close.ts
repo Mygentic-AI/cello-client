@@ -7,7 +7,7 @@
  */
 import { decodeStructure1 } from "@cello-protocol/protocol-types";
 import { buildLocalSealTerminus } from "./seal-local-terminus.js";
-import { RELAY_GAVE_NO_ANSWER } from "./seal-relay-silence.js";
+import { RELAY_GAVE_NO_ANSWER, relayRefusedUs } from "./seal-relay-silence.js";
 import { SessionSealLeafStore, type SealCarryLeaf } from "./session-seal-leaf-store.js";
 import type { SessionSealContext } from "./session-seal.js";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
@@ -40,8 +40,26 @@ export async function closeOverCarriedEvidence(
   sessionId: string,
   cause: string,
   correlationId?: string,
+  /**
+   * The relay's standing verdict about THIS AGENT, when there is a relay client to ask. The reason
+   * string cannot carry it — see `relayRefusedUs` — so it is passed alongside.
+   */
+  standingRefusal?: { reason: string } | null,
 ): Promise<{ ok: true; sequenceNumber: number; reportedRootHex: string } | null> {
   if (!RELAY_GAVE_NO_ANSWER.has(cause)) return null;
+  if (relayRefusedUs(standingRefusal)) {
+    /**
+     * THE RELAY ANSWERED, AND THE ANSWER WAS NO. Sealing over carried evidence here would be
+     * routing around a ruling — the relay authenticated this agent and then refused it, and that
+     * refusal is a decision about us rather than an absence of anyone to ask.
+     */
+    deps.ctx.logger.warn("session.seal.local_terminus.relay_refused", {
+      agentName, sessionId, cause, relayReason: standingRefusal?.reason, correlationId,
+      impact: "the relay REFUSED this agent rather than being unreachable, so this side did not sign its own closing leaf. No receipt was produced and the session is untouched — closing around a refusal would put a record on the chain that the witness declined to witness.",
+      guidance: "Fix what the relay refused (cello status names it — an expired credential, a rate limit, or a capacity cap), then close again. If the relay is genuinely gone rather than refusing, the close will proceed on its own.",
+    });
+    return null;
+  }
 
   const kp = deps.ctx.getKeyProvider(agentName);
   if (!kp) {

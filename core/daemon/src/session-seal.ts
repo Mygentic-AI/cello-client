@@ -472,12 +472,13 @@ export class SessionSeal {
     sessionId: string,
     cause: string,
     correlationId?: string,
+    standingRefusal?: { reason: string } | null,
   ): Promise<{ ok: true; sequenceNumber: number; reportedRootHex: string } | null> {
     return closeOverCarriedEvidence({
       ctx: this.#ctx,
       db: this.#db,
       getSealCarry: (pk, sid) => this.getSealCarry(pk, sid),
-    }, agentName, sessionId, cause, correlationId);
+    }, agentName, sessionId, cause, correlationId, standingRefusal);
   }
 
   async submitSealLeaf(
@@ -659,7 +660,10 @@ export class SessionSeal {
           this.#ctx.logger.warn("session.seal.leaf.submit.failed", { sessionId, reason: result.reason, correlationId });
           // 070-CARRIEDSEAL: the relay was asked and said nothing. Same answer as having no relay at
           // all — write the closing leaf here rather than lose a receipt for a witnessed record.
-          const local = await this.#carriedClose(agentName, sessionId, result.reason, correlationId);
+          // The relay client is in hand here, so its standing verdict can be asked for directly —
+          // the reason string above cannot carry it.
+          const local = await this.#carriedClose(agentName, sessionId, result.reason, correlationId,
+            entry.relayClient.getLastAuthRefusal());
           if (local) {
             this.#ctx.responderSealSubmitted.set(sealKey, { reportedRootHex: local.reportedRootHex, sequenceNumber: local.sequenceNumber });
             return { ...local, viaLocalTerminus: true as const };

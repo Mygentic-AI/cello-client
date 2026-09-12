@@ -17,6 +17,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { generateKeypair, verify, buildMerkleTree, merkleRoot, type LeafInput } from "@cello-protocol/crypto";
 import { encodeStructure1, decodeStructure1, encodeStructure2, decodeSealPayload, SCAN_RESULT_SENTINEL } from "@cello-protocol/protocol-types";
 import { buildLocalSealTerminus } from "../seal-local-terminus.js";
+import { RELAY_GAVE_NO_ANSWER, relayRefusedUs } from "../seal-relay-silence.js";
 import type { SealCarryLeaf } from "../session-seal-leaf-store.js";
 
 const LEAF_KIND_MSG = 0x00;
@@ -327,3 +328,46 @@ function prefixRootTrue(carry: readonly SealCarryLeaf[]): Uint8Array {
   const domain: Record<number, "msg" | "ctrl" | "doc" | "reject"> = { 0x00: "msg", 0x02: "ctrl", 0x04: "doc", 0x05: "reject" };
   return merkleRoot(buildMerkleTree(carry.map((l) => ({ kind: domain[l.leafKind]!, data: l.structure2Cbor }))));
 }
+
+/**
+ * ═══ A RELAY THAT RULED IS NOT A RELAY THAT WAS SILENT — fallback-finder finding 1 ═══
+ *
+ * `RELAY_GAVE_NO_ANSWER` is checked against the reason the SUBMIT BOUNDARY returns, and that
+ * boundary collapses almost every relay refusal into `relay_unavailable`. Only three token faults
+ * are surfaced under their own names (`DOD-M15-TOKENSTALE-1` split those out); everything else the
+ * relay actually said — rate limited, over its slot cap, this agent's token rejected as invalid,
+ * and by the documented default every future relay-side reason — arrives wearing the label for an
+ * outage.
+ *
+ * So the allow-set alone cannot tell the two apart, and a relay that AUTHENTICATED this agent and
+ * then explicitly refused it would have been read as silence and sealed around. That is the one
+ * thing the whole design says must never happen: routing around a ruling.
+ *
+ * The standing refusal is the signal the boundary drops, and it is right there on the client.
+ */
+describe("DOD-M15-CARRIEDSEAL-1 — silence, not a ruling, is what unlocks the local close", () => {
+  it("★★★ relayRefusedUs() blocks the local terminus even when the reason looks like an outage", () => {
+    // `relay_unavailable` IS in the allow-set — that is correct, it is also the genuine-outage
+    // label. What must differ is whether a refusal was standing when it was produced.
+    expect(RELAY_GAVE_NO_ANSWER.has("relay_unavailable"), "the outage label stays in the set").toBe(true);
+
+    // Silence: no refusal recorded. The close may proceed over carried evidence.
+    expect(relayRefusedUs(undefined)).toBe(false);
+    expect(relayRefusedUs(null)).toBe(false);
+
+    // A ruling: the relay answered and said no. Every one of these is the relay exercising
+    // judgement about this agent, and sealing around any of them is sealing around a decision.
+    for (const reason of [
+      "rate_limited",
+      "slot_cap_exceeded",
+      "session_tuple_cap_exceeded",
+      "online_token_signature_invalid",
+      "online_token_malformed",
+      "online_token_lifetime_too_long",
+      "online_token_expired",
+      "a_reason_added_in_2027",
+    ]) {
+      expect(relayRefusedUs({ reason, advice: "" }), `"${reason}" is the relay ruling, not silence`).toBe(true);
+    }
+  });
+});

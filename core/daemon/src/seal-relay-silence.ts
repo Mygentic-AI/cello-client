@@ -24,6 +24,30 @@
  *     guidance ("start the agent and retry") is the correct thing to tell someone.
  */
 
+/**
+ * ⚠️ THE ALLOW-SET IS NOT SUFFICIENT ON ITS OWN, AND THIS IS THE HALF THAT MAKES IT SOUND.
+ *
+ * The submit boundary COLLAPSES almost every relay refusal into `relay_unavailable`. Only three
+ * token faults survive under their own names (`DOD-M15-TOKENSTALE-1` split those out); everything
+ * else the relay actually said — rate limited, over its slot cap, this agent's token rejected as
+ * invalid, and by that code's own documented default every future relay-side reason — arrives at
+ * this file wearing the label for an outage.
+ *
+ * So the reason string alone cannot tell "nobody was there" from "they authenticated me and said
+ * no". A relay exercising judgement about this agent would have been read as silence and sealed
+ * around, which is the one thing this whole design says must never happen.
+ *
+ * The standing refusal is the signal the boundary drops, and the client still holds it. Ask for it
+ * directly rather than trying to infer it from a label that was never going to carry it.
+ *
+ * **A ruling is anything the relay answered with.** Not a list of known-bad reasons: a set like that
+ * defaults to "silence" for anything unfamiliar, which is the wrong direction here — a reason added
+ * next year would quietly become a bypass. Present means refused.
+ */
+export function relayRefusedUs(refusal: { reason: string } | null | undefined): boolean {
+  return refusal != null;
+}
+
 /** The relay never ruled. See the header — this is an allow-set and the default is to fail as before. */
 export const RELAY_GAVE_NO_ANSWER: ReadonlySet<string> = new Set([
   // No relay client, no stream, or the session is gone from the relay's side.
