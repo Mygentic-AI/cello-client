@@ -84,9 +84,42 @@ export async function closeOverCarriedEvidence(
    */
   const first = carry[0] ? decodeStructure1(carry[0].structure1Cbor) : null;
   if (!first?.ok) {
+    /**
+     * TWO DIFFERENT FACTS, AND THEY SEND THE OPERATOR TO DIFFERENT PLACES. An empty carry means the
+     * conversation was never witnessed; an undecodable first leaf means the record IS here and is
+     * damaged. Reporting the second as the first sends someone looking for something that is not
+     * missing.
+     */
+    const empty = carry.length === 0;
     deps.ctx.logger.info("session.seal.local_terminus.no_carry", {
-      agentName, sessionId, cause, carryLength: carry.length, correlationId,
-      impact: "no witnessed leaf is held for this session, so there is no record to close over and no receipt to produce.",
+      agentName, sessionId, cause, carryLength: carry.length,
+      reason: empty ? "seal_carry_empty" : "seal_carry_unreadable", correlationId,
+      impact: empty
+        ? "no witnessed leaf is held for this session, so there is no record to close over and no receipt to produce."
+        : "this session's first recorded leaf is on disk and cannot be decoded, so the record cannot be chained onto. The conversation is NOT missing — cello_transcript still shows it — but no receipt can be produced from this side.",
+    });
+    return null;
+  }
+
+  /**
+   * ⚠️ NO GENESIS, NO TERMINUS — and this used to be `?? new Uint8Array(32)`.
+   *
+   * The genesis is the session's agreed starting point, and it is what BOTH chain links fall back to
+   * for a party that has not spoken yet. Substituting thirty-two zero bytes does not fail: the
+   * directory's walk skips `prev_own_hash` for a sender's first leaf and never checks
+   * `last_seen_hash` at all, so the leaf notarizes and the counterparty — verifying against the real
+   * starting point — is the one who finds a link that does not reconcile. A silent substitution
+   * whose cost lands on the other party.
+   *
+   * The send path already refuses for exactly this reason ("no seed means no send… the honest
+   * outcome is to refuse rather than sign a chain anchored to nothing"). So does this.
+   */
+  const genesis = deps.ctx.leafRecords.sessionGenesisPrevRoot(agentName, sessionId);
+  if (!genesis) {
+    deps.ctx.logger.warn("session.seal.local_terminus.no_genesis", {
+      agentName, sessionId, cause, correlationId,
+      impact: "this session has no recorded starting point on this machine, so a closing leaf written here could not link to anything and its place in the conversation could never be proven. Nothing was signed and the session is untouched.",
+      guidance: "Close WITH your counterparty instead — a bilateral close does not need this value. cello_transcript still shows the conversation either way.",
     });
     return null;
   }
@@ -96,12 +129,37 @@ export async function closeOverCarriedEvidence(
     ownPubkeyHex,
     ownPubkey,
     sessionIdBytes: first.fields.sessionId,
-    genesis: deps.ctx.leafRecords.sessionGenesisPrevRoot(agentName, sessionId) ?? new Uint8Array(32),
+    genesis,
     finalRootHex: deps.ctx.getSessionTreeRootHex(agentName, sessionId),
     closeTimestamp: Date.now(),
     sign: async (bytes) => new Uint8Array(await kp.sign(bytes)),
   });
   if (!built.ok) {
+    /**
+     * ⚠️ AN ALREADY-PLACED TERMINUS IS A SUCCESS BEING REPORTED AS A FAILURE — review MEDIUM-3.
+     *
+     * `seal_carry_own_ctrl_present` means a previous close already wrote our closing leaf. Returning
+     * `null` sent the caller to its original refusal, so an operator who closed successfully and then
+     * closed again — or whose reconnect retried for them — was told the RELAY was unavailable, for a
+     * session whose closing leaf is on their own disk. The terminus builder's own docblock says the
+     * caller must reuse the one that is there; nobody did.
+     *
+     * Reused rather than rebuilt: the leaf on disk is the one whose bytes were signed, and rebuilding
+     * would produce a different timestamp and therefore a different record.
+     */
+    if (built.reason === "seal_carry_own_ctrl_present") {
+      const existing = carry.find((l) => l.leafKind === 0x02 && l.senderPubkeyHex === ownPubkeyHex);
+      const priorS1 = existing ? decodeStructure1(existing.structure1Cbor) : null;
+      if (existing && priorS1?.ok) {
+        const priorRootHex = deps.ctx.getSessionTree(agentName, sessionId)
+          .rootWithAppendedHex(Buffer.from(priorS1.fields.contentHash).toString("hex"));
+        deps.ctx.logger.info("session.seal.local_terminus.reused", {
+          agentName, sessionId, cause, sequenceNumber: existing.sequenceNumber, correlationId,
+          impact: "this side had already signed its closing leaf for this session, so the earlier one is carried again rather than a second being written. A second closing leaf would make the session unsealable by any directory, permanently.",
+        });
+        return { ok: true, sequenceNumber: existing.sequenceNumber, reportedRootHex: priorRootHex };
+      }
+    }
     deps.ctx.logger.warn("session.seal.local_terminus.refused", {
       agentName, sessionId, cause, reason: built.reason, correlationId,
       impact: "the relay could not be reached and the record this side holds cannot be closed over as it stands, so no receipt was produced.",

@@ -1147,9 +1147,16 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         // tunes how long to wait for the counterparty before escalating to a unilateral seal.
         // DOD-SEAL-BILATERAL-TIMEOUT-1: default is 660 s (11 min) — deliberately just over
         // the directory's deliveryGraceSeconds default (600 s / 10 min), so the bilateral
-        // timeout always expires AFTER the grace window. This makes seal_unilateral_too_early
-        // structurally unreachable under normal configuration; override via the env var for
-        // tests or operators who need a shorter window.
+        // timeout always expires AFTER the grace window; override via the env var for tests or
+        // operators who need a shorter window.
+        //
+        // ⚠️ THIS USED TO SAY seal_unilateral_too_early WAS "STRUCTURALLY UNREACHABLE", AND
+        // 070-CARRIEDSEAL MADE THAT FALSE. Rewritten rather than deleted, because a reader who
+        // believed it would be surprised by the refusal and go looking for a bug. The zero below
+        // skips the window entirely, so a session closed with no relay AND less than the grace
+        // period of age now reaches that refusal — which is correct (the directory's floor is a
+        // real floor) and is loud, with its own guidance. It is no longer unreachable; it is
+        // reachable exactly when there was never a ceremony to wait out.
         /**
          * ⚠️ 070-CARRIEDSEAL — THERE IS NOTHING TO WAIT FOR WHEN NO RELAY TOOK THE LEAF.
          *
@@ -1166,7 +1173,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
          * Zero, not "shorter": this is not a tuning judgement about how long a counterparty might
          * take. It is the absence of a counterparty channel.
          */
-        const bilateralTimeoutMs = submit.ok && submit.viaLocalTerminus === true
+        const bilateralTimeoutMs = submit.viaLocalTerminus === true
           ? 0
           : Number(process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"]) || 660_000;
         // DOD-M12B-CLOSE-SILENT-WAIT-1: SAY SO BEFORE THE SILENCE, not after it.

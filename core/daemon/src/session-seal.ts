@@ -143,6 +143,16 @@ export interface SessionSealContext {
 export class SessionSeal {
   readonly #ctx: SessionSealContext;
 
+  /**
+   * Sessions whose closing leaf THIS PROCESS signed locally, because no relay answered.
+   *
+   * Kept beside the idempotency mark rather than inside it: a retried close reads the mark and gets
+   * `responder_seal_already_submitted`, and without this it would lose the one fact that makes the
+   * eleven-minute bilateral wait pointless — so the retry would sit out a window for a ceremony that
+   * still cannot begin. In memory only; a restart correctly re-derives it by trying the relay again.
+   */
+  readonly #closedViaLocalTerminus = new Set<string>();
+
   constructor(ctx: SessionSealContext) {
     this.#ctx = ctx;
   }
@@ -499,7 +509,7 @@ export class SessionSeal {
          */
         viaLocalTerminus?: true;
       }
-    | { ok: false; reason: string; reportedRootHex?: string; sequenceNumber?: number }
+    | { ok: false; reason: string; reportedRootHex?: string; sequenceNumber?: number; viaLocalTerminus?: true }
   > {
     const sealKey = this.#ctx.sessionKey(agentName, sessionId);
     /**
@@ -534,7 +544,14 @@ export class SessionSeal {
       // 070-CARRIEDSEAL: there is no relay to hand this leaf to. If the reason is SILENCE rather
       // than a ruling, close over what we already hold instead of losing the receipt.
       const local = await this.#carriedClose(agentName, sessionId, transport.error, correlationId);
-      return local ? { ...local, viaLocalTerminus: true as const } : { ok: false, reason: transport.error };
+      if (!local) return { ok: false, reason: transport.error };
+      // ⚠️ THE MARK, ON THIS PATH TOO — review MEDIUM-3. The submit-failure branch below records it
+      // and this one did not, so a retried close re-entered the terminus builder, hit
+      // `seal_carry_own_ctrl_present`, and reported the RELAY as the fault for a session whose
+      // closing leaf was already on disk.
+      this.#ctx.responderSealSubmitted.set(sealKey, { reportedRootHex: local.reportedRootHex, sequenceNumber: local.sequenceNumber });
+      this.#closedViaLocalTerminus.add(sealKey);
+      return { ...local, viaLocalTerminus: true as const };
     }
     const entry = transport;
     /**
@@ -618,6 +635,8 @@ export class SessionSeal {
               reason: "responder_seal_already_submitted",
               reportedRootHex: prior.reportedRootHex,
               sequenceNumber: prior.sequenceNumber,
+              // Carried so a retry does not sit out a bilateral window that still cannot open.
+              ...(this.#closedViaLocalTerminus.has(sealKey) ? { viaLocalTerminus: true as const } : {}),
             }
           : { ok: false, reason: "responder_seal_already_submitted" };
       }
@@ -666,6 +685,7 @@ export class SessionSeal {
             entry.relayClient.getLastAuthRefusal());
           if (local) {
             this.#ctx.responderSealSubmitted.set(sealKey, { reportedRootHex: local.reportedRootHex, sequenceNumber: local.sequenceNumber });
+            this.#closedViaLocalTerminus.add(sealKey);
             return { ...local, viaLocalTerminus: true as const };
           }
           return { ok: false, reason: result.reason };
