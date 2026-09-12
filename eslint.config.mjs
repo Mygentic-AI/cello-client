@@ -92,10 +92,15 @@ const SENDRAW_SELECTORS = [
  * If you are reading this while adding a feature: this is not precedent. Split the file.
  */
 /**
- * ⚠️ **THREE MOVED ON 2026-09-12 FOR `072-FINGERPRINT`, BY 3, 3 AND 4 — MEASURED, AFTER THE COST WAS
- * CUT TWICE.** `daemon.ts` 1348 → 1352 (one import, one comment, one call to `logConsortiumAnchor`),
- * `daemon-status-report.ts` 114 → 117 and `status-handler.ts` 97 → 100 (one import, one comment, one
- * spread of `describeConsortiumFingerprint()` each).
+ * ⚠️ **THREE MOVED ON 2026-09-12 FOR `072-FINGERPRINT` — MEASURED TWICE, THE SECOND TIME AFTER
+ * REVIEW.** `daemon.ts` 1348 → 1362, `daemon-status-report.ts` 114 → 123, `status-handler.ts`
+ * 97 → 103.
+ *
+ * The first measurement (+3/+3/+4) bought one import and one call per site. Review then found the
+ * block was printing the COMPILED-IN root keys while the daemon can be verifying against a different
+ * set, or against none — so it now takes the enforced pair, and each status module carries the dep,
+ * its doc comment saying why it is not the constant, and the destructure. That prose is the whole
+ * finding; deleting it to stay under a number is how the next author reintroduces the bug.
  *
  * The unit prints the consortium root fingerprint the client verifies against, on both status
  * surfaces and in a startup event. Two surfaces is not duplication here — they are two different
@@ -327,7 +332,7 @@ export default [
     //  EXACT, never with slack: a ratchet with give is a
     // line that can come back.
     files: ["core/daemon/src/daemon.ts"],
-    rules: { "max-lines": ["error", { max: 1352, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 1362, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/daemon-handle.ts"],
@@ -379,7 +384,7 @@ export default [
   },
   {
     files: ["core/daemon/src/daemon-status-report.ts"],
-    rules: { "max-lines": ["error", { max: 117, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 123, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/ipc-surface.ts"],
@@ -447,7 +452,7 @@ export default [
   },
   {
     files: ["core/daemon/src/status-handler.ts"],
-    rules: { "max-lines": ["error", { max: 100, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 103, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/backup-restore-handlers.ts"],

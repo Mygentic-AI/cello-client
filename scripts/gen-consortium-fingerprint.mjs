@@ -78,6 +78,13 @@ const markdown = `${BEGIN}
 Consortium root fingerprint   ${short}
 Full digest                   ${full}
 \`\`\`
+
+Recompute it yourself — sha256 and nothing else, no install:
+
+\`\`\`bash
+${recompute}
+# → ${full}
+\`\`\`
 ${END}`;
 
 for (const rel of ["README.md", join("plugins", "cello", "skills", "setup", "SKILL.md")]) {

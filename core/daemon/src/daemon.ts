@@ -149,6 +149,15 @@ async function startDaemonHoldingLock(
     sessionNegotiator, getRelayCircuitAddress, telegramBotClient: injectedTelegramBotClient,
   } = config;
 
+  /**
+   * DOD-M15-CONSORTIUM-FINGERPRINT-1 — what this daemon ACTUALLY verifies manifests against.
+   *
+   * Straight off the config, because that is what `startBootCore` hands `verifyStartupManifest`.
+   * Reading the compiled-in constant instead would print the genuine CELLO fingerprint on a daemon
+   * pointed at someone else's consortium, or at none.
+   */
+  const enforcedConsortium = { rootKeys: config.manifestRootKeys, threshold: config.manifestThreshold };
+
   // 040-DAEMONROOT unit 7 (phase 1): transport, gateway, session manager, the manifest gate, the
   // roster sweep and the type registry → boot-core.ts. Three inputs, everything below comes out.
   const {
@@ -532,7 +541,7 @@ async function startDaemonHoldingLock(
     // rendered later. By value it would be undefined and every status would silently omit the block
     // that says a directory node could not be resolved.
     unresolvedNodesForStatus: () => unresolvedNodesForStatus(),
-    manifestProvider, directoryHttpUrl, challengeVerifier,
+    manifestProvider, directoryHttpUrl, challengeVerifier, enforcedConsortium,
   });
 
   // Register IPC handlers
@@ -651,6 +660,7 @@ async function startDaemonHoldingLock(
   registerStatusHandler({
     handlers, getAgentsForConnection, directorySignalingStatus, manifestOrigin, manifestProvider,
     directoryHttpUrl, challengeVerifier, unresolvedNodesForStatus, buildInterruptedSessions, buildActiveSessions: buildActiveSessionsWithAttendance,
+    enforcedConsortium,
   });
 
   // ─── MCP-001: no_current_agent guard for session tools ───
@@ -1060,7 +1070,7 @@ async function startDaemonHoldingLock(
   });
 
   // DOD-M15-CONSORTIUM-FINGERPRINT-1 — which consortium this binary can accept; see its header.
-  logConsortiumAnchor(logger);
+  logConsortiumAnchor(logger, enforcedConsortium);
 
   // Log daemon.started
   logger.info("daemon.started", {

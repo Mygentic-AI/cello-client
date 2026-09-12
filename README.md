@@ -448,21 +448,36 @@ This is the CELLO consortium's root fingerprint:
 Consortium root fingerprint   60e4-147d-9355-9b1c
 Full digest                   60e4147d93559b1cdb0b362ae36eedd6e82ea825a4e68d02bf9c1f9618683dbf
 ```
+
+Recompute it yourself — sha256 and nothing else, no install:
+
+```bash
+printf 'cello-consortium-root-v1\ne8300a2b9de7be6f6d629f778dc319715ad0010c0639f3a1564181d56d3eb104\n1\n' | shasum -a 256
+# → 60e4147d93559b1cdb0b362ae36eedd6e82ea825a4e68d02bf9c1f9618683dbf
+```
 <!-- END CONSORTIUM FINGERPRINT -->
 
-`cello status` prints the same value as `consortium_root_fingerprint`. If the two
-differ, that client is not talking to the CELLO consortium, whatever it calls
-itself. The value cannot be configured, so nothing you were told to set can
-change it.
+`cello status` reports the key set your daemon is actually verifying against, as
+`consortium_root_fingerprint`, alongside `consortium_root_fingerprint_state`. If
+the state is `bundled` and the fingerprint matches the value above, you are on the
+CELLO consortium. If it says `overridden`, someone has pointed your daemon at a
+different consortium with `CELLO_CONSORTIUM_ROOT_KEYS`; if it says `not_anchored`,
+your daemon is verifying no manifest at all. Both of those are reported in words
+rather than papered over with our fingerprint — the status line tells you what is
+in force, not what was compiled in.
+
+One thing it cannot tell you, and it is worth being plain about: this check runs
+inside the client you are already running. It catches a fork that reuses our
+client, which is the common case. It cannot vouch for a client you installed from
+somewhere other than the published packages — which is the reason to install from
+them.
 
 **You can check this before installing anything.** The machine-readable copy is
-[`consortium-fingerprint.json`](consortium-fingerprint.json) in this repository,
-and it is recomputable from the published root key with sha256 alone:
+[`consortium-fingerprint.json`](consortium-fingerprint.json) in this repository —
+it carries the root keys, the threshold and the same recompute command:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Mygentic-AI/cello-client/main/consortium-fingerprint.json
-# then, from the root_keys and threshold it lists:
-printf 'cello-consortium-root-v1\n<root key>\n<threshold>\n' | shasum -a 256
 ```
 
 The same value is published at <https://cello.mygentic.ai/fingerprint>. Two

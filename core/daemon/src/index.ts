@@ -116,4 +116,11 @@ export {
   consortiumFingerprintPreimage,
   describeConsortiumFingerprint,
 } from "./consortium-fingerprint.js";
-export { BUNDLED_CONSORTIUM_ROOT_KEYS, BUNDLED_CONSORTIUM_THRESHOLD } from "./bundled-consortium-manifest.js";
+export {
+  BUNDLED_CONSORTIUM_MANIFEST,
+  BUNDLED_CONSORTIUM_ROOT_KEYS,
+  BUNDLED_CONSORTIUM_THRESHOLD,
+} from "./bundled-consortium-manifest.js";
+
+// Same reason: the CLI test has to boot a daemon that is actually VERIFYING something.
+export { EmbeddedManifestProvider } from "./file-manifest-provider.js";
