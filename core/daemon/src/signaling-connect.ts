@@ -74,7 +74,6 @@ async function safeStop(node: CelloNode): Promise<void> {
   }
 }
 
-/** A directory node the daemon can dial, resolved from bootstrap config or a manifest. */
 /**
  * DOD-M15-STEP6-REPLAY-1 — how far out of date a directory identity proof may be.
  *
@@ -87,6 +86,7 @@ async function safeStop(node: CelloNode): Promise<void> {
 const IDENTITY_PROOF_MAX_SKEW_MS = 5 * 60_000;
 
 
+/** A directory node the daemon can dial, resolved from bootstrap config or a manifest. */
 export interface DirectoryEndpoint {
   peerId: string;
   /** A dialable multiaddr (e.g. /dns4/host/tcp/443/wss/p2p/<peerId>). Optional if already connected. */

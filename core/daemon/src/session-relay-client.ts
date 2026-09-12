@@ -97,7 +97,6 @@ export const RELAY_PROTOCOL_ID = "/cello/relay/1.0.0";
  */
 export const PROOF_RETRY_DELAY_MS = 1_000;
 export const RELAY_AUTH_DOMAIN = "CELLO-RELAY-AUTH-v1";
-/** Structure 1 leaf kind: 0x00 = message, 0x02 = control (matches the relay). */
 /**
  * DOD-WITNESS-STALL-1 — relay refusals that can NEVER resolve.
  *
@@ -295,6 +294,7 @@ export function classifyRelayAuthRefusal(
   };
 }
 
+/** Structure 1 leaf kind — these values match the relay's. Message leaf (the `cello_send` default). */
 export const LEAF_KIND_MSG = 0x00;
 /** Control leaf (SEAL etc.) — two distinct-sender ctrl leaves trigger directory notarization. */
 export const LEAF_KIND_CTRL = 0x02;
@@ -444,8 +444,9 @@ export interface AgentRelayClientOpts {
 
 /**
  * What ONE relay observed. Deliberately not a verdict, and the field names say so: this establishes
- * that this relay saw and refused that submission, and nothing about who sent it. Corroboration
- * would need several relays reporting the same hash sequence, which does not exist yet.
+ * that this relay saw and refused that submission, and nothing about who sent it. Verification is
+ * proactive (`DOD-M15-CORROBORATE-1`); BREADTH is not — several relays on one hash sequence is
+ * `DOD-M15-MULTIWITNESS-1`.
  */
 export interface RelayWitnessAlert {
   sessionIdHex: string;
@@ -680,9 +681,9 @@ export class AgentRelayClient {
   /**
    * PER-SESSION acknowledgement state (session_id hex → the position AND the content at it).
    *
-   * `seq` is the highest relay-assigned sequence. The relay's `seq_counter` is per session, and it
-   * rejects `last_seen_seq > seq_counter`, so each session's submit MUST carry that session's own
-   * high-water mark — NOT an agent-global one (which would make a newer session's first submit look
+   * `seq` is the highest relay-assigned sequence, advanced by an ack or a deliver. The relay's
+   * `seq_counter` is per session and it rejects `last_seen_seq > seq_counter`, so each session's
+   * submit MUST carry that session's own high-water mark — NOT an agent-global one (which would make a newer session's first submit look
    * ahead and get rejected).
    *
    * ⚠️ `hash` IS THE SAME FACT AS `seq`, WHICH IS WHY THEY LIVE IN ONE ENTRY — 033-ACKEMIT.
@@ -2941,7 +2942,6 @@ export class AgentRelayClient {
     }
   }
 
-  /** The highest relay-assigned sequence observed for a given session (ack or deliver). */
   /**
    * Advance this session's acknowledgement from a message that ARRIVED — 033-ACKEMIT review F1.
    *

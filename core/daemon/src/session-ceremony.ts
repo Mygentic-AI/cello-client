@@ -873,9 +873,14 @@ export async function sendSealFrostSignature(
  * channel. Rebuilds the canonical seal TBS from the cert fields and verifies the signature
  * against a key trusted independently of the delivering frame: the session primary_pubkey
  * (commitments[0] of this agent's FROST share) for 'frost'. A channel-swapped sealed_root
- * (or any TBS-bound field) fails this check (SI-003). The 'single' (pre-DKG) variant verifies
- * against the directory node key from the consortium manifest — not yet wired on the daemon;
- * surfaced honestly rather than accepted on faith.
+ * (or any TBS-bound field) fails this check (SI-003).
+ *
+ * 'single' is not a second variant this function is missing — it is a DOWNGRADE, refused by name
+ * before a session exists (`assignment_signature_type_downgraded`, assignment-verify.ts, checked
+ * against the directory's only producer of `signature_type`). A cert carrying it is a shape no
+ * honest peer can produce, so the branch below refuses rather than verifying. Do not "finish" it
+ * by adding a manifest-key path: that would make the downgrade verifiable instead of refused,
+ * which is the outcome the upstream check exists to prevent.
  */
 export async function verifyUnilateralCertificate(
   deps: { persistence: DaemonRegistrationPersistence; agentPubkeyHex: string; logger: Logger },
@@ -945,18 +950,20 @@ export async function verifyUnilateralCertificate(
  * primary value is OUT-OF-BAND (any holder of the signer's primary — e.g. an arbitrator — can verify
  * an exported cert's legibility).
  *
- * SYMMETRY STATUS: SYMMETRIC as of 038-KEYBIND, and the old text is worth stating because it names
- * what was broken. It read: *"The missing half is the INITIATOR-records-RESPONDER direction: an
- * initiator never learns the responder's primary, so when the responder closes first, the initiator
- * cannot verify locally and accepts with reason `signer_key_not_held`."* That was exactly right,
- * and it is now closed: the session assignment carries `participant_b_primary_pubkey` alongside a
- * binding signed by participant_b's own K_local, the initiator verifies that binding before it will
- * accept the assignment at all, and `initiate-session-handler.ts` records the result. Both closing
- * orders verify locally.
+ * SYMMETRY: both closing orders verify locally, and it takes BOTH bindings to stay that way. The
+ * initiator learns the responder's primary from `participant_b_primary_pubkey` with a binding
+ * signed by participant_b's own K_local, recorded by `initiate-session-handler.ts`; the responder
+ * learns the initiator's from `signer_pubkey` with `participant_a_key_binding`, verified before the
+ * assignment's threshold signature is checked at all and recorded by `inbound-sessions.ts`. Both
+ * are refused by name when absent or invalid (`assignment-verify.ts`).
  *
- * `signer_key_not_held` therefore no longer describes an ordinary responder-first close. It remains
- * reachable — a session row that predates the recording, or one whose assignment never reached this
- * path — and it is still the honest answer in those cases, which is why the branch stays.
+ * The binding, not the key, is the load-bearing part: carrying a group key alone would let a
+ * directory name one of its choosing, so a change that keeps either key and drops its binding
+ * breaks verification while appearing to work.
+ *
+ * `signer_key_not_held` is therefore NOT the ordinary responder-first outcome. It remains reachable
+ * for a session row that predates the recording, or one whose assignment never reached this path,
+ * and it is the honest answer there, which is why the branch stays.
  *
  * `legibility` MUST be the AS-RECEIVED wire object (not a normalised copy) — the directory signed
  * over the canonical hash of exactly what it sent.
@@ -1013,7 +1020,10 @@ export async function verifyBilateralSealCertificate(
   } else {
     // We do not hold the signer's key (no counterparty primary recorded) → cannot verify; accept
     // (the live frame arrived over the authenticated Noise channel; the binding aids out-of-band).
-    // This is the initiator-when-responder-closed-first case F2-b would close.
+    // Reachable only for a session whose assignment never carried (or never recorded) the
+    // counterparty's bound primary — a pre-038-KEYBIND row. A CURRENT session reaching here means
+    // `recordCounterpartyPrimary` did not run on either side (`initiate-session-handler.ts` for the
+    // initiator, `inbound-sessions.ts` for the responder), which is a defect, not a close order.
     return { ok: true, verified: false, reason: "signer_key_not_held" };
   }
 

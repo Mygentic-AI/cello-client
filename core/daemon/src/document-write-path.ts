@@ -447,16 +447,9 @@ export class DocumentWritePath {
     return { from: low, to: high };
   }
 
-  /** Key diff: set what changed, delete what is gone. Returns the keys written. */
   /**
-   * Fold the FILE's JSON into the map root, per key.
-   *
-   * Shares `jsonKeyOperations` with `cello_doc_write`, so the file path and the tool path cannot
-   * disagree about what counts as a changed key — the same rule the text path already follows for
-   * `lineHunks`.
-   */
-  /**
-   * Fold the FILE's JSON into the map root, per key and at every depth.
+   * Fold the FILE's JSON into the map root, per key and at every depth. It is a key DIFF — set what
+   * changed, delete what is gone — and it returns the keys written.
    *
    * Shares `applyJsonToMap` with `cello_doc_write`, so the file path and the tool path cannot
    * disagree about what counts as a changed key — the same rule the text path already follows for

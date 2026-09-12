@@ -74,7 +74,6 @@ export interface OfficerSignature {
   signature: string;
 }
 
-/** The full consortium manifest with threshold signatures. */
 /**
  * The portal's intake encryption key, as published in the manifest (M10B-D11).
  *
@@ -90,6 +89,7 @@ export interface ManifestIntakeKey {
   pubkey: string;
 }
 
+/** The full consortium manifest with threshold signatures. */
 export interface ConsortiumManifest {
   version: number;
   /** ISO 8601 timestamp — manifest is not valid before this time. */
