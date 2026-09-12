@@ -301,14 +301,11 @@ async function startDaemonHoldingLock(
     getDeliveryBookmark, advanceDeliveryBookmark, safeWatermarkAdvance,
   } = startBootConnectionState({ sessionNodeManager });
 
-  // 040-DAEMONROOT unit 6: attendance, the away reply and the one-shot rejection →
-  // attendance-wiring.ts.
+  // 040-DAEMONROOT unit 6: attendance and the away reply → attendance-wiring.ts.
+  // DOD-M15-AWAYSCOPE-1 took the one-shot rejection out, and with it every seal dependency this
+  // wiring used to hold — it can no longer initiate a seal at all, which is the point.
   const { attendanceCount, sendAwayResponse, contentTakes, backgroundSeals, awayAckSent } =
-    createAttendanceWiring({
-      logger, sessionNodeManager, perConnectionState, keyProviders, securityGateway,
-      handleActiveSealFlow, sealKey, sealInterruptedInProgress, pendingSealWaiters,
-      pendingUnilateralWaiters, sendOver,
-    });
+    createAttendanceWiring({ logger, sessionNodeManager, perConnectionState, securityGateway });
 
   // M8C-TGDOOR-1: the Telegram doorbell (telegram-doorbell.ts). Content-free by construction — the
   // module is never handed message text, so it cannot leak any (DOD-INV-CONTENTFREE), and it has no
@@ -960,8 +957,11 @@ async function startDaemonHoldingLock(
   sessionNodeManager.setOnContentArrived((agentName, sessionId, senderPubkey) => {
     // MONIKER-4 AC2: the message doorbell names the sender the same way the session doorbell does.
     notificationDispatcher.dispatchCelloMessage(agentName, sessionId, senderPubkey, resolveWho(agentName, senderPubkey, sessionId));
-    // M8C-AWAY-1: an unattended agent auto-acks an inbound message on an existing session.
-    void sendAwayResponse(agentName, sessionId, "message");
+    // DOD-M15-AWAYSCOPE-1 — THE AWAY REPLY FIRED HERE, and it was the defect: an unattended agent
+    // auto-acked every inbound message on an already-accepted session, and that greeting took a
+    // hash-chain leaf no seal could then certify. Nothing replaces it here — the counterparty learns
+    // this side is online-but-unattended out of band, on the liveness frame, which takes no leaf.
+    // The doorbell above is the only thing an arriving message may trigger. See attendance-wiring.
     // M8C-TGDOOR-1: message-waiting — coalesced (ring-once-until-read) inside sendTelegramDoorbell.
     void sendTelegramDoorbell(agentName, sessionId, "message_waiting", "New message waiting");
   });

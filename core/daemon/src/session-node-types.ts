@@ -640,9 +640,9 @@ export type CreateSessionResult =
 
 /**
  * DOD-COATTEND-1: how much of the arrival buffer is kept. Delivery reads the durable transcript
- * now, so this buffer is only a recency hint (`peekLatestReceivedContentHex` for M8C-AWAY-1's
- * [[WRAP]] check). Small, and stated: an unstated cap is a silent truncation, and no cap at all is
- * the leak the old destructive read was accidentally preventing.
+ * now, so this buffer is only what `cello_receive` pops from (`takeReceivedContent`). Small, and
+ * stated: an unstated cap is a silent truncation, and no cap at all is the leak the old destructive
+ * read was accidentally preventing.
  */
 export const RECEIVED_BUFFER_CAP = 32;
 

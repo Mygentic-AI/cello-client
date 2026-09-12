@@ -2576,17 +2576,16 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     };
   }
 
-  /** DOD-AWAY-WRAP-1: peek at the hex of the most-recently buffered (last) received message without
-   *  consuming it. Used by sendAwayResponse to detect [[WRAP]]-signalled messages and skip the away
-   *  reply. Returning the last entry (not the first) is intentional — the ingest file's
-   *  appendVerifiedContent always
-   *  pushes to the tail, so the tail is the message that just triggered onContentArrived. */
-  peekLatestReceivedContentHex(agentName: string, sessionId: string): string | null {
-    const buf = this.#receivedContent.get(this.#k(agentName, sessionId));
-    if (!buf || buf.length === 0) return null;
-    return buf[buf.length - 1]?.contentHex ?? null;
-  }
-
+  /**
+   * DOD-M15-AWAYSCOPE-1 removed `peekLatestReceivedContentHex` from here.
+   *
+   * Its one caller was the away responder, which read the arriving message's TAIL to decide whether
+   * to answer it — and answering an already-accepted session is the defect this order deleted. With
+   * that branch gone the accessor had no reader, and an accessor that hands out message plaintext
+   * with nobody asking for it is surface an adversary's own daemon build can still reach.
+   *
+   * The buffer it read is NOT dead: `takeReceivedContent` drains it for `cello_receive`.
+   */
   pushReceivedContentForTest(agentName: string, sessionId: string, seq: number, content: string, senderPubkey: string): void {
     this.#records.recordTranscriptMessage(agentName, sessionId, seq, "received", new TextEncoder().encode(content), "test");
     const key = this.#k(agentName, sessionId);

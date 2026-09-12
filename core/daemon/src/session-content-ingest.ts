@@ -1373,9 +1373,9 @@ export class SessionContentIngest {
     if (!buf) { buf = []; this.#ctx.receivedContent.set(recvKey, buf); }
     buf.push({ contentHex: Buffer.from(content).toString("hex"), senderPubkey, sequenceNumber: leafIndex });
     // DOD-COATTEND-1: BOUNDED, because delivery no longer drains this. Its remaining job is
-    // `peekLatestReceivedContentHex` (M8C-AWAY-1 reads the TAIL to spot a [[WRAP]]), so only the
-    // recent tail is load-bearing — but an unbounded array holding every message of every live
-    // session, in memory, for the life of the daemon, is a leak the old destructive read hid.
+    // `takeReceivedContent`, the pop `cello_receive` drives — an unbounded array holding every
+    // message of every live session, in memory, for the life of the daemon, is a leak the old
+    // destructive read hid. (The away responder's TAIL peek was the other reader, until AWAYSCOPE-1.)
     if (buf.length > RECEIVED_BUFFER_CAP) buf.splice(0, buf.length - RECEIVED_BUFFER_CAP);
     this.#ctx.logger.info("session.content.received", {
       sessionId,
