@@ -520,6 +520,26 @@ export function sentContentHashExists(
  *
  * 🚨 INERT, exactly as the live route is. It records evidence. It appends no leaf, advances no
  * sequence, touches no tree, and nothing about a refusal here says anything about the counterparty.
+ *
+ * ─── RULE 4's "rate-limited", on THIS route, and why there is no memo here ─────────────────────
+ *
+ * A refused entry is deliberately NOT confirm-deleted — a forgery must never be able to evict
+ * itself — so a bad acknowledgement is re-pulled on every drain, forever. The content path answers
+ * that with a bounded in-memory memo of what it already refused. This route does not need one, and
+ * the reason is three enforced bounds rather than an argument:
+ *
+ *   1. Only the COUNTERPARTY can put an entry here at all. The park envelope's SEC-1 gate runs
+ *      first and refuses anyone else, the relay included.
+ *   2. The relay caps each recipient's mailbox — `#maxRecipientEntries` / `#maxRecipientBytes` in
+ *      `file-content-store.ts`, with FIFO eviction inside the quota. So the number of entries that
+ *      can be waiting is bounded by the operator's own mailbox size, not by the counterparty's
+ *      patience.
+ *   3. The slot check above runs BEFORE any cryptography, so the cheap forgery — an entry filed
+ *      anywhere but the derived slot — costs one SHA-256 and no signature verification.
+ *
+ * What is left is one Ed25519 verify per correctly-slotted, wrongly-signed entry per drain,
+ * multiplied by a mailbox the relay already bounds. That is a cost, and it is a bounded one; a memo
+ * would shave it at the price of a second piece of state whose key a counterparty influences.
  */
 export function acceptParkedDeliveryAck(a: {
   db: DaemonDatabase;
