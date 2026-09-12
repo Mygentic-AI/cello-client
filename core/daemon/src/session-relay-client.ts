@@ -685,7 +685,8 @@ export class AgentRelayClient {
   /**
    * PER-SESSION acknowledgement state (session_id hex → the position AND the content at it).
    *
-   * `seq` is the highest relay-assigned sequence. The relay's `seq_counter` is per session, and it
+   * `seq` is the highest relay-assigned sequence observed for the session, from EITHER an ack or a
+   * deliver — both advance it. The relay's `seq_counter` is per session, and it
    * rejects `last_seen_seq > seq_counter`, so each session's submit MUST carry that session's own
    * high-water mark — NOT an agent-global one (which would make a newer session's first submit look
    * ahead and get rejected).
@@ -2946,7 +2947,6 @@ export class AgentRelayClient {
     }
   }
 
-  /** The highest relay-assigned sequence observed for a given session (ack or deliver). */
   /**
    * Advance this session's acknowledgement from a message that ARRIVED — 033-ACKEMIT review F1.
    *
