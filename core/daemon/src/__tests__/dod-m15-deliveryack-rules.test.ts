@@ -273,6 +273,23 @@ describe("DELIVERYACK: the five rules, on the inbound path", () => {
     expect(a.events.filter((e) => e.event === "content.delivery.ack.recorded").length).toBe(1);
   });
 
+  it("★★★ RULE 4: a flood of BAD acknowledgements cannot make this machine shout — one loud line per message", async () => {
+    /**
+     * The awaiting entry must SURVIVE a refusal (rule 5 depends on it), which is exactly what makes
+     * the log spendable: the counterparty can resend the same bad acknowledgement forever. The
+     * budget is keyed on a message THIS side sent, so they cannot create one — and the refusal is
+     * still recorded, at debug, so nothing is lost from the forensic record.
+     */
+    const a = await sendingAgent("rule4-flood.db");
+    for (let i = 0; i < 50; i++) a.node.invokeHandler(a.ack({ sig: new Uint8Array(63) }), COUNTERPARTY_PEER);
+    await settle();
+    const discards = a.events.filter((e) => e.event === "content.delivery.ack.discarded");
+    expect(discards.filter((e) => e.level === "warn").length).toBe(1);
+    expect(discards.length).toBe(50);
+    // And the flood changed nothing: still awaiting, nothing kept.
+    expect(stateAfter(a)).toEqual({ acked: false, heldAcks: 0 });
+  });
+
   it("★★★ RULE 3: an acknowledgement is INERT — no leaf, no transcript row, no seal, no session change", async () => {
     /**
      * Machine traffic never enters the tamper-evident record. Measured as a BEFORE/AFTER on the

@@ -57,11 +57,11 @@ function isAwaitingAck(
  * TTF/recovery path rather than a thrown error here.
  */
 export async function sendDeliveryAck(
-ctx: SessionContentPipelineContext,
-agentName: string,
-sessionId: string,
-contentHash: Uint8Array,
-correlationId?: string,
+  ctx: SessionContentPipelineContext,
+  agentName: string,
+  sessionId: string,
+  contentHash: Uint8Array,
+  correlationId?: string,
 ): Promise<void> {
   const entry = ctx.activeNodes.get(ctx.sessionKey(agentName, sessionId));
   if (!entry) {
@@ -222,13 +222,13 @@ correlationId?: string,
  * refused it. Reading absence as evasion is the defect, not the fix.
  */
 export function onDeliveryAck(
-ctx: SessionContentPipelineContext,
-resolveAwaitingAck: (agentName: string, sessionId: string, contentHash: Uint8Array) => void,
-agentName: string,
-sessionId: string,
-contentHash: Uint8Array,
-rawSig: unknown,
-correlationId?: string,
+  ctx: SessionContentPipelineContext,
+  resolveAwaitingAck: (agentName: string, sessionId: string, contentHash: Uint8Array) => void,
+  agentName: string,
+  sessionId: string,
+  contentHash: Uint8Array,
+  rawSig: unknown,
+  correlationId?: string,
 ): void {
   const hashHex = Buffer.from(contentHash).toString("hex");
   // RULE 2 — bound. Cheapest check, and it is what bounds everything below: an ack naming a hash
@@ -259,7 +259,27 @@ correlationId?: string,
     signature: rawSig instanceof Uint8Array ? rawSig : undefined,
   });
   if (!verdict.ok) {
-    ctx.logger.warn("content.delivery.ack.discarded", {
+    /**
+     * WHO HEARS THIS, and why the answer is only the log — asked because a refusal with no named
+     * surface is this milestone's most repeated defect and the exception has to be argued.
+     *
+     * There is no caller to answer: this arrives on an inbound stream, unrequested. And the AGENT
+     * must not be told, because telling it is the harm. "Your counterparty sent a bad
+     * acknowledgement" reads as an accusation, and the one thing this unit must never do is let an
+     * absent or unusable acknowledgement be read as evasion. The behavioural consequence the agent
+     * DOES see is already correct and already surfaced: the message stays awaiting and parks on the
+     * usual fallback, exactly as if nothing had arrived — which is the truth. The log keeps the
+     * forensic record for the operator who goes looking.
+     *
+     * ONCE PER MESSAGE, LOUDLY; after that quietly — the flag rides on the awaiting entry, so it
+     * is freed with it and an entry exists only for a message THIS side sent. See
+     * `AwaitingAckEntry.ackRefusalLogged` for why the budget is not something the other side can
+     * spend.
+     */
+    const awaiting = ctx.awaitingAck.get(ctx.sessionKey(agentName, sessionId))?.get(hashHex);
+    const firstForThisMessage = awaiting?.ackRefusalLogged !== true;
+    if (awaiting) awaiting.ackRefusalLogged = true;
+    ctx.logger[firstForThisMessage ? "warn" : "debug"]("content.delivery.ack.discarded", {
       agentName, sessionId, contentHash: hashHex, correlationId,
       reason: verdict.reason,
       detail: verdict.detail,
