@@ -106,3 +106,14 @@ export type { BackupResult, RestoreResult } from "./backup-restore.js";
 // The empty-roster affordance. Exported so the CLI renders the SAME words the daemon hands the
 // MCP shim — two surfaces, one string, no chance of one of them quietly omitting the cohort gate.
 export { noAgentsGuidance, botHandle, WAITLIST_URL, BOT_HANDLE_PRODUCTION, BOT_HANDLE_STAGING } from "./onboarding-guidance.js";
+
+// DOD-M15-CONSORTIUM-FINGERPRINT-1. Exported so the CLI's own test can assert the fingerprint
+// `cello status` PRINTS is derived from the constant the verifier enforces, rather than pinning a
+// literal that stays green after the two have drifted apart.
+export {
+  consortiumFingerprintShort,
+  consortiumFingerprintFull,
+  consortiumFingerprintPreimage,
+  describeConsortiumFingerprint,
+} from "./consortium-fingerprint.js";
+export { BUNDLED_CONSORTIUM_ROOT_KEYS, BUNDLED_CONSORTIUM_THRESHOLD } from "./bundled-consortium-manifest.js";
