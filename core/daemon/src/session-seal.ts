@@ -19,9 +19,11 @@
  * by luck.
  */
 import { createHash } from "node:crypto";
-import { buildMerkleTree, merkleRoot } from "@cello-protocol/crypto";
+import type { KeyProvider } from "@cello-protocol/crypto";
+import { closeOverCarriedEvidence } from "./seal-carried-close.js";
+import { verifyCertifiedRoot as judgeCertifiedRoot } from "./seal-certified-root-check.js";
 import { encodeSealPayload, decodeStructure1 } from "@cello-protocol/protocol-types";
-import { AUTOACK_BROKER_GRACE_MS, carryContentHashInputs } from "./session-node-types.js";
+import { AUTOACK_BROKER_GRACE_MS } from "./session-node-types.js";
 import type { SealUpgradeReadiness } from "./seal-upgrade.js";
 import type { Logger, SealReadinessView } from "./types.js";
 import type { SessionTree } from "./session-tree.js";
@@ -122,6 +124,12 @@ export interface SessionSealContext {
   requireAgentId(agentName: string): string;
   getSessionTree(agentName: string, sessionId: string): SessionTree;
   getSessionTreeRootHex(agentName: string, sessionId: string): string;
+  /**
+   * 070-CARRIEDSEAL: the agent's own signing key, for the closing leaf this side writes when no
+   * relay is left to order one. `undefined` when the agent is not loaded in this daemon — which is
+   * a refusal with its own name, never a leaf signed by something else.
+   */
+  getKeyProvider(agentName: string): KeyProvider | undefined;
   getDirectoryOnlineToken(agentName: string): Uint8Array | undefined;
   destroySessionSeed(agentName: string, sessionId: string): void;
   updateSessionStatus(
@@ -280,29 +288,8 @@ export class SessionSeal {
   }
 
   /**
-   * REBUILD THE CERTIFIED ROOT FROM THIS DAEMON'S OWN LEAVES — `DOD-M15-SEALWIRE-1` bullet 2.
-   *
-   * The receipt used to prove only that the directory signed SOMETHING: the client took the sealed
-   * root off the wire, confirmed the directory's signature over those bytes, stored it, and threw
-   * away the root it had computed a step earlier. At co-signing time that means **your key signs a
-   * root you never checked.**
-   *
-   * Bullet 1 moved the certified root into the content-hash domain, which is the domain this daemon
-   * can actually rebuild — each carry leaf's `content_hash` is the leaf hash (RFC 6962 §2.1 "hash"
-   * leaves are used as-is), and the carry is ordered by the relay's canonical `sequence_number`,
-   * which is the order the directory rebuilds in.
-   *
-   * ─── Why this returns "cannot judge" instead of always answering ───────────────────────────
-   *
-   * A root comparison that is WRONG makes every session unsealable, and force-abandon — no receipt —
-   * becomes the only exit. That failure is worse than the one being guarded, and this file already
-   * carries two comments saying so about other gates.
-   *
-   * The carry is this daemon's view, and it is not guaranteed complete at the instant a certificate
-   * arrives: the counterparty's SEAL ctrl leaf is what TRIGGERS the seal, so it may not have been
-   * witnessed here yet. So completeness is checked FIRST, against the certificate's own leaf count.
-   * A short carry means this daemon cannot judge — which is a different answer from "the roots
-   * disagree", and conflating them would turn a local timing gap into an accusation.
+   * Does a certificate describe the leaf set this daemon holds? The judgement lives in
+   * `seal-certified-root-check.ts`; this binds it to this instance's carry.
    */
   verifyCertifiedRoot(
     agentPubkeyHex: string,
@@ -310,98 +297,7 @@ export class SessionSeal {
     certifiedRoot: Uint8Array,
     certifiedLeafCount: number,
   ): { verdict: "match" } | { verdict: "mismatch"; ownRootHex: string | null; detail: string } | { verdict: "cannot_judge"; reason: string } {
-    const carry = this.getSealCarry(agentPubkeyHex, sessionIdHex);
-    if (carry.length === 0) return { verdict: "cannot_judge", reason: "no_carry" };
-
-    /**
-     * COMPLETENESS IS ESTABLISHED FROM THE CARRY'S OWN EVIDENCE, NEVER FROM THE CERTIFICATE.
-     *
-     * Review F3, and the first cut had this exactly backwards. It gated on
-     * `carry.length !== certifiedLeafCount`, where `certifiedLeafCount` is a field the DIRECTORY
-     * chooses and signs — so the party being checked controlled whether it was checked. A directory
-     * certifying a root over a different conversation had only to state a `leaf_count` that did not
-     * match, and the client answered "cannot judge" and accepted. The signature still verified,
-     * because the count is signed inside the same TBS.
-     *
-     * That is the hole §2b names in as many words: *"an attacker who wants to evade a mismatch check
-     * simply never supplies a checkable proof. Treating 'we could not tell' as harmless is the
-     * hole."* I defended against a false POSITIVE and left the false NEGATIVE one field away.
-     *
-     * The carry can answer the question by itself. A complete bilateral leaf set is:
-     *   - sequences contiguous from 1 — no gap where a leaf this daemon never saw would sit; and
-     *   - exactly two SEAL ctrl leaves, from two DISTINCT senders — which is what a bilateral seal
-     *     is, and is the condition that says the counterparty's closing leaf has landed here.
-     * Both predicates already exist in `seal-escalation.ts`; this reuses their shape rather than
-     * inventing a second opinion about the same question.
-     *
-     * When the carry IS self-evidently complete, a `leaf_count` that disagrees is no longer "I
-     * cannot tell" — it is the certificate describing a different leaf set, which is a MISMATCH.
-     */
-    const sequences = carry.map((l) => l.sequenceNumber).sort((a, b) => a - b);
-    const contiguousFromOne = sequences.every((n, i) => n === i + 1);
-    const ctrlSenders = new Set(
-      carry.filter((l) => l.leafKind === LEAF_KIND_CTRL).map((l) => l.senderPubkeyHex),
-    );
-    const selfEvidentlyComplete = contiguousFromOne && ctrlSenders.size === 2;
-
-    /**
-     * 🚨 THE CERTIFICATE MAY COVER EXACTLY WHAT THIS SIDE HOLDS — ASK THAT FIRST.
-     *
-     * `DOD-M15-UNILATERAL-1`. The completeness predicate below describes a BILATERAL leaf set: two
-     * SEAL ctrl leaves, from two distinct senders. **A solo seal can never satisfy it**, because the
-     * counterparty is gone and never posts one — that is the entire premise. So on the solo path
-     * this returned `cannot_judge` every time, `session-ceremony.ts` refuses to co-sign on anything
-     * that is not `match`, and **the sealing party refused to co-sign its own unilateral seal.** The
-     * FROST ceremony never reached threshold, the directory never completed, and the close came back
-     * `seal_unilateral_timeout` — the label that names our own wait. Measured against the real
-     * binaries: `j-unilateral` failed on exactly this, with the directory having already verified the
-     * chain and recorded the counterparty ABSENT.
-     *
-     * Completeness was only ever needed to tell TWO KINDS OF DISAGREEMENT apart — "the roots differ
-     * because my carry is behind" (cannot judge) from "the roots differ because the directory
-     * certified something else" (mismatch). It answers nothing when the roots AGREE: a certificate
-     * whose root and leaf count are exactly what this daemon holds is, by construction, over this
-     * daemon's own leaves. Nothing is taken on trust — both values are recomputed here from the
-     * carry, and an adversary who could satisfy them would have to have produced this leaf set.
-     *
-     * Deliberately BOTH values. A count that disagreed while the root matched would be a certificate
-     * contradicting itself, and this is not the place to wave that through.
-     */
-    const carryInputs = carryContentHashInputs(carry);
-    if (
-      carryInputs !== null &&
-      carry.length === certifiedLeafCount &&
-      Buffer.compare(Buffer.from(merkleRoot(buildMerkleTree(carryInputs))), Buffer.from(certifiedRoot)) === 0
-    ) {
-      return { verdict: "match" };
-    }
-
-    if (!selfEvidentlyComplete) {
-      return {
-        verdict: "cannot_judge",
-        reason: contiguousFromOne
-          ? `carry_incomplete: ${ctrlSenders.size} of 2 SEAL ctrl leaves witnessed here`
-          : `carry_noncontiguous: hold ${carry.length} leaves with a gap in the relay sequence`,
-      };
-    }
-    if (carry.length !== certifiedLeafCount) {
-      // The carry proves itself complete and the certificate claims a different size, so the
-      // certificate is over a different leaf set. Accusing is correct here.
-      return {
-        verdict: "mismatch",
-        ownRootHex: null, // no root computed — the sets differ in SIZE, which is decisive on its own
-        detail: `leaf_count_disagrees: this daemon holds a provably complete ${carry.length}-leaf set, the certificate claims ${certifiedLeafCount}`,
-      };
-    }
-    if (carryInputs === null) {
-      // A leaf this daemon cannot decode is a leaf it cannot judge. Never an accusation.
-      return { verdict: "cannot_judge", reason: "structure1_content_hash_unreadable" };
-    }
-    const ownRoot = merkleRoot(buildMerkleTree(carryInputs));
-    const ownRootHex = Buffer.from(ownRoot).toString("hex");
-    return Buffer.compare(Buffer.from(ownRoot), Buffer.from(certifiedRoot)) === 0
-      ? { verdict: "match" }
-      : { verdict: "mismatch", ownRootHex, detail: "root_disagrees: same leaf count, different leaves or different order" };
+    return judgeCertifiedRoot((pk, sid) => this.getSealCarry(pk, sid), agentPubkeyHex, sessionIdHex, certifiedRoot, certifiedLeafCount);
   }
 
   /**
@@ -566,6 +462,24 @@ export class SessionSeal {
    * session_sealed. Requires an active relay client; the caller falls back to the
    * directory-mediated path when this returns relay_unavailable.
    */
+  /**
+   * 070-CARRIEDSEAL — close over evidence this side already holds, when the relay never answered.
+   * The reasoning, the gates and the refusals live in `seal-carried-close.ts`; this binds it to
+   * this instance's context. `null` means "not that situation" and the caller's own refusal stands.
+   */
+  #carriedClose(
+    agentName: string,
+    sessionId: string,
+    cause: string,
+    correlationId?: string,
+  ): Promise<{ ok: true; sequenceNumber: number; reportedRootHex: string } | null> {
+    return closeOverCarriedEvidence({
+      ctx: this.#ctx,
+      db: this.#db,
+      getSealCarry: (pk, sid) => this.getSealCarry(pk, sid),
+    }, agentName, sessionId, cause, correlationId);
+  }
+
   async submitSealLeaf(
     agentName: string,
     sessionId: string,
@@ -603,7 +517,12 @@ export class SessionSeal {
     // M12-P15: resolved, not required. See #resolveSealTransport — an interrupted session has no
     // in-memory node BY CONSTRUCTION, and refusing here is what made the first fix inert.
     const transport = this.#resolveSealTransport(agentName, sessionId);
-    if ("error" in transport) return { ok: false, reason: transport.error };
+    if ("error" in transport) {
+      // 070-CARRIEDSEAL: there is no relay to hand this leaf to. If the reason is SILENCE rather
+      // than a ruling, close over what we already hold instead of losing the receipt.
+      const local = await this.#carriedClose(agentName, sessionId, transport.error, correlationId);
+      return local ?? { ok: false, reason: transport.error };
+    }
     const entry = transport;
     /**
      * DOD-M15-RELAYLEAK-1 — release a DETACHED seal transport when this submission is done.
@@ -726,6 +645,13 @@ export class SessionSeal {
           // Clear the idempotency mark so a genuine retry (agent close / reconnect) can proceed (DB-001).
           this.#ctx.responderSealSubmitted.delete(sealKey);
           this.#ctx.logger.warn("session.seal.leaf.submit.failed", { sessionId, reason: result.reason, correlationId });
+          // 070-CARRIEDSEAL: the relay was asked and said nothing. Same answer as having no relay at
+          // all — write the closing leaf here rather than lose a receipt for a witnessed record.
+          const local = await this.#carriedClose(agentName, sessionId, result.reason, correlationId);
+          if (local) {
+            this.#ctx.responderSealSubmitted.set(sealKey, { reportedRootHex: local.reportedRootHex, sequenceNumber: local.sequenceNumber });
+            return local;
+          }
           return { ok: false, reason: result.reason };
         }
         // SESSION-002: the reported_root for a unilateral seal is the content-hash root the

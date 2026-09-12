@@ -1379,6 +1379,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       getSessionTree: (a, sid) => this.getSessionTree(a, sid),
       getSessionTreeRootHex: (a, sid) => this.getSessionTreeRootHex(a, sid),
       getDirectoryOnlineToken: (a) => this.getDirectoryOnlineToken(a),
+      getKeyProvider: (a) => this.#keyProviderResolver?.(a),
       destroySessionSeed: (a, sid) => this.#life.destroySessionSeed(a, sid),
       updateSessionStatus: (a, sid, status, by) => this.#life.updateSessionStatus(a, sid, status, by),
     });
@@ -3182,8 +3183,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
    *
    * Both surfaces, always: the ERROR is the durable forensic record an investigation reads days
    * later, and the notice is the control — the thing that actually reaches the person.
-   */
-  /**
+   *
    * Can a refused message still reach this operator through the relay mailbox? — review F2.
    *
    * Feature-detected, not assumed: `openContentSeal` is documented OPTIONAL on `KeyProvider`, and
