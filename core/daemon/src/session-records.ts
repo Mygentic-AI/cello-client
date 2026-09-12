@@ -21,6 +21,7 @@ import { MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
 import { type TranscriptEntry, UNREAD_RECEIVED_WHERE, TERMINAL_STATUSES } from "./session-node-types.js";
 import { quarantineRedaction } from "./quarantine-framing.js";
 import { extractErrorMessage } from "./error-message.js";
+import { storeDeliveryAck } from "./session-delivery-acks.js";
 
 /** What this module needs from the manager, stated explicitly rather than handed `this`. */
 export interface SessionRecordsContext {
@@ -608,6 +609,28 @@ export class SessionRecords {
       return false;
     }
   }
+  /**
+   * DOD-M15-DELIVERYACK-1 — keep the counterparty's signature that their machine received a message.
+   *
+   * A thin forward, because this class is what holds the database handle and the write itself
+   * belongs beside the read and the five rules in `session-delivery-acks.ts`. Called ONLY after
+   * `verifyDeliveryAck` succeeded against the session's recorded counterparty key.
+   */
+  recordDeliveryAck(
+    agentName: string,
+    sessionId: string,
+    contentHashHex: string,
+    signerPubkeyHex: string,
+    signature: Uint8Array,
+    correlationId?: string,
+  ): void {
+    if (!this.#db) return;
+    storeDeliveryAck(this.#db, this.#ctx.logger, {
+      agentId: this.#ctx.requireAgentId(agentName),
+      agentName, sessionId, contentHashHex, signerPubkeyHex, signature, correlationId,
+    });
+  }
+
   /**
    * DOD-LOG-1: read a session's durable transcript back (after a restart), decrypted and ordered by
    * canonical sequence then direction. A blob that fails to decrypt (tamper/wrong key) is skipped
