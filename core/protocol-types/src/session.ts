@@ -95,6 +95,18 @@ interface SessionAssignmentCommon {
   // `false` and `""` are VALUES here, not absences: absent means a directory predating this layout.
   high_stakes?: boolean;    // the session's tier, forwarded so the TARGET can see what it is held to
   prior_relay_id?: string;  // on a resume, the relay that witnessed up to the handover; "" when fresh
+  /**
+   * 069-ORDERPROOF — the assigned relay's ACK-SIGNING pubkey, hex. `""` on a direct session.
+   *
+   * ⚠️ **THIS IS THE ANCHOR FOR EVERY RELAY ORDERING ATTESTATION IN THE SESSION.** It is inside the
+   * directory-signed TBS (the 13-field layout), so a participant verifying the relay's signature
+   * over a leaf's position checks it against a key the relay did not supply. Verifying against
+   * `relay_id` on the ack frame instead — which is what the client did before this order — checks a
+   * key against itself and proves only that the frame is internally consistent.
+   *
+   * NOT the same key as `relay_endpoint.peer_id`, which is the relay's libp2p transport identity.
+   */
+  relay_id?: string;
 }
 
 /**
@@ -195,6 +207,7 @@ export type SessionAssignment = SessionAssignmentFrost | SessionAssignmentSingle
  * @param transportMode - M7: 'direct' or 'relay' (optional for backward compat)
  * @param highStakes - 017-TBS: the session's high-stakes tier, forwarded so the TARGET can see it
  * @param priorRelayId - 017-TBS: on a resume, the relay that witnessed up to the handover; "" fresh
+ * @param relayId - 069-ORDERPROOF: the assigned relay's ack-signing pubkey (hex); "" when direct
  * @returns canonical CBOR bytes of the TBS array
  */
 export function buildSessionEstablishmentTbs(
@@ -210,6 +223,7 @@ export function buildSessionEstablishmentTbs(
   transportMode?: 'direct' | 'relay',
   highStakes?: boolean,
   priorRelayId?: string,
+  relayId?: string,
 ): Uint8Array {
   const tsEncoded = typeof timestamp === "bigint" || timestamp > 0xffffffff ? BigInt(timestamp) : timestamp;
 
@@ -250,6 +264,22 @@ export function buildSessionEstablishmentTbs(
      * the directory's signature — never from the client.
      */
     if (highStakes !== undefined && priorRelayId !== undefined) {
+      /**
+       * 069-ORDERPROOF: the 13-field layout, and it is now the normal path.
+       *
+       * `relayId` is the assigned relay's ACK-SIGNING pubkey, hex — the key its ordering
+       * attestations verify under. It is here because it was nowhere else: `relay_endpoint` carries
+       * a libp2p peer id, which is a different key, and it sits outside these bytes anyway. Without
+       * it a participant has nothing to check a relay's attestation against but the key the relay
+       * put in the frame, which is a signature checked against something its own signer controls.
+       *
+       * An always-present VALUE like `priorRelayId`: `""` on a direct session (there is no relay),
+       * 64 hex on a relayed one. The arity turns on whether the caller supplies it, never on what
+       * it contains — otherwise a direct session would have two possible layouts.
+       */
+      if (relayId !== undefined) {
+        return encodeCbor([...m7, highStakes, priorRelayId, relayId]) as Uint8Array;
+      }
       return encodeCbor([...m7, highStakes, priorRelayId]) as Uint8Array;
     }
 

@@ -407,6 +407,9 @@ export function buildResponderRelayAssignment(parsed: {
   initiatorPeerId: string;
   counterpartySessionPeerId: string | null;
   relayDirectorySignature: Uint8Array | undefined;
+  // 069-ORDERPROOF: `relay_id` off the SAME frame whose FROST signature the responder verified,
+  // so it is anchored by that signature rather than taken on the relay's word.
+  relayIdHex: string | null;
 }): RelayAssignmentCarry | undefined {
   if (!parsed.relayDirectorySignature) return undefined;
   return {
@@ -416,6 +419,10 @@ export function buildResponderRelayAssignment(parsed: {
     initiatorSessionPeerId: parsed.initiatorPeerId || undefined,
     counterpartySessionPeerId: parsed.counterpartySessionPeerId ?? undefined,
     assignmentSignature: parsed.relayDirectorySignature,
+    // `""` is a VALUE (a direct session names no relay) and must not become an anchor. Only a
+    // real 64-hex key is carried; anything else leaves the carry without one, and an attestation
+    // arriving on such a session is refused rather than verified against whatever it supplies.
+    ...(parsed.relayIdHex ? { relayPubkeyHex: parsed.relayIdHex } : {}),
   };
 }
 
@@ -445,6 +452,9 @@ export function extractInboundSessionAssignment(frame: Record<string, unknown>):
       // True when the field was PRESENT but not a well-formed 64-byte signature — a wire/version
       // bug, reported distinctly from "the directory issued none" (a legacy/direct session).
       relayDirectorySignatureMalformed: boolean;
+      // 069-ORDERPROOF: the assigned relay's ack-signing pubkey, hex. `null` when the field is
+      // absent, not a string, or `""` (a direct session, which names no relay).
+      relayIdHex: string | null;
       // MONIKER-2 AC2: the initiator's offered name, validated ONCE here at the wire
       // boundary — downstream code can never observe an invalid moniker. null when
       // absent (older client) or invalid; monikerRejected distinguishes the two so the
@@ -516,6 +526,7 @@ export function extractInboundSessionAssignment(frame: Record<string, unknown>):
     relayDirectorySignature: toSignature64(a["relay_directory_signature"]),
     relayDirectorySignatureMalformed:
       a["relay_directory_signature"] !== undefined && toSignature64(a["relay_directory_signature"]) === undefined,
+    relayIdHex: typeof a["relay_id"] === "string" && /^[0-9a-f]{64}$/i.test(a["relay_id"]) ? a["relay_id"] : null,
     offeredMoniker: monikerResult.offeredMoniker,
     monikerRejected: monikerResult.rejected,
     monikerRejectReason: monikerResult.reason ?? null,

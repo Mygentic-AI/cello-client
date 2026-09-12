@@ -66,6 +66,11 @@ export function createDirectoryConnect(deps: DirectoryConnectDeps) {
           initiatorSessionPeerId: assignment.initiator_session_peer_id,
           counterpartySessionPeerId: assignment.counterparty_session_peer_id,
           assignmentSignature: relayDirSig,
+          // 069-ORDERPROOF: the relay key this session's ordering attestations verify under, from
+          // the directory-signed `relay_id`. `""` (a direct session) carries no anchor.
+          ...(assignment.relay_id && /^[0-9a-f]{64}$/i.test(assignment.relay_id)
+            ? { relayPubkeyHex: assignment.relay_id }
+            : {}),
         }
       : undefined;
     return {

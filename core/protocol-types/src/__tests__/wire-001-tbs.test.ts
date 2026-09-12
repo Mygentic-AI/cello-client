@@ -351,3 +351,76 @@ describe("017-TBS: 12-field layout", () => {
     );
   });
 });
+
+// ─── 069-ORDERPROOF: the 13-field layout — the relay joins the signed bytes ───
+
+/**
+ * The relay's ack-signing key was in NO directory-signed structure. `relay_endpoint` carries a
+ * libp2p peer id, which is a different key, and it is outside the TBS anyway. So a participant
+ * had nothing to check the relay's ordering attestation against except the key the relay itself
+ * put in the frame — a signature checked against something its own signer controls.
+ *
+ * `relay_id` closes that. Same shape as `prior_relay_id`: an always-present VALUE, `""` on a
+ * direct session and 64 hex on a relayed one, so the arity turns on whether the caller supplies
+ * it and never on what it contains.
+ */
+describe("069-ORDERPROOF: 13-field layout", () => {
+  const M7: [string, string[], string, string[], "direct" | "relay"] = [
+    "12D3KooWInit", ["/ip4/127.0.0.1/tcp/9000"],
+    "12D3KooWCounterparty", ["/ip4/127.0.0.1/tcp/9001"],
+    "relay",
+  ];
+
+  it("emits 13 fields whenever relay_id is supplied, including the DIRECT session's empty value", () => {
+    const thirteen = buildSessionEstablishmentTbs(
+      makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
+      ...M7, false, "", "",
+    );
+    const twelve = buildSessionEstablishmentTbs(
+      makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
+      ...M7, false, "",
+    );
+    expect(thirteen.length).toBeGreaterThan(twelve.length);
+    expect(Buffer.from(thirteen).equals(Buffer.from(twelve))).toBe(false);
+  });
+
+  it("a DIFFERENT relay produces different bytes — this is the whole point of the field", () => {
+    // Without it, a directory's signature naming relay A would carry over to relay B, and a
+    // participant would accept B's ordering attestations for a session B was never assigned to.
+    const a = buildSessionEstablishmentTbs(
+      makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
+      ...M7, false, "", "a".repeat(64),
+    );
+    const b = buildSessionEstablishmentTbs(
+      makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
+      ...M7, false, "", "b".repeat(64),
+    );
+    expect(Buffer.from(a).equals(Buffer.from(b))).toBe(false);
+  });
+
+  it("relay_id is DISTINCT from prior_relay_id — the two slots do not alias", () => {
+    // Same 64 hex in different slots must not produce the same bytes, or a resume's prior relay
+    // could be presented as the current one.
+    const current = buildSessionEstablishmentTbs(
+      makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
+      ...M7, false, "", "a".repeat(64),
+    );
+    const prior = buildSessionEstablishmentTbs(
+      makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
+      ...M7, false, "a".repeat(64), "",
+    );
+    expect(Buffer.from(current).equals(Buffer.from(prior))).toBe(false);
+  });
+
+  it("is deterministic — same inputs, same bytes", () => {
+    const one = buildSessionEstablishmentTbs(
+      makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
+      ...M7, true, "a".repeat(64), "c".repeat(64),
+    );
+    const two = buildSessionEstablishmentTbs(
+      makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
+      ...M7, true, "a".repeat(64), "c".repeat(64),
+    );
+    expect(Buffer.from(one).equals(Buffer.from(two))).toBe(true);
+  });
+});

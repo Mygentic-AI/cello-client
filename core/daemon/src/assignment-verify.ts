@@ -70,6 +70,7 @@ export async function verifyAssignmentSignature(
     assignment.transport_mode,
     assignment.high_stakes,
     assignment.prior_relay_id,
+    assignment.relay_id,
   );
 
   /**
@@ -354,6 +355,7 @@ export function verifyInboundAssignment(
     assignment.transport_mode,
     assignment.high_stakes,
     assignment.prior_relay_id,
+    assignment.relay_id,
   );
 
   if (!verifyFrostSignature(assignment.directory_signature, tbs, CONTEXT_SESSION_ESTABLISHMENT, new Uint8Array(verifyAgainst))) {

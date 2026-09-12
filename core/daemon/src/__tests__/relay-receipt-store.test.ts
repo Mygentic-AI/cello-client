@@ -1,11 +1,17 @@
 /**
- * RelayReceiptStore + verifyRelayAck + evaluateRelayAck — M8B DOD-RELAYSIG-1 (daemon port).
+ * RelayReceiptStore + verifyRelayAck + evaluateRelayAck — DOD-M15-ORDERPROOF-1.
  *
- * Proves: a genuine relay ACK verifies; a FORGED sequence (or timestamp / wrong key / bad-length sig) is
- * rejected by the predicate AND by evaluateRelayAck (the verify-gates-store DECISION — a forged ACK yields
- * `invalid_signature`, never a stored receipt); the store is keyed on the attestation POSITION
- * (agent, session, sequence) so repeated content is NOT dropped, and is IMMUTABLE at a position (a relay
- * cannot rewrite the hash it already attested at a (session, sequence)).
+ * The relay's ordering attestation, and the two things this order changed about it.
+ *
+ * **It is verified against the relay key the DIRECTORY named**, from the FROST-signed
+ * `SessionAssignment`, never against `relay_id` riding in the frame being checked. Verifying a
+ * signature against a key its own signer supplied proves the frame is internally consistent and
+ * nothing at all about who ordered anything.
+ *
+ * **Missing, malformed and mismatched share ONE outcome.** Not three reasons a caller can branch
+ * on: an attestation that is absent leaves a party with no ordering evidence for that message,
+ * which is exactly what a stripped one leaves them with. Whoever can cause the absence must not
+ * get a softer answer than whoever can cause the corruption.
  */
 import { describe, it, expect, beforeEach } from "vitest";
 import { DatabaseSync } from "node:sqlite";
@@ -15,52 +21,127 @@ import { RelayReceiptStore, verifyRelayAck, evaluateRelayAck, type RelayReceipt 
 
 const NOOP_LOGGER = { debug() {}, info() {}, warn() {}, error() {} } as never;
 
-describe("verifyRelayAck (DOD-RELAYSIG-1) — a forged sequence is rejected", () => {
-  it("accepts a genuine relay signature and rejects every tamper", async () => {
+describe("verifyRelayAck (DOD-M15-ORDERPROOF-1) — every bound field is actually bound", () => {
+  it("accepts a genuine attestation and rejects every tamper, the session and the root included", async () => {
     const relay = generateKeypair();
     const relayPubkey = await relay.getPublicKey();
+    const sessionId = new Uint8Array(randomBytes(16));
     const contentHash = new Uint8Array(randomBytes(32));
+    const runningRoot = new Uint8Array(randomBytes(32));
     const seq = 7;
     const ts = 1_719_800_000_000;
-    const sig = await relay.sign(buildRelayAckTbs(contentHash, seq, ts));
+    const sig = await relay.sign(buildRelayAckTbs(sessionId, contentHash, seq, runningRoot, ts));
 
-    expect(verifyRelayAck(contentHash, seq, ts, sig, relayPubkey)).toBe(true);
-    expect(verifyRelayAck(contentHash, seq + 1, ts, sig, relayPubkey)).toBe(false);
-    expect(verifyRelayAck(contentHash, seq, ts + 1, sig, relayPubkey)).toBe(false);
-    expect(verifyRelayAck(new Uint8Array(randomBytes(32)), seq, ts, sig, relayPubkey)).toBe(false);
+    expect(verifyRelayAck(sessionId, contentHash, seq, runningRoot, ts, sig, relayPubkey)).toBe(true);
+    // A DIFFERENT SESSION. Without this field an attestation lifts out of one conversation into
+    // another — same hash, same position — and still verifies.
+    expect(verifyRelayAck(new Uint8Array(randomBytes(16)), contentHash, seq, runningRoot, ts, sig, relayPubkey)).toBe(false);
+    // A DIFFERENT PREFIX. The attestation says this leaf sat at this position of THIS chain.
+    expect(verifyRelayAck(sessionId, contentHash, seq, new Uint8Array(randomBytes(32)), ts, sig, relayPubkey)).toBe(false);
+    expect(verifyRelayAck(sessionId, contentHash, seq + 1, runningRoot, ts, sig, relayPubkey)).toBe(false);
+    expect(verifyRelayAck(sessionId, contentHash, seq, runningRoot, ts + 1, sig, relayPubkey)).toBe(false);
+    expect(verifyRelayAck(sessionId, new Uint8Array(randomBytes(32)), seq, runningRoot, ts, sig, relayPubkey)).toBe(false);
     const otherPubkey = await generateKeypair().getPublicKey();
-    expect(verifyRelayAck(contentHash, seq, ts, sig, otherPubkey)).toBe(false);
-    expect(verifyRelayAck(contentHash, seq, ts, new Uint8Array(63), relayPubkey)).toBe(false);
+    expect(verifyRelayAck(sessionId, contentHash, seq, runningRoot, ts, sig, otherPubkey)).toBe(false);
+    expect(verifyRelayAck(sessionId, contentHash, seq, runningRoot, ts, new Uint8Array(63), relayPubkey)).toBe(false);
+  });
+
+  it("a wrong-length field is REFUSED, not hashed — it returns false instead of throwing", async () => {
+    // The bytes arrive off a wire a relay controls. A 15-byte session id must not reach the hash,
+    // and it must not take down the frame handler either.
+    const relay = generateKeypair();
+    const relayPubkey = await relay.getPublicKey();
+    const sessionId = new Uint8Array(randomBytes(16));
+    const contentHash = new Uint8Array(randomBytes(32));
+    const runningRoot = new Uint8Array(randomBytes(32));
+    const sig = await relay.sign(buildRelayAckTbs(sessionId, contentHash, 1, runningRoot, 10));
+    expect(verifyRelayAck(new Uint8Array(15), contentHash, 1, runningRoot, 10, sig, relayPubkey)).toBe(false);
+    expect(verifyRelayAck(sessionId, contentHash, 1, new Uint8Array(31), 10, sig, relayPubkey)).toBe(false);
   });
 });
 
-describe("evaluateRelayAck (DOD-RELAYSIG-1) — the verify-gates-store DECISION", () => {
-  it("a genuine ACK yields a storable receipt; a FORGED sequence yields invalid_signature (never store)", async () => {
+describe("evaluateRelayAck (DOD-M15-ORDERPROOF-1) — anchored, and absent is not fine", () => {
+  const mk = async () => {
     const relay = generateKeypair();
     const relayId = Buffer.from(await relay.getPublicKey()).toString("hex");
+    const sessionId = new Uint8Array(randomBytes(16));
     const contentHash = new Uint8Array(randomBytes(32));
+    const runningRoot = new Uint8Array(randomBytes(32));
     const ts = 1_719_800_000_000;
     const seq = 7;
-    const goodSig = await relay.sign(buildRelayAckTbs(contentHash, seq, ts));
-    const base = { contentHash, sessionIdHex: "cc".repeat(16), agentPubkeyHex: "aa".repeat(32), timestamp: ts };
+    const sig = await relay.sign(buildRelayAckTbs(sessionId, contentHash, seq, runningRoot, ts));
+    return {
+      relay, relayId, sessionId, contentHash, runningRoot, ts, seq, sig,
+      base: {
+        sessionId,
+        contentHash,
+        runningRoot,
+        sessionIdHex: Buffer.from(sessionId).toString("hex"),
+        agentPubkeyHex: "aa".repeat(32),
+        expectedRelayPubkeyHex: relayId,
+        timestamp: ts,
+      },
+    };
+  };
 
-    // Genuine ACK → store, with the right receipt fields.
-    const good = evaluateRelayAck({ ...base, relayId, relaySignature: goodSig, sequenceNumber: seq });
-    expect(good.kind).toBe("store");
-    if (good.kind === "store") {
-      expect(good.receipt.sequenceNumber).toBe(seq);
-      expect(good.receipt.relayId).toBe(relayId);
-      expect(good.receipt.hashHex).toBe(Buffer.from(contentHash).toString("hex"));
+  it("a genuine attestation under the DIRECTORY-NAMED key yields a storable receipt", async () => {
+    const t = await mk();
+    const ev = evaluateRelayAck({ ...t.base, relayId: t.relayId, relaySignature: t.sig, sequenceNumber: t.seq });
+    expect(ev.kind).toBe("store");
+    if (ev.kind === "store") {
+      expect(ev.receipt.sequenceNumber).toBe(t.seq);
+      expect(ev.receipt.relayId).toBe(t.relayId);
+      expect(ev.receipt.hashHex).toBe(Buffer.from(t.contentHash).toString("hex"));
+      expect(ev.receipt.runningRootHex).toBe(Buffer.from(t.runningRoot).toString("hex"));
     }
+  });
 
-    // FORGED sequence: the signature is over seq=7 but the frame claims seq=8 → must NOT store.
-    expect(evaluateRelayAck({ ...base, relayId, relaySignature: goodSig, sequenceNumber: seq + 1 }).kind).toBe("invalid_signature");
-    // Random (non-binding) signature → must NOT store.
-    expect(evaluateRelayAck({ ...base, relayId, relaySignature: new Uint8Array(randomBytes(64)), sequenceNumber: seq }).kind).toBe("invalid_signature");
-    // Unsigned ACK (no signature) → unsigned, not stored, not rejected.
-    expect(evaluateRelayAck({ ...base, relayId, relaySignature: undefined, timestamp: undefined, sequenceNumber: seq }).kind).toBe("unsigned");
-    // Malformed relay_id → bad_relay_id.
-    expect(evaluateRelayAck({ ...base, relayId: "xyz", relaySignature: goodSig, sequenceNumber: seq }).kind).toBe("bad_relay_id");
+  it("a PERFECTLY VALID attestation from a relay the directory did not name is refused", async () => {
+    // The defect this closes, in one case: before this order the verification key came from
+    // `relay_id` on the frame. Any party able to write the frame minted a key, signed whatever
+    // ordering it liked with it, and put the key in the field we checked against.
+    const t = await mk();
+    const impostor = generateKeypair();
+    const impostorId = Buffer.from(await impostor.getPublicKey()).toString("hex");
+    const impostorSig = await impostor.sign(
+      buildRelayAckTbs(t.sessionId, t.contentHash, t.seq, t.runningRoot, t.ts),
+    );
+    const ev = evaluateRelayAck({
+      ...t.base,
+      relayId: impostorId,
+      relaySignature: impostorSig,
+      sequenceNumber: t.seq,
+    });
+    expect(ev.kind).toBe("refused");
+    if (ev.kind === "refused") expect(ev.cause).toBe("relay_not_assigned");
+  });
+
+  it("a signature over the right statement by a relay OMITTING its id is still checked against the anchor", async () => {
+    // The relay does not get to opt out of being checked by leaving a field blank.
+    const t = await mk();
+    const ev = evaluateRelayAck({ ...t.base, relayId: undefined, relaySignature: t.sig, sequenceNumber: t.seq });
+    expect(ev.kind).toBe("store");
+  });
+
+  it("MISSING, MALFORMED and MISMATCHED produce the SAME refusal — only the logged cause differs", async () => {
+    const t = await mk();
+    const cases: Array<[string, string, ReturnType<typeof evaluateRelayAck>]> = [
+      // The two ABSENCES share one cause on purpose: a signature with no root and a root with no
+      // signature are the same fact — the relay attested nothing usable.
+      ["missing signature", "attestation_absent", evaluateRelayAck({ ...t.base, relayId: t.relayId, relaySignature: undefined, timestamp: undefined, sequenceNumber: t.seq })],
+      ["missing running root", "attestation_absent", evaluateRelayAck({ ...t.base, runningRoot: undefined, relayId: t.relayId, relaySignature: t.sig, sequenceNumber: t.seq })],
+      ["malformed signature", "signature_invalid", evaluateRelayAck({ ...t.base, relayId: t.relayId, relaySignature: new Uint8Array(randomBytes(64)), sequenceNumber: t.seq })],
+      ["forged sequence", "signature_invalid", evaluateRelayAck({ ...t.base, relayId: t.relayId, relaySignature: t.sig, sequenceNumber: t.seq + 1 })],
+      ["malformed relay id", "bad_relay_id", evaluateRelayAck({ ...t.base, relayId: "xyz", relaySignature: t.sig, sequenceNumber: t.seq })],
+      ["no anchor recorded", "no_anchor", evaluateRelayAck({ ...t.base, expectedRelayPubkeyHex: undefined, relayId: t.relayId, relaySignature: t.sig, sequenceNumber: t.seq })],
+    ];
+    for (const [name, expectedCause, ev] of cases) {
+      // The OUTCOME is identical for every one of them. That is the clause.
+      expect(ev.kind, name).toBe("refused");
+      // And the cause is still named, so the log can say which it was. An operator reading "the
+      // relay did not sign" must not have to guess whether it meant "it signed wrong".
+      if (ev.kind === "refused") expect(ev.cause, name).toBe(expectedCause);
+    }
   });
 });
 
@@ -80,6 +161,7 @@ describe("RelayReceiptStore (DOD-RELAYSIG-1) — durable, positioned, immutable"
     sequenceNumber: seq,
     timestamp: seq * 10,
     signatureHex: "ee".repeat(64),
+    runningRootHex: "ff".repeat(32),
   });
 
   it("does NOT drop repeated content — the SAME hash at DIFFERENT positions is stored (code-review HIGH)", () => {
@@ -131,6 +213,7 @@ describe("RelayReceiptStore — Option B seal carry (DOD-OPTIONB-SEAL-1)", () =>
     sequenceNumber: seq,
     timestamp: seq * 10,
     signatureHex: "ee".repeat(64),
+    runningRootHex: "ff".repeat(32),
     structure2Cbor: s2,
     structure1Cbor: s1,
     leafKind: kind,
@@ -162,6 +245,7 @@ describe("RelayReceiptStore — Option B seal carry (DOD-OPTIONB-SEAL-1)", () =>
     store.store({
       hashHex: "11".repeat(32), agentPubkeyHex: agent, sessionIdHex: sess, relayId: "dd".repeat(32),
       relayPubkeyHex: "dd".repeat(32), sequenceNumber: 1, timestamp: 10, signatureHex: "ee".repeat(64),
+      runningRootHex: "ff".repeat(32),
     }, 1);
     store.store(mkLeaf(2, "22".repeat(32), new Uint8Array([0xa2]), new Uint8Array([0xb2]), 0), 1);
     // getSealLeaves returns only leaves that have the full carry bytes (the chain it can rebuild offline).

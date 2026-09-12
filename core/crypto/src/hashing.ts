@@ -76,27 +76,65 @@ export function opaqueLeafHash(prefix: number, data: Uint8Array): Uint8Array {
 }
 
 /**
- * Build the to-be-signed bytes for a relay hash-submit ACK.
+ * DOD-M15-ORDERPROOF-1 — the bytes a relay signs when it assigns a leaf a position.
  *
- * TBS = SHA-256(hash_bytes || seq_BE4 || ts_BE8)
- *   hash_bytes: 32 raw bytes (the Structure 1 content_hash — NOT hex-encoded)
- *   seq_BE4:    sequence_number as 4-byte big-endian uint32
- *   ts_BE8:     timestamp as 8-byte big-endian uint64
+ * This is the relay's ordering ATTESTATION, and both participants end up holding it. The relay is
+ * a blind witness: every field below is a hash, an identifier, a counter or a root the relay
+ * computed itself, so signing this never requires it to see content (INV-3).
  *
- * Both the relay (signer) and the client (verifier) must use this function so
- * they cannot diverge. RFC 8032 (Ed25519), FIPS 180-4 (SHA-256).
+ * TBS = SHA-256( DOMAIN ‖ session_id(16) ‖ content_hash(32) ‖ seq_BE4 ‖ running_root(32) ‖ ts_BE8 )
+ *
+ * Every field is FIXED WIDTH, which is why this is a plain concatenation and not a CBOR encoding:
+ * with no variable-length field there is no way to shift a byte from one field into the next, so
+ * the preimage is unambiguous without a length prefix or an encoder both sides must agree on.
+ *
+ * ⚠️ **WHAT EACH FIELD IS FOR — none of them is decoration.**
+ * - `DOMAIN` — CELLO has several relay signatures (`CELLO-RELAY-WITNESS-v1`, the liveness
+ *   response). Without a tag, one is replayable as another.
+ * - `session_id` — without it an attestation lifts cleanly out of one conversation and into
+ *   another: same hash, same position, different session, still verifies.
+ * - `running_root` — the root of the tree AFTER this leaf is appended. A position alone says where
+ *   a leaf sits in a COUNTER; the root says where it sits in a CHAIN, which is what lets a party
+ *   prove a prefix when the relay is gone (`070-CARRIEDSEAL`).
+ *
+ * Both the relay (signer) and the participants (verifiers) call this, so they cannot diverge.
+ * RFC 8032 (Ed25519), FIPS 180-4 (SHA-256).
+ *
+ * A wrong-length field THROWS rather than being hashed. A 15-byte session id is not a session, and
+ * silently hashing it would produce an attestation that verifies and means nothing.
  */
+export const RELAY_ORDER_DOMAIN = "CELLO-RELAY-ORDER-v1";
+
 export function buildRelayAckTbs(
+  sessionId: Uint8Array,
   hashBytes: Uint8Array,
   sequenceNumber: number,
+  runningRoot: Uint8Array,
   timestamp: number,
 ): Uint8Array {
+  if (sessionId.length !== 16) {
+    throw new RangeError(`buildRelayAckTbs: session_id must be 16 bytes, got ${sessionId.length}`);
+  }
+  if (hashBytes.length !== 32) {
+    throw new RangeError(`buildRelayAckTbs: content_hash must be 32 bytes, got ${hashBytes.length}`);
+  }
+  if (runningRoot.length !== 32) {
+    throw new RangeError(`buildRelayAckTbs: running_root must be 32 bytes, got ${runningRoot.length}`);
+  }
+
   const seqBuf = Buffer.allocUnsafe(4);
   seqBuf.writeUInt32BE(sequenceNumber >>> 0, 0);
 
   const tsBuf = Buffer.allocUnsafe(8);
   tsBuf.writeBigUInt64BE(BigInt(timestamp), 0);
 
-  const preimage = Buffer.concat([Buffer.from(hashBytes), seqBuf, tsBuf]);
+  const preimage = Buffer.concat([
+    Buffer.from(RELAY_ORDER_DOMAIN, "utf8"),
+    Buffer.from(sessionId),
+    Buffer.from(hashBytes),
+    seqBuf,
+    Buffer.from(runningRoot),
+    tsBuf,
+  ]);
   return new Uint8Array(createHash("sha256").update(preimage).digest());
 }

@@ -530,6 +530,14 @@ export interface RelayAssignmentCarry {
   initiatorSessionPeerId?: string;     // present for relay-mode sessions (covered by the sig when both present)
   counterpartySessionPeerId?: string;
   assignmentSignature: Uint8Array;     // 64-byte per-node directory sig over the relay TBS (relay_directory_signature)
+  /**
+   * 069-ORDERPROOF — the assigned relay's ACK-SIGNING pubkey, hex, taken from `relay_id` on an
+   * assignment whose FROST signature has already been verified. **This is the only key a relay
+   * ordering attestation is checked against.** Absent means the directory named no relay for this
+   * session, and every attestation that arrives is then refused for want of an anchor — never
+   * accepted on the key the frame itself carries.
+   */
+  relayPubkeyHex?: string;
 }
 
 /**
@@ -1052,11 +1060,26 @@ export class AgentRelayClient {
   }
 
   /**
-   * Verify a relay `hash_submit_ack`'s signed ordering record and durably store the receipt.
-   * The relay signs TBS = SHA-256(content_hash || seq_BE4 || ts_BE8) with its ack-signing key, whose hex is
-   * `relay_id`. We verify SELF-CONSISTENCY (the signature binds the sequence ⇒ a FORGED sequence fails) and
-   * record the immutable receipt. The authoritative registered-relay check is the directory's at seal
-   * (OPTIONB-SEAL). No-op when there is no receipt store, no pending leaf, or the ACK is unsigned.
+   * The relay pubkey the DIRECTORY named for a session — 069-ORDERPROOF, and the only key a relay
+   * ordering attestation is ever checked against.
+   *
+   * It rides the assignment carry, which is built from an assignment whose FROST signature this
+   * daemon verified before the session began, so it is anchored to something the relay does not
+   * control. `undefined` means no such key was recorded, and every attestation on that session is
+   * then refused for want of an anchor — never accepted against whatever key the frame supplies.
+   */
+  #expectedRelayPubkeyHex(sessionIdHex: string): string | undefined {
+    return this.#sessions.get(sessionIdHex)?.assignment?.relayPubkeyHex;
+  }
+
+  /**
+   * Verify a relay `hash_submit_ack`'s ordering attestation and durably store the receipt.
+   *
+   * The relay signs the session, the content hash, the position it assigned and the running root of
+   * the tree after this leaf. We verify it **against the relay key on the directory-signed
+   * assignment**, and refuse otherwise — missing, malformed and mismatched all take the one path.
+   *
+   * Returns true to REJECT the submit. A send must not settle ok on a position nothing witnessed.
    */
   #captureReceipt(frame: Record<string, unknown>, structure1Cbor: Uint8Array | undefined, seq: number): boolean {
     if (seq < 0 || !structure1Cbor) return false;
@@ -1073,30 +1096,41 @@ export class AgentRelayClient {
     }
     const contentHash = s1.fields.contentHash;
     const sessionId = s1.fields.sessionId;
+    const sessionIdHex = Buffer.from(sessionId).toString("hex");
     const ev = evaluateRelayAck({
+      sessionId,
       contentHash,
-      sessionIdHex: Buffer.from(sessionId).toString("hex"),
+      runningRoot: frame["running_root"] instanceof Uint8Array ? (frame["running_root"] as Uint8Array) : undefined,
+      sessionIdHex,
       agentPubkeyHex: this.senderPubkeyHex,
+      expectedRelayPubkeyHex: this.#expectedRelayPubkeyHex(sessionIdHex),
       relayId: typeof frame["relay_id"] === "string" ? frame["relay_id"] : undefined,
       relaySignature: frame["relay_signature"] instanceof Uint8Array ? (frame["relay_signature"] as Uint8Array) : undefined,
       timestamp: typeof frame["timestamp"] === "number" ? frame["timestamp"] : undefined,
       sequenceNumber: seq,
     });
     switch (ev.kind) {
-      case "unsigned":
-        // A relay that SHOULD sign but didn't → no durable witness for this message. Unsigned ACKs are
-        // tolerated, but make it diagnosable instead of invisible.
-        this.#logger.debug("relay.receipt.unsigned", { seq, hashShort: Buffer.from(contentHash).toString("hex").slice(0, 16) });
-        return false;
-      case "bad_relay_id":
-        this.#logger.warn("relay.receipt.bad_relay_id", { seq });
-        return false;
-      case "invalid_signature":
-        // FORGED / corrupt ACK — the signature does not bind (hash, seq, ts). REJECT the submit so the send
-        // does NOT settle ok on an unverified sequence (a forged ordering record must not drive ordering),
-        // and store nothing. The send still completes via the direct
-        // content path — the relay witness simply degrades to absent for this leaf.
-        this.#logger.warn("relay.receipt.signature_invalid", { seq });
+      case "refused":
+        /**
+         * ONE OUTCOME, and the cause is in the log rather than in the control flow.
+         *
+         * The submit is rejected for all five causes. A message whose position no assigned relay
+         * attested has no ordering evidence behind it, and letting the send settle ok would report
+         * a witnessed message that nothing witnessed. `attestation_absent` takes this path with the
+         * rest deliberately: the party who can produce the absence is the relay, which is the party
+         * the check exists to constrain, so a softer answer for absence is a mute button with our
+         * own name on it.
+         */
+        this.#logger.warn("relay.attestation.refused", {
+          seq,
+          session: sessionIdHex,
+          cause: ev.cause,
+          hashShort: Buffer.from(contentHash).toString("hex").slice(0, 16),
+          impact:
+            "the relay's ordering attestation for this message was refused, so this send did not " +
+            "settle and no evidence was stored. This agent holds no proof of where this message " +
+            "sits in the conversation, and nothing was recorded that could later be presented as one.",
+        });
         return true;
       case "store": {
         if (!this.#receiptStore) return false;
@@ -1184,7 +1218,12 @@ export class AgentRelayClient {
       const rejectSubmit = this.#captureReceipt(frame, structure1Cbor, seq);
       this.#settlePending(
         rejectSubmit
-          ? { ok: false, reason: "relay_ack_signature_invalid" }
+          /**
+           * ONE REASON for every refusal cause — 069-ORDERPROOF Done When 3. A distinct reason per
+           * cause would be observable, and the clause requires that a missing attestation and a
+           * malformed one look the same from outside. The cause is named in the log line above.
+           */
+          ? { ok: false, reason: "relay_ack_unverified" }
           : seq >= 0
             ? { ok: true, sequence_number: seq, structure1_cbor: structure1Cbor, structure2_cbor: structure2Cbor, sender_signature: senderSignature }
             : { ok: false, reason: "relay_ack_malformed" },
@@ -1412,6 +1451,68 @@ export class AgentRelayClient {
           }
         } else {
           this.#logger.warn("relay.seal_leaf.counterparty.capture_skipped", { seq, session: sidHex, hasS2: !!structure2Cbor, hasS1: s1.length > 0, hasSender: !!senderHex });
+        }
+      }
+      /**
+       * ─── THE RECIPIENT KEEPS THE ORDERING PROOF TOO — 069-ORDERPROOF unit 2 ──────────────────
+       *
+       * Before this, the relay's attestation went to the SENDER alone, on the submit
+       * acknowledgement. The recipient held no proof of where a single message of the conversation
+       * sat. That made one party's copy the only copy, which is the dependency this order exists to
+       * remove wearing a different coat.
+       *
+       * It is verified here exactly as on the send path — against the relay key the DIRECTORY named
+       * for this session, never `relay_id` on the frame — and an attestation that does not verify is
+       * refused and NOT stored. Nothing else changes: the leaf is still delivered to the session, the
+       * acknowledgement still advances, and no tree, root or leaf count is touched. This is evidence
+       * recorded beside the chain, never in it.
+       *
+       * Our own echoed leaf comes through here too. Storing it is a no-op — the ack path already
+       * wrote the same row at the same position, and the store is INSERT OR IGNORE — but it is not
+       * skipped, because the echo is the only copy a leaf COUNTER-SUBMITTED by the counterparty
+       * ever produces for us.
+       */
+      if (this.#receiptStore && seq >= 0 && deliveredS1.ok) {
+        const ev = evaluateRelayAck({
+          sessionId: deliveredS1.fields.sessionId,
+          contentHash: deliveredS1.fields.contentHash,
+          runningRoot: frame["running_root"] instanceof Uint8Array ? (frame["running_root"] as Uint8Array) : undefined,
+          sessionIdHex: sidHex,
+          agentPubkeyHex: this.senderPubkeyHex,
+          expectedRelayPubkeyHex: this.#expectedRelayPubkeyHex(sidHex),
+          relayId: typeof frame["relay_id"] === "string" ? frame["relay_id"] : undefined,
+          relaySignature: frame["relay_signature"] instanceof Uint8Array ? (frame["relay_signature"] as Uint8Array) : undefined,
+          timestamp: typeof frame["timestamp"] === "number" ? frame["timestamp"] : undefined,
+          sequenceNumber: seq,
+        });
+        if (ev.kind === "refused") {
+          /**
+           * LOUD, AND THE DELIVERY STILL LANDS. This is the one place the two halves differ, and
+           * deliberately: on the send path a refusal means OUR message has no witness, so the send
+           * must not settle. Here the counterparty's message has already been written and read —
+           * dropping it would let a relay silence a conversation by withholding its own signature,
+           * which hands the party the check constrains a far better weapon than the one it takes
+           * away. So the message arrives and the evidence is recorded as absent.
+           */
+          this.#logger.warn("relay.attestation.delivered.refused", {
+            seq,
+            session: sidHex,
+            cause: ev.cause,
+            impact:
+              "this message arrived, but the relay's proof of WHERE it sits in the conversation did " +
+              "not, so this agent cannot later show a third party that this message was ordered here. " +
+              "The message itself is unaffected and is in the transcript.",
+          });
+        } else {
+          try {
+            this.#receiptStore.store(ev.receipt, Date.now());
+          } catch (err) {
+            // A durable-evidence write failure is LOUD: the relay never re-sends a delivery, so a
+            // swallowed write permanently loses this side's only copy of the ordering proof.
+            this.#logger.error("relay.attestation.delivered.store_failed", {
+              seq, session: sidHex, error: extractErrorMessage(err),
+            });
+          }
         }
       }
       const session = this.#sessions.get(sidHex);
