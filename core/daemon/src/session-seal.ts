@@ -485,7 +485,19 @@ export class SessionSeal {
     sessionId: string,
     correlationId?: string,
   ): Promise<
-    | { ok: true; sequenceNumber: number; reportedRootHex: string }
+    | {
+        ok: true;
+        sequenceNumber: number;
+        reportedRootHex: string;
+        /**
+         * 070-CARRIEDSEAL: this leaf was signed HERE because no relay answered, so no relay holds
+         * it. The caller must not then wait out the bilateral window: a bilateral seal is a ceremony
+         * the RELAY runs from its own leaf log, and there is no relay. Waiting eleven minutes for a
+         * ceremony that cannot begin is eleven minutes of an operator watching nothing happen before
+         * the solo seal that was always the only outcome.
+         */
+        viaLocalTerminus?: true;
+      }
     | { ok: false; reason: string; reportedRootHex?: string; sequenceNumber?: number }
   > {
     const sealKey = this.#ctx.sessionKey(agentName, sessionId);
@@ -521,7 +533,7 @@ export class SessionSeal {
       // 070-CARRIEDSEAL: there is no relay to hand this leaf to. If the reason is SILENCE rather
       // than a ruling, close over what we already hold instead of losing the receipt.
       const local = await this.#carriedClose(agentName, sessionId, transport.error, correlationId);
-      return local ?? { ok: false, reason: transport.error };
+      return local ? { ...local, viaLocalTerminus: true as const } : { ok: false, reason: transport.error };
     }
     const entry = transport;
     /**
@@ -650,7 +662,7 @@ export class SessionSeal {
           const local = await this.#carriedClose(agentName, sessionId, result.reason, correlationId);
           if (local) {
             this.#ctx.responderSealSubmitted.set(sealKey, { reportedRootHex: local.reportedRootHex, sequenceNumber: local.sequenceNumber });
-            return local;
+            return { ...local, viaLocalTerminus: true as const };
           }
           return { ok: false, reason: result.reason };
         }
