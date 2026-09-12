@@ -71,6 +71,7 @@ import { createUnresolvedNodesReport } from "./unresolved-nodes-report.js";
 import { createDocumentSurface } from "./document-surface.js";
 import { createIpcSurface } from "./ipc-surface.js";
 import { createDaemonStatusReport } from "./daemon-status-report.js";
+import { logConsortiumAnchor } from "./consortium-fingerprint.js";
 import { createWhoResolver } from "./who-resolver.js";
 import { NO_CURRENT_AGENT_RESPONSE, registrationGuidance } from "./operator-guidance.js";
 import { wireDisconnectCleanup } from "./disconnect-cleanup.js";
@@ -1057,6 +1058,9 @@ async function startDaemonHoldingLock(
     staleCount: 0,
     goneCount: 0,
   });
+
+  // DOD-M15-CONSORTIUM-FINGERPRINT-1 — which consortium this binary can accept; see its header.
+  logConsortiumAnchor(logger);
 
   // Log daemon.started
   logger.info("daemon.started", {

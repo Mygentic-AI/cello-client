@@ -1333,8 +1333,53 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
       "M11-D5 makes the step-1 lookup serve staff overrides through the same row, so there is no " +
       "second table and no flag that could disagree with it.",
   },
+  {
+    surface: "README.md",
+    claim: "A genuine client cannot be fooled by a fork's consortium, and the fingerprint it prints cannot be configured",
+    excerpts: [
+      "A genuine client cannot be fooled by that — it",
+      "refuses any manifest not signed by the consortium root key compiled into it — but",
+      "itself. The value cannot be configured, so nothing you were told to set can",
+    ],
+    verdict: "true",
+    /**
+     * STRUCTURAL on both halves, and the two halves are enforced in different places.
+     *
+     * "Cannot be fooled" is the signature check: `EmbeddedManifestProvider.loadAndVerify` runs
+     * `verifyManifest` against `BUNDLED_CONSORTIUM_ROOT_KEYS` and REJECTS with
+     * `manifest_signature_invalid` before adopting anything, so a fork's manifest never becomes
+     * this client's roster. Bounded, and the README says so in the same breath: it stops a fake
+     * consortium fooling a genuine client, not a fork shipping its own client.
+     *
+     * "Cannot be configured" is the absence of a reader: `describeConsortiumFingerprint` takes no
+     * arguments and touches no environment variable, so there is no input for an operator — or for
+     * someone instructing an operator — to change.
+     */
+    enforcedBy: "structural",
+    evidence:
+      "`file-manifest-provider.ts` — EmbeddedManifestProvider.loadAndVerify rejects with " +
+      "ManifestLoadError(\"manifest_signature_invalid\") when verifyManifest fails, and leaves " +
+      "#manifest null, asserted in dod-m15-consortium-fingerprint-1.test.ts. " +
+      "`consortium-fingerprint.ts` — describeConsortiumFingerprint() reads the two compiled-in " +
+      "constants and nothing else; the same test sets CELLO_CONSORTIUM_ROOT_KEYS, " +
+      "CELLO_CONSORTIUM_THRESHOLD and CELLO_CONSORTIUM_FINGERPRINT and asserts the block is " +
+      "unchanged.",
+  },
+  {
+    surface: "plugins/cello/skills/setup/SKILL.md",
+    claim: "The fingerprint is compiled in and cannot be changed by a setting",
+    excerpts: [
+      "value is compiled in and cannot be configured, so nothing in your settings can",
+    ],
+    verdict: "true",
+    /** Same absence-of-a-reader argument as the README row above; same test. */
+    enforcedBy: "structural",
+    evidence:
+      "`consortium-fingerprint.ts` — describeConsortiumFingerprint() takes no arguments and reads " +
+      "no environment; dod-m15-consortium-fingerprint-1.test.ts sets three plausible override " +
+      "variables and asserts the printed block is byte-identical.",
+  },
 ];
-
 /**
  * DELIBERATELY NOT ADJUDICATED, and worth saying why rather than leaving a silent gap.
  *

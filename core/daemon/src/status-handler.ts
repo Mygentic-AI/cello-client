@@ -13,6 +13,7 @@
  */
 import { classifyManifestValidity, describeManifestValidity, type ManifestOrigin } from "./manifest-validity.js";
 import { describeDirectoryAuth } from "./directory-auth-posture.js";
+import { describeConsortiumFingerprint } from "./consortium-fingerprint.js";
 import { resolveDirectoryUrl } from "./directory-bootstrap.js";
 import type { IpcHandler } from "./ipc-server.js";
 import type { AgentInfo, ActiveSessionInfo, DirectorySignalingState, InterruptedSessionInfo } from "./types.js";
@@ -75,6 +76,8 @@ export function registerStatusHandler(deps: StatusHandlerDeps): void {
         classifyManifestValidity(manifestProvider?.getCurrentManifest() ?? null, Date.now()),
         manifestOrigin,
       ) ?? {}),
+      // DOD-M15-CONSORTIUM-FINGERPRINT-1 — WHICH consortium this client accepts a manifest from.
+      ...describeConsortiumFingerprint(),
       // DOD-M15-DIRAUTH-1: the posture is STATED, in both directions. Unlike every other field in
       // this milestone the healthy case is reported too — the defect is precisely that "enforced"
       // and "skipped" differ only by the absence of a log line, so an operator must be able to

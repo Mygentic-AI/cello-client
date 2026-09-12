@@ -1,0 +1,11 @@
+{
+  "fingerprint": "60e4-147d-9355-9b1c",
+  "fingerprint_full": "60e4147d93559b1cdb0b362ae36eedd6e82ea825a4e68d02bf9c1f9618683dbf",
+  "root_keys": [
+    "e8300a2b9de7be6f6d629f778dc319715ad0010c0639f3a1564181d56d3eb104"
+  ],
+  "threshold": 1,
+  "algorithm": "sha256 over the canonical preimage: the domain string, the root keys lowercased and sorted, then the threshold, each on its own line and each newline-terminated",
+  "recompute": "printf 'cello-consortium-root-v1\\ne8300a2b9de7be6f6d629f778dc319715ad0010c0639f3a1564181d56d3eb104\\n1\\n' | shasum -a 256",
+  "generated_by": "scripts/gen-consortium-fingerprint.mjs"
+}
