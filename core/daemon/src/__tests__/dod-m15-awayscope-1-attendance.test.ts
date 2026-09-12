@@ -230,6 +230,23 @@ describe("DOD-M15-AWAYSCOPE-1: the daemon announces its own attendance, and neve
     expect(mine!["attendanceObservedAt"]).toBe(1_700_000_000_001);
   });
 
+  it("★★ the daemon-wide listing carries it too — one field, not one per surface", async () => {
+    /**
+     * `cello sessions` and `cello sessions --all-agents` are two renderings of the same rows, and an
+     * operator moves between them. A field on one and not the other teaches the wrong lesson:
+     * absent would read as "nobody is attending" rather than "this surface does not ask", which is
+     * the opposite of what absence is defined to mean everywhere else in this order.
+     */
+    const { fake } = await setup();
+    const client = await connectAs("alice");
+    fake.answer.value = { liveness: "alive", observedAt: 1_700_000_000_002, attendance: "unattended" };
+
+    const res = (await client.send("list_sessions", { filter: "all" })) as Record<string, unknown>;
+    const mine = (res["sessions"] as Array<Record<string, unknown>>).find((s) => s["sessionId"] === SID_HEX);
+    expect(mine, "the daemon-wide listing must include the session at all").toBeDefined();
+    expect(mine!["counterpartyAttendance"]).toBe("unattended");
+  });
+
   it("★★ when the relay knows nothing, the field is ABSENT — never defaulted to a value", async () => {
     /**
      * A default is the failure that matters here. 'attended' would report a person present who is

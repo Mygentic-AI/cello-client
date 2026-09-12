@@ -760,13 +760,22 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
     return { ok: true, session_id: sessionId, ...(refusalsDismissed > 0 ? { refusals_dismissed: refusalsDismissed } : {}) };
   });
 
-  // list_sessions (daemon-wide, for the `cello sessions` CLI which has no current agent): same
-  // filter/limit semantics, across ALL agents.
+  /**
+   * list_sessions (daemon-wide, reached as `cello sessions --all-agents`): same filter/limit
+   * semantics, across ALL agents.
+   *
+   * ⚠️ ENRICHED WITH ATTENDANCE TOO (DOD-M15-AWAYSCOPE-1), and that is not tidiness. This and
+   * `cello_list_sessions` are two renderings of the same rows, and an operator moves between them.
+   * A field present on one and absent on the other teaches exactly the wrong lesson — absent reads
+   * as "nobody is attending" rather than "this surface does not ask" — and the whole point of the
+   * field is that its absence must mean "the relay did not say".
+   */
   handlers.set("list_sessions", async (params) => {
-    return selectSessions(
+    const listed = selectSessions(
       sessionNodeManager.getAllSessions(),
       params as Record<string, unknown> | undefined,
     );
+    return { ...listed, sessions: await attachAttendance(listed.sessions) };
   });
 
 }
