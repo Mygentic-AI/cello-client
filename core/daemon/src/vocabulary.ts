@@ -136,6 +136,22 @@ const DOCUMENT_VERBS: readonly DualSurfaceVerb[] = [
 ];
 
 /**
+ * Is this IPC method name one of the document verbs?
+ *
+ * Lives HERE, in the file that owns every tool name, and not at the call site — `ipc-server.ts` needs
+ * the answer to name the right cause when a gated verb arrives, and a `"cello_doc_"` literal there is
+ * flagged by the source audit as a dead tool name. Correctly flagged: a bare prefix is not a tool, and
+ * the audit cannot tell it from a typo'd one. `vocabulary.ts` is the one file that audit excludes,
+ * because defining names is its job.
+ *
+ * Answers by NAME, not by membership of `DOCUMENT_VERBS` — the caller asks precisely when the gate is
+ * closed and that list is therefore not in `DUAL_SURFACE_VERBS`.
+ */
+export function isDocumentVerbName(method: string): boolean {
+  return DOCUMENT_VERBS.some((v) => v.mcp === method);
+}
+
+/**
  * Every capability with BOTH an MCP tool and a CLI command, for THIS process.
  *
  * Read at module load, which is where every other consumer of this table already reads it — the CLI

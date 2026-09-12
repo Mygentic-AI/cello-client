@@ -81,6 +81,7 @@ export {
   deadCliVerbPattern,
   RENAMED_AWAY_TOOLS,
   knownToolNames,
+  isDocumentVerbName,
   toCliGuidance,
   renderForSurface,
   type DualSurfaceVerb,

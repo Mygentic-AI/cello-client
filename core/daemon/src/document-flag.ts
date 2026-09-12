@@ -21,8 +21,14 @@
  *     package. It cannot import this module, let alone open the daemon's SQLCipher database.
  *
  * So the value is an environment variable, and the shim reads the same variable by name with its
- * own three-line parser. `documents-flag-parity` asserts the shim's literal equals
- * `DOCUMENTS_FLAG_ENV`, so the two cannot drift.
+ * own three-line parser.
+ *
+ * ⚠️ THIS PARAGRAPH USED TO NAME A TEST CALLED `documents-flag-parity`, WHICH DOES NOT EXIST. Found by
+ * review, and rewritten rather than deleted because the wrong name is the evidence that the protection
+ * was asserted before it was located. **The protection is real and it lives in
+ * `docsflag-2-mcp-tools.test.ts`**: that test imports `DOCUMENTS_FLAG_ENV` from here and uses it to set
+ * the spawned shim's environment, so renaming this constant makes the ON case advertise nothing and the
+ * OFF case inherit the suite's ambient value — both red. Measured, not assumed: the rename was run.
  *
  * What IS taken from the config store's posture: **the tightest value is the default.** Absent
  * reads as off, an unparseable value reads as off, and only an explicit affirmative turns the layer

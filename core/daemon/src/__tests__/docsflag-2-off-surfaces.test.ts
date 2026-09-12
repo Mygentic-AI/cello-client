@@ -5,14 +5,21 @@
  * vocabulary registry, and the reconcile sweep timer. The CLI's help and the MCP shim's advertised
  * tool list are separate processes and are tested in their own packages, against their own binaries.
  *
- * ── THE COUNT IN THE ORDER IS FROM 2026-09-07 AND `main` HAS MOVED ────────────────────────────
+ * ── THE ORDER'S COUNT IS FROM 2026-09-07, AND NEITHER TOTAL IS THE PRODUCTION SURFACE ────────
  *
- * The order says the socket answers 80 verbs instead of 94. Remeasured here on 2026-09-12: the
- * daemon registers **87**, of which **14** are `cello_doc_*`, so the off state is **73**. The order's
- * figure is not wrong about anything that matters — it recorded a real total on a different day, and
- * seven verbs have come and gone since. So the numbers are asserted as measured AND the drop is
- * asserted as exactly fourteen, which is the property the clause is actually about: no document verb
- * is answerable, and nothing else went missing with them.
+ * The order says the socket answers 80 verbs instead of 94. Two corrections, the second found by
+ * review:
+ *
+ *  1. `main` has moved. Remeasured 2026-09-12: 87 registered, 14 of them `cello_doc_*`, so 73 off.
+ *  2. **Every daemon in this file starts with `CELLO_ENV=test`, which registers 13 verbs from
+ *     `test-handlers.ts` that an operator's socket never answers.** So neither 87 nor 73 is what an
+ *     operator sees; the production surface is 74 on and 60 off.
+ *
+ * Pinning a clause to a test-env total is how a magic number gets "fixed" by editing it the next time
+ * an unrelated verb is added. So the counts asserted below EXCLUDE the test-only verbs, and the three
+ * load-bearing assertions are ones no unrelated change can make stale: the drop is exactly fourteen,
+ * the fourteen that left are exactly the document verbs, and the non-document set is identical in both
+ * states.
  *
  * ── WHY `getHandlers()` IS THE RIGHT TARGET AND A SOURCE SCAN IS NOT ──────────────────────────
  *
@@ -118,6 +125,28 @@ describe("074-DOCSFLAG clauses 2/5/6/9 — the daemon's three document surfaces,
     return handle;
   }
 
+  /**
+   * The verbs an OPERATOR's socket answers: everything except the test-only handlers.
+   *
+   * These daemons run with `CELLO_ENV=test`, which registers `test-handlers.ts`. Counting those would
+   * pin the clause to a number no operator ever sees. The filter is by the two shapes that file uses —
+   * the `__test_` prefix and six older debug verbs that predate it — and `productionVerbs` asserts it
+   * actually removed something, so a rename in `test-handlers.ts` cannot silently make this a no-op.
+   */
+  const TEST_ONLY_VERBS = new Set([
+    "queue_failed_send", "debug_inject_park_fault", "enqueue_awaiting_content",
+    "mark_content_acked", "check_nonce", "drain_session",
+  ]);
+  function productionVerbs(h: DaemonHandle): string[] {
+    const all = [...h.getHandlers().keys()];
+    const kept = all.filter((k) => !k.startsWith("__test_") && !TEST_ONLY_VERBS.has(k));
+    expect(
+      all.length - kept.length,
+      "the test-only filter matched nothing — test-handlers.ts was renamed and this count is now wrong",
+    ).toBe(13);
+    return kept;
+  }
+
   async function connect(socketPath: string): Promise<IpcClient> {
     const client = await connectToDaemon(socketPath);
     clients.push(client);
@@ -127,10 +156,10 @@ describe("074-DOCSFLAG clauses 2/5/6/9 — the daemon's three document surfaces,
 
   // ── Clause 2: the IPC verb count, and no doc verb among them ────────────────────────────────
 
-  it("OFF: the handler map is 73 verbs, exactly 14 fewer than ON, and none of them is a doc verb", async () => {
+  it("OFF: the operator's socket answers 60 verbs, exactly 14 fewer than ON, and no doc verb", async () => {
     const off = await start("off");
-    const offKeys = [...off.getHandlers().keys()];
-    expect(offKeys).toHaveLength(73);
+    const offKeys = productionVerbs(off);
+    expect(offKeys).toHaveLength(60);
     expect(offKeys.filter((k) => k.startsWith("cello_doc_"))).toEqual([]);
     for (const verb of DOC_VERBS) expect(offKeys).not.toContain(verb);
 
@@ -138,9 +167,9 @@ describe("074-DOCSFLAG clauses 2/5/6/9 — the daemon's three document surfaces,
     handle = null;
 
     const on = await start("on");
-    const onKeys = [...on.getHandlers().keys()];
-    expect(onKeys).toHaveLength(87);
-    // The drop is the whole assertion: fourteen verbs left and nothing else did.
+    const onKeys = productionVerbs(on);
+    expect(onKeys).toHaveLength(74);
+    // The three assertions that survive any unrelated verb being added or removed.
     expect(onKeys.length - offKeys.length).toBe(14);
     expect(onKeys.filter((k) => k.startsWith("cello_doc_")).sort()).toEqual([...DOC_VERBS].sort());
     expect(new Set(onKeys.filter((k) => !k.startsWith("cello_doc_")))).toEqual(new Set(offKeys));
@@ -156,12 +185,66 @@ describe("074-DOCSFLAG clauses 2/5/6/9 — the daemon's three document surfaces,
     }
   }, 120_000);
 
+  /**
+   * REVIEW FINDING F3 — the refusal named the wrong subsystem.
+   *
+   * `method_not_found` is correct: the verb genuinely is not registered, and registering one to say
+   * "disabled" is what the order forbids. What was wrong was the GUIDANCE, which is generic and sends
+   * the reader to check that cello-mcp and the daemon are the same version — for a flag that is off by
+   * design.
+   *
+   * ⚠️ AND IT IS REACHABLE IN ORDINARY OPERATION, WHICH IS WHY IT IS NOT COSMETIC. The shim and the
+   * daemon are separate processes with separate environments: the MCP client spawns one, `cello login`
+   * starts the other. Set the flag for the shim only and it advertises fourteen tools against a daemon
+   * that answers none of them; run an older `@cello-protocol/connect` and you land in the same place.
+   * The only statement of the truth was a `document.layer.gated` line written at boot, possibly days
+   * earlier.
+   */
+  it("OFF: a gated doc verb is refused by ITS OWN CAUSE, not by generic version-skew guidance", async () => {
+    await start("off");
+    const client = await connect(join(tempDir, "daemon.sock"));
+    const err = await client.send("cello_doc_propose", {}).then(
+      () => { throw new Error("a gated doc verb must not resolve"); },
+      (e: unknown) => e as { message?: string; guidance?: string; code?: string },
+    );
+    const text = `${err.message ?? ""} ${err.guidance ?? ""}`;
+
+    // The cause, named where it surfaced.
+    expect(text).toContain("documents are disabled");
+    // Invariant 4 — the next step is in the payload, and it names the REAL variable and the REAL
+    // trap: both processes, or the tool stays advertised and unanswerable.
+    expect(err.guidance).toContain(DOCUMENTS_FLAG_ENV);
+    expect(err.guidance).toContain("cello-mcp");
+    // And the wrong subsystem is GONE from this answer — the whole finding.
+    expect(text, "still blames version skew for a flag that is off by design").not.toContain("same version");
+
+    // The forensic half is kept: the response is the control, the log is the record, never one instead
+    // of the other.
+    const refusal = events.find((e) => e.event === "document.verb.refused");
+    expect(refusal, "the refusal reached the caller but left no log line").toBeDefined();
+    expect(refusal?.fields["method"]).toBe("cello_doc_propose");
+    expect(refusal?.fields["reason"]).toBe("documents_disabled");
+  }, 120_000);
+
+  it("an unknown NON-document verb still gets the version-skew guidance — the fix did not widen", async () => {
+    await start("off");
+    const client = await connect(join(tempDir, "daemon.sock"));
+    const err = await client.send("cello_not_a_verb", {}).then(
+      () => { throw new Error("an unknown verb must not resolve"); },
+      (e: unknown) => e as { guidance?: string },
+    );
+    // The exemplar is chosen from the PREDICATE: the branch keys on the `cello_doc_` prefix, so the
+    // value that must take the other branch is a `cello_`-prefixed name that is not a doc verb.
+    expect(err.guidance).toContain("same version");
+    expect(err.guidance).not.toContain(DOCUMENTS_FLAG_ENV);
+  }, 120_000);
+
   // ── Clause 9: the state is one grep, not an inference ───────────────────────────────────────
 
   it("the daemon says which state the document layer is in, at startup, on both settings", async () => {
     await start("off");
-    const offLine = events.find((e) => e.event === "document.layer.state");
-    expect(offLine, "no document.layer.state at startup").toBeDefined();
+    const offLine = events.find((e) => e.event === "document.layer.gated");
+    expect(offLine, "no document.layer.gated at startup").toBeDefined();
     expect(offLine?.fields["state"]).toBe("off");
     expect(offLine?.fields["flag"]).toBe(DOCUMENTS_FLAG_ENV);
 
@@ -170,7 +253,7 @@ describe("074-DOCSFLAG clauses 2/5/6/9 — the daemon's three document surfaces,
     events = [];
 
     await start("on");
-    expect(events.find((e) => e.event === "document.layer.state")?.fields["state"]).toBe("on");
+    expect(events.find((e) => e.event === "document.layer.gated")?.fields["state"]).toBe("on");
   }, 120_000);
 
   // ── Clause 6: the sweep timer is never CREATED ──────────────────────────────────────────────

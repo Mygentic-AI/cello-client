@@ -66,7 +66,11 @@ export function wireDocumentGate(
 
   // Said once, at startup, so "are documents on?" is one grep rather than an inference from the
   // absence of something (order clause 9).
-  logger.info("document.layer.state", {
+  //
+  // Named `document.layer.gated` and not `document.layer.state`: the taxonomy is
+  // `domain.noun.verb`, and `state` is a noun, so the original read as a field name rather than an
+  // event. The `state` FIELD still carries `on` or `off` — that is where a noun belongs.
+  logger.info("document.layer.gated", {
     state: documentLayerState(),
     flag: DOCUMENTS_FLAG_ENV,
     consequence: documentsEnabled()
@@ -85,9 +89,21 @@ export function wireDocumentGate(
     // live-fleet report behind it — a counterparty pasted the bytes back — and the comment at that
     // fork used to claim an unwired hook "cannot change the conversation path". It can, and did.
     //
-    // So the classifier stays installed and a document frame is CONSUMED and REFUSED. Loud in the log
-    // because the refusal is otherwise invisible, and answered on the wire by the frame router's own
-    // refusal path rather than by silence.
+    // So the classifier stays installed and a document frame is CONSUMED and REFUSED.
+    //
+    // ⚠️ THE REFUSAL IS LOCAL, AND THIS COMMENT USED TO CLAIM OTHERWISE — it said the frame was
+    // "answered on the wire by the frame router's own refusal path rather than by silence", and that is
+    // false twice over: with documents off the router does not exist, and `session-content-ingest.ts`
+    // deliberately stopped reading a hook's `ok`/`reason` fields at all (a verdict is not knowable at
+    // that point in the flow). Nothing is sent to the peer. Rewritten rather than deleted, per the
+    // claim-truth rule: the sentence is the evidence that someone believed the peer was told.
+    //
+    // **What that costs the counterparty, stated because the log line does not reach them.** Their own
+    // reconcile sweep keeps retrying on its own bound, and from their side "documents disabled" is
+    // indistinguishable from "unreachable" — the order's own 321-refusals-in-85-minutes pathology,
+    // relocated to the other side. Accepted for alpha and disclosed in the order rather than described
+    // as a refusal the peer receives; closing it needs a wire reason code, which is a protocol change
+    // this order explicitly does not make.
     sessionNodeManager.setOnDocumentFrame(
       (agentName, sessionId, _content, senderPubkey, correlationId) => {
         logger.warn("document.frame.refused", {

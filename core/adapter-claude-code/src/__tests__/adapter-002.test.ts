@@ -189,6 +189,23 @@ describe("AC-008: SKILL.md references M1 tools and not M0-removed tools", () => 
    *
    * Driven off the vocabulary instead of a sample, so a new tool fails this until it is documented.
    */
+  /**
+   * ⚠️ 074-DOCSFLAG — THIS RATCHET NOW PINS THE SHIPPED DOCUMENT PROSE IN PLACE. Read before changing
+   * `SKILL.md`.
+   *
+   * The document layer is gated off by default, so `DUAL_SURFACE_VERBS` carries its fourteen rows only
+   * when `CELLO_DOCUMENTS` is set — and the suite sets it (`vitest.config.ts`), deliberately, so every
+   * existing document test runs against the layer it was written for. The consequence here is that this
+   * assertion REQUIRES `SKILL.md` to keep naming all fourteen document tools.
+   *
+   * That is correct today and it is a trap tomorrow. `SKILL.md` ships inside the connect tarball and is
+   * read by an agent to learn what it can call, so with the gate closed it describes fourteen tools the
+   * agent will not find — recorded as a finding on 074-DOCSFLAG and ruled POST-LAUNCH, because the
+   * damaging reader was the tool list and that is now empty. **Whoever gates or removes that prose must
+   * change this test in the same commit**, splitting it into an always-on half and a flag-conditional
+   * document half. It is deliberately NOT split in advance: doing so would weaken a live guard for a
+   * fix nobody has scheduled, and the replacement wording is Andre's call, not a coder's.
+   */
   it("documents EVERY dual-surface tool — no sampling", async () => {
     const content = await readFile(join(__dirname, "../../SKILL.md"), "utf-8");
     const undocumented = DUAL_SURFACE_VERBS.map((v) => v.mcp).filter((m) => !content.includes(m));
