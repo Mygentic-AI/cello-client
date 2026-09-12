@@ -31,7 +31,9 @@
  * The refusal is LOCAL. The peer is told nothing on the wire: `session-content-ingest.ts` deliberately
  * stopped reading the hook's `ok`/`reason` fields (a verdict is not knowable at that point in the
  * flow), so they are discarded here too. The counterparty's own reconcile sweep therefore keeps
- * retrying on its own bound, and from its side "documents disabled" is indistinguishable from
+ * re-attempting at its sweep INTERVAL indefinitely — with no backoff at all, because the backoff is
+ * refusal-driven (`onPeerRefusal` → `noteRefusal`) and fires only on a refusal that arrives on the wire,
+ * and we send none. From its side "documents disabled" is indistinguishable from
  * "unreachable". That is the order's own 321-refusals-in-85-minutes pathology relocated to the other
  * side, and it is disclosed in the order rather than described as a refusal the peer receives.
  */

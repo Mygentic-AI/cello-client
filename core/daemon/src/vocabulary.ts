@@ -144,8 +144,13 @@ const DOCUMENT_VERBS: readonly DualSurfaceVerb[] = [
  * the audit cannot tell it from a typo'd one. `vocabulary.ts` is the one file that audit excludes,
  * because defining names is its job.
  *
- * Answers by NAME, not by membership of `DOCUMENT_VERBS` — the caller asks precisely when the gate is
- * closed and that list is therefore not in `DUAL_SURFACE_VERBS`.
+ * ⚠️ THIS SENTENCE USED TO SAY *"answers by NAME, not by membership of `DOCUMENT_VERBS`"* AND THE BODY
+ * BELOW IS EXACTLY MEMBERSHIP OF `DOCUMENT_VERBS`. It meant `DUAL_SURFACE_VERBS`, and it shipped inside
+ * the commit whose whole subject was comments asserting what the code does not do. Rewritten rather than
+ * deleted, because a wrong comment in that commit is the evidence that the habit survives being named.
+ *
+ * What it actually does: answers from `DOCUMENT_VERBS` directly, never from `DUAL_SURFACE_VERBS`. The
+ * caller asks precisely when the gate is closed, and the document rows are not in that table then.
  */
 export function isDocumentVerbName(method: string): boolean {
   return DOCUMENT_VERBS.some((v) => v.mcp === method);

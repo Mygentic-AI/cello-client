@@ -98,10 +98,13 @@ export function wireDocumentGate(
     // that point in the flow). Nothing is sent to the peer. Rewritten rather than deleted, per the
     // claim-truth rule: the sentence is the evidence that someone believed the peer was told.
     //
-    // **What that costs the counterparty, stated because the log line does not reach them.** Their own
-    // reconcile sweep keeps retrying on its own bound, and from their side "documents disabled" is
-    // indistinguishable from "unreachable" — the order's own 321-refusals-in-85-minutes pathology,
-    // relocated to the other side. Accepted for alpha and disclosed in the order rather than described
+    // **What that costs the counterparty, stated because the log line does not reach them, and
+    // corrected once already for overstating their bound.** Their reconcile sweep re-attempts at its
+    // sweep INTERVAL, indefinitely, with no backoff at all: the backoff is refusal-driven
+    // (`onPeerRefusal` → `noteRefusal`) and fires only on a refusal that arrives on the wire. We send
+    // none, so nothing ever engages it. From their side "documents disabled" is indistinguishable from
+    // "unreachable" — the order's own 321-refusals-in-85-minutes pathology, relocated to the other
+    // side and with its brake disconnected. Accepted for alpha and disclosed in the order rather than described
     // as a refusal the peer receives; closing it needs a wire reason code, which is a protocol change
     // this order explicitly does not make.
     sessionNodeManager.setOnDocumentFrame(

@@ -33,7 +33,7 @@ import { chmod, stat, unlink } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import type { Logger, IpcRequest, IpcResponse, IpcNotification } from "./types.js";
 import { extractErrorMessage } from "./error-message.js";
-import { documentsEnabled, DOCUMENTS_FLAG_ENV } from "./document-flag.js";
+import { DOCUMENTS_FLAG_ENV } from "./document-flag.js";
 import { isDocumentVerbName } from "./vocabulary.js";
 
 /** Everything the server needs of a handler map: resolve a method name when a request arrives. */
@@ -244,7 +244,14 @@ export function createIpcServer(
        */
       // Asked of the vocabulary rather than matched against a prefix here: a bare `cello_doc_`
       // literal in this file is a dead tool name to the source audit, and it is right to say so.
-      const gatedDocumentVerb = isDocumentVerbName(request.method) && !documentsEnabled();
+      //
+      // ⚠️ NO `!documentsEnabled()` HERE, AND IT USED TO BE — review found it adds nothing and can only
+      // be wrong. Reaching this branch means the handler map has no entry for the method; when documents
+      // are ON all fourteen are registered, so a MISS on a document verb can only mean the gate was
+      // closed when that map was built. Worse, the map is built once at boot while an env read is live,
+      // so a process whose environment gains the flag afterwards would answer a genuinely gated verb
+      // with the version-skew guidance again — the exact defect this branch exists to remove.
+      const gatedDocumentVerb = isDocumentVerbName(request.method);
       const errorResp: IpcResponse = {
         id: request.id,
         error: {
