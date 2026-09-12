@@ -218,7 +218,13 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // whole job is to decide whether the document layer is constructed, so a version of it that is
     // never called leaves fourteen IPC verbs registered and a 120-second timer running — the exact
     // state the order exists to end — with nothing failing and nothing looking different.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(100);
+    //
+    // 100 → 101 for 070-CARRIEDSEAL's `buildLocalSealTerminus` (seal-local-terminus.ts), and this
+    // guard caught it on the first full run. Unwired it is silent in the way this corpus is for:
+    // the closing leaf simply never gets written, every close with a dead relay fails exactly as it
+    // did before, and the only symptom is a receipt that does not appear — which is
+    // indistinguishable from the bug the module was written to remove.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(101);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",
