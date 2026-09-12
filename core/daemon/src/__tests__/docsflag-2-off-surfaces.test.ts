@@ -200,6 +200,26 @@ describe("074-DOCSFLAG clauses 2/5/6/9 — the daemon's three document surfaces,
    * The only statement of the truth was a `document.layer.gated` line written at boot, possibly days
    * earlier.
    */
+  /**
+   * ⚠️ WHAT THIS GREEN DOES NOT PROVE, MEASURED RATHER THAN ASSUMED.
+   *
+   * `isDocumentVerbName` decides whether this branch fires, and it reads `DOCUMENT_VERBS` — the list
+   * that exists whatever the flag says — precisely because the caller asks in the state where the
+   * document rows are NOT in `DUAL_SURFACE_VERBS`. Mutating it to read `DUAL_SURFACE_VERBS` instead is
+   * a real production defect: a fresh daemon process has the variable absent at module load, so the
+   * surface table has no document rows and every gated verb falls back to the version-skew guidance.
+   *
+   * **That mutation leaves THIS FILE green, and the reason is module load order.** The suite runs with
+   * `CELLO_DOCUMENTS=1` (`vitest.config.ts`); `vocabulary.ts` is evaluated when this file's imports
+   * resolve, which is before any `start("off")` deletes the variable. So in THIS process the surface
+   * table has all fourteen rows no matter which state the daemon under test is in, and the mutated
+   * predicate answers correctly by accident.
+   *
+   * The mutation IS caught — in `docsflag-1-flag.test.ts`, which is the only file here that controls
+   * module load (`vi.resetModules()` after setting the variable) and therefore the only place the
+   * closed-gate shape of the vocabulary can be observed. Recorded here so nobody reads this green as
+   * covering the predicate.
+   */
   it("OFF: a gated doc verb is refused by ITS OWN CAUSE, not by generic version-skew guidance", async () => {
     await start("off");
     const client = await connect(join(tempDir, "daemon.sock"));

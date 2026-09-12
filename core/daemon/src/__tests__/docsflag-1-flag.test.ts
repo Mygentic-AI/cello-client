@@ -6,7 +6,7 @@
  * that look affirmative to a human and are not on the affirmative list, because that is the branch
  * where a default-tight parser earns its keep.
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { documentsEnabled, documentLayerState, DOCUMENTS_FLAG_ENV } from "../document-flag.js";
 
 describe("074-DOCSFLAG clause 1 — the flag", () => {
@@ -38,6 +38,34 @@ describe("074-DOCSFLAG clause 1 — the flag", () => {
       expect(documentLayerState({ [DOCUMENTS_FLAG_ENV]: raw })).toBe("off");
     },
   );
+
+  /**
+   * `isDocumentVerbName` is load-bearing for the gated-verb refusal, and it has to answer correctly in
+   * exactly the state where the document verbs are NOT in `DUAL_SURFACE_VERBS` — that is the only state
+   * the caller asks in. So it reads `DOCUMENT_VERBS`, which is populated regardless of the flag.
+   */
+  it("a document verb is recognised BY NAME even with the gate closed, which is when it is asked", async () => {
+    const saved = process.env[DOCUMENTS_FLAG_ENV];
+    try {
+      delete process.env[DOCUMENTS_FLAG_ENV];
+      vi.resetModules();
+      const { isDocumentVerbName, DUAL_SURFACE_VERBS } = await import("../vocabulary.js");
+      // The precondition the predicate has to survive: the rows are gone from the surface table.
+      expect(DUAL_SURFACE_VERBS.filter((v) => v.mcp.startsWith("cello_doc_"))).toEqual([]);
+      // And it still knows them.
+      expect(isDocumentVerbName("cello_doc_propose")).toBe(true);
+      expect(isDocumentVerbName("cello_doc_kill")).toBe(true);
+      // Exemplars from the PREDICATE, not from intent: it matches an exact name, so the values that
+      // must be false are a real non-document verb, the bare prefix, and a plausible near-miss.
+      expect(isDocumentVerbName("cello_send")).toBe(false);
+      expect(isDocumentVerbName("cello_doc_")).toBe(false);
+      expect(isDocumentVerbName("cello_doc_propose_v2")).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env[DOCUMENTS_FLAG_ENV];
+      else process.env[DOCUMENTS_FLAG_ENV] = saved;
+      vi.resetModules();
+    }
+  });
 
   it("reads the real process environment when given nothing, so production has no second path", () => {
     const saved = process.env[DOCUMENTS_FLAG_ENV];
