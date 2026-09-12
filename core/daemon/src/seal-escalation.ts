@@ -283,6 +283,25 @@ export async function escalateToUnilateralSeal(
           "The counterparty is online right now, so a solo seal is refused — it would record them ABSENT on a permanent receipt, which would be false. Nothing is wrong and nothing is lost. Close the conversation together and the seal completes BILATERALLY, which is the stronger receipt anyway. If they do go offline, retry cello_close_session then.",
       };
     }
+    if (uniResult.cause === "already_sealed") {
+      /**
+       * NOT A FAILURE, AND IT MUST NOT READ AS ONE — 070-CARRIEDSEAL.
+       *
+       * This side asked for a receipt and one already exists. Before the directory named this, the
+       * answer was silence for thirty seconds and then `seal_unilateral_timeout`: our own wait,
+       * reported as the fault, for a conversation that was properly sealed.
+       *
+       * It is the ORDINARY case with the relay gone. Nothing triggers a bilateral ceremony, so both
+       * parties close over their own carried evidence and whoever arrives second lands here every
+       * time. The receipt they want is already being delivered to them as the absent party.
+       */
+      return {
+        ok: false,
+        reason: "seal_already_sealed",
+        guidance:
+          "This conversation already has a receipt — a solo seal was notarized for it, and one session gets one. Nothing is wrong and nothing was lost. Read it with cello_sealed_receipt; it is delivered to both parties, so it will appear on this side even though the other party requested it. Do NOT force-abandon: that would forfeit a receipt you already have.",
+      };
+    }
     if (uniResult.cause === "high_stakes_evidence_required") {
       return {
         ok: false,

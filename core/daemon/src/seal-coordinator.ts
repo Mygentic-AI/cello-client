@@ -183,7 +183,12 @@ function keepCertifiedLeafSet(
  * will ever help is different in each, and telling someone to wait out a grace window that expired
  * two hours ago is worse than saying nothing.
  */
-export type UnilateralRefusalCause = "too_early" | "counterparty_present" | "high_stakes_evidence_required";
+/**
+ * 070-CARRIEDSEAL adds `already_sealed`: this session HAS a solo receipt, so the asker is late by an
+ * event rather than early by a clock. Ordinary rather than rare once a relay can be gone — with no
+ * relay there is no bilateral ceremony, so both parties close alone and the second one lands on it.
+ */
+export type UnilateralRefusalCause = "too_early" | "counterparty_present" | "high_stakes_evidence_required" | "already_sealed";
 
 /**
  * Stamp the receipt with WHERE THE MUTUALLY-SIGNED PREFIX ENDS, derived locally —
@@ -622,7 +627,8 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
          */
         const rawCause = frame["cause"];
         const cause: UnilateralRefusalCause | undefined =
-          rawCause === "too_early" || rawCause === "counterparty_present" || rawCause === "high_stakes_evidence_required"
+          rawCause === "too_early" || rawCause === "counterparty_present" ||
+          rawCause === "high_stakes_evidence_required" || rawCause === "already_sealed"
             ? rawCause
             : undefined;
         waiter({

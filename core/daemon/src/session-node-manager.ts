@@ -466,7 +466,18 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
   async signOwnEphemeralForTest(agentName: string, sessionId: string): Promise<{ ephemeralPublic: Uint8Array; signature: Uint8Array } | null> { return this.#ephemerals.signOwnEphemeralForTest(agentName, sessionId); }
   async handleEphemeralFrameForTest(agentName: string, sessionId: string, frame: { ephemeralPublic?: Uint8Array; signature?: Uint8Array }, correlationId = "test"): Promise<void> { return this.#ephemerals.handleEphemeralFrameForTest(agentName, sessionId, frame, correlationId); }
 
-  /** ─── DELEGATORS — the refusal-notice API other files call, unchanged by the split ────────── */
+  /**
+   * ─── DELEGATORS — the refusal-notice API other files call, unchanged by the split ──────────
+   *
+   * ⚠️ **REFUSALS LOGGED AND FILED NOTHING, AND THAT IS WHY THIS API EXISTS.** The encryption gate's
+   * three causes each carried a good `impact` and `guidance` at ERROR and none of them called
+   * `noteContentRefusal`, so the sentences an operator needed were in a file they have no reason to
+   * open. From their chair a message never arrived and the conversation went quiet — the exact defect
+   * `DOD-M15-NO-SILENT-REFUSAL-1` was built to end, three checks above the one that respected it.
+   *
+   * Both surfaces, always: the ERROR is the durable forensic record an investigation reads days
+   * later, and the notice is the control — the thing that actually reaches the person.
+   */
   noteContentRefusal(agentName: string, sessionId: string, reason: string, detail: { kind: RefusalKind; impact: string; guidance: string }): void { return this.#notices.noteContentRefusal(agentName, sessionId, reason, detail); }
   takeContentRefusals(agentName: string, sessionId: string, consumerId: string): Array<Omit<RefusalNotice, "sessionId">> { return this.#notices.takeContentRefusals(agentName, sessionId, consumerId); }
   dismissContentRefusals(agentName: string, sessionId: string): number { return this.#notices.dismissContentRefusals(agentName, sessionId); }
@@ -1379,6 +1390,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       getSessionTree: (a, sid) => this.getSessionTree(a, sid),
       getSessionTreeRootHex: (a, sid) => this.getSessionTreeRootHex(a, sid),
       getDirectoryOnlineToken: (a) => this.getDirectoryOnlineToken(a),
+      getKeyProvider: (a) => this.#keyProviderResolver?.(a),
       destroySessionSeed: (a, sid) => this.#life.destroySessionSeed(a, sid),
       updateSessionStatus: (a, sid, status, by) => this.#life.updateSessionStatus(a, sid, status, by),
     });
@@ -3171,18 +3183,6 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       ?? undefined;
   }
 
-  /**
-   * An inbound content frame refused before it could be read — the ENCRYPTION gate's three causes.
-   *
-   * ⚠️ **THESE LOGGED AND FILED NOTHING, AND THAT IS WHY THIS EXISTS.** All three carried a good
-   * `impact` and `guidance` at ERROR and none of them called `noteContentRefusal`, so the sentences
-   * an operator needed were in a file they have no reason to open. From their chair a message never
-   * arrived and the conversation went quiet — the exact defect `DOD-M15-NO-SILENT-REFUSAL-1` was
-   * built to end, on the same path, three checks above the one that respected it.
-   *
-   * Both surfaces, always: the ERROR is the durable forensic record an investigation reads days
-   * later, and the notice is the control — the thing that actually reaches the person.
-   */
   /**
    * Can a refused message still reach this operator through the relay mailbox? — review F2.
    *

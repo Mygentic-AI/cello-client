@@ -1147,10 +1147,35 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         // tunes how long to wait for the counterparty before escalating to a unilateral seal.
         // DOD-SEAL-BILATERAL-TIMEOUT-1: default is 660 s (11 min) — deliberately just over
         // the directory's deliveryGraceSeconds default (600 s / 10 min), so the bilateral
-        // timeout always expires AFTER the grace window. This makes seal_unilateral_too_early
-        // structurally unreachable under normal configuration; override via the env var for
-        // tests or operators who need a shorter window.
-        const bilateralTimeoutMs = Number(process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"]) || 660_000;
+        // timeout always expires AFTER the grace window; override via the env var for tests or
+        // operators who need a shorter window.
+        //
+        // ⚠️ THIS USED TO SAY seal_unilateral_too_early WAS "STRUCTURALLY UNREACHABLE", AND
+        // 070-CARRIEDSEAL MADE THAT FALSE. Rewritten rather than deleted, because a reader who
+        // believed it would be surprised by the refusal and go looking for a bug. The zero below
+        // skips the window entirely, so a session closed with no relay AND less than the grace
+        // period of age now reaches that refusal — which is correct (the directory's floor is a
+        // real floor) and is loud, with its own guidance. It is no longer unreachable; it is
+        // reachable exactly when there was never a ceremony to wait out.
+        /**
+         * ⚠️ 070-CARRIEDSEAL — THERE IS NOTHING TO WAIT FOR WHEN NO RELAY TOOK THE LEAF.
+         *
+         * A bilateral seal is a ceremony the RELAY runs: it watches its own leaf log for both
+         * parties' control leaves and drives the directory itself. If no relay answered, our leaf
+         * is not in any relay's log, the counterparty's closing leaf can never reach us, and the
+         * ceremony cannot begin — so the eleven-minute window is eleven minutes of an operator
+         * watching nothing happen before the solo seal that was always the only available outcome.
+         *
+         * It is also the last live-relay requirement on the close path. The evidence stopped needing
+         * the relay when the leaf was signed here; the WAIT still assumed one, and a wait for
+         * something that cannot happen is a dependency wearing a stopwatch.
+         *
+         * Zero, not "shorter": this is not a tuning judgement about how long a counterparty might
+         * take. It is the absence of a counterparty channel.
+         */
+        const bilateralTimeoutMs = submit.viaLocalTerminus === true
+          ? 0
+          : Number(process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"]) || 660_000;
         // DOD-M12B-CLOSE-SILENT-WAIT-1: SAY SO BEFORE THE SILENCE, not after it.
         //
         // This call is about to block for up to eleven minutes and return nothing. Measured
@@ -1161,7 +1186,9 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         // long this can legitimately take, and what forcing costs.
         logger.warn("session.seal.awaiting_counterparty", {
           sessionId, agentName: record.agent_name, deadlineMs: bilateralTimeoutMs, correlationId,
-          impact: `the seal is waiting for the counterparty for up to ${Math.round(bilateralTimeoutMs / 60_000)} minutes, then escalates to a unilateral seal and produces a real receipt. It is working. Do NOT force-abandon it — that forfeits the receipt this wait is earning.`,
+          impact: bilateralTimeoutMs === 0
+            ? "no relay took this side's closing leaf, so no bilateral ceremony can begin and there is nothing to wait for. The seal goes straight to the solo path over the evidence this side already holds, and produces a real receipt. Do NOT force-abandon it — that forfeits the receipt."
+            : `the seal is waiting for the counterparty for up to ${Math.round(bilateralTimeoutMs / 60_000)} minutes, then escalates to a unilateral seal and produces a real receipt. It is working. Do NOT force-abandon it — that forfeits the receipt this wait is earning.`,
         });
 
         /**
