@@ -20,6 +20,7 @@ import { renderFrontierMismatch, type FrontierMismatchStore } from "./frontier-m
 import { describeSealFailed, type SealFailure } from "./seal-failure-store.js";
 import { contentEncryptionGuidanceFor } from "./content-encryption-status.js";
 import { frameQuarantinedPayload } from "./quarantine-framing.js";
+import { readDeliveryFacts } from "./session-delivery-acks.js";
 
 export interface SessionReadDeps {
   /** DOD-FRONTIER-STRAND-1 AC3: retained mismatches, surfaced on the session LIST (the AC's surface). */
@@ -81,6 +82,63 @@ export interface SessionReadDeps {
     agentName: string,
     sessionIdHex: string,
   ) => Promise<{ ok: boolean; reason?: string; verified?: boolean }>;
+}
+
+/**
+ * DOD-M15-DELIVERYACK-1 — THREE FACTS PER SENT MESSAGE, AND NOT ONE WORD OF INFERENCE.
+ *
+ * A receipt that cannot distinguish *"they did not answer"* from *"it never reached them"* is not
+ * evidence, which is why these are three SEPARATE facts rather than a status: **ordered** (the relay
+ * assigned it a position), **delivered** (the relay handed the bytes over) and **acknowledged** (the
+ * recipient's own signature). Each is present or absent on its own.
+ *
+ * 🚨 A MISSING FACT IS REPORTED AS MISSING AND NOTHING MORE. There is no combined status here, no
+ * derived verdict, no count of absences, and no wording that reads as fault — because there are
+ * many blameless reasons a fact is absent: the relay parked the content and never delivered it, the
+ * recipient's daemon died between ordering and pull, their per-recipient queue hit its bound and
+ * dropped the oldest frame, the screener refused it, or it was quarantined on arrival. `note` says
+ * so in the payload rather than in prose a caller may never surface.
+ *
+ * 🚨 AND THIS IS NOT ASSENT. An acknowledgement says a machine received bytes, signed on ingest,
+ * before any human read them. `legibility.implies_assent` stays the literal `false` and this
+ * section adds nothing to it.
+ *
+ * ⚠️ IT IS NOT PART OF THE DIRECTORY-SIGNED `legibility`, DELIBERATELY. The legibility object's
+ * canonical bytes are folded into the FROST-signed seal, and the directory never sees an
+ * acknowledgement — putting these there would have the directory signing a per-message claim
+ * supplied by one of the two parties, which proves nothing about it. `asserted_by` names who stands
+ * behind each fact instead, and the acknowledgement carries the signature itself so a reader can
+ * check it against the counterparty's key rather than taking this daemon's word.
+ */
+function deliverySection(
+  sessionNodeManager: SessionReadDeps["sessionNodeManager"],
+  logger: Logger,
+  agentName: string,
+  sessionId: string,
+): { delivery: unknown } {
+  // Read through the manager's own public boundary accessors — the stable agent id and the database
+  // handle — rather than a new delegator. The facts are a pure read over three tables; routing them
+  // through the manager would add surface to a file whose size ratchet exists to stop exactly that.
+  const messages = readDeliveryFacts(
+    sessionNodeManager.getDb(),
+    logger,
+    sessionNodeManager.resolveAgentId(agentName),
+    sessionId,
+  );
+  return {
+    delivery: {
+      messages,
+      note:
+        "Three independent facts per message you SENT. `ordered` is the relay's countersigned " +
+        "position. `delivered` is the relay confirming it handed the bytes over — this side holds " +
+        "no such evidence for any message today, because a relay answers the recipient on pickup " +
+        "and never tells the depositor, so it reads null throughout. `acknowledged` is the " +
+        "recipient's own signature over this session id and this content hash, which you can check " +
+        "against their public key. A null is an ABSENCE OF EVIDENCE, never a finding: a message " +
+        "with no acknowledgement may well have been delivered and read, and the acknowledgement " +
+        "lost with the connection. Nothing here implies agreement to anything.",
+    },
+  };
 }
 
 export function registerSessionReadHandlers(deps: SessionReadDeps): void {
@@ -160,6 +218,7 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
         leaf_count: leaves.length,
         content_leaf_count: leaves.filter((l) => l.kind === "msg").length,
         legibility: cert.legibility,
+        ...deliverySection(sessionNodeManager, logger, agentName, sessionId),
       };
     }
     // M8C-INBOX-1 (F4): the single `sealed_receipt_not_found` conflated four distinct causes, so a
@@ -203,6 +262,7 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
               leaf_count: recoveredLeaves.length,
               content_leaf_count: recoveredLeaves.filter((l) => l.kind === "msg").length,
               legibility: recovered.legibility,
+              ...deliverySection(sessionNodeManager, logger, agentName, sessionId),
               verified: pulled.verified === true,
               ...(pulled.verified === true
                 ? {}

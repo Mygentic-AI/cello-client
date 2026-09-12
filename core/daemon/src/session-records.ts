@@ -21,6 +21,7 @@ import { MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
 import { type TranscriptEntry, UNREAD_RECEIVED_WHERE, TERMINAL_STATUSES } from "./session-node-types.js";
 import { quarantineRedaction } from "./quarantine-framing.js";
 import { extractErrorMessage } from "./error-message.js";
+import { storeDeliveryAck } from "./session-delivery-acks.js";
 
 /** What this module needs from the manager, stated explicitly rather than handed `this`. */
 export interface SessionRecordsContext {
@@ -608,6 +609,51 @@ export class SessionRecords {
       return false;
     }
   }
+  /**
+   * DOD-M15-DELIVERYACK-1 — keep the counterparty's signature that their machine received a message.
+   *
+   * A thin forward, because this class is what holds the database handle and the write itself
+   * belongs beside the read and the five rules in `session-delivery-acks.ts`. Called ONLY after
+   * `verifyDeliveryAck` succeeded against the session's recorded counterparty key.
+   */
+  recordDeliveryAck(
+    agentName: string,
+    sessionId: string,
+    contentHashHex: string,
+    signerPubkeyHex: string,
+    signature: Uint8Array,
+    correlationId?: string,
+  ): boolean {
+    if (!this.#db) return false;
+    return storeDeliveryAck(this.#db, this.#ctx.logger, {
+      agentId: this.#ctx.requireAgentId(agentName),
+      agentName, sessionId, contentHashHex, signerPubkeyHex, signature, correlationId,
+    });
+  }
+
+  /**
+   * DOD-M15-DELIVERYACK-1 rule 2 — did this side put these exact bytes on the wire in this session?
+   *
+   * The DURABLE half of the bind. A sent-direction transcript row joined to its leaf is written by
+   * our own send path and survives both the time-to-fallback timer and a daemon restart, which is
+   * what lets an acknowledgement for a message that had to be parked and recovered still count.
+   * Nothing a counterparty sends can create a row here.
+   */
+  hasSentContentHash(agentName: string, sessionId: string, contentHashHex: string): boolean {
+    if (!this.#db) return false;
+    const row = this.#db
+      .prepare(
+        `SELECT 1 AS present
+           FROM session_tree_leaves l
+           JOIN transcript t
+             ON t.agent_id = l.agent_id AND t.session_id = l.session_id AND t.sequence = l.leaf_index
+          WHERE l.agent_id = ? AND l.session_id = ? AND l.leaf_hash_hex = ? AND t.direction = 'sent'
+          LIMIT 1`,
+      )
+      .get(this.#ctx.requireAgentId(agentName), sessionId, contentHashHex);
+    return row !== undefined;
+  }
+
   /**
    * DOD-LOG-1: read a session's durable transcript back (after a restart), decrypted and ordered by
    * canonical sequence then direction. A blob that fails to decrypt (tamper/wrong key) is skipped

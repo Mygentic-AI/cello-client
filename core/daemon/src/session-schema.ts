@@ -481,6 +481,37 @@ export function ensureSessionSchema(
     sql: "ALTER TABLE transcript ADD COLUMN quarantine_reason TEXT",
   });
 
+  /**
+   * DOD-M15-DELIVERYACK-1 — the counterparty's SIGNATURE saying their machine received a message.
+   *
+   * One row per (agent, session, content hash), written only after the signature verified against
+   * the session's RECORDED counterparty key. `INSERT OR IGNORE` on that key is the idempotence: a
+   * replayed acknowledgement changes nothing, and the first one recorded stands.
+   *
+   * ⚠️ THIS IS NOT A CHAIN LEAF AND MUST NEVER BECOME ONE. Machine traffic does not enter the
+   * tamper-evident record — an acknowledgement in the tree would double the length of every
+   * conversation and make the daemon a participant in it. Nothing in the seal, the Merkle tree, the
+   * transcript or `last_seen_seq` reads this table; it is read by the receipt surface only.
+   *
+   * ⚠️ AND ITS ABSENCE MEANS NOTHING. A message with no row here was very possibly delivered and
+   * read: the acknowledgement may have been lost with the connection, the counterparty's daemon may
+   * have had no identity key to sign with, or their build may predate this. Any surface that reads
+   * a missing row as evasion — a score, a status, a counter that reads as fault — is a defect.
+   *
+   * Keyed on agent_id, never agent_name: agent_name is a mutable display label.
+   */
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS delivery_acks (
+      agent_id         TEXT    NOT NULL,
+      session_id       TEXT    NOT NULL,
+      content_hash_hex TEXT    NOT NULL,
+      signer_pubkey    TEXT    NOT NULL,
+      signature        BLOB    NOT NULL,
+      recorded_at      INTEGER NOT NULL,
+      PRIMARY KEY (agent_id, session_id, content_hash_hex)
+    )
+  `);
+
   // M8C-INBOX-1 (N2): per-agent, per-session read watermark. `last_delivered_seq` is the highest
   // RECEIVED transcript sequence the operator has been shown via cello_receive (delivery marks
   // read — no ack verb). Unread = received transcript rows with sequence > last_delivered_seq.
