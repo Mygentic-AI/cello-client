@@ -77,6 +77,7 @@ import { SessionSeal } from "./session-seal.js";
 import { SessionRelay } from "./session-relay.js";
 import { SessionLifecycle } from "./session-lifecycle.js";
 import type { SessionContentPipelineContext } from "./session-content-context.js";
+import { sendDeliveryAck } from "./session-delivery-acks.js";
 import { SESSION_CLOSED_REASON, sessionClosedState } from "./session-closed.js";
 import { StandingReceivers } from "./standing-receivers.js";
 import { RelayReceiptStore } from "./relay-receipt-store.js";
@@ -549,7 +550,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
   setContentParkHook(fn: (args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; structure1Signature?: Uint8Array; leafKind?: number; contentHashAlg: string | undefined }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string; retryAfterMs?: number }>): void { return this.#park.setContentParkHook(fn); }
   setParkedDrainHook(fn: (agentName: string, reason: ParkedDrainReason) => void): void { return this.#park.setParkedDrainHook(fn); }
   recoverOwnSealCtrlLeafForTest(agentName: string, sessionId: string): { reportedRootHex: string; sequenceNumber: number } | "none" | "unknown" { return this.#park.recoverOwnSealCtrlLeafForTest(agentName, sessionId); }
-  async recoverParkedEntry(agentName: string, sessionId: string, recipientPubkey: Uint8Array, unsealed: Uint8Array, contentHash: Uint8Array, correlationId?: string): Promise< | { ok: true; leafIndex: number; sequenceNumber: number; held?: boolean; appendedCount?: number; screenedOut?: boolean } | { ok: false; reason: string; retained?: boolean } > { return this.#park.recoverParkedEntry(agentName, sessionId, recipientPubkey, unsealed, contentHash, correlationId); }
+  async recoverParkedEntry(agentName: string, sessionId: string, recipientPubkey: Uint8Array, unsealed: Uint8Array, contentHash: Uint8Array, correlationId?: string): ReturnType<ParkRecovery["recoverParkedEntry"]> { return this.#park.recoverParkedEntry(agentName, sessionId, recipientPubkey, unsealed, contentHash, correlationId); }
 
   /**
    * ─── DELEGATORS — the class API is unchanged by the split, deliberately ──────────────────────
@@ -1100,6 +1101,8 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       ingestReceivedContent: (a, sid, c, h, cid, seq, alg) => this.ingestReceivedContent(a, sid, c, h, cid, seq, alg),
       witnessReceivedLeaf: (a, sid, h, s1, sig, kind, cid) => this.#contentIn.witnessReceivedLeaf(a, sid, h, s1, sig, kind, cid),
       noteAcknowledgeable: (a, sid, seq, h) => this.#contentIn.noteAcknowledgeable(a, sid, seq, h),
+      sendDeliveryAck: (a, sid, h, cid) => { void sendDeliveryAck(contentCtx, a, sid, h, cid); },
+      persistedRelayEndpoint: (a, sid) => this.#queries.getPersistedRelayEndpoint(a, sid),
     }, opts.parkedDrainBackstopMs ?? PARKED_DRAIN_BACKSTOP_DEFAULT_MS);
 
     this.#salts = new SessionSalts({

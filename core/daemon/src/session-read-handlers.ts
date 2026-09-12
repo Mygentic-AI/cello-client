@@ -136,7 +136,13 @@ function deliverySection(
         "recipient's own signature over this session id and this content hash, which you can check " +
         "against their public key. A null is an ABSENCE OF EVIDENCE, never a finding: a message " +
         "with no acknowledgement may well have been delivered and read, and the acknowledgement " +
-        "lost with the connection. Nothing here implies agreement to anything.",
+        "lost with the connection. Nothing here implies agreement to anything.\n\n" +
+        "`acknowledged` is NOT `legibility.final_message.answered` and neither can stand in for the " +
+        "other. `answered` says the other party AUTHORED something after your last message. " +
+        "`acknowledged` says their MACHINE took delivery of it, signed before any human read it. " +
+        "The combination that carries the most meaning is the one they cannot express separately: " +
+        "answered false AND acknowledged present — it reached them and they did not reply. Neither " +
+        "is agreement.",
     },
   };
 }

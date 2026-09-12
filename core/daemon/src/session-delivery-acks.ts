@@ -16,6 +16,7 @@ import type { Stream } from "@libp2p/interface";
 import { signDeliveryAck, verifyDeliveryAck } from "@cello-protocol/crypto";
 import { encodeCbor } from "@cello-protocol/protocol-types";
 import type { SessionContentPipelineContext } from "./session-content-context.js";
+import { encodeParkedDeliveryAck, parkedDeliveryAckMailboxHash, type ParkedDeliveryAck } from "./park-envelope.js";
 import { CELLO_CONTENT_PROTOCOL_ID } from "@cello-protocol/transport";
 import { extractErrorMessage } from "./error-message.js";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
@@ -77,19 +78,6 @@ export async function sendDeliveryAck(
   correlationId?: string,
 ): Promise<void> {
   const entry = ctx.activeNodes.get(ctx.sessionKey(agentName, sessionId));
-  if (!entry) {
-    // NOT a silent return. No ACK is exactly this milestone's symptom — the sender's TTF expires
-    // and the message parks — so the one case where we knowingly decline to send one has to say
-    // so, or it is indistinguishable from the defect.
-    ctx.logger.debug("content.delivery.ack.skipped", {
-      agentName,
-      sessionId,
-      contentHash: Buffer.from(contentHash).toString("hex"),
-      reason: "session_node_gone",
-      correlationId,
-    });
-    return;
-  }
   /**
    * SIGN BEFORE THE STREAM IS OPENED — an unsignable acknowledgement must not be sent at all.
    *
@@ -141,6 +129,19 @@ export async function sendDeliveryAck(
   // Assigned IMMEDIATELY after newStream: anything between the two is a window where a throw
   // leaks the stream because the catch cannot see it.
   let ackStream: Stream | undefined;
+  /**
+   * ⚠️ NO LIVE SESSION NODE IS THE OFFLINE CASE, NOT A REASON TO GIVE UP — and this branch used to
+   * be a bare early return logged as `session_node_gone`.
+   *
+   * Measured on the live journey: a message recovered from the relay mailbox is ingested when the
+   * SENDER is down, so there is no session node and no stream to write to. The acknowledgement was
+   * abandoned right here — which meant the messages that had to be parked, the ones a sender most
+   * needs evidence about, came back reading as never acknowledged. Straight to the mailbox instead.
+   */
+  if (!entry) {
+    await parkDeliveryAck(ctx, agentName, sessionId, contentHash, ackSig, correlationId, "no_live_session_node");
+    return;
+  }
   try {
     const stream = await entry.node.newStream(entry.counterpartySessionPeerId, CELLO_CONTENT_PROTOCOL_ID);
     ackStream = stream;
@@ -198,6 +199,90 @@ export async function sendDeliveryAck(
     if (ackStream !== undefined) {
       try { ackStream.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* already gone */ }
     }
+    /**
+     * DOD-M15-DELIVERYACK-1 unit 1 — THE DIRECT STREAM FAILED, SO THE RELAY'S MAILBOX CARRIES IT.
+     *
+     * This is the case the unit exists for and the one it used to lose. The ordinary reason this
+     * catch runs is that the sender's daemon is DOWN — we have their message, we have read it, and
+     * there is nobody on the other end of the stream. Before this, the acknowledgement simply
+     * evaporated and the sender came back holding no proof for a message they had in fact delivered.
+     *
+     * It rides the same store-and-forward path their content rides, sealed to them, with the
+     * discriminator inside the seal so the relay stays a blind custodian and needs no change. If the
+     * relay refuses or none is configured, we are exactly where the old code left us — which is why
+     * this is fire-and-forget and never turns a delivered message into a failure.
+     */
+    void parkDeliveryAck(ctx, agentName, sessionId, contentHash, ackSig, correlationId, "direct_send_failed");
+  }
+}
+
+/**
+ * Deposit an acknowledgement in the relay's per-recipient mailbox, addressed to the sender.
+ *
+ * ⚠️ THE MAILBOX SLOT IS A DERIVED HASH, NOT THE MESSAGE'S. Filing it under the hash it
+ * acknowledges would put it in the slot a parked copy of that very message occupies. See
+ * `parkedDeliveryAckMailboxHash`.
+ *
+ * ⚠️ AND IT IS NEVER ACKNOWLEDGED IN TURN. `parkContent` is being used for its transport only: the
+ * deposit produces no awaiting entry, no timer and no leaf, so nothing here can start a second
+ * conversation between two daemons about whether the first one arrived.
+ */
+async function parkDeliveryAck(
+  ctx: SessionContentPipelineContext,
+  agentName: string,
+  sessionId: string,
+  contentHash: Uint8Array,
+  ackSig: Uint8Array,
+  correlationId: string | undefined,
+  /** Why the direct stream was not used — carried into the log so the two cases stay legible. */
+  why: "no_live_session_node" | "direct_send_failed",
+): Promise<void> {
+  const hashHex = Buffer.from(contentHash).toString("hex");
+  const signer = ctx.keyProvider(agentName);
+  if (!signer) return; // Already reported as `content.delivery.ack.unsignable` before we got here.
+  try {
+    const payload = encodeParkedDeliveryAck({
+      sessionIdHex: sessionId,
+      contentHash,
+      ackSig,
+      signerPubkey: await signer.getPublicKey(),
+    });
+    const slotHex = Buffer.from(parkedDeliveryAckMailboxHash(sessionId, contentHash)).toString("hex");
+    const attempt = await ctx.park.parkOutOfBand(agentName, sessionId, slotHex, payload);
+    if (attempt.outcome === "parked") {
+      ctx.logger.info("content.delivery.ack.parked", {
+        agentName, sessionId, contentHash: hashHex, correlationId, why,
+        impact:
+          "the sender could not be reached directly, so the acknowledgement is waiting in the " +
+          "relay mailbox and reaches them when their agent is next online",
+      });
+      return;
+    }
+    /**
+     * NOT SILENT, and not an error either. The sender is simply left without this one piece of
+     * evidence — which is where they were before this unit existed. Said out loud because "no
+     * acknowledgement" is this unit's own symptom, so every case where one knowingly does not
+     * arrive has to be visible or it is indistinguishable from the defect.
+     */
+    ctx.logger.warn("content.delivery.ack.park.failed", {
+      agentName, sessionId, contentHash: hashHex, correlationId, why,
+      reason: attempt.outcome === "unconfigured" ? "no_relay_for_session" : (attempt.cause ?? "refused"),
+      impact:
+        "the acknowledgement reached neither the sender directly nor the relay mailbox, so they " +
+        "will hold no proof for this message. Their message WAS received and is readable here; " +
+        "nothing about the conversation is affected",
+      guidance:
+        "Nothing to do on this side. If the counterparty asks, the message is in your transcript " +
+        "and you can confirm receipt out of band.",
+    });
+  } catch (err: unknown) {
+    ctx.logger.warn("content.delivery.ack.park.failed", {
+      agentName, sessionId, contentHash: hashHex, correlationId,
+      reason: extractErrorMessage(err),
+      impact:
+        "the acknowledgement reached neither the sender directly nor the relay mailbox, so they " +
+        "will hold no proof for this message. Their message WAS received and is readable here",
+    });
   }
 }
 
@@ -393,6 +478,123 @@ export function storeDeliveryAck(
     });
     return false;
   }
+}
+
+/**
+ * DOD-M15-DELIVERYACK-1 rule 2, at the database — did this side put these exact bytes on the wire in
+ * this session?
+ *
+ * The durable bind, reachable from both routes: the live inbound handler asks through
+ * `SessionRecords`, and the mailbox drain asks here directly because it holds a database handle and
+ * no manager. A sent-direction transcript row joined to its leaf is written by our own send path and
+ * survives the fallback timer and a restart, which is what lets an acknowledgement for a message
+ * that had to be parked and recovered still count. Nothing a counterparty sends creates a row here.
+ */
+export function sentContentHashExists(
+  db: DaemonDatabase,
+  agentId: string,
+  sessionId: string,
+  contentHashHex: string,
+): boolean {
+  const row = db
+    .prepare(
+      `SELECT 1 AS present
+         FROM session_tree_leaves l
+         JOIN transcript t
+           ON t.agent_id = l.agent_id AND t.session_id = l.session_id AND t.sequence = l.leaf_index
+        WHERE l.agent_id = ? AND l.session_id = ? AND l.leaf_hash_hex = ? AND t.direction = 'sent'
+        LIMIT 1`,
+    )
+    .get(agentId, sessionId, contentHashHex);
+  return row !== undefined;
+}
+
+/**
+ * DOD-M15-DELIVERYACK-1 unit 1 — ACCEPT AN ACKNOWLEDGEMENT THAT CAME BACK THROUGH THE RELAY'S
+ * MAILBOX.
+ *
+ * This is the offline route: the counterparty read the message while this daemon was down, could not
+ * reach it directly, and parked the acknowledgement. It is held to the SAME five rules the live
+ * route is, because it is the same attacker-controlled input arriving by a different road — and to
+ * one more check the live route does not need, which has already run before this is called: the park
+ * envelope's own SEC-1 gate proved the DEPOSITOR is this session's counterparty.
+ *
+ * ⚠️ THE TWO CHECKS ARE INDEPENDENT AND BOTH ARE REQUIRED. The envelope gate says who put it in the
+ * mailbox; the signature below says who acknowledged the message. A relay holding the recipient's
+ * public key can deposit anything, and the envelope gate is what stops that — but a counterparty who
+ * rewrote their own daemon passes the envelope gate by construction, and only the signature check
+ * catches an acknowledgement they did not actually sign for this message.
+ *
+ * 🚨 INERT, exactly as the live route is. It records evidence. It appends no leaf, advances no
+ * sequence, touches no tree, and nothing about a refusal here says anything about the counterparty.
+ */
+export function acceptParkedDeliveryAck(a: {
+  db: DaemonDatabase;
+  logger: Logger;
+  agentId: string;
+  agentName: string;
+  sessionId: string;
+  /** The session's RECORDED counterparty key. Never the `signerPubkey` carried in the payload. */
+  counterpartyPubkeyHex: string | undefined;
+  ack: ParkedDeliveryAck;
+  correlationId?: string;
+}): { ok: true } | { ok: false; reason: string } {
+  const hashHex = Buffer.from(a.ack.contentHash).toString("hex");
+  const discard = (reason: string, impact: string): { ok: false; reason: string } => {
+    a.logger.warn("content.delivery.ack.parked.discarded", {
+      agentName: a.agentName, sessionId: a.sessionId, contentHash: hashHex,
+      correlationId: a.correlationId, reason, impact,
+    });
+    return { ok: false, reason };
+  };
+
+  // RULE 2 — bound. Durable only: by the time a parked acknowledgement is drained, any live timer
+  // for that message is long gone, which is the whole reason this route exists.
+  if (!sentContentHashExists(a.db, a.agentId, a.sessionId, hashHex)) {
+    return discard(
+      "not_sent_here",
+      "a parked acknowledgement named a message this side has no record of sending in this " +
+      "session. Discarded; nothing is concluded from it",
+    );
+  }
+  // RULE 1 — against the session's recorded key, never the one inside the payload.
+  const verdict = verifyDeliveryAck({
+    participantIdentityPublics:
+      a.counterpartyPubkeyHex && /^[0-9a-fA-F]{64}$/.test(a.counterpartyPubkeyHex)
+        ? [new Uint8Array(Buffer.from(a.counterpartyPubkeyHex, "hex"))]
+        : [],
+    sessionId: new Uint8Array(Buffer.from(a.sessionId, "hex")),
+    contentHash: a.ack.contentHash,
+    signature: a.ack.ackSig,
+  });
+  if (!verdict.ok) {
+    return discard(
+      verdict.reason,
+      "a parked acknowledgement did not verify against this session's recorded counterparty key. " +
+      "It is treated exactly as if none had arrived, and nothing about the counterparty is concluded",
+    );
+  }
+  // RULE 3 and RULE 4 — evidence only, exactly once. The stored row is the idempotence: this route
+  // and the direct route write the same key, so an acknowledgement that arrived both ways lands once.
+  const wrote = storeDeliveryAck(a.db, a.logger, {
+    agentId: a.agentId,
+    agentName: a.agentName,
+    sessionId: a.sessionId,
+    contentHashHex: hashHex,
+    signerPubkeyHex: Buffer.from(verdict.signerPublic).toString("hex"),
+    signature: a.ack.ackSig,
+    correlationId: a.correlationId,
+  });
+  if (wrote) {
+    a.logger.info("content.delivery.ack.parked.recovered", {
+      agentName: a.agentName, sessionId: a.sessionId, contentHash: hashHex,
+      correlationId: a.correlationId,
+      impact:
+        "an acknowledgement that could not be delivered while this daemon was down has been " +
+        "recovered from the relay mailbox; the proof for this message is now held locally",
+    });
+  }
+  return { ok: true };
 }
 
 /**

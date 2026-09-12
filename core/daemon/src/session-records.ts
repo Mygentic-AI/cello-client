@@ -21,7 +21,7 @@ import { MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
 import { type TranscriptEntry, UNREAD_RECEIVED_WHERE, TERMINAL_STATUSES } from "./session-node-types.js";
 import { quarantineRedaction } from "./quarantine-framing.js";
 import { extractErrorMessage } from "./error-message.js";
-import { storeDeliveryAck } from "./session-delivery-acks.js";
+import { storeDeliveryAck, sentContentHashExists } from "./session-delivery-acks.js";
 
 /** What this module needs from the manager, stated explicitly rather than handed `this`. */
 export interface SessionRecordsContext {
@@ -641,17 +641,10 @@ export class SessionRecords {
    */
   hasSentContentHash(agentName: string, sessionId: string, contentHashHex: string): boolean {
     if (!this.#db) return false;
-    const row = this.#db
-      .prepare(
-        `SELECT 1 AS present
-           FROM session_tree_leaves l
-           JOIN transcript t
-             ON t.agent_id = l.agent_id AND t.session_id = l.session_id AND t.sequence = l.leaf_index
-          WHERE l.agent_id = ? AND l.session_id = ? AND l.leaf_hash_hex = ? AND t.direction = 'sent'
-          LIMIT 1`,
-      )
-      .get(this.#ctx.requireAgentId(agentName), sessionId, contentHashHex);
-    return row !== undefined;
+    // One implementation, two routes: the direct stream reaches it through here, and the parked
+    // route reaches the same function from the mailbox drain, which holds a database handle and no
+    // manager. A second copy of a bind check is a second thing to keep in step.
+    return sentContentHashExists(this.#db, this.#ctx.requireAgentId(agentName), sessionId, contentHashHex);
   }
 
   /**

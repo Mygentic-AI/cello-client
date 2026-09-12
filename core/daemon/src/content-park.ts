@@ -28,6 +28,9 @@ import type { SecurityGatewayClient } from "@cello-protocol/gateway";
 import { ContentParkClient, ContentParkRefusedError, ContentParkUnreachableError } from "./content-park-client.js";
 import type { ParkDialFailure } from "./content-park-client.js";
 import { extractErrorMessage } from "./error-message.js";
+// DOD-M15-DELIVERYACK-1 unit 1: the mailbox also carries acknowledgements of OUR messages, parked
+// because this daemon was down when the counterparty read one. Same five rules, other road.
+import { acceptParkedDeliveryAck } from "./session-delivery-acks.js";
 import { decodeParkEnvelope, sealParkEnvelope } from "./park-envelope.js";
 import { contentHashFor, resolveContentHashAlg, isKnownContentHashAlg, CONTENT_HASH_ALGS } from "./wire-content-hash.js";
 import {
@@ -305,6 +308,60 @@ export function createContentPark(deps: ContentParkDeps) {
         contentHashBytes,
         correlationId,
       );
+      /**
+       * DOD-M15-DELIVERYACK-1 unit 1 — THE ENTRY WAS AN ACKNOWLEDGEMENT OF ONE OF OUR MESSAGES.
+       *
+       * The counterparty read something we sent while this daemon was DOWN, could not reach us
+       * directly, and left the signed acknowledgement here. It is not content: it appends no leaf,
+       * enters no transcript, and is not counted as a recovered message — counting it would report
+       * mail this operator never received.
+       *
+       * The envelope gate inside `recoverParkedEntry` has already proved the depositor is this
+       * session's counterparty. `acceptParkedDeliveryAck` runs the SECOND, independent check — the
+       * acknowledgement's own signature, against the key the SESSION recorded — plus the same bind
+       * and the same idempotence the live route uses. Two different keys, two different questions,
+       * and both must pass.
+       *
+       * CONFIRM-DELETE ONLY ON ACCEPTANCE, the same rule content follows: a refused entry is left in
+       * the mailbox so a forgery cannot evict itself, and so a transient local fault (no database,
+       * a failed write) does not destroy evidence we could have kept on the next drain.
+       */
+      if (ingest.ok && "deliveryAck" in ingest) {
+        const accepted = acceptParkedDeliveryAck({
+          db: sessionNodeManager.getDb(),
+          logger,
+          agentId: sessionNodeManager.resolveAgentId(recipientAgent.name),
+          agentName: recipientAgent.name,
+          sessionId: e.sessionIdHex,
+          counterpartyPubkeyHex: sessionNodeManager.getSessionRecord(recipientAgent.name, e.sessionIdHex)?.counterparty_pubkey,
+          ack: ingest.deliveryAck,
+          correlationId,
+        });
+        if (accepted.ok) {
+          try {
+            await client.confirm(node, Buffer.from(recipientPubkey, "hex"), contentHashBytes, kp);
+          } catch (err: unknown) {
+            // The proof is stored; failing to clear the mailbox slot costs one redundant drain,
+            // which the stored row then absorbs. Never a reason to report the recovery as failed.
+            logger.warn("content.park.confirm.failed", {
+              sessionId: e.sessionIdHex, contentHash: e.contentHashHex,
+              entryKind: "delivery_ack", error: extractErrorMessage(err),
+            });
+          }
+        }
+        /**
+         * ⚠️ A REFUSED ACKNOWLEDGEMENT IS NOT ADDED TO `refusals`, AND THE STRUCTURAL GUARD IN
+         * `dod-m15-inboxcause-1` IS WHAT CAUGHT ME PUTTING IT THERE.
+         *
+         * That list is mail the operator did not receive, and every entry in it raises a notice
+         * telling them so. An acknowledgement is not mail: nothing of theirs is missing, nobody is
+         * waiting on it, and the notice would read as an accusation about the counterparty — which
+         * is the single inference this unit forbids. It is logged (inside `acceptParkedDeliveryAck`)
+         * and left in the mailbox unconfirmed, exactly as a refused message is, so a forgery cannot
+         * evict itself and a local fault can be retried on the next drain.
+         */
+        continue;
+      }
       if (ingest.ok && ingest.held) {
         // DOD-MSG-4 (review finding #4): a held entry is NOT yet an appended leaf — its sequence is
         // the FUTURE canonical index, not a completed recovery. Do not count it as recovered; log it
