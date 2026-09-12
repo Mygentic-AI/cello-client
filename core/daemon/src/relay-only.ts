@@ -131,10 +131,13 @@ export function isCircuitAddr(addr: string): boolean {
   // operators' machines where install weight is a user-facing cost. The exact-segment test defeats
   // the demonstrated bypass with no new dependency.
   //
-  // ⚠️ RESIDUAL, stated rather than left implied: this proves the address CLAIMS a circuit hop, not
-  // that the circuit runs through a relay we chose. A peer could name a relay we hold no reservation
-  // with. Binding the embedded relay peer id to our own reservations is the stronger check and is
-  // NOT done here.
+  // ⚠️ RESIDUAL, stated rather than left implied, and TRACKED as `DOD-M15-CIRCUIT-RELAY-BIND-1`:
+  // this proves the address CLAIMS a circuit hop, not that the circuit runs through a relay we
+  // chose. A counterparty can name a relay we hold no reservation with — including one they run —
+  // and `dialableAddrs` will pass it, so the relay they named learns our IP with relay-only on.
+  // The stronger check is binding the embedded relay peer id to our own reservations, and it needs
+  // the reservation set here, which this module does not have. Do not narrow the bound by editing
+  // this sentence; close it at the call site that holds the reservations.
   return addr.split("/").includes("p2p-circuit");
 }
 
