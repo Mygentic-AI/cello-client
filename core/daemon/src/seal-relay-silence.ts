@@ -55,6 +55,19 @@ export const RELAY_GAVE_NO_ANSWER: ReadonlySet<string> = new Set([
   "relay_client_unavailable",
   "relay_client_closed",
   "relay_stream_closed",
+  /**
+   * ⚠️ KEPT DELIBERATELY, against a review finding that called it "a relay answer". It is one, and
+   * it is still the right side of this line.
+   *
+   * The relay answers `session_not_found` for a session it no longer holds — and a relay that has
+   * RESTARTED holds nothing, because its leaf log is a map in process memory. That is precisely the
+   * scenario this order exists for: the witness is gone even though the process is up and talking.
+   * Excluding it would mean a restarted relay still costs a conversation its receipt, which is the
+   * defect, not the fix.
+   *
+   * The refusals that must NOT unlock this path are the relay exercising judgement about this agent,
+   * and those are caught by `relayRefusedUs` above rather than by this list.
+   */
   "relay_session_gone",
   // The frame never left, or left and was never answered.
   "relay_submit_send_failed",
