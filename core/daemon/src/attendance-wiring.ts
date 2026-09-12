@@ -30,6 +30,7 @@ import { escalateToUnilateralSeal as runUnilateralEscalation, UNILATERAL_SEAL_TI
 import type { UnilateralResult } from "./seal-coordinator.js";
 import type { SealCompletion } from "./seal-coordinator.js";
 import { extractErrorMessage } from "./error-message.js";
+import { awaitOwnRecordSettled } from "./seal-settle.js";
 
 export interface AttendanceWiringDeps {
   logger: Logger;
@@ -230,7 +231,30 @@ export function createAttendanceWiring(deps: AttendanceWiringDeps) {
            * whole warning rather than half of it.
            */
           const oneshotReadiness = sessionNodeManager.sealReadiness(agentName, sessionId);
-          if (oneshotReadiness.diverged) {
+          /**
+           * DOD-M15-SEALPRECOND-1 — the same precondition, on the path with no operator.
+           *
+           * This path places its own leaf above and then seals; what this catches is a CONCURRENT
+           * send — the operator's, or the document path's — that the relay has ordered and this
+           * tree has not written. Signing over that is the 2026-09-11 loss, with nobody here to
+           * retry it. It waits, because the condition clears in milliseconds; only if it does not
+           * is the seal left to a close a human drives.
+           */
+          let unsettled = false;
+          if (oneshotReadiness.ownLeavesOrdered > 0) {
+            const settle = await awaitOwnRecordSettled(sessionNodeManager, agentName, sessionId);
+            unsettled = !settle.settled;
+            if (!settle.settled) {
+              logger.warn("session.away.inbox.oneshot.seal_skipped_settling", {
+                agentName, sessionId,
+                ownLeavesOrdered: settle.ownLeavesOrdered, waitedMs: settle.waitedMs,
+                impact: "a message of ours has a place in the relay's ordering this record has not taken, so the seal was NOT initiated — signing over a short tree is refused by the directory and costs the receipt permanently. The session stays closeable by hand.",
+              });
+            }
+          }
+          if (unsettled) {
+            // Skipped exactly as a diverged record is: logged, not sealed, still closeable by hand.
+          } else if (oneshotReadiness.diverged) {
             logger.warn("session.away.inbox.oneshot.seal_skipped_diverged", {
               agentName, sessionId,
               treeSize: oneshotReadiness.treeSize, highWaterSeq: oneshotReadiness.highWaterSeq,

@@ -88,6 +88,16 @@ export interface SessionContentPipelineContext {
   readonly awaitingAck: Map<string, Map<string, AwaitingAckEntry>>;
   readonly heldContent: Map<string, Map<number, HeldEntry>>;
   readonly witnessedSeq: Map<string, Map<string, number>>;
+  /**
+   * DOD-M15-SEALPRECOND-1 — content hash -> the sequence the relay assigned OUR OWN leaf, for the
+   * span between the relay ordering it and this tree placing it.
+   *
+   * Distinct from `witnessedSeq`, which gains an entry only for leaves NOT authored by us
+   * (`relayLeafHandler`), and that asymmetry is exactly what cost a receipt on 2026-09-11: the
+   * relay had ordered our third leaf, the tree still held two, and every counter the seal gate
+   * reads was zero. Gained at the assignment site in `sendContent`, lost in `placeOwnLeaf`.
+   */
+  readonly ownLeavesOrdered: Map<string, Map<string, number>>;
   readonly leafFetchTimers: Map<string, ReturnType<typeof setTimeout>>;
   readonly lastAck: Map<string, { seq: number; hash: Uint8Array }>;
   readonly receivedContent: Map<string, ReceivedContentEntry[]>;

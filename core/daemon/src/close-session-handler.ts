@@ -56,6 +56,7 @@ import { describeSealCommitted } from "./close-commitment.js";
 import type { DirectoryEndpoint } from "./signaling-connect.js";
 import type { ConsortiumEndpoint } from "./directory-bootstrap.js";
 import { extractErrorMessage } from "./error-message.js";
+import { awaitOwnRecordSettled } from "./seal-settle.js";
 
 export interface CloseSessionDeps {
   handlers: Map<string, IpcHandler>;
@@ -650,7 +651,10 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
       // DOD-M15-DIVERGE-1: `diverged: false` for the same reason every other field here is a
       // no-op value — this branch is the NOT-sealable statuses, where readiness is never consulted
       // and both gates below are skipped. It asserts nothing about the record; it keeps the shape.
-      : { ready: true, treeSize: 0, highWaterSeq: -1, heldCount: 0, missingLeaves: 0, heldOwn: 0, heldReceived: 0, diverged: false };
+      // DOD-M15-SEALPRECOND-1: `ownLeavesOrdered: 0` for the same reason `diverged` is false here —
+      // this is the NOT-sealable branch, where readiness is never consulted and every gate below is
+      // skipped. It keeps the shape and asserts nothing about the record.
+      : { ready: true, treeSize: 0, highWaterSeq: -1, heldCount: 0, missingLeaves: 0, heldOwn: 0, heldReceived: 0, diverged: false, ownLeavesOrdered: 0 };
     // Review HIGH-1: the guidance used to promise "the daemon pulls missing content automatically"
     // while nothing on this path pulled anything — autoRecoverForAgent fires on signaling reconnect,
     // seal-upgrade and agent start, none of which a close triggers. So the operator waited for an
@@ -672,6 +676,49 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
           error: extractErrorMessage(err),
         });
       }
+    }
+    /**
+     * DOD-M15-SEALPRECOND-1 — WAIT FOR THIS SIDE'S OWN RECORD TO STOP MOVING, then judge.
+     *
+     * After the drain, before the two refusals: it is the one condition here that clears on its own
+     * in milliseconds — an in-flight send the relay has ordered whose leaf this tree has not
+     * written. Signing inside that span produced the 2026-09-11 loss: a two-leaf root against a
+     * three-leaf relay set, refused by both directories, no second chance for either party.
+     *
+     * NOT for a diverged record — divergence never resolves, so waiting would delay a permanent
+     * answer to report a transient one, the substitution DOD-M15-DIVERGE-1 exists to prevent.
+     */
+    if (sealable && !readiness.diverged && readiness.ownLeavesOrdered > 0) {
+      const settle = await awaitOwnRecordSettled(sessionNodeManager, record.agent_name, sessionId);
+      readiness = sessionNodeManager.sealReadiness(record.agent_name, sessionId);
+      if (!settle.settled) {
+        logger.warn("session.seal.blocked_settling", {
+          agentName: record.agent_name, sessionId,
+          treeSize: readiness.treeSize, highWaterSeq: readiness.highWaterSeq,
+          ownLeavesOrdered: settle.ownLeavesOrdered,
+          waitedMs: settle.waitedMs,
+          impact: "a message of this operator's own has a place in the relay's ordering that this side's record has not taken yet, so NOTHING was signed — a root signed short of the relay's leaf set is refused by the directory and the receipt cannot be recovered",
+        });
+        return {
+          ok: false,
+          reason: "session_record_settling",
+          own_leaves_settling: settle.ownLeavesOrdered,
+          waited_ms: settle.waitedMs,
+          tree_size: readiness.treeSize,
+          // NAMES THIS SIDE, and only this side (065-SEALREASON). The counterparty has done nothing
+          // and is owed no part of this sentence; `session_incomplete` next door says the opposite
+          // thing — that they have not sent something — and borrowing its words here would send two
+          // operators to argue about a condition neither of them caused.
+          guidance:
+            `Nothing was signed. ${settle.ownLeavesOrdered} message(s) you sent have a place in the record that this side has not written yet, and a receipt signed without them is refused and cannot be recovered. ` +
+            `This is your own record catching up — the counterparty is not involved and there is nothing for them to do. ` +
+            `It normally settles in well under a second, so close again: cello_close_session ${sessionId}. ` +
+            `If it keeps returning this, cello_status shows the session as still settling and cello_transcript ${sessionId} shows what is already in the record.`,
+        };
+      }
+      logger.info("session.seal.settled", {
+        agentName: record.agent_name, sessionId, waitedMs: settle.waitedMs,
+      });
     }
     /**
      * DOD-M15-DIVERGE-1 — a PERMANENT parting gets its own answer, before the transient one.

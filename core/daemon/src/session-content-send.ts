@@ -303,6 +303,21 @@ export class SessionContentSender {
           // perfectly healthy first message reads as "ahead of the tail" and is held behind a gap
           // that does not exist. Do not remove this without changing both receive sites too.
           assignedSeq = witnessed.sequence_number - 1;
+          /**
+           * DOD-M15-SEALPRECOND-1 — FROM HERE UNTIL `placeOwnLeaf`, THIS TREE IS SHORT AND KNOWS IT.
+           *
+           * The relay has ordered this leaf, so every other party counts it, and this side cannot
+           * append it until the caller places it at the assigned position (DOD-M12B-INDEX-1, which
+           * is not being changed here). A seal signed inside that span covers a tree one leaf short
+           * of the relay's leaf set: `merkle_root_mismatch`, and a receipt lost permanently for
+           * BOTH sides — measured on session `e7dd3f43…`, 2026-09-11.
+           *
+           * Recorded rather than inferred, for the reason `missingLeaves` counts a witness map
+           * instead of subtracting `treeSize` from `highWaterSeq`: the relay's sequence space holds
+           * CTRL leaves and this tree does not, so arithmetic between the two reads a phantom gap
+           * forever after the first seal.
+           */
+          this.#noteOwnLeafOrdered(agentName, sessionId, Buffer.from(contentHash).toString("hex"), assignedSeq);
           this.#ctx.logger.info("session.relay.hash.submitted", {
             sessionId,
             // BOTH SPACES, NAMED. The relay's number is 1-based and the leaf index is 0-based, and
@@ -843,6 +858,16 @@ export class SessionContentSender {
       // about this later and would otherwise have to guess — and its guess ("it was parked, do not
       // resend") is the exact opposite of what the lost case needs.
       this.#ctx.liveness.noteImpairmentRetention(agentName, sessionId, durable ? "durable" : "lost");
+      /**
+       * DOD-M15-SEALPRECOND-1 — the send failed, so nothing here will place this leaf.
+       *
+       * UNCONDITIONAL, including the durable case whose caller DOES place: those callers place
+       * synchronously on the continuation of this return, with no await between, so nothing can
+       * read the marker in the interval. `document-delivery-transport.ts` places nothing on a
+       * failure at all — leaving its marker would make every later close of that session decline,
+       * and a session whose only exit is force-abandon has no receipt.
+       */
+      this.#clearOwnLeafOrdered(agentName, sessionId, Buffer.from(contentHash).toString("hex"));
       return {
         ok: false,
         reason: "session_stream_unavailable",
@@ -978,6 +1003,28 @@ export class SessionContentSender {
    * and it appends in arrival order as before: with no position there is no discipline to enforce,
    * and refusing would take messaging down whenever the relay is unreachable.
    */
+  /**
+   * DOD-M15-SEALPRECOND-1 — the relay has ordered a leaf of ours; the tree has not placed it yet.
+   * Public so a test can drive the exact state the 2026-09-11 close was in with no live relay.
+   */
+  noteOwnLeafOrdered(agentName: string, sessionId: string, contentHashHex: string, assignedSeq: number): void {
+    this.#noteOwnLeafOrdered(agentName, sessionId, contentHashHex, assignedSeq);
+  }
+
+  #noteOwnLeafOrdered(agentName: string, sessionId: string, contentHashHex: string, assignedSeq: number): void {
+    if (assignedSeq < 0) return;
+    const key = this.#ctx.sessionKey(agentName, sessionId);
+    let map = this.#ctx.ownLeavesOrdered.get(key);
+    if (!map) { map = new Map(); this.#ctx.ownLeavesOrdered.set(key, map); }
+    map.set(contentHashHex, assignedSeq);
+  }
+
+  #clearOwnLeafOrdered(agentName: string, sessionId: string, contentHashHex: string): void {
+    const map = this.#ctx.ownLeavesOrdered.get(this.#ctx.sessionKey(agentName, sessionId));
+    map?.delete(contentHashHex);
+    if (map?.size === 0) this.#ctx.ownLeavesOrdered.delete(this.#ctx.sessionKey(agentName, sessionId));
+  }
+
   placeOwnLeaf(
     agentName: string,
     sessionId: string,
@@ -1014,6 +1061,15 @@ export class SessionContentSender {
      */
     authorship: SentAuthorship | undefined,
   ): { placed: true; leafIndex: number; diverged?: true; unwitnessed?: true } | { placed: false; heldAt: number } {
+    /**
+     * DOD-M15-SEALPRECOND-1 — the marker is resolved HERE, on every outcome, and that is the point.
+     *
+     * Appended, appended-behind-the-frontier, or held: all three have dealt with the relay's
+     * position for this content, and a held leaf is already refused by `heldOwn` — counting it in
+     * both places would report one message as two conditions. Cleared at the TOP so no early
+     * return can leave a marker behind, which would make the session unsealable.
+     */
+    this.#clearOwnLeafOrdered(agentName, sessionId, contentHashHex);
     // Hydrate before reading the frontier: a durable hold this process has not read back yet would
     // make the tree look further along than it is.
     this.#ctx.held.ensureHeldRestored(agentName, sessionId);

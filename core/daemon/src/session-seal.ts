@@ -39,6 +39,7 @@ import type { SessionLeafRecords } from "./session-leaf-records.js";
 import type { StandingReceivers } from "./standing-receivers.js";
 import type { ActiveSessionEntry } from "./session-node-types.js";
 import { extractErrorMessage } from "./error-message.js";
+import { awaitOwnRecordSettled } from "./seal-settle.js";
 
 /** What the seal path needs from the manager. */
 export interface SessionSealContext {
@@ -58,6 +59,8 @@ export interface SessionSealContext {
   readonly activeNodes: Map<string, ActiveSessionEntry>;
   readonly heldContent: Map<string, Map<number, HeldEntry>>;
   readonly witnessedSeq: Map<string, Map<string, number>>;
+  /** DOD-M15-SEALPRECOND-1 — our own leaves the relay has ordered and this tree has not placed. */
+  readonly ownLeavesOrdered: Map<string, Map<string, number>>;
   readonly highWaterSeq: Map<string, number>;
   readonly orderingObserved: Set<string>;
   readonly contentDesynced: Map<string, "tampered" | "unverifiable">;
@@ -859,6 +862,29 @@ export class SessionSeal {
           reason: extractErrorMessage(err),
         });
       }
+      /**
+       * DOD-M15-SEALPRECOND-1 — the responder must not co-sign a record still being written either.
+       *
+       * This side signs its OWN root over its OWN tree, so a send of ours the relay has ordered and
+       * this tree has not placed produces exactly the short root the initiator produced on
+       * 2026-09-11. It was the one seal submission site with no gate at all.
+       *
+       * It WAITS first — the condition clears in milliseconds and declining costs a prompt
+       * bilateral seal. If it does not clear it declines to AUTO-sign and says so, the shape the
+       * SI-002 gate already uses: B's explicit close can still complete the seal.
+       */
+      const settle = await awaitOwnRecordSettled(this, agentName, sessionId);
+      if (!settle.settled) {
+        this.#ctx.logger.warn("session.seal.autoack.skipped", {
+          sessionId,
+          reason: "own_record_settling",
+          ownLeavesOrdered: settle.ownLeavesOrdered,
+          waitedMs: settle.waitedMs,
+          correlationId,
+          impact: "a message of ours has a place in the relay's ordering this record has not taken yet, so no responder signature was made — signing short is refused by the directory and costs the receipt. The seal can still be completed by an explicit close on this side.",
+        });
+        return { ok: false as const, reason: "own_record_settling" };
+      }
       const submitted = await this.submitSealLeaf(agentName, sessionId, correlationId);
       // RELEASE AFTER A GRACE WINDOW, not when the submit resolves.
       //
@@ -954,6 +980,16 @@ export class SessionSeal {
      * sealable right up until the counterparty answered `leaf_count_mismatch`, which is terminal.
      */
     diverged: boolean;
+    /**
+     * DOD-M15-SEALPRECOND-1 — leaves of OUR OWN the relay has ordered and this tree has not placed.
+     *
+     * The fourth term, and the one the 2026-09-11 lost receipt needed. The other three describe the
+     * counterparty's leaves or a permanent parting, and none of them moves when the relay orders a
+     * send of ours — `relayLeafHandler` records a witness only for leaves NOT authored by us. So a
+     * close landing between the ordering and `placeOwnLeaf` read a clean readiness and signed short.
+     * Unlike `diverged`, this RESOLVES in milliseconds, which is why its consumer waits.
+     */
+    ownLeavesOrdered: number;
   } {
     const key = this.#ctx.sessionKey(agentName, sessionId);
     // DOD-M12B-STRAND-1: hydrate first. An under-counted `heldCount` reports a gapped session as
@@ -1005,11 +1041,25 @@ export class SessionSeal {
     // merely suspected, because a gate that refuses a healthy session forever is worse than the bug
     // it guards: force-abandon, with no receipt, becomes the only exit.
     const diverged = this.#ctx.records.isSessionDiverged(agentName, sessionId);
+    /**
+     * DOD-M15-SEALPRECOND-1. A marker whose position the tree has ALREADY passed is spent — the
+     * leaf is in, or something else took the position and `diverged` says so — so it is dropped
+     * rather than counted, and no marker outlives its condition with no clock involved.
+     */
+    const ordered = this.#ctx.ownLeavesOrdered.get(key);
+    let ownLeavesOrdered = 0;
+    if (ordered) {
+      for (const [hash, seq] of [...ordered]) {
+        if (seq < treeSize) ordered.delete(hash);
+        else ownLeavesOrdered++;
+      }
+      if (ordered.size === 0) this.#ctx.ownLeavesOrdered.delete(key);
+    }
     return {
-      ready: missingLeaves === 0 && heldCount === 0 && !diverged,
+      ready: missingLeaves === 0 && heldCount === 0 && !diverged && ownLeavesOrdered === 0,
       treeSize, highWaterSeq, heldCount, missingLeaves,
       heldOwn, heldReceived: heldCount - heldOwn,
-      diverged,
+      diverged, ownLeavesOrdered,
     };
   }
 
@@ -1042,6 +1092,14 @@ export class SessionSeal {
       // the counterparty answers `leaf_count_mismatch` to — terminal, and the receipt is gone. The
       // raw counters cannot see this: nothing is missing and nothing is held.
       return { state: "unknown", reason: "record_diverged_from_relay" };
+    }
+    /**
+     * DOD-M15-SEALPRECOND-1 — READ BEFORE THE `!ready` BRANCH, for the reason stated above it.
+     * A settling record has nothing missing and nothing held, so `blocked` would report zeros for
+     * both — describing nothing, and pointing at a counterparty who has done nothing.
+     */
+    if (r.ownLeavesOrdered > 0) {
+      return { state: "unknown", reason: "own_send_settling" };
     }
     if (!r.ready) {
       const oldestHeldMs = this.#ctx.queries.oldestHeldMs(agentName, sessionId);
