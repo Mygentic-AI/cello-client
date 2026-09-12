@@ -261,3 +261,69 @@ function decodeS2Sig(cbor: Uint8Array): Uint8Array {
 function decodeS2PrevRoot(cbor: Uint8Array): Uint8Array {
   return new Uint8Array((cborDecode(cbor) as unknown[])[5] as Uint8Array);
 }
+
+/**
+ * ═══ THE FOUR LEAF DOMAINS ARE FOUR, NOT TWO — review HIGH-2 ═══
+ *
+ * `prev_root` is a fold over `leafHashFor(kind, structure2)`, and that function has four distinct
+ * domains: msg 0x00, ctrl 0x02, doc 0x04, reject 0x05. The directory's own `LEAF_KINDS` table
+ * carries a comment saying in terms that the previous shape — anything-but-0x02 becomes `msg` — was
+ * a trust-boundary bug and was removed.
+ *
+ * Writing it on THIS side is worse than harmless, because of where the error surfaces. A session
+ * that ever exchanged a document computes a prefix root the directory cannot reproduce, fails
+ * `PREV_ROOT_BREAK`, and reaches the operator as `unilateral_root_unverifiable` — whose guidance
+ * tells them their transcript ORDER is in dispute with their counterparty and to compare copies out
+ * of band. A hash-domain bug on our own machine, reported as the other person's fault.
+ */
+describe("DOD-M15-CARRIEDSEAL-1 — every leaf kind hashes in its own domain", () => {
+  it("★★★ a DOC leaf in the carry folds as doc, so the directory can reproduce prev_root", async () => {
+    const us = generateKeypair();
+    const them = generateKeypair();
+    const usHex = hex(new Uint8Array(await us.getPublicKey()));
+    const doc = await carriedLeaf({
+      seq: 1, kind: 0x04, kp: us,
+      lastSeenSeq: 0, lastSeenHash: GENESIS, prevOwnHash: GENESIS, prevRoot: new Uint8Array(32),
+    });
+    const theirs = await carriedLeaf({
+      seq: 2, kind: LEAF_KIND_MSG, kp: them,
+      lastSeenSeq: 1, lastSeenHash: GENESIS, prevOwnHash: GENESIS, prevRoot: prefixRootTrue([doc]),
+    });
+    const carry = [doc, theirs];
+    const r = await buildLocalSealTerminus(await inputs(carry, us, usHex));
+    expect(r.ok, `a carry holding a document leaf must still close: ${JSON.stringify(r)}`).toBe(true);
+    if (!r.ok) return;
+    // Computed here with the TRUE four-domain fold. Under the collapsed mapping the document leaf
+    // hashes as a message and this comes out different — which the directory reads as a broken chain.
+    expect(hex(decodeS2PrevRoot(r.leaf.structure2Cbor))).toBe(hex(prefixRootTrue(carry)));
+  });
+
+  it("★★★ a REJECT leaf likewise — and an unnameable kind byte is REFUSED, not coerced", async () => {
+    const us = generateKeypair();
+    const usHex = hex(new Uint8Array(await us.getPublicKey()));
+    const rej = await carriedLeaf({
+      seq: 1, kind: 0x05, kp: us,
+      lastSeenSeq: 0, lastSeenHash: GENESIS, prevOwnHash: GENESIS, prevRoot: new Uint8Array(32),
+    });
+    const ok = await buildLocalSealTerminus(await inputs([rej], us, usHex));
+    expect(ok.ok).toBe(true);
+    if (ok.ok) expect(hex(decodeS2PrevRoot(ok.leaf.structure2Cbor))).toBe(hex(prefixRootTrue([rej])));
+
+    // A byte this build cannot name has no domain to hash in. Guessing one produces a root nobody
+    // else computes — the same failure, arrived at by coercion instead of by a refusal.
+    const unknown = await carriedLeaf({
+      seq: 1, kind: 0x07, kp: us,
+      lastSeenSeq: 0, lastSeenHash: GENESIS, prevOwnHash: GENESIS, prevRoot: new Uint8Array(32),
+    });
+    expect(await buildLocalSealTerminus(await inputs([unknown], us, usHex))).toMatchObject({
+      ok: false,
+      reason: "seal_carry_leaf_kind_unknown",
+    });
+  });
+});
+
+/** The fold the DIRECTORY performs: four domains, each leaf in its own. */
+function prefixRootTrue(carry: readonly SealCarryLeaf[]): Uint8Array {
+  const domain: Record<number, "msg" | "ctrl" | "doc" | "reject"> = { 0x00: "msg", 0x02: "ctrl", 0x04: "doc", 0x05: "reject" };
+  return merkleRoot(buildMerkleTree(carry.map((l) => ({ kind: domain[l.leafKind]!, data: l.structure2Cbor }))));
+}

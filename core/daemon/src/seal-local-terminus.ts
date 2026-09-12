@@ -48,6 +48,28 @@ import type { SealCarryLeaf } from "./session-seal-leaf-store.js";
 /** The SEAL control leaf's kind byte — the same 0x02 the relay path hashes under. */
 const LEAF_KIND_CTRL = 0x02;
 
+/**
+ * ⚠️ FOUR DOMAINS, NOT TWO — review HIGH-2, and the collapsed form is a trust-boundary bug the
+ * directory's own `LEAF_KINDS` table already carries a comment about having removed.
+ *
+ * `prev_root` is a fold over `leafHashFor(kind, structure2)`, and that function prefixes each leaf
+ * with its own domain byte. Writing "anything but 0x02 is a message" here makes every session that
+ * ever exchanged a DOCUMENT (0x04) or carried a refusal leaf (0x05) compute a prefix root the
+ * directory cannot reproduce. It fails as a broken chain and reaches the operator as
+ * `unilateral_root_unverifiable`, whose guidance tells them their transcript ORDER is in dispute
+ * with their counterparty and to compare copies out of band — a hash-domain bug on this machine,
+ * reported as the other person's fault, on exactly the sessions where the receipt matters most.
+ *
+ * `undefined` for a byte this build cannot name. Guessing a domain for it produces a root nobody
+ * else computes, which is the same failure reached by coercion instead of by a refusal.
+ */
+const LEAF_DOMAINS: Readonly<Record<number, "msg" | "ctrl" | "doc" | "reject">> = {
+  0x00: "msg",
+  0x02: "ctrl",
+  0x04: "doc",
+  0x05: "reject",
+};
+
 export interface LocalSealTerminusInput {
   /** The relay's ordered log as this side holds it, ascending. Both parties' leaves. */
   carry: readonly SealCarryLeaf[];
@@ -79,6 +101,8 @@ export type LocalSealTerminusResult =
  *                               session unsealable by any directory, permanently — the caller must
  *                               reuse the one that is there, never add to it.
  *   `seal_carry_unreadable`     a leaf this daemon cannot decode is one it cannot chain onto.
+ *   `seal_carry_leaf_kind_unknown` a leaf kind this build cannot name has no domain to hash in, and
+ *                               a guessed one yields a root nobody else computes.
  */
 export async function buildLocalSealTerminus(
   input: LocalSealTerminusInput,
@@ -120,10 +144,12 @@ export async function buildLocalSealTerminus(
    * directory's incremental walk over `leafHashFor(kind, encodeStructure2(s2))`; the certified root
    * is the fold over raw content hashes. Same leaves, different pre-images, different values.
    */
-  const prefixInputs: LeafInput[] = ordered.map((l) => ({
-    kind: l.leafKind === LEAF_KIND_CTRL ? "ctrl" : "msg",
-    data: l.structure2Cbor,
-  }));
+  const prefixInputs: LeafInput[] = [];
+  for (const l of ordered) {
+    const domain = LEAF_DOMAINS[l.leafKind];
+    if (!domain) return { ok: false, reason: "seal_carry_leaf_kind_unknown" };
+    prefixInputs.push({ kind: domain, data: l.structure2Cbor });
+  }
   const prevRoot = merkleRoot(buildMerkleTree(prefixInputs));
 
   // The payload and its hash come from ONE derivation, deliberately. When they diverge the directory
