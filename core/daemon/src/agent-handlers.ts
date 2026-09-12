@@ -468,6 +468,22 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
       return { ok: true, released: null, guidance: "This connection was not attending any agent. Nothing to release." };
     }
     connState.currentAgent = null;
+    /**
+     * DOD-M15-AWAYSCOPE-1 — AND THE COUNTERPARTY IS TOLD. Review finding: this was the one gesture
+     * an operator makes ON PURPOSE to step away, and it announced nothing.
+     *
+     * The only other `unattended` producer is the socket closing. So an operator who finished a
+     * conversation, released the agent and left the terminal open left their counterparty reading
+     * `attended` — "a person is watching" — indefinitely. That is the exact false reassurance the
+     * three-value design exists to prevent, arriving from the most deliberate action of the three.
+     *
+     * Read AFTER the selection is cleared, for the same reason the disconnect path reads after
+     * `forgetConnection`: a co-attended agent is legitimate and permanent, and a count taken before
+     * would report an absence while a sibling connection is still reading.
+     */
+    if (countAttendance(perConnectionState, fromAgent) === 0) {
+      sessionNodeManager.announceAttendance(fromAgent, "unattended");
+    }
     getNotificationDispatcher().setCurrentAgent(connectionId, null);
     getNotificationDispatcher().dispatchAgentCurrentChanged(connectionId, fromAgent, null);
     logger.info("agent.current.released", { connectionId, fromAgent });

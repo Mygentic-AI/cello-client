@@ -1389,6 +1389,10 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       receivers: this.#receivers,
       witness: this.#witness,
       contentIn: this.#contentIn,
+      // DOD-M15-AWAYSCOPE-1: injected, and the daemon sets it in the composition root. The manager
+      // cannot answer it — attendance is an IPC-layer fact (who has claimed this agent), and this
+      // class is deliberately connection-agnostic.
+      currentAttendance: (agentName: string) => this.#currentAttendance(agentName),
       db: () => this.#db,
 
       activeNodes: this.#activeNodes,
@@ -2405,6 +2409,20 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
    * a send that fails is logged at debug inside the client. The cost of every failure is the same
    * and it is small: the counterparty reads "unknown" until the next notice.
    */
+  /**
+   * DOD-M15-AWAYSCOPE-1 — who answers "is anyone attending this agent". Set by the daemon.
+   *
+   * Defaults to `unattended` rather than throwing or guessing `attended`: before the composition
+   * root wires it, the truthful answer is that nobody has claimed anything. Defaulting the other
+   * way would tell a counterparty a person is watching during exactly the window in which the
+   * daemon has not finished starting.
+   */
+  #currentAttendance: (agentName: string) => "attended" | "unattended" | "offline" = () => "unattended";
+
+  setCurrentAttendanceSource(fn: (agentName: string) => "attended" | "unattended" | "offline"): void {
+    this.#currentAttendance = fn;
+  }
+
   announceAttendance(agentName: string, attendance: "attended" | "unattended" | "offline"): void {
     // The separator is `#k`'s own `\x1f`, not a colon — a colon is legal inside an agent name and
     // the map has never used one. Getting this wrong is silent: the loop matches nothing and every
@@ -2435,7 +2453,6 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     const record = this.getSessionRecord(agentName, sessionId);
     if (!record) return null;
     return entry.relayClient.queryLiveness(
-      entry.node,
       entry.relaySessionIdBytes,
       Uint8Array.from(Buffer.from(record.counterparty_pubkey, "hex")),
     );

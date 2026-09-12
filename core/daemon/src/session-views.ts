@@ -308,7 +308,12 @@ export function createSessionViews(deps: SessionViewsDeps) {
         ...s,
         relayLiveness: a.liveness,
         ...(a.observedAt > 0 ? { relayObservedAt: a.observedAt } : {}),
+        // BOTH, and they are different facts. `relayObservedAt` is when the relay last saw the
+        // connection change; `attendanceObservedAt` is when the agent last said something about
+        // itself. Labelling the attendance with the first dates an absence to a time before it was
+        // true, and the number then never moves when the operator steps away again.
         ...(a.attendance ? { counterpartyAttendance: a.attendance } : {}),
+        ...(a.attendanceObservedAt !== undefined ? { attendanceObservedAt: a.attendanceObservedAt } : {}),
       };
     });
   }

@@ -301,6 +301,23 @@ async function startDaemonHoldingLock(
     getDeliveryBookmark, advanceDeliveryBookmark, safeWatermarkAdvance,
   } = startBootConnectionState({ sessionNodeManager });
 
+  /**
+   * DOD-M15-AWAYSCOPE-1 — the one answer to "is anyone attending this agent", wired once here.
+   *
+   * It lives in the composition root because it needs both halves and neither owns the other: the
+   * per-connection selections (an IPC-layer fact) and the operator's explicit offline switch.
+   * `offline` is checked FIRST — an agent taken down on purpose is not merely unwatched, and
+   * reporting it as `unattended` tells the counterparty their message will be read later, which is
+   * the opposite of what the switch means.
+   */
+  const currentAttendance = (agentName: string): "attended" | "unattended" | "offline" =>
+    explicitlyOfflineAgents.has(agentName)
+      ? "offline"
+      : countAttendance(perConnectionState, agentName) > 0
+        ? "attended"
+        : "unattended";
+  sessionNodeManager.setCurrentAttendanceSource(currentAttendance);
+
   // 040-DAEMONROOT unit 6: attendance and the away reply → attendance-wiring.ts.
   // DOD-M15-AWAYSCOPE-1 took the one-shot rejection out, and with it every seal dependency this
   // wiring used to hold — it can no longer initiate a seal at all, which is the point.

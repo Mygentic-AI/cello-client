@@ -291,8 +291,17 @@ export interface ActiveSessionInfo {
    * session is the normal case. Absent when there was no relay to ask or the probe did not answer.
    */
   relayLiveness?: "alive" | "gone" | "unknown";
-  /** Unix ms of that relay observation. Absent when the relay has none. */
+  /** Unix ms of that relay observation — when it last saw the CONNECTION change. */
   relayObservedAt?: number;
+  /**
+   * Unix ms at which the far daemon made its attendance assertion.
+   *
+   * ⚠️ NOT `relayObservedAt`, and they are routinely hours apart. The relay sees an agent connect at
+   * 09:00; its operator steps away at 11:30. Dating the attendance 09:00 reports a state as of a
+   * time before it was true, and the number never moves when they step away again — so an operator
+   * watching it sees a frozen clock and reads it as stale data rather than as a current absence.
+   */
+  attendanceObservedAt?: number;
   /**
    * DOD-M15-AWAYSCOPE-1 — the counterparty daemon's own assertion about itself.
    *

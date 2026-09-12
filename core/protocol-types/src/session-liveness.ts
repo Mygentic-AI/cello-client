@@ -68,6 +68,19 @@ export interface SessionLivenessResponse {
    * for why refusing beats trimming.
    */
   attendance?: SessionAttendance;
+  /**
+   * When the far daemon made that assertion.
+   *
+   * ⚠️ NOT `observed_at`, AND THE TWO ARE ROUTINELY HOURS APART. `observed_at` is when the relay
+   * last saw that agent's CONNECTION change; this is when the agent last said something about
+   * itself. The relay sees you connect at 09:00 and you step away at 11:30 — labelling the
+   * attendance "as of 09:00" reports a state as of a time before it was true, and it never moves
+   * when you step away again, so a counterparty watching the number sees a frozen clock.
+   *
+   * Rides with `attendance` and is absent whenever it is, for the same reason: a daemon that is not
+   * asserting anything has no assertion to have timestamped.
+   */
+  attendance_observed_at?: number;
 }
 
 /**
@@ -147,6 +160,7 @@ export function encodeSessionLivenessResponse(frame: SessionLivenessResponse): U
     // older relay omits it entirely, and a build that can be told apart from an older one by the
     // shape of its silence is a build whose silence means two different things.
     ...(frame.attendance !== undefined ? { attendance: frame.attendance } : {}),
+    ...(frame.attendance_observed_at !== undefined ? { attendance_observed_at: frame.attendance_observed_at } : {}),
   }) as Uint8Array;
 }
 
@@ -183,11 +197,19 @@ export function decodeSessionLivenessResponse(bytes: Uint8Array): SessionLivenes
    * stale attendance onto a counterparty's view.
    */
   const attendance = o["attendance"];
+  const attendance_observed_at = o["attendance_observed_at"];
   if (attendance !== undefined) {
     if (!isAttendance(attendance)) return null;
     if (liveness !== "alive") return null;
-    return { type: "session_liveness_response", session_id, counterparty_pubkey, liveness, observed_at, attendance };
+    // The timestamp is REQUIRED alongside an attendance and refused without it. An attendance with
+    // no age is not actionable — "nobody is watching" is a different instruction at thirty seconds
+    // old and at two days — and accepting a bare one would make a build that cannot supply the age
+    // indistinguishable from one whose clock failed to.
+    if (typeof attendance_observed_at !== "number") return null;
+    return { type: "session_liveness_response", session_id, counterparty_pubkey, liveness, observed_at, attendance, attendance_observed_at };
   }
+  // And the reverse: a timestamp with nothing to date is a field that can only mislead.
+  if (attendance_observed_at !== undefined) return null;
   return { type: "session_liveness_response", session_id, counterparty_pubkey, liveness, observed_at };
 }
 

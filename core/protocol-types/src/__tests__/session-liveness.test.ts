@@ -118,14 +118,34 @@ describe("session_liveness_response codec", () => {
 describe("DOD-M15-AWAYSCOPE-1: attendance on the liveness response", () => {
   const base = { type: "session_liveness_response" as const, session_id: SID, counterparty_pubkey: PUB, observed_at: 1_700_000_000_000 };
 
-  it("★★ round-trips all three attendance values under liveness 'alive'", () => {
+  it("★★ round-trips all three attendance values under liveness 'alive', each with its own age", () => {
     for (const attendance of ["attended", "unattended", "offline"] as const) {
       const decoded = decodeSessionLivenessResponse(
-        encodeSessionLivenessResponse({ ...base, liveness: "alive", attendance }),
+        encodeSessionLivenessResponse({ ...base, liveness: "alive", attendance, attendance_observed_at: 1_700_000_009_999 }),
       );
       expect(decoded, `attendance ${attendance} did not survive the round trip`).not.toBeNull();
       expect(decoded!.attendance).toBe(attendance);
+      // NOT `observed_at`. That one is when the RELAY last saw the connection change; this is when
+      // the agent last said something about itself, and they are routinely hours apart.
+      expect(decoded!.attendance_observed_at).toBe(1_700_000_009_999);
+      expect(decoded!.observed_at).toBe(base.observed_at);
     }
+  });
+
+  it("★★ an attendance with NO age is refused, and an age with no attendance is too", () => {
+    /**
+     * Both directions, because each is a different lie. An attendance with no age is not actionable
+     * — "nobody is watching" is a different instruction at thirty seconds old and at two days — and
+     * accepting a bare one makes a build that cannot supply the age indistinguishable from one
+     * whose clock failed to. An age with nothing to date can only mislead the reader about which
+     * fact it belongs to, and this frame already carries a second timestamp it could be read as.
+     */
+    expect(decodeSessionLivenessResponse(
+      encodeCborForTest({ ...base, liveness: "alive", attendance: "unattended" }),
+    ), "an attendance with no age").toBeNull();
+    expect(decodeSessionLivenessResponse(
+      encodeCborForTest({ ...base, liveness: "alive", attendance_observed_at: 1 }),
+    ), "an age with no attendance").toBeNull();
   });
 
   it("★★ an OMITTED attendance decodes as absent, not as a default", () => {
@@ -145,7 +165,7 @@ describe("DOD-M15-AWAYSCOPE-1: attendance on the liveness response", () => {
     // the order forbids: it would let a modified peer pin a stale attendance by pairing it with a
     // liveness the relay would never have sent.
     for (const liveness of ["gone", "unknown"] as const) {
-      const bytes = encodeSessionLivenessResponse({ ...base, liveness, attendance: "attended" });
+      const bytes = encodeSessionLivenessResponse({ ...base, liveness, attendance: "attended", attendance_observed_at: 1 });
       expect(decodeSessionLivenessResponse(bytes), `${liveness} + attendance must not decode`).toBeNull();
     }
   });
@@ -153,7 +173,7 @@ describe("DOD-M15-AWAYSCOPE-1: attendance on the liveness response", () => {
   it("★★ an unrecognised attendance value fails exactly like a malformed frame", () => {
     // No best-effort accept: an attendance this build does not understand is not evidence of
     // anything, and passing it through as a string would put an unvalidated value on a status line.
-    const bytes = encodeCborForTest({ ...base, liveness: "alive", attendance: "busy" });
+    const bytes = encodeCborForTest({ ...base, liveness: "alive", attendance: "busy", attendance_observed_at: 1 });
     expect(decodeSessionLivenessResponse(bytes)).toBeNull();
   });
 

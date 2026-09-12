@@ -606,7 +606,12 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
     return sessions.map((s) => {
       const a = byId.get(s.sessionId);
       if (!a?.attendance) return s;
-      return { ...s, counterpartyAttendance: a.attendance, attendanceObservedAt: a.observedAt };
+      // The ASSERTION's age, not the relay's connection observation — see ActiveSessionInfo.
+      return {
+        ...s,
+        counterpartyAttendance: a.attendance,
+        ...(a.attendanceObservedAt !== undefined ? { attendanceObservedAt: a.attendanceObservedAt } : {}),
+      };
     });
   }
 

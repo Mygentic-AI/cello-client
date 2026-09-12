@@ -57,12 +57,28 @@ import type { SessionOwnChainStore } from "./session-own-chain-store.js";
  * relay does not know" can, and a log line that conflated them would send the next investigation
  * looking at the counterparty instead of at the session id.
  */
+/**
+ * The key an answer is matched to its question by: the two fields the RESPONSE carries back. One
+ * relay client serves every session an agent holds there, so two concurrent queries on one stream
+ * is ordinary — and an answer routed to whatever was asked last shows the wrong counterparty's row.
+ */
+function livenessKey(sessionId: Uint8Array, counterpartyPubkey: Uint8Array): string {
+  return `${Buffer.from(sessionId).toString("hex")}:${Buffer.from(counterpartyPubkey).toString("hex")}`;
+}
+
 export interface LivenessAnswer {
   liveness: SessionLiveness;
   /** Unix ms of the relay's most recent observation. 0 when it has none. */
   observedAt: number;
   /** The far daemon's own assertion. Absent unless `liveness` is 'alive'. */
   attendance?: SessionAttendance;
+  /**
+   * When the far daemon made that assertion — NOT `observedAt`, which is when the relay last saw
+   * its connection change. The two are routinely hours apart: the relay sees you connect at 09:00
+   * and you step away at 11:30, and labelling the attendance with 09:00 reports a state as of a
+   * time before it was true. Absent whenever `attendance` is.
+   */
+  attendanceObservedAt?: number;
   /** True when the relay refused to answer rather than answering "I don't know". */
   refused?: true;
 }
@@ -712,11 +728,17 @@ export class AgentRelayClient {
    */
   #pendingRelease: ((released: boolean) => void) | null = null;
   /**
-   * DOD-M15-AWAYSCOPE-1 — the in-flight liveness query, keyed by nothing, because there is at most
-   * one. A second concurrent query on the same shared stream would need correlation ids, and the
-   * caller (`cello status`, `cello sessions`) asks one session at a time.
+   * DOD-M15-AWAYSCOPE-1 — in-flight liveness queries, keyed `sessionIdHex:counterpartyHex`.
+   *
+   * ⚠️ A MAP, NOT A SLOT, and the first version was a slot. One `AgentRelayClient` serves EVERY
+   * session an agent holds on a relay and both callers fan out with `Promise.all`, so `cello status`
+   * with two open conversations fired two queries on one stream: the second overwrote the first's
+   * resolver, the first answer resolved the WRONG session's promise, and the other waited the full
+   * submit timeout — blowing the caller's budget so every row came back unenriched. With more than
+   * one session the feature did nothing, and when it did something it could show the wrong
+   * counterparty. The key is what the RESPONSE carries, so an answer is matched to its question.
    */
-  #pendingLiveness: ((r: LivenessAnswer) => void) | null = null;
+  #pendingLiveness = new Map<string, (r: LivenessAnswer) => void>();
   /** Serializes submits so only one is in flight at a time across all sessions. */
   #submitChain: Promise<unknown> = Promise.resolve();
   /** session_id hex → { the live node to (re)dial from, inbound leaf handler, Option-B assignment to present }. */
@@ -1178,26 +1200,47 @@ export class AgentRelayClient {
        * session the caller is not in, and it deliberately does not say which of the two reasons —
        * so the honest local answer is "unknown", not a hang until the timeout.
        */
-      const r = this.#pendingLiveness; this.#pendingLiveness = null;
-      if (r) {
-        if (type === "session_liveness_refused") {
-          r({ liveness: "unknown", observedAt: 0, refused: true });
+      /**
+       * ⚠️ A REFUSAL NAMES NOTHING, so it cannot be matched. The relay refuses without echoing the
+       * session or the subject — deliberately, because telling "no such session" from "not your
+       * session" is the enumeration signal `DOD-M15-RELAYAUTH-1` closed. So there is nothing to key
+       * on, and the only sound reading is that every outstanding query on this stream was refused:
+       * the refusal is a property of the CALLER, and the caller is the same for all of them.
+       */
+      if (type === "session_liveness_refused") {
+        for (const r of this.#pendingLiveness.values()) r({ liveness: "unknown", observedAt: 0, refused: true });
+        this.#pendingLiveness.clear();
+      } else {
+        const decoded = decodeSessionLivenessResponse(encodeCbor(frame));
+        if (decoded === null) {
+          // Malformed fails exactly like missing. A frame this build cannot read is not evidence of
+          // anything, and reporting it as 'gone' would invent an observation nobody made. It also
+          // cannot be matched to a waiter, so every outstanding query is answered 'unknown' rather
+          // than left to time out on a stream that just proved it speaks a shape we cannot read.
+          this.#logger.warn("session.relay.liveness.response_malformed", {
+            relayPeerId: this.#relayPeerId,
+            impact: "the counterparty's reachability is reported as unknown, which is what it is",
+          });
+          for (const r of this.#pendingLiveness.values()) r({ liveness: "unknown", observedAt: 0 });
+          this.#pendingLiveness.clear();
         } else {
-          const decoded = decodeSessionLivenessResponse(encodeCbor(frame));
-          if (decoded === null) {
-            // Malformed fails exactly like missing. A frame this build cannot read is not evidence
-            // of anything, and reporting it as 'gone' would invent an observation nobody made.
-            this.#logger.warn("session.relay.liveness.response_malformed", {
-              relayPeerId: this.#relayPeerId,
-              impact: "the counterparty's reachability is reported as unknown, which is what it is",
-            });
-            r({ liveness: "unknown", observedAt: 0 });
-          } else {
+          // MATCHED ON WHAT THE ANSWER ITSELF NAMES. Resolving the most recent waiter instead would
+          // be right exactly once — when only one query is outstanding — and silently wrong the
+          // moment an agent holds two conversations through one relay, which is ordinary.
+          const key = livenessKey(decoded.session_id, decoded.counterparty_pubkey);
+          const r = this.#pendingLiveness.get(key);
+          if (r) {
+            this.#pendingLiveness.delete(key);
             r({
               liveness: decoded.liveness,
               observedAt: decoded.observed_at,
               ...(decoded.attendance !== undefined ? { attendance: decoded.attendance } : {}),
+              ...(decoded.attendance_observed_at !== undefined ? { attendanceObservedAt: decoded.attendance_observed_at } : {}),
             });
+          } else {
+            // A late answer to a query that already timed out, or one nobody asked for. Dropped —
+            // handing it to a different session's waiter is exactly the defect this key exists for.
+            this.#logger.debug("session.relay.liveness.response_unmatched", { relayPeerId: this.#relayPeerId });
           }
         }
       }
@@ -1777,14 +1820,13 @@ export class AgentRelayClient {
    *
    * ── FIRE AND FORGET, AND THAT IS THE DESIGN ─────────────────────────────────────────────────────
    *
-   * Nothing is awaited and the relay sends no ack. The notice may be dropped, duplicated, or arrive
-   * out of order; `observed_at` settles it, last-write-wins. A failure here is logged at DEBUG and
-   * changes nothing the operator is doing — the cost is that their counterparty reads "unknown"
-   * until the next notice, which is the truth about what this relay knows.
+   * Nothing is awaited and the relay sends no ack. The notice may be dropped, duplicated or arrive
+   * out of order; `observed_at` settles it, last-write-wins. A failure changes nothing the operator
+   * is doing — the counterparty reads "unknown" until the next notice, which is what is true.
    *
-   * ⚠️ NO RETRY, NO QUEUE, and the reason is the defect above. Anything that made this reliable would
-   * want ordering, ordering wants a witness, and a witnessed position is how machine chatter reached
-   * the leaf set in the first place. A status hint that is allowed to be lost is the safe shape.
+   * ⚠️ NO RETRY, NO QUEUE. Anything that made this reliable would want ordering, ordering wants a
+   * witness, and a witnessed position is how machine chatter reached the leaf set. A status hint
+   * that is allowed to be lost is the safe shape.
    */
   announceAttendance(
     node: CelloNode,
@@ -1824,31 +1866,52 @@ export class AgentRelayClient {
   /**
    * DOD-M15-AWAYSCOPE-1 — ask the relay about the counterparty: reachable, and attended?
    *
-   * Two different facts with two different producers, which is why they are separate fields.
-   * `liveness` is the RELAY's own observation — it either holds that agent's standing connection or
-   * it does not. `attendance` is the far DAEMON's assertion about itself, which this relay was told
-   * and is repeating; it is absent whenever `liveness` is not 'alive', because a daemon nobody can
-   * reach is not asserting anything.
+   * Two facts with two producers, which is why they are separate fields. `liveness` is the RELAY's
+   * observation — it holds that agent's standing connection or it does not. `attendance` is the far
+   * DAEMON's assertion about itself, which the relay was told and repeats; absent whenever
+   * `liveness` is not 'alive', because a daemon nobody can reach asserts nothing.
    *
-   * ⚠️ EVERY FAILURE ANSWERS 'unknown', and never 'gone'. A timeout, a dead stream, a refusal and a
-   * frame this build cannot parse all mean "this side learned nothing" — reporting any of them as
-   * `gone` would invent an observation nobody made, and `gone` is the one value that tells an
-   * operator their counterparty has left.
+   * ⚠️ EVERY FAILURE ANSWERS 'unknown', never 'gone'. A timeout, a dead stream, a refusal and an
+   * unparseable frame all mean "this side learned nothing"; reporting any as `gone` invents an
+   * observation nobody made, and `gone` is the value that tells an operator their peer has left.
    */
+  /**
+   * Test-only seams for the liveness query path, which cannot be reached any other way.
+   *
+   * ⚠️ THEY EXIST BECAUSE A ONE-SESSION FAKE HID A REAL DEFECT. Every other test of this feature
+   * stubs `queryLiveness` outright, so the code that matches an ANSWER to its QUESTION never ran —
+   * and it was wrong: a single resolver slot handed one session's answer to another session's
+   * promise the moment an agent held two conversations through one relay, which is ordinary.
+   * Reaching that code needs a live stream and a dispatched frame, and both are private.
+   *
+   * Named `ForTest` like `__setLastActivityAtForTest` and `patchRelayClientForTest`, and doing
+   * nothing production does not: one installs the stream a dial would have produced, the other
+   * feeds the reader loop a frame the relay would have sent.
+   */
+  installStreamForTest(stream: Stream): void { this.#stream = stream; }
+  dispatchForTest(frame: Record<string, unknown>): void { this.#dispatch(frame); }
+
   async queryLiveness(
-    node: CelloNode,
     sessionId: Uint8Array,
     counterpartyPubkey: Uint8Array,
   ): Promise<LivenessAnswer> {
     const unknown: LivenessAnswer = { liveness: "unknown", observedAt: 0 };
     if (this.#closed) return unknown;
-    if (!(await this.#ensureConnected(node))) return unknown;
+    /**
+     * ⚠️ IT DOES NOT DIAL — the one place in this client that refuses to connect. Every other caller
+     * here does the operator's work; this one serves a READ (`cello status`, `cello sessions`), and
+     * a status command that opens a connection as a side effect changes what it is reporting on. It
+     * would also make a read of a dozen sessions pay a dial each, against a budget measured in what
+     * a person waits at a terminal. The cost is small and precise: right after a daemon restart a
+     * status read says 'unknown' instead of dialling; the first real message establishes the stream.
+     */
     const stream = this.#stream;
     if (!stream) return unknown;
 
     let resolveLiveness!: (r: LivenessAnswer) => void;
     const answer = new Promise<LivenessAnswer>((r) => { resolveLiveness = r; });
-    this.#pendingLiveness = resolveLiveness;
+    const key = livenessKey(sessionId, counterpartyPubkey);
+    this.#pendingLiveness.set(key, resolveLiveness);
     try {
       stream.send(lp.encode.single(encodeSessionLivenessQuery({
         type: "session_liveness_query",
@@ -1856,7 +1919,7 @@ export class AgentRelayClient {
         counterparty_pubkey: counterpartyPubkey,
       })));
     } catch (err: unknown) {
-      if (this.#pendingLiveness === resolveLiveness) this.#pendingLiveness = null;
+      this.#pendingLiveness.delete(key);
       this.#logger.debug("session.relay.liveness.query_failed", {
         relayPeerId: this.#relayPeerId, error: extractErrorMessage(err),
       });
@@ -1870,7 +1933,7 @@ export class AgentRelayClient {
         // NOT a stream reset, for the same reason a release timeout is not: a liveness query is not
         // ordered against anything, so tearing the shared stream down would cost every sibling
         // session its in-flight submits to tidy up one status read.
-        if (this.#pendingLiveness === resolveLiveness) this.#pendingLiveness = null;
+        this.#pendingLiveness.delete(key);
         this.#logger.debug("session.relay.liveness.query_timeout", { relayPeerId: this.#relayPeerId });
         return unknown;
       }
@@ -2180,7 +2243,7 @@ export class AgentRelayClient {
         { const r = this.#pendingRelease; this.#pendingRelease = null; if (r) r(false); }
         // DOD-M15-AWAYSCOPE-1: and an in-flight liveness query, so a status read does not wait its
         // whole timeout on a stream that is already gone. "unknown" is the honest answer.
-        { const r = this.#pendingLiveness; this.#pendingLiveness = null; if (r) r({ liveness: "unknown", observedAt: 0 }); }
+        { for (const r of this.#pendingLiveness.values()) r({ liveness: "unknown", observedAt: 0 }); this.#pendingLiveness.clear(); }
         // A pure-receiver session issues no submit, so it would never trigger a re-dial
         // after the node that owned the stream is torn down. If sessions remain, proactively
         // re-establish from any still-live registered session node so queued leaf_delivers

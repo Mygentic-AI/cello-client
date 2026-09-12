@@ -203,10 +203,45 @@ describe("DOD-M15-AWAYSCOPE-1: the daemon announces its own attendance, and neve
       .toEqual(["offline"]);
   });
 
+  it("★★ RELEASING the agent announces 'unattended' — the gesture an operator makes on purpose", async () => {
+    /**
+     * ⚠️ THIS ONE ANNOUNCED NOTHING, and it is the most deliberate of the three. `cello_stop_using_agent`
+     * is what an operator runs to step away; the only other `unattended` producer is the socket
+     * closing. So finishing a conversation, releasing the agent and leaving the terminal open left
+     * the counterparty reading `attended` — "a person is watching" — for as long as the terminal
+     * stayed open. That is the exact false reassurance three values exist to prevent.
+     */
+    const { fake } = await setup();
+    const client = await connectAs("alice");
+    await wait(50);
+    fake.announced.length = 0;
+
+    await client.send("cello_stop_using_agent", {});
+    await wait(100);
+
+    expect(fake.announced.map((a) => a.attendance)).toEqual(["unattended"]);
+  });
+
+  it("★★ releasing ONE of two attendees announces nothing — the other is still reading", async () => {
+    const { fake } = await setup();
+    const first = await connectAs("alice");
+    await connectAs("alice");
+    await wait(50);
+    fake.announced.length = 0;
+
+    await first.send("cello_stop_using_agent", {});
+    await wait(100);
+
+    expect(fake.announced, "co-attendance is legitimate and permanent").toEqual([]);
+  });
+
   it("★★ cello_status reports the far side as online-but-unattended, with what the relay observed", async () => {
     const { fake } = await setup();
     const client = await connectAs("alice");
-    fake.answer.value = { liveness: "alive", observedAt: 1_700_000_000_000, attendance: "unattended" };
+    fake.answer.value = {
+      liveness: "alive", observedAt: 1_700_000_000_000,
+      attendance: "unattended", attendanceObservedAt: 1_700_000_055_555,
+    };
 
     const res = (await client.send("cello_status", {})) as Record<string, unknown>;
     const active = res["active_sessions"] as Array<Record<string, unknown>>;
@@ -215,19 +250,34 @@ describe("DOD-M15-AWAYSCOPE-1: the daemon announces its own attendance, and neve
     expect(mine!["counterpartyAttendance"], "this is what the operator reads instead of a message").toBe("unattended");
     expect(mine!["relayLiveness"]).toBe("alive");
     expect(mine!["relayObservedAt"], "as of a timestamp — a status with no age is not actionable").toBe(1_700_000_000_000);
+    /**
+     * ⚠️ TWO TIMESTAMPS, AND THE RIGHT ONE IS SHOWN. The first version labelled the attendance with
+     * the RELAY's observation — when it last saw the connection change. Those are routinely hours
+     * apart: the relay sees you connect at 09:00 and you step away at 11:30, so the counterparty
+     * read "unattended, as of 09:00" — a time before it was true — and the number never moved when
+     * you stepped away again. The fake returns two DIFFERENT values precisely so a test that
+     * conflated them could not pass.
+     */
+    expect(mine!["attendanceObservedAt"], "the age of the ASSERTION, not of the connection observation")
+      .toBe(1_700_000_055_555);
   });
 
   it("★★ cello_list_sessions carries it too, because that is where an agent looks", async () => {
     const { fake } = await setup();
     const client = await connectAs("alice");
-    fake.answer.value = { liveness: "alive", observedAt: 1_700_000_000_001, attendance: "unattended" };
+    fake.answer.value = {
+      liveness: "alive", observedAt: 1_700_000_000_001,
+      attendance: "unattended", attendanceObservedAt: 1_700_000_066_666,
+    };
 
     const res = (await client.send("cello_list_sessions", { filter: "all" })) as Record<string, unknown>;
     const sessions = res["sessions"] as Array<Record<string, unknown>>;
     const mine = sessions.find((s) => s["sessionId"] === SID_HEX);
     expect(mine).toBeDefined();
     expect(mine!["counterpartyAttendance"]).toBe("unattended");
-    expect(mine!["attendanceObservedAt"]).toBe(1_700_000_000_001);
+    // The assertion's own age, not the relay's connection observation — the two values differ here
+    // on purpose, so a handler that passed the wrong one through cannot pass this test.
+    expect(mine!["attendanceObservedAt"]).toBe(1_700_000_066_666);
   });
 
   it("★★ the daemon-wide listing carries it too — one field, not one per surface", async () => {
