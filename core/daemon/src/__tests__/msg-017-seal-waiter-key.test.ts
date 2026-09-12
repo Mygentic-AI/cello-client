@@ -40,6 +40,9 @@ const CARRY = [1, 2, 3].map((n) => ({
   relayId: "relay-1",
   relayTimestamp: 1_700_000_000_000 + n,
   relaySignatureHex: "cc".repeat(64),
+  // 069-ORDERPROOF: a witnessed leaf carries the running root the relay bound into its signature.
+  // Without it this fixture models a PRE-069 carry, which the escalation refuses by name.
+  relayRunningRootHex: "ab".repeat(32),
 }));
 
 /** The production key. Mirrors `sealKey` in seal-coordinator.ts. */

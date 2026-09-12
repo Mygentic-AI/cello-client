@@ -73,6 +73,12 @@ export class SessionLeafRecords {
    */
   readonly #sessionGenesis = new Map<string, Uint8Array>();
   /**
+   * 069-ORDERPROOF — session key → the assigned relay's ack-signing pubkey, hex. The in-memory half
+   * of the anchor, written before the session row exists for exactly the reason the genesis map
+   * above is.
+   */
+  readonly #sessionRelayAnchor = new Map<string, string>();
+  /**
    * The session's genesis prev_root — what its FIRST message acknowledges, before anything has been
    * received (033-ACKEMIT).
    *
@@ -127,6 +133,61 @@ export class SessionLeafRecords {
     if (bytes && bytes.length === 32) return bytes;
     return undefined;
   }
+  /**
+   * 069-ORDERPROOF — the relay key this session's ordering attestations are checked against.
+   *
+   * Read in the SAME ORDER as the genesis next door, and for the same reasons: the live assignment
+   * first because it is authoritative, then the in-memory record (written before the session ROW
+   * exists), then the row (the restart case, where nothing else holds it).
+   *
+   * `undefined` means this session has no anchor — a direct session, or one opened before this
+   * order. The caller does not paper over that: an attestation arriving on such a session is
+   * refused by name rather than verified against whatever key it supplies.
+   */
+  sessionRelayAnchor(agentName: string, sessionId: string): string | undefined {
+    const live = this.#ctx.activeEntry(this.#ctx.sessionKey(agentName, sessionId))?.relayAssignment?.relayPubkeyHex;
+    if (live) return live;
+    const recorded = this.#sessionRelayAnchor.get(this.#ctx.sessionKey(agentName, sessionId));
+    if (recorded) return recorded;
+    const row = this.#db
+      ?.prepare("SELECT relay_anchor_hex FROM sessions WHERE agent_id = ? AND session_id = ?")
+      .get(this.#ctx.requireAgentId(agentName), sessionId) as { relay_anchor_hex?: unknown } | undefined;
+    const stored = row?.relay_anchor_hex;
+    // A stored value of the wrong shape is not a key. Refusing it here sends the caller down its
+    // own named refusal rather than verifying signatures against 17 bytes.
+    return typeof stored === "string" && /^[0-9a-f]{64}$/i.test(stored) ? stored : undefined;
+  }
+
+  /**
+   * Record the relay anchor, in memory first and durably second — the same split, and the same
+   * reason, as `persistGenesisPrevRoot`: the value is read when the session registers, which is
+   * before the session row exists.
+   */
+  persistRelayAnchor(agentName: string, sessionId: string, relayAnchorHex: string | undefined): void {
+    if (!relayAnchorHex || !/^[0-9a-f]{64}$/i.test(relayAnchorHex)) return;
+    this.#sessionRelayAnchor.set(this.#ctx.sessionKey(agentName, sessionId), relayAnchorHex);
+    if (!this.#db) return;
+    try {
+      this.#db
+        .prepare("UPDATE sessions SET relay_anchor_hex = ? WHERE agent_id = ? AND session_id = ? AND relay_anchor_hex IS NULL")
+        .run(relayAnchorHex, this.#ctx.requireAgentId(agentName), sessionId);
+    } catch (err: unknown) {
+      /**
+       * LOUD, AND IT DOES NOT BLOCK. Losing this row costs the session its ordering evidence after
+       * a restart — every send is then refused for want of an anchor — and that is a smaller harm
+       * than failing the session open in progress. ERROR because it is invisible until a restart.
+       */
+      this.#ctx.logger.error("session.relay_anchor.persist.failed", {
+        agentName, sessionId,
+        error: extractErrorMessage(err),
+        impact:
+          "the relay this session is witnessed by was not written to the database. Everything works " +
+          "until this daemon restarts; after that every message on this session is refused because " +
+          "the daemon cannot say which relay's ordering signature to trust.",
+      });
+    }
+  }
+
   persistGenesisPrevRoot(agentName: string, sessionId: string, assignment: RelayAssignmentCarry): void {
     let genesis: Uint8Array;
     try {
@@ -209,10 +270,14 @@ export class SessionLeafRecords {
     participantA: Uint8Array,
     participantB: Uint8Array,
     sessionTimestamp: number,
+    relayAnchorHex?: string,
   ): void {
     this.persistGenesisPrevRoot(agentName, sessionId, {
       participantA, participantB, sessionTimestamp,
     } as RelayAssignmentCarry);
+    // 069-ORDERPROOF: the anchor is recorded at the same moment and from the same signed
+    // assignment, so a session can never hold one without the other.
+    this.persistRelayAnchor(agentName, sessionId, relayAnchorHex);
   }
   /**
    * Test seam: put the session's genesis prev_root where a completed session open leaves it —

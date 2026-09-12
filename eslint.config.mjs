@@ -296,6 +296,8 @@ export default [
     //       count of it true, so it is deliberately given as a magnitude rather than a figure that
     //       silently rots.)
     files: ["core/daemon/src/session-node-manager.ts"],
+    // 3,387 → 3,390 (069-ORDERPROOF, +3): the delegator for the session's relay anchor — the key its
+    // ordering attestations verify under, which the seal and revive paths read from the session row.
     // 3,392 → 3,296 (DOD-M15-CLOSEDSESSION-1): thirty-seven trivial delegators collapsed to the
     // one-line form. A ratchet only ever shrinks, so it comes down with the file.
     //
@@ -323,7 +325,7 @@ export default [
     // that read it, its eviction on teardown, and one delegator. It is what stops a close signing a
     // root the relay's leaf set can never match, which cost a receipt on both sides on 2026-09-11.
     // Same bound as its neighbours; only ever shrinks.
-    rules: { "max-lines": ["error", { max: 3387, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 3390, skipBlankLines: false, skipComments: false }] },
   },
   {
     // 040-DAEMONROOT, lowered every unit; the target is under 1,000 and this pin is what stops the
@@ -360,7 +362,15 @@ export default [
      * rather than a slot, and why this is the one caller in the file that refuses to dial.
      */
     files: ["core/daemon/src/session-relay-client.ts"],
-    rules: { "max-lines": ["error", { max: 3027, skipBlankLines: false, skipComments: false }] },
+    // 3,143 → 3,167 (069-ORDERPROOF, +24): the anchor becomes a registerSession parameter carried
+    // across re-registration, because a revived session and every seal leaf register with no
+    // assignment in hand and would otherwise have nothing to check the relay's signature against.
+    // 3,027 → 3,143 (069-ORDERPROOF, +116): the recipient now keeps the relay's ordering proof
+    // too, verified against the directory-named relay key rather than the one in the frame. That is
+    // a second capture site on the delivery path plus the anchor lookup, and the refusal notes on
+    // both — which differ, because a refusal costs OUR send its witness and must not cost THEIRS
+    // its delivery.
+    rules: { "max-lines": ["error", { max: 3167, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/session-views.ts"],
@@ -400,7 +410,10 @@ export default [
   },
   {
     files: ["core/daemon/src/directory-connect.ts"],
-    rules: { "max-lines": ["error", { max: 120, skipBlankLines: false, skipComments: false }] },
+    // 120 → 129 (069-ORDERPROOF, +9): the assignment carry is built for either of two independent
+    // reasons now — something to present to the relay, or the name of the relay whose attestations
+    // this session accepts. Requiring both let a relay opt out of being checked by omitting one.
+    rules: { "max-lines": ["error", { max: 129, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/connection-agents.ts"],
@@ -448,7 +461,9 @@ export default [
   },
   {
     files: ["core/daemon/src/agent-admin-handlers.ts"],
-    rules: { "max-lines": ["error", { max: 130, skipBlankLines: false, skipComments: false }] },
+    // 130 → 133 (069-ORDERPROOF, +3): the relay-receipts surface returns the running root, without
+    // which a caller re-verifying an attestation from outside cannot rebuild the signed bytes.
+    rules: { "max-lines": ["error", { max: 133, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/status-handler.ts"],
@@ -489,7 +504,12 @@ export default [
   },
   {
     files: ["core/daemon/src/session-relay.ts"],
-    rules: { "max-lines": ["error", { max: 1798, skipBlankLines: false, skipComments: false }] },
+    // 1,811 → 1,814 (069-ORDERPROOF, +3): the anchor is passed at every registration site, including
+    // the revive path that has no assignment.
+    // 1,798 → 1,811 (069-ORDERPROOF, +13): the test seam that attaches a relay client can now also
+    // supply the session's anchor, because a fixture that built its node without a relay assignment
+    // has none — and every submit on such a session is refused for want of one.
+    rules: { "max-lines": ["error", { max: 1814, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/session-content-send.ts"],
@@ -502,12 +522,14 @@ export default [
   },
   {
     files: ["core/daemon/src/session-seal.ts"],
+    // 1,206 → 1,209 (069-ORDERPROOF, +3): the seal's ctrl leaf is submitted like any other and needs
+    // the same anchor; it carries no assignment, so it comes from the session's durable record.
     // 1,112 → 1,206 (DOD-M15-SEALPRECOND-1, +94): the fourth term in `sealReadiness`, its own state
     // on the status surface, the settle wait on the responder auto-acknowledge — the one seal
     // submission site that had no gate at all — and, after the unit review, the refusal inside
     // `submitSealLeaf` that makes the precondition hold by construction for every seal site rather
     // than by a hand-kept enumeration. Same bound as above; only ever shrinks.
-    rules: { "max-lines": ["error", { max: 1206, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 1209, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/*/src/__tests__/**/*.ts"],

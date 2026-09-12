@@ -39,7 +39,7 @@ import { describe, it, expect } from "vitest";
 import { generateKeypair } from "@cello-protocol/crypto";
 import { decodeStructure1 } from "@cello-protocol/protocol-types";
 import { AgentRelayClient, LEAF_KIND_MSG } from "../session-relay-client.js";
-import { makeFakeRelay, tick, noopLogger } from "./relay-client-fake.js";
+import { makeFakeRelay, tick, noopLogger, fakeRelayAnchor, fakeRelayAttestation } from "./relay-client-fake.js";
 
 /**
  * The session's starting point. A recognisable fill rather than zeros: an all-zero value is what an
@@ -67,7 +67,10 @@ async function connected(): Promise<{
     logger: noopLogger,
   });
   const relay = makeFakeRelay();
-  client.registerSession(SID_HEX, relay.node, undefined, undefined, GENESIS);
+  // 069-ORDERPROOF: the session is registered WITH its assignment anchor, so the client has the
+  // directory's word on which relay may attest. Without one every submit below is refused for want
+  // of an anchor — which is the correct behaviour, and not what these tests are about.
+  client.registerSession(SID_HEX, relay.node, undefined, await fakeRelayAnchor(), GENESIS);
 
   let seq = 0;
   /** Submit a leaf and let the fake relay acknowledge it, so the chain advances as it would live. */
@@ -81,7 +84,11 @@ async function connected(): Promise<{
       await tick();
     }
     seq += 1;
-    relay.push({ type: "hash_submit_ack", sequence_number: seq });
+    relay.push({
+      type: "hash_submit_ack",
+      sequence_number: seq,
+      ...(await fakeRelayAttestation(SID, contentHash, seq)),
+    });
     return (await p) as { ok: boolean };
   };
 
@@ -179,7 +186,7 @@ describe("DOD-M15-SELFCHAIN-1: what this agent signs as its own self link", () =
       logger: noopLogger,
     });
     const relay = makeFakeRelay();
-    client.registerSession(SID_HEX, relay.node, undefined, undefined, GENESIS);
+    client.registerSession(SID_HEX, relay.node, undefined, await fakeRelayAnchor(), GENESIS);
 
     const first = new Uint8Array(32).fill(0x11);
     const p1 = client.submitMessageHash(relay.node, SID, first, LEAF_KIND_MSG);
@@ -196,7 +203,7 @@ describe("DOD-M15-SELFCHAIN-1: what this agent signs as its own self link", () =
 
     const p2 = client.submitMessageHash(relay.node, SID, first, LEAF_KIND_MSG);
     await tick();
-    relay.push({ type: "hash_submit_ack", sequence_number: 1 });
+    relay.push({ type: "hash_submit_ack", sequence_number: 1, ...(await fakeRelayAttestation(SID, first, 1)) });
     expect((await p2).ok).toBe(true);
 
     const submits = relay.sentFrames.filter((f) => f["type"] === "hash_submit");
@@ -227,14 +234,15 @@ describe("DOD-M15-SELFCHAIN-1: what this agent signs as its own self link", () =
     });
     const relay = makeFakeRelay();
     // A session WITH a starting point first, so the stream can be authenticated at all…
-    client.registerSession(SID_HEX, relay.node, undefined, undefined, GENESIS);
-    const warmup = client.submitMessageHash(relay.node, SID, new Uint8Array(32).fill(9), LEAF_KIND_MSG);
+    client.registerSession(SID_HEX, relay.node, undefined, await fakeRelayAnchor(), GENESIS);
+    const warmupHash = new Uint8Array(32).fill(9);
+    const warmup = client.submitMessageHash(relay.node, SID, warmupHash, LEAF_KIND_MSG);
     await tick();
     relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
     await tick();
     relay.push({ type: "relay_auth_ok" });
     await tick();
-    relay.push({ type: "hash_submit_ack", sequence_number: 1 });
+    relay.push({ type: "hash_submit_ack", sequence_number: 1, ...(await fakeRelayAttestation(SID, warmupHash, 1)) });
     expect((await warmup).ok).toBe(true);
     const framesBefore = relay.sentFrames.filter((f) => f["type"] === "hash_submit").length;
 

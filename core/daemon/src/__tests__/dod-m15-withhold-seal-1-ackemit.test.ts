@@ -24,9 +24,9 @@ import { describe, it, expect, afterEach } from "vitest";
 import { decode } from "cbor-x";
 import * as lp from "it-length-prefixed";
 import { encodeCbor, encodeStructure1, computeGenesisPrevRoot, STRUCTURE1_VERSION } from "@cello-protocol/protocol-types";
-import { generateKeypair, sealSessionContent, buildRelayAckTbs } from "@cello-protocol/crypto";
+import { generateKeypair, sealSessionContent } from "@cello-protocol/crypto";
 import { AgentRelayClient, LEAF_KIND_MSG } from "../session-relay-client.js";
-import { makeFakeRelay, tick, noopLogger } from "./relay-client-fake.js";
+import { makeFakeRelay, tick, noopLogger, fakeRelayAnchor, pushAck } from "./relay-client-fake.js";
 import { DatabaseSync } from "node:sqlite";
 import { SessionSealLeafStore } from "../session-seal-leaf-store.js";
 import { RelayReceiptStore } from "../relay-receipt-store.js";
@@ -37,7 +37,8 @@ import { wireContentHash } from "../wire-content-hash.js";
 import { relayAckHashRefusalNotice } from "../refusal-reasons.js";
 import { SESSION_CONTENT_ENCRYPTION_V1 } from "../content-encryption-status.js";
 
-const SID = "3c".repeat(32);
+// 16 bytes — the shape a directory actually mints. See the note in the sealwire held-authorship test.
+const SID = "3c".repeat(16);
 const PEER = "12D3KooWQYV9dGMFoRzNStwpXztXaBUjtPqi6aMghfATmPnRAENn";
 const BODY = new TextEncoder().encode("the message they would rather the receipt did not contain");
 /** The key `createSession` agrees for content encryption — the fixture's completed key exchange. */
@@ -104,7 +105,19 @@ async function submittedStructure1(opts: { genesis?: Uint8Array; deliverFirst?: 
   const relay = makeFakeRelay();
   const sid = Uint8Array.from(Buffer.from(SID, "hex"));
   const sidHex = SID;
-  client.registerSession(sidHex, relay.node, undefined, undefined, opts.genesis);
+  /**
+   * The anchor rides ONLY when this fixture is exercising a real send — 069-ORDERPROOF.
+   *
+   * The carry is also what a session's starting point is DERIVED from when none is supplied, so
+   * attaching one to the no-seed case would hand that test a genesis and quietly turn it into a
+   * test of a chainable session. The no-seed case refuses before anything reaches the relay, so it
+   * needs no anchor.
+   */
+  client.registerSession(
+    sidHex, relay.node, undefined,
+    opts.genesis ? await fakeRelayAnchor() : undefined,
+    opts.genesis,
+  );
 
   let submit = client.submitMessageHash(relay.node, sid, wireContentHash(BODY), LEAF_KIND_MSG);
   await tick();
@@ -112,7 +125,7 @@ async function submittedStructure1(opts: { genesis?: Uint8Array; deliverFirst?: 
   await tick();
   relay.push({ type: "relay_auth_ok" });
   await tick();
-  relay.push({ type: "hash_submit_ack", sequence_number: 9 });
+  await pushAck(relay, sid, 9);
   let result = await submit;
 
   if (opts.deliverFirst) {
@@ -148,7 +161,7 @@ async function submittedStructure1(opts: { genesis?: Uint8Array; deliverFirst?: 
     await tick();
     submit = client.submitMessageHash(relay.node, sid, wireContentHash(BODY), LEAF_KIND_MSG);
     await tick();
-    relay.push({ type: "hash_submit_ack", sequence_number: 10 });
+    await pushAck(relay, sid, 10);
     result = await submit;
   }
   client.close();
@@ -384,7 +397,7 @@ describe("034-CARRYLEAF — a message its sender never witnessed is witnessed by
     });
     const relay = makeFakeRelay();
     const sid = Uint8Array.from(Buffer.from(SID, "hex"));
-    client.registerSession(SID, relay.node, undefined, undefined, GENESIS);
+    client.registerSession(SID, relay.node, undefined, await fakeRelayAnchor(), GENESIS);
 
     const submit = client.witnessReceivedLeaf(relay.node, sid, contentHash, LEAF_KIND_MSG, {
       structure1Cbor: theirClaim,
@@ -395,7 +408,7 @@ describe("034-CARRYLEAF — a message its sender never witnessed is witnessed by
     await tick();
     relay.push({ type: "relay_auth_ok" });
     await tick();
-    relay.push({ type: "hash_submit_ack", sequence_number: 4 });
+    await pushAck(relay, sid, 4);
     const res = await submit;
     client.close();
 
@@ -455,8 +468,6 @@ describe("034-CARRYLEAF — a message its sender never witnessed is witnessed by
     });
     const authorSig = await author.sign(withheld);
 
-    const relayKp = generateKeypair();
-    const relayIdHex = Buffer.from(await relayKp.getPublicKey()).toString("hex");
     const us = generateKeypair();
     const usPub = await us.getPublicKey();
     const db = new DatabaseSync(":memory:") as unknown as ConstructorParameters<typeof SessionSealLeafStore>[0];
@@ -473,7 +484,7 @@ describe("034-CARRYLEAF — a message its sender never witnessed is witnessed by
     });
     const relay = makeFakeRelay();
     const sid = Uint8Array.from(Buffer.from(SID, "hex"));
-    client.registerSession(SID, relay.node, undefined, undefined, GENESIS);
+    client.registerSession(SID, relay.node, undefined, await fakeRelayAnchor(), GENESIS);
 
     const submit = client.witnessReceivedLeaf(relay.node, sid, contentHash, LEAF_KIND_MSG, {
       structure1Cbor: withheld,
@@ -485,16 +496,10 @@ describe("034-CARRYLEAF — a message its sender never witnessed is witnessed by
     relay.push({ type: "relay_auth_ok" });
     await tick();
     const seq = 7;
-    const ts = 12345;
     const s2 = encodeCbor([seq, authorPub, contentHash, authorSig]) as Uint8Array;
-    relay.push({
-      type: "hash_submit_ack",
-      sequence_number: seq,
-      structure2_cbor: s2,
-      relay_id: relayIdHex,
-      timestamp: ts,
-      relay_signature: await relayKp.sign(buildRelayAckTbs(contentHash, seq, ts)),
-    });
+    // 069-ORDERPROOF: a real attestation over the real statement, signed by the relay this
+    // session's assignment names. `structure2_cbor` is the only thing this test overrides.
+    await pushAck(relay, sid, seq, { structure2_cbor: s2 });
     expect((await submit).ok, "the witness submit must be acked").toBe(true);
     await tick();
     client.close();
@@ -566,7 +571,7 @@ describe("034-CARRYLEAF — a message its sender never witnessed is witnessed by
     });
     const relay = makeFakeRelay();
     const sid = Uint8Array.from(Buffer.from(SID, "hex"));
-    client.registerSession(SID, relay.node, undefined, undefined, GENESIS);
+    client.registerSession(SID, relay.node, undefined, await fakeRelayAnchor(), GENESIS);
 
     // Get the client connected, then deliver OUR OWN leaf — witnessed by somebody else, so we
     // never saw an ack for it. This is exactly what a counter-submit by the counterparty produces.
@@ -576,7 +581,7 @@ describe("034-CARRYLEAF — a message its sender never witnessed is witnessed by
     await tick();
     relay.push({ type: "relay_auth_ok" });
     await tick();
-    relay.push({ type: "hash_submit_ack", sequence_number: 1 });
+    await pushAck(relay, sid, 1);
     await warm;
 
     relay.push({

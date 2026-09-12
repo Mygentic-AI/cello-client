@@ -25,7 +25,7 @@ import { createHash } from "node:crypto";
 import { generateKeypair } from "@cello-protocol/crypto";
 import { encodeCbor } from "@cello-protocol/protocol-types";
 import { AgentRelayClient, type RelayWitnessAlert } from "../session-relay-client.js";
-import { makeFakeRelay, tick, noopLogger } from "./relay-client-fake.js";
+import { makeFakeRelay, tick, noopLogger, fakeRelayAnchor, pushAck } from "./relay-client-fake.js";
 
 const SESSION_ID = new Uint8Array(16).fill(0x2f);
 const SESSION_HEX = Buffer.from(SESSION_ID).toString("hex");
@@ -67,7 +67,7 @@ async function connectedClient(opts: {
     ...(opts.onWitnessAlert ? { onWitnessAlert: opts.onWitnessAlert } : {}),
     ...(opts.onWitnessUnreadable ? { onWitnessUnreadable: opts.onWitnessUnreadable } : {}),
   });
-  client.registerSession(SESSION_HEX, relay.node, undefined, undefined, new Uint8Array(32).fill(0x9c));
+  client.registerSession(SESSION_HEX, relay.node, undefined, await fakeRelayAnchor(), new Uint8Array(32).fill(0x9c));
   // Drive the handshake so the reader loop is live and dispatching inbound frames.
   const submit = client.submitMessageHash(relay.node, SESSION_ID, new Uint8Array(32).fill(3));
   await tick();
@@ -75,7 +75,7 @@ async function connectedClient(opts: {
   await tick();
   relay.push({ type: "relay_auth_ok" });
   await tick();
-  relay.push({ type: "hash_submit_ack", sequence_number: 1 });
+  await pushAck(relay, SESSION_ID, 1);
   expect((await submit).ok, "precondition: the client must be authenticated and reading").toBe(true);
   return { client, relay };
 }
@@ -267,7 +267,7 @@ describe("DOD-M15-CORROBORATE-1 (client): a relay's witness alert reaches the op
     // And the session still works: the next send is submitted and acked as normal.
     const next = client.submitMessageHash(relay.node, SESSION_ID, new Uint8Array(32).fill(4));
     await tick();
-    relay.push({ type: "hash_submit_ack", sequence_number: 2 });
+    await pushAck(relay, SESSION_ID, 2);
     const res = await next;
     expect(res.ok, "the session must still carry traffic after an alert").toBe(true);
     client.close();

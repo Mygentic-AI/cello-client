@@ -58,14 +58,23 @@ export function createDirectoryConnect(deps: DirectoryConnectDeps) {
         reason: "relay_mode_assignment_without_directory_signature",
       });
     }
-    const carry: RelayAssignmentCarry | undefined = relayDirSig
+    /**
+     * 069-ORDERPROOF: the carry now exists for EITHER of two independent reasons — something to
+     * present to the relay, or the name of the relay whose ordering attestations this session will
+     * accept. Requiring both would mean a session that knows its relay but has no per-node
+     * signature verifies nothing at all, which hands the relay a way to opt out of being checked.
+     */
+    const relayAnchorHex =
+      assignment.relay_id && /^[0-9a-f]{64}$/i.test(assignment.relay_id) ? assignment.relay_id : undefined;
+    const carry: RelayAssignmentCarry | undefined = relayDirSig || relayAnchorHex
       ? {
           participantA: assignment.participant_a.pubkey,
           participantB: assignment.participant_b.pubkey,
           sessionTimestamp: assignment.session_timestamp,
           initiatorSessionPeerId: assignment.initiator_session_peer_id,
           counterpartySessionPeerId: assignment.counterparty_session_peer_id,
-          assignmentSignature: relayDirSig,
+          ...(relayDirSig ? { assignmentSignature: relayDirSig } : {}),
+          ...(relayAnchorHex ? { relayPubkeyHex: relayAnchorHex } : {}),
         }
       : undefined;
     return {

@@ -433,7 +433,10 @@ export class SessionNodeManager {
   clearOfferedDialer(agentName: string, sessionIdHex: string): void { return this.#receivers.clearOfferedDialer(agentName, sessionIdHex); }
   revokeOfferedDialer(agentName: string, sessionIdHex: string, offeredPeerId: string | null): void { return this.#receivers.revokeOfferedDialer(agentName, sessionIdHex, offeredPeerId); }
   /** ─── DELEGATORS — the leaf-record API other files call ─────────────────────────────── */
-recordSessionGenesis(agentName: string, sessionId: string, participantA: Uint8Array, participantB: Uint8Array, sessionTimestamp: number): void { return this.#leafRecords.recordSessionGenesis(agentName, sessionId, participantA, participantB, sessionTimestamp); }
+recordSessionGenesis(agentName: string, sessionId: string, participantA: Uint8Array, participantB: Uint8Array, sessionTimestamp: number, relayAnchorHex?: string): void { return this.#leafRecords.recordSessionGenesis(agentName, sessionId, participantA, participantB, sessionTimestamp, relayAnchorHex); }
+
+  /** 069-ORDERPROOF: the relay key this session's ordering attestations are verified against. */
+  sessionRelayAnchor(agentName: string, sessionId: string): string | undefined { return this.#leafRecords.sessionRelayAnchor(agentName, sessionId); }
   setSessionGenesisForTest(agentName: string, sessionId: string, genesis: Uint8Array): void { return this.#leafRecords.setSessionGenesisForTest(agentName, sessionId, genesis); }
   recordCertifiedLeafSet(agentName: string, sessionId: string, signedLeaves: readonly SealFrontierLeaf[], sealedRootHex: string, correlationId?: string): boolean { return this.#leafRecords.recordCertifiedLeafSet(agentName, sessionId, signedLeaves, sealedRootHex, correlationId); }
   noteCertifiedLeafSetUnavailable(agentName: string, sessionId: string, state: "not_carried_absent_party" | "not_carried_present_party", detail: string): void { return this.#leafRecords.noteCertifiedLeafSetUnavailable(agentName, sessionId, state, detail); }

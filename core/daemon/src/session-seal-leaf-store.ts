@@ -35,6 +35,12 @@ export interface SealCarryLeaf {
   relayTimestamp?: number;
   /** Hex of the 64-byte relay ACK signature (own leaves only). */
   relaySignatureHex?: string;
+  /**
+   * 069-ORDERPROOF: hex of the 32-byte running root the relay bound into its attestation for this
+   * position (own leaves only). Part of the signed statement, so without it the directory cannot
+   * rebuild the bytes and refuses the leaf as unwitnessed.
+   */
+  relayRunningRootHex?: string;
 }
 
 const CREATE_SQL = `
@@ -49,6 +55,9 @@ const CREATE_SQL = `
     relay_id          TEXT,
     relay_timestamp   INTEGER,
     relay_signature   TEXT,
+    -- 069-ORDERPROOF. NULLABLE: rows written before this order keep working, and a session created
+    -- before it still opens, reads and seals bilaterally exactly as it did.
+    relay_running_root TEXT,
     stored_at         INTEGER NOT NULL,
     PRIMARY KEY (agent_pubkey, session_id, sequence_number)
   );
@@ -62,6 +71,22 @@ export class SessionSealLeafStore {
     this.#db = db;
     this.#logger = logger;
     this.#db.exec(CREATE_SQL);
+    this.#migrateRunningRoot();
+  }
+
+  /**
+   * 069-ORDERPROOF: add `relay_running_root` to a table created before this order. `CREATE TABLE IF
+   * NOT EXISTS` leaves an existing table untouched, so without this an upgraded daemon would write
+   * to a column that is not there. Idempotent, additive and nullable — no row is rewritten and no
+   * existing evidence is invalidated.
+   */
+  #migrateRunningRoot(): void {
+    const cols = new Set(
+      (this.#db.prepare(`PRAGMA table_info(session_seal_leaves)`).all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    if (!cols.has("relay_running_root")) {
+      this.#db.exec(`ALTER TABLE session_seal_leaves ADD COLUMN relay_running_root TEXT`);
+    }
   }
 
   /**
@@ -73,8 +98,8 @@ export class SessionSealLeafStore {
     const info = this.#db
       .prepare(
         `INSERT OR IGNORE INTO session_seal_leaves
-           (agent_pubkey, session_id, sequence_number, leaf_kind, sender_pubkey_hex, structure2_cbor, structure1_cbor, relay_id, relay_timestamp, relay_signature, stored_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (agent_pubkey, session_id, sequence_number, leaf_kind, sender_pubkey_hex, structure2_cbor, structure1_cbor, relay_id, relay_timestamp, relay_signature, relay_running_root, stored_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         agentPubkeyHex,
@@ -87,6 +112,7 @@ export class SessionSealLeafStore {
         leaf.relayId ?? null,
         leaf.relayTimestamp ?? null,
         leaf.relaySignatureHex ?? null,
+        leaf.relayRunningRootHex ?? null,
         storedAtMs,
       );
     return Number(info.changes) > 0;
@@ -100,7 +126,7 @@ export class SessionSealLeafStore {
   getCarry(agentPubkeyHex: string, sessionIdHex: string): SealCarryLeaf[] {
     const rows = this.#db
       .prepare(
-        `SELECT sequence_number, leaf_kind, sender_pubkey_hex, structure2_cbor, structure1_cbor, relay_id, relay_timestamp, relay_signature
+        `SELECT sequence_number, leaf_kind, sender_pubkey_hex, structure2_cbor, structure1_cbor, relay_id, relay_timestamp, relay_signature, relay_running_root
            FROM session_seal_leaves WHERE agent_pubkey = ? AND session_id = ? ORDER BY sequence_number ASC`,
       )
       .all(agentPubkeyHex, sessionIdHex) as Array<Record<string, unknown>>;
@@ -113,6 +139,7 @@ export class SessionSealLeafStore {
       relayId: (r.relay_id as string | null) ?? undefined,
       relayTimestamp: (r.relay_timestamp as number | null) ?? undefined,
       relaySignatureHex: (r.relay_signature as string | null) ?? undefined,
+      relayRunningRootHex: (r.relay_running_root as string | null) ?? undefined,
     }));
   }
 }

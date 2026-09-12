@@ -68,11 +68,15 @@ import { Encoder, decode } from "cbor-x";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
 import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
+import { fakeRelayAttestation } from "./relay-client-fake.js";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
 /** The peer id `two-connection-fixture` configures when `relay: true`. */
 const FIXTURE_RELAY_PEER = "12D3KooWFixtureRelay";
-const SID = "b7".repeat(32);
+// 16 bytes, which is what a session id IS (CONTEXT.md). It was 32 here, a shape the directory
+// never mints, and 069-ORDERPROOF surfaced it: the relay attestation binds the session id and
+// refuses a wrong-length one rather than hashing it.
+const SID = "b7".repeat(16);
 
 /**
  * An acking relay whose first assigned sequence is `startSeq + 1`.
@@ -99,7 +103,26 @@ function makeAckingRelay(startSeq: number) {
             const u8 = chunk instanceof Uint8Array ? chunk : (chunk as { subarray(): Uint8Array }).subarray();
             const frame = decode(u8) as Record<string, unknown>;
             if (frame["type"] === "relay_auth_response") push({ type: "relay_auth_ok" });
-            else if (frame["type"] === "hash_submit") push({ type: "hash_submit_ack", sequence_number: ++seq });
+            // 069-ORDERPROOF: a session registered with its assignment anchor presents it and waits.
+            else if (frame["type"] === "client_record_assignment") push({ type: "assignment_ok" });
+            else if (frame["type"] === "hash_submit") {
+              /**
+               * 069-ORDERPROOF: the ack carries a real ordering attestation, signed over the hash
+               * this submit actually named. The client refuses a position no assigned relay
+               * attested, so a bare `{ sequence_number }` would put every test in this file on the
+               * unwitnessed-relay path rather than the held-leaf path they are about.
+               */
+              const s1 = frame["structure1_cbor"];
+              const fields = s1 instanceof Uint8Array ? (decode(s1) as unknown[]) : [];
+              const contentHash = fields[1] instanceof Uint8Array ? (fields[1] as Uint8Array) : new Uint8Array(32);
+              const sidBytes = frame["session_id"] instanceof Uint8Array ? (frame["session_id"] as Uint8Array) : new Uint8Array(16);
+              const n = ++seq;
+              push({
+                type: "hash_submit_ack",
+                sequence_number: n,
+                ...(await fakeRelayAttestation(sidBytes, contentHash, n)),
+              });
+            }
           }
         })();
       },

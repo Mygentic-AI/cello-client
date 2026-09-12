@@ -45,6 +45,9 @@ const CARRY = [1, 2, 3].map((n) => ({
   relayId: "relay-1",
   relayTimestamp: 1_700_000_000_000 + n,
   relaySignatureHex: "cc".repeat(64),
+  // 069-ORDERPROOF: a witnessed leaf carries the running root the relay bound into its signature.
+  // Without it this fixture models a PRE-069 carry, which the escalation refuses by name.
+  relayRunningRootHex: "ab".repeat(32),
 }));
 const SEALED_ROOT = "cd".repeat(32);
 
@@ -222,6 +225,7 @@ describe("DOD-M12B-INTERRUPTED-ESCALATE-1: an interrupted close can earn a recei
       sequenceNumber: 4, leafKind: 0x02, senderPubkeyHex: "11".repeat(32),
       structure2Cbor: new Uint8Array([4]), structure1Cbor: new Uint8Array([4, 4]),
       relayId: "relay-1", relayTimestamp: 1_700_000_000_004, relaySignatureHex: "cc".repeat(64),
+      relayRunningRootHex: "ab".repeat(32),
     }];
     const h = harness({
       flow: { ok: true, sessionId: SESSION, status: "seal_interrupted_pending" },
@@ -438,6 +442,7 @@ describe("DOD-M12B-PENDING-EXIT-1: a seal_interrupted_pending session can finall
       sequenceNumber: 4, leafKind: 0x02, senderPubkeyHex: "22".repeat(32),
       structure2Cbor: new Uint8Array([4]), structure1Cbor: new Uint8Array([4, 4]),
       relayId: "relay-1", relayTimestamp: 1_700_000_000_004, relaySignatureHex: "dd".repeat(64),
+      relayRunningRootHex: "ab".repeat(32),
     };
     const h = harness({
       status: "seal_interrupted_pending",

@@ -198,6 +198,10 @@ export function parseSessionAssignment(
    */
   const highStakes = typeof raw["high_stakes"] === "boolean" ? raw["high_stakes"] : undefined;
   const priorRelayId = typeof raw["prior_relay_id"] === "string" ? raw["prior_relay_id"] : undefined;
+  // 069-ORDERPROOF: read the same way and for the same reason — `""` is the ANSWER "this session
+  // has no relay", not an absence. Mapping it to `undefined` would take the verifier to the
+  // 12-field layout while the directory signed 13, and every direct session would fail to verify.
+  const relayId = typeof raw["relay_id"] === "string" ? raw["relay_id"] : undefined;
 
   const common = {
     session_id: sessionId,
@@ -216,6 +220,7 @@ export function parseSessionAssignment(
     transport_mode: transportMode,
     high_stakes: highStakes,
     prior_relay_id: priorRelayId,
+    relay_id: relayId,
   };
 
   if (sigType === "frost") {

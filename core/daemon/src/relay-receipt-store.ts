@@ -1,14 +1,26 @@
 /**
- * CELLO Daemon — RelayReceiptStore (M8B DOD-RELAYSIG-1)
+ * CELLO Daemon — RelayReceiptStore (DOD-M15-ORDERPROOF-1, was M8B DOD-RELAYSIG-1)
  *
  * The relay is the ordering/witness authority: it assigns a canonical sequence number to each submitted
- * content-hash leaf and signs an ACK over it (PERSIST-012, relay-node `buildRelayAckTbs`). This store is the
+ * content-hash leaf and signs an ATTESTATION over it (relay-node `buildRelayAckTbs`). This store is the
  * client's IMMUTABLE record of those signed attestations — durable evidence that the relay assigned a
  * specific sequence to a specific hash at a specific time. The receipt is what lets the client later prove
  * (or dispute) the relay's ordering, and is the building block the client carries to the directory at seal
  * time (OPTIONB-SEAL-1) instead of the directory dialing the relay.
  *
  * Verification is an Ed25519 check that MUST stay byte-compatible with the relay's signer.
+ *
+ * ⚠️ **THE KEY IT IS CHECKED AGAINST IS THE POINT — 069-ORDERPROOF.** This module used to verify the
+ * signature against `relay_id`, a key carried inside the very frame being checked, and its own comment
+ * called that "SELF-CONSISTENCY". It is not a check: anyone who can write the frame can mint a key, sign
+ * any ordering they like with it, and put the key in the field we verify against. The key now comes from
+ * `relay_id` on the **directory-signed `SessionAssignment`**, which is inside the FROST-signed TBS the
+ * client already verifies — something neither the relay nor either participant can rewrite.
+ *
+ * ⚠️ **AND ABSENT IS NOT FINE.** Missing, malformed and mismatched are ONE outcome (`refused`), because
+ * a party holding no attestation for a message is in exactly the state a corrupted one leaves them in.
+ * Whoever can cause the absence must not get a softer answer than whoever can cause the corruption — and
+ * the party who can cause the absence is the relay, the party the check exists to constrain.
  *
  * IMMUTABILITY (SI-003): the unique unit of a relay attestation is a POSITION — (agent, session, sequence)
  * — not a content hash. The same plaintext ("ok") legitimately produces the same content hash at DIFFERENT
@@ -39,6 +51,14 @@ export interface RelayReceipt {
   sequenceNumber: number;
   /** Unix ms timestamp embedded in the ACK TBS. */
   timestamp: number;
+  /**
+   * 069-ORDERPROOF — hex of the 32-byte running root of this session's tree AFTER this leaf was
+   * appended, as the relay signed it. The position alone says where a leaf sits in a COUNTER; the
+   * root says where it sits in a CHAIN, which is what lets a party prove a prefix once the relay is
+   * gone. Optional on the TYPE only so rows written before this order still read; every row this
+   * build writes has one.
+   */
+  runningRootHex?: string;
   /** Hex of the 64-byte Ed25519 signature over the ACK TBS. */
   signatureHex: string;
   // FED-OPTIONB-SEAL-001 — the per-leaf bytes a UNILATERAL seal carries so the directory rebuilds the
@@ -66,64 +86,120 @@ export interface SealLeaf extends RelayReceipt {
 }
 
 /**
- * Verify a relay ACK signature against the (relayId-derived) relay pubkey. Returns true iff the signature
- * is exactly 64 bytes and Ed25519-verifies over TBS = SHA-256(hash_bytes || seq_BE4 || ts_BE8) — the same
- * TBS the relay signs (`buildRelayAckTbs`). A forged sequence number changes the TBS, so its signature fails.
+ * Verify a relay ordering attestation against a relay pubkey the CALLER supplies — and the caller
+ * must have got it from the directory-signed assignment, never from the frame.
+ *
+ * Returns true iff every field is well-formed and the 64-byte Ed25519 signature verifies over
+ * TBS = SHA-256(DOMAIN ‖ session_id ‖ content_hash ‖ seq_BE4 ‖ running_root ‖ ts_BE8) — the same
+ * statement the relay signs. A forged sequence, a swapped session or a rewritten prefix all change
+ * the TBS, so each fails.
+ *
+ * A wrong-length field returns FALSE rather than throwing: these bytes come off a wire the relay
+ * controls, and a malformed length must refuse this attestation, not take down the frame handler.
  */
 export function verifyRelayAck(
+  sessionId: Uint8Array,
   contentHash: Uint8Array,
   sequenceNumber: number,
+  runningRoot: Uint8Array,
   timestamp: number,
   signature: Uint8Array,
   relayPubkey: Uint8Array,
 ): boolean {
   if (signature.length !== 64) return false;
-  const tbs = buildRelayAckTbs(contentHash, sequenceNumber, timestamp);
+  if (sessionId.length !== 16 || contentHash.length !== 32 || runningRoot.length !== 32) return false;
+  const tbs = buildRelayAckTbs(sessionId, contentHash, sequenceNumber, runningRoot, timestamp);
   return verify(relayPubkey, tbs, signature);
 }
+
+/** Why an attestation was refused. For the LOG — the protocol outcome is identical for all of them. */
+export type AckRefusalCause =
+  /** This session has no directory-named relay key recorded, so nothing can anchor the check. */
+  | "no_anchor"
+  /** The frame named a relay other than the one the directory assigned to this session. */
+  | "relay_not_assigned"
+  /** `relay_id` was present but is not a 64-hex Ed25519 pubkey. */
+  | "bad_relay_id"
+  /** No signature, no timestamp, or no running root — the relay attested nothing. */
+  | "attestation_absent"
+  /** The signature does not bind (session, hash, sequence, root, timestamp) under the assigned key. */
+  | "signature_invalid";
 
 /** The decision for one `hash_submit_ack` — pure + directly unit-testable (the verify-gates-store wiring). */
 export type AckEvaluation =
   | { kind: "store"; receipt: RelayReceipt }
-  /** The ACK carried no relay_id/signature/timestamp (a keyless/legacy relay) — nothing to attest. */
-  | { kind: "unsigned" }
-  /** relay_id is not a 64-hex Ed25519 pubkey. */
-  | { kind: "bad_relay_id" }
-  /** The signature does NOT bind (content_hash, sequence, timestamp) — a forged/corrupt ACK. REJECT. */
-  | { kind: "invalid_signature" };
+  /**
+   * REFUSED. One outcome for missing, malformed and mismatched — the caller must treat all three
+   * identically, and `cause` exists so the LOG can still name which one it was. A caller that
+   * branches on `cause` to soften any of them reintroduces exactly the hole this closes.
+   */
+  | { kind: "refused"; cause: AckRefusalCause };
 
 /**
- * Evaluate a relay ACK: decide whether it yields a storable, signature-verified receipt. This is the
- * verify-gates-store decision in isolation (so it is unit-testable without the relay stream) — a forged
- * signature returns `invalid_signature` and MUST NOT be stored (DoD: "a forged sequence is rejected").
+ * Evaluate a relay ordering attestation: decide whether it yields a storable, signature-verified
+ * receipt. This is the verify-gates-store decision in isolation, so it is unit-testable without the
+ * relay stream.
+ *
+ * `expectedRelayPubkeyHex` is the anchor and it is REQUIRED in substance: `undefined` refuses. It
+ * must come from `relay_id` on an assignment whose FROST signature has been verified.
  */
 export function evaluateRelayAck(params: {
+  sessionId: Uint8Array;
   contentHash: Uint8Array;
+  runningRoot: Uint8Array | undefined;
   sessionIdHex: string;
   agentPubkeyHex: string;
+  /** The relay the DIRECTORY assigned to this session, hex. Absent ⇒ nothing to anchor to ⇒ refuse. */
+  expectedRelayPubkeyHex: string | undefined;
   relayId: string | undefined;
   relaySignature: Uint8Array | undefined;
   timestamp: number | undefined;
   sequenceNumber: number;
 }): AckEvaluation {
-  const { contentHash, sessionIdHex, agentPubkeyHex, relayId, relaySignature, timestamp, sequenceNumber } = params;
-  if (!relayId || !relaySignature || timestamp === undefined) return { kind: "unsigned" };
-  if (!/^[0-9a-fA-F]{64}$/.test(relayId)) return { kind: "bad_relay_id" };
-  const relayPubkey = new Uint8Array(Buffer.from(relayId, "hex"));
-  if (!verifyRelayAck(contentHash, sequenceNumber, timestamp, relaySignature, relayPubkey)) {
-    return { kind: "invalid_signature" };
+  const {
+    sessionId, contentHash, runningRoot, sessionIdHex, agentPubkeyHex,
+    expectedRelayPubkeyHex, relayId, relaySignature, timestamp, sequenceNumber,
+  } = params;
+
+  if (!expectedRelayPubkeyHex || !/^[0-9a-fA-F]{64}$/.test(expectedRelayPubkeyHex)) {
+    return { kind: "refused", cause: "no_anchor" };
   }
+  /**
+   * THE FRAME'S OWN CLAIM IS COMPARED, NEVER TRUSTED. The signature below is verified against the
+   * directory's key regardless, so this comparison adds no security on its own — what it adds is a
+   * NAMED cause. A relay that has been replaced mid-session produces a valid signature under a key
+   * the directory never named, and "this is not the relay you were assigned" is the sentence an
+   * operator can act on. `undefined` is not a mismatch: a relay omitting the field does not get to
+   * skip the check, it simply gets checked against the anchor with no label.
+   */
+  if (relayId !== undefined) {
+    if (!/^[0-9a-fA-F]{64}$/.test(relayId)) return { kind: "refused", cause: "bad_relay_id" };
+    if (relayId.toLowerCase() !== expectedRelayPubkeyHex.toLowerCase()) {
+      return { kind: "refused", cause: "relay_not_assigned" };
+    }
+  }
+
+  if (!relaySignature || timestamp === undefined || !runningRoot) {
+    return { kind: "refused", cause: "attestation_absent" };
+  }
+
+  const relayPubkey = new Uint8Array(Buffer.from(expectedRelayPubkeyHex, "hex"));
+  if (!verifyRelayAck(sessionId, contentHash, sequenceNumber, runningRoot, timestamp, relaySignature, relayPubkey)) {
+    return { kind: "refused", cause: "signature_invalid" };
+  }
+
   return {
     kind: "store",
     receipt: {
       hashHex: Buffer.from(contentHash).toString("hex"),
       agentPubkeyHex,
       sessionIdHex,
-      relayId,
-      relayPubkeyHex: relayId,
+      relayId: expectedRelayPubkeyHex,
+      relayPubkeyHex: expectedRelayPubkeyHex,
       sequenceNumber,
       timestamp,
       signatureHex: Buffer.from(relaySignature).toString("hex"),
+      runningRootHex: Buffer.from(runningRoot).toString("hex"),
     },
   };
 }
@@ -139,6 +215,9 @@ const CREATE_RELAY_RECEIPTS_SQL = `
     relay_timestamp  INTEGER NOT NULL,
     signature_hex    TEXT    NOT NULL,
     stored_at        INTEGER NOT NULL,
+    -- 069-ORDERPROOF: the running root the relay signed alongside the position (nullable — rows
+    -- written before this order have none, and they stay readable and sealable exactly as they are).
+    running_root_hex TEXT,
     -- FED-OPTIONB-SEAL-001: per-leaf carry bytes for the unilateral-seal offline rebuild (nullable).
     structure2_cbor  BLOB,
     structure1_cbor  BLOB,
@@ -173,6 +252,10 @@ export class RelayReceiptStore {
       ["structure2_cbor", "BLOB"],
       ["structure1_cbor", "BLOB"],
       ["leaf_kind", "INTEGER"],
+      // 069-ORDERPROOF. NULLABLE, like the three above: a session that predates this order keeps
+      // every receipt it already holds, opens, reads and seals unchanged, and simply has no root
+      // recorded for those positions.
+      ["running_root_hex", "TEXT"],
     ] as const) {
       if (!cols.has(name)) {
         this.#db.exec(`ALTER TABLE relay_ack_receipts ADD COLUMN ${name} ${decl}`);
@@ -191,8 +274,8 @@ export class RelayReceiptStore {
     const info = this.#db
       .prepare(
         `INSERT OR IGNORE INTO relay_ack_receipts
-           (agent_pubkey, session_id, sequence_number, hash_hex, relay_id, relay_pubkey_hex, relay_timestamp, signature_hex, stored_at, structure2_cbor, structure1_cbor, leaf_kind)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (agent_pubkey, session_id, sequence_number, hash_hex, relay_id, relay_pubkey_hex, relay_timestamp, signature_hex, stored_at, structure2_cbor, structure1_cbor, leaf_kind, running_root_hex)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         receipt.agentPubkeyHex,
@@ -208,6 +291,7 @@ export class RelayReceiptStore {
         receipt.structure2Cbor ? Buffer.from(receipt.structure2Cbor) : null,
         receipt.structure1Cbor ? Buffer.from(receipt.structure1Cbor) : null,
         receipt.leafKind ?? null,
+        receipt.runningRootHex ?? null,
       );
     const wrote = Number(info.changes) > 0;
     if (!wrote && existing && existing.hashHex !== receipt.hashHex) {
@@ -228,7 +312,7 @@ export class RelayReceiptStore {
   get(agentPubkeyHex: string, sessionIdHex: string, sequenceNumber: number): RelayReceipt | undefined {
     const row = this.#db
       .prepare(
-        `SELECT agent_pubkey, session_id, sequence_number, hash_hex, relay_id, relay_pubkey_hex, relay_timestamp, signature_hex
+        `SELECT agent_pubkey, session_id, sequence_number, hash_hex, relay_id, relay_pubkey_hex, relay_timestamp, signature_hex, running_root_hex
            FROM relay_ack_receipts WHERE agent_pubkey = ? AND session_id = ? AND sequence_number = ?`,
       )
       .get(agentPubkeyHex, sessionIdHex, sequenceNumber) as Record<string, unknown> | undefined;
@@ -240,13 +324,13 @@ export class RelayReceiptStore {
     const rows = sessionIdHex
       ? this.#db
           .prepare(
-            `SELECT agent_pubkey, session_id, sequence_number, hash_hex, relay_id, relay_pubkey_hex, relay_timestamp, signature_hex
+            `SELECT agent_pubkey, session_id, sequence_number, hash_hex, relay_id, relay_pubkey_hex, relay_timestamp, signature_hex, running_root_hex
                FROM relay_ack_receipts WHERE agent_pubkey = ? AND session_id = ? ORDER BY sequence_number ASC`,
           )
           .all(agentPubkeyHex, sessionIdHex)
       : this.#db
           .prepare(
-            `SELECT agent_pubkey, session_id, sequence_number, hash_hex, relay_id, relay_pubkey_hex, relay_timestamp, signature_hex
+            `SELECT agent_pubkey, session_id, sequence_number, hash_hex, relay_id, relay_pubkey_hex, relay_timestamp, signature_hex, running_root_hex
                FROM relay_ack_receipts WHERE agent_pubkey = ? ORDER BY session_id, sequence_number ASC`,
           )
           .all(agentPubkeyHex);
@@ -262,7 +346,7 @@ export class RelayReceiptStore {
   getSealLeaves(agentPubkeyHex: string, sessionIdHex: string): SealLeaf[] {
     const rows = this.#db
       .prepare(
-        `SELECT agent_pubkey, session_id, sequence_number, hash_hex, relay_id, relay_pubkey_hex, relay_timestamp, signature_hex, structure2_cbor, structure1_cbor, leaf_kind
+        `SELECT agent_pubkey, session_id, sequence_number, hash_hex, relay_id, relay_pubkey_hex, relay_timestamp, signature_hex, running_root_hex, structure2_cbor, structure1_cbor, leaf_kind
            FROM relay_ack_receipts
           WHERE agent_pubkey = ? AND session_id = ? AND structure2_cbor IS NOT NULL AND structure1_cbor IS NOT NULL AND leaf_kind IS NOT NULL
           ORDER BY sequence_number ASC`,
@@ -286,6 +370,7 @@ export class RelayReceiptStore {
       sequenceNumber: row.sequence_number as number,
       timestamp: row.relay_timestamp as number,
       signatureHex: row.signature_hex as string,
+      ...(typeof row.running_root_hex === "string" ? { runningRootHex: row.running_root_hex } : {}),
     };
   }
 }

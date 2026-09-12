@@ -236,7 +236,10 @@ export class SessionSeal {
       // 033-ACKEMIT: the seal transport submits a ctrl leaf like any other, so it needs the same
       // acknowledgement seed. It carries no assignment of its own, so the genesis is supplied here
       // from the session's own active entry rather than derived inside the client.
-      client.registerSession(sessionId, node, undefined, undefined, this.#ctx.leafRecords.sessionGenesisPrevRoot(agentName, sessionId));
+      // 069-ORDERPROOF: the seal's ctrl leaf is submitted like any other and needs the same anchor.
+      // It carries no assignment, so this comes from the session's durable record — without it the
+      // relay's attestation for the SEAL leaf is refused and the close cannot settle.
+      client.registerSession(sessionId, node, undefined, undefined, this.#ctx.leafRecords.sessionGenesisPrevRoot(agentName, sessionId), this.#ctx.leafRecords.sessionRelayAnchor(agentName, sessionId));
     } else {
       /**
        * Review MEDIUM-1 — **A PATH THAT DECLINES TO FIX A LEAK MUST SAY SO.**

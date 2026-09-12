@@ -52,6 +52,7 @@ import type { SessionNegotiator } from "../transport-selector.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
 import type { SessionAssignment } from "@cello-protocol/protocol-types";
 import { registerFixtureSigner } from "./helpers/signed-assignment.js";
+import { fakeRelayAttestation, fakeRelayPubkeyHex } from "./relay-client-fake.js";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
@@ -73,8 +74,11 @@ const FAKE_RELAY_ADDR = "/ip4/127.0.0.1/tcp/1/p2p/fake-relay-seal-retry";
 
 /**
  * In-process fake relay: implements the relay side of the AgentRelayClient wire
- * contract (auth challenge → auth ok; hash_submit → unsigned hash_submit_ack).
- * Unsigned acks are accepted by evaluateRelayAck (kind "unsigned") — no relay key needed.
+ * contract (auth challenge → auth ok; hash_submit → a SIGNED hash_submit_ack).
+ *
+ * 069-ORDERPROOF: the ack is signed, because the client now refuses a position no ASSIGNED relay
+ * attested. The assignment below names this relay's key, so the anchor a participant verifies
+ * against is the directory's word, exactly as in production.
  * Records every hash_submit; exposes push() to deliver leaf_deliver frames.
  */
 function makeFakeRelayServer() {
@@ -102,9 +106,20 @@ function makeFakeRelayServer() {
             const frame = decode(u8) as Record<string, unknown>;
             if (frame["type"] === "relay_auth_response") {
               push({ type: "relay_auth_ok" });
+            } else if (frame["type"] === "client_record_assignment") {
+              push({ type: "assignment_ok" });
             } else if (frame["type"] === "hash_submit") {
               submits.push(frame);
-              push({ type: "hash_submit_ack", sequence_number: ++seq });
+              const s1 = frame["structure1_cbor"];
+              const fields = s1 instanceof Uint8Array ? (decode(s1) as unknown[]) : [];
+              const contentHash = fields[1] instanceof Uint8Array ? (fields[1] as Uint8Array) : new Uint8Array(32);
+              const sidBytes = frame["session_id"] instanceof Uint8Array ? (frame["session_id"] as Uint8Array) : new Uint8Array(16);
+              const n = ++seq;
+              push({
+                type: "hash_submit_ack",
+                sequence_number: n,
+                ...(await fakeRelayAttestation(sidBytes, contentHash, n)),
+              });
             }
           }
         })();
@@ -266,6 +281,15 @@ describe("M8B FINDING-1: unilateral seal escalation on retry close", () => {
           counterparty_session_addrs: [],
           signature_type: "frost",
           signer_pubkey: new Uint8Array(32),
+          /**
+           * 069-ORDERPROOF: the two fields that give this session an ANCHOR. Without
+           * `relay_directory_signature` the client builds no assignment carry at all, and without
+           * `relay_id` the carry has no relay key — either way every submit below is refused for
+           * want of an anchor, and this test would be measuring that refusal rather than the
+           * unilateral seal it is about.
+           */
+          relay_directory_signature: new Uint8Array(64).fill(0xc3),
+          relay_id: await fakeRelayPubkeyHex(),
         };
         return { ok: true, assignment, counterpartyPrimaryHex: "11".repeat(32) };
       },

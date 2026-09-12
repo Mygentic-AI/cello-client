@@ -37,7 +37,7 @@ import type { SessionLeafRecords } from "./session-leaf-records.js";
 import type { StandingReceivers } from "./standing-receivers.js";
 import type { WitnessAlerts } from "./witness-alerts.js";
 import type { SessionContentIngest } from "./session-content-ingest.js";
-import { AgentRelayClient, type RelayAuthRefusal } from "./session-relay-client.js";
+import { AgentRelayClient, type RelayAuthRefusal, type RelayAssignmentCarry } from "./session-relay-client.js";
 import {
   RELAY_QUARANTINE_MS,
   SR_RESERVATION_MAX_RETRIES,
@@ -463,7 +463,7 @@ export class SessionRelay {
       const entry = this.#ctx.activeNodes.get(this.#ctx.sessionKey(agentName, sessionId));
       if (entry) entry.relayAssignment = relay.assignment;
       if (relay.assignment) this.#ctx.leafRecords.persistGenesisPrevRoot(agentName, sessionId, relay.assignment);
-      client.registerSession(sessionIdHexForRelay, node, this.#ctx.contentIn.relayLeafHandler(agentName, sessionId, correlationId), relay.assignment, this.#ctx.leafRecords.sessionGenesisPrevRoot(agentName, sessionId));
+      client.registerSession(sessionIdHexForRelay, node, this.#ctx.contentIn.relayLeafHandler(agentName, sessionId, correlationId), relay.assignment, this.#ctx.leafRecords.sessionGenesisPrevRoot(agentName, sessionId), this.#ctx.leafRecords.sessionRelayAnchor(agentName, sessionId));
 
       if (entry) {
         entry.relayClient = client;
@@ -599,7 +599,7 @@ export class SessionRelay {
       // session — it never submits — and `registerSession` derives a seed from the assignment
       // anyway. Reaching into the session record for one here would also be reaching with the RELAY
       // session id, which is not the key that record is stored under.
-      client.registerSession(sessionIdHex, node, undefined, relay.assignment);
+      client.registerSession(sessionIdHex, node, undefined, relay.assignment, undefined, this.#ctx.leafRecords.sessionRelayAnchor(agentName, sessionIdHex));
       this.#ctx.logger.info("session.relay.assignment.presented_to_reservation_relay", {
         agentName,
         sessionId: sessionIdHex.slice(0, 16),
@@ -739,7 +739,7 @@ export class SessionRelay {
           entry.extraRelayClientKeys = [...(entry.extraRelayClientKeys ?? []), clientKey];
         }
         // No leaf handler: this relay is not witnessing the session, it only needs the binding.
-        client.registerSession(sessionIdHex, entry.node, undefined, assignment, this.#ctx.leafRecords.sessionGenesisPrevRoot(agentName, sessionId));
+        client.registerSession(sessionIdHex, entry.node, undefined, assignment, this.#ctx.leafRecords.sessionGenesisPrevRoot(agentName, sessionId), this.#ctx.leafRecords.sessionRelayAnchor(agentName, sessionId));
         const recorded = await client.recordAssignmentAndWait(entry.node, sessionIdHex);
         if (recorded) {
           this.#ctx.logger.info("session.transport.dial_authorized", {
@@ -777,7 +777,20 @@ export class SessionRelay {
    */
   /** CELLO_ENV=test only: patch a relay client and session-id bytes onto an existing active node entry
    *  so submitSealLeaf succeeds without a real relay handshake (used by the oneshot relay-path test). */
-  patchRelayClientForTest(agentName: string, sessionId: string, relayClient: AgentRelayClient, relaySessionIdBytes: Uint8Array): void {
+  patchRelayClientForTest(
+    agentName: string,
+    sessionId: string,
+    relayClient: AgentRelayClient,
+    relaySessionIdBytes: Uint8Array,
+    /**
+     * 069-ORDERPROOF: the session's assignment ANCHOR — the relay key the directory named, which
+     * every relay ordering attestation is verified against. Production puts it on the node entry
+     * when the session is created with a relay; a fixture that built its node without one supplies
+     * it here, or every submit is refused for want of an anchor and the fixture measures that
+     * refusal instead of whatever it was written for.
+     */
+    assignment?: RelayAssignmentCarry,
+  ): void {
     const entry = this.#ctx.activeNodes.get(this.#ctx.sessionKey(agentName, sessionId));
     if (!entry) throw new Error(`patchRelayClientForTest: no active node for (${agentName}, ${sessionId})`);
     entry.relayClient = relayClient;
@@ -796,8 +809,9 @@ export class SessionRelay {
       Buffer.from(relaySessionIdBytes).toString("hex"),
       entry.node,
       undefined,
-      entry.relayAssignment,
+      entry.relayAssignment ?? assignment,
       this.#ctx.leafRecords.sessionGenesisPrevRoot(agentName, sessionId),
+      this.#ctx.leafRecords.sessionRelayAnchor(agentName, sessionId) ?? assignment?.relayPubkeyHex,
     );
   }
 
@@ -1740,7 +1754,9 @@ export class SessionRelay {
 
       // 033-ACKEMIT: a revived session re-registers with no assignment in hand, so the genesis comes
       // from the entry that was just restored above.
-      client.registerSession(sessionId, node, this.#ctx.contentIn.relayLeafHandler(agentName, sessionId, correlationId), undefined, this.#ctx.leafRecords.sessionGenesisPrevRoot(agentName, sessionId));
+      // 069-ORDERPROOF: a revived session re-registers with no assignment, so the anchor comes from
+      // the session row — the reason it is stored there at all.
+      client.registerSession(sessionId, node, this.#ctx.contentIn.relayLeafHandler(agentName, sessionId, correlationId), undefined, this.#ctx.leafRecords.sessionGenesisPrevRoot(agentName, sessionId), this.#ctx.leafRecords.sessionRelayAnchor(agentName, sessionId));
 
       const entry = this.#ctx.activeNodes.get(this.#ctx.sessionKey(agentName, sessionId));
       if (entry) {

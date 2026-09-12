@@ -233,51 +233,95 @@ describe("second-preimage protection (SI-001)", () => {
   });
 });
 
-// ─── PERSIST-012 buildRelayAckTbs — canonical relay ACK TBS ──────────────────
+// ─── DOD-M15-ORDERPROOF-1 buildRelayAckTbs — the relay's ordering attestation ─
 //
-// Single implementation shared by the relay (signer) and the client (verifier).
-// Tests here are the cross-path contract: both sides use buildRelayAckTbs so
-// divergence is impossible.
-describe("buildRelayAckTbs (PERSIST-012)", () => {
+// Single implementation shared by the relay (signer) and BOTH participants (verifiers).
+// The statement binds the session, the content hash, the assigned position, the running
+// root of the tree AFTER this leaf, and the time. Every one of those is load-bearing and
+// each has its own test: drop the session and an attestation lifts into another
+// conversation; drop the root and it says where a leaf sits in a counter rather than in a
+// chain; drop the domain and it is replayable as another CELLO relay signature.
+describe("buildRelayAckTbs (DOD-M15-ORDERPROOF-1)", () => {
+  const SID = () => randomBytes(16);
+  const ROOT = () => randomBytes(32);
+
   it("returns 32 bytes (SHA-256 output)", () => {
-    const tbs = buildRelayAckTbs(randomBytes(32), 1, Date.now());
-    expect(tbs.length).toBe(32);
+    expect(buildRelayAckTbs(SID(), randomBytes(32), 1, ROOT(), Date.now()).length).toBe(32);
   });
 
   it("is deterministic — same inputs produce same bytes", () => {
-    const h = randomBytes(32);
-    expect(buildRelayAckTbs(h, 42, 1716000000000)).toEqual(buildRelayAckTbs(h, 42, 1716000000000));
+    const sid = SID(); const h = randomBytes(32); const root = ROOT();
+    expect(buildRelayAckTbs(sid, h, 42, root, 1716000000000)).toEqual(
+      buildRelayAckTbs(sid, h, 42, root, 1716000000000),
+    );
+  });
+
+  it("different SESSION ids → different TBS (an attestation cannot be lifted into another conversation)", () => {
+    const h = randomBytes(32); const root = ROOT();
+    expect(buildRelayAckTbs(SID(), h, 1, root, 1000)).not.toEqual(buildRelayAckTbs(SID(), h, 1, root, 1000));
+  });
+
+  it("different RUNNING ROOTS → different TBS (the attestation binds the prefix, not just the position)", () => {
+    const sid = SID(); const h = randomBytes(32);
+    expect(buildRelayAckTbs(sid, h, 1, ROOT(), 1000)).not.toEqual(buildRelayAckTbs(sid, h, 1, ROOT(), 1000));
   });
 
   it("different hash bytes → different TBS", () => {
-    const seq = 1; const ts = 1000;
-    expect(buildRelayAckTbs(randomBytes(32), seq, ts)).not.toEqual(buildRelayAckTbs(randomBytes(32), seq, ts));
+    const sid = SID(); const root = ROOT();
+    expect(buildRelayAckTbs(sid, randomBytes(32), 1, root, 1000)).not.toEqual(
+      buildRelayAckTbs(sid, randomBytes(32), 1, root, 1000),
+    );
   });
 
   it("different sequence numbers → different TBS", () => {
-    const h = randomBytes(32);
-    expect(buildRelayAckTbs(h, 1, 1000)).not.toEqual(buildRelayAckTbs(h, 2, 1000));
+    const sid = SID(); const h = randomBytes(32); const root = ROOT();
+    expect(buildRelayAckTbs(sid, h, 1, root, 1000)).not.toEqual(buildRelayAckTbs(sid, h, 2, root, 1000));
   });
 
   it("different timestamps → different TBS", () => {
-    const h = randomBytes(32);
-    expect(buildRelayAckTbs(h, 1, 1000)).not.toEqual(buildRelayAckTbs(h, 1, 2000));
+    const sid = SID(); const h = randomBytes(32); const root = ROOT();
+    expect(buildRelayAckTbs(sid, h, 1, root, 1000)).not.toEqual(buildRelayAckTbs(sid, h, 1, root, 2000));
   });
 
-  it("relay sign (raw bytes) → client verify (hex-decoded): same TBS, signature passes", async () => {
+  it("is domain-separated — the preimage opens with CELLO-RELAY-ORDER-v1", () => {
+    const sid = SID(); const h = randomBytes(32); const root = ROOT(); const seq = 9; const ts = 1716000000000;
+    const seqBuf = Buffer.alloc(4); seqBuf.writeUInt32BE(seq, 0);
+    const tsBuf = Buffer.alloc(8); tsBuf.writeBigUInt64BE(BigInt(ts), 0);
+    const expected = createHash("sha256")
+      .update(Buffer.concat([
+        Buffer.from("CELLO-RELAY-ORDER-v1", "utf8"),
+        Buffer.from(sid), Buffer.from(h), seqBuf, Buffer.from(root), tsBuf,
+      ]))
+      .digest();
+    // Rebuilt from the specification rather than by calling the function twice: a helper
+    // agreeing with itself is not evidence of what it produces.
+    expect(Buffer.from(buildRelayAckTbs(sid, h, seq, root, ts))).toEqual(expected);
+  });
+
+  it("REFUSES a wrong-length field rather than hashing it — a short session id is not a session", () => {
+    const h = randomBytes(32); const root = ROOT();
+    expect(() => buildRelayAckTbs(randomBytes(15), h, 1, root, 1000)).toThrow(/session_id/);
+    expect(() => buildRelayAckTbs(SID(), randomBytes(31), 1, root, 1000)).toThrow(/content_hash/);
+    expect(() => buildRelayAckTbs(SID(), h, 1, randomBytes(31), 1000)).toThrow(/running_root/);
+  });
+
+  it("relay sign → participant verify: same TBS, signature passes", async () => {
     const relayKp = generateKeypair();
     const relayPubkey = await relayKp.getPublicKey();
-    const contentHashBytes = randomBytes(32);
-    const seq = 7;
-    const ts = 1716000000000;
+    const sid = SID(); const contentHashBytes = randomBytes(32); const root = ROOT();
+    const seq = 7; const ts = 1716000000000;
 
-    // Relay uses raw bytes (as relay-node.ts does)
-    const relayTbs = buildRelayAckTbs(contentHashBytes, seq, ts);
+    const relayTbs = buildRelayAckTbs(sid, contentHashBytes, seq, root, ts);
     const sig = await relayKp.sign(relayTbs);
 
-    // Client hex-decodes the hash then calls buildRelayAckTbs (via buildSignedAckTbs)
-    const contentHashHex = Buffer.from(contentHashBytes).toString("hex");
-    const clientTbs = buildRelayAckTbs(Buffer.from(contentHashHex, "hex"), seq, ts);
+    // A participant rebuilds from hex-decoded copies, the shape both stores hold.
+    const clientTbs = buildRelayAckTbs(
+      Buffer.from(Buffer.from(sid).toString("hex"), "hex"),
+      Buffer.from(Buffer.from(contentHashBytes).toString("hex"), "hex"),
+      seq,
+      Buffer.from(Buffer.from(root).toString("hex"), "hex"),
+      ts,
+    );
 
     expect(relayTbs).toEqual(clientTbs);
     expect(verify(relayPubkey, clientTbs, sig)).toBe(true);

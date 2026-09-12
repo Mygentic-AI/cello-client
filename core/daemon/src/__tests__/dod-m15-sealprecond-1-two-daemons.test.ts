@@ -35,6 +35,7 @@ import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
 import { makeFakeRelayServer, FakeRelayAwareNode, FAKE_RELAY_PEER_ID, FAKE_RELAY_ADDR } from "./helpers/fake-relay-server.js";
+import { fakeRelayAnchor } from "./relay-client-fake.js";
 
 const SID_BYTES = Uint8Array.from(Array.from({ length: 16 }, (_, i) => i + 0xa1 & 0xff));
 const SID_HEX = Buffer.from(SID_BYTES).toString("hex");
@@ -139,7 +140,7 @@ describe("DOD-M15-SEALPRECOND-1: the counterparty's chain must not be left one l
       });
       await rc.connect(node as Parameters<typeof rc.connect>[0]);
       await wait(80);
-      side.snm.patchRelayClientForTest(sideName(side), SID_HEX, rc, SID_BYTES);
+      side.snm.patchRelayClientForTest(sideName(side), SID_HEX, rc, SID_BYTES, await fakeRelayAnchor());
     }
 
     // A's direct sends ARE B's inbound content. This is the counterparty's real receiving path —

@@ -103,6 +103,9 @@ export async function escalateToUnilateralSeal(
     relay_id: l.relayId,
     relay_timestamp: l.relayTimestamp,
     relay_signature: l.relaySignatureHex ? new Uint8Array(Buffer.from(l.relaySignatureHex, "hex")) : undefined,
+    // 069-ORDERPROOF: the running root travels with the signature it is bound into. Carrying one
+    // without the other would present a leaf the directory cannot check as though it were witnessed.
+    relay_running_root: l.relayRunningRootHex ? new Uint8Array(Buffer.from(l.relayRunningRootHex, "hex")) : undefined,
   }));
   // REFUSE LOCALLY FOR A LOCALLY-KNOWABLE FAILURE, rather than spending 30 s to be told nothing.
   //
@@ -182,6 +185,32 @@ export async function escalateToUnilateralSeal(
       reason: "seal_carry_bilateral_in_progress",
       guidance:
         "Both parties have posted their SEAL leaf, so the relay has what it needs to notarize this BILATERALLY — a better receipt than a unilateral one, and asking for a unilateral seal now would be refused. Wait for the seal to land (cello_sessions shows the status) and read the receipt with cello_sealed_receipt.",
+    };
+  }
+
+  /**
+   * ─── A CARRY THAT PREDATES 069-ORDERPROOF IS REFUSED HERE, BY NAME ────────────────────────────
+   *
+   * A leaf recorded before this order has a relay id, a timestamp and a signature and NO running
+   * root, because the statement the relay signed then did not bind one. The directory's decoder
+   * treats a partial receipt as a malformed FRAME and voids the whole submission — which reaches
+   * the operator as `not_authenticated` on a stream that is authenticated, and then as a timeout.
+   * That is this milestone's founding error-fidelity defect, reproduced one order later.
+   *
+   * So it is caught here, where the cause is known, and named. The evidence itself is not lost:
+   * `cello_transcript` still shows the conversation, and a BILATERAL close — where the counterparty
+   * co-signs rather than the directory rebuilding from a carry — is unaffected.
+   */
+  const preOrderproof = seal_leaves.filter(
+    (l) => l.relay_signature !== undefined && l.relay_running_root === undefined,
+  );
+  if (opts.refuseOnUnusableCarry && preOrderproof.length > 0) {
+    pendingUnilateralWaiters.delete(sealKey(agentName, sessionId));
+    return {
+      ok: false,
+      reason: "seal_carry_pre_orderproof",
+      guidance:
+        "This session's relay evidence was recorded before the relay started signing the position a message sits at, so the directory cannot rebuild it and this side cannot seal alone. Close it WITH your counterparty instead — an ordinary cello_close_session on both sides still produces a receipt. cello_transcript shows the conversation either way.",
     };
   }
 

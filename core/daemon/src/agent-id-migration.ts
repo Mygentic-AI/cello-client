@@ -116,6 +116,10 @@ const REKEY_TARGETS: readonly RekeyTarget[] = [
         -- and that session then acknowledges nothing until the counterparty speaks, so its own
         -- messages carry no content binding for as long as it stays one-sided.
         genesis_prev_root BLOB,
+        -- 069-ORDERPROOF: the assigned relay's ack-signing pubkey. Pinned here as well as in the
+        -- inline ALTER, or the rebuild drops it and the ALTER re-adds it EMPTY — every revived
+        -- session then loses the key its ordering attestations are checked against, silently.
+        relay_anchor_hex TEXT,
         -- DOD-M15-FREEZE-STATUS-1, carried for CELLO_Support's lane. Dropping these on upgrade would
         -- un-freeze a session frozen because a party signed with a key that was not the
         -- counterparty's — the failure that column exists to survive, reintroduced by the migration
