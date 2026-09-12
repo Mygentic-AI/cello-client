@@ -682,8 +682,8 @@ export class AgentRelayClient {
    * PER-SESSION acknowledgement state (session_id hex → the position AND the content at it).
    *
    * `seq` is the highest relay-assigned sequence, advanced by an ack or a deliver. The relay's
-   * `seq_counter` is per session, and it rejects `last_seen_seq > seq_counter`, so each session's submit MUST carry that session's own
-   * high-water mark — NOT an agent-global one (which would make a newer session's first submit look
+   * `seq_counter` is per session and it rejects `last_seen_seq > seq_counter`, so each session's
+   * submit MUST carry that session's own high-water mark — NOT an agent-global one (which would make a newer session's first submit look
    * ahead and get rejected).
    *
    * ⚠️ `hash` IS THE SAME FACT AS `seq`, WHICH IS WHY THEY LIVE IN ONE ENTRY — 033-ACKEMIT.

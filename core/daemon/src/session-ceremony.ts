@@ -950,12 +950,16 @@ export async function verifyUnilateralCertificate(
  * primary value is OUT-OF-BAND (any holder of the signer's primary — e.g. an arbitrator — can verify
  * an exported cert's legibility).
  *
- * SYMMETRY: both closing orders verify locally, and the property must stay that way. Each party
- * learns the other's primary from the session assignment — `participant_b_primary_pubkey` with a
- * binding signed by participant_b's own K_local, verified before the assignment is accepted at all
- * (`assignment-verify.ts`), recorded by `initiate-session-handler.ts`. The binding is the
- * load-bearing part: carrying the group key alone would let a directory name a key of its choosing,
- * so a change that keeps the key and drops the binding breaks verification while appearing to work.
+ * SYMMETRY: both closing orders verify locally, and it takes BOTH bindings to stay that way. The
+ * initiator learns the responder's primary from `participant_b_primary_pubkey` with a binding
+ * signed by participant_b's own K_local, recorded by `initiate-session-handler.ts`; the responder
+ * learns the initiator's from `signer_pubkey` with `participant_a_key_binding`, verified before the
+ * assignment's threshold signature is checked at all and recorded by `inbound-sessions.ts`. Both
+ * are refused by name when absent or invalid (`assignment-verify.ts`).
+ *
+ * The binding, not the key, is the load-bearing part: carrying a group key alone would let a
+ * directory name one of its choosing, so a change that keeps either key and drops its binding
+ * breaks verification while appearing to work.
  *
  * `signer_key_not_held` is therefore NOT the ordinary responder-first outcome. It remains reachable
  * for a session row that predates the recording, or one whose assignment never reached this path,
@@ -1018,7 +1022,8 @@ export async function verifyBilateralSealCertificate(
     // (the live frame arrived over the authenticated Noise channel; the binding aids out-of-band).
     // Reachable only for a session whose assignment never carried (or never recorded) the
     // counterparty's bound primary — a pre-038-KEYBIND row. A CURRENT session reaching here means
-    // the recording above it did not run, which is a defect, not a normal close order.
+    // `recordCounterpartyPrimary` did not run on either side (`initiate-session-handler.ts` for the
+    // initiator, `inbound-sessions.ts` for the responder), which is a defect, not a close order.
     return { ok: true, verified: false, reason: "signer_key_not_held" };
   }
 
