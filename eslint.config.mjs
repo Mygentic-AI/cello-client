@@ -334,7 +334,12 @@ export default [
      * rather than a slot, and why this is the one caller in the file that refuses to dial.
      */
     files: ["core/daemon/src/session-relay-client.ts"],
-    rules: { "max-lines": ["error", { max: 3027, skipBlankLines: false, skipComments: false }] },
+    // 3,027 → 3,143 (069-ORDERPROOF, +116): the recipient now keeps the relay's ordering proof
+    // too, verified against the directory-named relay key rather than the one in the frame. That is
+    // a second capture site on the delivery path plus the anchor lookup, and the refusal notes on
+    // both — which differ, because a refusal costs OUR send its witness and must not cost THEIRS
+    // its delivery.
+    rules: { "max-lines": ["error", { max: 3143, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/session-views.ts"],
@@ -374,7 +379,10 @@ export default [
   },
   {
     files: ["core/daemon/src/directory-connect.ts"],
-    rules: { "max-lines": ["error", { max: 120, skipBlankLines: false, skipComments: false }] },
+    // 120 → 129 (069-ORDERPROOF, +9): the assignment carry is built for either of two independent
+    // reasons now — something to present to the relay, or the name of the relay whose attestations
+    // this session accepts. Requiring both let a relay opt out of being checked by omitting one.
+    rules: { "max-lines": ["error", { max: 129, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/connection-agents.ts"],
@@ -463,7 +471,10 @@ export default [
   },
   {
     files: ["core/daemon/src/session-relay.ts"],
-    rules: { "max-lines": ["error", { max: 1798, skipBlankLines: false, skipComments: false }] },
+    // 1,798 → 1,811 (069-ORDERPROOF, +13): the test seam that attaches a relay client can now also
+    // supply the session's anchor, because a fixture that built its node without a relay assignment
+    // has none — and every submit on such a session is refused for want of one.
+    rules: { "max-lines": ["error", { max: 1811, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/session-content-send.ts"],

@@ -529,7 +529,18 @@ export interface RelayAssignmentCarry {
   sessionTimestamp: number;            // Unix ms
   initiatorSessionPeerId?: string;     // present for relay-mode sessions (covered by the sig when both present)
   counterpartySessionPeerId?: string;
-  assignmentSignature: Uint8Array;     // 64-byte per-node directory sig over the relay TBS (relay_directory_signature)
+  /**
+   * 64-byte per-node directory sig over the relay TBS (`relay_directory_signature`), presented to
+   * the relay as `client_record_assignment`.
+   *
+   * ⚠️ OPTIONAL SINCE 069-ORDERPROOF, and the split is real rather than defensive. A session can
+   * know WHICH relay may attest to it — `relay_id`, inside the FROST-signed assignment — while the
+   * directory issued no per-node relay signature to present. Those are two different facts and they
+   * were one field: folding them together would either make a session with nothing to present
+   * unable to verify anything, or make one that only knows its relay present an empty frame the
+   * relay refuses as forged.
+   */
+  assignmentSignature?: Uint8Array;
   /**
    * 069-ORDERPROOF — the assigned relay's ACK-SIGNING pubkey, hex, taken from `relay_id` on an
    * assignment whose FROST signature has already been verified. **This is the only key a relay
@@ -903,6 +914,9 @@ export class AgentRelayClient {
     if (this.#closed) return false;
     const sess = this.#sessions.get(sessionIdHex);
     if (!sess || !sess.assignment) return true;
+    // Nothing to PRESENT. The carry may exist only to name the relay this session's attestations
+    // verify against; there is no frame to send and nothing to wait for, so the submit proceeds.
+    if (!sess.assignment.assignmentSignature) return true;
     if (sess.recorded) return true;
     // Terminal rejection: a relay that cleanly rejected this assignment will reject it
     // again — stop re-presenting so a misconfigured/forged case can't storm the shared stream.
@@ -1181,6 +1195,7 @@ export class AgentRelayClient {
                     relayId: ev.receipt.relayId,
                     relayTimestamp: ev.receipt.timestamp,
                     relaySignatureHex: ev.receipt.signatureHex,
+                    ...(ev.receipt.runningRootHex ? { relayRunningRootHex: ev.receipt.runningRootHex } : {}),
                   }
                 : {}),
             }, Date.now());

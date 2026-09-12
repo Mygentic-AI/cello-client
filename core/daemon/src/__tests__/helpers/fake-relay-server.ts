@@ -21,6 +21,7 @@ import { Encoder, decode } from "cbor-x";
 import * as lp from "it-length-prefixed";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
+import { fakeRelayAttestation, fakeRelayPubkeyHex } from "../relay-client-fake.js";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
@@ -75,6 +76,9 @@ export function makeFakeRelayServer(opts: FakeRelayOpts = {}) {
             const u8 = chunk instanceof Uint8Array ? chunk : (chunk as { subarray(): Uint8Array }).subarray();
             const frame = decode(u8) as Record<string, unknown>;
             if (frame["type"] === "relay_auth_response") push({ type: "relay_auth_ok" });
+            // 069-ORDERPROOF: a session registered with its assignment anchor presents it and waits
+            // for this answer before it will submit. A real relay answers; so does this one.
+            else if (frame["type"] === "client_record_assignment") push({ type: "assignment_ok" });
             else if (frame["type"] === "hash_submit") {
               const s1 = frame["structure1_cbor"];
               const key = s1 instanceof Uint8Array ? Buffer.from(s1).toString("hex") : String(s1);
@@ -83,10 +87,30 @@ export function makeFakeRelayServer(opts: FakeRelayOpts = {}) {
                 sequenceNumber: ++seq,
                 leafKind: typeof frame["leaf_kind"] === "number" ? (frame["leaf_kind"] as number) : 0,
               };
+              /**
+               * 069-ORDERPROOF: this relay SIGNS its ordering, because the client now refuses a
+               * leaf whose position no ASSIGNED relay attested. An unsigned fixture would put every
+               * test on the path a client takes when a relay is unfit to witness, which is not the
+               * path any of them are about. The signing key is the suite's shared fake relay key,
+               * so a test names the same relay in its assignment that actually signed.
+               */
+              const attest = (sessionId: unknown, contentHash: Uint8Array, n: number) =>
+                fakeRelayAttestation(
+                  sessionId instanceof Uint8Array ? sessionId : new Uint8Array(16),
+                  contentHash,
+                  n,
+                );
+              // The content hash is index 1 of Structure 1, which is what the relay attests over.
+              const s1Arr = s1 instanceof Uint8Array ? (decode(s1) as unknown[]) : [];
+              const contentHash = s1Arr[1] instanceof Uint8Array ? (s1Arr[1] as Uint8Array) : new Uint8Array(32);
               if (already) {
                 // A re-submission of a leaf already ordered: acknowledge with the SAME position and
                 // do not witness it twice.
-                push({ type: "hash_submit_ack", sequence_number: leaf.sequenceNumber });
+                push({
+                  type: "hash_submit_ack",
+                  sequence_number: leaf.sequenceNumber,
+                  ...(await attest(frame["session_id"], contentHash, leaf.sequenceNumber)),
+                });
                 continue;
               }
               bySubmission.set(key, leaf);
@@ -94,7 +118,8 @@ export function makeFakeRelayServer(opts: FakeRelayOpts = {}) {
               // BEFORE the ack, deliberately: the tree state a test wants to inspect is the one that
               // existed when the relay committed the position, not the one after the client reacts.
               opts.onLeaf?.(leaf);
-              push({ type: "hash_submit_ack", sequence_number: leaf.sequenceNumber });
+              const attestation = await attest(frame["session_id"], contentHash, leaf.sequenceNumber);
+              push({ type: "hash_submit_ack", sequence_number: leaf.sequenceNumber, ...attestation });
               if (opts.broadcastLeaves) {
                 // The witness, to everyone on the session — the submitter included, exactly as the
                 // real relay echoes it. Whether a leaf is one's own is decided by the CLIENT from
@@ -107,6 +132,9 @@ export function makeFakeRelayServer(opts: FakeRelayOpts = {}) {
                   leaf_kind: leaf.leafKind,
                   structure1_cbor: frame["structure1_cbor"],
                   sender_signature: frame["sender_signature"],
+                  // 069-ORDERPROOF: the SAME attestation the sender's ack carries, so the recipient
+                  // holds it too — which is the whole of unit 2.
+                  ...attestation,
                 };
                 for (const to of streams) to(witness);
               }
@@ -128,7 +156,13 @@ export function makeFakeRelayServer(opts: FakeRelayOpts = {}) {
     streams.push(push);
     return stream;
   }
-  return { openStream, ordered: () => [...ordered], ctrlSubmits: () => [] as unknown[] };
+  return {
+    openStream,
+    ordered: () => [...ordered],
+    ctrlSubmits: () => [] as unknown[],
+    /** The key a test puts in the assignment as `relay_id` — the anchor the client verifies against. */
+    relayPubkeyHex: fakeRelayPubkeyHex,
+  };
 }
 
 /** A libp2p node that goes nowhere. */

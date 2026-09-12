@@ -10,7 +10,7 @@ import { describe, it, expect } from "vitest";
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { decode } from "cbor-x";
-import { generateKeypair, verify, buildRelayAckTbs, msgLeafHash, ctrlLeafHash, docLeafHash, rejectLeafHash, opaqueLeafHash } from "@cello-protocol/crypto";
+import { generateKeypair, verify, msgLeafHash, ctrlLeafHash, docLeafHash, rejectLeafHash, opaqueLeafHash } from "@cello-protocol/crypto";
 import { encodeStructure1 } from "@cello-protocol/protocol-types";
 import {
   AgentRelayClient,
@@ -23,7 +23,7 @@ import {
 } from "../session-relay-client.js";
 import { RelayReceiptStore } from "../relay-receipt-store.js";
 import { SessionSealLeafStore } from "../session-seal-leaf-store.js";
-import { makeFakeRelay, tick, noopLogger, fakeNode } from "./relay-client-fake.js";
+import { makeFakeRelay, tick, noopLogger, fakeNode, fakeRelayAnchor, fakeRelayAttestation, fakeRelayPubkeyHex, pushAck } from "./relay-client-fake.js";
 
 // The fake relay rig lives in `relay-client-fake.ts` (imported above) because the SEALWIRE
 // sender-leg tests needed the same one: two hand-written relay stubs drift, and only one of them
@@ -196,8 +196,8 @@ describe("AgentRelayClient: per-agent multi-session bookkeeping (H1)", () => {
     const relay = makeFakeRelay();
     const sidA = new Uint8Array(16).fill(0x0a);
     const sidB = new Uint8Array(16).fill(0x0b);
-    client.registerSession(Buffer.from(sidA).toString("hex"), relay.node, undefined, undefined, TEST_GENESIS);
-    client.registerSession(Buffer.from(sidB).toString("hex"), relay.node, undefined, undefined, TEST_GENESIS);
+    client.registerSession(Buffer.from(sidA).toString("hex"), relay.node, undefined, await fakeRelayAnchor(), TEST_GENESIS);
+    client.registerSession(Buffer.from(sidB).toString("hex"), relay.node, undefined, await fakeRelayAnchor(), TEST_GENESIS);
 
     // Drive the relay's challenge → auth_ok so the client authenticates on first submit.
     const submit1 = client.submitMessageHash(relay.node, sidA, new Uint8Array(32).fill(1, LEAF_KIND_MSG));
@@ -207,14 +207,14 @@ describe("AgentRelayClient: per-agent multi-session bookkeeping (H1)", () => {
     relay.push({ type: "relay_auth_ok" });
     await tick();
     // Session A's first leaf → relay assigns seq 5 (and echoes/acks).
-    relay.push({ type: "hash_submit_ack", sequence_number: 5 });
+    await pushAck(relay, sidA, 5);
     expect((await submit1).ok).toBe(true);
 
     // Now session B's FIRST submit. Its own relay counter is 0, so it must send last_seen_seq 0
     // — NOT session A's 5. With the old agent-global #lastSeen this would be 5 → relay rejects.
     const submit2 = client.submitMessageHash(relay.node, sidB, new Uint8Array(32).fill(2, LEAF_KIND_MSG));
     await tick();
-    relay.push({ type: "hash_submit_ack", sequence_number: 1 });
+    await pushAck(relay, sidB, 1);
     expect((await submit2).ok).toBe(true);
 
     // Decode the two hash_submit frames the client actually sent and read last_seen_seq (S1[4]).
@@ -238,7 +238,7 @@ describe("AgentRelayClient: per-agent multi-session bookkeeping (H1)", () => {
     });
     const relay = makeFakeRelay();
     const sid = new Uint8Array(16).fill(0x0c);
-    client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, undefined, TEST_GENESIS);
+    client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, await fakeRelayAnchor(), TEST_GENESIS);
 
     const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(9, LEAF_KIND_MSG));
     await tick();
@@ -249,7 +249,7 @@ describe("AgentRelayClient: per-agent multi-session bookkeeping (H1)", () => {
     // The relay's ack now carries the committed Structure2 (opaque bytes here — the round-trip is
     // what matters; real Structure2 verification is the receiver's job in increment 3).
     const fakeS2 = new Uint8Array([0xaa, 0xbb, 0xcc, 0xdd]);
-    relay.push({ type: "hash_submit_ack", sequence_number: 3, structure2_cbor: fakeS2 });
+    await pushAck(relay, sid, 3, { structure2_cbor: fakeS2 });
 
     const res = await submit;
     expect(res.ok).toBe(true);
@@ -271,11 +271,14 @@ describe("AgentRelayClient: client_record_assignment (FED-OPTIONB-SETUP-001)", (
   // Under Option B the directory no longer dials the relay; the CLIENT presents the directory-signed
   // assignment via a client_record_assignment frame. These pin #doRecord's edge logic (idempotency,
   // submit-gating, named-failure-on-reject) that the live spine only exercises on the happy path.
-  const carry = () => ({
+  // 069-ORDERPROOF: async now, because the carry has to name the relay whose attestations this
+  // session will accept, and that key is the suite's shared fake relay key.
+  const carry = async () => ({
     participantA: new Uint8Array(32).fill(0xa1),
     participantB: new Uint8Array(32).fill(0xb2),
     sessionTimestamp: 1_750_000_000_000,
     assignmentSignature: new Uint8Array(64).fill(0xc3),
+    relayPubkeyHex: await fakeRelayPubkeyHex(),
   });
 
   it("presents the assignment exactly ONCE (idempotent) and gates the first hash_submit on it", async () => {
@@ -287,10 +290,10 @@ describe("AgentRelayClient: client_record_assignment (FED-OPTIONB-SETUP-001)", (
       senderPubkey: await kp.getPublicKey(),
       logger: noopLogger,
     });
-    const relay = makeFakeRelay();
+    const relay = makeFakeRelay({ autoRecordAssignment: false });
     const sid = new Uint8Array(16).fill(0x0d);
     // registerSession with an assignment → eager #doRecord fires on the submit chain.
-    client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, carry());
+    client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, await carry());
     await tick();
     relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
     await tick();
@@ -302,14 +305,14 @@ describe("AgentRelayClient: client_record_assignment (FED-OPTIONB-SETUP-001)", (
     // A submit now — the session is already recorded, so #doSubmit's #doRecord is a no-op (no 2nd frame).
     const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(1, LEAF_KIND_MSG));
     await tick();
-    relay.push({ type: "hash_submit_ack", sequence_number: 1 });
+    await pushAck(relay, sid, 1);
     expect((await submit).ok).toBe(true);
 
     const records = relay.sentFrames.filter((f) => f["type"] === "client_record_assignment");
     expect(records.length).toBe(1); // idempotent: eager record only; submit-gate saw recorded=true
     expect(Buffer.from(records[0]!["session_id"] as Uint8Array).equals(Buffer.from(sid))).toBe(true);
     expect((records[0]!["assignment_signature"] as Uint8Array).length).toBe(64);
-    expect(Buffer.from(records[0]!["participant_a"] as Uint8Array).equals(Buffer.from(carry().participantA))).toBe(true);
+    expect(Buffer.from(records[0]!["participant_a"] as Uint8Array).equals(Buffer.from((await carry()).participantA))).toBe(true);
     // The submit was gated AFTER the record (record frame precedes the hash_submit on the wire).
     const recordIdx = relay.sentFrames.findIndex((f) => f["type"] === "client_record_assignment");
     const submitIdx = relay.sentFrames.findIndex((f) => f["type"] === "hash_submit");
@@ -333,9 +336,9 @@ describe("AgentRelayClient: client_record_assignment (FED-OPTIONB-SETUP-001)", (
       senderPubkey: await kp.getPublicKey(),
       logger: capLogger,
     });
-    const relay = makeFakeRelay();
+    const relay = makeFakeRelay({ autoRecordAssignment: false });
     const sid = new Uint8Array(16).fill(0x0e);
-    client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, carry());
+    client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, await carry());
     await tick();
     relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
     await tick();
@@ -363,11 +366,14 @@ describe("AgentRelayClient: session_not_found is transient, not terminal (DOD-FI
   // a TRANSIENT state with a bounded, self-clearing cause, and it must be distinguished from
   // `relay_unavailable` (a genuine outage, where proceeding unwitnessed is correct so the inbox
   // stays readable).
-  const carry = () => ({
+  // 069-ORDERPROOF: async now, because the carry has to name the relay whose attestations this
+  // session will accept, and that key is the suite's shared fake relay key.
+  const carry = async () => ({
     participantA: new Uint8Array(32).fill(0xa1),
     participantB: new Uint8Array(32).fill(0xb2),
     sessionTimestamp: 1_750_000_000_000,
     assignmentSignature: new Uint8Array(64).fill(0xc3),
+    relayPubkeyHex: await fakeRelayPubkeyHex(),
   });
 
   const connectedClient = async () => {
@@ -389,10 +395,10 @@ describe("AgentRelayClient: session_not_found is transient, not terminal (DOD-FI
     // counterparty's record landing — which the log shows arriving 5 ms – 2.1 s LATER.
     // The retry is what turns that lost race into a witnessed leaf.
     const client = await connectedClient();
-    const relay = makeFakeRelay();
+    const relay = makeFakeRelay({ autoRecordAssignment: false });
     const sid = new Uint8Array(16).fill(0x7a);
 
-    client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, undefined, TEST_GENESIS);
+    client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, await fakeRelayAnchor(), TEST_GENESIS);
     await tick();
 
     const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(1, LEAF_KIND_MSG));
@@ -405,7 +411,7 @@ describe("AgentRelayClient: session_not_found is transient, not terminal (DOD-FI
     relay.push({ type: "hash_submit_error", reason: "session_not_found" });
     await tick();
     // In the live window the counterparty's record lands here — the retry now succeeds.
-    relay.push({ type: "hash_submit_ack", sequence_number: 1 });
+    await pushAck(relay, sid, 1);
 
     const result = await submit;
     // The leaf ends up WITNESSED. Before the fix this returned
@@ -421,10 +427,10 @@ describe("AgentRelayClient: session_not_found is transient, not terminal (DOD-FI
 
   it("retries session_not_found a BOUNDED number of times — a relay that never holds it fails loudly", async () => {
     const client = await connectedClient();
-    const relay = makeFakeRelay();
+    const relay = makeFakeRelay({ autoRecordAssignment: false });
     const sid = new Uint8Array(16).fill(0x7b);
 
-    client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, undefined, TEST_GENESIS);
+    client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, await fakeRelayAnchor(), TEST_GENESIS);
     await tick();
 
     const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(2, LEAF_KIND_MSG));
@@ -456,10 +462,10 @@ describe("AgentRelayClient: session_not_found is transient, not terminal (DOD-FI
     // and retrying would storm the shared per-agent stream. Before the fix this sent the frame
     // anyway and surfaced the relay's `session_not_found` — the wrong subsystem entirely.
     const client = await connectedClient();
-    const relay = makeFakeRelay();
+    const relay = makeFakeRelay({ autoRecordAssignment: false });
     const sid = new Uint8Array(16).fill(0x7e);
 
-    client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, carry());
+    client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, await carry());
     await tick();
     relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
     await tick();
@@ -485,10 +491,10 @@ describe("AgentRelayClient: session_not_found is transient, not terminal (DOD-FI
     // session as a ghost with an empty log — and 2 of the 25 live failures are exactly that shape.
     // The discriminator has to be OUR state (did we record it?), never the relay's reason string.
     const client = await connectedClient();
-    const relay = makeFakeRelay();
+    const relay = makeFakeRelay({ autoRecordAssignment: false });
     const sid = new Uint8Array(16).fill(0x7d);
 
-    client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, carry());
+    client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, await carry());
     await tick();
     relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
     await tick();
@@ -516,10 +522,10 @@ describe("AgentRelayClient: session_not_found is transient, not terminal (DOD-FI
 
   it("does NOT retry a non-transient rejection — a different reason is returned as-is", async () => {
     const client = await connectedClient();
-    const relay = makeFakeRelay();
+    const relay = makeFakeRelay({ autoRecordAssignment: false });
     const sid = new Uint8Array(16).fill(0x7c);
 
-    client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, carry());
+    client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, await carry());
     await tick();
     relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
     await tick();
@@ -558,9 +564,7 @@ describe("AgentRelayClient: sealLeafStore capture (F1 — FED-OPTIONB-SEAL-001)"
 
   it("own-leaf hash_submit_ack → store has relay receipt fields (relay_id, relay_timestamp, relay_signature)", async () => {
     const { sealLeafStore, receiptStore } = makeStores();
-    const relayKp = generateKeypair();
-    const relayPub = await relayKp.getPublicKey();
-    const relayIdHex = Buffer.from(relayPub).toString("hex");
+    const relayIdHex = await fakeRelayPubkeyHex();
     const kp = generateKeypair();
     const pub = await kp.getPublicKey();
     const pubHex = Buffer.from(pub).toString("hex");
@@ -576,7 +580,7 @@ describe("AgentRelayClient: sealLeafStore capture (F1 — FED-OPTIONB-SEAL-001)"
     const relay = makeFakeRelay();
     const sid = new Uint8Array(16).fill(0xf1);
     const sidHex = Buffer.from(sid).toString("hex");
-    client.registerSession(sidHex, relay.node, undefined, undefined, TEST_GENESIS);
+    client.registerSession(sidHex, relay.node, undefined, await fakeRelayAnchor(), TEST_GENESIS);
 
     // The content hash that will be inside Structure1 (the submit produces it from this).
     const contentHash = new Uint8Array(32).fill(1);
@@ -587,19 +591,17 @@ describe("AgentRelayClient: sealLeafStore capture (F1 — FED-OPTIONB-SEAL-001)"
     relay.push({ type: "relay_auth_ok" });
     await tick();
 
-    // Build a REAL relay signature over the ACK TBS (so evaluateRelayAck returns "store").
-    const ts = 12345;
+    // A REAL attestation over the real statement, signed by the relay this session's assignment
+    // names — 069-ORDERPROOF. Anything less and `evaluateRelayAck` refuses it, which is the point.
     const seq = 1;
-    const tbs = buildRelayAckTbs(contentHash, seq, ts);
-    const relaySig = await relayKp.sign(tbs);
-    const fakeS2 = new Uint8Array([0x01, 0x02, 0x03]);
+    const attestation = await fakeRelayAttestation(sid, contentHash, seq);
+    const ts = attestation.timestamp;
+    const relaySig = attestation.relay_signature;
     relay.push({
       type: "hash_submit_ack",
       sequence_number: seq,
-      structure2_cbor: fakeS2,
-      relay_id: relayIdHex,
-      timestamp: ts,
-      relay_signature: relaySig,
+      structure2_cbor: new Uint8Array([0x01, 0x02, 0x03]),
+      ...attestation,
     });
     const res = await submit;
     expect(res.ok).toBe(true);
@@ -611,6 +613,9 @@ describe("AgentRelayClient: sealLeafStore capture (F1 — FED-OPTIONB-SEAL-001)"
     expect(carry[0].senderPubkeyHex).toBe(pubHex);
     expect(carry[0].relayId).toBe(relayIdHex);
     expect(carry[0].relayTimestamp).toBe(ts);
+    // 069-ORDERPROOF: the running root travels with the signature it is bound into — without it the
+    // directory cannot rebuild the signed bytes and refuses the leaf as unwitnessed.
+    expect(carry[0].relayRunningRootHex).toBe(Buffer.from(attestation.running_root).toString("hex"));
     expect(carry[0].relaySignatureHex).toBe(Buffer.from(relaySig).toString("hex"));
     expect(carry[0].structure2Cbor).toBeTruthy();
     expect(carry[0].structure1Cbor).toBeTruthy();
@@ -643,7 +648,7 @@ describe("AgentRelayClient: sealLeafStore capture (F1 — FED-OPTIONB-SEAL-001)"
     await tick();
     relay.push({ type: "relay_auth_ok" });
     await tick();
-    relay.push({ type: "hash_submit_ack", sequence_number: 1 });
+    await pushAck(relay, sid, 1);
     await submit;
 
     // Now simulate a counterparty leaf_deliver (authored by someone else).
@@ -684,9 +689,7 @@ describe("AgentRelayClient: sealLeafStore capture (F1 — FED-OPTIONB-SEAL-001)"
 
   it("own-echoed leaf_deliver → no duplicate receiptless row (immutability)", async () => {
     const { sealLeafStore, receiptStore } = makeStores();
-    const relayKp = generateKeypair();
-    const relayPub = await relayKp.getPublicKey();
-    const relayIdHex = Buffer.from(relayPub).toString("hex");
+    const relayIdHex = await fakeRelayPubkeyHex();
     const kp = generateKeypair();
     const pub = await kp.getPublicKey();
     const pubHex = Buffer.from(pub).toString("hex");
@@ -702,7 +705,7 @@ describe("AgentRelayClient: sealLeafStore capture (F1 — FED-OPTIONB-SEAL-001)"
     const relay = makeFakeRelay();
     const sid = new Uint8Array(16).fill(0xf3);
     const sidHex = Buffer.from(sid).toString("hex");
-    client.registerSession(sidHex, relay.node, undefined, undefined, TEST_GENESIS);
+    client.registerSession(sidHex, relay.node, undefined, await fakeRelayAnchor(), TEST_GENESIS);
 
     // Submit own leaf → ack captures it WITH receipt.
     const contentHash = new Uint8Array(32).fill(3);
@@ -712,17 +715,14 @@ describe("AgentRelayClient: sealLeafStore capture (F1 — FED-OPTIONB-SEAL-001)"
     await tick();
     relay.push({ type: "relay_auth_ok" });
     await tick();
-    const ts = 999;
     const seq = 1;
-    const tbs = buildRelayAckTbs(contentHash, seq, ts);
-    const relaySig = await relayKp.sign(tbs);
+    const attestation = await fakeRelayAttestation(sid, contentHash, seq);
+    const relaySig = attestation.relay_signature;
     relay.push({
       type: "hash_submit_ack",
       sequence_number: seq,
       structure2_cbor: new Uint8Array([0x07, 0x08]),
-      relay_id: relayIdHex,
-      timestamp: ts,
-      relay_signature: relaySig,
+      ...attestation,
     });
     await submit;
 

@@ -103,6 +103,9 @@ export async function escalateToUnilateralSeal(
     relay_id: l.relayId,
     relay_timestamp: l.relayTimestamp,
     relay_signature: l.relaySignatureHex ? new Uint8Array(Buffer.from(l.relaySignatureHex, "hex")) : undefined,
+    // 069-ORDERPROOF: the running root travels with the signature it is bound into. Carrying one
+    // without the other would present a leaf the directory cannot check as though it were witnessed.
+    relay_running_root: l.relayRunningRootHex ? new Uint8Array(Buffer.from(l.relayRunningRootHex, "hex")) : undefined,
   }));
   // REFUSE LOCALLY FOR A LOCALLY-KNOWABLE FAILURE, rather than spending 30 s to be told nothing.
   //

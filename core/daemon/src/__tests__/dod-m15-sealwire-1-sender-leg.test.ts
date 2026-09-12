@@ -51,7 +51,7 @@ import { decode } from "cbor-x";
 import { generateKeypair, verify } from "@cello-protocol/crypto";
 import { encodeSealPayload, decodeSealPayload } from "@cello-protocol/protocol-types";
 import { AgentRelayClient, LEAF_KIND_MSG, LEAF_KIND_CTRL, LEAF_KIND_DOC } from "../session-relay-client.js";
-import { makeFakeRelay, tick, noopLogger } from "./relay-client-fake.js";
+import { makeFakeRelay, tick, noopLogger, fakeRelayAnchor, pushAck } from "./relay-client-fake.js";
 
 async function connectedClient(): Promise<{
   client: AgentRelayClient;
@@ -68,7 +68,7 @@ async function connectedClient(): Promise<{
   });
   const relay = makeFakeRelay();
   const sid = new Uint8Array(16).fill(0x11);
-  client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, undefined, new Uint8Array(32).fill(0x9c));
+  client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, await fakeRelayAnchor(), new Uint8Array(32).fill(0x9c));
   return { client, relay, sid };
 }
 
@@ -107,7 +107,7 @@ describe("DOD-M15-SEALWIRE-1 sender leg: the SEAL payload reaches the wire, and 
     const { client, relay, sid } = await connectedClient();
     const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(1), LEAF_KIND_MSG);
     await authenticate(relay);
-    relay.push({ type: "hash_submit_ack", sequence_number: 1 });
+    await pushAck(relay, sid, 1);
     expect((await submit).ok).toBe(true);
 
     const frames = relay.sentFrames.filter((f) => f["type"] === "hash_submit");
@@ -131,7 +131,7 @@ describe("DOD-M15-SEALWIRE-1 sender leg: the SEAL payload reaches the wire, and 
 
     const submit = client.submitLeaf(relay.node, sid, contentHash, LEAF_KIND_CTRL, payload);
     await authenticate(relay);
-    relay.push({ type: "hash_submit_ack", sequence_number: 4 });
+    await pushAck(relay, sid, 4);
     expect((await submit).ok, "the seal submit must succeed").toBe(true);
 
     const frame = relay.sentFrames.filter((f) => f["type"] === "hash_submit")[0]!;
@@ -176,7 +176,7 @@ describe("DOD-M15-SEALWIRE-1 sender leg: the SEAL payload reaches the wire, and 
 
     const submit = client.submitLeaf(relay.node, sid, contentHash, LEAF_KIND_CTRL, payload);
     await authenticate(relay);
-    relay.push({ type: "hash_submit_ack", sequence_number: 4 });
+    await pushAck(relay, sid, 4);
     await submit;
 
     const frame = relay.sentFrames.filter((f) => f["type"] === "hash_submit")[0]!;
@@ -231,7 +231,7 @@ describe("DOD-M15-SEALWIRE-1 sender leg: the SEAL payload reaches the wire, and 
 
     const submit = client.submitMessageHash(relay.node, sid, contentHash, LEAF_KIND_MSG);
     await authenticate(relay);
-    relay.push({ type: "hash_submit_ack", sequence_number: 1 });
+    await pushAck(relay, sid, 1);
     const res = await submit;
     expect(res.ok, "the submit must succeed or there is no pair to check").toBe(true);
     if (!res.ok) return;
@@ -286,7 +286,7 @@ describe("DOD-M15-SEALWIRE-1 sender leg: the SEAL payload reaches the wire, and 
     // assertions below would then be measuring the handshake. (Same trap as the two tests above.)
     const warmup = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(7), LEAF_KIND_MSG);
     await authenticate(relay);
-    relay.push({ type: "hash_submit_ack", sequence_number: 1 });
+    await pushAck(relay, sid, 1);
     expect((await warmup).ok, "the client must be able to send, or the refusals below prove nothing").toBe(true);
     const framesBefore = relay.sentFrames.filter((f) => f["type"] === "hash_submit").length;
 
@@ -352,7 +352,7 @@ describe("DOD-M15-SEALWIRE-1 sender leg: the SEAL payload reaches the wire, and 
     // a frame would genuinely go out if the guard let one.
     const warmup = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(7), LEAF_KIND_MSG);
     await authenticate(relay);
-    relay.push({ type: "hash_submit_ack", sequence_number: 1 });
+    await pushAck(relay, sid, 1);
     expect((await warmup).ok, "the client must be able to send, or the refusals below prove nothing").toBe(true);
     const framesBefore = relay.sentFrames.filter((f) => f["type"] === "hash_submit").length;
 
@@ -401,7 +401,7 @@ describe("DOD-M15-SEALWIRE-1 sender leg: the SEAL payload reaches the wire, and 
 
     const warmup = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(7), LEAF_KIND_MSG);
     await authenticate(relay);
-    relay.push({ type: "hash_submit_ack", sequence_number: 1 });
+    await pushAck(relay, sid, 1);
     expect((await warmup).ok, "the client must be able to send, or the refusal below proves nothing").toBe(true);
     const framesBefore = relay.sentFrames.filter((f) => f["type"] === "hash_submit").length;
 

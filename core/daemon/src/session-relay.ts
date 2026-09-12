@@ -37,7 +37,7 @@ import type { SessionLeafRecords } from "./session-leaf-records.js";
 import type { StandingReceivers } from "./standing-receivers.js";
 import type { WitnessAlerts } from "./witness-alerts.js";
 import type { SessionContentIngest } from "./session-content-ingest.js";
-import { AgentRelayClient, type RelayAuthRefusal } from "./session-relay-client.js";
+import { AgentRelayClient, type RelayAuthRefusal, type RelayAssignmentCarry } from "./session-relay-client.js";
 import {
   RELAY_QUARANTINE_MS,
   SR_RESERVATION_MAX_RETRIES,
@@ -777,7 +777,20 @@ export class SessionRelay {
    */
   /** CELLO_ENV=test only: patch a relay client and session-id bytes onto an existing active node entry
    *  so submitSealLeaf succeeds without a real relay handshake (used by the oneshot relay-path test). */
-  patchRelayClientForTest(agentName: string, sessionId: string, relayClient: AgentRelayClient, relaySessionIdBytes: Uint8Array): void {
+  patchRelayClientForTest(
+    agentName: string,
+    sessionId: string,
+    relayClient: AgentRelayClient,
+    relaySessionIdBytes: Uint8Array,
+    /**
+     * 069-ORDERPROOF: the session's assignment ANCHOR — the relay key the directory named, which
+     * every relay ordering attestation is verified against. Production puts it on the node entry
+     * when the session is created with a relay; a fixture that built its node without one supplies
+     * it here, or every submit is refused for want of an anchor and the fixture measures that
+     * refusal instead of whatever it was written for.
+     */
+    assignment?: RelayAssignmentCarry,
+  ): void {
     const entry = this.#ctx.activeNodes.get(this.#ctx.sessionKey(agentName, sessionId));
     if (!entry) throw new Error(`patchRelayClientForTest: no active node for (${agentName}, ${sessionId})`);
     entry.relayClient = relayClient;
@@ -796,7 +809,7 @@ export class SessionRelay {
       Buffer.from(relaySessionIdBytes).toString("hex"),
       entry.node,
       undefined,
-      entry.relayAssignment,
+      entry.relayAssignment ?? assignment,
       this.#ctx.leafRecords.sessionGenesisPrevRoot(agentName, sessionId),
     );
   }

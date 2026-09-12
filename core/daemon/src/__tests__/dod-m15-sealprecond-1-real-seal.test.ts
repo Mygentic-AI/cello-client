@@ -36,6 +36,7 @@ import {
   makeFakeRelayServer, FakeRelayAwareNode, FAKE_RELAY_PEER_ID, FAKE_RELAY_ADDR,
   type OrderedLeaf,
 } from "./helpers/fake-relay-server.js";
+import { fakeRelayAnchor } from "./relay-client-fake.js";
 
 // The RELAY session id is 16 bytes — `decodeSealPayload` refuses any other length, and a 32-byte
 // one makes every seal submit fail as `seal_payload_invalid` long before anything under test runs.
@@ -124,7 +125,7 @@ describe("DOD-M15-SEALPRECOND-1 Done When 1: the signed root covers every messag
     });
     await relayClient.connect(node as Parameters<typeof relayClient.connect>[0]);
     await wait(100); // auth handshake
-    snm.patchRelayClientForTest("alice", SID_HEX, relayClient, SID_BYTES);
+    snm.patchRelayClientForTest("alice", SID_HEX, relayClient, SID_BYTES, await fakeRelayAnchor());
 
     const client = await connectToDaemon(join(tempDir, "d.sock"));
     clients.push(client);

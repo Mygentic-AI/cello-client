@@ -29,6 +29,7 @@ import type { SessionNodeManager, ISessionNodeFactory, SessionNodeConfig } from 
 import type { SecurityGatewayClient } from "../../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
+import { fakeRelayAnchor } from "../relay-client-fake.js";
 
 /** A libp2p node that goes nowhere. The daemon-side bookkeeping under test never dials. */
 export class FakeNode implements Partial<CelloNode> {
@@ -302,6 +303,15 @@ export async function startTwoConnectionFixture(
         keyProvider: kp,
         senderPubkey: await kp.getPublicKey(),
         sessionIdBytes: Buffer.from(sessionId, "hex"),
+        /**
+         * 069-ORDERPROOF: the session's ANCHOR — the relay key the directory named. Without it the
+         * client has nothing to check a relay's ordering attestation against and refuses every one,
+         * so every relayed send on this fixture would fail for want of an anchor rather than
+         * exercising whatever the test is about. Production gets this from the FROST-signed
+         * assignment; the fixture names the suite's shared fake relay key, which is the key the
+         * fake relays in these tests actually sign with.
+         */
+        assignment: await fakeRelayAnchor(),
       });
       agreeKey();
     },

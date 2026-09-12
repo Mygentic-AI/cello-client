@@ -411,14 +411,15 @@ export function buildResponderRelayAssignment(parsed: {
   // so it is anchored by that signature rather than taken on the relay's word.
   relayIdHex: string | null;
 }): RelayAssignmentCarry | undefined {
-  if (!parsed.relayDirectorySignature) return undefined;
+  // 069-ORDERPROOF: either half is reason enough to build the carry — see `directory-connect.ts`.
+  if (!parsed.relayDirectorySignature && !parsed.relayIdHex) return undefined;
   return {
     participantA: new Uint8Array(Buffer.from(parsed.participantAPubkeyHex, "hex")),
     participantB: new Uint8Array(Buffer.from(parsed.participantBPubkeyHex, "hex")),
     sessionTimestamp: parsed.sessionTimestamp,
     initiatorSessionPeerId: parsed.initiatorPeerId || undefined,
     counterpartySessionPeerId: parsed.counterpartySessionPeerId ?? undefined,
-    assignmentSignature: parsed.relayDirectorySignature,
+    ...(parsed.relayDirectorySignature ? { assignmentSignature: parsed.relayDirectorySignature } : {}),
     // `""` is a VALUE (a direct session names no relay) and must not become an anchor. Only a
     // real 64-hex key is carried; anything else leaves the carry without one, and an attestation
     // arriving on such a session is refused rather than verified against whatever it supplies.
