@@ -781,6 +781,16 @@ export class AgentRelayClient {
      * the agent's SHARED submit chain, so a degraded relay would hold every session's sends.
      */
     recordTimedOut: boolean;
+    /**
+     * 069-ORDERPROOF — the relay key every ordering attestation on this session is checked against.
+     *
+     * SUPPLIED BY THE CALLER rather than read off the assignment carry, for the reason the genesis
+     * is: a session revived after a restart, and every seal leaf, registers with NO assignment in
+     * hand. Reading only the carry left those paths with no anchor and every submit on them
+     * refused — the session would work until the daemon restarted and then stop, for a reason
+     * naming the relay.
+     */
+    relayAnchorHex?: string;
   }>();
 
   constructor(opts: AgentRelayClientOpts) {
@@ -844,14 +854,28 @@ export class AgentRelayClient {
      * without a seed is therefore a real fault, not a degraded mode.
      */
     genesisPrevRoot?: Uint8Array,
+    /**
+     * 069-ORDERPROOF — the relay key this session's ordering attestations verify under, from
+     * `relay_id` on the directory-signed assignment. Supplied by the caller because
+     * `session-node-manager` is where the durable copy lives, exactly as with the genesis above.
+     *
+     * ⚠️ ABSENT IS NOT A DEGRADED MODE. A session with no anchor refuses every attestation that
+     * arrives on it, by name, because the only alternative is checking a signature against a key
+     * the signer handed us.
+     */
+    relayAnchorHex?: string,
   ): void {
     const existing = this.#sessions.get(sessionIdHex);
     const carriedAssignment = assignment ?? existing?.assignment;
+    // The anchor is carried forward for the same reason the assignment is: a re-registration with
+    // nothing in hand must not silently strip a session of the key it verifies against.
+    const carriedAnchor = relayAnchorHex ?? carriedAssignment?.relayPubkeyHex ?? existing?.relayAnchorHex;
     this.#sessions.set(sessionIdHex, {
       node,
       onLeafDeliver: onLeafDeliver ?? (() => {}),
       // Carry the assignment forward across re-registration; never lose a recorded flag on re-register.
       assignment: carriedAssignment,
+      ...(carriedAnchor ? { relayAnchorHex: carriedAnchor } : {}),
       recorded: existing?.recorded ?? false,
       recordRejected: existing?.recordRejected ?? false,
       recordTimedOut: existing?.recordTimedOut ?? false,
@@ -1083,7 +1107,7 @@ export class AgentRelayClient {
    * then refused for want of an anchor — never accepted against whatever key the frame supplies.
    */
   #expectedRelayPubkeyHex(sessionIdHex: string): string | undefined {
-    return this.#sessions.get(sessionIdHex)?.assignment?.relayPubkeyHex;
+    return this.#sessions.get(sessionIdHex)?.relayAnchorHex;
   }
 
   /**

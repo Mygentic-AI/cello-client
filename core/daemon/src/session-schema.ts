@@ -130,6 +130,19 @@ export function ensureSessionSchema(
      * first leaf they receive they acknowledge content like any other session.
      */
     "ALTER TABLE sessions ADD COLUMN genesis_prev_root BLOB",
+    /**
+     * 069-ORDERPROOF — the ack-signing pubkey (hex) of the relay the DIRECTORY assigned to this
+     * session, from `relay_id` inside the FROST-signed assignment.
+     *
+     * It is here for the same reason `genesis_prev_root` is: a session restored after a restart
+     * re-registers with NO assignment in hand, and the seal path registers with none either. The
+     * anchor lives nowhere else, and without it every submit on a revived session — and every seal
+     * leaf — is refused for want of something to check the relay's attestation against.
+     *
+     * NULL for every session opened before this column existed, and for direct sessions, which have
+     * no relay. Those sessions simply hold no ordering attestations; they read and seal as before.
+     */
+    "ALTER TABLE sessions ADD COLUMN relay_anchor_hex TEXT",
     "ALTER TABLE sessions ADD COLUMN seal_legibility TEXT",
     "ALTER TABLE sessions ADD COLUMN sealed_root_hex TEXT",
     // M7 legibility-TBS-binding (responder verify): the counterparty's FROST primary (group)

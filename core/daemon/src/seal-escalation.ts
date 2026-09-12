@@ -188,6 +188,32 @@ export async function escalateToUnilateralSeal(
     };
   }
 
+  /**
+   * ─── A CARRY THAT PREDATES 069-ORDERPROOF IS REFUSED HERE, BY NAME ────────────────────────────
+   *
+   * A leaf recorded before this order has a relay id, a timestamp and a signature and NO running
+   * root, because the statement the relay signed then did not bind one. The directory's decoder
+   * treats a partial receipt as a malformed FRAME and voids the whole submission — which reaches
+   * the operator as `not_authenticated` on a stream that is authenticated, and then as a timeout.
+   * That is this milestone's founding error-fidelity defect, reproduced one order later.
+   *
+   * So it is caught here, where the cause is known, and named. The evidence itself is not lost:
+   * `cello_transcript` still shows the conversation, and a BILATERAL close — where the counterparty
+   * co-signs rather than the directory rebuilding from a carry — is unaffected.
+   */
+  const preOrderproof = seal_leaves.filter(
+    (l) => l.relay_signature !== undefined && l.relay_running_root === undefined,
+  );
+  if (opts.refuseOnUnusableCarry && preOrderproof.length > 0) {
+    pendingUnilateralWaiters.delete(sealKey(agentName, sessionId));
+    return {
+      ok: false,
+      reason: "seal_carry_pre_orderproof",
+      guidance:
+        "This session's relay evidence was recorded before the relay started signing the position a message sits at, so the directory cannot rebuild it and this side cannot seal alone. Close it WITH your counterparty instead — an ordinary cello_close_session on both sides still produces a receipt. cello_transcript shows the conversation either way.",
+    };
+  }
+
   const sent = await sendOver(agentName, {
     type: "seal_unilateral",
     session_id: new Uint8Array(Buffer.from(sessionId, "hex")),

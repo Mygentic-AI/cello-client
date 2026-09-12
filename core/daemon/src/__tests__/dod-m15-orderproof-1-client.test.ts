@@ -28,7 +28,10 @@ import { randomBytes } from "node:crypto";
 import { generateKeypair } from "@cello-protocol/crypto";
 import { encodeStructure1 } from "@cello-protocol/protocol-types";
 import { AgentRelayClient, LEAF_KIND_MSG } from "../session-relay-client.js";
+import { escalateToUnilateralSeal } from "../seal-escalation.js";
+import type { SessionNodeManager } from "../session-node-manager.js";
 import { RelayReceiptStore } from "../relay-receipt-store.js";
+import { SessionSealLeafStore } from "../session-seal-leaf-store.js";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import type { DaemonDatabase } from "../sqlcipher-db.js";
 import {
@@ -215,6 +218,92 @@ describe("DOD-M15-ORDERPROOF-1 (client): the recipient keeps the proof, and only
     expect(after, "the proof must outlive the process that received it").toBeDefined();
     expect(after!.hashHex).toBe(Buffer.from(contentHash).toString("hex"));
     expect(after!.runningRootHex).toBe(Buffer.from(frame.running_root as Uint8Array).toString("hex"));
+  });
+
+  it("★★★ a REFUSED attestation on the SEND path rejects the submit — it does not settle ok", async () => {
+    /**
+     * The wiring, not the predicate. `evaluateRelayAck` refusing is tested next door; this drives a
+     * real submit through the real client and reads what the SEND returns. Without it, making
+     * `#captureReceipt` swallow a refusal would leave every other test in this file green while a
+     * message reported itself witnessed by a relay that witnessed nothing.
+     */
+    const logs: LogLine[] = [];
+    const fx = await connected(logs);
+    const contentHash = new Uint8Array(32).fill(0x5a);
+    const submit = fx.client.submitMessageHash(fx.relay.node, SID, contentHash, LEAF_KIND_MSG);
+    await tick();
+    // A well-formed frame whose signature is not over anything — the relay's own copy corrupted, or
+    // a frame a stranger wrote onto the stream.
+    const attestation = await fakeRelayAttestation(SID, contentHash, 2);
+    fx.relay.push({
+      type: "hash_submit_ack",
+      sequence_number: 2,
+      ...attestation,
+      relay_signature: new Uint8Array(randomBytes(64)),
+    });
+
+    const res = await submit;
+    expect(res.ok, "a send must not settle ok on a position nothing witnessed").toBe(false);
+    expect(res.ok === false && res.reason).toBe("relay_ack_unverified");
+    expect(fx.receiptStore.get(fx.pubHex, SID_HEX, 2), "and nothing was stored").toBeUndefined();
+    const refusal = logs.find((l) => l.event === "relay.attestation.refused");
+    expect(refusal?.ctx["cause"]).toBe("signature_invalid");
+  });
+
+  it("★★★ a seal carry recorded BEFORE this order is refused HERE, by name, not by the directory", async () => {
+    /**
+     * A leaf stored before this order has a relay id, a timestamp and a signature and NO running
+     * root, because the statement the relay signed then did not bind one. Shipped as-is, the
+     * directory's decoder treats the partial receipt as a malformed FRAME and voids the whole
+     * submission — which reaches the operator as `not_authenticated` on an authenticated stream and
+     * then as a timeout naming our own wait. That is the error-fidelity defect this milestone is
+     * about, so the carry is judged locally where the cause is known.
+     */
+    db = openTestDb(dbPath());
+    const store = new SessionSealLeafStore(db, noopLogger);
+    const kp = generateKeypair();
+    const pubHex = Buffer.from(await kp.getPublicKey()).toString("hex");
+    // Exactly the pre-069 shape: witnessed, and no root.
+    store.store(pubHex, SID_HEX, {
+      sequenceNumber: 1,
+      leafKind: LEAF_KIND_MSG,
+      senderPubkeyHex: pubHex,
+      structure2Cbor: new Uint8Array([0xa1]),
+      structure1Cbor: new Uint8Array([0xb1]),
+      relayId: "dd".repeat(32),
+      relayTimestamp: 10,
+      relaySignatureHex: "ee".repeat(64),
+    }, 1);
+
+    const sent: unknown[] = [];
+    const res = await escalateToUnilateralSeal(
+      {
+        logger: noopLogger,
+        sessionNodeManager: { getSealCarry: (a: string, s: string) => store.getCarry(a, s) } as unknown as SessionNodeManager,
+        sendOver: async (_a: string, f: Record<string, unknown>) => { sent.push(f); return { ok: true }; },
+        pendingUnilateralWaiters: new Map(),
+        sealKey: (a: string, s: string) => `${a}:${s}`,
+        getKeyProvider: () => kp,
+        timeoutMs: 500,
+      },
+      "alice",
+      SID_HEX,
+      { reportedRootHex: "11".repeat(32), sequenceNumber: 1 },
+      "corr",
+      { refuseOnUnusableCarry: true },
+    );
+
+    expect(res.ok, "a carry the directory cannot check must not be sent").toBe(false);
+    expect(res.ok === false && res.reason).toBe("seal_carry_pre_orderproof");
+    expect(
+      sent.length,
+      "and NOTHING went to the directory — a frame it will void is a 30-second wait ending in a " +
+      "reason that names our own timer",
+    ).toBe(0);
+    expect(
+      res.ok === false && res.guidance,
+      "the guidance names an action the operator can actually take",
+    ).toMatch(/close it WITH your counterparty/i);
   });
 
   it("★★ a session recorded BEFORE this order still opens and reads — the migration is additive", async () => {

@@ -952,6 +952,8 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         Buffer.from(parsed.participantAPubkeyHex, "hex"),
         Buffer.from(parsed.participantBPubkeyHex, "hex"),
         parsed.sessionTimestamp,
+        // 069-ORDERPROOF: same moment, same verified assignment — see the initiator's copy.
+        parsed.relayIdHex ?? undefined,
       );
       const result = await sessionNodeManager.acceptSession(
         parsed.sessionIdHex,
