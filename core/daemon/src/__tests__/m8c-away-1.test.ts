@@ -1,24 +1,26 @@
 /**
- * CELLO-M8C-AWAY-1 — away response: unattended Primary auto-answers session requests + messages
+ * CELLO-M8C-AWAY-1 — away response: an unattended Primary auto-answers inbound session REQUESTS
  *
- * Clause coverage (M8C-BUILD-JOURNAL design note):
- * - A1: a NEW inbound session request while unattended gets an auto-ack (kind:"request" text)
- *   appended to the transcript; queued via the existing inboundSessionQueues mechanism regardless.
- * - A2: an inbound MESSAGE on an existing active session while unattended gets an auto-ack
- *   (kind:"message" text, distinct from A1's).
- * - A3: while ATTENDED (a connection has claimed the agent via cello_use_agent), no away
- *   response fires for either kind — the agent answers for itself.
- * - A4: coalescing — a second inbound message during the SAME away period does not re-trigger a
- *   second away ack (no reply storm).
- * - A5: becoming attended (cello_use_agent) clears the dedup, so a LATER away period (after the
- *   operator disconnects/attends elsewhere) gets a fresh ack rather than permanent silence.
+ * ⚠️ CLAUSES A2, A4 AND A5 ARE GONE, DELETED BY DOD-M15-AWAYSCOPE-1, and that is not a coverage
+ * loss — it is the behaviour they described being removed. They said an inbound MESSAGE on an
+ * ALREADY-ACCEPTED session got its own auto-ack, coalesced on a repeat and re-armed after a
+ * re-attend. Sending that ack is what cost session `e7dd3f43…` its receipt on both machines: the
+ * greeting took a hash-chain leaf in a live conversation and no seal over that chain could be
+ * certified. The replacement behaviour — an unattended agent says NOTHING into a session it is
+ * already in — is asserted in `dod-m15-awayscope-1.test.ts`, which also re-pins the half kept here.
+ *
+ * What this file still covers:
+ * - A1: a NEW inbound session request while unattended gets an auto-ack appended to the transcript;
+ *   queued via the existing inboundSessionQueues mechanism regardless.
+ * - A3: while ATTENDED (a connection has claimed the agent via cello_use_agent), no away response
+ *   fires — the agent answers for itself.
+ * - The greeting's leaf-commitment decision on a durably-queued vs. a lost send (M12-P13).
  * - Deviation (journaled, D14-pattern): opaque privacy mode (silence, indistinguishable from
  *   unreachable) is PARKED on M9-CFG-001 — this unit ships only the DoD's own mandated
  *   transparent default, which is a real, correct, non-fake behavior on its own.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { LEAF_KIND_MSG } from "../session-relay-client.js";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -33,8 +35,6 @@ import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
-import { Encoder, decode } from "cbor-x";
-import * as lp from "it-length-prefixed";
 import { markAsAutoReply } from "../away-detection.js";
 import { makeSignedAssignmentFrame, registerFixtureSigner, fixtureIdentity } from "./helpers/signed-assignment.js";
 
@@ -56,9 +56,6 @@ function msgLeafHash(content: Uint8Array): Uint8Array {
 
 class FakeNode implements Partial<CelloNode> {
   readonly #peerId = `fake-${Math.random().toString(36).slice(2)}`;
-  // Reviewer finding (a9099571): let a test toggle a transient failure on the NEXT newStream call
-  // only, to prove the away-ack dedup guard clears on failure and retries on the next arrival.
-  failNextStream = false;
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
   getPeerId(): string { return this.#peerId; }
@@ -72,10 +69,6 @@ class FakeNode implements Partial<CelloNode> {
   getDialability(): { dialable: boolean; publicAddr: string | null } { return { dialable: false, publicAddr: null }; }
   onDialabilityChange(_l: (d: { dialable: boolean; publicAddr: string | null }) => void): () => void { return () => {}; }
   async newStream(_peer: string, _proto: string): Promise<Stream> {
-    if (this.failNextStream) {
-      this.failNextStream = false;
-      throw new Error("connection_lost: counterparty stream dead");
-    }
     return { send() {}, async close() {}, abort() {}, status: "open" } as unknown as Stream;
   }
 }
@@ -100,77 +93,6 @@ function makeInjectableSignaling(
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-// ─── Relay + signaling stubs for DOD-INBOX-ONESHOT-1 relay-path test ─────────
-// Minimal in-process fake relay: auth challenge/ok + hash_submit_ack.
-// Mirrors the version in seal-unilateral-retry.test.ts (no FROST logic needed here).
-const CBOR_ENC = new Encoder({ tagUint8Array: false });
-const FAKE_RELAY_PEER_ID_ONESHOT = "12D3KooWFakeRelayForOneshotTest";
-const FAKE_RELAY_ADDR_ONESHOT = "/ip4/127.0.0.1/tcp/2/p2p/fake-relay-oneshot";
-
-function makeFakeRelayServerOneshot() {
-  let seq = 0;
-  const streams: Array<{ push: (frame: Record<string, unknown>) => void }> = [];
-  function openStream() {
-    const inbound: Uint8Array[] = [];
-    let notify: (() => void) | null = null;
-    let ended = false;
-    const push = (frame: Record<string, unknown>): void => {
-      const encoded = lp.encode.single(CBOR_ENC.encode(frame) as Uint8Array);
-      inbound.push(encoded instanceof Uint8Array ? encoded : (encoded as { subarray(): Uint8Array }).subarray());
-      notify?.();
-    };
-    const stream = {
-      send: (b: { subarray?: () => Uint8Array } | Uint8Array) => {
-        const bytes = b instanceof Uint8Array ? b : (b.subarray ? b.subarray() : (b as unknown as Uint8Array));
-        void (async () => {
-          for await (const chunk of lp.decode([bytes] as unknown as AsyncIterable<Uint8Array>)) {
-            const u8 = chunk instanceof Uint8Array ? chunk : (chunk as { subarray(): Uint8Array }).subarray();
-            const frame = decode(u8) as Record<string, unknown>;
-            if (frame["type"] === "relay_auth_response") push({ type: "relay_auth_ok" });
-            else if (frame["type"] === "hash_submit") push({ type: "hash_submit_ack", sequence_number: ++seq });
-          }
-        })();
-      },
-      close: async () => { ended = true; notify?.(); },
-      async *[Symbol.asyncIterator]() {
-        while (!ended) {
-          while (inbound.length) yield inbound.shift()!;
-          if (ended) return;
-          await new Promise<void>((r) => { notify = r; });
-          notify = null;
-        }
-      },
-    };
-    push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
-    streams.push({ push });
-    return stream;
-  }
-  return { openStream, ctrlSubmits: () => [] as unknown[] };
-}
-
-
-// A FakeNode variant whose newStream routes to a fake relay server for the relay peer id.
-// All other newStream calls return a no-op fake stream.
-class FakeRelayAwareNode extends FakeNode {
-  constructor(private readonly fakeRelay: ReturnType<typeof makeFakeRelayServerOneshot>) { super(); }
-  async dial(_addr: unknown): Promise<{ peerId: string }> { return { peerId: FAKE_RELAY_PEER_ID_ONESHOT }; }
-  async newStream(peerId: unknown, _proto: unknown): Promise<Stream> {
-    if (String(peerId) === FAKE_RELAY_PEER_ID_ONESHOT) return this.fakeRelay.openStream() as unknown as Stream;
-    return { send() {}, async close() {}, abort() {}, status: "open" } as unknown as Stream;
-  }
-}
-
-function makeRecordingSignalingOneshot(ref: { inject?: (frame: unknown) => void }): () => Promise<ConnectResult> {
-  let inbound: ((frame: unknown) => void) | null = null;
-  const stream: SignalingStream = {
-    send: async () => {},
-    onMessage: (h: (frame: unknown) => void) => { inbound = h; },
-    close: () => {},
-  };
-  ref.inject = (frame: unknown) => inbound?.(frame);
-  return async () => ({ stream, directoryNodeId: "fake-dir", manifestVersion: 1 });
-}
-// ─────────────────────────────────────────────────────────────────────────────
 
 describe("M8C-AWAY-1: away response", () => {
   let tempDir: string;
@@ -228,9 +150,9 @@ describe("M8C-AWAY-1: away response", () => {
    * about away mode is under test in the signature — it is only what gets the frame past the door
    * the production path now makes every assignment pass through.
    */
-  async function assignmentFrame(initiatorPubkeyHex: string, counterpartyPubkeyHex: string): Promise<Record<string, unknown>> {
+  async function assignmentFrame(initiatorPubkeyHex: string, counterpartyPubkeyHex: string, sessionId: Uint8Array = SID_BYTES): Promise<Record<string, unknown>> {
     const { frame } = await makeSignedAssignmentFrame({
-      sessionId: SID_BYTES,
+      sessionId,
       initiatorPubkey: Uint8Array.from(Buffer.from(initiatorPubkeyHex, "hex")),
       responderPubkey: Uint8Array.from(Buffer.from(counterpartyPubkeyHex, "hex")),
       initiatorSessionPeerId: "alice-session-peer-id",
@@ -299,7 +221,16 @@ describe("M8C-AWAY-1: away response", () => {
     injectRef.inject!(await assignmentFrame(initiatorPubkey, bobPubkey)); // bob never attended — no client connected yet
     await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
-    expect(events.find((e) => e.event === "session.away.response.sent" && e.context.kind === "request")).toBeDefined();
+    /**
+     * DOD-M15-AWAYSCOPE-1: `kind` is a CONSTANT in the code now, and this is the only assertion on
+     * its value. It is read off the event rather than filtered inside the `find` predicate so a
+     * wrong value says "expected 'message' to be 'request'" instead of "expected undefined to be
+     * defined" — the tell of the live failure was `kind: "message"` on a daemon log line, and an
+     * operator re-diagnosing greps for exactly that string.
+     */
+    const sentEvent = events.find((e) => e.event === "session.away.response.sent");
+    expect(sentEvent, "the greeting must actually be sent, or everything below is vacuous").toBeDefined();
+    expect(sentEvent!.context.kind).toBe("request");
     const { messages } = h.getSessionNodeManager().readTranscript("bob", SID_HEX);
     expect(messages).toHaveLength(1);
     expect(messages[0].direction).toBe("sent");
@@ -311,6 +242,48 @@ describe("M8C-AWAY-1: away response", () => {
     expect(messages[0].text).toContain("signal: wrap");
     expect(messages[0].text).not.toContain("[[WRAP]]");
   });
+
+  /**
+   * A4, RE-POINTED — review finding. The old version of this drove TWO inbound MESSAGES on two
+   * sessions, and it was deleted with the message trigger. Its SUBJECT is still live: the dedup key
+   * is `agent:session:request`, and dropping the session id from it is a one-token change.
+   *
+   * What that costs, and why a deleted test here is worse than it looks: two people knock on the
+   * same away agent, the first gets the greeting, and the SECOND is met with silence — no greeting,
+   * no explanation, nothing in their transcript — because the first caller consumed the agent's one
+   * dedup slot. Nothing else in the suite uses two sessions on one agent, so that narrowing would
+   * ship with everything green.
+   */
+  it("A4 (per-session isolation): two callers knocking on the SAME away agent each get their own greeting", async () => {
+    const { logger, events } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const h = await start(logger, new FakeNode(), makeInjectableSignaling(injectRef));
+    await wait(50);
+    const snm = h.getSessionNodeManager();
+    await snm.ensureStandingReceiverForAgent("bob");
+
+    const caller = fixtureIdentity().pubkeyHex;
+    snm.addContact("bob", caller, undefined, null, TIER.KNOWN);
+
+    const SID_2_BYTES = Uint8Array.from(Array.from({ length: 16 }, (_, i) => i + 101));
+    const SID_2_HEX = Buffer.from(SID_2_BYTES).toString("hex");
+    snm.setSessionContentKeyForTest("bob", SID_HEX, new Uint8Array(32).fill(0x7e));
+    snm.setSessionContentKeyForTest("bob", SID_2_HEX, new Uint8Array(32).fill(0x7e));
+
+    injectRef.inject!(await assignmentFrame(caller, bobPubkey));
+    injectRef.inject!(await assignmentFrame(caller, bobPubkey, SID_2_BYTES));
+    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
+
+    // BOTH sessions, named — a count of two would also pass if one session were greeted twice.
+    const greeted = events
+      .filter((e) => e.event === "session.away.response.sent")
+      .map((e) => e.context.sessionId)
+      .sort();
+    expect(greeted, "each caller is answered on their own session").toEqual([SID_HEX, SID_2_HEX].sort());
+    expect(snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent")).toHaveLength(1);
+    expect(snm.readTranscript("bob", SID_2_HEX).messages.filter((m) => m.direction === "sent")).toHaveLength(1);
+  }, 15_000);
 
   // A gateway whose OUTBOUND verdict is configurable per test (inbound always allows).
   class StubGateway implements SecurityGatewayClient {
@@ -413,258 +386,17 @@ describe("M8C-AWAY-1: away response", () => {
     expect(messages).toHaveLength(0);
   });
 
-  it("A2/A4/A5: message auto-ack while unattended, coalesced on a repeat, fresh after a re-away period", async () => {
-    const { logger, events } = makeLogger();
-    await makeAgentDir("alice");
-    const h = await start(logger, new FakeNode());
-    const snm = h.getSessionNodeManager();
-    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
-    // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionGenesisForTest("alice", SID_HEX, new Uint8Array(32).fill(0x9c));
-    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
-    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
-    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
-    // M8C-CONTACT-1: pre-register as known so this test stays focused on AWAY-1's own template
-    // logic — the unknown-sender ("Dispatched.") branch is covered by m8c-contact-1.test.ts.
-    snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
-
-    // A2: unattended (no connection yet) — an inbound message gets an away ack.
-    await snm.ingestReceivedContent("alice", SID_HEX, new TextEncoder().encode("hi"), msgLeafHash(new TextEncoder().encode("hi")), "c1");
-    await wait(30);
-    let sentEvents = events.filter((e) => e.event === "session.away.response.sent" && e.context.kind === "message");
-    expect(sentEvents).toHaveLength(1);
-
-    // A4: a SECOND message in the SAME away period does not re-trigger the away ACK — but
-    // DOD-INBOX-ONESHOT-1 fires instead: a [[WRAP]] rejection is sent and the seal is initiated.
-    await snm.ingestReceivedContent("alice", SID_HEX, new TextEncoder().encode("hi again"), msgLeafHash(new TextEncoder().encode("hi again")), "c2");
-    await wait(100);
-    sentEvents = events.filter((e) => e.event === "session.away.response.sent" && e.context.kind === "message");
-    expect(sentEvents).toHaveLength(1); // still just one away ACK — coalesced
-
-    let { messages } = snm.readTranscript("alice", SID_HEX);
-    let sentMessages = messages.filter((m) => m.direction === "sent");
-    // Two sent messages: the away ack (seq 0) + the one-shot rejection (seq 1 with [[WRAP]]).
-    expect(sentMessages).toHaveLength(2);
-    expect(sentMessages[0].text).toContain("message has been received");
-    expect(sentMessages[1].text).toContain("[[WRAP]]"); // the rejection
-
-    // A5: attend, then go away again — the dedup clears, so a NEW away period gets a fresh ack.
-    // However: the session was sealed by the one-shot path above; it is no longer active.
-    // A5 is tested on its own fresh session via the per-session-isolation test above.
-    // Skip the A5 portion here since the seal already closed the session.
-  });
-
-  it("A3: no auto-ack for a message while ATTENDED", async () => {
-    const { logger, events } = makeLogger();
-    await makeAgentDir("alice");
-    const h = await start(logger, new FakeNode());
-    const snm = h.getSessionNodeManager();
-    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
-    // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionGenesisForTest("alice", SID_HEX, new Uint8Array(32).fill(0x9c));
-    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
-    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
-    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
-    await connectAs("alice"); // attended
-
-    await snm.ingestReceivedContent("alice", SID_HEX, new TextEncoder().encode("hi"), msgLeafHash(new TextEncoder().encode("hi")), "c1");
-    await wait(30);
-
-    expect(events.find((e) => e.event === "session.away.response.sent")).toBeUndefined();
-    const { messages } = snm.readTranscript("alice", SID_HEX);
-    expect(messages.filter((m) => m.direction === "sent")).toHaveLength(0);
-  });
-
-  // Reviewer finding (a9099571, test-teeth gap): the dedup key is per (agent, SESSION, kind) — a
-  // regression that dropped sessionId from the key would incorrectly suppress the SECOND session's
-  // ack because the first session's message already consumed that kind's dedup slot.
-  it("A4 (per-session isolation): two different unattended sessions on the SAME agent each get their own independent away ack", async () => {
-    const { logger, events } = makeLogger();
-    await makeAgentDir("alice");
-    const h = await start(logger, new FakeNode());
-    const snm = h.getSessionNodeManager();
-    const SID_1 = "aa".repeat(32);
-    const SID_2 = "bb".repeat(32);
-    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
-    // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionGenesisForTest("alice", SID_1, new Uint8Array(32).fill(0x9c));
-    await snm.createSessionNode(SID_1, "alice", "cp1pubkeyhex", "peer-1", "corr-1");
-    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
-    snm.setSessionContentKeyForTest("alice", SID_1, new Uint8Array(32).fill(0x7e));
-    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
-    // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionGenesisForTest("alice", SID_2, new Uint8Array(32).fill(0x9c));
-    await snm.createSessionNode(SID_2, "alice", "cp2pubkeyhex", "peer-2", "corr-2");
-    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
-    snm.setSessionContentKeyForTest("alice", SID_2, new Uint8Array(32).fill(0x7e));
-
-    await snm.ingestReceivedContent("alice", SID_1, new TextEncoder().encode("m1"), msgLeafHash(new TextEncoder().encode("m1")), "c1");
-    await snm.ingestReceivedContent("alice", SID_2, new TextEncoder().encode("m2"), msgLeafHash(new TextEncoder().encode("m2")), "c2");
-    await wait(30);
-
-    const acked = events.filter((e) => e.event === "session.away.response.sent" && e.context.kind === "message");
-    expect(acked.map((e) => e.context.sessionId).sort()).toEqual([SID_1, SID_2].sort());
-  });
-
-  // DOD-AWAY-WRAP-1 AC2/AC3/AC4(b): a [[WRAP]]-signalled inbound message must NOT trigger the away reply.
-  it("DOD-AWAY-WRAP-1: [[WRAP]]-signalled message skips the away reply and logs skipped_wrap", async () => {
-    const { logger, events } = makeLogger();
-    await makeAgentDir("alice");
-    const h = await start(logger, new FakeNode());
-    const snm = h.getSessionNodeManager();
-    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
-    // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionGenesisForTest("alice", SID_HEX, new Uint8Array(32).fill(0x9c));
-    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
-    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
-    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
-    snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
-
-    const wrapContent = new TextEncoder().encode("goodbye [[WRAP]]");
-    await snm.ingestReceivedContent("alice", SID_HEX, wrapContent, msgLeafHash(wrapContent), "c1");
-    await wait(30);
-
-    // No away reply must be sent.
-    expect(events.find((e) => e.event === "session.away.response.sent")).toBeUndefined();
-    // The skip must be logged (observability AC).
-    expect(events.find((e) => e.event === "session.away.response.skipped_wrap")).toBeDefined();
-    // No sent message in transcript.
-    const { messages } = snm.readTranscript("alice", SID_HEX);
-    expect(messages.filter((m) => m.direction === "sent")).toHaveLength(0);
-  });
-
-  // DOD-WRAP-SUBSTRING-1 AC2 (live defect 2026-07-24, session 9d6f56d7…): a message that merely
-  // MENTIONS [[WRAP]] mid-body (sent signal:"over" — the real token is always APPENDED at the
-  // END by DOD-SIGNAL-TOKEN-1) must NOT be classified as a close signal. Pre-fix, the
-  // includes() substring match skipped the away reply AND the oneshot rejection silently.
-  it("DOD-WRAP-SUBSTRING-1: a message MENTIONING [[WRAP]] mid-body still triggers the away reply", async () => {
-    const { logger, events } = makeLogger();
-    await makeAgentDir("alice");
-    const h = await start(logger, new FakeNode());
-    const snm = h.getSessionNodeManager();
-    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
-    // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionGenesisForTest("alice", SID_HEX, new Uint8Array(32).fill(0x9c));
-    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
-    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
-    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
-    snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
-
-    const mentionContent = new TextEncoder().encode("can you explain the [[WRAP]] token to me? [[OVER]]");
-    await snm.ingestReceivedContent("alice", SID_HEX, mentionContent, msgLeafHash(mentionContent), "c1");
-    await wait(30);
-
-    expect(events.find((e) => e.event === "session.away.response.sent" && e.context.kind === "message")).toBeDefined();
-    expect(events.find((e) => e.event === "session.away.response.skipped_wrap")).toBeUndefined();
-  });
-
-  // DOD-WRAP-SUBSTRING-1 AC2 (oneshot arm): a SECOND unattended message mentioning [[WRAP]]
-  // mid-body must trigger the oneshot rejection, not the silent skip.
-  it("DOD-WRAP-SUBSTRING-1: a second message MENTIONING [[WRAP]] mid-body still triggers the oneshot rejection", async () => {
-    const { logger, events } = makeLogger();
-    await makeAgentDir("alice");
-    const h = await start(logger, new FakeNode());
-    const snm = h.getSessionNodeManager();
-    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
-    // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionGenesisForTest("alice", SID_HEX, new Uint8Array(32).fill(0x9c));
-    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
-    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
-    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
-    snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
-
-    const first = new TextEncoder().encode("hello, leaving a message [[OVER]]");
-    await snm.ingestReceivedContent("alice", SID_HEX, first, msgLeafHash(first), "c1");
-    await wait(30);
-    const second = new TextEncoder().encode("what does [[WRAP]] mean exactly? [[OVER]]");
-    await snm.ingestReceivedContent("alice", SID_HEX, second, msgLeafHash(second), "c2");
-    await wait(30);
-
-    expect(events.find((e) => e.event === "session.away.inbox.oneshot.rejected")).toBeDefined();
-    expect(events.find((e) => e.event === "session.away.response.skipped_wrap")).toBeUndefined();
-  });
-
-  // DOD-WRAP-SUBSTRING-1 AC3: a genuine trailing [[WRAP]] token (with trailing whitespace
-  // tolerated) still skips the away reply.
-  it("DOD-WRAP-SUBSTRING-1: a trailing [[WRAP]] token with trailing whitespace still skips", async () => {
-    const { logger, events } = makeLogger();
-    await makeAgentDir("alice");
-    const h = await start(logger, new FakeNode());
-    const snm = h.getSessionNodeManager();
-    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
-    // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionGenesisForTest("alice", SID_HEX, new Uint8Array(32).fill(0x9c));
-    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
-    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
-    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
-    snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
-
-    const wrapContent = new TextEncoder().encode("done here, thanks [[WRAP]]  \n");
-    await snm.ingestReceivedContent("alice", SID_HEX, wrapContent, msgLeafHash(wrapContent), "c1");
-    await wait(30);
-
-    expect(events.find((e) => e.event === "session.away.response.skipped_wrap")).toBeDefined();
-    expect(events.find((e) => e.event === "session.away.response.sent")).toBeUndefined();
-  });
-
-  // DOD-AWAY-ACK-ONESHOT-TEXT-1 (live defect 2026-07-24): the message-kind away ack must state
-  // the one-shot rule so a cooperative caller LLM stops after one message instead of walking
-  // into the rejection.
-  it("DOD-AWAY-ACK-ONESHOT-TEXT-1: the message ack states the one-message rule", async () => {
-    const { logger } = makeLogger();
-    await makeAgentDir("alice");
-    const h = await start(logger, new FakeNode());
-    const snm = h.getSessionNodeManager();
-    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
-    // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionGenesisForTest("alice", SID_HEX, new Uint8Array(32).fill(0x9c));
-    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
-    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
-    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
-    snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
-
-    const overContent = new TextEncoder().encode("hello [[OVER]]");
-    await snm.ingestReceivedContent("alice", SID_HEX, overContent, msgLeafHash(overContent), "c1");
-    await wait(30);
-
-    const { messages } = snm.readTranscript("alice", SID_HEX);
-    const ack = messages.find((m) => m.direction === "sent");
-    expect(ack).toBeDefined();
-    expect(ack!.text).toContain("one message per visit");
-  });
-
-  // DOD-AWAY-WRAP-1 AC4(c): a non-[[WRAP]] message still triggers the away reply.
-  // The complementary skipped_wrap assertion pins the guard: only [[WRAP]] suppresses; [[OVER]] does not.
-  it("DOD-AWAY-WRAP-1: a non-[[WRAP]] message still triggers the away reply (and skipped_wrap does NOT fire)", async () => {
-    const { logger, events } = makeLogger();
-    await makeAgentDir("alice");
-    const h = await start(logger, new FakeNode());
-    const snm = h.getSessionNodeManager();
-    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
-    // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionGenesisForTest("alice", SID_HEX, new Uint8Array(32).fill(0x9c));
-    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
-    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
-    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
-    snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
-
-    const overContent = new TextEncoder().encode("hello [[OVER]]");
-    await snm.ingestReceivedContent("alice", SID_HEX, overContent, msgLeafHash(overContent), "c1");
-    await wait(30);
-
-    expect(events.find((e) => e.event === "session.away.response.sent" && e.context.kind === "message")).toBeDefined();
-    // Revert-test anchor: if the [[WRAP]] guard were absent, skipped_wrap would never fire for any
-    // message — this assertion is vacuously true pre-fix. But if the guard were overly broad (e.g.
-    // matching any message containing "wrap" or "[["), this would catch the regression.
-    expect(events.find((e) => e.event === "session.away.response.skipped_wrap")).toBeUndefined();
-    const { messages } = snm.readTranscript("alice", SID_HEX);
-    expect(messages.filter((m) => m.direction === "sent")).toHaveLength(1);
-  });
-
-  // DOD-AWAY-WRAP-1 AC3: combined transcript shape — greeting at seq 0 (sent), [[WRAP]] message at
-  // seq 1 (received), NOTHING ELSE. Verifies the dedup guard doesn't double-send and the [[WRAP]]
-  // skip leaves no spurious seq 2.
-  it("DOD-AWAY-WRAP-1 AC3: sealed transcript shape — exactly greeting(sent) + [[WRAP]]-msg(received), nothing else", async () => {
+  /**
+   * DOD-AWAY-WRAP-1 AC3: combined transcript shape — greeting at seq 0 (sent), message at seq 1
+   * (received), NOTHING ELSE. The shape is what a leave-a-message visit is supposed to look like in
+   * the sealed receipt, and a spurious seq 2 is what broke the seal.
+   *
+   * ⚠️ THE REASON THERE IS NO SEQ 2 CHANGED, and the assertion is stronger for it. It used to be
+   * the [[WRAP]] skip: a closing message was the one kind the away responder declined to answer.
+   * After DOD-M15-AWAYSCOPE-1 there is nothing to decline — no message on an accepted session gets
+   * a reply, [[WRAP]] or not. So this now pins the general rule rather than one exemption from it.
+   */
+  it("DOD-AWAY-WRAP-1 AC3: sealed transcript shape — exactly greeting(sent) + caller's message(received), nothing else", async () => {
     const { logger } = makeLogger();
     const bobPubkey = await makeAgentDir("bob");
     const injectRef: { inject?: (frame: unknown) => void } = {};
@@ -679,7 +411,7 @@ describe("M8C-AWAY-1: away response", () => {
     injectRef.inject!(await assignmentFrame(caller, bobPubkey));
     await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
-    // Step 2: caller sends a [[WRAP]] message → daemon skips away reply.
+    // Step 2: the caller leaves its message. The daemon answers nothing into the accepted session.
     const wrapContent = new TextEncoder().encode("leaving my message [[WRAP]]");
     await snm.ingestReceivedContent("bob", SID_HEX, wrapContent, msgLeafHash(wrapContent), "wrap-corr");
     await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
@@ -688,9 +420,10 @@ describe("M8C-AWAY-1: away response", () => {
     expect(messages).toHaveLength(2);
     expect(messages[0].direction).toBe("sent");      // seq 0: away greeting
     expect(messages[0].text).toContain("currently away");
-    expect(messages[1].direction).toBe("received");  // seq 1: caller's [[WRAP]] message
+    expect(messages[1].direction).toBe("received");  // seq 1: the caller's message
     expect(messages[1].text).toContain("[[WRAP]]");
-    // No seq 2: the away reply was suppressed.
+    // No seq 2: the answering machine does not talk into a session it has already answered.
+    expect(snm.getSessionTree("bob", SID_HEX).size(), "the receipt covers one greeting and one message").toBe(2);
   });
 
   // DOD-AWAY-WRAP-1 AC1: the request-kind greeting names the agent and gives leave-a-message instructions.
@@ -715,445 +448,69 @@ describe("M8C-AWAY-1: away response", () => {
     expect(sent!.text).toContain("Leave a message");
   });
 
-  // DOD-INBOX-ONESHOT-1: second inbound message while unattended → [[WRAP]] rejection + seal initiated.
-  it("DOD-INBOX-ONESHOT-1 AC1: second unattended message triggers rejection reply and seal initiation", async () => {
+  /**
+   * M12-P13 — found live 2026-08-05 on the EC2 receiver (M12 Entry 89):
+   *   session.relay.leaf.delivered  sequenceNumber=1
+   *   session.away.response.failed  reason=session_stream_unavailable
+   * and then nothing, forever. The away reply owns the sequence the relay already witnessed for it;
+   * when its send failed the leaf was never appended, so this side's tree stayed at size 0 while the
+   * counterparty's content arrived claiming canonicalSeq 1. `nextExpected` IS the tree size, so every
+   * later message was held behind a gap that nothing could ever fill.
+   *
+   * ⚠️ BOTH OF THESE WERE MEASURED ON THE MESSAGE PATH AND ARE NOW DRIVEN BY A SESSION REQUEST.
+   * DOD-M15-AWAYSCOPE-1 deleted the message trigger, so the request greeting is the only away reply
+   * left — and the durable/lost decision it makes is the same code, reached the only way it can
+   * still be reached. Driving them through a stale trigger would have deleted the coverage instead
+   * of moving it.
+   *
+   * `sendContent` is stubbed rather than driven through a real relay: this pins the AWAY path's own
+   * decision, and that the `durable` flag it keys on is truthfully produced is pinned separately,
+   * against the real queue, in m8c-leavemsg-1.test.ts.
+   */
+  async function awayGreetingWithSendResult(durable: boolean) {
     const { logger, events } = makeLogger();
-    await makeAgentDir("alice");
-    const h = await start(logger, new FakeNode());
+    const bobPubkey = await makeAgentDir("bob");
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const h = await start(logger, new FakeNode(), makeInjectableSignaling(injectRef));
+    await wait(50);
     const snm = h.getSessionNodeManager();
-    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
-    // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionGenesisForTest("alice", SID_HEX, new Uint8Array(32).fill(0x9c));
-    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
-    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
-    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
-    snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
-
-    // First message: triggers the normal away ack, sets the dedup guard.
-    const msg1 = new TextEncoder().encode("hello [[OVER]]");
-    await snm.ingestReceivedContent("alice", SID_HEX, msg1, msgLeafHash(msg1), "c1");
-    await wait(30);
-    expect(events.find((e) => e.event === "session.away.response.sent" && e.context.kind === "message")).toBeDefined();
-
-    // Second message: dedup guard is set → rejection path fires.
-    const msg2 = new TextEncoder().encode("hello again [[OVER]]");
-    await snm.ingestReceivedContent("alice", SID_HEX, msg2, msgLeafHash(msg2), "c2");
-    await wait(100);
-
-    // AC1: rejection event logged.
-    expect(events.find((e) => e.event === "session.away.inbox.oneshot.rejected")).toBeDefined();
-    // AC2: rejection message contains [[WRAP]].
-    const { messages } = snm.readTranscript("alice", SID_HEX);
-    const rejectionMsg = messages.filter((m) => m.direction === "sent").at(-1);
-    expect(rejectionMsg?.text).toContain("[[WRAP]]");
-    // AC1 (seal): in this unit-test environment the agent is not loaded from the DB, so
-    // handleActiveSealFlow returns signing_key_unavailable. The honest observable is
-    // seal_initiate_FAILED, not seal_initiated. Reverting the .then() split would collapse these
-    // back to a single "seal_initiated" event with ok:false — this assertion would then fail,
-    // catching the regression.
-    expect(events.find((e) => e.event === "session.away.inbox.oneshot.seal_initiate_failed")).toBeDefined();
-    expect(events.find((e) => e.event === "session.away.inbox.oneshot.seal_initiated")).toBeUndefined();
-    // AC3: no further away ack fired (only one away.response.sent event total).
-    expect(events.filter((e) => e.event === "session.away.response.sent")).toHaveLength(1);
-    // F3: a third message must NOT trigger a second rejection (rejectedKey guard).
-    const msg3 = new TextEncoder().encode("third [[OVER]]");
-    await snm.ingestReceivedContent("alice", SID_HEX, msg3, msgLeafHash(msg3), "c3");
-    await wait(30);
-    expect(events.filter((e) => e.event === "session.away.inbox.oneshot.rejected")).toHaveLength(1);
-  });
-
-  // DOD-INBOX-ONESHOT-1 AC4: attended agent — second message does NOT trigger rejection.
-  // Revert-anchor: the dedup guard must be SET by an unattended first message before attending.
-  // Without the first unattended message the dedup key is never set and the rejection path is
-  // unreachable regardless — the test would be vacuously true.
-  it("DOD-INBOX-ONESHOT-1 AC4: unattended first message sets dedup; attending then prevents rejection on second", async () => {
-    const { logger, events } = makeLogger();
-    await makeAgentDir("alice");
-    const h = await start(logger, new FakeNode());
-    const snm = h.getSessionNodeManager();
-    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
-    // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionGenesisForTest("alice", SID_HEX, new Uint8Array(32).fill(0x9c));
-    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
-    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
-    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
-    snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
-
-    // First message arrives UNATTENDED — sets the dedup guard.
-    const msg1 = new TextEncoder().encode("hello [[OVER]]");
-    await snm.ingestReceivedContent("alice", SID_HEX, msg1, msgLeafHash(msg1), "c1");
-    await wait(30);
-    expect(events.find((e) => e.event === "session.away.response.sent" && e.context.kind === "message")).toBeDefined();
-
-    // Now attend — isAttended returns true for alice.
-    await connectAs("alice");
-
-    // Second message arrives while attended — isAttended() short-circuits, no rejection.
-    const msg2 = new TextEncoder().encode("hello again [[OVER]]");
-    await snm.ingestReceivedContent("alice", SID_HEX, msg2, msgLeafHash(msg2), "c2");
-    await wait(30);
-
-    expect(events.find((e) => e.event === "session.away.inbox.oneshot.rejected")).toBeUndefined();
-    // Only the original away ack fired.
-    expect(events.filter((e) => e.event === "session.away.response.sent")).toHaveLength(1);
-  });
-
-  // DOD-INBOX-ONESHOT-1 AC5: [[WRAP]] as the second message does NOT trigger the rejection.
-  // Revert-anchor: event ORDERING proves the [[WRAP]] check fires BEFORE the dedup/rejection path.
-  // If the order were reversed, skipped_wrap would be absent and rejected would appear instead.
-  it("DOD-INBOX-ONESHOT-1 AC5: [[WRAP]] as second message — skipped_wrap fires before rejection path, no rejected event", async () => {
-    const { logger, events } = makeLogger();
-    await makeAgentDir("alice");
-    const h = await start(logger, new FakeNode());
-    const snm = h.getSessionNodeManager();
-    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
-    // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionGenesisForTest("alice", SID_HEX, new Uint8Array(32).fill(0x9c));
-    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
-    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
-    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
-    snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
-
-    // First message: normal away ack — dedup guard is now set.
-    const msg1 = new TextEncoder().encode("hello [[OVER]]");
-    await snm.ingestReceivedContent("alice", SID_HEX, msg1, msgLeafHash(msg1), "c1");
-    await wait(30);
-    expect(events.find((e) => e.event === "session.away.response.sent")).toBeDefined();
-    const eventCountBeforeWrap = events.length;
-
-    // Second message carries [[WRAP]]: WRAP check (line 845) runs BEFORE dedup check.
-    // If order were reversed the dedup would fire first → rejected instead of skipped_wrap.
-    const msg2 = new TextEncoder().encode("goodbye [[WRAP]]");
-    await snm.ingestReceivedContent("alice", SID_HEX, msg2, msgLeafHash(msg2), "c2");
-    await wait(30);
-
-    const newEvents = events.slice(eventCountBeforeWrap);
-    // skipped_wrap must appear; rejected must not.
-    expect(newEvents.find((e) => e.event === "session.away.response.skipped_wrap")).toBeDefined();
-    expect(newEvents.find((e) => e.event === "session.away.inbox.oneshot.rejected")).toBeUndefined();
-    // skipped_wrap arrives before any possible rejected — index ordering proves it.
-    const skipIdx = newEvents.findIndex((e) => e.event === "session.away.response.skipped_wrap");
-    const rejectIdx = newEvents.findIndex((e) => e.event === "session.away.inbox.oneshot.rejected");
-    expect(skipIdx).toBeGreaterThanOrEqual(0);
-    expect(rejectIdx).toBe(-1); // absent, confirming correct ordering
-  });
-
-  // F1 (reviewer): A5 — cello_use_agent clears awayAckSent so the next away period gets a fresh ack.
-  // This is distinct from per-session isolation (which tests dedup-key scope across sessions).
-  // This tests attend-clearance ACROSS TIME on the same agent.
-  it("A5 (dedicated): cello_use_agent clears the dedup so the next away PERIOD gets a fresh ack", async () => {
-    const { logger, events } = makeLogger();
-    await makeAgentDir("alice");
-    const h = await start(logger, new FakeNode());
-    const snm = h.getSessionNodeManager();
-    const SID_A = "aa".repeat(32);
-    const SID_B = "bb".repeat(32);
-    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
-    // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionGenesisForTest("alice", SID_A, new Uint8Array(32).fill(0x9c));
-    await snm.createSessionNode(SID_A, "alice", "bobpubkeyhex", "bob-peer-id", "corr-a");
-    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
-    snm.setSessionContentKeyForTest("alice", SID_A, new Uint8Array(32).fill(0x7e));
-    snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
-
-    // Away period 1: first message sets dedup for SID_A.
-    const m1 = new TextEncoder().encode("hi [[OVER]]");
-    await snm.ingestReceivedContent("alice", SID_A, m1, msgLeafHash(m1), "c1");
-    await wait(30);
-    expect(events.filter((e) => e.event === "session.away.response.sent")).toHaveLength(1);
-
-    // Attend (cello_use_agent) — clears the dedup entries for "alice".
-    const client = await connectAs("alice");
-    client.close();
-    await wait(30);
-
-    // Away period 2: new session, same agent. Dedup was cleared so a fresh ack fires.
-    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
-    // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionGenesisForTest("alice", SID_B, new Uint8Array(32).fill(0x9c));
-    await snm.createSessionNode(SID_B, "alice", "bobpubkeyhex", "bob-peer-id", "corr-b");
-    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
-    snm.setSessionContentKeyForTest("alice", SID_B, new Uint8Array(32).fill(0x7e));
-    const m2 = new TextEncoder().encode("hi again [[OVER]]");
-    await snm.ingestReceivedContent("alice", SID_B, m2, msgLeafHash(m2), "c2");
-    await wait(30);
-
-    // Two away acks total — one per away period.
-    expect(events.filter((e) => e.event === "session.away.response.sent" && e.context.kind === "message")).toHaveLength(2);
-  });
-
-  // DOD-INBOX-ONESHOT-1 AC1 — RELAY PATH: second unattended message goes through the relay-mediated
-  // seal path (submitSealLeaf → session_sealed), NOT the signaling-only handleActiveSealFlow.
-  //
-  // Revert test: reverting the IIFE back to `void handleActiveSealFlow(...).then(...)` would invoke
-  // handleActiveSealFlow, which calls submitSealLeaf only in close-session-handler.ts (not reached
-  // here), so no hash_submit_ack arrives and the session_sealed injection has no waiter —
-  // session.away.inbox.oneshot.sealed is never logged. The test would fail with a timeout.
-  it("DOD-INBOX-ONESHOT-1 AC1 (relay path): second unattended message → relay-mediated seal completes", async () => {
-    const priorBilateralMs = process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"];
-    process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"] = "2000"; // short enough for a unit test
-    try {
-      const { logger, events } = makeLogger();
-      const relay = makeFakeRelayServerOneshot();
-      const sigRef: { inject?: (frame: unknown) => void } = {};
-      await makeAgentDir("alice");
-      // Use FakeNode (not a real libp2p node) so content delivery to counterparty succeeds trivially.
-      // Relay client is patched in below via patchRelayClientForTest — no real handshake needed.
-      const h = await start(logger, new FakeNode(), makeRecordingSignalingOneshot(sigRef));
-      const snm = h.getSessionNodeManager();
-
-      // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
-      // session it cannot anchor, and a fixture builds one below the paths that record it.
-      snm.setSessionGenesisForTest("alice", SID_HEX, new Uint8Array(32).fill(0x9c));
-      await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
-      // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
-      snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
-      snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
-
-      // Patch a fake relay client onto the active node entry so submitSealLeaf returns ok:true.
-      // The relay's openStream returns an in-process stream that responds to hash_submit.
-      // Wire a relay client onto the session node entry so submitSealLeaf can succeed.
-      // Use the relay-aware FakeNode variant so AgentRelayClient.#connect can open a stream
-      // to the fake relay server without a real libp2p node.
-      const aliceKp = await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
-      const relayAwareNode = new FakeRelayAwareNode(relay);
-      const { AgentRelayClient } = await import("../session-relay-client.js");
-      const fakeRelayClient = new AgentRelayClient({
-        relayPeerId: FAKE_RELAY_PEER_ID_ONESHOT,
-        relayAddrs: [FAKE_RELAY_ADDR_ONESHOT],
-        keyProvider: aliceKp,
-        senderPubkey: await aliceKp.getPublicKey(),
-        logger,
-      });
-      await fakeRelayClient.connect(relayAwareNode as Parameters<typeof fakeRelayClient.connect>[0]);
-      await wait(100); // auth handshake
-      snm.patchRelayClientForTest("alice", SID_HEX, fakeRelayClient, SID_BYTES);
-
-      /**
-       * DOD-M15-DIVERGE-1: SUBMIT THE INBOUND HASHES TO THE RELAY BEFORE INGESTING THEM.
-       *
-       * The counterparty's daemon submits every message it sends, so in production the relay's
-       * counter has already advanced past an inbound message by the time this side appends it.
-       * This fixture ingested directly and never submitted, so the tree ran ahead of the relay's
-       * counter and every subsequent `placeOwnLeaf` came back BEHIND the frontier — the session was
-       * genuinely diverged (two `session.tree.position_behind_frontier` ERRORs, `assignedSeq 0 /
-       * nextExpected 1` then `assignedSeq 1 / nextExpected 3`) and then sealed anyway.
-       *
-       * That skew was an artifact of the fixture, not of the away path, and it made this test assert
-       * that a diverged tree completes a seal — the outcome `placeOwnLeaf`'s own comment calls the
-       * riskiest in the codebase. Submitting first restores the production shape and lets the test
-       * exercise the healthy path it has always claimed to.
-       */
-      const sid = Buffer.from(SID_HEX, "hex");
-      const msg1 = new TextEncoder().encode("hello [[OVER]]");
-      await fakeRelayClient.submitMessageHash(relayAwareNode as never, sid, msgLeafHash(msg1, LEAF_KIND_MSG));
-      await snm.ingestReceivedContent("alice", SID_HEX, msg1, msgLeafHash(msg1), "c1");
-      await wait(100);
-      expect(events.find((e) => e.event === "session.away.response.sent")).toBeDefined();
-
-      // Second message: triggers the relay-mediated seal path.
-      const msg2 = new TextEncoder().encode("hello again [[OVER]]");
-      await fakeRelayClient.submitMessageHash(relayAwareNode as never, sid, msgLeafHash(msg2, LEAF_KIND_MSG));
-      await snm.ingestReceivedContent("alice", SID_HEX, msg2, msgLeafHash(msg2), "c2");
-      await wait(100);
-
-      // Rejection must be logged and carry [[WRAP]].
-      expect(events.find((e) => e.event === "session.away.inbox.oneshot.rejected")).toBeDefined();
-      const { messages } = snm.readTranscript("alice", SID_HEX);
-      expect(messages.filter((m) => m.direction === "sent").at(-1)?.text).toContain("[[WRAP]]");
-
-      // seal_initiated on the relay path must be logged (not seal_initiate_failed).
-      await wait(200);
-      expect(events.find((e) => e.event === "session.away.inbox.oneshot.seal_initiated" && e.context.path === "relay")).toBeDefined();
-      // DOD-M15-DIVERGE-1: and it got there on a HEALTHY tree. Before the relay submits above, this
-      // session diverged twice and sealed regardless; the gate now skips a diverged one, so without
-      // this assertion a future fixture regression would read as "the seal path broke".
-      expect(events.find((e) => e.event === "session.tree.position_behind_frontier"), "the fixture must not skew the tree against the relay").toBeUndefined();
-      expect(events.find((e) => e.event === "session.away.inbox.oneshot.seal_skipped_diverged")).toBeUndefined();
-      expect(events.find((e) => e.event === "session.away.inbox.oneshot.seal_initiate_failed")).toBeUndefined();
-
-      // Inject session_sealed: the bilateral wait resolves and session.away.inbox.oneshot.sealed fires.
-      sigRef.inject!({
-        type: "session_sealed",
-        session_id: SID_BYTES,
-        sealed_root: new Uint8Array(32).fill(0xab),
-      });
-      await wait(200);
-      expect(events.find((e) => e.event === "session.away.inbox.oneshot.sealed")).toBeDefined();
-    } finally {
-      if (priorBilateralMs === undefined) delete process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"];
-      else process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"] = priorBilateralMs;
-    }
-  }, 15_000);
-
-  // Reviewer finding (a9099571, MEDIUM): a transient send failure must not permanently silence the
-  // rest of the away period — the dedup guard must clear so the NEXT arrival retries.
-  it("dedup clears on a send failure — the next arrival in the same away period retries", async () => {
-    const { logger, events } = makeLogger();
-    await makeAgentDir("alice");
-    const node = new FakeNode();
-    const h = await start(logger, node);
-    const snm = h.getSessionNodeManager();
-    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
-    // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionGenesisForTest("alice", SID_HEX, new Uint8Array(32).fill(0x9c));
-    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
-    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
-    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
-
-    node.failNextStream = true; // the away-ack's own send will fail
-    await snm.ingestReceivedContent("alice", SID_HEX, new TextEncoder().encode("hi"), msgLeafHash(new TextEncoder().encode("hi")), "c1");
-    await wait(30);
-    expect(events.find((e) => e.event === "session.away.response.failed")).toBeDefined();
-    expect(events.find((e) => e.event === "session.away.response.sent")).toBeUndefined();
-
-    // Next arrival in the SAME away period (no attend in between) — must retry, not stay silent.
-    await snm.ingestReceivedContent("alice", SID_HEX, new TextEncoder().encode("hi again"), msgLeafHash(new TextEncoder().encode("hi again")), "c2");
-    await wait(30);
-    expect(events.find((e) => e.event === "session.away.response.sent" && e.context.kind === "message")).toBeDefined();
-  });
-
-  // M12-P13 — found live 2026-08-05 on the EC2 receiver (M12 Entry 89):
-  //   session.relay.leaf.delivered  sequenceNumber=1
-  //   session.away.response.failed  reason=session_stream_unavailable
-  // and then nothing, forever. The away reply owns the sequence the relay already witnessed for it;
-  // when its send failed the leaf was never appended, so this side's tree stayed at size 0 while the
-  // counterparty's content arrived claiming canonicalSeq 1. `nextExpected` IS the tree size, so
-  // every later message was held behind a gap that nothing could ever fill. The receiver stranded
-  // its own session — and the operator was told nothing at all.
-  //
-  // `sendContent` is stubbed here rather than driven through a real relay: this pins the AWAY path's
-  // own decision (commit the leaf when the content is durably queued), and that the `durable` flag
-  // it keys on is truthfully produced is pinned separately, against the real queue, in
-  // m8c-leavemsg-1.test.ts. Stubbing what is already proven elsewhere beats not testing this at all.
-  it("M12-P13: an away reply whose send is DURABLY QUEUED still commits its leaf — otherwise the receiver stalls at its own sequence forever", async () => {
-    const { logger, events } = makeLogger();
-    await makeAgentDir("alice");
-    const h = await start(logger, new FakeNode());
-    const snm = h.getSessionNodeManager();
-    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
-    // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionGenesisForTest("alice", SID_HEX, new Uint8Array(32).fill(0x9c));
-    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
-    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
-    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
+    await snm.ensureStandingReceiverForAgent("bob");
+    const caller = fixtureIdentity().pubkeyHex;
+    snm.addContact("bob", caller, undefined, null, TIER.KNOWN);
 
     snm.sendContent = async () => ({
-      ok: false as const, reason: "session_stream_unavailable", error: "connection_lost", durable: true,
+      ok: false as const, reason: "session_stream_unavailable", error: "connection_lost", durable,
     });
 
-    const hi = new TextEncoder().encode("hi");
-    await snm.ingestReceivedContent("alice", SID_HEX, hi, msgLeafHash(hi), "c1");
-    await wait(30);
+    injectRef.inject!(await assignmentFrame(caller, bobPubkey));
+    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
+    return { snm, events };
+  }
 
-    // The inbound message is leaf 0; the away reply owns leaf 1 whether or not its send landed.
-    expect(snm.getSessionTree("alice", SID_HEX).size(), "the away reply's witnessed sequence must exist locally").toBe(2);
-    const sent = snm.readTranscript("alice", SID_HEX).messages.filter((m) => m.direction === "sent");
-    expect(sent).toHaveLength(1);
+  it("M12-P13: an away greeting whose send is DURABLY QUEUED still commits its leaf — otherwise the caller stalls at its own sequence forever", async () => {
+    const { snm, events } = await awayGreetingWithSendResult(true);
+
+    // The greeting owns the sequence the relay witnessed for it whether or not its send landed.
+    expect(snm.getSessionTree("bob", SID_HEX).size(), "the greeting's witnessed sequence must exist locally").toBe(1);
+    expect(snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent")).toHaveLength(1);
     // Deferred is not failed, and it must be visible as its own event — a queued reply that reads
     // as `failed` sends the next investigation looking for a message that is not actually lost.
     expect(events.find((e) => e.event === "session.away.response.deferred")).toBeDefined();
-  });
+  }, 15_000);
 
-  it("M12-P13: a durably-queued away reply is NOT re-sent on the next arrival — the queued one already owns that sequence", async () => {
-    // The pre-existing retry-on-failure behaviour (test above) is correct for a LOST reply and wrong
-    // for a queued one: retrying mints a second away message at a second sequence, and the recipient
-    // gets the same greeting twice with a hole where the first one was.
-    const { logger } = makeLogger();
-    await makeAgentDir("alice");
-    const h = await start(logger, new FakeNode());
-    const snm = h.getSessionNodeManager();
-    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
-    // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionGenesisForTest("alice", SID_HEX, new Uint8Array(32).fill(0x9c));
-    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
-    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
-    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
-
-    snm.sendContent = async () => ({
-      ok: false as const, reason: "session_stream_unavailable", error: "connection_lost", durable: true,
-    });
-
-    const a = new TextEncoder().encode("hi");
-    await snm.ingestReceivedContent("alice", SID_HEX, a, msgLeafHash(a), "c1");
-    await wait(30);
-    const b = new TextEncoder().encode("hi again");
-    await snm.ingestReceivedContent("alice", SID_HEX, b, msgLeafHash(b), "c2");
-    await wait(30);
-
-    // The second arrival legitimately produces the ONESHOT REJECTION — that is a different message
-    // and it must still happen. What must not happen is a second AWAY GREETING at a second
-    // sequence, which is what clearing the guard on a queued reply would mint.
-    const sent = snm.readTranscript("alice", SID_HEX).messages.filter((m) => m.direction === "sent");
-    const REJECTION = "one message per visit. Closing.";
-    const greetings = sent.filter((m) => !m.text.includes(REJECTION));
-    expect(greetings, "one away period, one away greeting").toHaveLength(1);
-    expect(sent.some((m) => m.text.includes(REJECTION)), "the oneshot rejection still fires").toBe(true);
-  });
-
-  it("M12-P13 (third caller): a durably-queued ONESHOT REJECTION commits its leaf — this path seals immediately after, so a hole here is a guaranteed root mismatch", async () => {
-    // The reject send was the caller I missed on the first pass, and it is the worst of the three:
-    // it is followed straight away by submitSealLeaf. A queued rejection whose leaf is not committed
-    // means we seal a tree that is one leaf short of the sequence the counterparty receives at —
-    // not a stall this time but an unsealable pair of roots, which is precisely the state the two
-    // force-abandoned sessions of 2026-08-05 ended in.
-    const { logger } = makeLogger();
-    await makeAgentDir("alice");
-    const h = await start(logger, new FakeNode());
-    const snm = h.getSessionNodeManager();
-    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
-    // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionGenesisForTest("alice", SID_HEX, new Uint8Array(32).fill(0x9c));
-    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
-    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
-    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
-
-    const a = new TextEncoder().encode("first");
-    await snm.ingestReceivedContent("alice", SID_HEX, a, msgLeafHash(a), "c1");
-    await wait(30);
-    const sizeAfterAway = snm.getSessionTree("alice", SID_HEX).size();
-
-    // Only the REJECTION's send fails-but-queues; the away reply above went out normally.
-    snm.sendContent = async () => ({
-      ok: false as const, reason: "session_stream_unavailable", error: "connection_lost", durable: true,
-    });
-    const b = new TextEncoder().encode("second");
-    await snm.ingestReceivedContent("alice", SID_HEX, b, msgLeafHash(b), "c2");
-    await wait(60);
-
-    // +1 for the inbound "second", +1 for the queued rejection that owns its witnessed sequence.
-    expect(snm.getSessionTree("alice", SID_HEX).size()).toBe(sizeAfterAway + 2);
-  });
-
-  it("M12-P13: a LOST away reply appends nothing and says so at ERROR — silence is what made this cost two sessions", async () => {
+  it("M12-P13: a LOST away greeting appends nothing and says so at ERROR — silence is what made this cost two sessions", async () => {
     // The mirror of the durable case. A leaf here would commit a sequence the counterparty will
     // never receive content for, which is a permanent root mismatch — the sessions become
     // unsealable and the only exit is a force-abandon with no notarized receipt.
-    const { logger, events } = makeLogger();
-    await makeAgentDir("alice");
-    const h = await start(logger, new FakeNode());
-    const snm = h.getSessionNodeManager();
-    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
-    // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionGenesisForTest("alice", SID_HEX, new Uint8Array(32).fill(0x9c));
-    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
-    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
-    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
+    const { snm, events } = await awayGreetingWithSendResult(false);
 
-    snm.sendContent = async () => ({
-      ok: false as const, reason: "session_stream_unavailable", error: "connection_lost", durable: false,
-    });
-
-    const hi = new TextEncoder().encode("hi");
-    await snm.ingestReceivedContent("alice", SID_HEX, hi, msgLeafHash(hi), "c1");
-    await wait(30);
-
-    expect(snm.getSessionTree("alice", SID_HEX).size(), "no leaf for content that is gone").toBe(1);
+    expect(snm.getSessionTree("bob", SID_HEX).size(), "no leaf for content that is gone").toBe(0);
+    expect(snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent")).toHaveLength(0);
     const failed = events.find((e) => e.event === "session.away.response.failed");
     expect(failed).toBeDefined();
     expect(failed!.level, "a lost message is an error, not a warning").toBe("error");
     expect(String(failed!.context.impact)).toContain("lost");
-  });
+  }, 15_000);
 
   // ─── M12-P18: a refused session tells a TRUSTED sender why, and stays silent to a stranger ─────
   async function driveOverCapRefusal(tier: number, preseed: number) {

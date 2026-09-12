@@ -31,6 +31,7 @@ import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
 import { seedAgents } from "./helpers/seed-agents.js";
+import { receivedRows } from "./helpers/received-rows.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 
@@ -140,8 +141,7 @@ describe("DOD-M12B-STRAND-1: verified content that cannot yet be delivered is du
     expect(second.events.some((e) => e.event === "session.content.released")).toBe(true);
 
     // And the agent can actually read it — durable must mean deliverable, not merely stored.
-    const drained = [0, 1, 2].map(() => mgr2.takeReceivedContent(AGENT, sid));
-    expect(drained.map((d) => d && Buffer.from(d.contentHex, "hex").toString())).toEqual(["m0", "m1", "m2"]);
+    expect(receivedRows(mgr2, AGENT, sid).map((r) => r.text)).toEqual(["m0", "m1", "m2"]);
 
     // The restore is OBSERVABLE. A silent one would leave the live run that has to prove this fix
     // with nothing to point at, and it is the counterpart to `session.content.held` on the way in.

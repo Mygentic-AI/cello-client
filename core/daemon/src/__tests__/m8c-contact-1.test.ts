@@ -12,7 +12,10 @@
  *   so the ABUSE-1 acceptance caps keep applying to them. (D21 / four-level-screening-policy.)
  * - K4: an UNKNOWN sender's session request gets the minimal "Dispatched." text (not the fuller
  *   AWAY-1 text), and they STAY unknown until the operator engages.
- * - K5: a KNOWN contact's away response uses the normal, richer AWAY-1 per-type text.
+ * - K5: a KNOWN contact's away response uses the normal, richer AWAY-1 greeting text.
+ *   (There used to be a SECOND away text, for a message on an already-accepted session. It was
+ *   deleted by DOD-M15-AWAYSCOPE-1 — sending it into a live conversation is what cost session
+ *   `e7dd3f43…` its receipt — so K4 and K5 are now about the knock and nothing else.)
  * - K6: --agent resolves explicitly, else falls back to the connection's current/sole-online agent
  *   (F18), matching cello_check_notifications' own resolution.
  */
@@ -333,15 +336,23 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     expect(h.getSessionNodeManager().isContact("bob", strangerPubkey)).toBe(false);
   });
 
-  it("DOD-M15-AWAYLEAF-1: a stranger who knocks THEN sends gets ONE ack, because a second identical leaf can never be sealed", async () => {
+  it("DOD-M15-AWAYLEAF-1: a stranger who knocks THEN sends gets ONE ack — and after AWAYSCOPE-1 there is no second ack to suppress", async () => {
     /**
      * The strand, reproduced at its source. `STRANGER_TEXT` is the same bytes for both ack kinds, so
-     * before this fix an unattended agent put TWO leaves with one content hash into its own
+     * before AWAYLEAF-1 an unattended agent put TWO leaves with one content hash into its own
      * transcript. The counterparty deduplicates them to one whenever the relay position is
      * unavailable, and the two frontiers then differ by exactly one leaf forever.
      *
      * Measured live on 2026-09-07 (session 9b4d89f9): 4 leaves against 3, `close_session` refused
      * `leaf_count_mismatch`, receipt permanently unobtainable.
+     *
+     * ⚠️ WHAT HOLDS THIS NOW IS NOT THE AWAYLEAF-1 GUARD — DOD-M15-AWAYSCOPE-1 asked for this to be
+     * VERIFIED rather than assumed, and it is verified here. The second ack was the MESSAGE-kind
+     * one, and there is no longer any such thing: an inbound message on an accepted session
+     * produces no reply of any kind, so the duplicate-leaf guard is never reached on this journey
+     * and `suppressed_duplicate` never fires. The OUTCOME the line exists for — one ack, one leaf,
+     * a sealable pair of frontiers — is unchanged, and that is what is asserted. AWAYLEAF-1's guard
+     * itself stays in place; nothing here is licence to remove it.
      */
     const { logger, events } = makeLogger();
     const bobPubkey = await makeAgentDir("bob");
@@ -362,13 +373,19 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     /**
-     * THE ASSERTION THAT FAILS ON A REVERT. Reverting sends "[[AUTO-REPLY]] Dispatched." twice, and
-     * this reads two identical entries instead of one.
+     * THE ASSERTION THAT FAILS ON A REVERT of EITHER line. Restoring the message-kind away reply
+     * sends "[[AUTO-REPLY]] Dispatched." a second time (and removing AWAYLEAF-1's guard as well
+     * commits its leaf), and this reads two identical entries instead of one.
      */
     const sent = snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent");
     expect(sent.map((s) => s.text)).toEqual([markAsAutoReply("Dispatched.")]);
-    expect(events.find((e) => e.event === "session.away.response.suppressed_duplicate")?.context)
-      .toMatchObject({ agentName: "bob", kind: "message" });
+    // Named, not merely counted: the tree is what the seal is taken over, and a transcript with one
+    // row over a tree with two leaves is the exact shape that refused `leaf_count_mismatch`.
+    expect(snm.getSessionTree("bob", SID_HEX).size(), "the greeting and the stranger's message, nothing else").toBe(2);
+    // The suppression path is NOT reached any more, and saying so is the verification the order
+    // asked for. A `suppressed_duplicate` here would mean a second ack was computed and caught late
+    // rather than never attempted.
+    expect(events.find((e) => e.event === "session.away.response.suppressed_duplicate")).toBeUndefined();
   });
 
   it("DOD-M15-AWAYSALT-1: a LATE salt agreement still reaches the away ack, so adoption is never closed", async () => {
@@ -470,13 +487,16 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     expect(sent.map((s) => s.text)).toEqual([markAsAutoReply("Back in an hour.")]);
   });
 
-  it("DOD-M15-AWAYLEAF-1 teeth: a KNOWN contact on the DEFAULT text still gets BOTH acks, because they differ", async () => {
+  it("DOD-M15-AWAYSCOPE-1: a KNOWN contact on the DEFAULT text gets the GREETING and nothing for the message", async () => {
     /**
-     * THE CONTROL, and the bypass the reviewer named (MEDIUM-3). The guard must suppress only what is
-     * genuinely identical — it must NOT silence the known caller's second ack, which carries the
-     * one-shot rule that `DOD-AWAY-ACK-ONESHOT-TEXT-1` exists to guarantee. Without this test an
-     * over-broad guard (or a revert to a per-session "one ack ever" rule) passes the whole suite
-     * while quietly removing the instruction that stops a cooperative caller talking to an empty room.
+     * THE CONTROL, and it changed sides. It used to assert that a known caller got BOTH acks — the
+     * knock's greeting and the message's one-shot instruction — because the two texts differ and
+     * AWAYLEAF-1's guard must suppress only genuinely identical bytes.
+     *
+     * DOD-M15-AWAYSCOPE-1 deleted the second ack outright, so the control it provides now is the
+     * opposite one and it is the one that matters more: the deletion must not have taken the FIRST
+     * ack with it. A stranger and a known contact are checked separately here because they take
+     * different text paths, and a deletion that silenced one of them would still pass the other.
      */
     const { logger } = makeLogger();
     const bobPubkey = await makeAgentDir("bob");
@@ -496,17 +516,25 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     const sent = snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent");
-    expect(sent.length, "two DIFFERENT acks must both be sent").toBe(2);
+    expect(sent.length, "the knock is answered; the message is not").toBe(1);
     expect(sent[0]?.text).toContain("is currently away. Leave a message"); // offerFor(agentName)
-    expect(sent[1]?.text).toContain("one message per visit");             // the one-shot rule
+    // Named, so a future widening back into the session is caught by the artifact the seal is taken
+    // over rather than only by a transcript count.
+    expect(snm.getSessionTree("bob", SID_HEX).size(), "greeting + the caller's message").toBe(2);
   });
 
-  it("DOD-M15-AWAYLEAF-1: suppressing the duplicate ack does NOT disarm the one-shot rejection", async () => {
+  it("DOD-M15-AWAYSCOPE-1: a caller who keeps talking to an empty room is left alone, and the session stays open", async () => {
     /**
-     * THE TEETH ON THE FIX ITSELF. The suppression returns early, and the obvious way to write it
-     * leaves the message-kind guard unset — which silently removes `DOD-INBOX-ONESHOT-1`. A stranger
-     * could then talk to an unattended agent indefinitely with nothing ever closing the session, and
-     * the ack test above would still pass. So the SECOND message must still be rejected.
+     * THIS TEST INVERTED. It used to assert `DOD-INBOX-ONESHOT-1`: a second message from a caller
+     * who ignored the leave-one-message instruction drew a `[[WRAP]]` rejection and an immediate
+     * seal, so the inbox could not be talked at indefinitely.
+     *
+     * That closed the session from the side with nobody watching, and closing it is what destroyed
+     * the receipt: the rejection took a leaf the counterparty had already sealed past. Andre's
+     * principle 4 — a session with nobody live must not be terminal — and principle 8 — the party
+     * who comes back is the one who closes. So the cost of a chatty caller is now a few queued
+     * messages, and the session is still there, still active, still sealable, when the operator
+     * returns. That is the trade this order makes deliberately, and this is where it is pinned.
      */
     const { logger, events } = makeLogger();
     const bobPubkey = await makeAgentDir("bob");
@@ -527,9 +555,13 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     await snm.ingestReceivedContent("bob", SID_HEX, m2, msgLeafHash(m2), "c2");
     await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
-    // The one-shot rejection is reached on the SECOND message, exactly as it is without this fix.
-    const rejected = events.filter((e) => e.event === "session.away.inbox.oneshot.rejected");
-    expect(rejected.length, "the second message must still be rejected, not silently suppressed").toBeGreaterThan(0);
+    // Nothing is said back, on either message, and nothing closes the session.
+    expect(events.filter((e) => e.event.startsWith("session.away.inbox.oneshot"))).toHaveLength(0);
+    const sent = snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent");
+    expect(sent.map((s) => s.text), "the greeting only — no rejection, no [[WRAP]]")
+      .toEqual([markAsAutoReply("Dispatched.")]);
+    expect(snm.getSessionTree("bob", SID_HEX).size(), "greeting + the caller's two messages").toBe(3);
+    expect(snm.getSessionRecord("bob", SID_HEX)?.status, "the returning operator still has a session to close").toBe("active");
   });
 
   it("K3 (CC-1): the operator replying INTO an inbound session (cello_send) promotes the sender to a known contact", async () => {
@@ -589,42 +621,6 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     // Reviewer F1 (DOD-WRAP-SUBSTRING-1): the greeting instructs `signal: wrap`, never the
     // literal token (a pasted mid-body token is invisible to the end-anchored detector).
     expect(messages.filter((m) => m.direction === "sent")[0]?.text).toContain("signal: wrap");
-  });
-
-  it("K4/K5 (message-kind): an unknown sender's message on an existing session ALSO gets the minimal text; a known one gets the richer text", async () => {
-    const { logger, events } = makeLogger();
-    await makeAgentDir("alice");
-    const h = await start({ logger, node: new FakeNode() });
-    const snm = h.getSessionNodeManager();
-    const SID_UNKNOWN = "11".repeat(32);
-    const SID_KNOWN = "22".repeat(32);
-    // The session's starting point, seeded BEFORE the node exists — see `helpers/session-genesis.ts`.
-    agreeSessionGenesis(SID_UNKNOWN, [{ mgr: snm, agentName: "alice" }]);
-    await snm.createSessionNode(SID_UNKNOWN, "alice", "strangerpubkeyhex", "peer-1", "corr-1");
-    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
-    snm.setSessionContentKeyForTest("alice", SID_UNKNOWN, new Uint8Array(32).fill(0x7e));
-    // The session's starting point, seeded BEFORE the node exists — see `helpers/session-genesis.ts`.
-    agreeSessionGenesis(SID_KNOWN, [{ mgr: snm, agentName: "alice" }]);
-    await snm.createSessionNode(SID_KNOWN, "alice", "knownpubkeyhex", "peer-2", "corr-2");
-    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
-    snm.setSessionContentKeyForTest("alice", SID_KNOWN, new Uint8Array(32).fill(0x7e));
-    snm.addContact("alice", "knownpubkeyhex", undefined, null, TIER.KNOWN); // pre-established KNOWN; strangerpubkeyhex is not
-
-    const m1 = new TextEncoder().encode("from stranger");
-    await snm.ingestReceivedContent("alice", SID_UNKNOWN, m1, msgLeafHash(m1), "c1");
-    const m2 = new TextEncoder().encode("from known");
-    await snm.ingestReceivedContent("alice", SID_KNOWN, m2, msgLeafHash(m2), "c2");
-    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
-
-    const unknownEvent = events.find((e) => e.event === "session.away.response.sent" && e.context.sessionId === SID_UNKNOWN);
-    expect(unknownEvent?.context).toMatchObject({ kind: "message", isKnown: false });
-    const knownEvent = events.find((e) => e.event === "session.away.response.sent" && e.context.sessionId === SID_KNOWN);
-    expect(knownEvent?.context).toMatchObject({ kind: "message", isKnown: true });
-
-    const unknownSent = snm.readTranscript("alice", SID_UNKNOWN).messages.filter((m) => m.direction === "sent");
-    expect(unknownSent[0]?.text).toBe(markAsAutoReply("Dispatched.")); // DOD-M12B-AWAY-MARK-1
-    const knownSent = snm.readTranscript("alice", SID_KNOWN).messages.filter((m) => m.direction === "sent");
-    expect(knownSent[0]?.text).toContain("message has been received");
   });
 
   it("K2: cello_initiate_session auto-adds the target as a contact", async () => {

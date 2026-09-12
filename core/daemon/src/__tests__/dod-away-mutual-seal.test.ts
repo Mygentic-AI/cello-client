@@ -79,7 +79,11 @@ describe("an away responder recognises another away responder", () => {
     // an un-upgraded peer's away reply is still recognised. Both facts are pinned here at once —
     // the sent text is the marker plus the unchanged body, so neither the wording nor the marker
     // can drift away from the detector without failing.
-    expect(AWAY_AUTO_REPLY_TEXTS.oneShot).toBe(`${AWAY_AUTO_REPLY_MARKER} ${ONE_SHOT}`);
     expect(AWAY_AUTO_REPLY_TEXTS.offerFor("Alice")).toBe(`${AWAY_AUTO_REPLY_MARKER} ${OFFER}`);
+    // DOD-M15-AWAYSCOPE-1 stopped SENDING the one-shot body — it was only ever sent into an
+    // already-accepted session — so there is no sent text left to compare `ONE_SHOT` against. It is
+    // now purely a RECOGNISER for an un-upgraded peer, and that is what is pinned instead: the
+    // detector must still match the exact pre-marker bytes an older build puts on the wire.
+    expect(isOwnAwayAutoReply(ONE_SHOT), "an un-upgraded peer's one-shot must still be recognised").toBe(true);
   });
 });

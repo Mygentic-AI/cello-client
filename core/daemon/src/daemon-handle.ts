@@ -15,7 +15,7 @@ import type { IpcHandler } from "./ipc-server.js";
 
 export interface DaemonHandle {
   stop(reason: string): Promise<void>;
-  getStatus(): DaemonStatusResponse;
+  getStatus(): Promise<DaemonStatusResponse>;
   /**
    * DOD-M12B-CLOSE-SILENT-WAIT-1 test hook: put a session into the state a normal close sits in for
    * up to eleven minutes. Marks the real waiter map the status surface reads and emits the same

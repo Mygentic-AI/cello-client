@@ -78,7 +78,23 @@
  */
 export const AWAY_AUTO_REPLY_MARKER = "[[AUTO-REPLY]]";
 
-/** The unmarked bodies. Kept separate so the legacy detector below matches an un-upgraded peer. */
+/**
+ * The unmarked bodies. Kept separate so the legacy detector below matches an un-upgraded peer.
+ *
+ * ⚠️ `ONESHOT_BODY` IS NO LONGER SENT, AND NOTHING READS IT EITHER. DOD-M15-AWAYSCOPE-1 deleted the
+ * branch that sent it AND the only production call site of `isOwnAwayAutoReply`, which was in the
+ * same branch. An earlier version of this comment said the legacy recogniser "is what stops this
+ * side treating that machine traffic as a person" — review caught that, and it is false: the only
+ * live recogniser is `isAutoReplyMarked`, which matches the MARKER and therefore does NOT match an
+ * un-upgraded peer's unmarked body.
+ *
+ * So an old peer's one-shot now arrives unlabelled. That is a real, small loss and it is stated
+ * rather than papered over: the operator sees the text, which names itself as an away reply in
+ * plain English, and nothing acts on the classification any more because nothing replies.
+ *
+ * Both are RETAINED, not dead-code-cleaned, because the order forbids touching this guard while the
+ * attendance work is unfinished — a call site may return. Retained-pending-a-caller, said out loud.
+ */
 const ONESHOT_BODY =
   "Agent is currently away. Your message has been received and will be read when the operator returns. " +
   "This inbox accepts one message per visit — please close the session now (send with signal: wrap) instead of sending more.";
@@ -108,50 +124,44 @@ export function isAutoReplyMarked(text: string): boolean {
 
 /** The exact strings this daemon sends as away auto-replies. Marked at the source. */
 export const AWAY_AUTO_REPLY_TEXTS = {
-  /**
-   * The one-shot acknowledgement, sent when a message arrives for an unattended agent.
-   * States the one-shot rule, because without it a cooperative caller has no reason to stop.
-   */
-  oneShot: `${AWAY_AUTO_REPLY_MARKER} ${ONESHOT_BODY}`,
-
   /** The session-offer answer, which names the away agent — so it is built, not fixed. */
   offerFor(agentName: string): string {
     return `${AWAY_AUTO_REPLY_MARKER} ${agentName}${OFFER_SUFFIX}`;
   },
 
   /**
-   * M8C-CONTACT-1: "unknown senders learn only 'dispatched' by default" — deliberately minimal and
-   * the SAME for both ack kinds, unlike the two above. That sameness is what DOD-M15-AWAYLEAF-1
-   * contains; the guard is at the send site in `attendance-wiring.ts`, which is where the content
-   * hash exists. Lives here beside its siblings for the reason the marker does: one definition, so
-   * a reword cannot desynchronise the detector.
+   * M8C-CONTACT-1: "unknown senders learn only 'dispatched' by default" — deliberately minimal.
+   *
+   * It stays bare after DOD-M15-AWAYSCOPE-1. Andre's principle 3 draws the line at ACCEPTED
+   * sessions: a counterparty who accepted is entitled to know what happened to the session, and a
+   * STRANGER knocking is not. Lives here beside its siblings for the reason the marker does: one
+   * definition, so a reword cannot desynchronise the detector.
    */
   stranger: `${AWAY_AUTO_REPLY_MARKER} Dispatched.`,
 } as const;
 
 /**
- * The system default away text, per kind and per whether the caller is known. MOVED HERE from
- * `attendance-wiring.ts` (DOD-M15-AWAYLEAF-1) so the selection sits beside the strings it selects
- * so the selection sits beside the strings it selects.
+ * The system default away text for an inbound session REQUEST, per whether the caller is known.
+ * MOVED HERE from `attendance-wiring.ts` (DOD-M15-AWAYLEAF-1) so the selection sits beside the
+ * strings it selects.
  *
  * The record that travelled with it:
  * - DOD-AWAY-WRAP-1 AC1: the request text is a leave-a-message greeting, and it names the specific
  *   away agent — which is why it is built rather than fixed.
- * - DOD-AWAY-ACK-ONESHOT-TEXT-1 (live defect 2026-07-24): the message ack must STATE the one-shot
- *   rule. Without it a cooperative caller LLM has no reason to stop, sends a follow-up, and eats the
- *   DOD-INBOX-ONESHOT-1 rejection the design itself invited.
  * - ONE definition, shared with the detector in this file. A second copy elsewhere is how a reworded
  *   away message stops being recognised as machine traffic and the mutual-seal loop
  *   (DOD-AWAY-MUTUAL-SEAL-1) quietly comes back.
  *
- * ⚠️ A STRANGER GETS THE SAME STRING FOR BOTH KINDS. That is contained by DOD-M15-AWAYLEAF-1's
- * guard at the send site — not by varying the text, which would tell an unknown caller more than
- * M8C-CONTACT-1 allows. Note the guard cannot live here: `resolveAwayMessage` OVERRIDES this
- * function entirely, so a configured away message is kind-independent too and collides the same way.
+ * ⚠️ DOD-M15-AWAYSCOPE-1 TOOK THE SECOND KIND AWAY, and with it the reason this function took a
+ * `kind` at all. There used to be a second arm for a message arriving on an ALREADY-ACCEPTED
+ * session — the one-shot acknowledgement, `DOD-AWAY-ACK-ONESHOT-TEXT-1` — and sending it was the
+ * defect: it typed a status announcement into a live conversation and took a chain leaf doing it.
+ * Its wording survives below as `ONESHOT_BODY`, unsent, because the legacy branch of
+ * `isOwnAwayAutoReply` is the only thing that still recognises an un-upgraded peer sending it.
  */
-export function systemAwayText(kind: "request" | "message", agentName: string, isKnown: boolean): string {
+export function systemAwayText(agentName: string, isKnown: boolean): string {
   if (!isKnown) return AWAY_AUTO_REPLY_TEXTS.stranger;
-  return kind === "request" ? AWAY_AUTO_REPLY_TEXTS.offerFor(agentName) : AWAY_AUTO_REPLY_TEXTS.oneShot;
+  return AWAY_AUTO_REPLY_TEXTS.offerFor(agentName);
 }
 
 

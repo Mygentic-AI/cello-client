@@ -845,9 +845,9 @@ export class SessionLifecycle {
         reason: "interrupted",
       });
       // DELIBERATELY NOT #evictSessionCaches here (unlike destroySessionNode/retireSessionNode):
-      // an interrupted session is not terminal. (1) #receivedContent must stay drainable — the
-      // record survives, and cello_receive legitimately reads buffered unread messages after a
-      // transient relay blip; evicting would silently discard deliverable plaintext. (2) Evict
+      // an interrupted session is not terminal. (1) Reason (1) used to be the in-memory arrival
+      // buffer, which had to stay drainable across a blip; that buffer is gone and cello_receive
+      // reads the durable transcript, which eviction never touched anyway. (2) Evict
       // also cancels armed TTF timers (`clearAwaitingForSession`, in `session-content-send.ts`) — on
       // a dying session the TTF
       // park backstop is exactly what must fire for un-acked content (MSG-001). The caches are

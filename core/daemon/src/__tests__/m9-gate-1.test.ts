@@ -33,6 +33,7 @@ import type { Stream } from "@libp2p/interface";
 import { spawnGatewaySidecar, LocalSidecarGatewayClient, type SpawnedGateway } from "@cello-protocol/gateway";
 import { seedAgents } from "./helpers/seed-agents.js";
 import { extractErrorMessage } from "../error-message.js";
+import { receivedCount, receivedText } from "./helpers/received-rows.js";
 
 function makeLogger(): Logger { return { debug() {}, info() {}, warn() {}, error() {} }; }
 function msgLeafHash(content: Uint8Array): Uint8Array {
@@ -133,8 +134,7 @@ describe("M9-GATE-1: the park-recovery producer is screened by a REAL gateway pr
     const res = await mgr.ingestReceivedContent("alice", SID, content, msgLeafHash(content));
     expect(res.ok).toBe(true);
     expect(mgr.getSessionTree("alice", SID).size()).toBe(1); // leafed
-    const drained = mgr.takeReceivedContent("alice", SID);
-    expect(drained && Buffer.from(drained.contentHex, "hex").toString()).toBe("recovered-from-park, perfectly fine");
+    expect(receivedText(mgr, "alice", SID)).toBe("recovered-from-park, perfectly fine");
 
     // The REAL gateway process logged the inbound screen of these exact bytes (proof-of-screening).
     const fp = createHash("sha256").update(content).digest("hex");
@@ -151,6 +151,9 @@ describe("M9-GATE-1: the park-recovery producer is screened by a REAL gateway pr
     expect(res.ok).toBe(true);
     expect(res.ok && res.screenedOut).toBe(true);
     expect(mgr.getSessionTree("alice", SID).size()).toBe(1); // one tamper-evident leaf
-    expect(mgr.takeReceivedContent("alice", SID)).toBeNull(); // the agent never sees it
+    // The agent never sees it. A RECEIVED row is what `cello_receive` serves; a terminal block
+    // leaves the leaf for chain parity and no row, so this is the same question the old buffer
+    // drain asked and the one an operator would actually be answered with.
+    expect(receivedCount(mgr, "alice", SID)).toBe(0);
   }, 30_000);
 });

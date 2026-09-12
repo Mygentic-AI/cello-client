@@ -20,7 +20,7 @@
  *     difference between "your counterparty is quiet" and "your sibling took it".
  *
  * WHY HERE AND NOT IN SessionNodeManager. The ledger's subject is connection identity, which is an
- * IPC-layer concept. `SessionNodeManager` is deliberately connection-agnostic — `#receivedContent`
+ * IPC-layer concept. `SessionNodeManager` is deliberately connection-agnostic — its session caches
  * being keyed by (agent, session) and NOT by connection IS the Tier-1 defect — so teaching it about
  * connections inside the launch-gate slice would start the redesign early. This sits beside the
  * per-connection read cursor, which is the same kind of state for the same reason.

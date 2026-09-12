@@ -68,6 +68,7 @@ import { SessionQueries } from "./session-queries.js";
 import { RefusalNotices } from "./refusal-notices.js";
 import { SessionEphemerals } from "./session-ephemerals.js";
 import { SessionLiveness } from "./session-liveness.js";
+import type { LivenessAnswer } from "./session-relay-client.js";
 import { WitnessAlerts } from "./witness-alerts.js";
 import { HeldContent, type HeldEntry } from "./held-content.js";
 import { SessionLeafRecords } from "./session-leaf-records.js";
@@ -91,7 +92,7 @@ import { type SecurityGatewayClient } from "@cello-protocol/gateway";
  * `(witness relay, session)`, so a repeated observation raises `occurrences` rather than taking
  * another slot in a bounded list.
  */
-import { ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL, heldRelayIdsOf, PARKED_DRAIN_BACKSTOP_DEFAULT_MS, type ActiveSessionEntry, SALT_AGREEMENT_WAIT_MS, type AwaitingAckEntry, CONTENT_MAX_INBOUND_STREAMS, type ISessionNodeFactory, LEAF_FETCH_GRACE_MS, type ParkedDrainReason, type QuarantinedRecord, type ReceivedContentEntry, type RefusalNotice, type SessionImpairment, type SessionRevivalIdentity, type TranscriptEntry, type WitnessAlertNotice } from "./session-node-types.js";
+import { ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL, heldRelayIdsOf, PARKED_DRAIN_BACKSTOP_DEFAULT_MS, type ActiveSessionEntry, SALT_AGREEMENT_WAIT_MS, type AwaitingAckEntry, CONTENT_MAX_INBOUND_STREAMS, type ISessionNodeFactory, LEAF_FETCH_GRACE_MS, type ParkedDrainReason, type QuarantinedRecord, type RefusalNotice, type SessionImpairment, type SessionRevivalIdentity, type TranscriptEntry, type WitnessAlertNotice } from "./session-node-types.js";
 
 // Re-exported so this module's public surface is unchanged by the split: every existing
 // importer of session-node-manager.js keeps working, and no test moves an import path.
@@ -671,7 +672,6 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
   // DAEMON-004: per-session FIFO buffer of verified received content awaiting
   // cello_receive. Populated by `session-content-ingest.ts` — ingestReceivedContent and the
   // content stream handler.
-  #receivedContent = new Map<string, ReceivedContentEntry[]>();
   // F1-b: a terminal answer for a sealed session, set at seal teardown BEFORE the
   // received-content buffer is evicted. A blocking cello_receive waiting when the seal
   // fires returns this instead of hanging or 404ing; `unreadCount` tells the caller how
@@ -767,7 +767,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
   // the next expected leaf is HELD here (keyed #k(agent,session) -> (canonicalSeq -> entry)) instead
   // of being appended out of order. Once the missing in-between sequence(s) land (recovered from the
   // relay mailbox), #releaseHeld drains the held entries in canonical order. content is plaintext in
-  // memory only — evicted on teardown, same as #receivedContent.
+  // memory only — evicted on teardown, same as the other per-session caches.
   /**
    * DOD-M15-SEALWIRE-1 bullet 5 — `authorship` rides the held entry.
    *
@@ -1223,7 +1223,6 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       witnessedSeq: this.#witnessedSeq,
       leafFetchTimers: this.#leafFetchTimers,
       lastAck: this.#lastAck,
-      receivedContent: this.#receivedContent,
       resolvedContent: this.#resolvedContent,
       undeliverableSeqs: this.#undeliverableSeqs,
       highWaterSeq: this.#highWaterSeq,
@@ -1393,6 +1392,10 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       receivers: this.#receivers,
       witness: this.#witness,
       contentIn: this.#contentIn,
+      // DOD-M15-AWAYSCOPE-1: injected, and the daemon sets it in the composition root. The manager
+      // cannot answer it — attendance is an IPC-layer fact (who has claimed this agent), and this
+      // class is deliberately connection-agnostic.
+      currentAttendance: (agentName: string) => this.#currentAttendance(agentName),
       db: () => this.#db,
 
       activeNodes: this.#activeNodes,
@@ -1728,7 +1731,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
    * the operator's own agents (the loopback case) can hold the two ends of the SAME session_id on
    * ONE daemon, so a bare session_id is ambiguous between them. This composite string key — the
    * agent name and the hex session id joined by a 0x1f unit separator (which appears in neither) —
-   * is the key for every in-memory session-core map (#activeNodes, #trees, #receivedContent,
+   * is the key for every in-memory session-core map (#activeNodes, #trees,
    * #contentDesynced, #responderSealSubmitted, #awaitingAck) and for the per-session maps the
    * collaborators own, which build the same key the same way. #relayClients is already per-agent
    * (its own key), and the standing receivers are keyed by agent name directly.
@@ -1849,7 +1852,6 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     // held content and high-water map below are cleared, on the abnormal path only.
     const treeSizeBeforeEviction = this.#trees.get(key)?.size() ?? null;
     this.#trees.delete(key);
-    this.#receivedContent.delete(key);
     // CELLO-M7-MSG-001: cancel any armed TTF timers so a torn-down session never
     // fires a park backstop (or keeps a timer) after it is gone.
     this.#contentOut.clearAwaitingForSession(agentName, sessionId);
@@ -2170,7 +2172,6 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     // Evict in-memory per-session caches (trees reload from SQLite; received-content
     // plaintext must not survive shutdown in memory).
     this.#trees.clear();
-    this.#receivedContent.clear();
     // DOD-M12B-SESSION-SEED-1 (review F5): transport identities are key material and belong in the
     // same sentence as the plaintext above. Shutdown marks every active row `interrupted` by direct
     // SQL, so no `SessionLifecycle.updateSessionStatus` destroy fires for them — without this, every live session's
@@ -2398,6 +2399,68 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
 
   submitSealLeaf(...args: Parameters<SessionSeal["submitSealLeaf"]>): ReturnType<SessionSeal["submitSealLeaf"]> { return this.#seal.submitSealLeaf(...args); }
 
+  /**
+   * DOD-M15-AWAYSCOPE-1 — tell every relay this agent is talking through whether anyone is watching.
+   *
+   * ⚠️ THIS IS WHAT REPLACED THE AWAY REPLY. An unattended agent used to answer inbound messages
+   * with its greeting, which took a hash-chain leaf inside a live conversation and cost session
+   * `e7dd3f43…` its receipt on both machines. The fact is worth telling; it is a fact ABOUT the
+   * session, so it rides the out-of-band liveness frame and takes no leaf, enters no transcript, and
+   * is never seen by the counterparty's agent as a message.
+   *
+   * BEST EFFORT AND SILENT ON FAILURE, by design. A session with no relay (direct-only) is skipped;
+   * a send that fails is logged at debug inside the client. The cost of every failure is the same
+   * and it is small: the counterparty reads "unknown" until the next notice.
+   */
+  /**
+   * DOD-M15-AWAYSCOPE-1 — who answers "is anyone attending this agent". Set by the daemon.
+   *
+   * Defaults to `unattended` rather than throwing or guessing `attended`: before the composition
+   * root wires it, the truthful answer is that nobody has claimed anything. Defaulting the other
+   * way would tell a counterparty a person is watching during exactly the window in which the
+   * daemon has not finished starting.
+   */
+  #currentAttendance: (agentName: string) => "attended" | "unattended" | "offline" = () => "unattended";
+
+  setCurrentAttendanceSource(fn: (agentName: string) => "attended" | "unattended" | "offline"): void {
+    this.#currentAttendance = fn;
+  }
+
+  announceAttendance(agentName: string, attendance: "attended" | "unattended" | "offline"): void {
+    // The separator is `#k`'s own `\x1f`, not a colon — a colon is legal inside an agent name and
+    // the map has never used one. Getting this wrong is silent: the loop matches nothing and every
+    // announcement is skipped, with no error anywhere.
+    const prefix = this.#k(agentName, "");
+    for (const [key, entry] of this.#activeNodes) {
+      if (!key.startsWith(prefix)) continue;
+      if (!entry.relayClient || !entry.relaySessionIdBytes) continue;
+      entry.relayClient.announceAttendance(entry.node, entry.relaySessionIdBytes, attendance);
+    }
+  }
+
+  /**
+   * DOD-M15-AWAYSCOPE-1 — ask the relay what it knows about the counterparty of ONE session.
+   *
+   * ⚠️ NOT `getSessionLiveness`, which is a different question with a different answer. That one is
+   * daemon-local: does THIS process hold a libp2p connection for the session, and it has a fourth
+   * value (`impaired`) the wire type does not. This one asks the RELAY, which sees the counterparty's
+   * standing connection even when this daemon has no direct link to them, and it is the only path
+   * that can carry attendance — because attendance is the far daemon's own assertion, relayed.
+   *
+   * Returns null when there is nothing to ask: no session, or a session with no relay behind it.
+   * That is distinct from an answer of 'unknown', which means the relay was asked and did not know.
+   */
+  async queryRelayLiveness(agentName: string, sessionId: string): Promise<LivenessAnswer | null> {
+    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
+    if (!entry?.relayClient || !entry.relaySessionIdBytes) return null;
+    const record = this.getSessionRecord(agentName, sessionId);
+    if (!record) return null;
+    return entry.relayClient.queryLiveness(
+      entry.relaySessionIdBytes,
+      Uint8Array.from(Buffer.from(record.counterparty_pubkey, "hex")),
+    );
+  }
+
   sealReadiness(...args: Parameters<SessionSeal["sealReadiness"]>): ReturnType<SessionSeal["sealReadiness"]> { return this.#seal.sealReadiness(...args); }
 
   sealReadinessView(...args: Parameters<SessionSeal["sealReadinessView"]>): ReturnType<SessionSeal["sealReadinessView"]> { return this.#seal.sealReadinessView(...args); }
@@ -2466,7 +2529,6 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
 
   placeOwnLeaf(...args: Parameters<SessionContentSender["placeOwnLeaf"]>): ReturnType<SessionContentSender["placeOwnLeaf"]> { return this.#contentOut.placeOwnLeaf(...args); }
 
-  takeReceivedContent(...args: Parameters<SessionContentIngest["takeReceivedContent"]>): ReturnType<SessionContentIngest["takeReceivedContent"]> { return this.#contentIn.takeReceivedContent(...args); }
 
   recordWitnessedSequence(...args: Parameters<SessionContentIngest["recordWitnessedSequence"]>): ReturnType<SessionContentIngest["recordWitnessedSequence"]> { return this.#contentIn.recordWitnessedSequence(...args); }
 
@@ -2579,24 +2641,19 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     };
   }
 
-  /** DOD-AWAY-WRAP-1: peek at the hex of the most-recently buffered (last) received message without
-   *  consuming it. Used by sendAwayResponse to detect [[WRAP]]-signalled messages and skip the away
-   *  reply. Returning the last entry (not the first) is intentional — the ingest file's
-   *  appendVerifiedContent always
-   *  pushes to the tail, so the tail is the message that just triggered onContentArrived. */
-  peekLatestReceivedContentHex(agentName: string, sessionId: string): string | null {
-    const buf = this.#receivedContent.get(this.#k(agentName, sessionId));
-    if (!buf || buf.length === 0) return null;
-    return buf[buf.length - 1]?.contentHex ?? null;
-  }
-
-  pushReceivedContentForTest(agentName: string, sessionId: string, seq: number, content: string, senderPubkey: string): void {
-    this.#records.recordTranscriptMessage(agentName, sessionId, seq, "received", new TextEncoder().encode(content), "test");
-    const key = this.#k(agentName, sessionId);
-    let buf = this.#receivedContent.get(key);
-    if (!buf) { buf = []; this.#receivedContent.set(key, buf); }
-    buf.push({ contentHex: Buffer.from(content, "utf8").toString("hex"), senderPubkey, sequenceNumber: seq });
-  }
+  /**
+   * THE IN-MEMORY ARRIVAL BUFFER WAS HERE, with `takeReceivedContent`, `pushReceivedContentForTest`
+   * and `peekLatestReceivedContentHex`. All three are gone, and so is the buffer.
+   *
+   * It kept the plaintext of the last 32 messages of every live session in daemon memory for the
+   * life of the process. `cello_receive` stopped draining it at DOD-COATTEND-1, when delivery moved
+   * onto the durable transcript; the away responder's peek at its tail was the last reader, and
+   * DOD-M15-AWAYSCOPE-1 deleted that with the branch that answered an accepted session. What
+   * remained was every conversation this agent had, held in memory, for nobody.
+   *
+   * Tests that asked it "did this message reach the agent" now ask the transcript, which is what
+   * production serves — see `__tests__/helpers/received-rows.ts` for why the answer is the same.
+   */
 
   /**
    * F1-b: the terminal answer for a session that sealed while a blocking receive was (or could be)

@@ -256,10 +256,19 @@ describe("DOD-M15-TOKENSTALE-1: the split did not strip the fallbacks that exist
       .not.toContain("online_token_expired");
   });
 
-  it("★★ the away auto-seal still falls back, where nobody is watching (F3)", () => {
-    // By construction there is no operator on this path, so the loss would be silent.
-    expect(read("attendance-wiring.ts")).toMatch(/submit\.reason === "relay_unavailable" \|\| isLocalCredentialRefusal\(submit\.reason\)/);
-  });
+  /**
+   * F3 WAS THE AWAY AUTO-SEAL, and it is gone rather than weakened.
+   *
+   * It guarded the fallback on the one seal path with no operator watching: the one-shot rejection
+   * an unattended agent sent into an already-accepted session, which closed the session and sealed
+   * it on the spot. `DOD-M15-AWAYSCOPE-1` deleted that path — sending anything into a live session
+   * is what cost session `e7dd3f43…` its receipt — so `attendance-wiring.ts` no longer calls
+   * `submitSealLeaf` at all and there is no branch left for this clause to check.
+   *
+   * Said here rather than silently dropped, because a scan-the-source enforcer that stops finding
+   * its subject passes for the wrong reason. There is nothing unwatched left to guard on this line;
+   * the other three sites below and above still are.
+   */
 
   it("★★ a stale verdict cannot relabel a genuine relay outage as our credential (F4)", () => {
     /**

@@ -22,6 +22,12 @@ import { contentEncryptionGuidanceFor } from "./content-encryption-status.js";
 import { frameQuarantinedPayload } from "./quarantine-framing.js";
 import { readDeliveryFacts } from "./session-delivery-acks.js";
 
+/**
+ * DOD-M15-AWAYSCOPE-1: one budget for ALL the attendance probes a list fires, not one each. Set by
+ * what a person will sit through at a terminal, not by what a slow relay might need.
+ */
+const ATTENDANCE_PROBE_BUDGET_MS = 1_500;
+
 export interface SessionReadDeps {
   /** DOD-FRONTIER-STRAND-1 AC3: retained mismatches, surfaced on the session LIST (the AC's surface). */
   frontierMismatches: FrontierMismatchStore;
@@ -638,6 +644,43 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
     return { ok: true, filter, limit, totalMatched: matched.length, sessions };
   }
 
+  /**
+   * DOD-M15-AWAYSCOPE-1 — fill `counterpartyAttendance` on the OPEN rows, under one shared budget.
+   *
+   * One budget for the whole list rather than one per row: an operator with a dozen sessions must
+   * not wait a dozen relay timeouts. On expiry the rows are returned UNENRICHED rather than
+   * partially enriched — a list where some rows carry the field and others do not, with nothing
+   * saying which, cannot be read: a missing field is indistinguishable from a field meaning
+   * "unknown", and the reader would draw the wrong conclusion about whichever rows lost the race.
+   */
+  async function attachAttendance(sessions: SessionListEntry[]): Promise<SessionListEntry[]> {
+    const open = sessions.filter((s) => s.category === "open");
+    if (open.length === 0) return sessions;
+    const budget = new Promise<"timeout">((r) => setTimeout(() => r("timeout"), ATTENDANCE_PROBE_BUDGET_MS));
+    const answers = await Promise.race([
+      Promise.all(open.map(async (s) => {
+        try {
+          return await sessionNodeManager.queryRelayLiveness(s.agentName, s.sessionId);
+        } catch {
+          return null;
+        }
+      })),
+      budget,
+    ]);
+    if (answers === "timeout") return sessions;
+    const byId = new Map(open.map((s, i) => [s.sessionId, answers[i]]));
+    return sessions.map((s) => {
+      const a = byId.get(s.sessionId);
+      if (!a?.attendance) return s;
+      // The ASSERTION's age, not the relay's connection observation — see ActiveSessionInfo.
+      return {
+        ...s,
+        counterpartyAttendance: a.attendance,
+        ...(a.attendanceObservedAt !== undefined ? { attendanceObservedAt: a.attendanceObservedAt } : {}),
+      };
+    });
+  }
+
   // cello_list_sessions (MCP, per current agent): the discovery surface for the by-id reads
   // (cello_get_transcript / cello_get_sealed_receipt). Accepts { filter?: open|closed|failed|all,
   // limit?: number } — defaults to open + DEFAULT_LIST_LIMIT so failed/dead handshakes don't drown
@@ -650,10 +693,23 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
       return NO_CURRENT_AGENT_RESPONSE;
     }
     reapDeadHalfOpenSessions(agentName); // CC-5/F21: drop provably-dead half-open sessions before listing
-    return selectSessions(
+    const listed = selectSessions(
       sessionNodeManager.getSessionsForAgent(agentName),
       params as Record<string, unknown> | undefined,
     );
+    /**
+     * DOD-M15-AWAYSCOPE-1 unit 3 — and whether anyone is attending the far side of the OPEN ones.
+     *
+     * ⚠️ OPEN SESSIONS ONLY, and that is not an optimisation. A closed or failed session has no
+     * relay to ask and no counterparty state that means anything any more; probing them would spend
+     * a round trip per archived row to fill a field whose only honest value is absent.
+     *
+     * This is the surface the ORDER names, and it is where the replacement for the away reply
+     * actually lands: an agent listing its sessions can see that the far side is online but
+     * unattended, and report that to its operator — instead of being told the same thing by a
+     * machine-written message that took a leaf and broke the receipt.
+     */
+    return { ...listed, sessions: await attachAttendance(listed.sessions) };
   });
 
   // ─── DOD-SESSION-NAME-1: cello_name_session — set or clear THIS agent's label for a session ───
@@ -775,13 +831,22 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
     return { ok: true, session_id: sessionId, ...(refusalsDismissed > 0 ? { refusals_dismissed: refusalsDismissed } : {}) };
   });
 
-  // list_sessions (daemon-wide, for the `cello sessions` CLI which has no current agent): same
-  // filter/limit semantics, across ALL agents.
+  /**
+   * list_sessions (daemon-wide, reached as `cello sessions --all-agents`): same filter/limit
+   * semantics, across ALL agents.
+   *
+   * ⚠️ ENRICHED WITH ATTENDANCE TOO (DOD-M15-AWAYSCOPE-1), and that is not tidiness. This and
+   * `cello_list_sessions` are two renderings of the same rows, and an operator moves between them.
+   * A field present on one and absent on the other teaches exactly the wrong lesson — absent reads
+   * as "nobody is attending" rather than "this surface does not ask" — and the whole point of the
+   * field is that its absence must mean "the relay did not say".
+   */
   handlers.set("list_sessions", async (params) => {
-    return selectSessions(
+    const listed = selectSessions(
       sessionNodeManager.getAllSessions(),
       params as Record<string, unknown> | undefined,
     );
+    return { ...listed, sessions: await attachAttendance(listed.sessions) };
   });
 
 }

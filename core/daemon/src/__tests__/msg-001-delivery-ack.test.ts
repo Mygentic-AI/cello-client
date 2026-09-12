@@ -40,6 +40,7 @@ import { InMemoryKeyProvider, signDeliveryAck } from "@cello-protocol/crypto";
 import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
+import { receivedCount } from "./helpers/received-rows.js";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
@@ -187,8 +188,8 @@ describe("MSG-001: delivery ACK / TTF (daemon)", () => {
     const res = await mgrA.sendContent("alice", SID, content, hash, "corr-a", LEAF_KIND_MSG);
     expect(res.ok).toBe(true);
 
-    // The receiver ingested it (buffered for cello_receive).
-    expect(await waitFor(() => mgrB.takeReceivedContent("bob", SID) !== null)).toBe(true);
+    // The receiver ingested it, and it is readable by cello_receive.
+    expect(await waitFor(() => receivedCount(mgrB, "bob", SID) === 1)).toBe(true);
 
     // The sender observably transitioned from awaiting → acked over a real ACK frame.
     expect(await waitFor(() => a.events.some((e) => e.event === "content.delivery.acked"))).toBe(true);

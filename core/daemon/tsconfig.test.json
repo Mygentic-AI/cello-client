@@ -170,6 +170,7 @@
     "src/__tests__/helpers/encrypted-db.ts",
     "src/__tests__/helpers/hold-singleton-lock.ts",
     "src/__tests__/helpers/park-relay.ts",
+    "src/__tests__/helpers/received-rows.ts",
     "src/__tests__/helpers/seed-agents.ts",
     // `DOD-M15-SELFCHAIN-1`. New and clean on creation, which is this list's admission criterion.
     // It hands out the value every fixture's session chains to, so a signature drift here would
