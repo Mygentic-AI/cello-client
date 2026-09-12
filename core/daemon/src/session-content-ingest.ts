@@ -1372,10 +1372,11 @@ export class SessionContentIngest {
     let buf = this.#ctx.receivedContent.get(recvKey);
     if (!buf) { buf = []; this.#ctx.receivedContent.set(recvKey, buf); }
     buf.push({ contentHex: Buffer.from(content).toString("hex"), senderPubkey, sequenceNumber: leafIndex });
-    // DOD-COATTEND-1: BOUNDED, because delivery no longer drains this. Its remaining job is
-    // `takeReceivedContent`, the pop `cello_receive` drives — an unbounded array holding every
-    // message of every live session, in memory, for the life of the daemon, is a leak the old
-    // destructive read hid. (The away responder's TAIL peek was the other reader, until AWAYSCOPE-1.)
+    // DOD-COATTEND-1: BOUNDED, because delivery no longer drains this — an unbounded array holding
+    // every message of every live session, in memory, for the life of the daemon, is the leak the
+    // old destructive read hid. ⚠️ IT NOW HAS NO PRODUCTION READER AT ALL: `takeReceivedContent` is
+    // reached only from tests, and the away responder's TAIL peek — the other one — went with
+    // DOD-M15-AWAYSCOPE-1. The cap is what keeps the leak bounded until the buffer is removed.
     if (buf.length > RECEIVED_BUFFER_CAP) buf.splice(0, buf.length - RECEIVED_BUFFER_CAP);
     this.#ctx.logger.info("session.content.received", {
       sessionId,

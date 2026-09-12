@@ -639,10 +639,14 @@ export type CreateSessionResult =
 // ─── SessionNodeManager ───────────────────────────────────────────────────────
 
 /**
- * DOD-COATTEND-1: how much of the arrival buffer is kept. Delivery reads the durable transcript
- * now, so this buffer is only what `cello_receive` pops from (`takeReceivedContent`). Small, and
- * stated: an unstated cap is a silent truncation, and no cap at all is the leak the old destructive
- * read was accidentally preventing.
+ * DOD-COATTEND-1: how much of the arrival buffer is kept. Small, and stated: an unstated cap is a
+ * silent truncation, and no cap at all is the leak the old destructive read was accidentally
+ * preventing.
+ *
+ * ⚠️ THE BUFFER HAS NO PRODUCTION READER (review finding, verified). Delivery reads the durable
+ * transcript; `takeReceivedContent` is reached only from tests; the away responder's peek went with
+ * DOD-M15-AWAYSCOPE-1. Until the buffer itself is removed, this cap is the only thing bounding a
+ * plaintext leak nothing consumes.
  */
 export const RECEIVED_BUFFER_CAP = 32;
 
