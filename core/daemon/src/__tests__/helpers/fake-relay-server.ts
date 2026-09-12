@@ -36,11 +36,28 @@ export interface OrderedLeaf {
 export interface FakeRelayOpts {
   /** Called synchronously as the relay assigns a sequence — before the client is told. */
   onLeaf?: (leaf: OrderedLeaf) => void;
+  /**
+   * Deliver every ordered leaf to every connected stream as `leaf_deliver`, which is what a real
+   * relay does and what gives a SECOND daemon its ordering. Default OFF: the existing callers have
+   * one client, and echoing leaves back at it would change their auto-acknowledge behaviour.
+   */
+  broadcastLeaves?: boolean;
 }
 
 export function makeFakeRelayServer(opts: FakeRelayOpts = {}) {
   let seq = 0;
   const ordered: OrderedLeaf[] = [];
+  const streams: Array<(frame: Record<string, unknown>) => void> = [];
+  /**
+   * ONE SEQUENCE PER CONTENT HASH — the relay orders a MESSAGE, not a submission.
+   *
+   * Both parties submit the same leaf (the sender when it sends, the receiver when it
+   * acknowledges), and a relay that numbered each submission separately would hand the two sides
+   * different positions for the same message: every leaf after the first lands ahead of its own
+   * tail and is held forever. That is a fixture artifact with no counterpart in production, and it
+   * makes a two-party test unable to reach any of the states it was written for.
+   */
+  const bySubmission = new Map<string, OrderedLeaf>();
   function openStream() {
     const inbound: Uint8Array[] = [];
     let notify: (() => void) | null = null;
@@ -59,15 +76,40 @@ export function makeFakeRelayServer(opts: FakeRelayOpts = {}) {
             const frame = decode(u8) as Record<string, unknown>;
             if (frame["type"] === "relay_auth_response") push({ type: "relay_auth_ok" });
             else if (frame["type"] === "hash_submit") {
-              const leaf: OrderedLeaf = {
+              const s1 = frame["structure1_cbor"];
+              const key = s1 instanceof Uint8Array ? Buffer.from(s1).toString("hex") : String(s1);
+              const already = bySubmission.get(key);
+              const leaf: OrderedLeaf = already ?? {
                 sequenceNumber: ++seq,
                 leafKind: typeof frame["leaf_kind"] === "number" ? (frame["leaf_kind"] as number) : 0,
               };
+              if (already) {
+                // A re-submission of a leaf already ordered: acknowledge with the SAME position and
+                // do not witness it twice.
+                push({ type: "hash_submit_ack", sequence_number: leaf.sequenceNumber });
+                continue;
+              }
+              bySubmission.set(key, leaf);
               ordered.push(leaf);
               // BEFORE the ack, deliberately: the tree state a test wants to inspect is the one that
               // existed when the relay committed the position, not the one after the client reacts.
               opts.onLeaf?.(leaf);
               push({ type: "hash_submit_ack", sequence_number: leaf.sequenceNumber });
+              if (opts.broadcastLeaves) {
+                // The witness, to everyone on the session — the submitter included, exactly as the
+                // real relay echoes it. Whether a leaf is one's own is decided by the CLIENT from
+                // the sender pubkey inside `structure1_cbor`, never by a field the relay sets, so
+                // the same frame is correct for every recipient.
+                const witness = {
+                  type: "leaf_deliver",
+                  sequence_number: leaf.sequenceNumber,
+                  session_id: frame["session_id"],
+                  leaf_kind: leaf.leafKind,
+                  structure1_cbor: frame["structure1_cbor"],
+                  sender_signature: frame["sender_signature"],
+                };
+                for (const to of streams) to(witness);
+              }
             }
           }
         })();
@@ -83,6 +125,7 @@ export function makeFakeRelayServer(opts: FakeRelayOpts = {}) {
       },
     };
     push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
+    streams.push(push);
     return stream;
   }
   return { openStream, ordered: () => [...ordered], ctrlSubmits: () => [] as unknown[] };
@@ -99,6 +142,8 @@ export class FakeNode implements Partial<CelloNode> {
   listenAddresses(): string[] { return ["/ip4/127.0.0.1/tcp/0"]; }
   async dial(_a: string): Promise<{ peerId: string }> { return { peerId: "remote" }; }
   async handle(_p: string, _h: unknown): Promise<void> {}
+  /** Real nodes drop a peer that sent a frame on the wrong session; the refusal path calls this. */
+  async hangUp(_peer: string): Promise<void> {}
   getProtocols(): string[] { return []; }
   getConnections(): Array<{ peerId: string; encryption: string | undefined }> { return []; }
   onPeerConnect(_h: (p: string) => void): void {}
@@ -121,6 +166,12 @@ export class FakeRelayAwareNode extends FakeNode {
    * before the caller places its leaf. Awaited, so a test can run a whole close inside the window.
    */
   onDirectStream?: () => void | Promise<void>;
+  /**
+   * Every byte this node hands to a DIRECT (non-relay) stream. That is the counterparty's copy of
+   * the message, and feeding it to a second daemon's real inbound handler is what makes a two-daemon
+   * test possible without two libp2p stacks.
+   */
+  onDirectSend?: (bytes: Uint8Array) => void;
   constructor(private readonly fakeRelay: ReturnType<typeof makeFakeRelayServer>) { super(); }
   async dial(_addr: unknown): Promise<{ peerId: string }> { return { peerId: FAKE_RELAY_PEER_ID }; }
   async newStream(peerId: unknown, _proto: unknown): Promise<Stream> {
@@ -132,6 +183,12 @@ export class FakeRelayAwareNode extends FakeNode {
       this.onDirectStream = undefined;
       await hook();
     }
-    return { send() {}, async close() {}, abort() {}, status: "open" } as unknown as Stream;
+    const forward = this.onDirectSend;
+    return {
+      send(b: Uint8Array | { subarray(): Uint8Array }) {
+        forward?.(b instanceof Uint8Array ? b : b.subarray());
+      },
+      async close() {}, abort() {}, status: "open",
+    } as unknown as Stream;
   }
 }
