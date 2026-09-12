@@ -37,7 +37,7 @@ import type { SessionEphemerals } from "./session-ephemerals.js";
 import type { SessionLiveness } from "./session-liveness.js";
 import type { HeldContent, HeldEntry } from "./held-content.js";
 import type { SessionLeafRecords } from "./session-leaf-records.js";
-import { type ActiveSessionEntry, type AwaitingAckEntry, type ReceivedContentEntry } from "./session-node-types.js";
+import { type ActiveSessionEntry, type AwaitingAckEntry } from "./session-node-types.js";
 /**
  * What the content pipeline needs from the manager.
  *
@@ -100,7 +100,6 @@ export interface SessionContentPipelineContext {
   readonly ownLeavesOrdered: Map<string, Map<string, number>>;
   readonly leafFetchTimers: Map<string, ReturnType<typeof setTimeout>>;
   readonly lastAck: Map<string, { seq: number; hash: Uint8Array }>;
-  readonly receivedContent: Map<string, ReceivedContentEntry[]>;
   readonly resolvedContent: Map<string, Set<string>>;
   readonly undeliverableSeqs: Map<string, Set<number>>;
   readonly highWaterSeq: Map<string, number>;

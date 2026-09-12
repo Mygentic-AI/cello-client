@@ -94,7 +94,10 @@ describe("DOD-M15-SEALWIRE-1 bullet 5: no call site quietly stops handing over t
      * every scan-the-tree test and this one asserts a negative, so a regex that matches nothing is
      * indistinguishable from a clean tree.
      */
-    expect(sites.length, "the scanner must actually see the production call sites").toBeGreaterThanOrEqual(6);
+    // Was 6; DOD-M15-AWAYSCOPE-1 deleted the one-shot rejection's site, which was one of them.
+    // The floor tracks the real count rather than being loosened to "more than zero" — a floor that
+    // cannot fail is the same as no floor.
+    expect(sites.length, "the scanner must actually see the production call sites").toBeGreaterThanOrEqual(5);
 
     const bare = sites.filter((s) => {
       if (s.text.includes("sentAuthorship(")) return false;
@@ -114,9 +117,12 @@ describe("DOD-M15-SEALWIRE-1 bullet 5: no call site quietly stops handing over t
     ).toEqual([]);
   });
 
-  it("★ and the away-reply sites specifically, because those are the three that shipped broken", () => {
-    // Named individually rather than counted: the defect was three specific sites, and a count
-    // passes while the wrong three are wired.
+  it("★ and the away-reply sites specifically, because those are the ones that shipped broken", () => {
+    // Named individually rather than counted: the defect was specific sites, and a count passes
+    // while the wrong ones are wired.
+    // DOD-M15-AWAYSCOPE-1: THREE became TWO. The third was the one-shot rejection, which only ever
+    // fired on an already-accepted session — the branch that order deleted. The two left are the
+    // direct and the durably-queued away GREETING, both on the session-request path.
     // 040-DAEMONROOT unit 6: the away responder moved out of daemon.ts into attendance-wiring.ts.
     // Read from the file that HOLDS it — reading the old one would find zero sites and the
     // `.toBe(3)` below would go red for the right number and the wrong reason.
@@ -127,8 +133,8 @@ describe("DOD-M15-SEALWIRE-1 bullet 5: no call site quietly stops handing over t
 
     expect(
       awayCalls.length,
-      "the three away-reply call sites must still exist — if this drops, the scan below is vacuous",
-    ).toBe(3);
+      "the two away-reply call sites must still exist — if this drops, the scan below is vacuous",
+    ).toBe(2);
     for (const call of awayCalls) {
       expect(
         call,

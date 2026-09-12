@@ -4,8 +4,11 @@
  * Three families of frames:
  *
  *   1. Delivery ACK (D-c) — on the Noise-authenticated SESSION channel.
- *      Unsigned, transport-authenticated. Levels form an OPEN ladder
- *      (received → persisted → future). The protocol acts on 'persisted' ONLY.
+ *      SIGNED by the acknowledging agent's identity key since
+ *      DOD-M15-DELIVERYACK-1; the session channel authenticates the hop, the
+ *      signature is what the sender can still show a third party afterwards.
+ *      Levels form an OPEN ladder (received → persisted → future). The protocol
+ *      acts on 'persisted' ONLY.
  *
  *   2. Content recovery reverse-channel — on the SESSION channel.
  *      The receiver asks the sender to resend the content behind a known
@@ -139,10 +142,22 @@ export function buildParkContentTbs(
 export type ContentAckLevel = "received" | "persisted" | (string & {});
 
 /**
- * Unsigned delivery ACK emitted by the receiver AFTER it durably persists the
- * content AND its content_hash cross-check succeeds. Carries NO signature —
- * authentication is the Noise session channel (D-c, SI-004). Never an input to
- * the seal, the Merkle tree, or last_seen_seq.
+ * Delivery ACK emitted by the receiver AFTER it durably persists the content AND its content_hash
+ * cross-check succeeds. Never an input to the seal, the Merkle tree, or last_seen_seq.
+ *
+ * ⚠️ IT USED TO CARRY NO SIGNATURE, and this comment used to say authentication was the Noise
+ * session channel alone (D-c, SI-004). That was true and it was not enough, which is the whole of
+ * `DOD-M15-DELIVERYACK-1`: the channel authenticates the HOP, and dies with the connection. It left
+ * the sender holding nothing it could show anyone, so "it never reached me" was unanswerable — and
+ * unanswerable in both directions, because the relay parking content, a daemon dying between
+ * ordering and pull, a bounded queue dropping its oldest frame and a screener refusal all look
+ * identical to a party choosing not to answer. The old sentence is rewritten rather than deleted
+ * because an auditor reading it would conclude the frame is unsigned by design.
+ *
+ * `ack_sig` is the acknowledging agent's Ed25519 signature over
+ * `deliveryAckSigningMessage(session_id, content_hash)` (`@cello-protocol/crypto`). It attests
+ * RECEIPT BY A MACHINE — it is signed on ingest, not when a human reads it, so it says nothing
+ * about attention and nothing whatever about agreement.
  */
 export interface ContentDeliveryAck {
   type: "content_delivery_ack";
@@ -152,6 +167,12 @@ export interface ContentDeliveryAck {
   content_hash: Uint8Array;
   /** Ladder level; the sender acts on 'persisted' only. */
   level: ContentAckLevel;
+  /**
+   * The acknowledging agent's Ed25519 signature (64 bytes) over the canonical delivery-ack
+   * statement. REQUIRED — an acknowledgement with no signature is discarded exactly as a wrong one
+   * is, because an attacker evading a mismatch check omits the field rather than getting it wrong.
+   */
+  ack_sig: Uint8Array;
 }
 
 // ─── 2. Content recovery reverse-channel ────────────────────────────────────
@@ -240,7 +261,10 @@ export function isContentDeliveryAck(frame: unknown): frame is ContentDeliveryAc
     f["type"] === "content_delivery_ack" &&
     hasBytes(f["session_id"]) &&
     hasBytes(f["content_hash"]) &&
-    typeof f["level"] === "string"
+    typeof f["level"] === "string" &&
+    // DOD-M15-DELIVERYACK-1: a frame with no signature is not a delivery acknowledgement. The guard
+    // fails it here rather than downstream so a missing proof and a wrong one cannot diverge.
+    hasBytes(f["ack_sig"])
   );
 }
 

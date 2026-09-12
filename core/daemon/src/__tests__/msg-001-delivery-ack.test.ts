@@ -1,26 +1,34 @@
 import { LEAF_KIND_MSG } from "../session-relay-client.js";
+import { readDeliveryFacts } from "../session-delivery-acks.js";
 /**
  * CELLO-M7-MSG-001 — delivery ACK / TTF (send + receive), re-homed onto the daemon.
  *
  * AC-001 (round-trip): after the receiver durably ingests a content frame AND its
- *   content_hash cross-check succeeds, it emits an unsigned `persisted` delivery ACK
- *   back over the session channel; the sender resolves its awaiting-ACK timer and
- *   fires content.delivery.acked. The ACK carries no signature. Verified across two
- *   independent SessionNodeManagers whose nodes are cross-wired so the ACK travels
- *   the real CBOR→lp-frame→decode→handler path (NOT an internal method injection).
- *   The cross-PROCESS variant is the milestone-close live two-daemon smoke.
+ *   content_hash cross-check succeeds, it emits a `persisted` delivery ACK back over
+ *   the session channel; the sender resolves its awaiting-ACK timer and fires
+ *   content.delivery.acked. Verified across two independent SessionNodeManagers whose
+ *   nodes are cross-wired so the ACK travels the real CBOR→lp-frame→decode→handler
+ *   path (NOT an internal method injection). The cross-PROCESS variant is the
+ *   milestone-close live two-daemon smoke.
  * AC-002 (persisted-only): a `received`-level ACK does NOT resolve the timer or fire
  *   content.delivery.acked — the protocol acts on `persisted` ONLY; only the
  *   `persisted` ACK clears it.
  *
- * No signature anywhere on the ACK (SI-004): authentication is the session channel.
+ * ⚠️ THIS HEADER USED TO END "No signature anywhere on the ACK (SI-004): authentication is the
+ * session channel", and AC-001 asserted it. `DOD-M15-DELIVERYACK-1` made it false: the channel
+ * authenticates the HOP and dies with the connection, so it left the sender holding nothing it
+ * could show a third party — "it never reached me" was unanswerable in both directions. The ACK now
+ * carries the receiver's Ed25519 signature over (session id, content hash), and an ACK with no
+ * signature, a malformed one, or one signed by anybody else is DISCARDED on one path. Rewritten
+ * rather than deleted, because the old sentence is why a reader would think the frame is unsigned
+ * by design.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import * as lp from "it-length-prefixed";
 import { Encoder } from "cbor-x";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
@@ -28,9 +36,11 @@ import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import { seedAgentKeys, wireAgentKeyProviders } from "./helpers/seed-agents.js";
 import { agreeSessionGenesis, TEST_SESSION_GENESIS } from "./helpers/session-genesis.js";
+import { InMemoryKeyProvider, signDeliveryAck } from "@cello-protocol/crypto";
 import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
+import { receivedCount } from "./helpers/received-rows.js";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
@@ -138,7 +148,7 @@ describe("MSG-001: delivery ACK / TTF (daemon)", () => {
 
   const SID = "ef".repeat(32);
 
-  it("AC-001: receiver auto-ACKs after ingest; sender resolves and fires content.delivery.acked (no signature, no park)", async () => {
+  it("AC-001: receiver auto-ACKs after ingest; sender resolves, KEEPS the signature, and fires content.delivery.acked (no park)", async () => {
     const nodeA = new WiredNode();
     const nodeB = new WiredNode();
     nodeA.peer = nodeB; // A's sends reach B's handler
@@ -178,8 +188,8 @@ describe("MSG-001: delivery ACK / TTF (daemon)", () => {
     const res = await mgrA.sendContent("alice", SID, content, hash, "corr-a", LEAF_KIND_MSG);
     expect(res.ok).toBe(true);
 
-    // The receiver ingested it (buffered for cello_receive).
-    expect(await waitFor(() => mgrB.takeReceivedContent("bob", SID) !== null)).toBe(true);
+    // The receiver ingested it, and it is readable by cello_receive.
+    expect(await waitFor(() => receivedCount(mgrB, "bob", SID) === 1)).toBe(true);
 
     // The sender observably transitioned from awaiting → acked over a real ACK frame.
     expect(await waitFor(() => a.events.some((e) => e.event === "content.delivery.acked"))).toBe(true);
@@ -187,8 +197,18 @@ describe("MSG-001: delivery ACK / TTF (daemon)", () => {
     expect(acked?.context.contentHash).toBe(Buffer.from(hash).toString("hex"));
     expect(acked?.context.level).toBe("persisted");
     expect(acked?.context.correlationId).toBe("corr-a");
-    // The ACK carries no signature anywhere in the flow (SI-004).
-    expect(JSON.stringify(a.events)).not.toContain("signature");
+    /**
+     * DOD-M15-DELIVERYACK-1: this assertion used to be `not.toContain("signature")`. The signature
+     * is now the point — and it is KEPT, not merely checked in flight, because a proof the sender
+     * cannot produce later is no answer to "it never reached me".
+     */
+    const recorded = a.events.find((e) => e.event === "content.delivery.ack.recorded");
+    expect(recorded, "the sender must keep the receiver's signature, not just verify it").toBeTruthy();
+    expect(recorded?.context.signerPubkey).toBe(bobPub);
+    const facts = readDeliveryFacts(mgrA.getDb(), a.logger, mgrA.resolveAgentId("alice"), SID);
+    expect(facts.length).toBe(1);
+    expect(facts[0]?.acknowledged?.signer_pubkey).toBe(bobPub);
+    expect(facts[0]?.acknowledged?.signature.length).toBe(128); // 64 bytes, hex
     // No park / TTF-expiry happened (the ACK arrived well within the 60s TTF).
     expect(a.events.some((e) => e.event === "content.delivery.ttf_expired")).toBe(false);
   });
@@ -205,7 +225,14 @@ describe("MSG-001: delivery ACK / TTF (daemon)", () => {
     await wireAgentKeyProviders(mgrA, mgrA.getDb());
     // The session's starting point, seeded BEFORE creation — see `helpers/session-genesis.ts`.
     mgrA.setSessionGenesisForTest("alice", SID, TEST_SESSION_GENESIS);
-    await mgrA.createSessionNode(SID, "alice", "bobpk", "bob-peer", "corr-a");
+    /**
+     * DOD-M15-DELIVERYACK-1: the counterparty is a REAL keypair, and it has to be. The placeholder
+     * `"bobpk"` was a pubkey nothing could sign as, so every ACK this test forges would now be
+     * discarded for the wrong reason — passing the clause while proving none of it.
+     */
+    const bobKp = new InMemoryKeyProvider(new Uint8Array(randomBytes(32)));
+    const bobPubHex = Buffer.from(await bobKp.getPublicKey()).toString("hex");
+    await mgrA.createSessionNode(SID, "alice", bobPubHex, "bob-peer", "corr-a");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     mgrA.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
 
@@ -214,8 +241,9 @@ describe("MSG-001: delivery ACK / TTF (daemon)", () => {
     const res = await mgrA.sendContent("alice", SID, content, hash, "corr-a", LEAF_KIND_MSG);
     expect(res.ok).toBe(true);
 
-    const ackFrame = (level: string): unknown =>
-      lp.encode.single(CBOR_ENC.encode({ type: "content_delivery_ack", session_id: SID, content_hash: hash, level }));
+    const bobSig = await signDeliveryAck(bobKp, Buffer.from(SID, "hex"), hash);
+    const ackFrame = (level: string, ack_sig: Uint8Array | undefined = bobSig): unknown =>
+      lp.encode.single(CBOR_ENC.encode({ type: "content_delivery_ack", session_id: SID, content_hash: hash, level, ...(ack_sig ? { ack_sig } : {}) }));
 
     // A `received` ACK must NOT resolve the awaiting entry.
     nodeA.invokeHandler(ackFrame("received"), "bob-peer");

@@ -292,6 +292,40 @@ export interface ActiveSessionInfo {
    *  buildInterruptedSessions returns THIS type; it typechecked only because TS exempts spread
    *  properties from excess-property checking, so a renderer typed as this could not read it. */
   frontierMismatch?: SessionListEntry["frontierMismatch"];
+  /**
+   * DOD-M15-AWAYSCOPE-1 — what the RELAY observed about the counterparty's standing connection.
+   *
+   * ⚠️ A DIFFERENT QUESTION FROM `liveness` ABOVE, and the two disagree routinely. `liveness` is
+   * daemon-local: does this process hold a libp2p connection for the session. This one is the
+   * relay's, and it is visible even when this daemon has no direct link — which on a relay-mediated
+   * session is the normal case. Absent when there was no relay to ask or the probe did not answer.
+   */
+  relayLiveness?: "alive" | "gone" | "unknown";
+  /** Unix ms of that relay observation — when it last saw the CONNECTION change. */
+  relayObservedAt?: number;
+  /**
+   * Unix ms at which the far daemon made its attendance assertion.
+   *
+   * ⚠️ NOT `relayObservedAt`, and they are routinely hours apart. The relay sees an agent connect at
+   * 09:00; its operator steps away at 11:30. Dating the attendance 09:00 reports a state as of a
+   * time before it was true, and the number never moves when they step away again — so an operator
+   * watching it sees a frozen clock and reads it as stale data rather than as a current absence.
+   */
+  attendanceObservedAt?: number;
+  /**
+   * DOD-M15-AWAYSCOPE-1 — the counterparty daemon's own assertion about itself.
+   *
+   * 'attended' — a person is watching. 'unattended' — online, nobody reading, the message WILL be
+   * read when they return. 'offline' — deliberately not accepting.
+   *
+   * THE MIDDLE VALUE IS WHY THIS FIELD EXISTS. Before it, an unattended agent announced itself by
+   * sending its away greeting into the conversation, which took a hash-chain leaf and destroyed the
+   * receipt on both machines. It is status now, never a message: it appears on `cello status` and
+   * `cello sessions`, never in a transcript and never in a sealed receipt.
+   *
+   * Absent unless `relayLiveness` is 'alive' — a daemon nobody can reach is not asserting anything.
+   */
+  counterpartyAttendance?: "attended" | "unattended" | "offline";
 }
 
 // --- Daemon configuration ---
@@ -702,6 +736,23 @@ export interface SessionListEntry {
     guidance: string;
   };
 
+  /**
+   * DOD-M15-AWAYSCOPE-1 — the counterparty daemon's own assertion about itself, for an OPEN session.
+   *
+   * 'attended' — a person is watching. 'unattended' — online, nobody reading, and the message WILL
+   * be read when they return. 'offline' — deliberately not accepting.
+   *
+   * THE MIDDLE VALUE IS THE REASON THIS FIELD EXISTS. Before it, the only way to learn an agent was
+   * unattended was for its daemon to say so INSIDE the conversation — which took a hash-chain leaf
+   * and cost session `e7dd3f43…` its receipt on both machines. It is session status now: it is read
+   * here and on `cello status`, it never enters a transcript, and it never reaches a sealed receipt.
+   *
+   * Absent unless the relay currently holds that agent's connection, because a daemon nobody can
+   * reach is not asserting anything — and absent for any session with no relay behind it to ask.
+   */
+  counterpartyAttendance?: "attended" | "unattended" | "offline";
+  /** Unix ms at which that assertion, or the relay's own observation, was made. */
+  attendanceObservedAt?: number;
   messageCount: number;
   createdAt: string;
   updatedAt: string;

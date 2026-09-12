@@ -107,6 +107,21 @@ export {
   type EphemeralAuthRefusal,
   type EphemeralAuthResult,
 } from "./session-ephemeral-auth.js";
+
+// DOD-M15-DELIVERYACK-1: the recipient SIGNS that its machine received a given content hash in a
+// given session, and the sender keeps that signature. Before this, "it never reached me" was
+// unanswerable in both directions. Receipt only — never assent, never a chain leaf, and a missing
+// acknowledgement is evidence of nothing.
+export {
+  deliveryAckSigningMessage,
+  signDeliveryAck,
+  verifyDeliveryAck,
+  DELIVERY_ACK_REFUSALS,
+  DELIVERY_ACK_SIG_BYTES,
+  DELIVERY_ACK_HASH_BYTES,
+  type DeliveryAckRefusal,
+  type DeliveryAckResult,
+} from "./delivery-ack-auth.js";
 export {
   sealSessionContent,
   openSessionContent,

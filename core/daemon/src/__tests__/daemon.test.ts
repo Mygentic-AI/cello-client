@@ -126,7 +126,7 @@ describe("daemon", () => {
 
     handle = await startDaemon(makeConfig());
 
-    const status = handle.getStatus();
+    const status = (await handle.getStatus());
     expect(status.agents).toHaveLength(1);
     expect(status.agents[0].name).toBe("test-agent");
     // Not started in this daemon. `stopped` — the old enum called this "registered", which said
@@ -146,7 +146,7 @@ describe("daemon", () => {
     // Not started yet. Pre-CC-8 the daemon-wide status (what the CLI `cello status` reads) showed the
     // same value AFTER the agent came online too — startAgentInternal only adds to onlineAgents and
     // never mutates the stored record — so an operator couldn't tell running from stopped via the CLI.
-    expect(handle.getStatus().agents[0].state).toBe("stopped");
+    expect((await handle.getStatus()).agents[0].state).toBe("stopped");
 
     const client = await connectToDaemon(config.socketPath);
     try {
@@ -160,8 +160,8 @@ describe("daemon", () => {
     // running, exactly as the MCP surface does. It is asserted as RUNNING rather than the literal
     // "online" because that rung now additionally requires an attendee, and this test closes its
     // connection before asking — so the agent is genuinely unattended by the time it looks.
-    expect(isAgentRunning(handle.getStatus().agents[0].state)).toBe(true);
-    expect(handle.getStatus().agents[0].state).not.toBe("stopped");
+    expect(isAgentRunning((await handle.getStatus()).agents[0].state)).toBe(true);
+    expect((await handle.getStatus()).agents[0].state).not.toBe("stopped");
   });
 
   it("reports agentCount in daemon.started event", async () => {
@@ -179,7 +179,7 @@ describe("daemon", () => {
 
   it("status response has correct structure", async () => {
     handle = await startDaemon(makeConfig());
-    const status = handle.getStatus();
+    const status = (await handle.getStatus());
 
     expect(status.daemon).toBe("running");
     expect(status.directory_signaling).toBe("reconnecting");
@@ -197,7 +197,7 @@ describe("daemon", () => {
     const client = await connectToDaemon(config.socketPath);
     try {
       const result = (await client.send("status")) as DaemonStatusResponse;
-      const expected = handle.getStatus();
+      const expected = (await handle.getStatus());
       expect(result.daemon).toBe(expected.daemon);
       expect(result.directory_signaling).toBe(expected.directory_signaling);
       expect(result.agents).toEqual(expected.agents);
@@ -252,7 +252,7 @@ describe("daemon", () => {
     db.close();
 
     handle = await startDaemon(makeConfig());
-    const status = handle.getStatus();
+    const status = (await handle.getStatus());
 
     const failedAgent = status.agents.find((a) => a.name === "bad-agent");
     expect(failedAgent).toBeDefined();

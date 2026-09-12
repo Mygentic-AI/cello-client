@@ -66,6 +66,20 @@ export interface SessionRelayContext {
   readonly receivers: StandingReceivers;
   readonly witness: WitnessAlerts;
   readonly contentIn: SessionContentIngest;
+  /**
+   * DOD-M15-AWAYSCOPE-1 — is anyone attending this agent, right now?
+   *
+   * Read at the moment a session gains a relay, so a session opened while the operator is ALREADY
+   * away is announced too. Without it the fan-out on the three attendance TRANSITIONS misses this
+   * case entirely: a session accepted by the standing receiver during an away stretch is not in
+   * `#activeNodes` when the transition fires, and no later transition happens — so the counterparty
+   * reads "unknown" for the whole conversation, when the answer is the one this order is about,
+   * "unattended, will be read later".
+   *
+   * A function rather than a value: attendance changes under this module and a captured boolean
+   * would be the state at construction, which is always "nobody, the daemon just started".
+   */
+  currentAttendance(agentName: string): "attended" | "unattended" | "offline";
 
   /** A function: the manager opens its database after construction. Re-exposed below as `#db`. */
   db(): DaemonDatabase | null;
@@ -455,6 +469,11 @@ export class SessionRelay {
         entry.relayClient = client;
         entry.relaySessionIdBytes = relay.sessionIdBytes;
         entry.relayClientKey = clientKey;
+        // DOD-M15-AWAYSCOPE-1: the session just gained a relay, so tell it where this agent stands.
+        // The three attendance transitions fan out over sessions that already exist; this is the
+        // other direction — a session that arrives DURING an away stretch, which is exactly the
+        // case the order is about and the one the transitions cannot see.
+        client.announceAttendance(node, relay.sessionIdBytes, this.#ctx.currentAttendance(agentName));
         // 2b: remember the relay endpoint so the content-park backstop deposits to the SAME relay.
         entry.relayPeerId = relay.relayPeerId;
         entry.relayAddrs = relay.relayAddrs;

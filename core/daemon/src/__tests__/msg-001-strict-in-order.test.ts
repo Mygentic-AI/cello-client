@@ -33,6 +33,7 @@ import { buildStructure2, encodeStructure2 } from "@cello-protocol/protocol-type
 import { encodeStructure1 } from "@cello-protocol/protocol-types";
 import { encodeParkEnvelope } from "../park-envelope.js";
 import { seedAgents } from "./helpers/seed-agents.js";
+import { receivedCount, receivedRows } from "./helpers/received-rows.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 
@@ -132,8 +133,7 @@ describe("DOD-MSG-4: strict in-order content gate", () => {
     expect(leafHashes(mgr), "leaf order is the canonical sequence, not arrival order").toEqual([hx(h0), hx(h1), hx(h2)]);
 
     // And cello_receive drains them in canonical order m0, m1, m2.
-    const drain = [0, 1, 2].map(() => mgr.takeReceivedContent(AGENT, sid));
-    expect(drain.map((d) => d && Buffer.from(d.contentHex, "hex").toString())).toEqual(["m0", "m1", "m2"]);
+    expect(receivedRows(mgr, AGENT, sid).map((r) => r.text)).toEqual(["m0", "m1", "m2"]);
   });
 
   /**
@@ -212,9 +212,9 @@ describe("DOD-MSG-4: strict in-order content gate", () => {
       "m1 must be delivered: the only gap is a position a redelivery consumed, and nothing will ever fill it",
     ).toBe(2);
     expect(
-      mgr.takeReceivedContent(AGENT, sid) !== null,
-      "m1 must be readable by the agent, not stranded in the in-memory hold buffer",
-    ).toBe(true);
+      receivedCount(mgr, AGENT, sid),
+      "m1 must be readable by the agent, not stranded in the hold buffer",
+    ).toBe(2);
   });
 
   it("the in-order happy path is unchanged — sequential arrivals append immediately", async () => {

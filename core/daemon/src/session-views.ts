@@ -169,6 +169,11 @@ export function createSessionViews(deps: SessionViewsDeps) {
     }
   }
 
+  // DOD-M15-AWAYSCOPE-1: one budget for ALL the attendance probes a status read fires, not one
+  // each. An operator with a dozen sessions must not wait a dozen timeouts, and the number is set by
+  // what a person will sit through at a terminal rather than by what a slow relay might need.
+  const ATTENDANCE_PROBE_BUDGET_MS = 1_500;
+
   // M8B F16: per-session liveness for ACTIVE sessions, shared by both status surfaces
   // ("status" for the CLI, "cello_status" for MCP). The signal (session.liveness.changed,
   // tracked in the node manager) existed but nothing consumed it — a dead counterparty
@@ -239,5 +244,79 @@ export function createSessionViews(deps: SessionViewsDeps) {
 
   // `probeSealReadiness` is NOT returned: its only caller is `buildInterruptedSessions`, which
   // moved with it. Returning it would make a private helper reachable for no consumer.
-  return { buildInterruptedSessions, reapDeadHalfOpenSessions, buildActiveSessions, agentStateFor };
+  /**
+   * DOD-M15-AWAYSCOPE-1 unit 3 — the same active sessions, plus what the RELAY knows about the far
+   * side: is it reachable, and is anyone attending it.
+   *
+   * ── WHY THIS IS A SEPARATE, ASYNC BUILD ─────────────────────────────────────────────────────────
+   *
+   * `buildActiveSessions` answers from local state and must stay synchronous — it is called from the
+   * half-open reaper's own path and from surfaces that cannot await. Attendance is not local: it is
+   * the far daemon's assertion, held by the relay, and the only way to have it is to ask. So the
+   * round trip lives here, on top, and every caller that can afford it uses this one.
+   *
+   * ── WHAT THE OPERATOR GETS, AND WHY IT IS NOT A MESSAGE ─────────────────────────────────────────
+   *
+   * This is the whole replacement for the away reply. An unattended agent used to announce itself by
+   * sending its greeting INTO the conversation, which took a hash-chain leaf and cost session
+   * `e7dd3f43…` its receipt on both machines. The same fact now arrives here, as session STATUS: the
+   * operator reads it, their agent never has to answer it, and it never enters a transcript or a
+   * sealed receipt.
+   *
+   * ── THE TWO LIVENESSES ARE BOTH REPORTED, AND THEY ARE NOT THE SAME QUESTION ────────────────────
+   *
+   * `liveness` is daemon-local — does THIS process hold a libp2p connection for the session. It has a
+   * fourth value, `impaired`, meaning the connection is up and writes on it are failing.
+   * `relayLiveness` is the RELAY's observation of the counterparty's standing connection, which is
+   * visible even when this daemon has no direct link at all. They disagree routinely and legitimately
+   * — a relay-mediated session is the normal case — so collapsing them into one word would make the
+   * commoner state look like a fault.
+   *
+   * ── BOUNDED, BECAUSE A STATUS COMMAND MUST ANSWER ───────────────────────────────────────────────
+   *
+   * Every session is asked in parallel under ONE budget. A relay that does not answer costs the
+   * operator a wait, not a hang, and the sessions that did answer are still reported — a status read
+   * that blocks on the slowest relay is a status read nobody runs when it matters.
+   */
+  async function buildActiveSessionsWithAttendance(): Promise<ActiveSessionInfo[]> {
+    const sessions = buildActiveSessions();
+    if (sessions.length === 0) return sessions;
+    const deadline = new Promise<"timeout">((r) => setTimeout(() => r("timeout"), ATTENDANCE_PROBE_BUDGET_MS));
+    const answered = await Promise.race([
+      Promise.all(sessions.map(async (s) => {
+        try {
+          return await sessionNodeManager.queryRelayLiveness(s.agentName, s.sessionId);
+        } catch {
+          // A probe that throws tells the operator nothing, and must not take the status read with
+          // it. Null here reads the same as "this session has no relay to ask", which is honest.
+          return null;
+        }
+      })),
+      deadline,
+    ]);
+    if (answered === "timeout") {
+      // The local picture, unenriched. NOT an error and not a partial merge: pairing answers to
+      // sessions after a race would report some rows enriched and others not, with nothing saying
+      // which — and an operator cannot tell a missing field from a field that means "unknown".
+      logger.debug("session.attendance.probe.timeout", { sessions: sessions.length, budgetMs: ATTENDANCE_PROBE_BUDGET_MS });
+      return sessions;
+    }
+    return sessions.map((s, i) => {
+      const a = answered[i];
+      if (!a) return s;
+      return {
+        ...s,
+        relayLiveness: a.liveness,
+        ...(a.observedAt > 0 ? { relayObservedAt: a.observedAt } : {}),
+        // BOTH, and they are different facts. `relayObservedAt` is when the relay last saw the
+        // connection change; `attendanceObservedAt` is when the agent last said something about
+        // itself. Labelling the attendance with the first dates an absence to a time before it was
+        // true, and the number then never moves when the operator steps away again.
+        ...(a.attendance ? { counterpartyAttendance: a.attendance } : {}),
+        ...(a.attendanceObservedAt !== undefined ? { attendanceObservedAt: a.attendanceObservedAt } : {}),
+      };
+    });
+  }
+
+  return { buildInterruptedSessions, reapDeadHalfOpenSessions, buildActiveSessions, buildActiveSessionsWithAttendance, agentStateFor };
 }

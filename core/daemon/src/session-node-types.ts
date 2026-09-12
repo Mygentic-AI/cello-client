@@ -623,13 +623,6 @@ export interface ActiveSessionEntry {
   extraRelayClientKeys?: string[];
 }
 
-/** DAEMON-004: a piece of content received and verified, awaiting cello_receive. */
-export interface ReceivedContentEntry {
-  contentHex: string;
-  senderPubkey: string;
-  sequenceNumber: number;
-}
-
 // ─── Result types ─────────────────────────────────────────────────────────────
 
 export type CreateSessionResult =
@@ -639,12 +632,13 @@ export type CreateSessionResult =
 // ─── SessionNodeManager ───────────────────────────────────────────────────────
 
 /**
- * DOD-COATTEND-1: how much of the arrival buffer is kept. Delivery reads the durable transcript
- * now, so this buffer is only a recency hint (`peekLatestReceivedContentHex` for M8C-AWAY-1's
- * [[WRAP]] check). Small, and stated: an unstated cap is a silent truncation, and no cap at all is
- * the leak the old destructive read was accidentally preventing.
+ * `RECEIVED_BUFFER_CAP` AND `ReceivedContentEntry` WERE HERE, and both are gone with the buffer.
+ *
+ * DOD-COATTEND-1 moved delivery onto the durable transcript and left an in-memory copy of every
+ * arriving message behind it, plaintext, capped at 32 per session, held for the daemon's life. The
+ * cap was all that bounded it. Nothing read it after DOD-M15-AWAYSCOPE-1 removed the away
+ * responder's peek, so there is no buffer left to bound.
  */
-export const RECEIVED_BUFFER_CAP = 32;
 
 /**
  * M12-P12 (review F6): the outcome of one park-deposit attempt. A bare boolean conflated
@@ -870,6 +864,17 @@ export interface AwaitingAckEntry {
   contentHashAlg?: string;
   structure1Signature?: Uint8Array;
   leafKind?: number;
+  /**
+   * DOD-M15-DELIVERYACK-1: has a REFUSED acknowledgement for this message already been logged loudly?
+   *
+   * The awaiting entry survives a refusal — it must, because a bad acknowledgement has to leave the
+   * message in exactly the state no acknowledgement would. So without this a counterparty can send
+   * the same malformed acknowledgement ten thousand times and get ten thousand WARN lines out of
+   * this machine. It lives HERE rather than in a map of its own so it is freed with the entry, and
+   * because an entry exists only for a message THIS side sent: the other party cannot spend a
+   * budget they cannot create. Nothing reads it but the choice of log level.
+   */
+  ackRefusalLogged?: boolean;
 }
 
 /**

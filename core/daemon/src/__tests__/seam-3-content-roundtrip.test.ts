@@ -37,6 +37,7 @@ import { seedAgentKeys, wireAgentKeyProviders } from "./helpers/seed-agents.js";
 import { agreeSessionGenesis } from "./helpers/session-genesis.js";
 import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
+import { receivedCount, receivedRows } from "./helpers/received-rows.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 
@@ -176,12 +177,12 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
     expect(sent.ok).toBe(true);
 
     // B: the content arrives, cross-checks, appends to B's daemon-owned tree, and buffers.
-    const received = await pollFor(() => B.manager.takeReceivedContent("bob", SID));
+    const received = await pollFor(() => receivedRows(B.manager, "bob", SID)[0] ?? null);
     // The receiver's own refusals, in the failure message: a round trip that stops at B says nothing
     // about WHY on its own, and every refusal on that path names itself.
     expect(received, JSON.stringify(B.events.filter((e) => e.event.startsWith("session.content.")))).not.toBeNull();
-    expect(Buffer.from(received!.contentHex, "hex").toString()).toBe(text);
-    expect(received!.sequenceNumber).toBe(0);
+    expect(received!.text).toBe(text);
+    expect(received!.sequence).toBe(0);
     expect(B.manager.getSessionTree("bob", SID).size()).toBe(1);
     expect(B.events.find((e) => e.event === "session.content.received")).toBeDefined();
 
@@ -257,7 +258,7 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
     const rejected = await pollFor(() => B.events.find((e) => e.event === "session.content.cross_check.failed"));
     expect(rejected).not.toBeNull();
     expect(rejected!.context["reason"]).toBe("content_hash_mismatch");
-    expect(B.manager.takeReceivedContent("bob", SID)).toBeNull();
+    expect(receivedCount(B.manager, "bob", SID)).toBe(0);
     expect(B.manager.getSessionTree("bob", SID).size()).toBe(0);
 
     // DOD-UP-1 KERNEL: a tampered cross-check makes the session unverifiable — B must NOT ratify a

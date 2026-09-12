@@ -26,7 +26,8 @@ export interface DaemonStatusDeps {
   agents: ReadonlyArray<AgentInfo>;
   agentStateFor: (a: AgentInfo) => AgentState;
   buildInterruptedSessions: () => InterruptedSessionInfo[];
-  buildActiveSessions: () => ActiveSessionInfo[];
+  /** DOD-M15-AWAYSCOPE-1: the ENRICHED build — `cello status` is where an operator looks first. */
+  buildActiveSessions: () => Promise<ActiveSessionInfo[]>;
   directorySignalingStatus: () => DirectorySignalingState;
   /** Emits on every state except "looked recently, all well" — see the header. */
   unresolvedNodesForStatus: () => { directory_endpoints_unresolved: unknown } | undefined;
@@ -45,7 +46,7 @@ export function createDaemonStatusReport(deps: DaemonStatusDeps) {
   } = deps;
 
   // Build status response factory
-  function getStatus(): DaemonStatusResponse {
+  async function getStatus(): Promise<DaemonStatusResponse> {
     // M7-SESSION-001 AC-006/AC-007: surface interrupted sessions
     const interrupted_sessions: InterruptedSessionInfo[] = buildInterruptedSessions();
 
@@ -105,7 +106,7 @@ export function createDaemonStatusReport(deps: DaemonStatusDeps) {
       retryQueueDepth: retryQueue.getTotalDepth(),
       interrupted_sessions,
       // M8B F16: per-session liveness so a counterparty-gone session is visible.
-      active_sessions: buildActiveSessions(),
+      active_sessions: await buildActiveSessions(),
     };
   }
 

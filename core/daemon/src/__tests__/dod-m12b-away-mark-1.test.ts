@@ -19,8 +19,10 @@
  * matching below MUST stay: it is the only thing that recognises a peer running the old build.
  *
  * PREFIX, not suffix, and that is load-bearing. `[[WRAP]]` detection is end-anchored on purpose
- * (`DOD-WRAP-SUBSTRING-1`), and the one-shot rejection ends with `[[WRAP]]`. A marker appended at
- * the end would take that position and silently break the counterparty's close detection.
+ * (`DOD-WRAP-SUBSTRING-1`), and an away text may end with `[[WRAP]]` — the daemon's own one-shot
+ * rejection did until `DOD-M15-AWAYSCOPE-1` deleted it, and an operator-configured one still may.
+ * A marker appended at the end would take that position and silently break the counterparty's
+ * close detection.
  *
  * ── THE MARKER LABELS, IT NEVER SUPPRESSES ──────────────────────────────────────────────────────
  *
@@ -49,19 +51,23 @@ import {
 const SID64 = (a: string) => a.repeat(64).slice(0, 64);
 
 describe("DOD-M12B-AWAY-MARK-1: every away auto-reply carries the marker", () => {
+  // DOD-M15-AWAYSCOPE-1 deleted the one-shot acknowledgement and the [[WRAP]]-bearing rejection —
+  // both were only ever sent INTO an already-accepted session, which is the thing that order stops.
+  // The two texts this daemon still sends are the ones asserted here.
   it("the system default texts this daemon sends are marked", () => {
-    expect(isAutoReplyMarked(AWAY_AUTO_REPLY_TEXTS.oneShot)).toBe(true);
     expect(isAutoReplyMarked(AWAY_AUTO_REPLY_TEXTS.offerFor("CELLO_Support"))).toBe(true);
+    expect(isAutoReplyMarked(AWAY_AUTO_REPLY_TEXTS.stranger)).toBe(true);
   });
 
   it("the marker is a PREFIX, so it cannot take the end-anchored [[WRAP]] position", () => {
-    expect(AWAY_AUTO_REPLY_TEXTS.oneShot.startsWith(AWAY_AUTO_REPLY_MARKER)).toBe(true);
     expect(AWAY_AUTO_REPLY_TEXTS.offerFor("X").startsWith(AWAY_AUTO_REPLY_MARKER)).toBe(true);
-    // The one-shot rejection is the case that actually breaks: it ends with [[WRAP]] and the
-    // counterparty's close detection is end-anchored on that exact token.
-    const rejection = markAsAutoReply("This inbox only accepts one message per visit. Closing. [[WRAP]]");
-    expect(rejection.trimEnd().endsWith("[[WRAP]]")).toBe(true);
-    expect(isAutoReplyMarked(rejection)).toBe(true);
+    expect(AWAY_AUTO_REPLY_TEXTS.stranger.startsWith(AWAY_AUTO_REPLY_MARKER)).toBe(true);
+    // The case that actually breaks is any away text ENDING in [[WRAP]] — an operator is free to
+    // configure one, and the counterparty's close detection is end-anchored on that exact token.
+    // A suffixed marker would take the end position and silently break their close.
+    const configured = markAsAutoReply("Back Monday. Nothing to answer here. [[WRAP]]");
+    expect(configured.trimEnd().endsWith("[[WRAP]]")).toBe(true);
+    expect(isAutoReplyMarked(configured)).toBe(true);
   });
 
   it("marking is idempotent — the choke point may mark an already-marked message", () => {
@@ -175,7 +181,7 @@ describe("DOD-M12B-AWAY-MARK-1: the receiving side is told, and is never silence
     await client.send("cello_use_agent", { name: "alice" });
 
     const s = SID64("b");
-    seed("alice", s, 0, AWAY_AUTO_REPLY_TEXTS.oneShot);
+    seed("alice", s, 0, AWAY_AUTO_REPLY_TEXTS.offerFor("bob"));
 
     const res = (await client.send("cello_receive", { session_id: s, since_seq: -1 })) as Record<string, unknown>;
     const guidance = String(res["auto_reply_guidance"] ?? "");
@@ -292,7 +298,7 @@ describe("DOD-M12B-AWAY-MARK-1: the LIVE receive exit, not just the batch one", 
     const s = SID64("m");
     insertSessionRow("alice", s);
     handle.getSessionNodeManager()
-      .recordTranscriptMessage("alice", s, 0, "received", new TextEncoder().encode(AWAY_AUTO_REPLY_TEXTS.oneShot), "seed");
+      .recordTranscriptMessage("alice", s, 0, "received", new TextEncoder().encode(AWAY_AUTO_REPLY_TEXTS.offerFor("bob")), "seed");
 
     const res = (await client.send("cello_receive", { session_id: s, timeout_ms: 2000 })) as Record<string, unknown>;
     const guidance = String(res["auto_reply_guidance"] ?? "");

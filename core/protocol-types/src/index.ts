@@ -234,12 +234,16 @@ export type {
   SessionLiveness,
   SessionLivenessQuery,
   SessionLivenessResponse,
+  SessionAttendance,
+  SessionAttendanceNotice,
 } from "./session-liveness.js";
 export {
   encodeSessionLivenessQuery,
   decodeSessionLivenessQuery,
   encodeSessionLivenessResponse,
   decodeSessionLivenessResponse,
+  encodeSessionAttendanceNotice,
+  decodeSessionAttendanceNotice,
 } from "./session-liveness.js";
 
 // MONIKER-0 — the single home of the agent-name / moniker charset rule (wire contract).

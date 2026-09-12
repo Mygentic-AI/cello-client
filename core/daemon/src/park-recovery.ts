@@ -18,7 +18,7 @@ import type { SealCarryLeaf } from "./session-seal-leaf-store.js";
 import type { SessionTree } from "./session-tree.js";
 import { LEAF_KIND_CTRL } from "./session-relay-client.js";
 import { decodeStructure1 } from "@cello-protocol/protocol-types";
-import { decodeParkEnvelope, authenticateParkedEntry } from "./park-envelope.js";
+import { decodeParkEnvelope, authenticateParkedEntry, decodeParkedDeliveryAck, type ParkedDeliveryAck } from "./park-envelope.js";
 import type { InboundRefusals } from "./inbound-refusals.js";
 import { type ParkedDrainReason, type ParkAttempt, type ActiveSessionEntry, MAX_REFUSED_PARKED_ENTRIES } from "./session-node-types.js";
 import { ParkEnvelopeError, type ParkAuthFailure } from "./park-envelope.js";
@@ -67,6 +67,19 @@ export interface ParkContext {
     correlationId?: string,
   ): void;
   noteAcknowledgeable(agentName: string, sessionId: string, canonicalSeq: number, contentHash: Uint8Array): void;
+  /**
+   * DOD-M15-DELIVERYACK-1 unit 1 — sign for a message that arrived through the MAILBOX.
+   *
+   * ⚠️ THE RECOVERED PATH NEVER ACKNOWLEDGED ANYTHING AT ALL, and that is a bigger gap than the one
+   * the unit set out to close. The acknowledgement was emitted from the direct frame handler only,
+   * so a message that had to be parked — one of the blameless ways delivery is delayed, and the
+   * exact case the sender most needs evidence about — was read, appended and answered with silence.
+   * The sender's own copy then showed it as never acknowledged, which is indistinguishable from the
+   * counterparty ignoring it.
+   */
+  sendDeliveryAck(agentName: string, sessionId: string, contentHash: Uint8Array, correlationId?: string): void;
+  /** The relay endpoint recorded for a session, for the case where no live entry exists. */
+  persistedRelayEndpoint(agentName: string, sessionId: string): { relayPeerId: string; relayAddrs: string[] } | null;
 }
 
 export class ParkRecovery {
@@ -286,6 +299,63 @@ export class ParkRecovery {
       };
     }
   }
+  /**
+   * DOD-M15-DELIVERYACK-1 unit 1 — DEPOSIT OUT-OF-BAND MACHINE TRAFFIC WITH NO LIVE SESSION NODE.
+   *
+   * `parkContent` resolves the recipient and the relay from the in-memory session entry, which is
+   * exactly what does not exist in the case this is for: the counterparty's daemon is down, so there
+   * is no live node, and an acknowledgement produced by the mailbox-recovery path had nowhere to go.
+   * Measured, not assumed — the live journey showed `content.delivery.ack.skipped
+   * / session_node_gone` at precisely this point.
+   *
+   * So the endpoint is taken from the PERSISTED session row, the same source the crash-backstop
+   * flush uses for the same reason. Everything else is `parkContent`'s path unchanged: the payload
+   * is sealed to the recipient and the relay holds ciphertext it cannot read.
+   *
+   * ⚠️ NOT FOR CONTENT. Content parked with no ordering record and no signature over one is a
+   * message that is readable and permanently unnotarizable, which is the withholding attack's whole
+   * shape — `parkContent`'s own comment says so. Out-of-band traffic takes no leaf and enters no
+   * receipt, so it has nothing to be truncated out of.
+   */
+  async parkOutOfBand(
+    agentName: string,
+    sessionId: string,
+    slotHashHex: string,
+    payload: Uint8Array,
+  ): Promise<ParkAttempt> {
+    const hook = this.#contentParkHook;
+    if (!hook) return { outcome: "unconfigured" };
+    const entry = this.#ctx.activeEntry(this.#ctx.sessionKey(agentName, sessionId));
+    const record = this.#ctx.getSessionRecord(agentName, sessionId);
+    const recipientPubkeyHex = entry?.counterpartyPubkey ?? record?.counterparty_pubkey;
+    const relay = entry?.relayPeerId && entry?.relayAddrs
+      ? { relayPeerId: entry.relayPeerId, relayAddrs: entry.relayAddrs }
+      : this.#ctx.persistedRelayEndpoint(agentName, sessionId);
+    /**
+     * TWO CAUSES, TWO ANSWERS — review F5. One label for both sent an operator to the relay when the
+     * real problem was a session row with no counterparty recorded, which is a local fault and has a
+     * completely different remedy.
+     */
+    if (!recipientPubkeyHex) return { outcome: "refused", cause: "no_counterparty_recorded" };
+    if (!relay) return { outcome: "unconfigured" };
+    try {
+      const result = await hook({
+        agentName,
+        sessionId,
+        recipientPubkeyHex,
+        relayPeerId: relay.relayPeerId,
+        relayAddrs: relay.relayAddrs,
+        contentHashHex: slotHashHex,
+        content: payload,
+        contentHashAlg: undefined,
+      });
+      if (!result.ok) return { outcome: "refused", cause: result.cause ?? result.reason };
+      return { outcome: "parked" };
+    } catch (err: unknown) {
+      return { outcome: "refused", cause: extractErrorMessage(err) };
+    }
+  }
+
   /** DOD-M12B-INDEX-1 — this agent's own K_local pubkey, for attributing its own held content.
    *  Null when it cannot be resolved: an UNATTRIBUTED annex row is true, a falsely attributed one
    *  is not, and this is the record that outlives the session. */
@@ -390,6 +460,13 @@ export class ParkRecovery {
   ): Promise<
     | { ok: true; leafIndex: number; sequenceNumber: number; held?: boolean; appendedCount?: number; screenedOut?: boolean }
     /**
+     * DOD-M15-DELIVERYACK-1 unit 1 — the entry was not a message at all; it was the counterparty
+     * acknowledging one of OURS, parked because this daemon was down when they read it. The caller
+     * accepts it (verify, bind, store) and confirm-deletes the mailbox entry. It appends no leaf and
+     * has no sequence, which is why it is its own shape rather than an `ok: true` with zeroes in it.
+     */
+    | { ok: true; deliveryAck: ParkedDeliveryAck }
+    /**
      * `retained` — `041-PARKSTUCK` review H1. Did this daemon actually keep a local copy of the
      * refused bytes?
      *
@@ -453,6 +530,34 @@ export class ParkRecovery {
         correlationId,
       });
       return { ok: false, reason: verdict.reason };
+    }
+
+    /**
+     * DOD-M15-DELIVERYACK-1 unit 1 — IS THIS A MESSAGE, OR AN ACKNOWLEDGEMENT OF ONE?
+     *
+     * Placed HERE and not one line earlier, deliberately: the envelope gate above has just proved
+     * the depositor is this session's counterparty, so nothing a stranger or the relay put in the
+     * mailbox reaches this branch. Placed here and not LATER, because the next thing that happens to
+     * a recovered entry is ingest — and an acknowledgement ingested as a message would be appended
+     * to the transcript, take a leaf, and enter the notarized record, which is the one thing machine
+     * traffic must never do.
+     *
+     * The decision does not touch the relay: the tag lives inside the seal, so the relay can neither
+     * read it, strip it to make an acknowledgement be ingested as content, nor add one to make a
+     * message disappear into the evidence store.
+     *
+     * The ACCEPTANCE is not done here. This function's caller holds the database handle, and putting
+     * the verify-bind-store here would need this module to reach a store it has no business holding;
+     * the caller hands the payload to the one function both routes share.
+     */
+    const parkedAck = decodeParkedDeliveryAck(env.content);
+    if (parkedAck) {
+      this.#ctx.logger.debug("content.recover.delivery_ack", {
+        agentName, sessionId, correlationId,
+        contentHash: Buffer.from(parkedAck.contentHash).toString("hex"),
+        mailboxSlot: contentHashHex,
+      });
+      return { ok: true, deliveryAck: parkedAck };
     }
 
     // Authenticated. The ordering record (when present) is still verified independently by
@@ -657,6 +762,22 @@ export class ParkRecovery {
         impact: "THIS EXACT MESSAGE was refused on the direct path and the same content has now been accepted from the relay mailbox, where the sealed envelope proves the sender. The refusal did not hold: the message WAS delivered by the other route. What the direct path could not confirm is still unconfirmed — the mailbox proves WHO sent it and nothing about the check that refused it — so the receipt can show this message arrived without showing everything a directly-delivered one would.",
         guidance: "Nothing to do about this message. The fix named on the original refusal still stands: until the cause clears, every message on this session takes the slower route and lands with less attached to it.",
       });
+    }
+    /**
+     * DOD-M15-DELIVERYACK-1 unit 1 — SIGN FOR IT, exactly as the direct path does.
+     *
+     * ⚠️ NOT ON `held` OR `screenedOut`. The acknowledgement says *this machine took delivery of
+     * these bytes*, and neither of those is delivery yet: a held frame is buffered behind an
+     * ordering gap and is acknowledged when the release path re-enters ingest, and a screened-out
+     * one is leafed but never shown. Acknowledging either would tell the sender something that is
+     * not true, on the one signal this whole unit exists to make trustworthy.
+     *
+     * Fire-and-forget: the acknowledgement's own path handles its own failure (it parks), and a
+     * message that WAS recovered must never be reported as a failed recovery because signing for it
+     * did not work out.
+     */
+    if (result.ok && result.held !== true && result.screenedOut !== true) {
+      this.#ctx.sendDeliveryAck(agentName, sessionId, contentHash, correlationId);
     }
     return result;
   }

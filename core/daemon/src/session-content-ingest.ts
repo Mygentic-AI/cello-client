@@ -18,7 +18,7 @@
  */
 import * as lp from "it-length-prefixed";
 import { decode } from "cbor-x";
-import { encodeCbor, decodeStructure1 } from "@cello-protocol/protocol-types";
+import { decodeStructure1 } from "@cello-protocol/protocol-types";
 import { openSessionContent } from "@cello-protocol/crypto";
 import { CELLO_CONTENT_PROTOCOL_ID, type CelloNode } from "@cello-protocol/transport";
 import { GATEWAY_UNAVAILABLE, GOVERNANCE_TIMEOUT, type SecurityGatewayClient } from "@cello-protocol/gateway";
@@ -32,8 +32,11 @@ import { triageOrphanedContent } from "./orphan-triage.js";
 import { extractErrorMessage } from "./error-message.js";
 import { retentionSentence } from "./quarantine-framing.js";
 import { LEAF_KIND_CTRL } from "./session-relay-client.js";
-import { ACK_HASH_REASONS, AUTHORSHIP_SELF_CHAIN_MISMATCH, AUTHORSHIP_SESSION_MISMATCH, CONTENT_MAX_INBOUND_STREAMS, CONTENT_STREAM_LINGER_MS, RECEIVED_BUFFER_CAP, REFUSAL_MAY_STILL_ARRIVE, REFUSAL_NO_OTHER_ROUTE, type AckHashReason, type ReceivedContentEntry } from "./session-node-types.js";
+import { ACK_HASH_REASONS, AUTHORSHIP_SELF_CHAIN_MISMATCH, AUTHORSHIP_SESSION_MISMATCH, CONTENT_MAX_INBOUND_STREAMS, CONTENT_STREAM_LINGER_MS, REFUSAL_MAY_STILL_ARRIVE, REFUSAL_NO_OTHER_ROUTE, type AckHashReason } from "./session-node-types.js";
 import type { SessionContentPipelineContext } from "./session-content-context.js";
+// DOD-M15-DELIVERYACK-1: the acknowledgement is its own subject — signed, verified against the
+// session's recorded counterparty key, and kept as evidence. It lives in its own module.
+import { sendDeliveryAck, onDeliveryAck } from "./session-delivery-acks.js";
 import type { SessionContentSender } from "./session-content-send.js";
 
 export class SessionContentIngest {
@@ -1369,14 +1372,17 @@ export class SessionContentIngest {
     // grace window and the relay is never asked, which is what keeps a fetch off the hot path of
     // every message.
     this.markContentResolved(agentName, sessionId, contentHashHex);
-    let buf = this.#ctx.receivedContent.get(recvKey);
-    if (!buf) { buf = []; this.#ctx.receivedContent.set(recvKey, buf); }
-    buf.push({ contentHex: Buffer.from(content).toString("hex"), senderPubkey, sequenceNumber: leafIndex });
-    // DOD-COATTEND-1: BOUNDED, because delivery no longer drains this. Its remaining job is
-    // `peekLatestReceivedContentHex` (M8C-AWAY-1 reads the TAIL to spot a [[WRAP]]), so only the
-    // recent tail is load-bearing — but an unbounded array holding every message of every live
-    // session, in memory, for the life of the daemon, is a leak the old destructive read hid.
-    if (buf.length > RECEIVED_BUFFER_CAP) buf.splice(0, buf.length - RECEIVED_BUFFER_CAP);
+    /**
+     * THE ARRIVAL BUFFER USED TO BE FILLED HERE, and nothing read it.
+     *
+     * Every verified message was copied into an in-memory list as plaintext, capped at the last 32
+     * per session and held for the life of the daemon process. `cello_receive` stopped draining it
+     * at DOD-COATTEND-1, when delivery moved onto the durable transcript written a few lines above;
+     * the away responder's peek at its tail was the last reader, and DOD-M15-AWAYSCOPE-1 deleted
+     * that. What was left was the plaintext of every conversation, kept in memory, for nobody.
+     *
+     * The transcript row IS the delivery record. There is nothing to keep alongside it.
+     */
     this.#ctx.logger.info("session.content.received", {
       sessionId,
       senderPubkey,
@@ -1395,102 +1401,6 @@ export class SessionContentIngest {
       });
     }
     return { leafIndex };
-  }
-
-
-
-  /** DAEMON-004: pop the oldest verified received content for cello_receive. */
-  takeReceivedContent(agentName: string, sessionId: string): ReceivedContentEntry | null {
-    const buf = this.#ctx.receivedContent.get(this.#ctx.sessionKey(agentName, sessionId));
-    if (!buf || buf.length === 0) return null;
-    return buf.shift() ?? null;
-  }
-
-
-
-  /**
-   * Send an unsigned `persisted` delivery ACK back to the sender over the same
-   * /cello/content/1.0.0 protocol (AC-001). Best-effort: authentication is the Noise
-   * session channel, so the ACK carries no signature; a failed ACK send is logged and
-   * the sender recovers via its TTF/recovery path rather than a thrown error here.
-   */
-  async #sendDeliveryAck(agentName: string, sessionId: string, contentHash: Uint8Array, correlationId?: string): Promise<void> {
-    const entry = this.#ctx.activeNodes.get(this.#ctx.sessionKey(agentName, sessionId));
-    if (!entry) {
-      // NOT a silent return. No ACK is exactly this milestone's symptom — the sender's TTF expires
-      // and the message parks — so the one case where we knowingly decline to send one has to say
-      // so, or it is indistinguishable from the defect.
-      this.#ctx.logger.debug("content.delivery.ack.skipped", {
-        agentName,
-        sessionId,
-        contentHash: Buffer.from(contentHash).toString("hex"),
-        reason: "session_node_gone",
-        correlationId,
-      });
-      return;
-    }
-    // Held outside the try so the catch can retire a stream that was opened and then failed to
-    // write. Without it every failure leaks the OUTBOUND half of the stream the receiver-side
-    // `finally` retires — same defect, other end, other cap. See the note on #handleContentStream.
-    // Assigned IMMEDIATELY after newStream: anything between the two is a window where a throw
-    // leaks the stream because the catch cannot see it.
-    let ackStream: Stream | undefined;
-    try {
-      const stream = await entry.node.newStream(entry.counterpartySessionPeerId, CELLO_CONTENT_PROTOCOL_ID);
-      ackStream = stream;
-      // Injected ACK-write failure — thrown from inside the try so it lands in exactly the catch a
-      // real reset lands in, and the whole downstream path (impair → abort → log) runs unmodified.
-      if (this.#ctx.ackFaultRemaining > 0) {
-        this.#ctx.ackFaultRemaining -= 1;
-        this.#ctx.logger.warn("content.delivery.ack.fault.injected", { sessionId });
-        throw new Error("connection_lost: injected delivery-ack fault");
-      }
-      const frame = encodeCbor({
-        type: "content_delivery_ack",
-        session_id: sessionId,
-        content_hash: contentHash,
-        level: "persisted",
-        correlation_id: correlationId,
-      }) as Uint8Array;
-      stream.send(lp.encode.single(frame));
-      // NOT SWALLOWED, for the same reason the direct-send path stopped swallowing it: `close()`
-      // waits for the write buffer to drain, so a reset mid-flush throws HERE and that is exactly
-      // the case where the bytes never left. A swallowed close made two things happen at once —
-      // this log claimed the ACK went out while the sender's TTF fired and parked, and the abort in
-      // the catch below (the thing that frees the stream slot) became unreachable.
-      await stream.close();
-      // AFTER the close, because that is when it is true. The receiver-side counterpart to the
-      // sender's content.delivery.acked: B has acknowledged this content `persisted`, so the sender
-      // stops retrying/parking. Emitted for BOTH a normally delivered message AND a terminal-screen
-      // block (the block is a definitive receipt — the leaf is recorded, so the sender must stop) —
-      // and deliberately NOT for a transient hold.
-      this.#ctx.logger.info("content.delivery.ack.sent", {
-        sessionId,
-        contentHash: Buffer.from(contentHash).toString("hex"),
-        correlationId,
-      });
-      // An agent that mostly LISTENS sends content rarely and ACKs constantly. Clearing only on the
-      // content path would leave exactly those sessions reporting a broken conversation forever
-      // after one bad ACK — the one-way door, on the other send path.
-      this.#ctx.liveness.clearSessionImpairment(agentName, sessionId, "delivery_ack", correlationId);
-    } catch (err: unknown) {
-      this.#ctx.logger.warn("content.delivery.ack.send.failed", {
-        sessionId,
-        contentHash: Buffer.from(contentHash).toString("hex"),
-        error: extractErrorMessage(err),
-        // "Cannot write to a stream that is closed" names where the write died, never why. The
-        // why is almost always the per-protocol stream cap, and these two numbers are what turn
-        // that from a log-measurement session into a grep.
-        ...this.#ctx.streamCensus(entry.node, entry.counterpartySessionPeerId),
-        correlationId,
-      });
-      // The ACK travels the same direct path as our own content, so a failure here is the same
-      // evidence: writes to this counterparty are not landing.
-      this.#ctx.liveness.markSessionImpaired(agentName, sessionId, { cause: "delivery_ack", error: extractErrorMessage(err), correlationId });
-      if (ackStream !== undefined) {
-        try { ackStream.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* already gone */ }
-      }
-    }
   }
 
 
@@ -1779,7 +1689,7 @@ export class SessionContentIngest {
         const ackHash = frame["content_hash"];
         const level = frame["level"];
         if (ackHash instanceof Uint8Array && level === "persisted") {
-          this.#send.resolveAwaitingAck(agentName, sessionId, ackHash);
+          onDeliveryAck(this.#ctx, (a, sid, h) => this.#send.resolveAwaitingAck(a, sid, h), agentName, sessionId, ackHash, frame["ack_sig"], correlationId);
         }
         return;
       }
@@ -2237,7 +2147,7 @@ export class SessionContentIngest {
           }
           void this.witnessReceivedLeaf(agentName, sessionId, contentHash, s1Cbor, senderSig, framedKind, correlationId);
         }
-        void this.#sendDeliveryAck(agentName, sessionId, contentHash, correlationId);
+        void sendDeliveryAck(this.#ctx, agentName, sessionId, contentHash, correlationId);
       }
     } catch (err: unknown) {
       this.#ctx.logger.warn("session.content.stream.read.failed", {

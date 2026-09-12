@@ -20,6 +20,13 @@ export interface DisconnectCleanupDeps {
   getConnState: (connectionId: string) => { currentAgent: string | null; clientType?: string } | undefined;
   /** How many connections still attend an agent, after this one goes. */
   countAttendanceFor: (agentName: string) => number;
+  /**
+   * DOD-M15-AWAYSCOPE-1 — tell this agent's counterparties that the last attendee just left.
+   *
+   * Injected as a function rather than the whole manager: this module's job is releasing
+   * connection-scoped state, and handing it a session manager would invite it to grow one.
+   */
+  announceAttendance: (agentName: string, attendance: "attended" | "unattended" | "offline") => void;
   /** Releases the three per-connection maps. Lives with the maps, not here. */
   forgetConnection: (connectionId: string) => void;
   forgetTakeLedger: (connectionId: string) => void;
@@ -42,7 +49,7 @@ export interface DisconnectCleanupDeps {
 
 export function wireDisconnectCleanup(deps: DisconnectCleanupDeps): void {
   const {
-    ipcServer, getConnState, countAttendanceFor, forgetConnection, forgetTakeLedger,
+    ipcServer, getConnState, countAttendanceFor, forgetConnection, forgetTakeLedger, announceAttendance,
     inboundSessionWaiters,
     getNotificationDispatcher,
   } = deps;
@@ -81,6 +88,21 @@ export function wireDisconnectCleanup(deps: DisconnectCleanupDeps): void {
     // The three per-connection maps are released by the module that owns them; the reasons each
     // must die with its connection live there, beside the containers.
     forgetConnection(connectionId);
+    /**
+     * DOD-M15-AWAYSCOPE-1 — the counterparty is told, the moment the LAST attendee leaves.
+     *
+     * ⚠️ AFTER `forgetConnection`, and that ordering is the whole correctness of this line. The count
+     * above is computed as "minus one" precisely because this connection is still in the map; here
+     * it is gone, so `countAttendanceFor` reads the truth and a co-attended agent — legitimate and
+     * permanent — does not get reported as unattended because one of several clients closed.
+     *
+     * This is what the away reply used to do by sending a message into the conversation, which took
+     * a hash-chain leaf and cost a completed exchange its receipt. Saying it out of band costs
+     * nothing and is readable by the counterparty whenever they ask.
+     */
+    if (closing?.currentAgent && countAttendanceFor(closing.currentAgent) === 0) {
+      announceAttendance(closing.currentAgent, "unattended");
+    }
     // DOD-COATTEND-VISIBLE-1 (review HIGH): the take ledger is connection-scoped for the SAME
     // reason and must die with the connection too. Leaving it behind made every reconnect look
     // like a theft: a fresh connection starts at cursor -1, so every take a now-dead connection

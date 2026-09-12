@@ -438,7 +438,7 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     snm.markSessionLivenessForTest("bob", impairedSid, "impaired");
 
     // getStatus() is what drives the reap (compute-on-read).
-    h.getStatus();
+    (await h.getStatus());
     await wait(100);
 
     const status = (sid: string): string =>

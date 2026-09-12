@@ -149,7 +149,7 @@ export interface InboundSessionDeps {
   handleInboundSealInterruptedRequest: (frame: Record<string, unknown>) => Promise<void>;
   reapDeadHalfOpenSessions: (agentName?: string) => void;
   /** AWAY-1: the auto-reply when nobody is attending this agent. */
-  sendAwayResponse: (agentName: string, sessionId: string, kind: "request" | "message") => Promise<void>;
+  sendAwayResponse: (agentName: string, sessionId: string) => Promise<void>;
   dispatchSessionStateChangedWithTelegram: (agentName: string, sessionId: string, state: string, counterpartyPubkey: string | null) => void;
   sendTelegramDoorbell: (agentName: string, sessionId: string, kind: "session_request" | "message_waiting" | "state_change", detail: string) => Promise<void>;
   /**
@@ -1135,7 +1135,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       }
       // M8C-AWAY-1: an unattended agent auto-acks a fresh inbound session request. Fire-and-forget
       // (sendAwayResponse never throws) — best-effort, must not delay/block acceptance completion.
-      void sendAwayResponse(agentName, parsed.sessionIdHex, "request");
+      void sendAwayResponse(agentName, parsed.sessionIdHex);
       // CC-1 (2026-07-07): do NOT auto-add the requester here. Accepting the *connection* must not
       // grant *trust*. The old auto-add promoted any stranger who knocked once to "known" (Level-4
       // fast-track), which defeated BOTH the screening layer AND the ABUSE-1 acceptance caps
