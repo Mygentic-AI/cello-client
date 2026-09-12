@@ -873,9 +873,14 @@ export async function sendSealFrostSignature(
  * channel. Rebuilds the canonical seal TBS from the cert fields and verifies the signature
  * against a key trusted independently of the delivering frame: the session primary_pubkey
  * (commitments[0] of this agent's FROST share) for 'frost'. A channel-swapped sealed_root
- * (or any TBS-bound field) fails this check (SI-003). The 'single' (pre-DKG) variant verifies
- * against the directory node key from the consortium manifest — not yet wired on the daemon;
- * surfaced honestly rather than accepted on faith.
+ * (or any TBS-bound field) fails this check (SI-003).
+ *
+ * 'single' is not a second variant this function is missing — it is a DOWNGRADE, refused by name
+ * before a session exists (`assignment_signature_type_downgraded`, assignment-verify.ts, checked
+ * against the directory's only producer of `signature_type`). A cert carrying it is a shape no
+ * honest peer can produce, so the branch below refuses rather than verifying. Do not "finish" it
+ * by adding a manifest-key path: that would make the downgrade verifiable instead of refused,
+ * which is the outcome the upstream check exists to prevent.
  */
 export async function verifyUnilateralCertificate(
   deps: { persistence: DaemonRegistrationPersistence; agentPubkeyHex: string; logger: Logger },
