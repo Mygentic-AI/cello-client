@@ -65,7 +65,6 @@ describe("DELIVERYACK/parked: the payload says what it is, and only to the recip
       sessionIdHex: SID,
       contentHash: HASH,
       ackSig: sig,
-      signerPubkey: await bob.getPublicKey(),
     });
     const back = decodeParkedDeliveryAck(bytes);
     expect(back).not.toBeNull();
@@ -90,11 +89,11 @@ describe("DELIVERYACK/parked: the payload says what it is, and only to the recip
       new Uint8Array([0x00, 0x01, 0x02]),
       // A CBOR array of the right arity with a different tag.
       (await import("@cello-protocol/protocol-types")).encodeCbor([
-        "cello/park/something-else/v1", SID, HASH, new Uint8Array(64), new Uint8Array(32),
+        "cello/park/something-else/v1", SID, HASH, new Uint8Array(64),
       ]) as Uint8Array,
       // The right tag in the WRONG slot.
       (await import("@cello-protocol/protocol-types")).encodeCbor([
-        SID, PARKED_DELIVERY_ACK_TAG, HASH, new Uint8Array(64), new Uint8Array(32),
+        SID, PARKED_DELIVERY_ACK_TAG, HASH, new Uint8Array(64),
       ]) as Uint8Array,
     ]) {
       expect(
@@ -110,16 +109,16 @@ describe("DELIVERYACK/parked: the payload says what it is, and only to the recip
       sessionIdHex: SID,
       contentHash: HASH,
       ackSig: await signDeliveryAck(bob, Buffer.from(SID, "hex"), HASH),
-      signerPubkey: await bob.getPublicKey(),
     };
     const { encodeCbor } = await import("@cello-protocol/protocol-types");
     // Right tag, wrong widths — each field in turn. None may be waved through.
     const wrong = [
-      [PARKED_DELIVERY_ACK_TAG, SID, new Uint8Array(31), good.ackSig, good.signerPubkey],
-      [PARKED_DELIVERY_ACK_TAG, SID, good.contentHash, new Uint8Array(63), good.signerPubkey],
-      [PARKED_DELIVERY_ACK_TAG, SID, good.contentHash, good.ackSig, new Uint8Array(31)],
-      [PARKED_DELIVERY_ACK_TAG, "not hex", good.contentHash, good.ackSig, good.signerPubkey],
-      [PARKED_DELIVERY_ACK_TAG, SID, good.contentHash, good.ackSig],
+      [PARKED_DELIVERY_ACK_TAG, SID, new Uint8Array(31), good.ackSig],
+      [PARKED_DELIVERY_ACK_TAG, SID, good.contentHash, new Uint8Array(63)],
+      [PARKED_DELIVERY_ACK_TAG, "not hex", good.contentHash, good.ackSig],
+      [PARKED_DELIVERY_ACK_TAG, SID, good.contentHash],
+      // A trailing extra field is not a superset to be tolerated — it is a different shape.
+      [PARKED_DELIVERY_ACK_TAG, SID, good.contentHash, good.ackSig, new Uint8Array(32)],
     ];
     for (const w of wrong) {
       expect(decodeParkedDeliveryAck(encodeCbor(w) as Uint8Array)).toBeNull();
@@ -181,7 +180,7 @@ describe("DELIVERYACK/parked: an acknowledgement out of the mailbox is held to t
     bobPubHex: string;
     sentHash: Uint8Array;
     /** `counterparty` is NOT defaulted — see the no-key test for why that matters. */
-    accept: (ack: ParkedDeliveryAck, counterparty: string | undefined) => { ok: boolean; reason?: string };
+    accept: (ack: ParkedDeliveryAck, counterparty: string | undefined, slotHex?: string) => { ok: boolean; reason?: string };
     held: () => number;
   }> {
     const events: Array<{ level: string; event: string; context: Record<string, unknown> }> = [];
@@ -215,9 +214,10 @@ describe("DELIVERYACK/parked: an acknowledgement out of the mailbox is held to t
 
     return {
       db, logger, events, agentId, bob, bobPubHex, sentHash,
-      accept: (ack, counterparty) =>
+      accept: (ack, counterparty, slotHex) =>
         acceptParkedDeliveryAck({
           db, logger, agentId, agentName: "alice", sessionId: SESSION,
+          mailboxSlotHex: slotHex ?? Buffer.from(parkedDeliveryAckMailboxHash(SESSION, ack.contentHash)).toString("hex"),
           counterpartyPubkeyHex: counterparty, ack, correlationId: "corr",
         }),
       held: () => readDeliveryFacts(db, logger, agentId, SESSION).filter((f) => f.acknowledged !== null).length,
@@ -229,7 +229,6 @@ describe("DELIVERYACK/parked: an acknowledgement out of the mailbox is held to t
       sessionIdHex: session,
       contentHash: hash,
       ackSig: await signDeliveryAck(signer, Buffer.from(session, "hex"), hash),
-      signerPubkey: await signer.getPublicKey(),
     };
   }
 
@@ -326,5 +325,47 @@ describe("DELIVERYACK/parked: an acknowledgement out of the mailbox is held to t
     }
     // And nothing froze: a discard leaves the session exactly as it was.
     expect(f.events.some((e) => e.event.includes("freeze") || e.event.includes("refused.session"))).toBe(false);
+  });
+  /**
+   * ⚠️ THE DERIVATION ON ITS OWN PROTECTED NOBODY, and the test that only compared hashes said
+   * nothing about it. A counterparty running a modified client picks the mailbox slot freely — the
+   * park envelope's signature covers whatever slot they chose, so it authenticates. Filing an
+   * acknowledgement AT THE CONTENT HASH of a message they were supposed to deliver makes the
+   * relay's own dedup absorb the real content deposit: the message never arrives, nothing is
+   * refused, and every log line is clean, because the acknowledgement itself is valid.
+   *
+   * These are consumer tests for that reason. The producer choosing a good slot is not the
+   * property; the receiver refusing a bad one is.
+   */
+
+  it("★★★ an acknowledgement filed at the MESSAGE's own slot is discarded", async () => {
+    const f = await fixture("slot-collide.db");
+    const ack = await ackFor(f.bob, f.sentHash);
+    // The attack: the slot IS the content hash of the message being acknowledged.
+    const verdict = f.accept(ack, f.bobPubHex, Buffer.from(f.sentHash).toString("hex"));
+    expect(verdict).toEqual({ ok: false, reason: "slot_not_derived" });
+    expect(f.held()).toBe(0);
+  });
+
+  it("★★★ any slot other than the derived one is discarded", async () => {
+    const f = await fixture("slot-any.db");
+    const ack = await ackFor(f.bob, f.sentHash);
+    for (const slot of ["00".repeat(32), "ab".repeat(32), Buffer.from(parkedDeliveryAckMailboxHash("ab".repeat(16), f.sentHash)).toString("hex")]) {
+      expect(f.accept(ack, f.bobPubHex, slot).reason).toBe("slot_not_derived");
+    }
+    // ...and the derived one is accepted, so the loop above is not refusing everything.
+    expect(f.accept(ack, f.bobPubHex)).toEqual({ ok: true });
+  });
+
+  it("★★★ the session named INSIDE the seal must match the one the relay filed it under", async () => {
+    /**
+     * The relay supplies the outer session id and is in the threat model. The inner one is under
+     * the depositor's signature and the relay can neither read nor change it. Disagreement means
+     * one of them is lying and there is no version of continuing that is right.
+     */
+    const f = await fixture("slot-session.db");
+    const ack = { ...(await ackFor(f.bob, f.sentHash)), sessionIdHex: "ab".repeat(16) };
+    expect(f.accept(ack, f.bobPubHex).reason).toBe("session_mismatch");
+    expect(f.held()).toBe(0);
   });
 });

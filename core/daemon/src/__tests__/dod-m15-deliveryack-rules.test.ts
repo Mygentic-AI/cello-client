@@ -422,4 +422,46 @@ describe("DELIVERYACK: the five rules, on the inbound path", () => {
       expect(rendered).not.toContain(word);
     }
   });
+  /**
+   * The order asks for this in a sentence that was read past the first time: *"make sure the three
+   * new facts do not duplicate or contradict it."*
+   *
+   * They measure different things. `answered` is AUTHORSHIP — did the other party write anything
+   * after your last message — and it is derived by the DIRECTORY from the leaf set at seal time.
+   * `acknowledged` is DELIVERY — did their machine take the bytes, signed on ingest, before any
+   * human read them. The pair that carries the most meaning is the one neither can express alone:
+   * answered false AND acknowledged present, which is "it reached them and they did not reply" —
+   * the very distinction this whole order exists to make available.
+   *
+   * These are structural checks rather than a co-occurrence, which is what the live journey already
+   * shows. A structure cannot contradict if nothing reads across it.
+   */
+  it("★★★ nothing in the delivery facts reads, derives from, or restates `final_message`", async () => {
+    const a = await sendingAgent("no-duplication.db");
+    a.node.invokeHandler(a.ack({ sig: await signDeliveryAck(a.bob, Buffer.from(SID, "hex"), a.hash) }), COUNTERPARTY_PEER);
+    await settle();
+    const facts = readDeliveryFacts(a.mgr.getDb(), a.logger, a.mgr.resolveAgentId("alice"), SID);
+    expect(facts.length).toBeGreaterThan(0);
+    const rendered = JSON.stringify(facts);
+    // No field of the certificate's final_message is copied in, under any name.
+    for (const leaked of ["answered", "final_message", "sender_pubkey", "attests", "implies_assent", "disclaimer"]) {
+      expect(rendered, `the delivery facts restate "${leaked}" from the certificate`).not.toContain(leaked);
+    }
+    // And the three facts are exactly the three, with no fourth that could combine them.
+    expect(Object.keys(facts[0]!).sort()).toEqual(["acknowledged", "content_hash", "delivered", "ordered", "seq"]);
+  });
+
+  it("★★★ `answered` is a SEAL-TIME fact from the directory and the delivery facts never touch it", async () => {
+    /**
+     * The structural half: the read that produces the delivery facts does not query, join to, or
+     * receive anything the certificate carries. If it did, the two could drift into disagreement
+     * about the same message — which is the contradiction the order is warning about.
+     */
+    const src = await import("node:fs/promises").then((fs) =>
+      fs.readFile(new URL("../session-delivery-acks.ts", import.meta.url), "utf8"));
+    const readFn = src.slice(src.indexOf("export function readDeliveryFacts"));
+    for (const term of ["final_message", "answered", "legibility", "seal_legibility", "sealed_root"]) {
+      expect(readFn, `readDeliveryFacts reads "${term}" — the two facts must stay independent`).not.toContain(term);
+    }
+  });
 });

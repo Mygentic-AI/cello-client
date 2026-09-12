@@ -111,10 +111,18 @@ export interface ParkedDeliveryAck {
   sessionIdHex: string;
   /** The content hash being acknowledged — the MESSAGE's hash, not the mailbox slot. */
   contentHash: Uint8Array;
-  /** The acknowledging agent's Ed25519 signature over the canonical delivery-ack statement. */
+  /**
+   * The acknowledging agent's Ed25519 signature over the canonical delivery-ack statement.
+   *
+   * ⚠️ THERE IS NO `signerPubkey` FIELD, AND THERE WAS ONE. It was encoded, decoded and then never
+   * read, while its own comment claimed it was "verified against the session's recorded key" — a
+   * comment asserting a property no code enforced, which is the exact shape this repo keeps finding.
+   * It could not be made useful either: the signature is checked against the key the SESSION
+   * recorded, so a self-declared signer adds nothing and a mismatching one adds a second way to say
+   * the same no. Removed rather than documented, while nothing is published and no mailbox holds
+   * one.
+   */
   ackSig: Uint8Array;
-  /** Who claims to have signed it. VERIFIED against the session's recorded key, never trusted from here. */
-  signerPubkey: Uint8Array;
 }
 
 /**
@@ -127,7 +135,6 @@ export function encodeParkedDeliveryAck(ack: ParkedDeliveryAck): Uint8Array {
     ack.sessionIdHex,
     ack.contentHash,
     ack.ackSig,
-    ack.signerPubkey,
   ]) as Uint8Array;
 }
 
@@ -148,14 +155,13 @@ export function decodeParkedDeliveryAck(content: Uint8Array): ParkedDeliveryAck 
   } catch {
     return null;
   }
-  if (!Array.isArray(arr) || arr.length !== 5) return null;
-  const [tag, sessionIdHex, contentHash, ackSig, signerPubkey] = arr as unknown[];
+  if (!Array.isArray(arr) || arr.length !== 4) return null;
+  const [tag, sessionIdHex, contentHash, ackSig] = arr as unknown[];
   if (tag !== PARKED_DELIVERY_ACK_TAG) return null;
   if (typeof sessionIdHex !== "string" || !/^[0-9a-fA-F]+$/.test(sessionIdHex) || sessionIdHex.length % 2 !== 0) return null;
   if (!(contentHash instanceof Uint8Array) || contentHash.length !== 32) return null;
   if (!(ackSig instanceof Uint8Array) || ackSig.length !== 64) return null;
-  if (!(signerPubkey instanceof Uint8Array) || signerPubkey.length !== 32) return null;
-  return { sessionIdHex, contentHash, ackSig, signerPubkey };
+  return { sessionIdHex, contentHash, ackSig };
 }
 
 /** Current envelope version. v1 (unsigned) is decodable but NEVER acceptable — see authenticate(). */

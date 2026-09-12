@@ -327,16 +327,38 @@ export function createContentPark(deps: ContentParkDeps) {
        * a failed write) does not destroy evidence we could have kept on the next drain.
        */
       if (ingest.ok && "deliveryAck" in ingest) {
-        const accepted = acceptParkedDeliveryAck({
-          db: sessionNodeManager.getDb(),
-          logger,
-          agentId: sessionNodeManager.resolveAgentId(recipientAgent.name),
-          agentName: recipientAgent.name,
-          sessionId: e.sessionIdHex,
-          counterpartyPubkeyHex: sessionNodeManager.getSessionRecord(recipientAgent.name, e.sessionIdHex)?.counterparty_pubkey,
-          ack: ingest.deliveryAck,
-          correlationId,
-        });
+        /**
+         * WRAPPED, because a LOCAL fault here must not cost the rest of the drain — review F3.
+         *
+         * `getDb()` and `resolveAgentId()` both throw, and an escape from this loop takes every
+         * REMAINING entry with it, messages included, unread, reported to the caller as a generic
+         * internal error. The content path never had this shape because `recoverParkedEntry` owns
+         * its own failures. The entry is left in the mailbox, so the next drain retries it.
+         */
+        let accepted: { ok: true } | { ok: false; reason: string };
+        try {
+          accepted = acceptParkedDeliveryAck({
+            db: sessionNodeManager.getDb(),
+            logger,
+            agentId: sessionNodeManager.resolveAgentId(recipientAgent.name),
+            agentName: recipientAgent.name,
+            sessionId: e.sessionIdHex,
+            mailboxSlotHex: e.contentHashHex,
+            counterpartyPubkeyHex: sessionNodeManager.getSessionRecord(recipientAgent.name, e.sessionIdHex)?.counterparty_pubkey,
+            ack: ingest.deliveryAck,
+            correlationId,
+          });
+        } catch (err: unknown) {
+          logger.error("content.delivery.ack.parked.accept_failed", {
+            agentName: recipientAgent.name, sessionId: e.sessionIdHex, correlationId,
+            error: extractErrorMessage(err),
+            impact:
+              "a local fault stopped this side storing an acknowledgement it had already recovered. " +
+              "The entry stays in the mailbox and the next drain retries it; the rest of the " +
+              "mailbox, messages included, is still drained",
+          });
+          continue;
+        }
         if (accepted.ok) {
           try {
             await client.confirm(node, Buffer.from(recipientPubkey, "hex"), contentHashBytes, kp);

@@ -331,7 +331,13 @@ export class ParkRecovery {
     const relay = entry?.relayPeerId && entry?.relayAddrs
       ? { relayPeerId: entry.relayPeerId, relayAddrs: entry.relayAddrs }
       : this.#ctx.persistedRelayEndpoint(agentName, sessionId);
-    if (!recipientPubkeyHex || !relay) return { outcome: "unconfigured" };
+    /**
+     * TWO CAUSES, TWO ANSWERS — review F5. One label for both sent an operator to the relay when the
+     * real problem was a session row with no counterparty recorded, which is a local fault and has a
+     * completely different remedy.
+     */
+    if (!recipientPubkeyHex) return { outcome: "refused", cause: "no_counterparty_recorded" };
+    if (!relay) return { outcome: "unconfigured" };
     try {
       const result = await hook({
         agentName,

@@ -238,15 +238,8 @@ async function parkDeliveryAck(
   why: "no_live_session_node" | "direct_send_failed",
 ): Promise<void> {
   const hashHex = Buffer.from(contentHash).toString("hex");
-  const signer = ctx.keyProvider(agentName);
-  if (!signer) return; // Already reported as `content.delivery.ack.unsignable` before we got here.
   try {
-    const payload = encodeParkedDeliveryAck({
-      sessionIdHex: sessionId,
-      contentHash,
-      ackSig,
-      signerPubkey: await signer.getPublicKey(),
-    });
+    const payload = encodeParkedDeliveryAck({ sessionIdHex: sessionId, contentHash, ackSig });
     const slotHex = Buffer.from(parkedDeliveryAckMailboxHash(sessionId, contentHash)).toString("hex");
     const attempt = await ctx.park.parkOutOfBand(agentName, sessionId, slotHex, payload);
     if (attempt.outcome === "parked") {
@@ -533,8 +526,11 @@ export function acceptParkedDeliveryAck(a: {
   logger: Logger;
   agentId: string;
   agentName: string;
+  /** The session the RELAY filed this entry under. */
   sessionId: string;
-  /** The session's RECORDED counterparty key. Never the `signerPubkey` carried in the payload. */
+  /** The mailbox slot the entry was pulled from — what the relay files it by. */
+  mailboxSlotHex: string;
+  /** The session's RECORDED counterparty key. Never a key carried in the payload. */
   counterpartyPubkeyHex: string | undefined;
   ack: ParkedDeliveryAck;
   correlationId?: string;
@@ -548,6 +544,42 @@ export function acceptParkedDeliveryAck(a: {
     return { ok: false, reason };
   };
 
+  /**
+     🚨 THE SLOT MUST BE THE DERIVED ONE, AND WITHOUT THIS CHECK THE DERIVATION PROTECTED NOBODY.
+
+     `parkedDeliveryAckMailboxHash` puts an acknowledgement in a slot no message's content hash can
+     occupy — for an HONEST depositor. A counterparty running a modified client picks the slot
+     freely: the park envelope's signature covers whatever slot they chose, so it authenticates. They
+     file an acknowledgement AT THE CONTENT HASH of a message they were supposed to deliver, the
+     relay files by (recipient, content_hash) and dedups, and the real content deposit is absorbed.
+     The message never arrives, nothing is refused, and every log line is clean — because the
+     acknowledgement itself is perfectly valid.
+
+     So the slot is checked against the derivation before anything else. It costs no cryptography,
+     which also makes it the right first gate for an entry that is re-pulled on every drain.
+   */
+  const expectedSlot = Buffer.from(parkedDeliveryAckMailboxHash(a.sessionId, a.ack.contentHash)).toString("hex");
+  if (a.mailboxSlotHex.toLowerCase() !== expectedSlot) {
+    return discard(
+      "slot_not_derived",
+      "a parked acknowledgement was filed in a mailbox slot that is not the one its own contents " +
+      "derive. An acknowledgement sitting in a message's slot would absorb that message's delivery " +
+      "through the relay's own dedup, so it is discarded and the slot is left alone",
+    );
+  }
+  /**
+   * The session id INSIDE the seal must be the one the relay filed it under. The relay supplies the
+   * outer value and is in the threat model; the inner one is under the depositor's signature and
+   * the relay can neither read nor change it. Disagreement means one of them is lying, and there is
+   * no version of that where continuing is right.
+   */
+  if (a.ack.sessionIdHex.toLowerCase() !== a.sessionId.toLowerCase()) {
+    return discard(
+      "session_mismatch",
+      "a parked acknowledgement names a different session inside its seal than the one the relay " +
+      "filed it under. Discarded rather than routed on either claim",
+    );
+  }
   // RULE 2 — bound. Durable only: by the time a parked acknowledgement is drained, any live timer
   // for that message is long gone, which is the whole reason this route exists.
   if (!sentContentHashExists(a.db, a.agentId, a.sessionId, hashHex)) {
