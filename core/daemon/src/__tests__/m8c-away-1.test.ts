@@ -32,10 +32,11 @@ import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
-import type { Stream } from "@libp2p/interface";
-import { Encoder, decode } from "cbor-x";
-import * as lp from "it-length-prefixed";
 import { markAsAutoReply } from "../away-detection.js";
+// The relay + node fakes live in ONE place now (helpers/fake-relay-server.ts) — this file was that
+// place, and DOD-M15-SEALPRECOND-1 needed the same ordering relay to prove a seal is not signed
+// over a short tree. A second copy would drift from the leaf protocol silently.
+import { makeFakeRelayServer, FakeNode, FakeRelayAwareNode, FAKE_RELAY_PEER_ID as FAKE_RELAY_PEER_ID_ONESHOT, FAKE_RELAY_ADDR as FAKE_RELAY_ADDR_ONESHOT } from "./helpers/fake-relay-server.js";
 import { makeSignedAssignmentFrame, registerFixtureSigner, fixtureIdentity } from "./helpers/signed-assignment.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
@@ -54,31 +55,6 @@ function msgLeafHash(content: Uint8Array): Uint8Array {
   return new Uint8Array(createHash("sha256").update(new Uint8Array([0x00])).update(content).digest());
 }
 
-class FakeNode implements Partial<CelloNode> {
-  readonly #peerId = `fake-${Math.random().toString(36).slice(2)}`;
-  // Reviewer finding (a9099571): let a test toggle a transient failure on the NEXT newStream call
-  // only, to prove the away-ack dedup guard clears on failure and retries on the next arrival.
-  failNextStream = false;
-  async start(): Promise<void> {}
-  async stop(): Promise<void> {}
-  getPeerId(): string { return this.#peerId; }
-  listenAddresses(): string[] { return ["/ip4/127.0.0.1/tcp/0"]; }
-  async dial(_a: string): Promise<{ peerId: string }> { return { peerId: "remote" }; }
-  async handle(_p: string, _h: unknown): Promise<void> {}
-  getProtocols(): string[] { return []; }
-  getConnections(): Array<{ peerId: string; encryption: string | undefined }> { return []; }
-  onPeerConnect(_h: (p: string) => void): void {}
-  onPeerDisconnect(_h: (p: string) => void): void {}
-  getDialability(): { dialable: boolean; publicAddr: string | null } { return { dialable: false, publicAddr: null }; }
-  onDialabilityChange(_l: (d: { dialable: boolean; publicAddr: string | null }) => void): () => void { return () => {}; }
-  async newStream(_peer: string, _proto: string): Promise<Stream> {
-    if (this.failNextStream) {
-      this.failNextStream = false;
-      throw new Error("connection_lost: counterparty stream dead");
-    }
-    return { send() {}, async close() {}, abort() {}, status: "open" } as unknown as Stream;
-  }
-}
 class FixedFactory implements ISessionNodeFactory {
   constructor(private node: CelloNode) {}
   async createNode(_c: SessionNodeConfig): Promise<CelloNode> { return this.node; }
@@ -103,63 +79,6 @@ const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // ─── Relay + signaling stubs for DOD-INBOX-ONESHOT-1 relay-path test ─────────
 // Minimal in-process fake relay: auth challenge/ok + hash_submit_ack.
 // Mirrors the version in seal-unilateral-retry.test.ts (no FROST logic needed here).
-const CBOR_ENC = new Encoder({ tagUint8Array: false });
-const FAKE_RELAY_PEER_ID_ONESHOT = "12D3KooWFakeRelayForOneshotTest";
-const FAKE_RELAY_ADDR_ONESHOT = "/ip4/127.0.0.1/tcp/2/p2p/fake-relay-oneshot";
-
-function makeFakeRelayServerOneshot() {
-  let seq = 0;
-  const streams: Array<{ push: (frame: Record<string, unknown>) => void }> = [];
-  function openStream() {
-    const inbound: Uint8Array[] = [];
-    let notify: (() => void) | null = null;
-    let ended = false;
-    const push = (frame: Record<string, unknown>): void => {
-      const encoded = lp.encode.single(CBOR_ENC.encode(frame) as Uint8Array);
-      inbound.push(encoded instanceof Uint8Array ? encoded : (encoded as { subarray(): Uint8Array }).subarray());
-      notify?.();
-    };
-    const stream = {
-      send: (b: { subarray?: () => Uint8Array } | Uint8Array) => {
-        const bytes = b instanceof Uint8Array ? b : (b.subarray ? b.subarray() : (b as unknown as Uint8Array));
-        void (async () => {
-          for await (const chunk of lp.decode([bytes] as unknown as AsyncIterable<Uint8Array>)) {
-            const u8 = chunk instanceof Uint8Array ? chunk : (chunk as { subarray(): Uint8Array }).subarray();
-            const frame = decode(u8) as Record<string, unknown>;
-            if (frame["type"] === "relay_auth_response") push({ type: "relay_auth_ok" });
-            else if (frame["type"] === "hash_submit") push({ type: "hash_submit_ack", sequence_number: ++seq });
-          }
-        })();
-      },
-      close: async () => { ended = true; notify?.(); },
-      async *[Symbol.asyncIterator]() {
-        while (!ended) {
-          while (inbound.length) yield inbound.shift()!;
-          if (ended) return;
-          await new Promise<void>((r) => { notify = r; });
-          notify = null;
-        }
-      },
-    };
-    push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
-    streams.push({ push });
-    return stream;
-  }
-  return { openStream, ctrlSubmits: () => [] as unknown[] };
-}
-
-
-// A FakeNode variant whose newStream routes to a fake relay server for the relay peer id.
-// All other newStream calls return a no-op fake stream.
-class FakeRelayAwareNode extends FakeNode {
-  constructor(private readonly fakeRelay: ReturnType<typeof makeFakeRelayServerOneshot>) { super(); }
-  async dial(_addr: unknown): Promise<{ peerId: string }> { return { peerId: FAKE_RELAY_PEER_ID_ONESHOT }; }
-  async newStream(peerId: unknown, _proto: unknown): Promise<Stream> {
-    if (String(peerId) === FAKE_RELAY_PEER_ID_ONESHOT) return this.fakeRelay.openStream() as unknown as Stream;
-    return { send() {}, async close() {}, abort() {}, status: "open" } as unknown as Stream;
-  }
-}
-
 function makeRecordingSignalingOneshot(ref: { inject?: (frame: unknown) => void }): () => Promise<ConnectResult> {
   let inbound: ((frame: unknown) => void) | null = null;
   const stream: SignalingStream = {
@@ -894,7 +813,7 @@ describe("M8C-AWAY-1: away response", () => {
     process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"] = "2000"; // short enough for a unit test
     try {
       const { logger, events } = makeLogger();
-      const relay = makeFakeRelayServerOneshot();
+      const relay = makeFakeRelayServer();
       const sigRef: { inject?: (frame: unknown) => void } = {};
       await makeAgentDir("alice");
       // Use FakeNode (not a real libp2p node) so content delivery to counterparty succeeds trivially.
