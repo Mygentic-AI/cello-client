@@ -34,7 +34,6 @@ import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
-import type { Stream } from "@libp2p/interface";
 import { markAsAutoReply } from "../away-detection.js";
 // ONE definition of the go-nowhere node. It was inline here; DOD-M15-SEALPRECOND-1 needed the same
 // one for a two-daemon test and moved it to a helper rather than writing a second.
