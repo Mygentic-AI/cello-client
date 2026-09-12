@@ -39,7 +39,6 @@ export interface WitnessAlertNotice {
 
 
 
-/** SEC-1 / review M4: cap on the refused-parked-entry memo (remote-fed → must be bounded). */
 /**
  * How long the auto-acknowledge path holds its broker visiting connection AFTER submitting the seal
  * leaf. The directory pushes `seal_verified` back ~60ms later (measured on GCP), so releasing on
@@ -48,6 +47,7 @@ export interface WitnessAlertNotice {
  */
 export const AUTOACK_BROKER_GRACE_MS = 30_000;
 
+/** SEC-1 / review M4: cap on the refused-parked-entry memo (remote-fed → must be bounded). */
 export const MAX_REFUSED_PARKED_ENTRIES = 512;
 /**
  * Per-session cap on remembered unreadable-algorithm frames (`DOD-M15-SEALWIRE-1` part B1).
