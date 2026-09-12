@@ -28,6 +28,22 @@ import { encodeCbor } from "./cbor.js";
 
 export type SessionLiveness = "alive" | "gone" | "unknown";
 
+/**
+ * DOD-M15-AWAYSCOPE-1 — what the far daemon says about ITSELF, as distinct from what the relay
+ * observed about its connection.
+ *
+ *   - 'attended'   : online, and a live client has claimed the agent — a person is watching.
+ *   - 'unattended' : online, nobody watching. The message is queued and WILL be read on return.
+ *   - 'offline'    : deliberately not accepting. Not a fault, and not a wait.
+ *
+ * THREE VALUES, NOT TWO, and the middle one is the whole point. Collapsing 'unattended' into
+ * 'offline' tells the counterparty to give up on a conversation that is merely waiting; collapsing
+ * it into 'attended' tells them a person is reading when nobody is. The failure this order exists
+ * to fix came from a daemon ANSWERING in place of its absent operator, and the fix is only complete
+ * if the counterparty can learn the same fact without a message being sent.
+ */
+export type SessionAttendance = "attended" | "unattended" | "offline";
+
 export interface SessionLivenessQuery {
   type: "session_liveness_query";
   /** 16-byte binary session id */
@@ -43,6 +59,42 @@ export interface SessionLivenessResponse {
   liveness: SessionLiveness;
   /** Unix ms timestamp of the relay's most recent observation for this recipient */
   observed_at: number;
+  /**
+   * The counterparty daemon's own assertion about itself, relayed verbatim.
+   *
+   * ABSENT unless `liveness` is 'alive', and that is a rule about reality rather than a convention:
+   * a daemon the relay cannot reach cannot be asserting anything, so a frame pairing an attendance
+   * with 'gone' or 'unknown' is self-contradictory and the decoder refuses it whole. See the decoder
+   * for why refusing beats trimming.
+   */
+  attendance?: SessionAttendance;
+}
+
+/**
+ * DOD-M15-AWAYSCOPE-1 — how the relay learns attendance, since it cannot observe it.
+ *
+ * The relay knows whether it holds a connection. It cannot know whether a human is watching the
+ * daemon at the other end of it. So the daemon asserts that itself, out of band, and the relay
+ * repeats the assertion to the counterparty on the liveness response.
+ *
+ * ⚠️ THIS FRAME NAMES NO SPEAKER, DELIBERATELY. The sender is the authenticated relay connection,
+ * never a key inside the frame — the relay matches that authenticated key against the participants
+ * of the directory-signed assignment it already holds for the named session. `leaf-witness.ts`
+ * states the reason in full: a claim is proof only when checked against something the claimant does
+ * not supply. A `pubkey` field here would be a field the attacker fills in.
+ *
+ * ⚠️ AND IT CARRIES NO SEQUENCE NUMBER. `observed_at` orders it, last-write-wins, and the price is
+ * that a notice may arrive twice, late, or out of order. That price is correct. A sequence number
+ * would make this ordered traffic, ordered traffic wants a witness, and a witnessed position is how
+ * machine chatter got into the leaf set and destroyed a receipt in the first place.
+ */
+export interface SessionAttendanceNotice {
+  type: "session_attendance_notice";
+  /** 16-byte binary session id this assertion is scoped to. */
+  session_id: Uint8Array;
+  attendance: SessionAttendance;
+  /** Unix ms at which the asserting daemon observed its own state. Bounded by the relay, not here. */
+  observed_at: number;
 }
 
 function toUint8Array(v: unknown): Uint8Array | null {
@@ -53,6 +105,10 @@ function toUint8Array(v: unknown): Uint8Array | null {
 
 function isLiveness(v: unknown): v is SessionLiveness {
   return v === "alive" || v === "gone" || v === "unknown";
+}
+
+function isAttendance(v: unknown): v is SessionAttendance {
+  return v === "attended" || v === "unattended" || v === "offline";
 }
 
 export function encodeSessionLivenessQuery(frame: SessionLivenessQuery): Uint8Array {
@@ -87,6 +143,10 @@ export function encodeSessionLivenessResponse(frame: SessionLivenessResponse): U
     counterparty_pubkey: frame.counterparty_pubkey,
     liveness: frame.liveness,
     observed_at: frame.observed_at,
+    // The KEY is omitted when there is nothing to say, never written as an explicit undefined: an
+    // older relay omits it entirely, and a build that can be told apart from an older one by the
+    // shape of its silence is a build whose silence means two different things.
+    ...(frame.attendance !== undefined ? { attendance: frame.attendance } : {}),
   }) as Uint8Array;
 }
 
@@ -108,5 +168,57 @@ export function decodeSessionLivenessResponse(bytes: Uint8Array): SessionLivenes
   if (!counterparty_pubkey || counterparty_pubkey.length !== 32) return null;
   if (!isLiveness(liveness)) return null;
   if (typeof observed_at !== "number") return null;
+  /**
+   * DOD-M15-AWAYSCOPE-1 — MALFORMED FAILS EXACTLY LIKE MISSING. No tolerance branch.
+   *
+   * Two shapes are refused, and the second is the one that matters. An unrecognised VALUE is
+   * refused because a value this build cannot interpret is not evidence, and passing the raw string
+   * through would put unvalidated peer input on an operator's status line. An attendance paired
+   * with a liveness other than 'alive' is refused because it is self-contradictory — the relay
+   * never builds that frame, so seeing one means someone else did.
+   *
+   * Refusing the FRAME rather than dropping the field is the deliberate half. Trimming would leave
+   * a caller holding a liveness answer that looks ordinary, while the thing that made it suspicious
+   * has been quietly discarded — and it is exactly the shape a modified peer would send to pin a
+   * stale attendance onto a counterparty's view.
+   */
+  const attendance = o["attendance"];
+  if (attendance !== undefined) {
+    if (!isAttendance(attendance)) return null;
+    if (liveness !== "alive") return null;
+    return { type: "session_liveness_response", session_id, counterparty_pubkey, liveness, observed_at, attendance };
+  }
   return { type: "session_liveness_response", session_id, counterparty_pubkey, liveness, observed_at };
+}
+
+export function encodeSessionAttendanceNotice(frame: SessionAttendanceNotice): Uint8Array {
+  return encodeCbor({
+    type: "session_attendance_notice",
+    session_id: frame.session_id,
+    attendance: frame.attendance,
+    observed_at: frame.observed_at,
+  }) as Uint8Array;
+}
+
+export function decodeSessionAttendanceNotice(bytes: Uint8Array): SessionAttendanceNotice | null {
+  let obj: unknown;
+  try {
+    obj = cborDecode(bytes);
+  } catch {
+    return null;
+  }
+  if (typeof obj !== "object" || obj === null) return null;
+  const o = obj as Record<string, unknown>;
+  if (o["type"] !== "session_attendance_notice") return null;
+  const session_id = toUint8Array(o["session_id"]);
+  const attendance = o["attendance"];
+  const observed_at = o["observed_at"];
+  if (!session_id || session_id.length !== 16) return null;
+  if (!isAttendance(attendance)) return null;
+  if (typeof observed_at !== "number") return null;
+  // `observed_at` is NOT bounded here. A codec that clamped or rejected on clock skew would be
+  // making a trust decision with no clock of its own to compare against on the encode side; the
+  // relay is the party with the authority and the reference clock, and it refuses out-of-range
+  // values rather than clamping them. See `#processSessionAttendanceNotice`.
+  return { type: "session_attendance_notice", session_id, attendance, observed_at };
 }
