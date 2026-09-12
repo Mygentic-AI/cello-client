@@ -212,7 +212,13 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // rotate-then-open that is written but never reached at spawn leaves the file unbounded; in
     // neither case does anything fail, warn, or look different until someone measures the file
     // months later. That is the shape this corpus exists to catch.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(99);
+    //
+    // 99 → 100 for 074-DOCSFLAG's `wireDocumentGate` (document-gate-wiring.ts), and this guard caught
+    // it on the first full run. It is the most literal occupant of the corpus to date: the module's
+    // whole job is to decide whether the document layer is constructed, so a version of it that is
+    // never called leaves fourteen IPC verbs registered and a 120-second timer running — the exact
+    // state the order exists to end — with nothing failing and nothing looking different.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(100);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",

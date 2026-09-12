@@ -48,8 +48,15 @@ describe("the notification path has production callers at BOTH ends", () => {
   it("the composition root reads notices into the inbox", () => {
     // The reader half. Asserted on the composition root's source because that is the seam where a
     // fully-built feature stays invisible: nothing fails when it is simply never passed in.
+    //
+    // ⚠️ THE PATTERN WAS WIDENED BY 074-DOCSFLAG, AND WHAT IT ASSERTS IS UNCHANGED. The wiring is now
+    // inside a flag test, so the composition root spells it `(ownerAgentId: string)` — a typed
+    // parameter, because the spread it sits in no longer gives TypeScript the contextual type — and
+    // `documentLayer!`, because the binding is `| undefined` when the layer is gated off. Those two
+    // characters are the whole difference. Deleting the wiring still fails this test; the mutation was
+    // run.
     expect(
-      /documentNotices:\s*\(ownerAgentId\)\s*=>\s*documentLayer\.notifications\.pending\(/.test(DAEMON_SRC),
+      /documentNotices:\s*\(ownerAgentId(?:\s*:\s*string)?\)\s*=>\s*documentLayer!?\.notifications\.pending\(/.test(DAEMON_SRC),
       "cello_check_notifications is not wired to document notices — the reader exists and nothing calls it",
     ).toBe(true);
   });

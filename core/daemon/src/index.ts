@@ -64,6 +64,12 @@ export { TypeRegistry, type TypeClassification, type UnclassifiedType, type Type
 export { DbRegistryVersionStore, type IRegistryVersionStore } from "./registry-version-store-db.js";
 export { pollRegistryOverHttp, startRegistryPoll, type RegistryPollOutcome, type RegistryPollFailureReason } from "./registry-poll.js";
 
+// 074-DOCSFLAG — the one value that decides whether the collaborative-document layer exists in this
+// process. Exported because the CLI registry reads it to decide whether `cello doc` is a command at
+// all, and the MCP shim's parity test reads the variable NAME from here so the shim's own literal
+// cannot drift from it.
+export { documentsEnabled, documentLayerState, DOCUMENTS_FLAG_ENV } from "./document-flag.js";
+
 // The ONE vocabulary (capability → {cli, mcp}). Exported so the CLI registry and the connect shim's
 // audit test derive their names from the SAME table the daemon renders its guidance from, instead of
 // three lists of literals that drift.

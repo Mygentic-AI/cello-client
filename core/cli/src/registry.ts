@@ -13,7 +13,7 @@
 
 import { join } from "node:path";
 import { MONIKER_RE } from "@cello-protocol/protocol-types";
-import { createBackup, restoreBackup, probeSingletonLock } from "@cello-protocol/daemon";
+import { createBackup, restoreBackup, probeSingletonLock, documentsEnabled } from "@cello-protocol/daemon";
 import type { Logger } from "@cello-protocol/daemon";
 import {
   login,
@@ -321,7 +321,7 @@ const DOC_VERB_HELP: Record<string, string> = {
 };
 
 
-export const COMMANDS: readonly CommandSpec[] = [
+const ALL_COMMANDS: readonly CommandSpec[] = [
   // ═══ Setup — get a working agent, in the order you actually do it ═══════════════════════════
   {
     name: "login",
@@ -1603,6 +1603,25 @@ export const COMMANDS: readonly CommandSpec[] = [
     },
   },
 ];
+
+/**
+ * The commands this process offers.
+ *
+ * ── 074-DOCSFLAG ──────────────────────────────────────────────────────────────────────────────
+ *
+ * `doc` is removed when the document layer is gated off. Everything in this file derives from ONE
+ * table — dispatch, the `Commands:` help table, per-command help, and the recognized-flag set — so
+ * filtering here is what makes the clause "`cello --help` shows no `doc` command" and the clause
+ * "`cello doc …` does not dispatch" the same change rather than two that can disagree. A command
+ * hidden from help but still typeable would be the worst of the three states.
+ *
+ * Read at module load, which for the CLI IS startup: a fresh process per invocation.
+ *
+ * NOTHING IS DELETED — the `doc` entry is still declared above, in full, with its help text.
+ */
+export const COMMANDS: readonly CommandSpec[] = documentsEnabled()
+  ? ALL_COMMANDS
+  : ALL_COMMANDS.filter((c) => c.name !== "doc");
 
 export function commandNames(): string[] {
   return COMMANDS.map((c) => c.name);

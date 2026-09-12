@@ -53,7 +53,8 @@ import { registerTestHandlers } from "./test-handlers.js";
 import { registerAgentAdminHandlers } from "./agent-admin-handlers.js";
 import { registerStatusHandler } from "./status-handler.js";
 import { registerBackupRestoreHandlers } from "./backup-restore-handlers.js";
-import { createDocumentWiring } from "./document-wiring.js";
+import { wireDocumentGate } from "./document-gate-wiring.js";
+import { documentsEnabled } from "./document-flag.js";
 import { createSignalingWiring } from "./signaling-wiring.js";
 import { createAttendanceWiring } from "./attendance-wiring.js";
 import { startBootCore } from "./boot-core.js";
@@ -68,7 +69,6 @@ import { createSessionNotify } from "./session-notify.js";
 import { createConnectionAgents } from "./connection-agents.js";
 import { createDirectoryConnect } from "./directory-connect.js";
 import { createUnresolvedNodesReport } from "./unresolved-nodes-report.js";
-import { createDocumentSurface } from "./document-surface.js";
 import { createIpcSurface } from "./ipc-surface.js";
 import { createDaemonStatusReport } from "./daemon-status-report.js";
 import { logConsortiumAnchor } from "./consortium-fingerprint.js";
@@ -927,7 +927,12 @@ async function startDaemonHoldingLock(
     // §16.5's passive notification, wired 2026-08-08. Both halves existed with no production caller
     // — nothing wrote a notice and nothing read one — so an agent learned a document had changed
     // only by polling, and `cello_doc_read` cleared rows that could never exist.
-    documentNotices: (ownerAgentId) => documentLayer.notifications.pending(ownerAgentId),
+    // 074-DOCSFLAG: OMITTED with documents off, not passed-and-guarded — `documentSection` already
+    // returns `{}` for an absent dep, so the inbox carries no document key at all, the shape it had
+    // before the layer existed. A callback returning `[]` would say the same thing twice.
+    ...(documentsEnabled()
+      ? { documentNotices: (ownerAgentId: string) => documentLayer!.notifications.pending(ownerAgentId) }
+      : {}),
     ownerKeyFor: (agentName) =>
       loadedAgents.find((a) => a.name === agentName)?.pubkey?.toLowerCase() ?? null,
   });
@@ -994,30 +999,24 @@ async function startDaemonHoldingLock(
     void sendTelegramDoorbell(agentName, sessionId, "message_waiting", "New message waiting");
   });
 
-  // 040-DAEMONROOT unit 4: the document layer and its per-agent carrier → document-wiring.ts.
-  const { documentLayer, documentOwnerKeyFor, documentTransportFor } = createDocumentWiring({
+  // 074-DOCSFLAG: the document layer exists in this process, or it does not → document-gate-wiring.ts.
+  // ONE value, default off, gating CONSTRUCTION — with it off the fourteen IPC verbs are never
+  // registered and the sweep timer is never created. That module carries the reasoning.
+  const {
+    documentLayer, reconcileSweepTimer, reconcileScheduler: builtReconcileScheduler,
+    documentOwnerKeyFor,
+  } = wireDocumentGate({
     logger, sessionNodeManager, loadedAgents, keyProviders,
     securityGateway, celloDir: config.celloDir,
     deliveryOpens, pubkeyOfAgent, openSessionFor, perAgentSignaling, runDiscoveryLookup,
-    // The scheduler does not exist yet — it is built below, from this layer's sweep targets. A
-    // getter is what keeps the refusal backoff alive; the value would be a captured `undefined`.
     getReconcileScheduler: () => reconcileScheduler,
     notificationDispatcher,
     getCloseSessionHandler: () => handlers.get("cello_close_session"),
-  });
-
-  // 040-DAEMONROOT unit 15: the document operator surface and the sweep that keeps shared documents
-  // converging → document-surface.ts.
-  const {
-    reconcileSweepTimer, reconcileScheduler: builtReconcileScheduler,
-  } = createDocumentSurface({
-    logger, handlers, loadedAgents, keyProviders, perConnectionState, perAgentSignaling,
-    resolveCurrentAgent, documentLayer, documentOwnerKeyFor, documentTransportFor,
+    handlers, perConnectionState, resolveCurrentAgent,
   });
   // The scheduler is produced by the surface and assigned back here, because two modules built
   // EARLIER hold getters over this binding. They read at call time, which is always after this.
   reconcileScheduler = builtReconcileScheduler;
-
   documentOwnerKeyForHook = documentOwnerKeyFor;
 
   // ── THE SOCKET OPENS ONLY NOW, and the ordering is load-bearing (2026-08-16). ──
@@ -1090,7 +1089,8 @@ async function startDaemonHoldingLock(
   let stoppedHookFired = false;
 
   async function stop(reason: string): Promise<void> {
-    clearInterval(reconcileSweepTimer);
+    // 074-DOCSFLAG: `undefined` when documents are gated off — there is then no sweep to stop.
+    if (reconcileSweepTimer !== undefined) clearInterval(reconcileSweepTimer);
     clearInterval(revivalBoundSweepTimer);
     // DOD-M15-RELAYABUSE-1: scheduled park retries. Unref'd, so they never held the process open —
     // cleared so an in-process restart cannot leave one draining into a torn-down manager.
