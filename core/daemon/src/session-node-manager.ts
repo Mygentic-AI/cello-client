@@ -437,6 +437,7 @@ recordSessionGenesis(agentName: string, sessionId: string, participantA: Uint8Ar
 
   /** 069-ORDERPROOF: the relay key this session's ordering attestations are verified against. */
   sessionRelayAnchor(agentName: string, sessionId: string): string | undefined { return this.#leafRecords.sessionRelayAnchor(agentName, sessionId); }
+  persistRelayAnchor(agentName: string, sessionId: string, relayAnchorHex: string | undefined): void { return this.#leafRecords.persistRelayAnchor(agentName, sessionId, relayAnchorHex); }
   setSessionGenesisForTest(agentName: string, sessionId: string, genesis: Uint8Array): void { return this.#leafRecords.setSessionGenesisForTest(agentName, sessionId, genesis); }
   recordCertifiedLeafSet(agentName: string, sessionId: string, signedLeaves: readonly SealFrontierLeaf[], sealedRootHex: string, correlationId?: string): boolean { return this.#leafRecords.recordCertifiedLeafSet(agentName, sessionId, signedLeaves, sealedRootHex, correlationId); }
   noteCertifiedLeafSetUnavailable(agentName: string, sessionId: string, state: "not_carried_absent_party" | "not_carried_present_party", detail: string): void { return this.#leafRecords.noteCertifiedLeafSetUnavailable(agentName, sessionId, state, detail); }

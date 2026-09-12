@@ -167,6 +167,14 @@ export class SessionLeafRecords {
     if (!relayAnchorHex || !/^[0-9a-f]{64}$/i.test(relayAnchorHex)) return;
     this.#sessionRelayAnchor.set(this.#ctx.sessionKey(agentName, sessionId), relayAnchorHex);
     if (!this.#db) return;
+    /**
+     * WRITE-ONCE ON DISK, overwritable in memory — an asymmetry worth naming rather than leaving to
+     * be discovered. If a session is ever handed to a SECOND relay (resume/handover, which nothing
+     * requests today), the row keeps the FIRST relay's key. Read order prefers the live assignment,
+     * so this only shows after a restart, and it shows as a named refusal — attestations checked
+     * against the old key fail loud — never as evidence accepted against the wrong witness. Whoever
+     * ships handover owns making this follow the handover.
+     */
     try {
       this.#db
         .prepare("UPDATE sessions SET relay_anchor_hex = ? WHERE agent_id = ? AND session_id = ? AND relay_anchor_hex IS NULL")
@@ -445,5 +453,17 @@ export class SessionLeafRecords {
   /** The in-memory genesis prev-root for a session, when one has been recorded. */
   genesisFor(agentName: string, sessionId: string): Uint8Array | undefined {
     return this.#sessionGenesis.get(this.#ctx.sessionKey(agentName, sessionId));
+  }
+
+  /**
+   * The in-memory relay anchor for a session — the counterpart of `genesisFor`, and read at the
+   * same moment for the same reason: the session ROW is inserted after the anchor is recorded, so
+   * the INSERT carries the value rather than an UPDATE trying to find a row that is not there yet.
+   *
+   * Deliberately NOT `sessionRelayAnchor`: that one reads the row as its last resort, which at
+   * insert time is the row being written. This is the memory copy only.
+   */
+  relayAnchorFor(agentName: string, sessionId: string): string | undefined {
+    return this.#sessionRelayAnchor.get(this.#ctx.sessionKey(agentName, sessionId));
   }
 }

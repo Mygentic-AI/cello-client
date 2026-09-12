@@ -297,6 +297,19 @@ export async function startTwoConnectionFixture(
       // a producer that signs the wrong statement — the exact hollow-test finding that made
       // `sealParkEnvelope` a single producer in the first place.
       const kp = generateKeypair();
+      /**
+       * ⚠️ RECORDED BEFORE THE SESSION NODE, for the same reason the genesis above is, and by the
+       * SAME production call — `069-ORDERPROOF`.
+       *
+       * `persistRelayAnchor` is what production calls (from `recordSessionGenesis`, before the node
+       * is built). Routing the fixture through it rather than through a second quieter setter is
+       * what makes the durable half testable at all: the anchor lands in the in-memory map here,
+       * and `#insertSessionRow` carries it into the session ROW a moment later. Calling it after
+       * `createSessionNode` would leave the row NULL — which is precisely the defect this seam was
+       * added to catch.
+       */
+      const anchor = await fakeRelayAnchor();
+      snm.persistRelayAnchor(agent, sessionId, anchor.relayPubkeyHex);
       await snm.createSessionNode(sessionId, agent, counterpartyPubkey, peerId, "fixture", false, {
         relayPeerId: "12D3KooWFixtureRelay",
         relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFixtureRelay"],
@@ -311,7 +324,7 @@ export async function startTwoConnectionFixture(
          * assignment; the fixture names the suite's shared fake relay key, which is the key the
          * fake relays in these tests actually sign with.
          */
-        assignment: await fakeRelayAnchor(),
+        assignment: anchor,
       });
       agreeKey();
     },

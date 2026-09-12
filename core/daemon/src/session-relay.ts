@@ -599,7 +599,11 @@ export class SessionRelay {
       // session — it never submits — and `registerSession` derives a seed from the assignment
       // anyway. Reaching into the session record for one here would also be reaching with the RELAY
       // session id, which is not the key that record is stored under.
-      client.registerSession(sessionIdHex, node, undefined, relay.assignment, undefined, this.#ctx.leafRecords.sessionRelayAnchor(agentName, sessionIdHex));
+      // The same applies to the relay ANCHOR (069-ORDERPROOF): this call used to pass a lookup on
+      // the relay session id, which — per the paragraph above — can only ever miss. A lookup that
+      // cannot succeed, sitting beside a working fallback inside `registerSession`, reads as
+      // coverage and is not. Nothing is passed; the assignment supplies the anchor.
+      client.registerSession(sessionIdHex, node, undefined, relay.assignment, undefined, undefined);
       this.#ctx.logger.info("session.relay.assignment.presented_to_reservation_relay", {
         agentName,
         sessionId: sessionIdHex.slice(0, 16),

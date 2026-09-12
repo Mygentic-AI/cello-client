@@ -1682,14 +1682,21 @@ export class SessionLifecycle {
        * one, which is a session whose sends will be refused by name rather than silently unlinked.
        */
       const genesis = this.#ctx.leafRecords.genesisFor(agentName, sessionId);
+      /**
+       * ⚠️ THE RELAY ANCHOR RIDES THE SAME INSERT — `DOD-M15-ORDERPROOF-1`, and for the identical
+       * reason. It was first written as an UPDATE beside the genesis's UPDATE, which matched no row
+       * at all: the conversation worked until the daemon restarted, and then every message on a
+       * revived session was refused for want of the key to check the relay's signature against.
+       */
+      const relayAnchor = this.#ctx.leafRecords.relayAnchorFor(agentName, sessionId);
       this.#db
         .prepare(
           `INSERT INTO sessions
-           (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, genesis_prev_root)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+           (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, genesis_prev_root, relay_anchor_hex)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(sessionId, this.#ctx.requireAgentId(agentName), counterpartyPubkey, status, now, now,
-             genesis ? Buffer.from(genesis) : null);
+             genesis ? Buffer.from(genesis) : null, relayAnchor ?? null);
       return true;
     } catch (err: unknown) {
       // D4 review F2: this helper serves the CREATE/ACCEPT paths (and interrupt-restore) — the old

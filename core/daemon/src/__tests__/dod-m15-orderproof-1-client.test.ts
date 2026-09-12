@@ -37,6 +37,7 @@ import type { DaemonDatabase } from "../sqlcipher-db.js";
 import {
   makeFakeRelay, tick, noopLogger, fakeRelayAnchor, fakeRelayAttestation, pushAck,
 } from "./relay-client-fake.js";
+import { startTwoConnectionFixture } from "./helpers/two-connection-fixture.js";
 
 const GENESIS = new Uint8Array(32).fill(0x9c);
 const SID = new Uint8Array(16).fill(0xf7);
@@ -342,4 +343,53 @@ describe("DOD-M15-ORDERPROOF-1 (client): the recipient keeps the proof, and only
     }, 2);
     expect(store.get("aa".repeat(32), SID_HEX, 2)?.runningRootHex).toBe("ab".repeat(32));
   });
+});
+
+describe("DOD-M15-ORDERPROOF-1: the anchor OUTLIVES the process that learned it", () => {
+  /**
+   * ★★★ THE TEST THAT WAS MISSING, AND THE DEFECT IT CATCHES.
+   *
+   * The anchor — which relay's ordering signature this session trusts — arrives on the
+   * directory-signed assignment, which exists only while the session is being opened. Every read
+   * after that is from memory, and memory dies with the daemon. So the anchor has to be on the
+   * session ROW, and the first implementation wrote it with an UPDATE that ran BEFORE the row was
+   * inserted: it matched nothing, threw nothing, and logged nothing.
+   *
+   * What that costs the operator: the conversation works perfectly, the daemon restarts — an
+   * upgrade, a reboot, a crash — and from that moment every message on that conversation is
+   * refused, and it can never be sealed alone either, because the seal's own leaf is refused with
+   * it. The daemon's refusal names the relay, so the operator goes and looks at a relay that is
+   * fine.
+   *
+   * It is asserted on the ROW and through a fixture that has been torn down, not on the live
+   * object: reading the in-memory copy is what made the defect invisible in the first place.
+   */
+  it("★★★ the relay key the directory named is on the session ROW, not only in memory", async () => {
+    const fx = await startTwoConnectionFixture({ dirPrefix: "cello-orderproof-anchor-" });
+    try {
+      const sid = "5d".repeat(16);
+      await fx.createSession(sid, "alice", "bobpubkeyhex", "bob-peer-id", { relay: true });
+
+      const expected = (await fakeRelayAnchor()).relayPubkeyHex;
+      expect(
+        fx.snm.sessionRelayAnchor("alice", sid),
+        "PRECONDITION: the live session knows its anchor — if this fails the test below proves nothing",
+      ).toBe(expected);
+
+      /**
+       * Read through the PRODUCTION row getter, not a test-only one. `SELECT *`, so the column is
+       * there at runtime; `SessionRecord` does not declare it because nothing in production reads
+       * the anchor off the record, and a declaration added only to satisfy a test would be the
+       * first step towards it becoming something production depends on.
+       */
+      const row = fx.snm.getSessionRecord("alice", sid) as unknown as { relay_anchor_hex?: string } | null;
+      expect(
+        row?.relay_anchor_hex,
+        "the anchor must be ON DISK. NULL here means it lives only in this process, and the first " +
+          "restart takes the session's ability to send or to seal alone with it",
+      ).toBe(expected);
+    } finally {
+      await fx.cleanup();
+    }
+  }, 60_000);
 });
