@@ -29,7 +29,9 @@ import { extractErrorMessage } from "./error-message.js";
  * falls through to the pre-roster path with NO step-6 directory authentication — so a value that
  * merely reaches the same machine, such as a DNS name for the same host, silently disables the
  * defense against a MITM redirecting /bootstrap to a rogue directory. It fails open and quietly,
- * which is why the requirement is stated here rather than left to be rediscovered.
+ * which is why the requirement is stated here rather than left to be rediscovered. That the match
+ * is byte-exact and the miss is silent is `DOD-M15-STEP6-REPLAY-1` — tracked, not overlooked; the
+ * TLS half that made a single bundled name possible at all is `DOD-M15-BOOTSTRAP-TLS-1`.
  *
  * A NAME as of 2026-09-10, and the condition the previous comment set is exactly what changed: it
  * said this "cannot be this constant until the manifest carries names", and the manifest now carries
