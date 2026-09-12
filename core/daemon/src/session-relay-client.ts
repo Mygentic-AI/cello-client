@@ -444,13 +444,9 @@ export interface AgentRelayClientOpts {
 
 /**
  * What ONE relay observed. Deliberately not a verdict, and the field names say so: this establishes
- * that this relay saw and refused that submission, and nothing about who sent it.
- *
- * ONE witness is not corroboration, and the type is shaped to stop a reader forgetting it.
- * `DOD-M15-CORROBORATE-1` closed the other half — this relay verifies every submitted hash as it
- * arrives rather than at seal time, so an alert does not depend on the accusing client reporting
- * anything. What is still open is BREADTH: several relays reporting the same hash sequence, which
- * is `DOD-M15-MULTIWITNESS-1`. Until that lands, treat an alert as one machine's account.
+ * that this relay saw and refused that submission, and nothing about who sent it. Verification is
+ * proactive (`DOD-M15-CORROBORATE-1`); BREADTH is not — several relays on one hash sequence is
+ * `DOD-M15-MULTIWITNESS-1`.
  */
 export interface RelayWitnessAlert {
   sessionIdHex: string;
@@ -685,9 +681,8 @@ export class AgentRelayClient {
   /**
    * PER-SESSION acknowledgement state (session_id hex → the position AND the content at it).
    *
-   * `seq` is the highest relay-assigned sequence observed for the session, from EITHER an ack or a
-   * deliver — both advance it. The relay's `seq_counter` is per session, and it
-   * rejects `last_seen_seq > seq_counter`, so each session's submit MUST carry that session's own
+   * `seq` is the highest relay-assigned sequence, advanced by an ack or a deliver. The relay's
+   * `seq_counter` is per session, and it rejects `last_seen_seq > seq_counter`, so each session's submit MUST carry that session's own
    * high-water mark — NOT an agent-global one (which would make a newer session's first submit look
    * ahead and get rejected).
    *
