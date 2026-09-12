@@ -29,6 +29,8 @@
  *  - the connect shim's tool names == the MCP names here.
  */
 
+import { documentsEnabled } from "./document-flag.js";
+
 /** A capability reachable from BOTH surfaces. `mcp` is the tool name; `cli` is the command line. */
 export interface DualSurfaceVerb {
   mcp: string;
@@ -36,13 +38,17 @@ export interface DualSurfaceVerb {
 }
 
 /**
- * Every capability with BOTH an MCP tool and a CLI command. Guidance naming one of these is
- * rendered per caller.
+ * Every dual-surface capability that is ALWAYS present. Guidance naming one of these is rendered
+ * per caller.
+ *
+ * The one group that is not here is documents — see `DOCUMENT_VERBS` below, which joins this list
+ * only when the 074-DOCSFLAG gate is open. Read `DUAL_SURFACE_VERBS` rather than this constant;
+ * this half exists so the gate has something to add to.
  *
  * The `cli` string is what an operator would TYPE, so per-contact ops carry the `<pubkey>`
  * placeholder — the CLI shape is `cello contact <pubkey> set-tier`, not `cello contact-set-tier`.
  */
-export const DUAL_SURFACE_VERBS: readonly DualSurfaceVerb[] = [
+const ALWAYS_ON_VERBS: readonly DualSurfaceVerb[] = [
   // Agents
   { mcp: "cello_agents", cli: "cello agents" },
   { mcp: "cello_start_agent", cli: "cello start-agent" },
@@ -84,25 +90,6 @@ export const DUAL_SURFACE_VERBS: readonly DualSurfaceVerb[] = [
   { mcp: "cello_attestation_consent_list", cli: "cello attestation-consent list" },
   { mcp: "cello_attestation_consent_accept", cli: "cello attestation-consent accept" },
   { mcp: "cello_attestation_consent_refuse", cli: "cello attestation-consent refuse" },
-  // Federated documents (M14 / DOD-DOC-TOOLS-1). Declared only now that all four places exist —
-  // daemon handlers, this table, the CLI commands, and the MCP shim. A vocabulary entry is a
-  // promise to an operator that a command exists, and declaring the names ahead of the handlers
-  // failed three guards at once: "every declared tool has a handler behind it", "every
-  // dual-surface capability's CLI name is a real command", and the source audit.
-  { mcp: "cello_doc_propose", cli: "cello doc propose" },
-  { mcp: "cello_doc_invite", cli: "cello doc invite" },
-  { mcp: "cello_doc_remove", cli: "cello doc remove" },
-  { mcp: "cello_doc_inbox", cli: "cello doc inbox" },
-  { mcp: "cello_doc_accept", cli: "cello doc accept" },
-  { mcp: "cello_doc_refuse", cli: "cello doc refuse" },
-  { mcp: "cello_doc_list", cli: "cello doc list" },
-  { mcp: "cello_doc_read", cli: "cello doc read" },
-  { mcp: "cello_doc_diff", cli: "cello doc diff" },
-  { mcp: "cello_doc_watch", cli: "cello doc watch" },
-  { mcp: "cello_doc_write", cli: "cello doc write" },
-  { mcp: "cello_doc_publish", cli: "cello doc publish" },
-  { mcp: "cello_doc_close", cli: "cello doc close" },
-  { mcp: "cello_doc_kill", cli: "cello doc kill" },
   // Other
   { mcp: "cello_moniker", cli: "cello moniker" },
   { mcp: "cello_settings_get", cli: "cello settings get" },
@@ -117,6 +104,68 @@ export const DUAL_SURFACE_VERBS: readonly DualSurfaceVerb[] = [
   // DOD-M9B-AUDIT-1 — read-only on both surfaces.
   { mcp: "cello_policy_log", cli: "cello policy log" },
 ];
+
+/**
+ * Federated documents (M14 / DOD-DOC-TOOLS-1), behind the 074-DOCSFLAG gate.
+ *
+ * A vocabulary entry is a PROMISE TO AN OPERATOR that a command exists — declaring the names ahead
+ * of the handlers once failed three guards at once ("every declared tool has a handler behind it",
+ * "every dual-surface capability's CLI name is a real command", and the source audit). That is
+ * exactly why these move with the flag rather than staying declared: with documents off there is no
+ * handler, no CLI command and no MCP tool behind them, so leaving the rows here would make this
+ * table promise fourteen things the product does not do.
+ *
+ * NOTHING IS DELETED. The rows are here, in the shape they have always had, and they rejoin
+ * `DUAL_SURFACE_VERBS` the moment the flag is on.
+ */
+const DOCUMENT_VERBS: readonly DualSurfaceVerb[] = [
+  { mcp: "cello_doc_propose", cli: "cello doc propose" },
+  { mcp: "cello_doc_invite", cli: "cello doc invite" },
+  { mcp: "cello_doc_remove", cli: "cello doc remove" },
+  { mcp: "cello_doc_inbox", cli: "cello doc inbox" },
+  { mcp: "cello_doc_accept", cli: "cello doc accept" },
+  { mcp: "cello_doc_refuse", cli: "cello doc refuse" },
+  { mcp: "cello_doc_list", cli: "cello doc list" },
+  { mcp: "cello_doc_read", cli: "cello doc read" },
+  { mcp: "cello_doc_diff", cli: "cello doc diff" },
+  { mcp: "cello_doc_watch", cli: "cello doc watch" },
+  { mcp: "cello_doc_write", cli: "cello doc write" },
+  { mcp: "cello_doc_publish", cli: "cello doc publish" },
+  { mcp: "cello_doc_close", cli: "cello doc close" },
+  { mcp: "cello_doc_kill", cli: "cello doc kill" },
+];
+
+/**
+ * Is this IPC method name one of the document verbs?
+ *
+ * Lives HERE, in the file that owns every tool name, and not at the call site — `ipc-server.ts` needs
+ * the answer to name the right cause when a gated verb arrives, and a `"cello_doc_"` literal there is
+ * flagged by the source audit as a dead tool name. Correctly flagged: a bare prefix is not a tool, and
+ * the audit cannot tell it from a typo'd one. `vocabulary.ts` is the one file that audit excludes,
+ * because defining names is its job.
+ *
+ * ⚠️ THIS SENTENCE USED TO SAY *"answers by NAME, not by membership of `DOCUMENT_VERBS`"* AND THE BODY
+ * BELOW IS EXACTLY MEMBERSHIP OF `DOCUMENT_VERBS`. It meant `DUAL_SURFACE_VERBS`, and it shipped inside
+ * the commit whose whole subject was comments asserting what the code does not do. Rewritten rather than
+ * deleted, because a wrong comment in that commit is the evidence that the habit survives being named.
+ *
+ * What it actually does: answers from `DOCUMENT_VERBS` directly, never from `DUAL_SURFACE_VERBS`. The
+ * caller asks precisely when the gate is closed, and the document rows are not in that table then.
+ */
+export function isDocumentVerbName(method: string): boolean {
+  return DOCUMENT_VERBS.some((v) => v.mcp === method);
+}
+
+/**
+ * Every capability with BOTH an MCP tool and a CLI command, for THIS process.
+ *
+ * Read at module load, which is where every other consumer of this table already reads it — the CLI
+ * renders its help in a fresh process per invocation, and the daemon builds its handler map once at
+ * boot. "Read once at startup" and "read at module load" are the same act here.
+ */
+export const DUAL_SURFACE_VERBS: readonly DualSurfaceVerb[] = documentsEnabled()
+  ? [...ALWAYS_ON_VERBS, ...DOCUMENT_VERBS]
+  : ALWAYS_ON_VERBS;
 
 /**
  * Tools that exist ONLY on the MCP surface. Listed so the audit test can tell "known MCP-only" from

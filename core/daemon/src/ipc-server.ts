@@ -33,6 +33,8 @@ import { chmod, stat, unlink } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import type { Logger, IpcRequest, IpcResponse, IpcNotification } from "./types.js";
 import { extractErrorMessage } from "./error-message.js";
+import { DOCUMENTS_FLAG_ENV } from "./document-flag.js";
+import { isDocumentVerbName } from "./vocabulary.js";
 
 /** Everything the server needs of a handler map: resolve a method name when a request arrives. */
 export interface HandlerLookup {
@@ -221,14 +223,62 @@ export function createIpcServer(
 
     const handler = handlers.get(request.method);
     if (!handler) {
+      /**
+       * ⚠️ A GATED DOCUMENT VERB IS NOT A VERSION SKEW, AND THE DEFAULT GUIDANCE SAYS IT IS.
+       *
+       * 074-DOCSFLAG gates the document layer off by default, so the fourteen `cello_doc_*` verbs are
+       * genuinely absent from this map — which is the point. But the guidance below names the wrong
+       * subsystem: it sends the operator to check that the shim and the daemon are the same version,
+       * for a flag that is off by design.
+       *
+       * **This is reachable in ordinary operation, not a corner.** The shim and the daemon are
+       * separate processes with separate environments — the MCP client spawns one, `cello login`
+       * starts the other — so a shim whose environment HAS the flag advertises fourteen tools against
+       * a daemon whose environment does not. An operator running an older `@cello-protocol/connect`
+       * reaches the same place. Either way the only statement of the truth is a
+       * `document.layer.gated` line written at boot, minutes or days earlier.
+       *
+       * So the cause is named where it surfaces, and nothing is registered to do it: this is the same
+       * `method_not_found` refusal with the right reason attached, so the enumerated verb count is
+       * unchanged and no gated verb becomes answerable.
+       */
+      // Asked of the vocabulary rather than matched against a prefix here: a bare `cello_doc_`
+      // literal in this file is a dead tool name to the source audit, and it is right to say so.
+      //
+      // ⚠️ NO `!documentsEnabled()` HERE, AND IT USED TO BE — review found it adds nothing and can only
+      // be wrong. Reaching this branch means the handler map has no entry for the method; when documents
+      // are ON all fourteen are registered, so a MISS on a document verb can only mean the gate was
+      // closed when that map was built. Worse, the map is built once at boot while an env read is live,
+      // so a process whose environment gains the flag afterwards would answer a genuinely gated verb
+      // with the version-skew guidance again — the exact defect this branch exists to remove.
+      const gatedDocumentVerb = isDocumentVerbName(request.method);
       const errorResp: IpcResponse = {
         id: request.id,
         error: {
           code: "method_not_found",
-          message: `Unknown method: ${request.method}`,
-          guidance: `Unknown IPC method '${request.method}'. Check that cello-mcp and the daemon are the same version. Run 'cello status' to verify the daemon is running.`,
+          message: gatedDocumentVerb
+            ? `Unknown method: ${request.method} — collaborative documents are disabled on this daemon`
+            : `Unknown method: ${request.method}`,
+          guidance: gatedDocumentVerb
+            ? `Collaborative documents are turned OFF on this daemon, so '${request.method}' is not ` +
+              `registered. This is deliberate: the layer is paused while the base protocol is ` +
+              `finished. To turn it on, set ${DOCUMENTS_FLAG_ENV}=1 in the environment that starts ` +
+              `the daemon AND in the environment that starts cello-mcp, then restart both — the two ` +
+              `are separate processes and setting it in only one leaves the tool advertised and ` +
+              `unanswerable. Otherwise, stop using the document tools and say documents are disabled.`
+            : `Unknown IPC method '${request.method}'. Check that cello-mcp and the daemon are the same version. Run 'cello status' to verify the daemon is running.`,
         },
       };
+      if (gatedDocumentVerb) {
+        // The log keeps the forensic half: the response is the control, and both are required.
+        logger.warn("document.verb.refused", {
+          connectionId: conn.id,
+          method: request.method,
+          reason: "documents_disabled",
+          consequence: "a document tool was called against a daemon that does not register one",
+          remedy: `set ${DOCUMENTS_FLAG_ENV}=1 for BOTH the daemon and cello-mcp, or stop calling document verbs`,
+        });
+      }
       conn.socket.write(JSON.stringify(errorResp) + "\n");
       return;
     }

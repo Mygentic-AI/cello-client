@@ -26,12 +26,15 @@ const DAEMON_DIST = join(PKG_ROOT, "dist", "daemon.js");
 // screen — moved out of daemon.js into document-wiring.js. Both are read and searched as ONE text,
 // because what is asserted is that the call site exists in WHAT SHIPS, not which file it sits in.
 const DOCUMENT_WIRING_DIST = join(PKG_ROOT, "dist", "document-wiring.js");
+// 074-DOCSFLAG: the flag test that decides whether the two modules above are constructed at all.
+const DOCUMENT_GATE_WIRING_DIST = join(PKG_ROOT, "dist", "document-gate-wiring.js");
 const DAEMON_BIN_DIST = join(PKG_ROOT, "dist", "bin", "cello-daemon.js");
 const GATEWAY_DIST = join(REPO_ROOT, "core", "gateway", "dist", "bin", "cello-gateway.js");
 
 let daemon = "";
 let daemonOnly = "";
 let documentWiring = "";
+let documentGateWiring = "";
 let daemonBin = "";
 let gateway = "";
 
@@ -40,10 +43,12 @@ beforeAll(async () => {
   // "the wiring is gone" if the assertion quietly passes.
   expect(existsSync(DAEMON_DIST), `${DAEMON_DIST} — run pnpm build`).toBe(true);
   expect(existsSync(DOCUMENT_WIRING_DIST), `${DOCUMENT_WIRING_DIST} — run pnpm build`).toBe(true);
+  expect(existsSync(DOCUMENT_GATE_WIRING_DIST), `${DOCUMENT_GATE_WIRING_DIST} — run pnpm build`).toBe(true);
   expect(existsSync(GATEWAY_DIST), `${GATEWAY_DIST} — run pnpm build`).toBe(true);
   expect(existsSync(DAEMON_BIN_DIST), `${DAEMON_BIN_DIST} — run pnpm build`).toBe(true);
   daemonOnly = await readFile(DAEMON_DIST, "utf8");
   documentWiring = await readFile(DOCUMENT_WIRING_DIST, "utf8");
+  documentGateWiring = await readFile(DOCUMENT_GATE_WIRING_DIST, "utf8");
   daemon = daemonOnly + "\n" + documentWiring;
   daemonBin = await readFile(DAEMON_BIN_DIST, "utf8");
   gateway = await readFile(GATEWAY_DIST, "utf8");
@@ -85,7 +90,16 @@ describe("the shipped daemon CONSTRUCTS the document wiring", () => {
     // whether or not one line imports it. Delete the call below and the document layer is entirely
     // unwired — no inbound classification, no semantic screen — while every string the other tests
     // look for is still sitting in the artifact. THIS is the assertion that reddens on that.
-    expect(daemonOnly).toContain("createDocumentWiring(");
+    //
+    // ⚠️ 074-DOCSFLAG MOVED THE CALL ONE FILE FURTHER OUT, AND THE CHAIN IS WHY THIS IS STILL A
+    // RATCHET. The construction now sits behind a flag in `document-gate-wiring.js`, so `daemon.js`
+    // alone no longer contains `createDocumentWiring(`. Adding that artifact to `daemonOnly` would
+    // have broken the assertion's teeth — the module calling its own import proves nothing. So the
+    // two links are asserted separately: the root must construct the GATE, and the gate must
+    // construct the WIRING. Cutting either one still reddens this test.
+    expect(daemonOnly, "the composition root does not call wireDocumentGate").toContain("wireDocumentGate(");
+    expect(documentGateWiring, "the gate does not construct the document wiring").toContain("createDocumentWiring(");
+    expect(documentGateWiring, "the gate does not construct the document surface").toContain("createDocumentSurface(");
   });
 });
 
