@@ -97,7 +97,6 @@ export const RELAY_PROTOCOL_ID = "/cello/relay/1.0.0";
  */
 export const PROOF_RETRY_DELAY_MS = 1_000;
 export const RELAY_AUTH_DOMAIN = "CELLO-RELAY-AUTH-v1";
-/** Structure 1 leaf kind: 0x00 = message, 0x02 = control (matches the relay). */
 /**
  * DOD-WITNESS-STALL-1 — relay refusals that can NEVER resolve.
  *
@@ -295,6 +294,7 @@ export function classifyRelayAuthRefusal(
   };
 }
 
+/** Structure 1 leaf kind — these values match the relay's. Message leaf (the `cello_send` default). */
 export const LEAF_KIND_MSG = 0x00;
 /** Control leaf (SEAL etc.) — two distinct-sender ctrl leaves trigger directory notarization. */
 export const LEAF_KIND_CTRL = 0x02;
