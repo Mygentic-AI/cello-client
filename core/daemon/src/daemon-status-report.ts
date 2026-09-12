@@ -10,6 +10,7 @@
  */
 import { classifyManifestValidity, describeManifestValidity, type ManifestOrigin } from "./manifest-validity.js";
 import { describeDirectoryAuth } from "./directory-auth-posture.js";
+import { describeConsortiumFingerprint, type EnforcedConsortium } from "./consortium-fingerprint.js";
 import { resolveDirectoryUrl } from "./directory-bootstrap.js";
 import type {
   ActiveSessionInfo, AgentInfo, AgentState, DaemonStatusResponse, DirectorySignalingState,
@@ -36,13 +37,19 @@ export interface DaemonStatusDeps {
   directoryHttpUrl: string | undefined;
   /** Its ABSENCE is the reportable state: no verifier means authentication is not enforced. */
   challengeVerifier: unknown;
+  /**
+   * The root keys and threshold this daemon actually hands `loadAndVerify` — NOT the compiled-in
+   * constant. Review measured that the two differ in two live postures, and printing the bundled
+   * fingerprint in either one reassures an operator who is on someone else's network.
+   */
+  enforcedConsortium: EnforcedConsortium;
 }
 
 export function createDaemonStatusReport(deps: DaemonStatusDeps) {
   const {
     sessionNodeManager, retryQueue, agents, agentStateFor, buildInterruptedSessions,
     buildActiveSessions, directorySignalingStatus, unresolvedNodesForStatus, manifestOrigin,
-    manifestProvider, directoryHttpUrl, challengeVerifier,
+    manifestProvider, directoryHttpUrl, challengeVerifier, enforcedConsortium,
   } = deps;
 
   // Build status response factory
@@ -70,6 +77,8 @@ export function createDaemonStatusReport(deps: DaemonStatusDeps) {
         classifyManifestValidity(manifestProvider?.getCurrentManifest() ?? null, Date.now()),
         manifestOrigin,
       ) ?? {}),
+      // DOD-M15-CONSORTIUM-FINGERPRINT-1 — WHICH consortium this client accepts a manifest from.
+      ...describeConsortiumFingerprint(enforcedConsortium),
       // DOD-M15-DIRAUTH-1: the posture is STATED, in both directions. Unlike every other field in
       // this milestone the healthy case is reported too — the defect is precisely that "enforced"
       // and "skipped" differ only by the absence of a log line, so an operator must be able to

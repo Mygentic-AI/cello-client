@@ -20,6 +20,13 @@ import type { Logger, DaemonConfig } from "@cello-protocol/daemon";
 import { createServer, type Server } from "node:net";
 import { login, logout, status, register, createAgent } from "../commands.js";
 import { monikerSet, settingsGet, settingsSet, startAgent } from "../parity-commands.js";
+import {
+  consortiumFingerprintShort,
+  BUNDLED_CONSORTIUM_MANIFEST,
+  BUNDLED_CONSORTIUM_ROOT_KEYS,
+  BUNDLED_CONSORTIUM_THRESHOLD,
+  EmbeddedManifestProvider,
+} from "@cello-protocol/daemon";
 
 describe("cli commands", () => {
   let tempDir: string;
@@ -260,6 +267,36 @@ describe("cli commands", () => {
       expect(parsed.daemon).toBe("running");
       expect(parsed.directory_signaling).toBe("reconnecting");
       expect(Array.isArray(parsed.agents)).toBe(true);
+    });
+
+    /**
+     * DOD-M15-CONSORTIUM-FINGERPRINT-1 — the OPERATOR'S surface, not the IPC payload.
+     *
+     * The daemon test asserts the fingerprint is in the status response. That is one layer short of
+     * the clause, which is that `cello status` PRINTS it: a response field the renderer drops is
+     * indistinguishable, to the person asking "am I on the real network?", from the field not
+     * existing. This asserts the text the terminal emits.
+     */
+    it("prints the consortium root fingerprint the daemon verifies against", async () => {
+      // The manifest deps are REAL: a daemon wired with none verifies nothing, and a fingerprint
+      // printed in that posture would describe a check that is not running.
+      handle = await startDaemon({
+        ...makeConfig(),
+        manifestProvider: new EmbeddedManifestProvider(BUNDLED_CONSORTIUM_MANIFEST),
+        manifestRootKeys: BUNDLED_CONSORTIUM_ROOT_KEYS,
+        manifestThreshold: BUNDLED_CONSORTIUM_THRESHOLD,
+      });
+
+      const result = await status(tempDir);
+
+      const expected = consortiumFingerprintShort(
+        BUNDLED_CONSORTIUM_ROOT_KEYS,
+        BUNDLED_CONSORTIUM_THRESHOLD,
+      );
+      expect(result.output).toContain(expected);
+      const parsed = JSON.parse(result.output);
+      expect(parsed.consortium_root_fingerprint).toBe(expected);
+      expect(parsed.consortium_root_fingerprint_state).toBe("bundled");
     });
 
     // DOD-LOGOUT-EXIT-1 AC3. `status` decided "stopped" from a single FILE STAT — the absence of

@@ -1333,8 +1333,65 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
       "M11-D5 makes the step-1 lookup serve staff overrides through the same row, so there is no " +
       "second table and no flag that could disagree with it.",
   },
+  {
+    surface: "README.md",
+    claim: "A genuine client cannot be fooled by a fork's consortium; the status line reports the key set actually in force, and says what it cannot vouch for",
+    excerpts: [
+      "A genuine client cannot be fooled by that — it",
+      "refuses any manifest not signed by the consortium root key compiled into it — but",
+      "rather than papered over with our fingerprint — the status line tells you what is",
+      "`consortium_root_fingerprint`, alongside `consortium_root_fingerprint_state`. If",
+      "your daemon is verifying no manifest at all. Both of those are reported in words",
+      "One thing it cannot tell you, and it is worth being plain about: this check runs",
+      "client, which is the common case. It cannot vouch for a client you installed from",
+    ],
+    verdict: "corrected",
+    /**
+     * ⚠️ THE FIRST VERSION OF THIS ROW PASSED THE SCANNER AND DEFENDED A FALSE SENTENCE, which is
+     * worth keeping in view because it is the ledger's own failure mode.
+     *
+     * The README said *"the value cannot be configured, so nothing you were told to set can change
+     * it"*, and this row defended it with *"`describeConsortiumFingerprint` takes no arguments and
+     * touches no environment variable"*. That was TRUE OF THE FUNCTION and FALSE OF THE CLAIM: three
+     * environment variables — `CELLO_CONSORTIUM_MANIFEST`, `CELLO_CONSORTIUM_ROOT_KEYS`,
+     * `CELLO_CONSORTIUM_THRESHOLD` — change exactly what the daemon verifies against, and the block
+     * was printing the compiled-in fingerprint regardless. Review caught it. A reader takes "cannot
+     * be configured" to mean *what this client trusts cannot be changed by a setting*, and a setting
+     * changed it.
+     *
+     * What is true now, and what the corrected text says: the block reports the key set handed to
+     * the verifier, states which of three postures produced it, and reports NO fingerprint when the
+     * daemon verifies no manifest. An override cannot make it read `bundled` — it can only make it
+     * announce itself.
+     */
+    enforcedBy: "structural",
+    evidence:
+      "`file-manifest-provider.ts` — EmbeddedManifestProvider.loadAndVerify rejects with " +
+      "ManifestLoadError(\"manifest_signature_invalid\") when verifyManifest fails, and leaves " +
+      "#manifest null. `consortium-fingerprint.ts` — describeConsortiumFingerprint(enforced) is " +
+      "handed config.manifestRootKeys / manifestThreshold, the same pair startBootCore gives " +
+      "verifyStartupManifest. dod-m15-consortium-fingerprint-1.test.ts boots a daemon against a " +
+      "DIFFERENT signed consortium and asserts both surfaces print that consortium's fingerprint " +
+      "with state `overridden`, and boots one with no provider and asserts a null fingerprint with " +
+      "state `not_anchored`.",
+  },
+  {
+    surface: "plugins/cello/skills/setup/SKILL.md",
+    claim: "The status output distinguishes the compiled-in key set from an overridden one, and from none",
+    excerpts: [
+      "set compiled into your client, `overridden` means an environment variable has",
+      "pointed it at a different consortium, and `not_anchored` means it is verifying no",
+    ],
+    verdict: "corrected",
+    /** Same correction as the README row above — this surface carried the same false sentence. */
+    enforcedBy: "structural",
+    evidence:
+      "`consortium-fingerprint.ts` — consortiumPosture() compares the fingerprint of the ENFORCED " +
+      "key set against the bundled one; dod-m15-consortium-fingerprint-1.test.ts asserts all three " +
+      "postures on both status surfaces, and a hardcoded fingerprint planted in status-handler.ts " +
+      "was confirmed to redden the overridden case.",
+  },
 ];
-
 /**
  * DELIBERATELY NOT ADJUDICATED, and worth saying why rather than leaving a silent gap.
  *
