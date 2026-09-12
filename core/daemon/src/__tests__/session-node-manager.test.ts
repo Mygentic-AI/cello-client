@@ -1400,11 +1400,11 @@ describe("SessionNodeManager — integration tests", () => {
 
     try {
       // No agent online yet → no standing receiver.
-      expect(handle.getStatus().standing_receiver_ready).toBe(false);
+      expect((await handle.getStatus()).standing_receiver_ready).toBe(false);
 
       // Bring an agent online (the same call cello_start_agent makes).
       await handle.getSessionNodeManager().ensureStandingReceiverForAgent("alice");
-      expect(handle.getStatus().standing_receiver_ready).toBe(true);
+      expect((await handle.getStatus()).standing_receiver_ready).toBe(true);
 
       // session.node.created must have been logged for alice's standing receiver
       const srCreated = events.find(

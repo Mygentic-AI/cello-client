@@ -72,7 +72,7 @@ describe("daemon retry-queue and nonce-dedup integration", () => {
   describe("AC-009: cello status includes retryQueueDepth", () => {
     it("returns retryQueueDepth: 0 when no messages are queued", async () => {
       handle = await startDaemon(makeConfig());
-      const status = handle.getStatus();
+      const status = (await handle.getStatus());
 
       expect(status.retryQueueDepth).toBe(0);
       expect(typeof status.retryQueueDepth).toBe("number");
@@ -181,7 +181,7 @@ describe("daemon retry-queue and nonce-dedup integration", () => {
       handle = await startDaemon(makeConfig());
 
       // The status should show 3 queued messages immediately
-      const status = handle.getStatus();
+      const status = (await handle.getStatus());
       expect(status.retryQueueDepth).toBe(3);
 
       // Check nonce dedup via IPC
@@ -363,7 +363,7 @@ describe("daemon retry-queue and nonce-dedup integration", () => {
       handle = await startDaemon(config);
 
       // After restart, the retry_queue entry survived in SQLCipher
-      const status = handle.getStatus();
+      const status = (await handle.getStatus());
       expect(status.retryQueueDepth).toBe(1);
 
       // Verify via IPC that the entry is present (drain_session returns nonces)

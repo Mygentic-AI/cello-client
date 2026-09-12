@@ -498,7 +498,7 @@ async function startDaemonHoldingLock(
   // 040-DAEMONROOT unit 10: the views the daemon builds of its own sessions and agents →
   // session-views.ts. `getStatus` stays here, where its breadth is honest, and calls in.
   const {
-    buildInterruptedSessions, reapDeadHalfOpenSessions, buildActiveSessions,
+    buildInterruptedSessions, reapDeadHalfOpenSessions, buildActiveSessionsWithAttendance,
     agentStateFor,
   } = createSessionViews({
     logger, sessionNodeManager, perConnectionState, onlineAgents, explicitlyOfflineAgents,
@@ -509,7 +509,7 @@ async function startDaemonHoldingLock(
   // 040-DAEMONROOT unit 17: the whole-daemon status the CLI renders → daemon-status-report.ts.
   const { getStatus } = createDaemonStatusReport({
     sessionNodeManager, retryQueue, agents, agentStateFor, buildInterruptedSessions,
-    buildActiveSessions, directorySignalingStatus, manifestOrigin,
+    buildActiveSessions: buildActiveSessionsWithAttendance, directorySignalingStatus, manifestOrigin,
     // Resolved at call time: the report it produces is built below this, and a status is only ever
     // rendered later. By value it would be undefined and every status would silently omit the block
     // that says a directory node could not be resolved.
@@ -632,7 +632,7 @@ async function startDaemonHoldingLock(
   // this handler and the daemon-wide getStatus() the CLI renders.
   registerStatusHandler({
     handlers, getAgentsForConnection, directorySignalingStatus, manifestOrigin, manifestProvider,
-    directoryHttpUrl, challengeVerifier, unresolvedNodesForStatus, buildInterruptedSessions, buildActiveSessions,
+    directoryHttpUrl, challengeVerifier, unresolvedNodesForStatus, buildInterruptedSessions, buildActiveSessions: buildActiveSessionsWithAttendance,
   });
 
   // ─── MCP-001: no_current_agent guard for session tools ───
@@ -1027,6 +1027,7 @@ async function startDaemonHoldingLock(
     countAttendanceFor: (agentName: string) => countAttendance(perConnectionState, agentName),
     forgetConnection,
     forgetTakeLedger: (connectionId: string) => contentTakes.forget(connectionId),
+    announceAttendance: (agentName, attendance) => sessionNodeManager.announceAttendance(agentName, attendance),
     inboundSessionWaiters,
     // A GETTER, though the dispatcher is a const 82 lines ABOVE — so that moving its construction
     // below this line cannot break the disconnect path silently. Reason in full at the dep.

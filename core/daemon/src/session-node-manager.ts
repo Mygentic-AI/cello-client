@@ -68,6 +68,7 @@ import { SessionQueries } from "./session-queries.js";
 import { RefusalNotices } from "./refusal-notices.js";
 import { SessionEphemerals } from "./session-ephemerals.js";
 import { SessionLiveness } from "./session-liveness.js";
+import type { LivenessAnswer } from "./session-relay-client.js";
 import { WitnessAlerts } from "./witness-alerts.js";
 import { HeldContent, type HeldEntry } from "./held-content.js";
 import { SessionLeafRecords } from "./session-leaf-records.js";
@@ -2390,6 +2391,55 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
   // delegators below: a copy is a second declaration free to drift from the first.
 
   submitSealLeaf(...args: Parameters<SessionSeal["submitSealLeaf"]>): ReturnType<SessionSeal["submitSealLeaf"]> { return this.#seal.submitSealLeaf(...args); }
+
+  /**
+   * DOD-M15-AWAYSCOPE-1 — tell every relay this agent is talking through whether anyone is watching.
+   *
+   * ⚠️ THIS IS WHAT REPLACED THE AWAY REPLY. An unattended agent used to answer inbound messages
+   * with its greeting, which took a hash-chain leaf inside a live conversation and cost session
+   * `e7dd3f43…` its receipt on both machines. The fact is worth telling; it is a fact ABOUT the
+   * session, so it rides the out-of-band liveness frame and takes no leaf, enters no transcript, and
+   * is never seen by the counterparty's agent as a message.
+   *
+   * BEST EFFORT AND SILENT ON FAILURE, by design. A session with no relay (direct-only) is skipped;
+   * a send that fails is logged at debug inside the client. The cost of every failure is the same
+   * and it is small: the counterparty reads "unknown" until the next notice.
+   */
+  announceAttendance(agentName: string, attendance: "attended" | "unattended" | "offline"): void {
+    // The separator is `#k`'s own `\x1f`, not a colon — a colon is legal inside an agent name and
+    // the map has never used one. Getting this wrong is silent: the loop matches nothing and every
+    // announcement is skipped, with no error anywhere.
+    const prefix = this.#k(agentName, "");
+    for (const [key, entry] of this.#activeNodes) {
+      if (!key.startsWith(prefix)) continue;
+      if (!entry.relayClient || !entry.relaySessionIdBytes) continue;
+      entry.relayClient.announceAttendance(entry.node, entry.relaySessionIdBytes, attendance);
+    }
+  }
+
+  /**
+   * DOD-M15-AWAYSCOPE-1 — ask the relay what it knows about the counterparty of ONE session.
+   *
+   * ⚠️ NOT `getSessionLiveness`, which is a different question with a different answer. That one is
+   * daemon-local: does THIS process hold a libp2p connection for the session, and it has a fourth
+   * value (`impaired`) the wire type does not. This one asks the RELAY, which sees the counterparty's
+   * standing connection even when this daemon has no direct link to them, and it is the only path
+   * that can carry attendance — because attendance is the far daemon's own assertion, relayed.
+   *
+   * Returns null when there is nothing to ask: no session, or a session with no relay behind it.
+   * That is distinct from an answer of 'unknown', which means the relay was asked and did not know.
+   */
+  async queryRelayLiveness(agentName: string, sessionId: string): Promise<LivenessAnswer | null> {
+    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
+    if (!entry?.relayClient || !entry.relaySessionIdBytes) return null;
+    const record = this.getSessionRecord(agentName, sessionId);
+    if (!record) return null;
+    return entry.relayClient.queryLiveness(
+      entry.node,
+      entry.relaySessionIdBytes,
+      Uint8Array.from(Buffer.from(record.counterparty_pubkey, "hex")),
+    );
+  }
 
   sealReadiness(...args: Parameters<SessionSeal["sealReadiness"]>): ReturnType<SessionSeal["sealReadiness"]> { return this.#seal.sealReadiness(...args); }
 

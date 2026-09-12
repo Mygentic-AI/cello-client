@@ -377,7 +377,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     expect(String(failEvent!.context.errorMessage)).toContain("stream dead");
 
     // DB-001: the content was preserved in the durable retry_queue (not dropped).
-    expect(h.getStatus().retryQueueDepth).toBeGreaterThanOrEqual(1);
+    expect((await h.getStatus()).retryQueueDepth).toBeGreaterThanOrEqual(1);
     // Tree NOT advanced on a failed send.
     expect(snm.getSessionTree("alice", SID).size()).toBe(0);
   });

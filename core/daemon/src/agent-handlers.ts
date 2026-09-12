@@ -360,6 +360,21 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
       return { ok: true };
     }
     onlineAgents.delete(name);
+    /**
+     * DOD-M15-AWAYSCOPE-1 — say OFFLINE before the sessions are torn down, not after.
+     *
+     * ⚠️ THE ORDERING IS THE WHOLE POINT. The teardown below destroys every session node for this
+     * agent, and the relay client rides on the node — announce afterwards and there is nothing left
+     * to announce through. The counterparty would be left reading the last thing they were told,
+     * which is 'unattended': "nobody is watching, it will be read later". That is the opposite of
+     * what an operator reaching for a kill switch means, and 'offline' exists as a third value
+     * precisely so the two cannot be confused.
+     *
+     * Best-effort, like every attendance notice — the send is not awaited and may lose the race with
+     * the teardown. The failure mode is the counterparty reading 'gone' once the relay loses the
+     * connection, which is true and is the next-best thing to hear.
+     */
+    sessionNodeManager.announceAttendance(name, "offline");
     // DOD-LOOP-1: tear down this agent's standing receiver. AWAITED and LOGGED, matching
     // cello_remove_agent — a teardown that did not happen must be VISIBLE. Fire-and-forget with a
     // swallowed catch reported the agent offline while its receiver could still be live and bound
@@ -523,6 +538,19 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
     for (const key of Array.from(awayAckSent)) {
       if (key.startsWith(`${name}:`)) awayAckSent.delete(key);
     }
+    /**
+     * DOD-M15-AWAYSCOPE-1 — and the COUNTERPARTY is told, out of band, that somebody arrived.
+     *
+     * This is the half that replaced the away reply. An unattended agent used to announce itself by
+     * sending its greeting INTO the conversation, which took a hash-chain leaf and destroyed the
+     * receipt. Attendance is a fact about the session, so it travels on the liveness frame instead:
+     * no leaf, no transcript row, and the far agent never sees a message it has to answer.
+     *
+     * Fired on the TRANSITION rather than on a timer. A poll would tell the counterparty the same
+     * thing repeatedly and still be late; the moment an operator attaches is the moment worth
+     * reporting, and the relay holds it until asked.
+     */
+    sessionNodeManager.announceAttendance(name, "attended");
     // MCP-002: Update dispatcher's routing table and send notification to this connection only
     getNotificationDispatcher().setCurrentAgent(connectionId, name);
     getNotificationDispatcher().dispatchAgentCurrentChanged(connectionId, fromAgent, name);

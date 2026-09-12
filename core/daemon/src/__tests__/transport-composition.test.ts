@@ -119,7 +119,7 @@ describe("AC-010: composition root wires transport adapters by CELLO_ENV", () =>
     handle = await startDaemon(makeConfig());
 
     // (a) daemon started
-    expect(handle.getStatus()).toBeDefined();
+    expect((await handle.getStatus())).toBeDefined();
 
     // wiring event fired with the stub selection
     const wired = logEvents.find((e) => e.event === "transport.adapters.wired");

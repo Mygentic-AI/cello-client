@@ -31,6 +31,13 @@ import { createHash } from "node:crypto";
 import * as lp from "it-length-prefixed";
 import { decode } from "cbor-x";
 import { encodeCbor, decodeSealPayload, encodeStructure1, decodeStructure1, computeGenesisPrevRoot } from "@cello-protocol/protocol-types";
+import {
+  encodeSessionLivenessQuery,
+  decodeSessionLivenessResponse,
+  encodeSessionAttendanceNotice,
+  type SessionAttendance,
+  type SessionLiveness,
+} from "@cello-protocol/protocol-types";
 import type { Stream } from "@libp2p/interface";
 import type { CelloNode } from "@cello-protocol/transport";
 import { verify, type KeyProvider } from "@cello-protocol/crypto";
@@ -39,6 +46,26 @@ import { extractErrorMessage } from "./error-message.js";
 import { evaluateRelayAck, type RelayReceiptStore } from "./relay-receipt-store.js";
 import type { SessionSealLeafStore } from "./session-seal-leaf-store.js";
 import type { SessionOwnChainStore } from "./session-own-chain-store.js";
+
+/**
+ * DOD-M15-AWAYSCOPE-1 — what a liveness query answers with.
+ *
+ * `refused` is kept separate from the values rather than folded into `liveness`, because it means
+ * something different: the relay declined to say, most likely because this caller is not a
+ * participant of the session it named. The liveness is 'unknown' either way — the operator surface
+ * shows the same thing — but a caller that wants to tell "the relay would not tell me" from "the
+ * relay does not know" can, and a log line that conflated them would send the next investigation
+ * looking at the counterparty instead of at the session id.
+ */
+export interface LivenessAnswer {
+  liveness: SessionLiveness;
+  /** Unix ms of the relay's most recent observation. 0 when it has none. */
+  observedAt: number;
+  /** The far daemon's own assertion. Absent unless `liveness` is 'alive'. */
+  attendance?: SessionAttendance;
+  /** True when the relay refused to answer rather than answering "I don't know". */
+  refused?: true;
+}
 
 
 export const RELAY_PROTOCOL_ID = "/cello/relay/1.0.0";
@@ -684,6 +711,12 @@ export class AgentRelayClient {
    * serialized on the shared stream, exactly like `#pendingRecord`, whose ack also carries no id.
    */
   #pendingRelease: ((released: boolean) => void) | null = null;
+  /**
+   * DOD-M15-AWAYSCOPE-1 — the in-flight liveness query, keyed by nothing, because there is at most
+   * one. A second concurrent query on the same shared stream would need correlation ids, and the
+   * caller (`cello status`, `cello sessions`) asks one session at a time.
+   */
+  #pendingLiveness: ((r: LivenessAnswer) => void) | null = null;
   /** Serializes submits so only one is in flight at a time across all sessions. */
   #submitChain: Promise<unknown> = Promise.resolve();
   /** session_id hex → { the live node to (re)dial from, inbound leaf handler, Option-B assignment to present }. */
@@ -1134,6 +1167,40 @@ export class AgentRelayClient {
             ? { ok: true, sequence_number: seq, structure1_cbor: structure1Cbor, structure2_cbor: structure2Cbor, sender_signature: senderSignature }
             : { ok: false, reason: "relay_ack_malformed" },
       );
+    } else if (type === "session_liveness_response" || type === "session_liveness_refused") {
+      /**
+       * DOD-M15-AWAYSCOPE-1 — the relay's answer to "is my counterparty reachable, and is anyone
+       * attending it". Decoded through the shared codec rather than read field by field here: that
+       * codec is what refuses an attendance paired with a non-alive liveness, and re-reading the
+       * fields inline would quietly reintroduce the tolerance branch it exists to prevent.
+       *
+       * A REFUSAL resolves the waiter rather than dropping it. The relay refuses a query naming a
+       * session the caller is not in, and it deliberately does not say which of the two reasons —
+       * so the honest local answer is "unknown", not a hang until the timeout.
+       */
+      const r = this.#pendingLiveness; this.#pendingLiveness = null;
+      if (r) {
+        if (type === "session_liveness_refused") {
+          r({ liveness: "unknown", observedAt: 0, refused: true });
+        } else {
+          const decoded = decodeSessionLivenessResponse(encodeCbor(frame));
+          if (decoded === null) {
+            // Malformed fails exactly like missing. A frame this build cannot read is not evidence
+            // of anything, and reporting it as 'gone' would invent an observation nobody made.
+            this.#logger.warn("session.relay.liveness.response_malformed", {
+              relayPeerId: this.#relayPeerId,
+              impact: "the counterparty's reachability is reported as unknown, which is what it is",
+            });
+            r({ liveness: "unknown", observedAt: 0 });
+          } else {
+            r({
+              liveness: decoded.liveness,
+              observedAt: decoded.observed_at,
+              ...(decoded.attendance !== undefined ? { attendance: decoded.attendance } : {}),
+            });
+          }
+        }
+      }
     } else if (type === "hash_submit_error") {
       const reason = typeof frame["reason"] === "string" ? frame["reason"] : "relay_rejected";
       // Carry the relay's `detail` through — see `SubmitResult`. Reading the class and discarding
@@ -1697,6 +1764,122 @@ export class AgentRelayClient {
    * ⚠️ **THE FRAME CARRIES NO PEER ID, deliberately.** The relay frees the peer this connection
    * authenticated as. A peer id on the wire would let any registered agent free another's.
    */
+  /**
+   * DOD-M15-AWAYSCOPE-1 — tell this relay whether anyone is attending this agent, for one session.
+   *
+   * ── WHY THIS EXISTS AT ALL ──────────────────────────────────────────────────────────────────────
+   *
+   * An unattended agent used to answer inbound messages with its away greeting. That greeting took a
+   * hash-chain leaf inside a live conversation, and on session `e7dd3f43…` it cost two operators a
+   * completed conversation's receipt, permanently. The fact itself is worth telling — a counterparty
+   * mid-exchange genuinely needs to know whether to wait — but it is a fact ABOUT the session, not a
+   * sentence IN it. So it rides here instead, and takes no leaf.
+   *
+   * ── FIRE AND FORGET, AND THAT IS THE DESIGN ─────────────────────────────────────────────────────
+   *
+   * Nothing is awaited and the relay sends no ack. The notice may be dropped, duplicated, or arrive
+   * out of order; `observed_at` settles it, last-write-wins. A failure here is logged at DEBUG and
+   * changes nothing the operator is doing — the cost is that their counterparty reads "unknown"
+   * until the next notice, which is the truth about what this relay knows.
+   *
+   * ⚠️ NO RETRY, NO QUEUE, and the reason is the defect above. Anything that made this reliable would
+   * want ordering, ordering wants a witness, and a witnessed position is how machine chatter reached
+   * the leaf set in the first place. A status hint that is allowed to be lost is the safe shape.
+   */
+  announceAttendance(
+    node: CelloNode,
+    sessionId: Uint8Array,
+    attendance: SessionAttendance,
+  ): void {
+    if (this.#closed) return;
+    void (async () => {
+      try {
+        if (!(await this.#ensureConnected(node))) return;
+        const stream = this.#stream;
+        if (!stream) return;
+        stream.send(lp.encode.single(encodeSessionAttendanceNotice({
+          type: "session_attendance_notice",
+          session_id: sessionId,
+          attendance,
+          // OUR clock, stated plainly. The relay bounds it against its own and refuses a value too
+          // far ahead rather than clamping — clamping would turn a hostile timestamp into a valid
+          // recent one, and this client is the code an adversary gets to rewrite.
+          observed_at: Date.now(),
+        })));
+        this.#logger.debug("session.relay.attendance.announced", {
+          relayPeerId: this.#relayPeerId,
+          sessionId: Buffer.from(sessionId).toString("hex").slice(0, 16),
+          attendance,
+        });
+      } catch (err: unknown) {
+        this.#logger.debug("session.relay.attendance.announce_failed", {
+          relayPeerId: this.#relayPeerId,
+          error: extractErrorMessage(err),
+          impact: "the counterparty reads 'unknown' for this agent until the next notice lands",
+        });
+      }
+    })();
+  }
+
+  /**
+   * DOD-M15-AWAYSCOPE-1 — ask the relay about the counterparty: reachable, and attended?
+   *
+   * Two different facts with two different producers, which is why they are separate fields.
+   * `liveness` is the RELAY's own observation — it either holds that agent's standing connection or
+   * it does not. `attendance` is the far DAEMON's assertion about itself, which this relay was told
+   * and is repeating; it is absent whenever `liveness` is not 'alive', because a daemon nobody can
+   * reach is not asserting anything.
+   *
+   * ⚠️ EVERY FAILURE ANSWERS 'unknown', and never 'gone'. A timeout, a dead stream, a refusal and a
+   * frame this build cannot parse all mean "this side learned nothing" — reporting any of them as
+   * `gone` would invent an observation nobody made, and `gone` is the one value that tells an
+   * operator their counterparty has left.
+   */
+  async queryLiveness(
+    node: CelloNode,
+    sessionId: Uint8Array,
+    counterpartyPubkey: Uint8Array,
+  ): Promise<LivenessAnswer> {
+    const unknown: LivenessAnswer = { liveness: "unknown", observedAt: 0 };
+    if (this.#closed) return unknown;
+    if (!(await this.#ensureConnected(node))) return unknown;
+    const stream = this.#stream;
+    if (!stream) return unknown;
+
+    let resolveLiveness!: (r: LivenessAnswer) => void;
+    const answer = new Promise<LivenessAnswer>((r) => { resolveLiveness = r; });
+    this.#pendingLiveness = resolveLiveness;
+    try {
+      stream.send(lp.encode.single(encodeSessionLivenessQuery({
+        type: "session_liveness_query",
+        session_id: sessionId,
+        counterparty_pubkey: counterpartyPubkey,
+      })));
+    } catch (err: unknown) {
+      if (this.#pendingLiveness === resolveLiveness) this.#pendingLiveness = null;
+      this.#logger.debug("session.relay.liveness.query_failed", {
+        relayPeerId: this.#relayPeerId, error: extractErrorMessage(err),
+      });
+      return unknown;
+    }
+    let timer!: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<"timeout">((r) => { timer = setTimeout(() => r("timeout"), HASH_SUBMIT_TIMEOUT_MS); });
+    try {
+      const result = await Promise.race([answer, timeout]);
+      if (result === "timeout") {
+        // NOT a stream reset, for the same reason a release timeout is not: a liveness query is not
+        // ordered against anything, so tearing the shared stream down would cost every sibling
+        // session its in-flight submits to tidy up one status read.
+        if (this.#pendingLiveness === resolveLiveness) this.#pendingLiveness = null;
+        this.#logger.debug("session.relay.liveness.query_timeout", { relayPeerId: this.#relayPeerId });
+        return unknown;
+      }
+      return result;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async releaseReservation(node: CelloNode): Promise<boolean> {
     if (this.#closed) return false;
     if (!(await this.#ensureConnected(node))) {
@@ -1995,6 +2178,9 @@ export class AgentRelayClient {
         // 054-SRSPLIT: settle an in-flight release too, so it does not wait its full timeout on a
         // stream that is already gone. `false` is honest — the relay was not told.
         { const r = this.#pendingRelease; this.#pendingRelease = null; if (r) r(false); }
+        // DOD-M15-AWAYSCOPE-1: and an in-flight liveness query, so a status read does not wait its
+        // whole timeout on a stream that is already gone. "unknown" is the honest answer.
+        { const r = this.#pendingLiveness; this.#pendingLiveness = null; if (r) r({ liveness: "unknown", observedAt: 0 }); }
         // A pure-receiver session issues no submit, so it would never trigger a re-dial
         // after the node that owned the stream is torn down. If sessions remain, proactively
         // re-establish from any still-live registered session node so queued leaf_delivers

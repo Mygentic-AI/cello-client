@@ -39,7 +39,12 @@ export interface StatusHandlerDeps {
   /** Emits ONLY when something is wrong or nothing has looked recently enough to say. */
   unresolvedNodesForStatus: () => { directory_endpoints_unresolved: unknown } | undefined;
   buildInterruptedSessions: () => InterruptedSessionInfo[];
-  buildActiveSessions: () => ActiveSessionInfo[];
+  /**
+   * DOD-M15-AWAYSCOPE-1: the ENRICHED build. `cello_status` is an agent-facing surface and the
+   * agent is exactly the reader that must not have to send a message to find out whether the far
+   * side is attended — that is the defect this order closes.
+   */
+  buildActiveSessions: () => Promise<ActiveSessionInfo[]>;
 }
 
 export function registerStatusHandler(deps: StatusHandlerDeps): void {
@@ -86,7 +91,7 @@ export function registerStatusHandler(deps: StatusHandlerDeps): void {
       // the daemon-wide getStatus() surfaces them.
       interrupted_sessions: buildInterruptedSessions(),
       // M8B F16: per-session liveness on the MCP surface too.
-      active_sessions: buildActiveSessions(),
+      active_sessions: await buildActiveSessions(),
     };
   });
 }

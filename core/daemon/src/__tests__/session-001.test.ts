@@ -506,7 +506,7 @@ describe("SESSION-001: daemon status interrupted_sessions field", () => {
     };
     const h = await startDaemon(config);
     handle = h as typeof handle;
-    const status = h.getStatus() as DaemonStatusResponse;
+    const status = (await h.getStatus()) as DaemonStatusResponse;
 
     expect(status.interrupted_sessions).toBeDefined();
     expect(Array.isArray(status.interrupted_sessions)).toBe(true);
@@ -562,7 +562,7 @@ describe("SESSION-001: daemon status interrupted_sessions field", () => {
     };
     const h = await startDaemon(config);
     handle = h as typeof handle;
-    const status = h.getStatus() as DaemonStatusResponse;
+    const status = (await h.getStatus()) as DaemonStatusResponse;
 
     // `cello status` surfaces ONLY genuinely-resumable interrupted sessions (messages exchanged).
     // sid2 is interrupted with 0 messages — a failed handshake — and must NOT appear here (it would
