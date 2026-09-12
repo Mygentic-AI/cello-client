@@ -623,13 +623,6 @@ export interface ActiveSessionEntry {
   extraRelayClientKeys?: string[];
 }
 
-/** DAEMON-004: a piece of content received and verified, awaiting cello_receive. */
-export interface ReceivedContentEntry {
-  contentHex: string;
-  senderPubkey: string;
-  sequenceNumber: number;
-}
-
 // ─── Result types ─────────────────────────────────────────────────────────────
 
 export type CreateSessionResult =
@@ -639,16 +632,13 @@ export type CreateSessionResult =
 // ─── SessionNodeManager ───────────────────────────────────────────────────────
 
 /**
- * DOD-COATTEND-1: how much of the arrival buffer is kept. Small, and stated: an unstated cap is a
- * silent truncation, and no cap at all is the leak the old destructive read was accidentally
- * preventing.
+ * `RECEIVED_BUFFER_CAP` AND `ReceivedContentEntry` WERE HERE, and both are gone with the buffer.
  *
- * ⚠️ THE BUFFER HAS NO PRODUCTION READER (review finding, verified). Delivery reads the durable
- * transcript; `takeReceivedContent` is reached only from tests; the away responder's peek went with
- * DOD-M15-AWAYSCOPE-1. Until the buffer itself is removed, this cap is the only thing bounding a
- * plaintext leak nothing consumes.
+ * DOD-COATTEND-1 moved delivery onto the durable transcript and left an in-memory copy of every
+ * arriving message behind it, plaintext, capped at 32 per session, held for the daemon's life. The
+ * cap was all that bounded it. Nothing read it after DOD-M15-AWAYSCOPE-1 removed the away
+ * responder's peek, so there is no buffer left to bound.
  */
-export const RECEIVED_BUFFER_CAP = 32;
 
 /**
  * M12-P12 (review F6): the outcome of one park-deposit attempt. A bare boolean conflated

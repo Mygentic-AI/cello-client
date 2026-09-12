@@ -35,6 +35,7 @@ import { seedAgentKeys, wireAgentKeyProviders } from "./helpers/seed-agents.js";
 import { agreeSessionGenesis } from "./helpers/session-genesis.js";
 import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
+import { receivedCount, receivedText } from "./helpers/received-rows.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 
@@ -151,7 +152,7 @@ describe("DOD-M12B-REDIAL-1: a lost connection is re-dialled on demand", () => {
 
     // Baseline: the session works.
     await send(A, "before");
-    expect(await pollFor(() => B.manager.takeReceivedContent("bob", SID))).not.toBeNull();
+    expect(await pollFor(() => receivedCount(B.manager, "bob", SID) >= 1 || null)).toBe(true);
 
     // The connection is gone as far as the send path is concerned — exactly what `newStream`
     // reports after any blip. The peer is still listening the whole time, which is the point: this
@@ -172,9 +173,9 @@ describe("DOD-M12B-REDIAL-1: a lost connection is re-dialled on demand", () => {
     const dials = A.events.filter((e) => e.event === "session.transport.connected");
     expect(dials.length, "the recovery must go through a real dial, not just a second attempt").toBe(2);
 
-    const arrived = await pollFor(() => B.manager.takeReceivedContent("bob", SID));
+    const arrived = await pollFor(() => receivedText(B.manager, "bob", SID, 1));
     expect(arrived, "the message must actually reach the counterparty").not.toBeNull();
-    expect(Buffer.from(arrived!.contentHex, "hex").toString()).toBe("after the blip");
+    expect(arrived).toBe("after the blip");
   }, 60_000);
 
   it("a session this side never dialled has no address to dial back with, and says so", async () => {

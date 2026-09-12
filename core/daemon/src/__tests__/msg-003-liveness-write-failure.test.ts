@@ -35,6 +35,7 @@ import { seedAgentKeys, wireAgentKeyProviders } from "./helpers/seed-agents.js";
 import { agreeSessionGenesis } from "./helpers/session-genesis.js";
 import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
+import { receivedCount } from "./helpers/received-rows.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 
@@ -156,7 +157,7 @@ describe("DOD-M12B-ACK-1: liveness stops claiming `alive` when writes fail", () 
     // Baseline: a real delivery over a real connection — `alive` here is TRUE, and the rest of the
     // test is about the moment it stops being true.
     await send(A, "first");
-    expect(await pollFor(() => B.manager.takeReceivedContent("bob", SID))).not.toBeNull();
+    expect(await pollFor(() => receivedCount(B.manager, "bob", SID) >= 1 || null)).toBe(true);
     expect(A.manager.getSessionLiveness("alice", SID)).toBe("alive");
 
     // One failed write. The connection is untouched — the fault is injected after newStream — so
@@ -173,7 +174,7 @@ describe("DOD-M12B-ACK-1: liveness stops claiming `alive` when writes fail", () 
     // Recovery is observed, not assumed — an impaired flag that never clears would report a dead
     // conversation for every session that ever had one bad write.
     await send(A, "third");
-    expect(await pollFor(() => B.manager.takeReceivedContent("bob", SID))).not.toBeNull();
+    expect(await pollFor(() => receivedCount(B.manager, "bob", SID) >= 2 || null)).toBe(true);
     expect(A.manager.getSessionLiveness("alice", SID)).toBe("alive");
   }, 60_000);
 
@@ -230,7 +231,7 @@ describe("DOD-M12B-ACK-1: liveness stops claiming `alive` when writes fail", () 
   it("`impaired` does not override a counterparty that is genuinely gone (the `gone` guard in #markSessionImpaired)", async () => {
     const { A, B } = await liveSession();
     await send(A, "first");
-    expect(await pollFor(() => B.manager.takeReceivedContent("bob", SID))).not.toBeNull();
+    expect(await pollFor(() => receivedCount(B.manager, "bob", SID) >= 1 || null)).toBe(true);
 
     // B disappears entirely — the connection drops and liveness is legitimately `gone`.
     await B.manager.gracefulShutdown();

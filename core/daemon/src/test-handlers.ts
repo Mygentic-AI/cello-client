@@ -313,9 +313,9 @@ export function registerTestHandlers(deps: TestHandlerDeps): void {
     ).run(sessionId, agentRow.agent_id, counterpartyPubkey, status, now, now);
     return { ok: true };
   });
-
-  // M8C-INBOX-1 (reviewer F1): buffer a received message so a test can drive a live cello_receive
-  // and assert the watermark advances (the N3 delivery-marks-read coupling), without a session tree.
+  // M8C-INBOX-1 (F1): seed a received message so a test can drive a live cello_receive and assert the
+  // watermark advances (N3), without a session tree. It seeded the arrival buffer until that buffer
+  // was deleted for having no production reader; the transcript row is what cello_receive serves.
   handlers.set("__test_buffer_received", async (params, _connectionId) => {
     const agentName = params?.agentName as string | undefined;
     const sessionId = params?.sessionId as string | undefined;
@@ -324,7 +324,7 @@ export function registerTestHandlers(deps: TestHandlerDeps): void {
     if (!agentName || !sessionId || typeof seq !== "number") {
       return { error: "missing_params", guidance: "Provide agentName, sessionId, seq." };
     }
-    sessionNodeManager.pushReceivedContentForTest(agentName, sessionId, seq, content, (params?.senderPubkey as string) ?? "cp");
+    sessionNodeManager.recordTranscriptMessage(agentName, sessionId, seq, "received", new TextEncoder().encode(content), "test-seed");
     return { ok: true };
   });
   } // end CELLO_ENV=test guard

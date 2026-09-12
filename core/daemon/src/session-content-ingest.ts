@@ -32,7 +32,7 @@ import { triageOrphanedContent } from "./orphan-triage.js";
 import { extractErrorMessage } from "./error-message.js";
 import { retentionSentence } from "./quarantine-framing.js";
 import { LEAF_KIND_CTRL } from "./session-relay-client.js";
-import { ACK_HASH_REASONS, AUTHORSHIP_SELF_CHAIN_MISMATCH, AUTHORSHIP_SESSION_MISMATCH, CONTENT_MAX_INBOUND_STREAMS, CONTENT_STREAM_LINGER_MS, RECEIVED_BUFFER_CAP, REFUSAL_MAY_STILL_ARRIVE, REFUSAL_NO_OTHER_ROUTE, type AckHashReason, type ReceivedContentEntry } from "./session-node-types.js";
+import { ACK_HASH_REASONS, AUTHORSHIP_SELF_CHAIN_MISMATCH, AUTHORSHIP_SESSION_MISMATCH, CONTENT_MAX_INBOUND_STREAMS, CONTENT_STREAM_LINGER_MS, REFUSAL_MAY_STILL_ARRIVE, REFUSAL_NO_OTHER_ROUTE, type AckHashReason } from "./session-node-types.js";
 import type { SessionContentPipelineContext } from "./session-content-context.js";
 import type { SessionContentSender } from "./session-content-send.js";
 
@@ -1369,14 +1369,21 @@ export class SessionContentIngest {
     // grace window and the relay is never asked, which is what keeps a fetch off the hot path of
     // every message.
     this.markContentResolved(agentName, sessionId, contentHashHex);
-    let buf = this.#ctx.receivedContent.get(recvKey);
-    if (!buf) { buf = []; this.#ctx.receivedContent.set(recvKey, buf); }
-    buf.push({ contentHex: Buffer.from(content).toString("hex"), senderPubkey, sequenceNumber: leafIndex });
+    /**
+     * THE ARRIVAL BUFFER USED TO BE FILLED HERE, and nothing read it.
+     *
+     * Every verified message was copied into an in-memory list as plaintext, capped at the last 32
+     * per session and held for the life of the daemon process. `cello_receive` stopped draining it
+     * at DOD-COATTEND-1, when delivery moved onto the durable transcript written a few lines above;
+     * the away responder's peek at its tail was the last reader, and DOD-M15-AWAYSCOPE-1 deleted
+     * that. What was left was the plaintext of every conversation, kept in memory, for nobody.
+     *
+     * The transcript row IS the delivery record. There is nothing to keep alongside it.
+     */
     // DOD-COATTEND-1: BOUNDED, because delivery no longer drains this — an unbounded array holding
     // every message of every live session in memory for the daemon's life is the leak the old
     // destructive read hid. ⚠️ AND IT NOW HAS NO PRODUCTION READER AT ALL: `takeReceivedContent` is
     // test-only, the away responder's peek went with AWAYSCOPE-1, so this cap is all that bounds it.
-    if (buf.length > RECEIVED_BUFFER_CAP) buf.splice(0, buf.length - RECEIVED_BUFFER_CAP);
     this.#ctx.logger.info("session.content.received", {
       sessionId,
       senderPubkey,
@@ -1395,15 +1402,6 @@ export class SessionContentIngest {
       });
     }
     return { leafIndex };
-  }
-
-
-
-  /** DAEMON-004: pop the oldest verified received content for cello_receive. */
-  takeReceivedContent(agentName: string, sessionId: string): ReceivedContentEntry | null {
-    const buf = this.#ctx.receivedContent.get(this.#ctx.sessionKey(agentName, sessionId));
-    if (!buf || buf.length === 0) return null;
-    return buf.shift() ?? null;
   }
 
 

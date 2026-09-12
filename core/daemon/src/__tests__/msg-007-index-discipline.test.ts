@@ -22,6 +22,7 @@
  */
 import { describe, it, expect, afterEach } from "vitest";
 import { startTwoConnectionFixture, msgLeafHash, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
+import { receivedRows } from "./helpers/received-rows.js";
 
 const SID = "8a".repeat(32);
 const AGENT = "alice";
@@ -89,12 +90,7 @@ describe("DOD-M12B-INDEX-1: the sender's own leaf takes its relay-assigned posit
       { sequence: 2, direction: "sent" },
     ]);
     // And it must NOT be delivered to our own agent as inbound content.
-    const inbound: string[] = [];
-    for (;;) {
-      const next = snm.takeReceivedContent(AGENT, SID);
-      if (!next) break;
-      inbound.push(Buffer.from(next.contentHex, "hex").toString());
-    }
+    const inbound = receivedRows(snm, AGENT, SID).map((r) => r.text);
     expect(inbound, "our own message must never come back to us as inbound").toEqual(["theirs at 0", "theirs at 1"]);
   }, 60_000);
 

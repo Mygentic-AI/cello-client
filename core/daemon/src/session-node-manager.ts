@@ -90,7 +90,7 @@ import { type SecurityGatewayClient } from "@cello-protocol/gateway";
  * `(witness relay, session)`, so a repeated observation raises `occurrences` rather than taking
  * another slot in a bounded list.
  */
-import { ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL, heldRelayIdsOf, PARKED_DRAIN_BACKSTOP_DEFAULT_MS, type ActiveSessionEntry, SALT_AGREEMENT_WAIT_MS, type AwaitingAckEntry, CONTENT_MAX_INBOUND_STREAMS, type ISessionNodeFactory, LEAF_FETCH_GRACE_MS, type ParkedDrainReason, type QuarantinedRecord, type ReceivedContentEntry, type RefusalNotice, type SessionImpairment, type SessionRevivalIdentity, type TranscriptEntry, type WitnessAlertNotice } from "./session-node-types.js";
+import { ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL, heldRelayIdsOf, PARKED_DRAIN_BACKSTOP_DEFAULT_MS, type ActiveSessionEntry, SALT_AGREEMENT_WAIT_MS, type AwaitingAckEntry, CONTENT_MAX_INBOUND_STREAMS, type ISessionNodeFactory, LEAF_FETCH_GRACE_MS, type ParkedDrainReason, type QuarantinedRecord, type RefusalNotice, type SessionImpairment, type SessionRevivalIdentity, type TranscriptEntry, type WitnessAlertNotice } from "./session-node-types.js";
 
 // Re-exported so this module's public surface is unchanged by the split: every existing
 // importer of session-node-manager.js keeps working, and no test moves an import path.
@@ -670,7 +670,6 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
   // DAEMON-004: per-session FIFO buffer of verified received content awaiting
   // cello_receive. Populated by `session-content-ingest.ts` — ingestReceivedContent and the
   // content stream handler.
-  #receivedContent = new Map<string, ReceivedContentEntry[]>();
   // F1-b: a terminal answer for a sealed session, set at seal teardown BEFORE the
   // received-content buffer is evicted. A blocking cello_receive waiting when the seal
   // fires returns this instead of hanging or 404ing; `unreadCount` tells the caller how
@@ -766,7 +765,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
   // the next expected leaf is HELD here (keyed #k(agent,session) -> (canonicalSeq -> entry)) instead
   // of being appended out of order. Once the missing in-between sequence(s) land (recovered from the
   // relay mailbox), #releaseHeld drains the held entries in canonical order. content is plaintext in
-  // memory only — evicted on teardown, same as #receivedContent.
+  // memory only — evicted on teardown, same as the other per-session caches.
   /**
    * DOD-M15-SEALWIRE-1 bullet 5 — `authorship` rides the held entry.
    *
@@ -1220,7 +1219,6 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       witnessedSeq: this.#witnessedSeq,
       leafFetchTimers: this.#leafFetchTimers,
       lastAck: this.#lastAck,
-      receivedContent: this.#receivedContent,
       resolvedContent: this.#resolvedContent,
       undeliverableSeqs: this.#undeliverableSeqs,
       highWaterSeq: this.#highWaterSeq,
@@ -1725,7 +1723,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
    * the operator's own agents (the loopback case) can hold the two ends of the SAME session_id on
    * ONE daemon, so a bare session_id is ambiguous between them. This composite string key — the
    * agent name and the hex session id joined by a 0x1f unit separator (which appears in neither) —
-   * is the key for every in-memory session-core map (#activeNodes, #trees, #receivedContent,
+   * is the key for every in-memory session-core map (#activeNodes, #trees,
    * #contentDesynced, #responderSealSubmitted, #awaitingAck) and for the per-session maps the
    * collaborators own, which build the same key the same way. #relayClients is already per-agent
    * (its own key), and the standing receivers are keyed by agent name directly.
@@ -1846,7 +1844,6 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     // held content and high-water map below are cleared, on the abnormal path only.
     const treeSizeBeforeEviction = this.#trees.get(key)?.size() ?? null;
     this.#trees.delete(key);
-    this.#receivedContent.delete(key);
     // CELLO-M7-MSG-001: cancel any armed TTF timers so a torn-down session never
     // fires a park backstop (or keeps a timer) after it is gone.
     this.#contentOut.clearAwaitingForSession(agentName, sessionId);
@@ -2167,7 +2164,6 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     // Evict in-memory per-session caches (trees reload from SQLite; received-content
     // plaintext must not survive shutdown in memory).
     this.#trees.clear();
-    this.#receivedContent.clear();
     // DOD-M12B-SESSION-SEED-1 (review F5): transport identities are key material and belong in the
     // same sentence as the plaintext above. Shutdown marks every active row `interrupted` by direct
     // SQL, so no `SessionLifecycle.updateSessionStatus` destroy fires for them — without this, every live session's
@@ -2463,7 +2459,6 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
 
   placeOwnLeaf(...args: Parameters<SessionContentSender["placeOwnLeaf"]>): ReturnType<SessionContentSender["placeOwnLeaf"]> { return this.#contentOut.placeOwnLeaf(...args); }
 
-  takeReceivedContent(...args: Parameters<SessionContentIngest["takeReceivedContent"]>): ReturnType<SessionContentIngest["takeReceivedContent"]> { return this.#contentIn.takeReceivedContent(...args); }
 
   recordWitnessedSequence(...args: Parameters<SessionContentIngest["recordWitnessedSequence"]>): ReturnType<SessionContentIngest["recordWitnessedSequence"]> { return this.#contentIn.recordWitnessedSequence(...args); }
 
@@ -2577,23 +2572,18 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
   }
 
   /**
-   * DOD-M15-AWAYSCOPE-1 removed `peekLatestReceivedContentHex` from here. Its one caller was the
-   * away responder, reading the arriving message's TAIL to decide whether to answer it, and
-   * answering an already-accepted session is the defect that order deleted — an accessor handing
-   * out message plaintext with no reader is surface an adversary's own daemon build still reaches.
-   * ⚠️ AND ITS BUFFER HAS NO PRODUCTION READER EITHER — review finding, verified. This comment
-   * claimed `takeReceivedContent` "drains it for `cello_receive`"; that stopped being true at
-   * DOD-COATTEND-1, when delivery moved onto the durable transcript. Every caller left is a test, so
-   * `#receivedContent` holds the last 32 messages of every live session as plaintext, in daemon
-   * memory, for the daemon's life, read by nothing. Not removed here (~40 test call sites, and a
-   * different line's subject); it is on the order as its own item. */
-  pushReceivedContentForTest(agentName: string, sessionId: string, seq: number, content: string, senderPubkey: string): void {
-    this.#records.recordTranscriptMessage(agentName, sessionId, seq, "received", new TextEncoder().encode(content), "test");
-    const key = this.#k(agentName, sessionId);
-    let buf = this.#receivedContent.get(key);
-    if (!buf) { buf = []; this.#receivedContent.set(key, buf); }
-    buf.push({ contentHex: Buffer.from(content, "utf8").toString("hex"), senderPubkey, sequenceNumber: seq });
-  }
+   * THE IN-MEMORY ARRIVAL BUFFER WAS HERE, with `takeReceivedContent`, `pushReceivedContentForTest`
+   * and `peekLatestReceivedContentHex`. All three are gone, and so is the buffer.
+   *
+   * It kept the plaintext of the last 32 messages of every live session in daemon memory for the
+   * life of the process. `cello_receive` stopped draining it at DOD-COATTEND-1, when delivery moved
+   * onto the durable transcript; the away responder's peek at its tail was the last reader, and
+   * DOD-M15-AWAYSCOPE-1 deleted that with the branch that answered an accepted session. What
+   * remained was every conversation this agent had, held in memory, for nobody.
+   *
+   * Tests that asked it "did this message reach the agent" now ask the transcript, which is what
+   * production serves — see `__tests__/helpers/received-rows.ts` for why the answer is the same.
+   */
 
   /**
    * F1-b: the terminal answer for a session that sealed while a blocking receive was (or could be)

@@ -39,6 +39,7 @@ import { seedAgentKeys, wireAgentKeyProviders } from "./helpers/seed-agents.js";
 import { agreeSessionGenesis } from "./helpers/session-genesis.js";
 import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
+import { receivedText } from "./helpers/received-rows.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 
@@ -163,9 +164,9 @@ describe("DOD-M12B-ACK-1: content streams are not leaked at the receiver", () =>
       // `delivered` is the field that separates "went to the peer" from "parked for later". A park
       // here is the defect: there is no relay in this harness, so a parked frame is a lost one.
       expect(sent.ok, `send ${i} refused`).toBe(true);
-      const drained = await pollFor(() => B.manager.takeReceivedContent("bob", SID));
-      expect(drained, `message ${i} never arrived at B`).not.toBeNull();
-      received.push(Buffer.from(drained!.contentHex, "hex").toString());
+      const arrived = await pollFor(() => receivedText(B.manager, "bob", SID, i));
+      expect(arrived, `message ${i} never arrived at B`).not.toBeNull();
+      received.push(arrived!);
     }
 
     // Every message, in order, once.

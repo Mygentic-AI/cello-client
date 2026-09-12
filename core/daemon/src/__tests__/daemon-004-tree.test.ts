@@ -49,6 +49,7 @@ import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
 import { seedAgents, wireAgentKeyProviders } from "./helpers/seed-agents.js";
 import { agreeSessionGenesis } from "./helpers/session-genesis.js";
+import { receivedCount, receivedRows } from "./helpers/received-rows.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 
@@ -372,11 +373,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     expect(recvEvent!.context.sessionId).toBe(sid);
     expect(recvEvent!.context.senderPubkey).toBe("bobpubkey");
 
-    const buffered = mgr.takeReceivedContent("alice", sid);
-    expect(buffered).not.toBeNull();
-    expect(Buffer.from(buffered!.contentHex, "hex").toString()).toBe("from-bob");
-    // FIFO drained
-    expect(mgr.takeReceivedContent("alice", sid)).toBeNull();
+    expect(receivedRows(mgr, "alice", sid).map((r) => r.text), "one message reached the agent").toEqual(["from-bob"]);
   });
 
   it("AC-001 receive (tamper): a content_hash MISMATCH is rejected — no append, no buffer, warn event", async () => {
@@ -394,7 +391,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     const res = await mgr.ingestReceivedContent("alice", sid, content, wrongHash);
     expect(res.ok).toBe(false);
     expect(mgr.getSessionTreeRootHex("alice", sid)).toBe(rootBefore);
-    expect(mgr.takeReceivedContent("alice", sid)).toBeNull();
+    expect(receivedCount(mgr, "alice", sid)).toBe(0);
     const failEvent = events.find((e) => e.event === "session.content.cross_check.failed");
     expect(failEvent).toBeDefined();
     expect(failEvent!.level).toBe("warn");
@@ -481,9 +478,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     expect(recv).toBeDefined();
     // The receiver shares the sender's correlationId — extracted from the frame, not minted.
     expect(recv!.context.correlationId).toBe(correlationId);
-    const buffered = mgr.takeReceivedContent("alice", sid);
-    expect(buffered).not.toBeNull();
-    expect(Buffer.from(buffered!.contentHex, "hex").toString()).toBe("loopback-hi");
+    expect(receivedRows(mgr, "alice", sid).map((r) => r.text)).toEqual(["loopback-hi"]);
   });
 
   /**
@@ -835,10 +830,12 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
 
     await mgr.destroySessionNode("alice", sid, "sealed");
 
-    // The in-memory plaintext buffer is gone after teardown.
-    expect(mgr.takeReceivedContent("alice", sid)).toBeNull();
-    // But the durable transcript is intact — the tree reloads from SQLite with the
-    // same root, proving eviction dropped only the in-memory cache, not durable state.
+    // The durable transcript is intact — the tree reloads from SQLite with the same root, proving
+    // eviction dropped only the in-memory cache, not durable state.
+    //
+    // (This used to also assert the in-memory plaintext buffer was gone. That buffer had no reader
+    // in production and was deleted; the surviving half — that teardown does not touch what is
+    // durable — is the half that was ever load-bearing.)
     expect(mgr.getSessionTreeRootHex("alice", sid)).toBe(persistedRoot);
   });
 
@@ -860,7 +857,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     const c1 = new TextEncoder().encode("m1");
     expect((await mgr.ingestReceivedContent("alice", sid, c1, msgLeafHash(c1))).ok).toBe(true);
     expect(mgr.getSessionTree("alice", sid).size()).toBe(1);
-    expect(mgr.takeReceivedContent("alice", sid)).not.toBeNull();
+    expect(receivedCount(mgr, "alice", sid)).toBe(1);
 
     // Freeze: the seal commitment advances the session out of 'active'.
     mgr.persistSealInterruptedCommitment({ agentName: "alice",
@@ -876,8 +873,8 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     expect(res.ok).toBe(false);
     expect(mgr.getSessionTree("alice", sid).size()).toBe(1);
     expect(mgr.getSessionTreeRootHex("alice", sid)).toBe(rootAfterCommit);
-    // No content buffered from the rejected frame.
-    expect(mgr.takeReceivedContent("alice", sid)).toBeNull();
+    // Nothing from the rejected frame reached the agent — the count is still the one live message.
+    expect(receivedCount(mgr, "alice", sid)).toBe(1);
   });
 
   // ── round-2 finding #7: message_count must track the daemon-owned tree across an

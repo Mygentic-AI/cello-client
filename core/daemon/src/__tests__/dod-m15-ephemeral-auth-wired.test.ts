@@ -42,6 +42,7 @@ import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import { encodeCbor } from "@cello-protocol/protocol-types";
 import * as lp from "it-length-prefixed";
+import { receivedCount, receivedRows } from "./helpers/received-rows.js";
 
 /** The lp-framed CBOR a content stream actually carries. */
 function framed(frame: Record<string, unknown>): Uint8Array {
@@ -174,18 +175,16 @@ describe("DOD-M15-EPHEMERAL-AUTH-1: the real exchange, over a real connection", 
       "the send PARKED instead of going direct — `ok` alone covers parked, so asserting it would pass for a message that never crossed the connection",
     ).toBe(true);
 
-    const received = await pollFor(() => B.manager.takeReceivedContent("bob", SID));
+    const received = await pollFor(() => receivedRows(B.manager, "bob", SID)[0] ?? null);
     expect(received, "the message never arrived at B").not.toBeNull();
-    // The buffer holds the PLAINTEXT as hex — decrypted on the way in, exactly as every reader
-    // downstream expects it. Comparing the hex proves the bytes, not just a length.
+    // B's transcript holds the PLAINTEXT — decrypted on the way in, exactly as every reader
+    // downstream expects it. The BYTES are compared, not the length: a truncated or re-encoded
+    // decrypt has the wrong bytes and the right shape.
     expect(
-      Buffer.from((received as { contentHex: string }).contentHex, "hex").toString("utf8"),
-      "B decrypted to something other than what A sent",
-    ).toBe(text);
-    expect(
-      (received as { contentHex: string }).contentHex,
-      "and it is the plaintext that was buffered, not the sealed form",
+      Buffer.from(received!.text, "utf8").toString("hex"),
+      "B stored something other than the exact bytes A sent",
     ).toBe(Buffer.from(content).toString("hex"));
+    expect(received!.text, "B decrypted to something other than what A sent").toBe(text);
   }, 60_000);
 
   it("★★ the BYTES ON THE WIRE are ciphertext — asserted on the FRAME B actually received", async () => {
@@ -207,7 +206,7 @@ describe("DOD-M15-EPHEMERAL-AUTH-1: the real exchange, over a real connection", 
     const text = "a sentence a relay must not be able to read";
     const content = new TextEncoder().encode(text);
     await A.manager.sendContent("alice", SID, content, msgLeafHash(content), "corr-wire", LEAF_KIND_MSG);
-    await pollFor(() => B.manager.takeReceivedContent("bob", SID));
+    await pollFor(() => receivedCount(B.manager, "bob", SID) >= 1 || null);
 
     const frame = seen.find((f) => f["type"] === "content_frame");
     expect(frame, "B never saw a content frame — nothing to assert about the wire").toBeDefined();
@@ -421,11 +420,7 @@ describe("DOD-M15-EPHEMERAL-AUTH-1: the real exchange, over a real connection", 
       B.events.find((e) => e.event === "session.content.refused") ?? null);
     expect(refused, "a frame with no encryption marker was read as plaintext").not.toBeNull();
     expect(refused!.context["reason"]).toBe("content_encryption_absent_or_unknown");
-    const delivered = B.manager.takeReceivedContent("bob", SID);
-    expect(
-      delivered === null || delivered.length === 0,
-      "a refused frame must deliver nothing",
-    ).toBe(true);
+    expect(receivedCount(B.manager, "bob", SID), "a refused frame must deliver nothing").toBe(0);
   }, 60_000);
 
   it("★★ a body encrypted under a DIFFERENT key is refused unread", async () => {
@@ -443,7 +438,6 @@ describe("DOD-M15-EPHEMERAL-AUTH-1: the real exchange, over a real connection", 
     const refused = await pollFor(() =>
       B.events.find((e) => e.event === "session.content.refused" && e.context["reason"] === "decrypt_failed") ?? null);
     expect(refused, "a body under the wrong key was accepted").not.toBeNull();
-    const got = B.manager.takeReceivedContent("bob", SID);
-    expect(got === null || got.length === 0, "a refused frame must deliver nothing").toBe(true);
+    expect(receivedCount(B.manager, "bob", SID), "a refused frame must deliver nothing").toBe(0);
   }, 60_000);
 });

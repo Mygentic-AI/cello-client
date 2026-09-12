@@ -26,6 +26,7 @@ import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
 import type { SecurityGatewayClient, ScreenVerdict } from "@cello-protocol/gateway";
+import { receivedCount, receivedRows } from "./helpers/received-rows.js";
 
 function makeLogger(): Logger {
   return { debug() {}, info() {}, warn() {}, error() {} };
@@ -126,7 +127,7 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
     expect(res.ok).toBe(false);
     expect((res as { reason: string }).reason).toBe("test_block");
     expect(gw.inbound).toBe(1); // the funnel screened it
-    expect(mgr.takeReceivedContent("alice", SID)).toBeNull(); // never reached the agent buffer
+    expect(receivedCount(mgr, "alice", SID), "never reached the agent").toBe(0);
     expect(mgr.getSessionTree("alice", SID).size()).toBe(0); // no leaf for blocked transient content
   });
 
@@ -143,7 +144,7 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
     expect(res.ok).toBe(false);
     expect(gw.inbound).toBe(1);
     expect(mgr.getSessionTree("alice", SID).size()).toBe(0);
-    expect(mgr.takeReceivedContent("alice", SID)).toBeNull();
+    expect(receivedCount(mgr, "alice", SID)).toBe(0);
   });
 
   it("release path: every delivered message is screened exactly once across hold + release", async () => {
@@ -164,8 +165,8 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
 
     expect(mgr.getSessionTree("alice", SID).size()).toBe(3);
     expect(gw.inbound).toBe(3);
-    const drained = [0, 1, 2].map(() => mgr.takeReceivedContent("alice", SID));
-    expect(drained.map((d) => d && Buffer.from(d!.contentHex, "hex").toString())).toEqual(["m0", "m1", "m2"]);
+    // All three reached the agent, IN ORDER — the held c2 released behind c1, not ahead of it.
+    expect(receivedRows(mgr, "alice", SID).map((r) => r.text)).toEqual(["m0", "m1", "m2"]);
   });
 
   it("B1: two concurrent ingests of the SAME content hash produce exactly ONE leaf (dedup survives the screen await)", async () => {
@@ -282,7 +283,7 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
       // The three D4a harms, each asserted directly.
       expect(mgr.findNextReceivedAfter("alice", SID, -1), "cello_receive's reader never sees it").toBeNull();
       expect(mgr.getSessionTree("alice", SID).size()).toBe(0);
-      expect(mgr.takeReceivedContent("alice", SID)).toBeNull();
+      expect(receivedCount(mgr, "alice", SID), "and it is not a RECEIVED row — quarantined is its own direction").toBe(0);
       // THE INVARIANT: no unread is minted for a session cello_receive cannot read.
       expect(mgr.getUnreadSummary("alice")).toHaveLength(0);
       // AC4: "unknown" was never papered in.
@@ -290,16 +291,27 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
     });
 
     it("regression: with a sessions row, ingest still delivers and attributes the sender from the record", async () => {
-      const { mgr } = await setupCapturing();
+      const { mgr, events } = await setupCapturing();
       // The session's starting point, seeded BEFORE the node exists — see `helpers/session-genesis.ts`.
       agreeSessionGenesis(SID, [{ mgr, agentName: "alice" }]);
       await mgr.createSessionNode(SID, "alice", "bobpubkey", "bob-peer-id", "corr-2");
       const content = enc("attributed message");
       const res = await mgr.ingestReceivedContent("alice", SID, content, msgLeafHash(content), "corr-2");
       expect(res.ok).toBe(true);
-      const entry = mgr.takeReceivedContent("alice", SID);
-      expect(entry).not.toBeNull();
-      expect(entry!.senderPubkey).toBe("bobpubkey"); // from the session record, never "unknown"
+      expect(receivedCount(mgr, "alice", SID)).toBe(1);
+      /**
+       * ⚠️ THIS ASSERTION MOVED AND IT IS NOT THE SAME ASSERTION. It used to read `senderPubkey` off
+       * the in-memory arrival entry and check it was "bobpubkey" rather than "unknown". That field
+       * went with the buffer, and it was the ONLY place that value was ever held — the transcript's
+       * `sender_pubkey` column is not written on this path, so nothing durable carries it.
+       *
+       * Production does not read it either: `cello_receive` attributes from the session RECORD's
+       * `counterparty_pubkey`. So what is asserted now is the thing production actually depends on,
+       * plus the absence of the event that fires when attribution falls through to "unknown" —
+       * which is the defect the original test was written against.
+       */
+      expect(mgr.getSessionRecord("alice", SID)?.counterparty_pubkey).toBe("bobpubkey");
+      expect(events.find((e) => e.event === "session.content.sender_unresolved")).toBeUndefined();
       expect(mgr.readTranscript("alice", SID).messages).toHaveLength(1);
     });
 
@@ -342,7 +354,7 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
     expect(gw.inbound).toBe(0); // the gateway was never consulted
     expect(routed).toBe(1); // the document layer got the frame
     expect(mgr.getSessionTree("alice", SID).size()).toBe(1); // the doc leaf was still taken
-    expect(mgr.takeReceivedContent("alice", SID)).toBeNull(); // never conversation content
+    expect(receivedCount(mgr, "alice", SID), "a document frame is never conversation content").toBe(0);
   });
 
   it("message: still takes the full gateway screen when the classifier says not-a-document", async () => {
