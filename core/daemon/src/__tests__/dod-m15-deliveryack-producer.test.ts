@@ -18,13 +18,13 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash, randomBytes } from "node:crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
-import { InMemoryKeyProvider, verifyDeliveryAck } from "@cello-protocol/crypto";
+import { InMemoryKeyProvider, verifyDeliveryAck, signDeliveryAck } from "@cello-protocol/crypto";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import { seedAgentKeys, wireAgentKeyProviders } from "./helpers/seed-agents.js";
 import { TEST_SESSION_GENESIS } from "./helpers/session-genesis.js";
 import {
-  decodeParkedDeliveryAck, parkedDeliveryAckMailboxHash, encodeParkEnvelope,
+  decodeParkedDeliveryAck, parkedDeliveryAckMailboxHash, encodeParkEnvelope, encodeParkedDeliveryAck,
 } from "../park-envelope.js";
 import { buildParkContentTbs } from "@cello-protocol/protocol-types";
 import type { Logger } from "../types.js";
@@ -97,9 +97,11 @@ describe("DELIVERYACK/producer: an acknowledgement with nowhere to go goes to th
     events: LogEvent[];
     bobPubHex: string;
     alicePubHex: string;
+    alicePub: Uint8Array;
     deposits: Deposit[];
     contentHash: Uint8Array;
     deliverFromMailbox: () => Promise<unknown>;
+    parkedAckFromCounterparty: () => Promise<{ envelope: Uint8Array; slot: Uint8Array }>;
   }> {
     const { logger, events } = makeLogger();
     const mgr = new SessionNodeManager({
@@ -159,7 +161,28 @@ describe("DELIVERYACK/producer: an acknowledgement with nowhere to go goes to th
     const deliverFromMailbox = (): Promise<unknown> =>
       mgr.recoverParkedEntry("alice", SID, alicePub, envelope, contentHash, "corr");
 
-    return { mgr, events, bobPubHex, alicePubHex, deposits, contentHash, deliverFromMailbox };
+    /**
+     * The same mailbox shape, carrying an ACKNOWLEDGEMENT from bob rather than a message — used to
+     * prove the recovery path recognises one and does not answer it.
+     */
+    const parkedAckFromCounterparty = async (): Promise<{ envelope: Uint8Array; slot: Uint8Array }> => {
+      const slot = parkedDeliveryAckMailboxHash(SID, contentHash);
+      const payload = encodeParkedDeliveryAck({
+        sessionIdHex: SID,
+        contentHash,
+        ackSig: await signDeliveryAck(bob, Buffer.from(SID, "hex"), contentHash),
+      });
+      return {
+        envelope: encodeParkEnvelope({
+          content: payload,
+          senderPubkey: new Uint8Array(Buffer.from(bobPubHex, "hex")),
+          parkSig: await bob.sign(buildParkContentTbs(SID, alicePub, slot)),
+        }),
+        slot,
+      };
+    };
+
+    return { mgr, events, bobPubHex, alicePubHex, alicePub, deposits, contentHash, deliverFromMailbox, parkedAckFromCounterparty };
   }
 
   it("★★★ with NO live session node, the acknowledgement is deposited — not abandoned", async () => {
@@ -230,6 +253,34 @@ describe("DELIVERYACK/producer: an acknowledgement with nowhere to go goes to th
     expect(a.deposits.length).toBe(1);
     expect(a.deposits[0]!.relayPeerId, "it must use the session's recorded relay").toBe("12D3KooWTestRelayPeerId");
     expect(decodeParkedDeliveryAck(a.deposits[0]!.content)).not.toBeNull();
+  });
+
+  it("★★★ AN ACKNOWLEDGEMENT IS NEVER ITSELF ACKNOWLEDGED — it terminates", async () => {
+    /**
+     * The order's own words: *"An ack is never itself acked. It terminates."* Two daemons that
+     * acknowledged each other's acknowledgements would talk forever without either operator sending
+     * anything, and every one of those would be a deposit in somebody's mailbox.
+     *
+     * It holds today because the acknowledgement branch returns before ingest, and therefore before
+     * the acknowledge-on-recovery call added by this unit. That is an ORDERING, which is exactly the
+     * kind of property a later refactor breaks silently — so it is pinned here rather than left to
+     * be re-derived by whoever moves that branch.
+     */
+    const a = await receivingAgent("no-ack-of-ack.db");
+    // First, prove the fixture WOULD deposit for a message — otherwise this test passes on nothing.
+    await a.deliverFromMailbox();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(a.deposits.length, "the control case must deposit, or the assertion below is vacuous").toBe(1);
+    a.deposits.length = 0;
+    a.events.length = 0; // ...and the event log too, or the assertion below reads the control case.
+
+    // Now deliver an ACKNOWLEDGEMENT through the very same mailbox path.
+    const parkedAck = await a.parkedAckFromCounterparty();
+    const res = await a.mgr.recoverParkedEntry("alice", SID, a.alicePub, parkedAck.envelope, parkedAck.slot, "corr");
+    await new Promise((r) => setTimeout(r, 50));
+    expect(res, "an acknowledgement must be recognised as one, not ingested as a message").toHaveProperty("deliveryAck");
+    expect(a.deposits.length, "an acknowledgement was acknowledged — the loop this rule exists to stop").toBe(0);
+    expect(a.events.some((e) => e.event === "content.delivery.ack.parked")).toBe(false);
   });
 
   it("★★★ with no relay recorded for the session, it is LOUD and says what the sender loses", async () => {
