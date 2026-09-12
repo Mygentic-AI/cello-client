@@ -355,12 +355,28 @@ describe("DOD-M12B-RESERVATION-RETRY-1: the backoff and the budget", () => {
       expect(n - seen, "sampling too coarse to measure the gaps — rerun; this is not a backoff failure").toBeLessThanOrEqual(1);
       while (seen < n) { at.push(Date.now() - started); seen += 1; }
     }
-    expect(at.length, "needs at least three retries to compare two gaps").toBeGreaterThanOrEqual(3);
+    expect(at.length, "needs at least four retries to compare the first gap with the last").toBeGreaterThanOrEqual(4);
 
+    /**
+     * FIRST GAP vs LAST, with a factor — not "each longer than the last".
+     *
+     * The adjacent comparison went red on 2026-09-12 with gaps of 59, 56, 124ms: the doubling was
+     * plainly there (56 → 124) and the FIRST gap had been inflated from ~30 to 59 by a sampling
+     * stall, three test suites being on the machine at once. The comment above already anticipates
+     * the coarse-sampling problem for one shape of it; this is the other shape, and a red that
+     * accuses the backoff of a scheduler stall is the false accusation that comment exists to stop.
+     *
+     * THE TEETH ARE INTACT, which is the only reason this is a tolerance and not a weakening. The
+     * waits are 30/60/120/240, so the last gap is EIGHT times the first, and a stall would have to
+     * inflate the first gap fourfold to reach the 2× bar. A flat interval — the mutant this test was
+     * written for, `now + retryMs` — gives a ratio of 1 and still fails.
+     */
     const gaps = at.slice(1).map((v, i) => v - at[i]!);
+    const first = gaps[0]!;
+    const last = gaps[gaps.length - 1]!;
     expect(
-      gaps[1]! > gaps[0]!,
-      `each wait must be longer than the last — got gaps ${gaps.join(", ")}ms. A flat interval passes every other test in this file.`,
+      last >= first * 2,
+      `the wait must GROW — got gaps ${gaps.join(", ")}ms, last/first = ${(last / first).toFixed(1)}x, need 2x. A flat interval passes every other test in this file.`,
     ).toBe(true);
   }, 30_000);
 

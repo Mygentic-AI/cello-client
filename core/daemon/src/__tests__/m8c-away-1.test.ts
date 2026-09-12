@@ -36,6 +36,9 @@ import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-man
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
 import { markAsAutoReply } from "../away-detection.js";
+// ONE definition of the go-nowhere node. It was inline here; DOD-M15-SEALPRECOND-1 needed the same
+// one for a two-daemon test and moved it to a helper rather than writing a second.
+import { FakeNode } from "./helpers/fake-relay-server.js";
 import { makeSignedAssignmentFrame, registerFixtureSigner, fixtureIdentity } from "./helpers/signed-assignment.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
@@ -54,24 +57,6 @@ function msgLeafHash(content: Uint8Array): Uint8Array {
   return new Uint8Array(createHash("sha256").update(new Uint8Array([0x00])).update(content).digest());
 }
 
-class FakeNode implements Partial<CelloNode> {
-  readonly #peerId = `fake-${Math.random().toString(36).slice(2)}`;
-  async start(): Promise<void> {}
-  async stop(): Promise<void> {}
-  getPeerId(): string { return this.#peerId; }
-  listenAddresses(): string[] { return ["/ip4/127.0.0.1/tcp/0"]; }
-  async dial(_a: string): Promise<{ peerId: string }> { return { peerId: "remote" }; }
-  async handle(_p: string, _h: unknown): Promise<void> {}
-  getProtocols(): string[] { return []; }
-  getConnections(): Array<{ peerId: string; encryption: string | undefined }> { return []; }
-  onPeerConnect(_h: (p: string) => void): void {}
-  onPeerDisconnect(_h: (p: string) => void): void {}
-  getDialability(): { dialable: boolean; publicAddr: string | null } { return { dialable: false, publicAddr: null }; }
-  onDialabilityChange(_l: (d: { dialable: boolean; publicAddr: string | null }) => void): () => void { return () => {}; }
-  async newStream(_peer: string, _proto: string): Promise<Stream> {
-    return { send() {}, async close() {}, abort() {}, status: "open" } as unknown as Stream;
-  }
-}
 class FixedFactory implements ISessionNodeFactory {
   constructor(private node: CelloNode) {}
   async createNode(_c: SessionNodeConfig): Promise<CelloNode> { return this.node; }

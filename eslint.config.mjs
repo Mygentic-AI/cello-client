@@ -291,7 +291,13 @@ export default [
     // agent", which lives in the composition root because it needs the per-connection selections AND
     // the explicit offline switch and neither owns the other. Both lines are the measured cost of
     // one named unit, not headroom, on the bound the 055-ONDEMAND note above sets.
-    rules: { "max-lines": ["error", { max: 3372, skipBlankLines: false, skipComments: false }] },
+    //
+    // ⚠️ AND DOD-M15-SEALPRECOND-1, +15 measured on top of both of the above: the map of our own
+    // leaves the relay has ordered and this tree has not placed, its wiring into the two contexts
+    // that read it, its eviction on teardown, and one delegator. It is what stops a close signing a
+    // root the relay's leaf set can never match, which cost a receipt on both sides on 2026-09-11.
+    // Same bound as its neighbours; only ever shrinks.
+    rules: { "max-lines": ["error", { max: 3387, skipBlankLines: false, skipComments: false }] },
   },
   {
     // 040-DAEMONROOT, lowered every unit; the target is under 1,000 and this pin is what stops the
@@ -400,7 +406,11 @@ export default [
   },
   {
     files: ["core/daemon/src/attendance-wiring.ts"],
-    rules: { "max-lines": ["error", { max: 479, skipBlankLines: false, skipComments: false }] },
+    // 479 → 260 on the 066/067 merge. 066-AWAYSCOPE deleted the away responder's reply on accepted
+    // sessions, which took the whole one-shot seal block with it, and 067's settle wait went with
+    // it — the precondition now holds inside `submitSealLeaf`, so no caller carries a copy. A
+    // ratchet only ever shrinks, and this is the shrink.
+    rules: { "max-lines": ["error", { max: 260, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/signaling-wiring.ts"],
@@ -457,11 +467,21 @@ export default [
   },
   {
     files: ["core/daemon/src/session-content-send.ts"],
-    rules: { "max-lines": ["error", { max: 1352, skipBlankLines: false, skipComments: false }] },
+    // 1,352 → 1,408 (DOD-M15-SEALPRECOND-1, +56): the marker for an own leaf the relay has ORDERED
+    // and this tree has not placed — set at the assignment site, cleared in `placeOwnLeaf`. It is
+    // the state the seal gate had no term for, and a close landing inside that window signed a
+    // root no directory could verify and cost a receipt permanently on both sides. Measured cost
+    // of one named unit after its prose was compressed once; only ever shrinks from here.
+    rules: { "max-lines": ["error", { max: 1408, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/session-seal.ts"],
-    rules: { "max-lines": ["error", { max: 1112, skipBlankLines: false, skipComments: false }] },
+    // 1,112 → 1,206 (DOD-M15-SEALPRECOND-1, +94): the fourth term in `sealReadiness`, its own state
+    // on the status surface, the settle wait on the responder auto-acknowledge — the one seal
+    // submission site that had no gate at all — and, after the unit review, the refusal inside
+    // `submitSealLeaf` that makes the precondition hold by construction for every seal site rather
+    // than by a hand-kept enumeration. Same bound as above; only ever shrinks.
+    rules: { "max-lines": ["error", { max: 1206, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/*/src/__tests__/**/*.ts"],

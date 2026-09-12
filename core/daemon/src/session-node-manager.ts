@@ -763,6 +763,14 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
   // not trust the counterparty for ordering). When B has no witness for an arriving hash
   // (relay-degraded), it falls back to arrival-order append.
   #witnessedSeq = new Map<string, Map<string, number>>();
+  /**
+   * DOD-M15-SEALPRECOND-1 — our OWN leaves the relay has ordered and this tree has not yet placed,
+   * keyed #k(agent,session) -> (contentHashHex -> assigned leaf index). `#witnessedSeq` above holds
+   * only the COUNTERPARTY's, so nothing in the seal gate could see a send of ours between the relay
+   * assigning its sequence and `placeOwnLeaf` writing it — the window the 2026-09-11 close signed
+   * a two-leaf root inside, losing the receipt for both sides.
+   */
+  #ownLeavesOrdered = new Map<string, Map<string, number>>();
   // DOD-MSG-4: out-of-order direct arrivals. A content frame whose canonical sequence is AHEAD of
   // the next expected leaf is HELD here (keyed #k(agent,session) -> (canonicalSeq -> entry)) instead
   // of being appended out of order. Once the missing in-between sequence(s) land (recovered from the
@@ -1221,6 +1229,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       awaitingAck: this.#awaitingAck,
       heldContent: this.#heldContent,
       witnessedSeq: this.#witnessedSeq,
+      ownLeavesOrdered: this.#ownLeavesOrdered,
       leafFetchTimers: this.#leafFetchTimers,
       lastAck: this.#lastAck,
       resolvedContent: this.#resolvedContent,
@@ -1344,6 +1353,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       activeNodes: this.#activeNodes,
       heldContent: this.#heldContent,
       witnessedSeq: this.#witnessedSeq,
+      ownLeavesOrdered: this.#ownLeavesOrdered,
       highWaterSeq: this.#highWaterSeq,
       orderingObserved: this.#orderingObserved,
       contentDesynced: this.#contentDesynced,
@@ -1889,6 +1899,9 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     // DOD-MSG-4: drop the strict-in-order bookkeeping (witness map, held plaintext, high-water)
     // so a torn-down session retains no stale ordering state or buffered plaintext.
     this.#witnessedSeq.delete(key);
+    // DOD-M15-SEALPRECOND-1: a marker cannot outlive the node that would have placed it, or a
+    // revived session's every close is refused for a send that can no longer land.
+    this.#ownLeavesOrdered.delete(key);
     /**
      * DOD-M15-SEALWIRE-1 bullet 6 (part A) — both salt maps are CACHES and both go.
      *
@@ -2527,6 +2540,8 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     return this.#contentOut.sendContent(...args);
   }
 
+  /** DOD-M15-SEALPRECOND-1 — see SessionContentSender.noteOwnLeafOrdered. */
+  noteOwnLeafOrdered(...args: Parameters<SessionContentSender["noteOwnLeafOrdered"]>): ReturnType<SessionContentSender["noteOwnLeafOrdered"]> { return this.#contentOut.noteOwnLeafOrdered(...args); }
   placeOwnLeaf(...args: Parameters<SessionContentSender["placeOwnLeaf"]>): ReturnType<SessionContentSender["placeOwnLeaf"]> { return this.#contentOut.placeOwnLeaf(...args); }
 
 
