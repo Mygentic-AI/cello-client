@@ -42,6 +42,9 @@ import { encodeCbor, decodeCbor } from "./cbor.js";
  * governance frontier at authoring — inside the signed preimage. It is the content's causal
  * link to the governance that made it admissible; the per-envelope epoch stamp it replaces is
  * deleted by the same phase. No compatibility owed: nothing was published between bumps.
+ *
+ * The epoch rule the deleted stamp carried is still the rule and is kept here because its own
+ * member is gone: V1 has exactly ONE epoch, and compaction — which is what mints new ones — is V2.
  */
 export const DOCUMENT_UPDATE_DOMAIN = "CELLO-DOCUMENT-UPDATE-v3";
 
@@ -51,8 +54,6 @@ export const DOCUMENT_UPDATE_DOMAIN = "CELLO-DOCUMENT-UPDATE-v3";
  * document, not an error.
  */
 export const DOCUMENT_UPDATE_ENCODING_V1 = "yjs-v1";
-
-/** V1 has exactly one epoch. Compaction (which mints new epochs) is V2. */
 
 /** A 32-byte hex digest — the shape of `document_id` and of every chain link. */
 const HEX32 = /^[0-9a-f]{64}$/;
