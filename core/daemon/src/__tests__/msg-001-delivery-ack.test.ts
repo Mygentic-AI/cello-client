@@ -204,7 +204,7 @@ describe("MSG-001: delivery ACK / TTF (daemon)", () => {
     const recorded = a.events.find((e) => e.event === "content.delivery.ack.recorded");
     expect(recorded, "the sender must keep the receiver's signature, not just verify it").toBeTruthy();
     expect(recorded?.context.signerPubkey).toBe(bobPub);
-    const facts = readDeliveryFacts(mgrA.getDb(), mgrA.resolveAgentId("alice"), SID);
+    const facts = readDeliveryFacts(mgrA.getDb(), a.logger, mgrA.resolveAgentId("alice"), SID);
     expect(facts.length).toBe(1);
     expect(facts[0]?.acknowledged?.signer_pubkey).toBe(bobPub);
     expect(facts[0]?.acknowledged?.signature.length).toBe(128); // 64 bytes, hex

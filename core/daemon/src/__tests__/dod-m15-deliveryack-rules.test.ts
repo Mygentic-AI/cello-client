@@ -120,6 +120,7 @@ describe("DELIVERYACK: the five rules, on the inbound path", () => {
   async function sendingAgent(dbName: string): Promise<{
     mgr: SessionNodeManager;
     node: LoneNode;
+    logger: Logger;
     events: LogEvent[];
     bob: InMemoryKeyProvider;
     bobPubHex: string;
@@ -160,7 +161,7 @@ describe("DELIVERYACK: the five rules, on the inbound path", () => {
           ...(over.sig === undefined ? {} : { ack_sig: over.sig }),
         }),
       );
-    return { mgr, node, events, bob, bobPubHex, hash, ack };
+    return { mgr, node, logger, events, bob, bobPubHex, hash, ack };
   }
 
   /** The protocol state rule 5 is about: still awaiting, nothing fired, nothing kept. */
@@ -170,7 +171,7 @@ describe("DELIVERYACK: the five rules, on the inbound path", () => {
   } {
     return {
       acked: a.events.some((e) => e.event === "content.delivery.acked"),
-      heldAcks: readDeliveryFacts(a.mgr.getDb(), a.mgr.resolveAgentId("alice"), SID).filter((f) => f.acknowledged !== null).length,
+      heldAcks: readDeliveryFacts(a.mgr.getDb(), a.logger, a.mgr.resolveAgentId("alice"), SID).filter((f) => f.acknowledged !== null).length,
     };
   }
 
@@ -179,7 +180,7 @@ describe("DELIVERYACK: the five rules, on the inbound path", () => {
     a.node.invokeHandler(a.ack({ sig: await signDeliveryAck(a.bob, Buffer.from(SID, "hex"), a.hash) }), COUNTERPARTY_PEER);
     await settle();
     expect(stateAfter(a)).toEqual({ acked: true, heldAcks: 1 });
-    const kept = readDeliveryFacts(a.mgr.getDb(), a.mgr.resolveAgentId("alice"), SID)[0]!;
+    const kept = readDeliveryFacts(a.mgr.getDb(), a.logger, a.mgr.resolveAgentId("alice"), SID)[0]!;
     expect(kept.acknowledged?.signer_pubkey).toBe(a.bobPubHex);
     expect(kept.acknowledged?.asserted_by).toBe("recipient");
   });
@@ -208,7 +209,7 @@ describe("DELIVERYACK: the five rules, on the inbound path", () => {
     );
     await settle();
     expect(stateAfter(a)).toEqual({ acked: false, heldAcks: 0 });
-    expect(a.events.find((e) => e.event === "content.delivery.ack.discarded")?.context.reason).toBe("not_awaiting");
+    expect(a.events.find((e) => e.event === "content.delivery.ack.discarded")?.context.reason).toBe("not_sent_here");
   });
 
   it("★★★ RULE 5: a MISSING signature and a MALFORMED one leave the protocol in exactly the state an ABSENT acknowledgement does", async () => {
@@ -261,16 +262,98 @@ describe("DELIVERYACK: the five rules, on the inbound path", () => {
     const sig = await signDeliveryAck(a.bob, Buffer.from(SID, "hex"), a.hash);
     a.node.invokeHandler(a.ack({ sig }), COUNTERPARTY_PEER);
     await settle();
-    const first = readDeliveryFacts(a.mgr.getDb(), a.mgr.resolveAgentId("alice"), SID);
+    const first = readDeliveryFacts(a.mgr.getDb(), a.logger, a.mgr.resolveAgentId("alice"), SID);
     const ackedCount = () => a.events.filter((e) => e.event === "content.delivery.acked").length;
     expect(ackedCount()).toBe(1);
 
     for (let i = 0; i < 20; i++) a.node.invokeHandler(a.ack({ sig }), COUNTERPARTY_PEER);
     await settle();
     // Twenty replays: one row, one acked event, and the stored signature unchanged.
-    expect(readDeliveryFacts(a.mgr.getDb(), a.mgr.resolveAgentId("alice"), SID)).toEqual(first);
+    expect(readDeliveryFacts(a.mgr.getDb(), a.logger, a.mgr.resolveAgentId("alice"), SID)).toEqual(first);
     expect(ackedCount()).toBe(1);
     expect(a.events.filter((e) => e.event === "content.delivery.ack.recorded").length).toBe(1);
+  });
+
+  it("★★★ RULE 2: the bind is DURABLE — an acknowledgement that arrives after the fallback window still counts", async () => {
+    /**
+     * THE FINDING THIS TEST EXISTS FOR. The bind used to be "are we still awaiting one", and the
+     * awaiting entry lives for the time-to-fallback — twenty seconds — after which the message
+     * parks and the entry is deleted. So the message that was hardest to deliver, the one that had
+     * to be parked and recovered, is precisely the one whose acknowledgement arrived too late to be
+     * kept. That is the opposite of the point of the unit.
+     *
+     * The shape here is that late arrival with nothing else moving: a hash with a durable
+     * sent-direction record and NO awaiting entry. It must be accepted.
+     */
+    const a = await sendingAgent("rule2-durable.db");
+    const lateHash = msgLeafHash(new TextEncoder().encode("sent long ago, acknowledged just now"));
+    const lateHex = Buffer.from(lateHash).toString("hex");
+    const db = a.mgr.getDb();
+    const agentId = a.mgr.resolveAgentId("alice");
+    db.prepare(
+      "INSERT INTO session_tree_leaves (agent_id, session_id, leaf_index, leaf_kind, leaf_hash_hex, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    ).run(agentId, SID, 7, "msg", lateHex, Date.now());
+    db.prepare(
+      "INSERT INTO transcript (agent_id, session_id, sequence, direction, blob, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    ).run(agentId, SID, 7, "sent", Buffer.from("sent long ago, acknowledged just now"), Date.now());
+
+    // No awaiting entry for this hash — that window is long gone.
+    a.node.invokeHandler(
+      a.ack({ hash: lateHash, sig: await signDeliveryAck(a.bob, Buffer.from(SID, "hex"), lateHash) }),
+      COUNTERPARTY_PEER,
+    );
+    await settle();
+    const kept = readDeliveryFacts(a.mgr.getDb(), a.logger, agentId, SID).find((f) => f.content_hash === lateHex);
+    expect(
+      kept?.acknowledged?.signer_pubkey,
+      "an acknowledgement for a message this side durably sent must be kept even with no live timer",
+    ).toBe(a.bobPubHex);
+    expect(kept?.seq).toBe(7);
+  });
+
+  it("★★★ RULE 1: with NO usable recorded key for the counterparty, there is nothing to check against and the ack is discarded", async () => {
+    /**
+     * The guard that produces an EMPTY participant list. It is reachable in production: a session
+     * whose recorded counterparty value is not a 64-hex key (a legacy or half-written row) has
+     * nothing an acknowledgement can be checked against — and the one thing that must never happen
+     * there is falling back to a key carried in the frame, which would prove only that somebody
+     * owns a keypair.
+     */
+    const node = new LoneNode();
+    const { logger, events } = makeLogger();
+    const mgr = new SessionNodeManager({
+      securityGateway: new PassthroughGatewayClient(),
+      factory: new ControlledFactory(node as unknown as CelloNode),
+      logger,
+      dbPath: join(tempDir, "rule1-nokey.db"),
+      contentTtfMs: 60_000,
+    });
+    await mgr.initialize();
+    managers.push(mgr);
+    await seedAgentKeys(mgr.getDb(), ["alice"]);
+    await wireAgentKeyProviders(mgr, mgr.getDb());
+    mgr.setSessionGenesisForTest("alice", SID, TEST_SESSION_GENESIS);
+    // NOT a 64-hex key — the shape the regex refuses.
+    await mgr.createSessionNode(SID, "alice", "bobpk", COUNTERPARTY_PEER, "corr");
+    mgr.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
+    const content = new TextEncoder().encode("to a session with no usable counterparty key");
+    const hash = msgLeafHash(content);
+    expect((await mgr.sendContent("alice", SID, content, hash, "corr", LEAF_KIND_MSG)).ok).toBe(true);
+
+    const bob = new InMemoryKeyProvider(new Uint8Array(randomBytes(32)));
+    node.invokeHandler(
+      lp.encode.single(CBOR_ENC.encode({
+        type: "content_delivery_ack", session_id: SID, content_hash: hash, level: "persisted",
+        ack_sig: await signDeliveryAck(bob, Buffer.from(SID, "hex"), hash),
+      })),
+      COUNTERPARTY_PEER,
+    );
+    await settle();
+    expect(events.some((e) => e.event === "content.delivery.acked")).toBe(false);
+    expect(events.find((e) => e.event === "content.delivery.ack.discarded")?.context.reason)
+      .toBe("delivery_ack_no_participant_keys");
+    expect(readDeliveryFacts(mgr.getDb(), logger, mgr.resolveAgentId("alice"), SID)
+      .filter((f) => f.acknowledged !== null).length).toBe(0);
   });
 
   it("★★★ RULE 4: a flood of BAD acknowledgements cannot make this machine shout — one loud line per message", async () => {
@@ -317,7 +400,7 @@ describe("DELIVERYACK: the five rules, on the inbound path", () => {
     const a = await sendingAgent("facts.db");
     a.node.invokeHandler(a.ack({ sig: await signDeliveryAck(a.bob, Buffer.from(SID, "hex"), a.hash) }), COUNTERPARTY_PEER);
     await settle();
-    const [fact] = readDeliveryFacts(a.mgr.getDb(), a.mgr.resolveAgentId("alice"), SID);
+    const [fact] = readDeliveryFacts(a.mgr.getDb(), a.logger, a.mgr.resolveAgentId("alice"), SID);
     expect(fact).toBeTruthy();
     // Three independent slots. Acknowledged is present; the two relay-asserted facts are not held
     // by this side and read null — reported as missing, with nothing inferred from it.
@@ -325,7 +408,13 @@ describe("DELIVERYACK: the five rules, on the inbound path", () => {
       ["acknowledged", "content_hash", "delivered", "ordered", "seq"],
     );
     expect(fact!.ordered).toBeNull();
-    expect(fact!.delivered).toBeNull();
+    // `delivered` is present in SHAPE and absent in FACT, and it names who would assert it — so a
+    // reader can tell "nobody holds this" from "the relay said no". A bare null could not.
+    expect(fact!.delivered).toEqual({
+      asserted_by: "relay",
+      held: false,
+      why_absent: expect.stringContaining("never tells the sender"),
+    });
     expect(fact!.acknowledged).not.toBeNull();
     // No derived verdict anywhere in the payload: nothing that reads as a status or a score.
     const rendered = JSON.stringify(fact);

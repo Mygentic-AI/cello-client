@@ -22,22 +22,35 @@ import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
 
 /**
- * DOD-M15-DELIVERYACK-1 rule 2 — is this a hash we sent in this session and are still awaiting an
- * acknowledgement for?
+ * DOD-M15-DELIVERYACK-1 rule 2 — did THIS side send this message in THIS session?
  *
- * The bind check, and the thing that bounds the whole path: `awaitingAck` is populated only by our
- * OWN sends and each entry is consumed on the first accepted acknowledgement, so the number a
- * session can ever record is the number of messages this side sent in it. A counterparty cannot
- * make this side allocate anything by sending acknowledgements.
+ * ⚠️ THIS USED TO ASK "are we still awaiting an acknowledgement for it", AND THAT CLOSED THE
+ * EVIDENCE WINDOW ON EXACTLY THE DISPUTES THE UNIT EXISTS TO SETTLE. `awaitingAck` is in memory and
+ * its entries live for the time-to-fallback — 20 seconds by default — after which the timer fires,
+ * the content parks, and the entry is deleted. So: A sends, B is offline or slow, A parks the
+ * message, B comes back, recovers it, ingests it and signs. A threw the acknowledgement away as
+ * `not_awaiting` and kept nothing. **The message that was hardest to deliver is the one A ends up
+ * with no proof for**, which is the opposite of the point. A daemon restart in between did the same.
+ *
+ * So the bind is now DURABLE: the sent-direction transcript row and its leaf, which say this side
+ * put these bytes on the wire in this session and survive both the timer and a restart. The
+ * in-memory map stays as a first answer for the ordinary case where the acknowledgement comes back
+ * in milliseconds and the durable rows may not be visible yet.
+ *
+ * It is still a bound the counterparty cannot spend: both sources are written only by our OWN
+ * sends, so the number of acknowledgements a session can record is the number of messages this side
+ * sent in it. What changed is that the window is the conversation rather than twenty seconds.
  */
-function isAwaitingAck(
+function weSentThisMessage(
   ctx: SessionContentPipelineContext,
   agentName: string,
   sessionId: string,
   contentHash: Uint8Array,
 ): boolean {
+  const hashHex = Buffer.from(contentHash).toString("hex");
   const bySession = ctx.awaitingAck.get(ctx.sessionKey(agentName, sessionId));
-  return bySession?.has(Buffer.from(contentHash).toString("hex")) === true;
+  if (bySession?.has(hashHex) === true) return true;
+  return ctx.records.hasSentContentHash(agentName, sessionId, hashHex);
 }
 
 /**
@@ -233,14 +246,13 @@ export function onDeliveryAck(
   const hashHex = Buffer.from(contentHash).toString("hex");
   // RULE 2 — bound. Cheapest check, and it is what bounds everything below: an ack naming a hash
   // we never sent (or already recorded) allocates nothing and is gone here.
-  if (!isAwaitingAck(ctx, agentName, sessionId, contentHash)) {
+  if (!weSentThisMessage(ctx, agentName, sessionId, contentHash)) {
     ctx.logger.debug("content.delivery.ack.discarded", {
       agentName, sessionId, contentHash: hashHex, correlationId,
-      reason: "not_awaiting",
+      reason: "not_sent_here",
       impact:
-        "an acknowledgement arrived for a message this side is not awaiting one for — it was " +
-        "never sent in this session, or it was already acknowledged, or its fallback window had " +
-        "already expired and the message parked. Discarded; nothing is concluded from it",
+        "an acknowledgement arrived naming a message this side has no record of sending in this " +
+        "session. Discarded; nothing is concluded from it",
     });
     return;
   }
@@ -277,7 +289,7 @@ export function onDeliveryAck(
      * spend.
      */
     const awaiting = ctx.awaitingAck.get(ctx.sessionKey(agentName, sessionId))?.get(hashHex);
-    const firstForThisMessage = awaiting?.ackRefusalLogged !== true;
+    const firstForThisMessage = awaiting !== undefined && awaiting.ackRefusalLogged !== true;
     if (awaiting) awaiting.ackRefusalLogged = true;
     ctx.logger[firstForThisMessage ? "warn" : "debug"]("content.delivery.ack.discarded", {
       agentName, sessionId, contentHash: hashHex, correlationId,
@@ -289,10 +301,18 @@ export function onDeliveryAck(
     });
     return;
   }
-  // RULE 3 — evidence, and nothing else. Recorded BEFORE the timer is resolved so a write failure
-  // cannot leave the sender believing it holds a proof it does not.
-  // `rawSig` is a Uint8Array whenever the verdict is ok — the verifier refuses `undefined`.
-  ctx.records.recordDeliveryAck(
+  /**
+   * RULE 3 AND RULE 4 — evidence, and nothing else, exactly once.
+   *
+   * Recorded BEFORE the timer is resolved, so a write failure cannot leave the sender believing it
+   * holds a proof it does not. The WRITE is what makes this idempotent now that the bind is durable:
+   * a replay finds the row already there, `INSERT OR IGNORE` keeps the first one, and the caller is
+   * told nothing was written — so no second `content.delivery.acked`, no second log line, and a
+   * counterparty replaying an acknowledgement ten thousand times moves nothing at all.
+   *
+   * `rawSig` is a Uint8Array whenever the verdict is ok — the verifier refuses `undefined`.
+   */
+  const wrote = ctx.records.recordDeliveryAck(
     agentName,
     sessionId,
     hashHex,
@@ -300,6 +320,16 @@ export function onDeliveryAck(
     rawSig as Uint8Array,
     correlationId,
   );
+  if (!wrote) {
+    ctx.logger.debug("content.delivery.ack.discarded", {
+      agentName, sessionId, contentHash: hashHex, correlationId,
+      reason: "already_recorded",
+      impact:
+        "this acknowledgement is one this side already holds. Discarded as a duplicate; the first " +
+        "one recorded stands and nothing changed",
+    });
+    return;
+  }
   resolveAwaitingAck(agentName, sessionId, contentHash);
 }
 
@@ -325,10 +355,10 @@ export function storeDeliveryAck(
     signature: Uint8Array;
     correlationId?: string;
   },
-): void {
+): boolean {
   const { agentId, agentName, sessionId, contentHashHex, signerPubkeyHex, signature, correlationId } = a;
   try {
-    db
+    const info = db
       .prepare(
         `INSERT OR IGNORE INTO delivery_acks
            (agent_id, session_id, content_hash_hex, signer_pubkey, signature, recorded_at)
@@ -342,9 +372,13 @@ export function storeDeliveryAck(
         Buffer.from(signature),
         Date.now(),
       );
-    logger.info("content.delivery.ack.recorded", {
-      agentName, sessionId, contentHash: contentHashHex, signerPubkey: signerPubkeyHex, correlationId,
-    });
+    const wrote = Number(info.changes) > 0;
+    if (wrote) {
+      logger.info("content.delivery.ack.recorded", {
+        agentName, sessionId, contentHash: contentHashHex, signerPubkey: signerPubkeyHex, correlationId,
+      });
+    }
+    return wrote;
   } catch (err: unknown) {
     logger.error("content.delivery.ack.record.failed", {
       agentName, sessionId, contentHash: contentHashHex, correlationId,
@@ -357,6 +391,7 @@ export function storeDeliveryAck(
         "This is a LOCAL storage fault. If it repeats, check free disk space and that the " +
         "agent's database is writable; the acknowledgement cannot be re-requested afterwards.",
     });
+    return false;
   }
 }
 
@@ -382,20 +417,43 @@ export function storeDeliveryAck(
  */
 export function readDeliveryFacts(
   db: DaemonDatabase,
+  logger: Logger,
   agentId: string,
   sessionId: string,
 ): Array<{
   seq: number | null;
   content_hash: string;
   ordered: { asserted_by: "relay"; relay_id: string; relay_timestamp: number; signature: string } | null;
-  delivered: null;
+  delivered: { asserted_by: "relay"; held: false; why_absent: string };
   acknowledged: { asserted_by: "recipient"; signer_pubkey: string; signature: string; recorded_at: number } | null;
 }> {
+  /**
+   * ⚠️ AN EMPTY PUBKEY HERE WOULD BLANK EVERY `ordered` FACT IN THE RECEIPT, and silently.
+   *
+   * The relay receipts are scoped by this agent's own key, so `?? ""` would match no rows and every
+   * message would report `ordered: null` — indistinguishable from a relay that never countersigned
+   * anything. The caller has already resolved the agent id, so the row must exist; an empty value
+   * is a LOCAL fault and it says so rather than answering with a plausible emptiness.
+   */
   const agentPubkey = (
     db.prepare("SELECT k_local_pubkey FROM agents WHERE agent_id = ?").get(agentId) as
       | { k_local_pubkey: string }
       | undefined
   )?.k_local_pubkey ?? "";
+  if (!agentPubkey) {
+    logger.error("session.delivery.facts.agent_pubkey_missing", {
+      agentId,
+      sessionId,
+      impact:
+        "this receipt will report every message as NOT ordered by the relay, although the relay " +
+        "may well have ordered them — the relay's records are keyed by this agent's own public " +
+        "key and this machine could not find it. Read the absence of `ordered` here as unknown, " +
+        "not as a fact about the relay",
+      guidance:
+        "This is a LOCAL fault: the agent row exists but carries no identity key. Check " +
+        "cello_status for this agent and restart it; nothing about the conversation is affected.",
+    });
+  }
   /**
    * ⚠️ THE ROW KEY IS THE CONTENT HASH, NOT THE SEQUENCE, AND IT HAD TO BE.
    *
@@ -469,7 +527,21 @@ export function readDeliveryFacts(
             signature: receipt.signature_hex,
           }
         : null,
-      delivered: null,
+      /**
+       * PRESENT IN SHAPE, ABSENT IN FACT — and it names who would assert it, exactly as the other
+       * two do. A reader mapping over this array can then tell "nobody holds this" from "the relay
+       * said no", which a bare `null` cannot. It is not inference: `held: false` is a statement
+       * about what THIS side has, never about the counterparty.
+       */
+      delivered: {
+        asserted_by: "relay" as const,
+        held: false as const,
+        why_absent:
+          "a relay tells the RECIPIENT when it hands content over and never tells the sender, so " +
+          "this side holds no relay-asserted delivery evidence for any message. It is left absent " +
+          "rather than filled in from this machine's own send having succeeded, which would be " +
+          "this machine asserting a relay's fact about itself",
+      },
       acknowledged: ack
         ? {
             asserted_by: "recipient" as const,

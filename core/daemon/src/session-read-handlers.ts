@@ -112,6 +112,7 @@ export interface SessionReadDeps {
  */
 function deliverySection(
   sessionNodeManager: SessionReadDeps["sessionNodeManager"],
+  logger: Logger,
   agentName: string,
   sessionId: string,
 ): { delivery: unknown } {
@@ -120,6 +121,7 @@ function deliverySection(
   // through the manager would add surface to a file whose size ratchet exists to stop exactly that.
   const messages = readDeliveryFacts(
     sessionNodeManager.getDb(),
+    logger,
     sessionNodeManager.resolveAgentId(agentName),
     sessionId,
   );
@@ -216,7 +218,7 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
         leaf_count: leaves.length,
         content_leaf_count: leaves.filter((l) => l.kind === "msg").length,
         legibility: cert.legibility,
-        ...deliverySection(sessionNodeManager, agentName, sessionId),
+        ...deliverySection(sessionNodeManager, logger, agentName, sessionId),
       };
     }
     // M8C-INBOX-1 (F4): the single `sealed_receipt_not_found` conflated four distinct causes, so a
@@ -260,7 +262,7 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
               leaf_count: recoveredLeaves.length,
               content_leaf_count: recoveredLeaves.filter((l) => l.kind === "msg").length,
               legibility: recovered.legibility,
-              ...deliverySection(sessionNodeManager, agentName, sessionId),
+              ...deliverySection(sessionNodeManager, logger, agentName, sessionId),
               verified: pulled.verified === true,
               ...(pulled.verified === true
                 ? {}

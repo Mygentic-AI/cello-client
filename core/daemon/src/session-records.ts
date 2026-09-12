@@ -623,12 +623,35 @@ export class SessionRecords {
     signerPubkeyHex: string,
     signature: Uint8Array,
     correlationId?: string,
-  ): void {
-    if (!this.#db) return;
-    storeDeliveryAck(this.#db, this.#ctx.logger, {
+  ): boolean {
+    if (!this.#db) return false;
+    return storeDeliveryAck(this.#db, this.#ctx.logger, {
       agentId: this.#ctx.requireAgentId(agentName),
       agentName, sessionId, contentHashHex, signerPubkeyHex, signature, correlationId,
     });
+  }
+
+  /**
+   * DOD-M15-DELIVERYACK-1 rule 2 — did this side put these exact bytes on the wire in this session?
+   *
+   * The DURABLE half of the bind. A sent-direction transcript row joined to its leaf is written by
+   * our own send path and survives both the time-to-fallback timer and a daemon restart, which is
+   * what lets an acknowledgement for a message that had to be parked and recovered still count.
+   * Nothing a counterparty sends can create a row here.
+   */
+  hasSentContentHash(agentName: string, sessionId: string, contentHashHex: string): boolean {
+    if (!this.#db) return false;
+    const row = this.#db
+      .prepare(
+        `SELECT 1 AS present
+           FROM session_tree_leaves l
+           JOIN transcript t
+             ON t.agent_id = l.agent_id AND t.session_id = l.session_id AND t.sequence = l.leaf_index
+          WHERE l.agent_id = ? AND l.session_id = ? AND l.leaf_hash_hex = ? AND t.direction = 'sent'
+          LIMIT 1`,
+      )
+      .get(this.#ctx.requireAgentId(agentName), sessionId, contentHashHex);
+    return row !== undefined;
   }
 
   /**
