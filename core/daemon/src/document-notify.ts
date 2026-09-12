@@ -98,7 +98,6 @@ const CREATE_READ_MARKS_SQL = `
 /** Born on an existing table. See `PEER_DECISION_COLUMNS` in document-handshake.ts for the pattern. */
 const READ_MARK_COLUMNS = ["ALTER TABLE document_read_marks ADD COLUMN my_text TEXT"];
 
-/** Types `diff` can render. Decided in-unit; see the header for why the list is closed. */
 /**
  * The types `cello_doc_diff` renders — DERIVED from the one registry, never listed here.
  *
