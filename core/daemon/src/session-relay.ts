@@ -597,12 +597,8 @@ export class SessionRelay {
       // relay is not witnessing the session, it only needs the binding that authorizes the dial.
       // 033-ACKEMIT: no genesis is passed and none is needed. This client is not witnessing the
       // session — it never submits — and `registerSession` derives a seed from the assignment
-      // anyway. Reaching into the session record for one here would also be reaching with the RELAY
-      // session id, which is not the key that record is stored under.
-      // The same applies to the relay ANCHOR (069-ORDERPROOF): this call used to pass a lookup on
-      // the relay session id, which — per the paragraph above — can only ever miss. A lookup that
-      // cannot succeed, sitting beside a working fallback inside `registerSession`, reads as
-      // coverage and is not. Nothing is passed; the assignment supplies the anchor.
+      // anyway. Reaching into the session record for one — or for the ANCHOR (069-ORDERPROOF), which
+      // is why none is passed — reaches with the RELAY session id, not the key it is stored under.
       client.registerSession(sessionIdHex, node, undefined, relay.assignment, undefined, undefined);
       this.#ctx.logger.info("session.relay.assignment.presented_to_reservation_relay", {
         agentName,

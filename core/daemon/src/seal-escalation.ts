@@ -200,11 +200,22 @@ export async function escalateToUnilateralSeal(
    * So it is caught here, where the cause is known, and named. The evidence itself is not lost:
    * `cello_transcript` still shows the conversation, and a BILATERAL close — where the counterparty
    * co-signs rather than the directory rebuilding from a carry — is unaffected.
+   *
+   * ⚠️ THIS ONE IS **NOT** GATED ON `refuseOnUnusableCarry`, AND THAT IS THE POINT OF THE FIX.
+   *
+   * It was, and the flag is only set on the repeat-close path — so the ORDINARY
+   * `cello_close_session` escalation, which is the path almost everyone takes, sailed straight past
+   * the message written for it and spent thirty seconds arriving at `seal_unilateral_timeout`: our
+   * own wait, named as the fault. The four checks above are gated for a real reason — each can
+   * refuse a HEALTHY session early (a receipt still in flight, a bilateral seal genuinely
+   * completing). This one cannot. A partial receipt is not a timing state; no directory can ever
+   * rebuild it, on any path, at any moment. There is nothing to wait for, so there is nothing the
+   * gate would protect.
    */
   const preOrderproof = seal_leaves.filter(
     (l) => l.relay_signature !== undefined && l.relay_running_root === undefined,
   );
-  if (opts.refuseOnUnusableCarry && preOrderproof.length > 0) {
+  if (preOrderproof.length > 0) {
     pendingUnilateralWaiters.delete(sealKey(agentName, sessionId));
     return {
       ok: false,

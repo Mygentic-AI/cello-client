@@ -43,7 +43,7 @@ import type { CelloNode } from "@cello-protocol/transport";
 import { verify, type KeyProvider } from "@cello-protocol/crypto";
 import type { Logger } from "./types.js";
 import { extractErrorMessage } from "./error-message.js";
-import { evaluateRelayAck, type RelayReceiptStore } from "./relay-receipt-store.js";
+import { evaluateRelayAck, readSubmittedLeaf, type RelayReceiptStore } from "./relay-receipt-store.js";
 import type { SessionSealLeafStore } from "./session-seal-leaf-store.js";
 import type { SessionOwnChainStore } from "./session-own-chain-store.js";
 
@@ -1121,20 +1121,18 @@ export class AgentRelayClient {
    * Returns true to REJECT the submit. A send must not settle ok on a position nothing witnessed.
    */
   #captureReceipt(frame: Record<string, unknown>, structure1Cbor: Uint8Array | undefined, seq: number): boolean {
-    if (seq < 0 || !structure1Cbor) return false;
-    // Structure 1 = [version, content_hash(32), sender_pubkey(32), session_id(16), last_seen_seq,
-    // ts], plus last_seen_hash(32) at index 6 on a v2 claim (020-ACKHASH). content_hash is index 1
-    // and session_id index 3 in both.
-    const s1 = decodeStructure1(structure1Cbor);
-    if (!s1.ok) {
-      // Our OWN just-signed bytes — near-impossible to fail; surface it rather than drop silently.
-      // The reason is carried because "we cannot read what we just wrote" and "we wrote a layout we
-      // cannot name" are different faults with the same symptom.
-      this.#logger.warn("relay.receipt.undecodable_leaf", { seq, structure1Reason: s1.reason });
-      return false;
+    // ⚠️ REJECTS WHEN THE CHECK COULD NOT BE RUN, not only when it failed — `readSubmittedLeaf`
+    // carries the reasoning. Both of these used to settle the send ok having verified nothing.
+    const leaf = readSubmittedLeaf(structure1Cbor, seq);
+    if (leaf.kind === "none") return false;
+    if (leaf.kind === "unreadable") {
+      this.#logger.warn(leaf.event, { seq, structure1Reason: leaf.reason, impact:
+        "this side cannot read the leaf it just submitted, so the relay's ordering attestation has " +
+        "nothing to be checked against. The send is refused rather than settled on a position " +
+        "nothing witnessed." });
+      return true;
     }
-    const contentHash = s1.fields.contentHash;
-    const sessionId = s1.fields.sessionId;
+    const { contentHash, sessionId } = leaf;
     const sessionIdHex = Buffer.from(sessionId).toString("hex");
     const ev = evaluateRelayAck({
       sessionId,

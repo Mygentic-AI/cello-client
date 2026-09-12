@@ -3387,5 +3387,4 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       .get(agentId, sessionId) as { n: number };
     return this.#queries.countReceivedMessages(agentName, sessionId) + (held?.n ?? 0);
   }
-
 }

@@ -32,6 +32,7 @@
  * Crypto: Ed25519 (RFC 8032), SHA-256 (FIPS 180-4). TBS = SHA-256(hash_bytes || seq_BE4 || ts_BE8).
  */
 import { verify, buildRelayAckTbs } from "@cello-protocol/crypto";
+import { decodeStructure1 } from "@cello-protocol/protocol-types";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
 
@@ -134,6 +135,38 @@ export type AckEvaluation =
    * branches on `cause` to soften any of them reintroduces exactly the hole this closes.
    */
   | { kind: "refused"; cause: AckRefusalCause };
+
+/**
+ * Read back the leaf we just submitted, so the relay's attestation has something to be checked
+ * against — the step BEFORE `evaluateRelayAck`, and the one that decides whether the check can run
+ * at all.
+ *
+ * ⚠️ "COULD NOT RUN THE CHECK" IS NOT "THE CHECK PASSED" — 069-ORDERPROOF.
+ *
+ * Both failures here used to be waved through by the caller, which settled the send `ok` having
+ * verified nothing: the absent-versus-verified collapse this unit exists to remove, reproduced at
+ * the one point where nothing was left to verify with. These are our OWN just-signed bytes, so a
+ * hostile relay cannot steer into either — unreachable in practice, which is a different claim from
+ * safe to wave through, and the distinction is the one that decays under later edits.
+ *
+ * `"none"` is the honest third answer: no submit was made, so no attestation is owed and none is
+ * missing. It is the only one of the three that does not reject.
+ */
+export function readSubmittedLeaf(
+  structure1Cbor: Uint8Array | undefined,
+  seq: number,
+): { kind: "none" } | { kind: "unreadable"; event: string; reason?: string } | { kind: "ok"; contentHash: Uint8Array; sessionId: Uint8Array } {
+  if (seq < 0) return { kind: "none" };
+  if (!structure1Cbor) return { kind: "unreadable", event: "relay.receipt.leaf_absent" };
+  // Structure 1 = [version, content_hash(32), sender_pubkey(32), session_id(16), last_seen_seq, ts],
+  // plus last_seen_hash(32) at index 6 on a v2 claim (020-ACKHASH). content_hash is index 1 and
+  // session_id index 3 in both.
+  const s1 = decodeStructure1(structure1Cbor);
+  // The reason is carried because "we cannot read what we just wrote" and "we wrote a layout we
+  // cannot name" are different faults with the same symptom.
+  if (!s1.ok) return { kind: "unreadable", event: "relay.receipt.undecodable_leaf", reason: s1.reason };
+  return { kind: "ok", contentHash: s1.fields.contentHash, sessionId: s1.fields.sessionId };
+}
 
 /**
  * Evaluate a relay ordering attestation: decide whether it yields a storable, signature-verified

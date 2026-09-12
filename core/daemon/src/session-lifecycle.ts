@@ -1674,20 +1674,13 @@ export class SessionLifecycle {
     const now = Date.now();
     try {
       /**
-       * ⚠️ THE SESSION'S STARTING POINT GOES IN AT INSERT — `DOD-M15-SELFCHAIN-1`.
-       *
-       * It is recorded before this row exists (the session open needs it before the node is built),
-       * so an UPDATE at that moment has nothing to match. Writing it here is what puts it on disk,
-       * and on disk is what lets the chain be resumed after a restart. `null` when nothing recorded
-       * one, which is a session whose sends will be refused by name rather than silently unlinked.
+       * ⚠️ THE STARTING POINT AND THE RELAY ANCHOR BOTH GO IN AT INSERT — `DOD-M15-SELFCHAIN-1` and
+       * `DOD-M15-ORDERPROOF-1`, one rule, one reason. Both are recorded before this row exists, so
+       * an UPDATE then matches nothing — as the anchor, written that way first, found. On disk is
+       * what survives a restart: without the genesis the chain cannot resume, without the anchor
+       * there is no key to check the relay against. `null` when none — refused by name, not unlinked.
        */
       const genesis = this.#ctx.leafRecords.genesisFor(agentName, sessionId);
-      /**
-       * ⚠️ THE RELAY ANCHOR RIDES THE SAME INSERT — `DOD-M15-ORDERPROOF-1`, and for the identical
-       * reason. It was first written as an UPDATE beside the genesis's UPDATE, which matched no row
-       * at all: the conversation worked until the daemon restarted, and then every message on a
-       * revived session was refused for want of the key to check the relay's signature against.
-       */
       const relayAnchor = this.#ctx.leafRecords.relayAnchorFor(agentName, sessionId);
       this.#db
         .prepare(
