@@ -2577,26 +2577,16 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
   }
 
   /**
-   * DOD-M15-AWAYSCOPE-1 removed `peekLatestReceivedContentHex` from here.
-   *
-   * Its one caller was the away responder, which read the arriving message's TAIL to decide whether
-   * to answer it — and answering an already-accepted session is the defect this order deleted. With
-   * that branch gone the accessor had no reader, and an accessor that hands out message plaintext
-   * with nobody asking for it is surface an adversary's own daemon build can still reach.
-   *
-   * ⚠️ AND THE BUFFER IT READ HAS NO PRODUCTION READER EITHER — review finding, verified. The
-   * comment here used to say `takeReceivedContent` "drains it for `cello_receive`". That was true
-   * until DOD-COATTEND-1 moved delivery onto the durable transcript (see the note at
-   * `session-content-handlers.ts:1334`, which says so in its own words) and it is not true now:
-   * `takeReceivedContent` is reached only from tests. So `#receivedContent` holds the last 32
-   * messages of every live session as plaintext, in memory, for the life of the daemon, and nothing
-   * reads them.
-   *
-   * NOT removed here, and the reason is scope rather than doubt: it is ~40 test call sites and a
-   * different line's subject. Recorded as its own item on the order instead. What is fixed here is
-   * the comment, because a stale claim at the one place a reader comes to check is how this
-   * survived two orders.
-   */
+   * DOD-M15-AWAYSCOPE-1 removed `peekLatestReceivedContentHex` from here. Its one caller was the
+   * away responder, reading the arriving message's TAIL to decide whether to answer it, and
+   * answering an already-accepted session is the defect that order deleted — an accessor handing
+   * out message plaintext with no reader is surface an adversary's own daemon build still reaches.
+   * ⚠️ AND ITS BUFFER HAS NO PRODUCTION READER EITHER — review finding, verified. This comment
+   * claimed `takeReceivedContent` "drains it for `cello_receive`"; that stopped being true at
+   * DOD-COATTEND-1, when delivery moved onto the durable transcript. Every caller left is a test, so
+   * `#receivedContent` holds the last 32 messages of every live session as plaintext, in daemon
+   * memory, for the daemon's life, read by nothing. Not removed here (~40 test call sites, and a
+   * different line's subject); it is on the order as its own item. */
   pushReceivedContentForTest(agentName: string, sessionId: string, seq: number, content: string, senderPubkey: string): void {
     this.#records.recordTranscriptMessage(agentName, sessionId, seq, "received", new TextEncoder().encode(content), "test");
     const key = this.#k(agentName, sessionId);

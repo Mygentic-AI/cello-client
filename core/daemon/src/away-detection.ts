@@ -81,10 +81,19 @@ export const AWAY_AUTO_REPLY_MARKER = "[[AUTO-REPLY]]";
 /**
  * The unmarked bodies. Kept separate so the legacy detector below matches an un-upgraded peer.
  *
- * ⚠️ `ONESHOT_BODY` IS NO LONGER SENT BY THIS DAEMON (DOD-M15-AWAYSCOPE-1) and it is not dead. It
- * is now purely a RECOGNISER: a peer on an older build still sends these exact bytes into an
- * accepted session, and `isOwnAwayAutoReply`'s legacy branch is what stops this side treating that
- * machine traffic as a person. Rewording it silently un-recognises every un-upgraded peer.
+ * ⚠️ `ONESHOT_BODY` IS NO LONGER SENT, AND NOTHING READS IT EITHER. DOD-M15-AWAYSCOPE-1 deleted the
+ * branch that sent it AND the only production call site of `isOwnAwayAutoReply`, which was in the
+ * same branch. An earlier version of this comment said the legacy recogniser "is what stops this
+ * side treating that machine traffic as a person" — review caught that, and it is false: the only
+ * live recogniser is `isAutoReplyMarked`, which matches the MARKER and therefore does NOT match an
+ * un-upgraded peer's unmarked body.
+ *
+ * So an old peer's one-shot now arrives unlabelled. That is a real, small loss and it is stated
+ * rather than papered over: the operator sees the text, which names itself as an away reply in
+ * plain English, and nothing acts on the classification any more because nothing replies.
+ *
+ * Both are RETAINED, not dead-code-cleaned, because the order forbids touching this guard while the
+ * attendance work is unfinished — a call site may return. Retained-pending-a-caller, said out loud.
  */
 const ONESHOT_BODY =
   "Agent is currently away. Your message has been received and will be read when the operator returns. " +

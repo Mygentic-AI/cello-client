@@ -170,9 +170,17 @@ export function createAttendanceWiring(deps: AttendanceWiringDeps) {
       }
       const sendResult = await sessionNodeManager.sendContent(agentName, sessionId, contentBytes, new Uint8Array(away.hash), randomUUID(), LEAF_KIND_MSG, away.alg);
       if (!sendResult.ok && !sendResult.durable) {
-        // Reviewer MEDIUM fix: a transient failure must NOT permanently silence the rest of this
-        // away period — clear the guard so the next inbound arrival retries the ack. Both guards:
-        // AWAYLEAF-1's in-flight claim would otherwise suppress the retry as its own duplicate.
+        // ⚠️ NO TRIGGER REACHES THIS RETRY TODAY, and the comment used to promise one.
+        //
+        // It cleared the guard so "the next inbound arrival retries the ack". The next inbound
+        // arrival was a MESSAGE, and DOD-M15-AWAYSCOPE-1 deleted that trigger. A session request
+        // arrives once per session, so nothing re-enters `sendAwayResponse` for this session and the
+        // greeting is simply lost — the consequence that order accepted, said here in the code
+        // rather than only in its commit message.
+        //
+        // The clears stay because they are correct and free the moment a re-trigger exists (a
+        // reconnect sweep, or the attendance work in units 2-4). Both guards, because AWAYLEAF-1's
+        // in-flight claim would otherwise suppress that retry as its own duplicate.
         awayAckSent.delete(dedupKey); awayAckSent.delete(txtKey);
         // M12-P13: this branch now means the reply is GONE, not merely late (the queued case is
         // handled below), so it is an error and it says what the consequence is. It was a bare warn
@@ -222,10 +230,18 @@ export function createAttendanceWiring(deps: AttendanceWiringDeps) {
         committed: placedReply.placed,
       });
     } catch (err: unknown) {
-      // Reviewer MEDIUM fix: same as above — an unexpected throw must not permanently lock out
-      // future retries for the rest of this away period.
+      // Same as above: the clear is correct and currently unreachable — nothing re-enters this
+      // function for a session whose request has already been answered. `txtKey` is deliberately
+      // not cleared here and was not before; moot while nothing retries, and noted so the asymmetry
+      // is not read as intent by whoever restores a trigger.
       awayAckSent.delete(dedupKey);
-      logger.warn("session.away.response.failed", { agentName, sessionId, kind, error: extractErrorMessage(err) });
+      // A DISTINCT NAME, and a distinct LEVEL. This threw somewhere unexpected; the branch above is
+      // a send that reported failure. Two different causes with two different remedies were sharing
+      // one event name at two levels, so a log reader matching on the name got whichever fired.
+      logger.error("session.away.response.threw", {
+        agentName, sessionId, kind, error: extractErrorMessage(err),
+        impact: "the away greeting was never sent and this caller gets no acknowledgement at all",
+      });
     }
   }
 

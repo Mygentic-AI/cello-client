@@ -150,9 +150,9 @@ describe("M8C-AWAY-1: away response", () => {
    * about away mode is under test in the signature — it is only what gets the frame past the door
    * the production path now makes every assignment pass through.
    */
-  async function assignmentFrame(initiatorPubkeyHex: string, counterpartyPubkeyHex: string): Promise<Record<string, unknown>> {
+  async function assignmentFrame(initiatorPubkeyHex: string, counterpartyPubkeyHex: string, sessionId: Uint8Array = SID_BYTES): Promise<Record<string, unknown>> {
     const { frame } = await makeSignedAssignmentFrame({
-      sessionId: SID_BYTES,
+      sessionId,
       initiatorPubkey: Uint8Array.from(Buffer.from(initiatorPubkeyHex, "hex")),
       responderPubkey: Uint8Array.from(Buffer.from(counterpartyPubkeyHex, "hex")),
       initiatorSessionPeerId: "alice-session-peer-id",
@@ -221,7 +221,16 @@ describe("M8C-AWAY-1: away response", () => {
     injectRef.inject!(await assignmentFrame(initiatorPubkey, bobPubkey)); // bob never attended — no client connected yet
     await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
-    expect(events.find((e) => e.event === "session.away.response.sent" && e.context.kind === "request")).toBeDefined();
+    /**
+     * DOD-M15-AWAYSCOPE-1: `kind` is a CONSTANT in the code now, and this is the only assertion on
+     * its value. It is read off the event rather than filtered inside the `find` predicate so a
+     * wrong value says "expected 'message' to be 'request'" instead of "expected undefined to be
+     * defined" — the tell of the live failure was `kind: "message"` on a daemon log line, and an
+     * operator re-diagnosing greps for exactly that string.
+     */
+    const sentEvent = events.find((e) => e.event === "session.away.response.sent");
+    expect(sentEvent, "the greeting must actually be sent, or everything below is vacuous").toBeDefined();
+    expect(sentEvent!.context.kind).toBe("request");
     const { messages } = h.getSessionNodeManager().readTranscript("bob", SID_HEX);
     expect(messages).toHaveLength(1);
     expect(messages[0].direction).toBe("sent");
@@ -233,6 +242,48 @@ describe("M8C-AWAY-1: away response", () => {
     expect(messages[0].text).toContain("signal: wrap");
     expect(messages[0].text).not.toContain("[[WRAP]]");
   });
+
+  /**
+   * A4, RE-POINTED — review finding. The old version of this drove TWO inbound MESSAGES on two
+   * sessions, and it was deleted with the message trigger. Its SUBJECT is still live: the dedup key
+   * is `agent:session:request`, and dropping the session id from it is a one-token change.
+   *
+   * What that costs, and why a deleted test here is worse than it looks: two people knock on the
+   * same away agent, the first gets the greeting, and the SECOND is met with silence — no greeting,
+   * no explanation, nothing in their transcript — because the first caller consumed the agent's one
+   * dedup slot. Nothing else in the suite uses two sessions on one agent, so that narrowing would
+   * ship with everything green.
+   */
+  it("A4 (per-session isolation): two callers knocking on the SAME away agent each get their own greeting", async () => {
+    const { logger, events } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const h = await start(logger, new FakeNode(), makeInjectableSignaling(injectRef));
+    await wait(50);
+    const snm = h.getSessionNodeManager();
+    await snm.ensureStandingReceiverForAgent("bob");
+
+    const caller = fixtureIdentity().pubkeyHex;
+    snm.addContact("bob", caller, undefined, null, TIER.KNOWN);
+
+    const SID_2_BYTES = Uint8Array.from(Array.from({ length: 16 }, (_, i) => i + 101));
+    const SID_2_HEX = Buffer.from(SID_2_BYTES).toString("hex");
+    snm.setSessionContentKeyForTest("bob", SID_HEX, new Uint8Array(32).fill(0x7e));
+    snm.setSessionContentKeyForTest("bob", SID_2_HEX, new Uint8Array(32).fill(0x7e));
+
+    injectRef.inject!(await assignmentFrame(caller, bobPubkey));
+    injectRef.inject!(await assignmentFrame(caller, bobPubkey, SID_2_BYTES));
+    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
+
+    // BOTH sessions, named — a count of two would also pass if one session were greeted twice.
+    const greeted = events
+      .filter((e) => e.event === "session.away.response.sent")
+      .map((e) => e.context.sessionId)
+      .sort();
+    expect(greeted, "each caller is answered on their own session").toEqual([SID_HEX, SID_2_HEX].sort());
+    expect(snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent")).toHaveLength(1);
+    expect(snm.readTranscript("bob", SID_2_HEX).messages.filter((m) => m.direction === "sent")).toHaveLength(1);
+  }, 15_000);
 
   // A gateway whose OUTBOUND verdict is configurable per test (inbound always allows).
   class StubGateway implements SecurityGatewayClient {

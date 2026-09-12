@@ -205,10 +205,25 @@ describe("DOD-M15-AWAYSCOPE-1: an unattended agent says nothing into a session i
   });
 
   /**
-   * ★★ The mutual-seal property, RE-PROVEN rather than assumed (DoD clause 7) — unit 1 deleted the
-   * branch that used to hold it. Two away agents: the far side's away GREETING arrives here as an
-   * ordinary inbound message. Nothing answers it, so there is no second ctrl leaf and no
-   * notarization of a conversation nobody had.
+   * ★★ DoD clause 7 — the mutual-seal property, and it now holds BY CONSTRUCTION rather than by a
+   * guard. Saying that plainly is the point of this comment, because the test below cannot tell the
+   * difference and a reader would assume the guard is what passed it.
+   *
+   * Two away agents: the far side's away GREETING arrives here as an ordinary inbound message.
+   * Before, `isOwnAwayAutoReply` recognised it and returned silently, so the one-shot did not fire
+   * and no second ctrl leaf was minted. Now NOTHING answers ANY inbound message, so the greeting is
+   * not a special case — it takes the same path as a person's sentence. The outcome clause 7 names
+   * is unchanged and is asserted; the mechanism holding it is not the guard any more.
+   *
+   * ⚠️ TWO THINGS WERE LOST WITH THAT CALL SITE, both recorded rather than discovered later:
+   *   - `session.away.mutual.skipped` can never fire again. Its `matched: "marker" | "legacy_exact"`
+   *     field was added by DOD-M12B-AWAY-MARK-1 precisely so a peer prefixing EVERY message with
+   *     the marker — a 15-character attack on the one-shot auto-close — became visible in the log.
+   *     There is no one-shot left to attack, so the attack is gone with its signal; but the marker
+   *     is also no longer counted anywhere, and that belongs on AWAY-MARK-1's line, not this one.
+   *   - an un-upgraded peer's unmarked one-shot is no longer classified as machine traffic at all.
+   *
+   * This test therefore asserts the OUTCOME and makes no claim about which code held it.
    */
   it("★★ a far-side away greeting arriving as a message notarizes nothing", async () => {
     const { logger, events } = makeLogger();
