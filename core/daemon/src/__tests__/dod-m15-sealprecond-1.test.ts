@@ -143,7 +143,10 @@ describe("DOD-M15-SEALPRECOND-1: the close waits for its own record to settle", 
 
     expect(res.ok).toBe(true);
     expect(h.reads(), "the condition is re-read, not slept through").toBeGreaterThan(1);
-    expect(Date.now() - started, "it must not serve out the whole bound").toBeLessThan(1_000);
+    // ONE POLL INTERVAL, not "less than the bound" (review). `await sleep(100)` followed by a
+    // single read would satisfy a loose ceiling while being exactly the fixed delay this order
+    // forbids; it cannot satisfy this one.
+    expect(Date.now() - started, "it must return on the state, within about one poll").toBeLessThan(100);
   });
 
   it("a healthy close is untouched — no new false positive, no added latency", async () => {
@@ -227,19 +230,82 @@ describe("DOD-M15-SEALPRECOND-1: sealReadiness counts our own ordered-but-unplac
     await fx.createSession(SID, "alice");
     fx.snm.noteOwnLeafOrdered("alice", SID, HASH, 0);
 
+    // ITS OWN STATE. `unknown` means unknowable or permanently parted, and a message halfway out
+    // the door is the most ordinary thing a live conversation does — wearing the alarming label for
+    // it teaches an operator to discount the label.
     expect(fx.snm.sealReadinessView("alice", SID)).toEqual({
-      state: "unknown",
-      reason: "own_send_settling",
+      state: "settling",
+      ownSendsInFlight: 1,
     });
   });
 
-  it("a real send through the daemon leaves no marker behind once it has placed its leaf", async () => {
-    // The marker must be resolved by the ordinary path, or every session becomes permanently
-    // unsealable after its first message — a false positive far worse than the defect.
+  it("the REAL cello_send path resolves its own marker — a leak here makes the session unsealable", async () => {
+    /**
+     * The property nothing else here proves, and the one whose failure is worse than the defect:
+     * the ordinary production chain — IPC handler -> sendContent -> placeOwnLeaf — must clear the
+     * marker it set, keyed the same way at both ends. A marker left behind refuses every later
+     * close of a healthy session, and force-abandon (no receipt) becomes the only exit.
+     *
+     * `seedSent` cannot show this: it appends a leaf directly and never enters either producer, so
+     * a test written on it passes with the whole unit reverted. This drives the real handler over a
+     * real IPC socket, with the marker pre-set under the hash that send will compute.
+     */
     await fx.createSession(SID, "alice");
-    fx.seedSent("alice", SID, "one");
-    fx.seedReceived("alice", SID, "two");
+    const client = await fx.connectAs("alice");
+    const bytes = new TextEncoder().encode("settle me");
+    const { hash } = await fx.snm.contentHashForSession("alice", SID, bytes);
+    const hex = Buffer.from(hash).toString("hex");
+
+    fx.snm.noteOwnLeafOrdered("alice", SID, hex, 0);
+    expect(fx.snm.sealReadiness("alice", SID).ownLeavesOrdered, "precondition: the marker is set").toBe(1);
+
+    const res = await client.send("cello_send", { session_id: SID, content: "settle me" }) as Record<string, unknown>;
+    expect(res.ok, `the send itself must succeed: ${JSON.stringify(res)}`).toBe(true);
+
+    const after = fx.snm.sealReadiness("alice", SID);
+    expect(after.ownLeavesOrdered, "the send placed its leaf, so its marker is gone").toBe(0);
+    expect(after.ready, "and the session is closeable again").toBe(true);
+  });
+
+  it("a marker the tree has already grown past is swept, not counted forever", async () => {
+    // The self-healing rule, and the reason no clock appears anywhere in this unit. If a marker
+    // ever outlived its send — a throw between the relay's ordering and the placement — a session
+    // whose tree has since reached that position must not stay unsealable on the strength of it.
+    await fx.createSession(SID, "alice");
+    fx.snm.noteOwnLeafOrdered("alice", SID, HASH, 0);
+    expect(fx.snm.sealReadiness("alice", SID).ownLeavesOrdered).toBe(1);
+
+    fx.seedSent("alice", SID, "the position is taken");
 
     expect(fx.snm.sealReadiness("alice", SID)).toMatchObject({ ownLeavesOrdered: 0, ready: true });
+  });
+
+  it("the marker does not survive the teardown of the node that would have placed it", async () => {
+    // A revived session must not be refused for a send that can no longer land. Same reasoning as
+    // the witness map beside it, and the same eviction.
+    await fx.createSession(SID, "alice");
+    fx.snm.noteOwnLeafOrdered("alice", SID, HASH, 3);
+    expect(fx.snm.sealReadiness("alice", SID).ready).toBe(false);
+
+    await fx.snm.destroySessionNode("alice", SID, "peer_gone");
+
+    expect(fx.snm.sealReadiness("alice", SID)).toMatchObject({ ownLeavesOrdered: 0, ready: true });
+  });
+
+  it("submitSealLeaf itself refuses a settling record — the gate holds even if a caller forgets", async () => {
+    /**
+     * Review HIGH-3. The three callers check and then act, so a send taking its position between
+     * the check and the root computation would slip through — microseconds instead of 352ms, and
+     * this order's whole point is that the size of the window does not matter. The last word is at
+     * the one function every seal leaf passes through, so a seal site written next year is gated
+     * whether or not its author knows this rule exists.
+     */
+    await fx.createSession(SID, "alice");
+    fx.snm.noteOwnLeafOrdered("alice", SID, HASH, 0);
+
+    const res = await fx.snm.submitSealLeaf("alice", SID, "test-correlation");
+
+    expect(res.ok).toBe(false);
+    expect((res as { reason: string }).reason).toBe("own_record_settling");
   });
 });

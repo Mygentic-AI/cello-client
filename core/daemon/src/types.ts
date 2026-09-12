@@ -255,6 +255,16 @@ export interface DaemonStatusResponse {
 export type SealReadinessView =
   | { state: "ready" }
   | { state: "blocked"; awaitingArrival: number; heldBehindGap: number; oldestHeldMs: number | null }
+  /**
+   * DOD-M15-SEALPRECOND-1 — a message of this side's own is on its way into the record.
+   *
+   * ITS OWN STATE, not `unknown`, and not `blocked` (review MEDIUM-4). `unknown` means unknowable
+   * or permanently parted; this is the most ordinary thing a live conversation does, and wearing an
+   * alarming label for it teaches an operator to discount the label. `blocked` is worse still: its
+   * two counters are both zero here, so it describes nothing and points at a counterparty who has
+   * done nothing. This clears on its own in milliseconds and needs no action from anyone.
+   */
+  | { state: "settling"; ownSendsInFlight: number }
   | { state: "unknown"; reason: string };
 
 /** One active session's status row (see DaemonStatusResponse.active_sessions). */

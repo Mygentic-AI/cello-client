@@ -572,6 +572,31 @@ export class SessionSeal {
     | { ok: false; reason: string; reportedRootHex?: string; sequenceNumber?: number }
   > {
     const sealKey = this.#ctx.sessionKey(agentName, sessionId);
+    /**
+     * DOD-M15-SEALPRECOND-1 — THE PRECONDITION BY CONSTRUCTION, at the one point every seal leaf
+     * passes through. Review HIGH-3.
+     *
+     * The three callers wait for the record to settle and then submit, which leaves a check-then-act
+     * window: a `cello_send` can take its position after the caller read readiness and before the
+     * root is computed. The window is microseconds rather than the measured 352ms, and microseconds
+     * is exactly what this order says not to accept — a 14ms gap and a 14s gap fail identically.
+     *
+     * So the last word is here. Every present and future seal submission site is gated whether or
+     * not its author knew this rule existed, which is the property the enumeration in the order
+     * could only give for the sites that existed on the day it was written.
+     *
+     * Read AFTER nothing and BEFORE everything: no transport is resolved, no idempotency mark is
+     * taken, so a refusal here leaves the session exactly as it found it and the caller's retry is
+     * a genuine retry.
+     */
+    const settling = this.sealReadiness(agentName, sessionId).ownLeavesOrdered;
+    if (settling > 0) {
+      this.#ctx.logger.warn("session.seal.leaf.refused_settling", {
+        agentName, sessionId, ownLeavesOrdered: settling, correlationId,
+        impact: "a message of ours has a place in the relay's ordering this record has not taken, so NO leaf was submitted and no root was signed — a root signed short of the relay's leaf set is refused by the directory and the receipt cannot be recovered",
+      });
+      return { ok: false, reason: "own_record_settling" };
+    }
     // M12-P15: resolved, not required. See #resolveSealTransport — an interrupted session has no
     // in-memory node BY CONSTRUCTION, and refusing here is what made the first fix inert.
     const transport = this.#resolveSealTransport(agentName, sessionId);
@@ -870,21 +895,12 @@ export class SessionSeal {
        * 2026-09-11. It was the one seal submission site with no gate at all.
        *
        * It WAITS first — the condition clears in milliseconds and declining costs a prompt
-       * bilateral seal. If it does not clear it declines to AUTO-sign and says so, the shape the
-       * SI-002 gate already uses: B's explicit close can still complete the seal.
+       * bilateral seal. The REFUSAL is not written here: `submitSealLeaf` reads the same condition
+       * and answers `own_record_settling`, so this waits and then asks, and the one refusal travels
+       * out through the ordinary result handling below (review HIGH-1/LOW-5 — an early return here
+       * skipped the broker release and logged the same skip twice).
        */
-      const settle = await awaitOwnRecordSettled(this, agentName, sessionId);
-      if (!settle.settled) {
-        this.#ctx.logger.warn("session.seal.autoack.skipped", {
-          sessionId,
-          reason: "own_record_settling",
-          ownLeavesOrdered: settle.ownLeavesOrdered,
-          waitedMs: settle.waitedMs,
-          correlationId,
-          impact: "a message of ours has a place in the relay's ordering this record has not taken yet, so no responder signature was made — signing short is refused by the directory and costs the receipt. The seal can still be completed by an explicit close on this side.",
-        });
-        return { ok: false as const, reason: "own_record_settling" };
-      }
+      await awaitOwnRecordSettled(this, agentName, sessionId);
       const submitted = await this.submitSealLeaf(agentName, sessionId, correlationId);
       // RELEASE AFTER A GRACE WINDOW, not when the submit resolves.
       //
@@ -928,6 +944,26 @@ export class SessionSeal {
             reason: result.reason,
             correlationId,
           });
+          /**
+           * DOD-M15-SEALPRECOND-1 review HIGH-2 — SAY IT TO SOMEBODY WHO CAN ACT ON IT.
+           *
+           * A refusal that only reaches the log promises a recovery nothing performs: the initiator
+           * waits out its unilateral timeout — two hours on the session this order was written from
+           * — and the receipt is lost anyway. The SI-002 gate twelve lines up already solved this
+           * by pushing `counterparty_closing` so B's agent drives an explicit close, and this is the
+           * same situation: a refusal to AUTO-sign, where a human close still completes the seal.
+           *
+           * Scoped to the settling reason on purpose. The other reasons here (relay down, transport
+           * gone) are not conditions a prompt close can fix, and pushing a decision point for them
+           * would train the agent to ignore the one that matters.
+           */
+          if (result.reason === "own_record_settling") {
+            try {
+              this.#ctx.onSessionStateChanged?.(record.agent_name, sessionId, "counterparty_closing", record.counterparty_pubkey);
+            } catch (err: unknown) {
+              this.#ctx.logger.debug("session.state.notify.failed", { sessionId, reason: extractErrorMessage(err) });
+            }
+          }
         }
       })
       .catch((err: unknown) => {
@@ -1099,7 +1135,7 @@ export class SessionSeal {
      * both — describing nothing, and pointing at a counterparty who has done nothing.
      */
     if (r.ownLeavesOrdered > 0) {
-      return { state: "unknown", reason: "own_send_settling" };
+      return { state: "settling", ownSendsInFlight: r.ownLeavesOrdered };
     }
     if (!r.ready) {
       const oldestHeldMs = this.#ctx.queries.oldestHeldMs(agentName, sessionId);

@@ -435,10 +435,12 @@ export default [
   },
   {
     files: ["core/daemon/src/session-seal.ts"],
-    // 1,112 → 1,170 (DOD-M15-SEALPRECOND-1, +58): the fourth term in `sealReadiness`, its own state
-    // on the status surface, and the settle wait on the responder auto-acknowledge — the one seal
-    // submission site that had no gate at all. Same bound as above; only ever shrinks.
-    rules: { "max-lines": ["error", { max: 1170, skipBlankLines: false, skipComments: false }] },
+    // 1,112 → 1,206 (DOD-M15-SEALPRECOND-1, +94): the fourth term in `sealReadiness`, its own state
+    // on the status surface, the settle wait on the responder auto-acknowledge — the one seal
+    // submission site that had no gate at all — and, after the unit review, the refusal inside
+    // `submitSealLeaf` that makes the precondition hold by construction for every seal site rather
+    // than by a hand-kept enumeration. Same bound as above; only ever shrinks.
+    rules: { "max-lines": ["error", { max: 1206, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/*/src/__tests__/**/*.ts"],
