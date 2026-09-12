@@ -1344,6 +1344,7 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
       "your daemon is verifying no manifest at all. Both of those are reported in words",
       "One thing it cannot tell you, and it is worth being plain about: this check runs",
       "client, which is the common case. It cannot vouch for a client you installed from",
+      "> anything. [How, and what it cannot cover](#which-network-am-i-on).",
     ],
     verdict: "corrected",
     /**
