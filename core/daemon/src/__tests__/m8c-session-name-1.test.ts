@@ -232,7 +232,7 @@ describe("DOD-SESSION-NAME-1: naming a session", () => {
     // The name landed anyway, and the response SAYS SO rather than letting "no further action is
     // needed" imply otherwise.
     expect(res.session_name).toBe("the one that got interrupted");
-    expect(res.guidance).toContain("WAS applied");
+    expect(res.guidance).toContain("name you gave was applied");
     expect((await listOne(client)).sessionName).toBe("the one that got interrupted");
   });
 
