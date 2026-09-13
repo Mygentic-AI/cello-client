@@ -745,14 +745,25 @@ export function readDeliveryFacts(
     db
       .prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'relay_ack_receipts'")
       .get() !== undefined;
+  // 069-ORDERPROOF hands this side the relay's signature for the COUNTERPARTY's messages too, so the
+  // receipts table is no longer "what we sent". Those rows are left out, or every received message
+  // is listed as a sent one with no acknowledgement (live, 2026-09-13).
+  const receivedHashes = new Set((db
+    .prepare(
+      `SELECT l.leaf_hash_hex AS hash_hex FROM session_tree_leaves l JOIN transcript t
+          ON t.agent_id = l.agent_id AND t.session_id = l.session_id AND t.sequence = l.leaf_index
+        WHERE l.agent_id = ? AND l.session_id = ? AND t.direction = 'received'`,
+    )
+    .all(agentId, sessionId) as Array<{ hash_hex: string }>).map((r) => r.hash_hex));
   if (relayTablePresent) {
     for (const r of db
       .prepare(
         `SELECT hash_hex, relay_id, relay_timestamp, signature_hex
-           FROM relay_ack_receipts WHERE agent_pubkey = ? AND session_id = ?`,
+           FROM relay_ack_receipts WHERE agent_pubkey = ? AND session_id = ?
+            AND (leaf_kind IS NULL OR leaf_kind <> 2)`,
       )
       .all(agentPubkey, sessionId) as Array<{ hash_hex: string; relay_id: string; relay_timestamp: number; signature_hex: string }>) {
-      receipts.set(r.hash_hex, r);
+      if (!receivedHashes.has(r.hash_hex)) receipts.set(r.hash_hex, r);
     }
   }
   const acks = new Map<string, { signer_pubkey: string; signature: Uint8Array; recorded_at: number }>();

@@ -311,6 +311,37 @@ describe("DELIVERYACK: the five rules, on the inbound path", () => {
     expect(kept?.seq).toBe(7);
   });
 
+  it("★★ a message this side RECEIVED is not listed among the messages it sent", async () => {
+    // Live 2026-09-13: the relay's ordering signature now arrives for BOTH sides' messages, and the
+    // receipt listed every received message as a sent one with no acknowledgement — so half the
+    // conversation looked unacknowledged.
+    const a = await sendingAgent("received-not-sent.db");
+    const db = a.mgr.getDb();
+    const agentId = a.mgr.resolveAgentId("alice");
+    const pub = (db.prepare("SELECT k_local_pubkey FROM agents WHERE agent_id = ?").get(agentId) as { k_local_pubkey: string }).k_local_pubkey;
+    db.exec(`CREATE TABLE IF NOT EXISTS relay_ack_receipts (agent_pubkey TEXT NOT NULL, session_id TEXT NOT NULL,
+      sequence_number INTEGER NOT NULL, hash_hex TEXT NOT NULL, relay_id TEXT NOT NULL, relay_pubkey_hex TEXT NOT NULL,
+      relay_timestamp INTEGER NOT NULL, signature_hex TEXT NOT NULL, stored_at INTEGER NOT NULL, running_root_hex TEXT,
+      structure2_cbor BLOB, structure1_cbor BLOB, leaf_kind INTEGER, PRIMARY KEY (agent_pubkey, session_id, sequence_number))`);
+    const theirs = Buffer.from(msgLeafHash(new TextEncoder().encode("bob said this"))).toString("hex");
+    db.prepare("INSERT INTO session_tree_leaves (agent_id, session_id, leaf_index, leaf_kind, leaf_hash_hex, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(agentId, SID, 3, "msg", theirs, Date.now());
+    db.prepare("INSERT INTO transcript (agent_id, session_id, sequence, direction, blob, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(agentId, SID, 3, "received", Buffer.from("bob said this"), Date.now());
+    db.prepare(`INSERT INTO relay_ack_receipts (agent_pubkey, session_id, sequence_number, hash_hex, relay_id, relay_pubkey_hex,
+      relay_timestamp, signature_hex, stored_at, leaf_kind) VALUES (?, ?, 4, ?, 'r', 'rp', 1, 'aa', 1, 0)`)
+      .run(pub, SID, theirs);
+
+    // And a seal commitment is not a message at all.
+    db.prepare(`INSERT INTO relay_ack_receipts (agent_pubkey, session_id, sequence_number, hash_hex, relay_id, relay_pubkey_hex,
+      relay_timestamp, signature_hex, stored_at, leaf_kind) VALUES (?, ?, 5, 'c0ffee', 'r', 'rp', 1, 'aa', 1, 2)`)
+      .run(pub, SID);
+
+    const facts = readDeliveryFacts(db, a.logger, agentId, SID);
+    expect(facts.find((f) => f.content_hash === theirs)).toBeUndefined();
+    expect(facts.find((f) => f.content_hash === "c0ffee")).toBeUndefined();
+  });
+
   it("★★★ RULE 1: with NO usable recorded key for the counterparty, there is nothing to check against and the ack is discarded", async () => {
     /**
      * The guard that produces an EMPTY participant list. It is reachable in production: a session
