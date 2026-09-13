@@ -252,4 +252,27 @@ describe("074-DOCSFLAG — an inbound document frame with the layer OFF", () => 
     // and not a broken classifier.
     expect(isDocumentFrame(documentFrameBytes())).toBe(true);
   });
+
+  it("OFF: an ordinary message is DELIVERED — not consumed, not refused, written to the transcript", async () => {
+    // ⚠️ THE TEST ABOVE PROVED THE CLASSIFIER SAYS "not a document" AND THIS FILE STILL SHIPPED A
+    // DAEMON THAT DROPPED EVERY MESSAGE. The classifier was right; the documents-off hook never asked
+    // it and answered `consumed: true` for every frame. Found live 2026-09-13: every chat message on
+    // daemon 0.0.213 was refused as `documents_disabled`, dropped, and still signed for. So the
+    // property is asserted where it lives — on the ingest and the database, with the layer off.
+    const h = await start("off");
+    events = [];
+    const message = new TextEncoder().encode("hello there, ordinary message");
+    await ingestDocumentFrame(h, "sess-off-msg", message, "corr-off-msg");
+
+    const seen = events.map((e) => e.event);
+    expect(seen, "an ordinary message was refused as a document").not.toContain("document.frame.refused");
+    expect(seen, "an ordinary message was consumed by the document fork").not.toContain(
+      "session.document.received",
+    );
+    const db = h.getSessionNodeManager().getDb()!;
+    const rows = db
+      .prepare("SELECT COUNT(*) AS n FROM transcript WHERE session_id = ? AND direction = 'received'")
+      .get("sess-off-msg") as { n: number };
+    expect(rows.n, "an ordinary message never reached the operator's conversation history").toBe(1);
+  }, 120_000);
 });

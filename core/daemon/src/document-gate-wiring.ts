@@ -108,7 +108,12 @@ export function wireDocumentGate(
     // as a refusal the peer receives; closing it needs a wire reason code, which is a protocol change
     // this order explicitly does not make.
     sessionNodeManager.setOnDocumentFrame(
-      (agentName, sessionId, _content, senderPubkey, correlationId) => {
+      (agentName, sessionId, content, senderPubkey, correlationId) => {
+        // ⚠️ ASK THE CLASSIFIER FIRST. The ingest hands EVERY inbound frame to this hook, and the real
+        // router answers `consumed: false` for anything that is not document traffic. This stand-in
+        // used to skip the question and claim every frame, so with documents off every ordinary chat
+        // message was refused, dropped, and still signed for (live, daemon 0.0.213, 2026-09-13).
+        if (!isDocumentFrame(content)) return { consumed: false };
         logger.warn("document.frame.refused", {
           agentName,
           sessionId,
