@@ -9,6 +9,7 @@
 
 import { describe, it, expect } from "vitest";
 import { terminalRelayRefusal } from "../session-terminal-refusal.js";
+import { isTerminalRelayRefusal } from "../session-relay-client.js";
 
 function fixture() {
   const retired: string[] = [];
@@ -19,6 +20,24 @@ function fixture() {
   };
   return { deps, retired, errors };
 }
+
+describe("session_closing — the other side closed before this message reached the relay", () => {
+  it("is terminal for the send, so the message is never passed to the peer or reported delivered", () => {
+    // Live 2026-09-13, session `a1a67b3a…`: treated as a transient failure, the message went to the
+    // peer anyway, the sender was told "delivered", and both seals failed on the split record.
+    expect(isTerminalRelayRefusal("session_closing")).toBe(true);
+  });
+
+  it("tells the sender they closed and nothing was sent — and does not claim a retirement", () => {
+    const f = fixture();
+    const res = terminalRelayRefusal(f.deps, { sessionId: "s-9", reason: "session_closing", correlationId: "c-9" });
+    expect(res.ok).toBe(false);
+    expect(res.error).toContain("closed");
+    expect(res.guidance).toContain("Nothing was sent");
+    // The session is still sealing: saying it was retired would send them looking for a problem.
+    expect(res.guidance).not.toContain("retired");
+  });
+});
 
 describe("a terminal relay refusal RETIRES the session, not just reports it", () => {
   it("retires the session the relay has sealed", () => {

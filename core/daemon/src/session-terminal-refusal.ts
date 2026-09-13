@@ -74,6 +74,19 @@ export function terminalRelayRefusal(
     correlationId: input.correlationId,
     impact: "the relay has ended this session — nothing sent now can ever be part of its record",
   });
+  // The session is still sealing here — the other side closed first. Nothing is retired, and the
+  // sentence must not say so, or they go looking for a problem that is not there.
+  if (input.reason === "session_closing") {
+    return {
+      ok: false,
+      reason: input.reason,
+      error: "the other side closed this conversation just before your message reached the relay",
+      durable: false,
+      guidance:
+        "Nothing was sent. The other side closed this conversation a moment before your message " +
+        "arrived, so it is being sealed as it stood without it. Start a new session if there is more to say.",
+    };
+  }
   return {
     ok: false,
     reason: input.reason,

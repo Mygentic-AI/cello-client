@@ -128,6 +128,8 @@ export const TERMINAL_RELAY_REFUSALS: ReadonlySet<string> = new Set([
    * would retire a conversation that is about to seal normally.
    */
   "seal_refused",
+  // The counterparty closed first: terminal for THIS SEND only, never retires (live 2026-09-13).
+  "session_closing",
 ]);
 
 /** True when the relay has ended this session and no later submit can succeed. */
