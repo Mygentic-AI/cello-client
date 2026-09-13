@@ -148,7 +148,7 @@ export function createSessionNotify(deps: SessionNotifyDeps) {
     getNotificationDispatcher().dispatchSessionStateChanged(agentName, sessionId, state, counterpartyPubkey, who);
     void sendTelegramDoorbell(agentName, sessionId, "state_change", `Session ${state}`);
     // Reviewer HIGH fix (a60d68ed): telegramRungUnread had NO cleanup at all — a session that
-    // rings once and is never read via cello_receive/since_seq (e.g. the operator only ever uses
+    // rings once and is never read via cello_receive (e.g. the operator only ever uses
     // cello_get_transcript, which does not advance the read watermark) left a permanent entry for
     // the life of the daemon process. Every state change is a natural point to drop it — the
     // worst case if the session is still genuinely active is one possible extra ring later, far

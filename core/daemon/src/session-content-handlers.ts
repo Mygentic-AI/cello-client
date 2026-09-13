@@ -689,7 +689,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         );
         // `sequence_number` is a LEAF INDEX or nothing. Reporting the relay's number when no leaf
         // exists hands the caller a value that matches no leaf on this side, and anything that
-        // feeds it to a cursor or a `--since-seq` read is then wrong.
+        // feeds it to a cursor is then wrong.
         const queuedLeaf = placed.placed ? placed.leafIndex : -1;
         if (placed.placed) {
           sessionNodeManager.recordTranscriptMessage(record.agent_name, sessionId, queuedLeaf, "sent", sendBytes, correlationId, sentAuthorship(sendResult));
@@ -1033,8 +1033,8 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     // DOD-UNREAD-1 D4b: a TRANSCRIPT-ONLY session — received rows exist but no sessions row (the
     // pre-D3/D4a phantom residue: the counterparty's reply landed while this side refused the
     // session). Those rows are counted unread by getUnreadSummary, so cello_receive MUST be able
-    // to read them or the badge can never clear. Reading is a transcript operation: the since_seq
-    // catch-up below works from the durable transcript alone. Only a session with NEITHER a row
+    // to read them or the badge can never clear. Reading is a transcript operation: the read below
+    // works from the durable transcript alone. Only a session with NEITHER a row
     // NOR transcript rows is truly not found.
     let transcriptOnly = false;
     if (!record) {
@@ -1174,10 +1174,19 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
       // DOD-M12B-AWAY-MARK-1: an away auto-reply is an ordinary message leaf, so without the mark a
       // read is positive evidence a person answered. The content is passed through WHOLE.
       const autoReplyCount = unread.filter((m) => isAutoReplyMarked(m.text)).length;
+      // A message that arrived but could not be written to the transcript has no row, so the
+      // bookmark just moved past it. Say so HERE, on the answer that crossed it — otherwise the
+      // operator sees only a gap in the sequence numbers (review of 86ec7524).
+      const lastSeq = unread[unread.length - 1]!.sequence;
+      const crossed = sessionNodeManager.getUndeliverableSeqs(agentName, sessionId).filter((s) => s <= lastSeq);
       return {
         ok: true,
         session_id: sessionId,
         count: unread.length,
+        ...(crossed.length > 0 ? {
+          undeliverable_sequences: [...crossed],
+          undeliverable_guidance: `${crossed.length} message(s) arrived but could not be written to the local transcript, so they cannot be shown. This is a fault on THIS machine (check disk space and ~/.cello permissions), not the counterparty. Ask them to resend once it is fixed.`,
+        } : {}),
         messages: unread.map((m) => ({
           sequence: m.sequence,
           content: m.text,
@@ -1234,6 +1243,10 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
       const terminal = sessionNodeManager.peekTerminalMarker(agentName, sessionId);
       if (terminal) {
         const sealedRoot = sessionNodeManager.getSealedRootHex(agentName, sessionId);
+        // ⚠️ Unread messages are deliberately NOT handed over here, although that is the one place
+        // "every unread message" does not hold. A sealed conversation's leftover message is not live
+        // work: on 2026-08-05 an agent obeyed a [[STANDBY]] from a session that had ended. The
+        // operator is pointed at cello_transcript instead (DOD-TERMINAL-WAKE-1).
         // AC3 covers "both outcomes" — got something / got nothing. This is the third exit from the
         // same silent handler, and leaving it silent would reproduce the defect one branch over.
         logger.info("session.receive.sealed", {

@@ -73,8 +73,9 @@ describe("cello_receive — every unread message, one bookmark per agent", () =>
     await fx.ingestReceived("alice", SID, "two");
 
     expect(texts((await conn.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Answer)).toEqual(["one", "two"]);
-    const sent = (await conn.send("cello_send", { session_id: SID, content: "answer" })) as Answer;
-    expect(sent.reason, "everything was read, so the send must not be refused as unread").not.toBe("session_not_current");
+    await conn.send("cello_send", { session_id: SID, content: "answer", signal: "over" });
+    // The gate logs every refusal; a send that fails later for a fixture reason must not pass this.
+    expect(fx.eventsNamed("session.send.blocked"), "everything was read, so the read-before-send gate must not refuse").toEqual([]);
   });
 
   it("★★ a permanent hole (a blocked message) does not strand every later message", async () => {

@@ -41,14 +41,31 @@ describe("DOD-COATTEND-1 F2: a swallowed transcript write is reported as itself"
    * `try/catch` that swallows, so the throw under test was the stub's own. The defect lives INSIDE
    * that catch, so the failure has to originate under it.
    */
-  function breakTranscriptWrites(): void {
+  function breakTranscriptWrites(): () => void {
     const db = fx.snm.getDb() as unknown as { prepare: (sql: string) => unknown };
     const realPrepare = db.prepare.bind(db);
     db.prepare = (sql: string) => {
       if (/INSERT OR IGNORE INTO transcript/i.test(sql)) throw new Error("SQLITE_FULL: database or disk is full");
       return realPrepare(sql);
     };
+    return () => { db.prepare = realPrepare; };
   }
+
+  it("W4: a read that moves PAST a lost message says so on that same answer", async () => {
+    // One bookmark per agent moves to the last message handed over, crossing the lost one. Without
+    // this the operator sees only a gap in the sequence numbers (review of 86ec7524).
+    await fx.createSession(SID, "alice");
+    const conn = await fx.connectAs("alice");
+    const restore = breakTranscriptWrites();
+    await fx.ingestReceived("alice", SID, "lost to the disk");
+    restore();
+    await fx.ingestReceived("alice", SID, "this one landed");
+
+    const r = (await conn.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>;
+    expect((r.messages as Array<{ content: string }>).map((m) => m.content)).toEqual(["this one landed"]);
+    expect(r.undeliverable_sequences).toEqual([0]);
+    expect(String(r.undeliverable_guidance)).toMatch(/THIS machine/);
+  });
 
   it("W1: the ingest FAILS instead of reporting success on a message it could not durably record", async () => {
     await fx.createSession(SID, "alice");

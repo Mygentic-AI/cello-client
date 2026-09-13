@@ -53,7 +53,7 @@ export function createTelegramDoorbell(deps: TelegramDoorbellDeps): TelegramDoor
   let telegramPollerGeneration = 0;
   let telegramUpdateOffset = 0;
   // Coalescing: ring once for the FIRST message-waiting event since a session was last fully
-  // read; cleared on read (cello_receive/since_seq advancing that session's watermark). Session
+  // read; cleared on read (cello_receive advancing that session's watermark). Session
   // requests and state changes bypass this Set entirely — DoD says they always ring.
   const telegramRungUnread = new Set<string>();
 

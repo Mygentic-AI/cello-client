@@ -64,7 +64,7 @@ export function startBootConnectionState(deps: BootConnectionStateDeps) {
     if (seq > prior) byId.set(sessionId, seq); // monotonic — never lowers
   }
   // M8C-CURSOR-1 (cello-unit-reviewer HIGH finding, confirmed by live reproduction): a
-  // received-only delivery (since_seq / live-drain cello_receive) must NOT blindly advance the
+  // received-only delivery (cello_get_transcript's received view) must NOT blindly advance the
   // cursor to the max sequence it happened to see — leaf indices are shared and strictly
   // contiguous across BOTH directions (appendSessionLeaf always assigns leafCount, no gaps), so a
   // gap between the connection's actual cursor and that max can hide an unread SENT leaf authored

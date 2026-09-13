@@ -28,7 +28,7 @@ import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/
 const SID = "cd".repeat(32);
 const contents = (r: Record<string, unknown>) => ((r.messages ?? []) as Array<{ content: string }>).map((m) => m.content);
 
-describe("DOD-COATTEND-1: two attached sessions BOTH receive the message", () => {
+describe("DOD-COATTEND-1: two attached sessions share ONE bookmark — the first reader receives the message", () => {
   let fx: TwoConnectionFixture;
 
   beforeEach(async () => {
