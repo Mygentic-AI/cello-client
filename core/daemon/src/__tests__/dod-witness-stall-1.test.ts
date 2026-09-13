@@ -54,6 +54,8 @@ describe("a relay refusal that can never resolve is not treated as a hiccup", ()
     // collapse happened.
     expect([...TERMINAL_RELAY_REFUSALS].sort()).toEqual([
       "seal_refused",
+      // Terminal for the SEND only — the other side closed first (2026-09-13).
+      "session_closing",
       "session_not_found",
       "session_sealed",
     ]);

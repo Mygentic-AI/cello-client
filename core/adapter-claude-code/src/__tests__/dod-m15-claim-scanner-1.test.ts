@@ -220,7 +220,6 @@ const UNADJUDICATED_BASELINE: Record<string, number> = {
   "core/cli/src/registry.ts (operator-facing strings)": 4,
   "plugins/cello/agents/cello-receptionist.md": 8,
   "plugins/cello/skills/cello/SKILL.md": 29,
-  "plugins/cello/skills/documents/SKILL.md": 18,
   "plugins/cello/skills/receptionist/SKILL.md": 11,
   "plugins/cello/skills/reconnect/SKILL.md": 4,
   "plugins/cello/skills/setup/SKILL.md": 9,
