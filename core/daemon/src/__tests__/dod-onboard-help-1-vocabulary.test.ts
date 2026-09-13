@@ -22,6 +22,7 @@ import {
   MCP_ONLY_TOOLS,
   deadCliVerbPattern,
   knownToolNames,
+  isDocumentVerbName,
   toCliGuidance,
   renderForSurface,
 } from "../vocabulary.js";
@@ -222,7 +223,14 @@ describe("DOD-ONBOARD-HELP-1 §2b — SOURCE AUDIT: the daemon never names a com
 
   it("every cello_* token the daemon shows a user resolves to a real tool", () => {
     const known = knownToolNames();
-    const unknown = scan(/cello_[a-z_]+/g).filter((t) => !known.has(t.token));
+    // 074-DOCSFLAG: with documents OFF the doc verbs leave the vocabulary, but the document layer's
+    // own files still name them — and those files register nothing while the flag is off, so their
+    // guidance is only ever shown when the tools exist. `notification-handlers.ts` names them only in
+    // `documentSection`, which returns nothing unless the document layer is wired. A doc verb
+    // anywhere ELSE is still a finding.
+    const docGated = (file: string) => /^document-/.test(file) || file === "notification-handlers.ts";
+    const unknown = scan(/cello_[a-z_]+/g).filter((t) =>
+      !known.has(t.token) && !(isDocumentVerbName(t.token) && docGated(t.file)));
     expect(
       unknown,
       `The daemon names MCP tool(s) that do not exist. An error message handing the operator a dead ` +
