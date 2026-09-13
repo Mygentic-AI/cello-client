@@ -712,6 +712,12 @@ class CelloAdapter(BasePlatformAdapter):
             m["content"] for m in messages
             if isinstance(m, dict) and isinstance(m.get("content"), str) and m["content"]
         ] if isinstance(messages, list) else []
+        lost_note = result.get("undeliverable_guidance")
+        if isinstance(lost_note, str) and lost_note:
+            # A message this machine failed to save was skipped by this read. The agent is the only
+            # one who can pass that on, so it rides in the turn as well as the log.
+            logger.error("[cello] %s (session %s)", lost_note, session_id)
+            parts.append("[CELLO notice] " + lost_note)
         if not parts:
             # Nothing unread: another session on this agent read it first, or it timed out. An
             # empty user turn tells the agent nothing - the wake notice at least names the session.

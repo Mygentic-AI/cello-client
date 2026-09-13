@@ -571,6 +571,15 @@ describe("DOD-HERMES-4 — the adapter owns inbound content and outbound deliver
     expect(v.delivered![0].text).toContain("CELLO wake");
   });
 
+  it("a lost-message notice from the daemon reaches the agent's turn", () => {
+    const v = run({
+      op: "notify", kind: "cello_message", data: MSG,
+      receive_result: { ok: true, count: 1, messages: [{ sequence: 1, content: "hi" }], undeliverable_guidance: "1 message(s) could not be written" },
+    });
+    expect(v.delivered![0].text).toContain("hi");
+    expect(v.delivered![0].text).toContain("could not be written");
+  });
+
   it("a top-level 'content' string is NOT read — the daemon answers with 'messages' now", () => {
     // Guards the 2026-09-13 break: the bridge read result.content, the daemon had stopped sending
     // it, and every message was marked read and delivered to nobody.
