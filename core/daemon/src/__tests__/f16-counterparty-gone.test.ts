@@ -286,6 +286,15 @@ describe("M8B F16: counterparty-gone surfaces on cello_receive and cello_status"
     const { A, clientA, clientB } = await establishSession();
     try {
       const snm = A.getSessionNodeManager();
+      // PRIMER FIRST — the same precondition the delivery_impaired test below spells out. Session
+      // setup and the content-key exchange finish independently; a send issued before the key is
+      // agreed fails as `content_key` WITHOUT opening a stream, so the injected fault is never
+      // consumed and lands on the next send instead. Measured in CI on the v0.0.301 tag run: the
+      // recovery send failed `session_stream_unavailable`.
+      const primer = (await clientA.send("cello_send", {
+        session_id: SID_HEX, content: "primer — proves the content key is established", signal: "over",
+      })) as Record<string, unknown>;
+      expect(primer.ok, `the primer send must succeed: ${JSON.stringify(primer)}`).toBe(true);
       snm.injectSendFault(1);
       await clientA.send("cello_send", { session_id: SID_HEX, content: "does not land", signal: "over" });
 
@@ -327,6 +336,15 @@ describe("M8B F16: counterparty-gone surfaces on cello_receive and cello_status"
     const { A, clientA, clientB } = await establishSession();
     try {
       const snm = A.getSessionNodeManager();
+      // PRIMER FIRST — the same precondition the delivery_impaired test below spells out. Session
+      // setup and the content-key exchange finish independently; a send issued before the key is
+      // agreed fails as `content_key` WITHOUT opening a stream, so the injected fault is never
+      // consumed and lands on the next send instead. Measured in CI on the v0.0.301 tag run: the
+      // recovery send failed `session_stream_unavailable`.
+      const primer = (await clientA.send("cello_send", {
+        session_id: SID_HEX, content: "primer — proves the content key is established", signal: "over",
+      })) as Record<string, unknown>;
+      expect(primer.ok, `the primer send must succeed: ${JSON.stringify(primer)}`).toBe(true);
       snm.injectSendFault(1);
       await clientA.send("cello_send", { session_id: SID_HEX, content: "does not land", signal: "over" });
       if (snm.getSessionImpairment("alice", SID_HEX)?.retained !== "lost") return; // covered above
