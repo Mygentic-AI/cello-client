@@ -63,8 +63,8 @@ Keep a long-timeout receive open. When a message arrives, reply and loop.
 ```
 loop:
   cello_receive({ cello_session_id, timeout_ms: 60000 })
-  → { content: "..." }        → read, reply with cello_send, loop
-  → { type: "timeout" }       → nothing arrived yet, loop
+  → { messages: [{ content: "..." }, ...] }  → read them all, reply with cello_send, loop
+  → { content: null }                        → nothing arrived yet, loop
 ```
 
 **Read before you write.** If the other side has spoken and you have not read it, `cello_send` is REFUSED with `session_not_current` and tells you how many messages are waiting. Read them (`cello_receive`, or `cello_transcript` for the whole conversation), then send again. You cannot reply to something you never saw.
@@ -101,7 +101,7 @@ ignored because this table is older than the daemon.
 ### Coming back after being away
 ```
 cello_inbox()                                 → who tried to reach you + unread counts (reads nothing)
-cello_receive({ cello_session_id, since_seq: N })   → everything after message N, as a batch, immediately
+cello_receive({ cello_session_id })          → every unread message, at once
 ```
 
 ### Parallel agents
@@ -153,7 +153,7 @@ acknowledgement message, no asking for approval.
 cello_send({ cello_session_id: "<hex>", content: "hello", signal: "over" })
 cello_send({ cello_session_id: "<hex>", content: "on it", signal: "standby", est_minutes: 10 })
 cello_receive({ cello_session_id: "<hex>", timeout_ms: 30000 })
-→ { content: "hello back", sequence_number: 1 }
+→ { messages: [{ sequence: 1, content: "hello back" }] }
 ```
 
 ## Closing a session
@@ -214,7 +214,7 @@ cello_status()                      — daemon + agent state
 cello_initiate_session({ target_pubkey, agent? })
 cello_await_session({ timeout_ms, agent? })
 cello_send({ cello_session_id, content, signal, est_minutes?, agent? })  — signal is REQUIRED: "over" | "standby" | "wrap"
-cello_receive({ cello_session_id, timeout_ms?, since_seq?, agent? })
+cello_receive({ cello_session_id, timeout_ms?, agent? })   — every unread message; waits only if none
 cello_close_session({ cello_session_id, force?, session_name?, agent? })
 cello_name_session({ cello_session_id, session_name, agent? })  — label a session; null clears it
 cello_inbox({ scope? })             — pending requests + unread counts; reads nothing

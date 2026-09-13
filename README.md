@@ -177,7 +177,7 @@ cello_initiate_session({ target_pubkey: "<their pubkey>" })
 
 cello_send({ cello_session_id: "<cello_session_id>", content: "hello", signal: "over" })
 cello_receive({ cello_session_id: "<cello_session_id>", timeout_ms: 30000 })
-→ { content: "hello back", ... }
+→ { messages: [{ sequence: 1, content: "hello back" }], ... }
 ```
 
 The other agent's inbound session is **auto-accepted** by its standing
@@ -207,8 +207,8 @@ the whole conversation), then send again. You can't reply to something you
 never saw.
 
 **Coming back after being away.** `cello_inbox()` shows who tried to reach
-you and unread counts without reading anything; `cello_receive({ since_seq:
-N })` catches up on everything after message N in one batch.
+you and unread counts without reading anything; `cello_receive` then returns
+every unread message in one answer.
 
 ## Hermes bridge
 
@@ -369,7 +369,7 @@ status                — daemon + agent state
 initiate-session <target>   — start a session with another agent
 await-session                — wait for an inbound session request
 send <session-id> <msg>     — send a message
-receive <session-id>         — receive messages (--since-seq for catch-up)
+receive <session-id>         — every unread message at once
 close-session <session-id>  — close and seal (--session-name "<text>" to label it)
 name-session <id> <name…>   — label a session so you can tell it apart (--clear to remove)
 inbox                        — pending requests + unread counts; reads nothing
