@@ -16,7 +16,7 @@ import { describe, it, expect } from "vitest";
 import { readFile, readdir } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { knownToolNames, RENAMED_AWAY_TOOLS, deadCliVerbPattern } from "@cello-protocol/daemon";
+import { RENAMED_AWAY_TOOLS, deadCliVerbPattern } from "@cello-protocol/daemon";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SKILLS_DIR = join(__dirname, "../../../../plugins/cello/skills");
@@ -39,7 +39,7 @@ describe("plugin skills — shipped content, audited like shipped content", () =
     // empty list — the shape that let five trust-signal tools ship undocumented.
     const skills = await skillFiles();
     expect(skills.length).toBeGreaterThan(0);
-    expect(skills.map((s) => s.name).sort()).toContain("documents");
+    expect(skills.map((s) => s.name).sort()).toContain("cello");
   });
 
   it("names no tool that was RENAMED AWAY or deleted", async () => {
@@ -90,14 +90,11 @@ describe("plugin skills — shipped content, audited like shipped content", () =
     }
   });
 
-  it("the documents skill covers every document verb", async () => {
+  it("no skill ships for the documents feature while it is switched off", async () => {
+    // Live 2026-09-13: the plugin still shipped a documents skill with no tool behind it, so an
+    // agent could load instructions for verbs it cannot call. Restore the skill from git with the
+    // feature.
     const skills = await skillFiles();
-    const documents = skills.find((s) => s.name === "documents")!;
-    const docVerbs = [...knownToolNames()].filter((t) => t.startsWith("cello_doc_"));
-    expect(docVerbs.length).toBeGreaterThan(0);
-    // Driven off the vocabulary, not a sample: a verb added later fails this until it is documented,
-    // which is the only version of this check that stays true.
-    const missing = docVerbs.filter((v) => !documents.content.includes(v));
-    expect(missing, `plugins/cello/skills/documents/SKILL.md omits: ${missing.join(", ")}`).toEqual([]);
+    expect(skills.find((s) => s.name === "documents")).toBeUndefined();
   });
 });
