@@ -1111,11 +1111,15 @@ export class SessionContentIngest {
     // DOD-M12B-SEAL-STUCK-1: this process has now seen this session's ordering state, so an empty
     // witness map for it means "no gap" rather than "never looked".
     this.#ctx.orderingObserved.add(key);
+    const hw = this.#ctx.highWaterSeq.get(key) ?? -1;
+    if (sequenceNumber > hw) this.#ctx.highWaterSeq.set(key, sequenceNumber);
+    // ALREADY PLACED: the message beat the relay's copy on the direct path. The entry is retired
+    // when a leaf is appended, so recording it now would never be retired, and every close would
+    // answer `session_incomplete` until force-abandon — live on `0a534851…`, 2026-09-13.
+    if (this.#ctx.getSessionTree(agentName, sessionId).hashAt(sequenceNumber) === contentHashHex) return;
     let map = this.#ctx.witnessedSeq.get(key);
     if (!map) { map = new Map(); this.#ctx.witnessedSeq.set(key, map); }
     map.set(contentHashHex, sequenceNumber);
-    const hw = this.#ctx.highWaterSeq.get(key) ?? -1;
-    if (sequenceNumber > hw) this.#ctx.highWaterSeq.set(key, sequenceNumber);
 
     /**
      * DOD-M12B-LEAF-TRIGGERS-FETCH-1 — A LEAF WE CANNOT READ IS A FETCH ORDER.

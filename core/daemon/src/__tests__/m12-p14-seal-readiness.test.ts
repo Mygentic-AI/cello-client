@@ -286,6 +286,20 @@ describe("M12-P14: sealReadiness computes from real manager state", () => {
     expect(fx.snm.getSessionTree("alice", SID).size()).toBe(1);
   });
 
+  it("★★★ the relay's copy arriving AFTER the message was placed is not a missing leaf", async () => {
+    // Live 2026-09-13, session `0a534851…`: the counterparty's message arrived on the direct path
+    // 4ms before the relay's ordering copy. The message was placed, then the late copy re-recorded
+    // it as outstanding and nothing ever cleared it — `treeSize 3, missingLeaves 1`, and every
+    // close answered `session_incomplete` until force-abandon, with no receipt.
+    await fx.createSession(SID, "alice");
+    const idx = fx.seedReceived("alice", SID, "arrived first on the direct path");
+    const hash = fx.snm.getSessionTree("alice", SID).hashAt(idx)!;
+
+    fx.snm.recordWitnessedSequence("alice", SID, hash, idx);
+
+    expect(fx.snm.sealReadiness("alice", SID)).toMatchObject({ ready: true, missingLeaves: 0 });
+  });
+
   it("a high-water AHEAD of the tree does NOT by itself refuse — ctrl leaves live in that space, msg leaves do not", async () => {
     // The false positive that the first implementation would have shipped. The relay increments its
     // sequence counter for EVERY leaf including the seal ctrl leaf, while the tree is msg-only, so
