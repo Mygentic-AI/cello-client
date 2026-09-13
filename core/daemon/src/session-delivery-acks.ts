@@ -758,12 +758,17 @@ export function readDeliveryFacts(
   if (relayTablePresent) {
     for (const r of db
       .prepare(
-        `SELECT hash_hex, relay_id, relay_timestamp, signature_hex
+        `SELECT hash_hex, relay_id, relay_timestamp, signature_hex, sequence_number
            FROM relay_ack_receipts WHERE agent_pubkey = ? AND session_id = ?
             AND (leaf_kind IS NULL OR leaf_kind <> 2)`,
       )
-      .all(agentPubkey, sessionId) as Array<{ hash_hex: string; relay_id: string; relay_timestamp: number; signature_hex: string }>) {
-      if (!receivedHashes.has(r.hash_hex)) receipts.set(r.hash_hex, r);
+      .all(agentPubkey, sessionId) as Array<{ hash_hex: string; relay_id: string; relay_timestamp: number; signature_hex: string; sequence_number: number }>) {
+      // Both sides can send identical bytes ("ok"), so the hash alone cannot say whose message a
+      // receipt is for. When we SENT this hash, keep only the receipt at our own leaf's position
+      // (relay numbers from 1, the tree from 0); otherwise keep it only if nobody sent it to us.
+      const ownSeq = seqByHash.get(r.hash_hex);
+      const ours = ownSeq !== undefined ? ownSeq === r.sequence_number - 1 : !receivedHashes.has(r.hash_hex);
+      if (ours) receipts.set(r.hash_hex, r);
     }
   }
   const acks = new Map<string, { signer_pubkey: string; signature: Uint8Array; recorded_at: number }>();

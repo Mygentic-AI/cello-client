@@ -340,6 +340,18 @@ describe("DELIVERYACK: the five rules, on the inbound path", () => {
     const facts = readDeliveryFacts(db, a.logger, agentId, SID);
     expect(facts.find((f) => f.content_hash === theirs)).toBeUndefined();
     expect(facts.find((f) => f.content_hash === "c0ffee")).toBeUndefined();
+
+    // Both sides sent the SAME text: our own copy must stay in the list, with OUR receipt.
+    db.prepare("INSERT INTO session_tree_leaves (agent_id, session_id, leaf_index, leaf_kind, leaf_hash_hex, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(agentId, SID, 5, "msg", theirs, Date.now());
+    db.prepare("INSERT INTO transcript (agent_id, session_id, sequence, direction, blob, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(agentId, SID, 5, "sent", Buffer.from("bob said this"), Date.now());
+    db.prepare(`INSERT INTO relay_ack_receipts (agent_pubkey, session_id, sequence_number, hash_hex, relay_id, relay_pubkey_hex,
+      relay_timestamp, signature_hex, stored_at, leaf_kind) VALUES (?, ?, 6, ?, 'r', 'rp', 2, 'bb', 1, 0)`)
+      .run(pub, SID, theirs);
+    const mine = readDeliveryFacts(db, a.logger, agentId, SID).find((f) => f.content_hash === theirs);
+    expect(mine?.seq).toBe(5);
+    expect(mine?.ordered?.signature).toBe("bb");
   });
 
   it("★★★ RULE 1: with NO usable recorded key for the counterparty, there is nothing to check against and the ack is discarded", async () => {
