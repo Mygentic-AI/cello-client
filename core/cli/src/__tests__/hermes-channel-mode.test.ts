@@ -111,10 +111,9 @@ retry_scheduled = {"v": False}
 adapter._requeue_wake_later = lambda frame, delay: retry_scheduled.__setitem__("v", True)
 
 calls = []
-receive_result = spec.get("receive_result", {"ok": True, "content": "hello from the peer"})
-# A QUEUE of pending messages, mirroring the daemon: cello_receive serves this connection's
-# oldest unread and returns an empty 'ok' once drained. Default is a single message so the
-# existing cases are unchanged.
+receive_result = spec.get("receive_result", {"ok": True, "count": 1, "messages": [{"sequence": 0, "content": "hello from the peer"}]})
+# The pending messages, mirroring the daemon since 2026-09-13: ONE cello_receive returns every
+# unread message as 'messages' and marks them read, so a second read returns nothing.
 receive_queue = list(spec.get("receive_queue") or [])
 
 async def fake_call(method, params=None, timeout=None):
@@ -123,12 +122,11 @@ async def fake_call(method, params=None, timeout=None):
         if receive_result == "raise":
             raise ConnectionError("socket died")
         if spec.get("receive_queue") is not None:
-            if not receive_queue:
+            batch = [{"sequence": i, "content": c} for i, c in enumerate(receive_queue)]
+            receive_queue.clear()
+            if not batch:
                 return {"ok": True, "content": None}
-            nxt = receive_queue.pop(0)
-            if nxt == "raise":
-                raise ConnectionError("socket died mid-drain")
-            return {"ok": True, "content": nxt}
+            return {"ok": True, "count": len(batch), "messages": batch}
         return receive_result
     if method == "cello_send":
         return spec.get("send_result") or {"ok": True}
@@ -155,7 +153,7 @@ async def main():
                 req = json.loads(blob.decode("utf-8"))
                 calls.append({"method": req.get("method"), "params": req.get("params") or {}})
                 if req.get("method") == "cello_receive":
-                    body = {"id": req["id"], "result": {"ok": True, "content": "hello from the peer"}}
+                    body = {"id": req["id"], "result": {"ok": True, "count": 1, "messages": [{"sequence": 0, "content": "hello from the peer"}]}}
                     reader.feed_data((json.dumps(body) + "\\n").encode("utf-8"))
             async def drain(self): pass
             def close(self): pass
@@ -554,21 +552,13 @@ describe("DOD-HERMES-4 — the adapter owns inbound content and outbound deliver
     expect(v.delivered).toHaveLength(1); // one turn, so one reply — not a reply per message
   });
 
-  it("AC10: it keeps reading until the queue is EMPTY, so nothing is left to block the reply", () => {
+  it("AC10: ONE read takes every waiting message — a second read would find them already marked read", () => {
     const v = run({
       op: "notify", kind: "cello_message", data: MSG,
       receive_queue: ["a", "b", "c"],
     });
-    const receives = v.calls.filter((c) => c.method === "cello_receive");
-    // 3 messages + 1 read that comes back empty = the drain proved it reached the end.
-    expect(receives.length).toBe(4);
-  });
-
-  it("AC10: only the FIRST read waits — the rest are non-blocking, or a drain costs 5s per message", () => {
-    const v = run({ op: "notify", kind: "cello_message", data: MSG, receive_queue: ["a", "b"] });
-    const receives = v.calls.filter((c) => c.method === "cello_receive");
-    expect(Number(receives[0].params.timeout_ms)).toBeGreaterThan(0);
-    for (const r of receives.slice(1)) expect(Number(r.params.timeout_ms)).toBe(0);
+    expect(v.calls.filter((c) => c.method === "cello_receive").length).toBe(1);
+    expect(v.delivered![0].text).toBe("a\n\nb\n\nc");
   });
 
   it("AC10: a single queued message behaves exactly as before — no drain-shaped regression", () => {
@@ -581,15 +571,11 @@ describe("DOD-HERMES-4 — the adapter owns inbound content and outbound deliver
     expect(v.delivered![0].text).toContain("CELLO wake");
   });
 
-  it("AC10: a mid-drain failure delivers what was already read rather than losing it", () => {
-    // Dropping the successfully-read messages on a later error would put them nowhere: the daemon
-    // has already marked them read, so they are not recoverable from the wake notice either.
-    const v = run({
-      op: "notify", kind: "cello_message", data: MSG,
-      receive_queue: ["first one arrived", "raise"],
-    });
-    expect(v.delivered![0].text).toContain("first one arrived");
-    expect(v.delivered![0].text).not.toContain("CELLO wake");
+  it("a top-level 'content' string is NOT read — the daemon answers with 'messages' now", () => {
+    // Guards the 2026-09-13 break: the bridge read result.content, the daemon had stopped sending
+    // it, and every message was marked read and delivered to nobody.
+    const v = run({ op: "notify", kind: "cello_message", data: MSG, receive_result: { ok: true, content: "old shape" } });
+    expect(v.delivered![0].text).not.toBe("old shape");
   });
 
   // ─────────────── AC9: the fallback notice must not tell a channel-mode agent to send
