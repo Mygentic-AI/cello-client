@@ -66,6 +66,7 @@ function harness(opts: {
     getSealCertificate: () => null,
     resolveAgentId: () => "aid",
     setSessionName: () => {},
+    getUnreadReceivedCount: () => 0,
     sealReadiness: () => ({ ready: true, treeSize: 1, highWaterSeq: 0, heldCount: 0, missingLeaves: 0, heldOwn: 0, heldReceived: 0, diverged: false }),
   };
 
@@ -211,6 +212,7 @@ describe("an interrupted close asks the relay to notarize, not just the counterp
         getSealCertificate: () => null,
         resolveAgentId: () => "aid",
         setSessionName: () => {},
+        getUnreadReceivedCount: () => 0,
         sealReadiness: () => ({ ready: true, treeSize: 1, highWaterSeq: 0, heldCount: 0, missingLeaves: 0, heldOwn: 0, heldReceived: 0, diverged: false }),
       },
       getConnState: () => ({ currentAgent: AGENT }),
@@ -291,6 +293,7 @@ function discoveryHarness(opts: {
       getSealCertificate: () => null,
       resolveAgentId: () => "aid",
       setSessionName: () => {},
+      getUnreadReceivedCount: () => 0,
       sealReadiness: () => ({ ready: true, treeSize: 1, highWaterSeq: 0, heldCount: 0, missingLeaves: 0, heldOwn: 0, heldReceived: 0, diverged: false }),
     },
     getConnState: () => ({ currentAgent: AGENT }),

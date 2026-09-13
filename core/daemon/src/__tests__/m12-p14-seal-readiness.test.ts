@@ -40,6 +40,7 @@ function harness(sealReady: Readiness, status = "interrupted") {
 
   const sessionNodeManager = {
     getSessionRecord: () => ({ agent_name: AGENT, agent_id: "aid", session_id: SESSION, status }),
+    getUnreadReceivedCount: () => 0,
     sealReadiness: () => sealReady,
     // DOD-M12B-ABANDON-NOTIFY-1: force-abandon now tells the counterparty first. Modelled as
     // "could not reach them", which is the case the guidance has to be honest about.

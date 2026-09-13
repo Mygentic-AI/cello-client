@@ -65,6 +65,7 @@ function twoAgentHarness() {
         getSealCertificate: () => null,
         resolveAgentId: () => `id-${agent}`,
         setSessionName: () => {},
+        getUnreadReceivedCount: () => 0,
         sealReadiness: () => ({ ready: true, treeSize: 1, highWaterSeq: 0, heldCount: 0, missingLeaves: 0 }),
       },
       getConnState: () => ({ currentAgent: agent }),

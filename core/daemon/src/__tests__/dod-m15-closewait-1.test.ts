@@ -136,7 +136,7 @@ describe("DOD-M15-CLOSEWAIT-1: the broker connection outlives the response", () 
   const SESSION = "ab".repeat(16);
 
   /** Builds a cross-node ACTIVE close whose seal never resolves, so the tail stays in flight. */
-  async function harness() {
+  async function harness(unread = 0) {
     const { registerCloseSessionHandler } = await import("../close-session-handler.js");
     const handlers = new Map<string, (p: Record<string, unknown>, c: string) => Promise<unknown>>();
     const stop = vi.fn(async () => {});
@@ -163,6 +163,7 @@ describe("DOD-M15-CLOSEWAIT-1: the broker connection outlives the response", () 
         getSealCertificate: () => null,
         resolveAgentId: () => "aid",
         setSessionName: () => {},
+        getUnreadReceivedCount: () => unread,
         sealReadiness: () => ({ ready: true, treeSize: 1, highWaterSeq: 0, heldCount: 0, missingLeaves: 0, heldOwn: 0, heldReceived: 0, diverged: false }),
       },
       getConnState: () => ({ currentAgent: AGENT }),
@@ -186,6 +187,23 @@ describe("DOD-M15-CLOSEWAIT-1: the broker connection outlives the response", () 
 
     return { close: handlers.get("cello_close_session")!, stop, events, backgroundSeals };
   }
+
+  it("★ closing with an UNREAD message still closes, and says so (live test 2026-09-13)", async () => {
+    const bilateral = process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"];
+    process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"] = "600000";
+    try {
+      const unreadRes = (await (await harness(2)).close({ session_id: SESSION }, "conn-1")) as Record<string, unknown>;
+      expect(unreadRes["seal_status"]).toBe("committed");
+      expect(unreadRes["unread_count"]).toBe(2);
+      expect(String(unreadRes["unread_warning"])).toMatch(/2 message\(s\).*never read/);
+
+      const readRes = (await (await harness(0)).close({ session_id: SESSION }, "conn-1")) as Record<string, unknown>;
+      expect(readRes["unread_warning"], "nothing unread, nothing to warn about").toBeUndefined();
+    } finally {
+      if (bilateral === undefined) delete process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"];
+      else process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"] = bilateral;
+    }
+  }, 30_000);
 
   it("★ the close returns WITHOUT releasing the broker connection the background seal still needs", async () => {
     /**
@@ -296,6 +314,7 @@ describe("DOD-M15-CLOSEWAIT-1: the background ceremony is announced and tracked"
         getSealCertificate: () => null,
         resolveAgentId: () => "aid",
         setSessionName: () => {},
+        getUnreadReceivedCount: () => 0,
         sealReadiness: () => ({ ready: true, treeSize: 1, highWaterSeq: 0, heldCount: 0, missingLeaves: 0, heldOwn: 0, heldReceived: 0, diverged: false }),
       },
       getConnState: () => ({ currentAgent: AGENT }),

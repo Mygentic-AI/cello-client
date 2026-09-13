@@ -49,6 +49,7 @@ function harness(readNext: () => ReadinessShape, status = "active") {
 
   const sessionNodeManager = {
     getSessionRecord: () => ({ agent_name: AGENT, agent_id: "aid", session_id: SESSION, status }),
+    getUnreadReceivedCount: () => 0,
     sealReadiness: () => { readinessReads += 1; return readNext(); },
     notifyCounterpartyAbandon: async () => ({ told: false, reason: "no_local_node" as const }),
     abandonSession: async () => true,

@@ -1456,7 +1456,16 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
             });
           },
         );
-        return describeSealCommitted({ sessionId: sid, deadlineMs: bilateralTimeoutMs });
+        // Live test 2026-09-13: closing with a message you never read gave no warning. The close
+        // still goes ahead — the message is in the sealed record — but the operator is told.
+        const unreadAtClose = sessionNodeManager.getUnreadReceivedCount(rec.agent_name, sid);
+        return {
+          ...describeSealCommitted({ sessionId: sid, deadlineMs: bilateralTimeoutMs }),
+          ...(unreadAtClose > 0 ? {
+            unread_count: unreadAtClose,
+            unread_warning: `You closed this conversation with ${unreadAtClose} message(s) from the other side that you never read. They are part of the sealed record — read them with cello_transcript ${sid}.`,
+          } : {}),
+        };
       } finally {
         // Fix #1: release the transient broker seal-connection (best-effort; the seal result stands).
         //
