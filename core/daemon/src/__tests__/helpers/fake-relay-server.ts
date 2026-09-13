@@ -43,6 +43,11 @@ export interface FakeRelayOpts {
    * one client, and echoing leaves back at it would change their auto-acknowledge behaviour.
    */
   broadcastLeaves?: boolean;
+  /**
+   * Refuse a submit instead of ordering it: return a relay reason and it answers
+   * `hash_submit_error` with that reason, taking no position. Default: never refuses.
+   */
+  refuseSubmit?: (leafKind: number) => string | undefined;
 }
 
 export function makeFakeRelayServer(opts: FakeRelayOpts = {}) {
@@ -81,6 +86,8 @@ export function makeFakeRelayServer(opts: FakeRelayOpts = {}) {
             else if (frame["type"] === "client_record_assignment") push({ type: "assignment_ok" });
             else if (frame["type"] === "hash_submit") {
               const s1 = frame["structure1_cbor"];
+              const refusal = opts.refuseSubmit?.(typeof frame["leaf_kind"] === "number" ? (frame["leaf_kind"] as number) : 0);
+              if (refusal !== undefined) { push({ type: "hash_submit_error", reason: refusal }); continue; }
               const key = s1 instanceof Uint8Array ? Buffer.from(s1).toString("hex") : String(s1);
               const already = bySubmission.get(key);
               const leaf: OrderedLeaf = already ?? {

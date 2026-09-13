@@ -41,7 +41,7 @@ import type { SessionLeafRecords } from "./session-leaf-records.js";
 import type { StandingReceivers } from "./standing-receivers.js";
 import type { ActiveSessionEntry } from "./session-node-types.js";
 import { extractErrorMessage } from "./error-message.js";
-import { awaitOwnRecordSettled } from "./seal-settle.js";
+import { awaitOwnRecordSettled, SEAL_SETTLE_DEADLINE_MS as SEAL_STALE_WAIT_MS } from "./seal-settle.js";
 
 /** What the seal path needs from the manager. */
 export interface SessionSealContext {
@@ -646,17 +646,21 @@ export class SessionSeal {
       // and lock every future close out of escalation (a FINDING-1-shaped deadlock via a
       // different trigger) — clear the mark on any unexpected exception.
       try {
-        const finalRootHex = this.#ctx.getSessionTreeRootHex(agentName, sessionId);
-        const sealPayload = encodeSealPayload({
-          session_id: entry.relaySessionIdBytes,
-          final_root: new Uint8Array(Buffer.from(finalRootHex, "hex")),
-          close_timestamp: Date.now(),
-          attestation: "PENDING",
-        });
-        // content_hash = SHA-256(0x02 || seal_payload) — the ctrl leaf kind byte is 0x02.
-        const contentHash = new Uint8Array(
-          createHash("sha256").update(new Uint8Array([LEAF_KIND_CTRL])).update(sealPayload).digest(),
-        );
+        const signClose = () => {
+          const finalRootHex = this.#ctx.getSessionTreeRootHex(agentName, sessionId);
+          const payload = encodeSealPayload({
+            session_id: entry.relaySessionIdBytes,
+            final_root: new Uint8Array(Buffer.from(finalRootHex, "hex")),
+            close_timestamp: Date.now(),
+            attestation: "PENDING",
+          });
+          // content_hash = SHA-256(0x02 || seal_payload) — the ctrl leaf kind byte is 0x02.
+          const hash = new Uint8Array(
+            createHash("sha256").update(new Uint8Array([LEAF_KIND_CTRL])).update(payload).digest(),
+          );
+          return { sealPayload: payload, contentHash: hash };
+        };
+        let { sealPayload, contentHash } = signClose();
         /**
          * ⚠️ `sealPayload` IS PASSED, AND ITS ABSENCE WAS THE WHOLE DEFECT — `DOD-M15-SEALWIRE-1`
          * bullets 3+4, review pass 1, F1.
@@ -672,7 +676,28 @@ export class SessionSeal {
          * altered or fabricated the payload — the relay is the only party on that path"* — a correct
          * relay accused by name, in an error written to sound like an attack, for a mismatch made here.
          */
-        const result = await entry.relayClient.submitLeaf(entry.node, entry.relaySessionIdBytes, contentHash, LEAF_KIND_CTRL, sealPayload);
+        const relaySidHex = Buffer.from(entry.relaySessionIdBytes).toString("hex");
+        const seenBefore = entry.relayClient.lastSeenAck(relaySidHex)?.seq ?? 0;
+        let result = await entry.relayClient.submitLeaf(entry.node, entry.relaySessionIdBytes, contentHash, LEAF_KIND_CTRL, sealPayload);
+        /**
+         * `seal_stale`: the relay already filed a message from the other side that this close did not
+         * include — it reached the relay just before our close. Signing anyway would notarize a root
+         * missing it, and both seals would fail. Wait for that message to land in our record (the
+         * acknowledgement moves only when it is placed), then sign ONCE more. A condition on state,
+         * bounded so a message that never arrives cannot hold the close; past the bound this falls
+         * through to the ordinary failure handling below.
+         */
+        if (!result.ok && result.reason === "seal_stale") {
+          const deadline = Date.now() + SEAL_STALE_WAIT_MS;
+          while ((entry.relayClient.lastSeenAck(relaySidHex)?.seq ?? 0) <= seenBefore && Date.now() < deadline) {
+            await new Promise<void>((r) => { const t = setTimeout(r, 20); t.unref?.(); });
+          }
+          this.#ctx.logger.info("session.seal.leaf.stale_resign", {
+            sessionId, correlationId, advanced: (entry.relayClient.lastSeenAck(relaySidHex)?.seq ?? 0) > seenBefore,
+          });
+          ({ sealPayload, contentHash } = signClose());
+          result = await entry.relayClient.submitLeaf(entry.node, entry.relaySessionIdBytes, contentHash, LEAF_KIND_CTRL, sealPayload);
+        }
         if (!result.ok) {
           // Clear the idempotency mark so a genuine retry (agent close / reconnect) can proceed (DB-001).
           this.#ctx.responderSealSubmitted.delete(sealKey);
