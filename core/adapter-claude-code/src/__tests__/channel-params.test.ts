@@ -51,19 +51,15 @@ describe("buildChannelParams — Claude Code channel contract", () => {
       expect(content).not.toMatch(/attending/);
     });
 
-    it("says the message reaches EVERY attending session, and names the door to a sibling's replies", () => {
-      // The text this replaces warned that "another one may read it first — if cello_receive
-      // returns nothing, run cello_transcript". DOD-COATTEND-1 made delivery non-destructive, so
-      // that outcome can no longer occur; the warning described a fixed defect and would have
-      // taught operators to distrust a surface that is now correct. Caught by running the live
-      // two-session journey and reading what the doorbell actually says.
+    it("says whichever session reads first receives it, and names the transcript for the rest", () => {
+      // 2026-09-13: one bookmark per agent, so only the first reader gets the message from
+      // cello_receive. Promising every window its own copy would send the others waiting.
       const { content, meta } = buildChannelParams(
         { type: "cello_message", from: "aa".repeat(32), session_id: "s1", attendance: 2 }, "cello_message");
       expect(content).toMatch(/2 sessions are attending/);
-      expect(content, "reading must be stated as non-destructive").toMatch(/does not take it from the others/);
-      expect(content, "and the transcript is named for the reason that IS true").toMatch(/cello_transcript/);
-      expect(content, "the fixed defect must not be advertised as a live hazard").not.toMatch(/may read it first/);
-      expect(content).not.toMatch(/if cello_receive returns nothing/);
+      expect(content).toMatch(/whichever reads first receives this message/);
+      expect(content).toMatch(/cello_transcript/);
+      expect(content, "the old promise must be gone").not.toMatch(/does not take it from the others/);
       expect(meta.attendance).toBe("2"); // and it stays machine-readable on the tag attributes
     });
 
