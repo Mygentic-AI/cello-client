@@ -1143,7 +1143,8 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
      * the empty answer (`content_undeliverable`) rather than by holding the bookmark behind it.
      */
     const from = record ? record.counterparty_pubkey : null;
-    const takeUnread = (): Array<{ sequence: number; text: string }> | null => {
+    type Taken = Array<{ sequence: number; text: string }> & { readonly previousWatermark?: number };
+    const takeUnread = (): Taken | null => {
       const watermark = sessionNodeManager.getLastDeliveredSeq(agentName, sessionId);
       // Asked ~47x/second while blocked, so the cheap SQL probe runs first and the transcript is
       // decoded only when something is actually there.
@@ -1153,9 +1154,9 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
       if (unread.length === 0) return null;
       sessionNodeManager.advanceLastDeliveredSeq(agentName, sessionId, unread[unread.length - 1]!.sequence);
       clearTelegramRung(agentName, sessionId); // M8C-TGDOOR-1: read clears the ring
-      return unread;
+      return Object.assign(unread, { previousWatermark: watermark });
     };
-    const deliver = (unread: Array<{ sequence: number; text: string }>, correlationId: string) => {
+    const deliver = (unread: Taken, correlationId: string) => {
       logger.info("session.receive.delivered", {
         sessionId, agentName, connectionId, count: unread.length,
         firstSequence: unread[0]!.sequence, lastSequence: unread[unread.length - 1]!.sequence,
@@ -1178,7 +1179,10 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
       // bookmark just moved past it. Say so HERE, on the answer that crossed it — otherwise the
       // operator sees only a gap in the sequence numbers (review of 86ec7524).
       const lastSeq = unread[unread.length - 1]!.sequence;
-      const crossed = sessionNodeManager.getUndeliverableSeqs(agentName, sessionId).filter((s) => s <= lastSeq);
+      // Only the lost messages THIS read moved past — the in-memory set is never pruned, so without
+      // the lower bound every later read would repeat the warning until a restart.
+      const readFrom = unread.previousWatermark ?? -1;
+      const crossed = sessionNodeManager.getUndeliverableSeqs(agentName, sessionId).filter((s) => s > readFrom && s <= lastSeq);
       return {
         ok: true,
         session_id: sessionId,

@@ -65,6 +65,12 @@ describe("DOD-COATTEND-1 F2: a swallowed transcript write is reported as itself"
     expect((r.messages as Array<{ content: string }>).map((m) => m.content)).toEqual(["this one landed"]);
     expect(r.undeliverable_sequences).toEqual([0]);
     expect(String(r.undeliverable_guidance)).toMatch(/THIS machine/);
+
+    // Said ONCE: the next read that moves the bookmark must not repeat a loss it did not cross.
+    await fx.ingestReceived("alice", SID, "and another");
+    const next = (await conn.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>;
+    expect((next.messages as Array<{ content: string }>).map((m) => m.content)).toEqual(["and another"]);
+    expect(next.undeliverable_sequences).toBeUndefined();
   });
 
   it("W1: the ingest FAILS instead of reporting success on a message it could not durably record", async () => {
