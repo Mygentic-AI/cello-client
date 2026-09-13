@@ -404,7 +404,10 @@ describe("DOD-M15-REFUSEDEVIDENCE-1 — a refused message is kept, flagged, and 
     try {
       await client.send("ipc.connect", { clientType: "mcp" });
       await client.send("cello_use_agent", { name: "alice" });
-      await client.send("cello_receive", { session_id: SID, since_seq: -1, timeout_ms: 500 });
+      // since_seq is gone: the plain read hands over everything unread and crosses holes.
+      const res = await client.send("cello_receive", { session_id: SID, timeout_ms: 500 }) as { messages?: Array<{ sequence: number; content: string }> };
+      expect(res.messages?.map((m) => m.content)).toContain("the one after");
+      expect(res.messages?.map((m) => m.content)).not.toContain(ATTACK);
       expect(
         snm.getLastDeliveredSeq("alice", SID),
         "the watermark must cross the blocked leaf at 0 and reach the real message at 1. Wedged at " +

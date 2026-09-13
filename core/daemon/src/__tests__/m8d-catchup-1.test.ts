@@ -114,7 +114,10 @@ describe("DOD-COATTEND-CATCHUP-1: a session behind a SIBLING'S SEND has a door, 
     expect(lastBlockedCursor(fx)).toBe(-1);
 
     const got = (await connB.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>;
-    expect(got.content, "receive DOES deliver the counterparty's message").toBe("counterparty follow-up");
+    expect(
+      (got.messages as Array<{ content: string }>).map((m) => m.content),
+      "receive DOES deliver the counterparty's message",
+    ).toEqual(["counterparty follow-up"]);
 
     await fx.ingestReceived("alice", SID, "another one");
     expect(((await connB.send("cello_send", { session_id: SID, content: "x" })) as Record<string, unknown>).ok).toBe(false);

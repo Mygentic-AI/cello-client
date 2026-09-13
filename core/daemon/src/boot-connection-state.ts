@@ -78,42 +78,9 @@ export function startBootConnectionState(deps: BootConnectionStateDeps) {
     advanceConnectionCursor(connectionId, sessionId, cursor);
   }
 
-  /**
-   * DOD-COATTEND-1 (review F1, BLOCKING) — the DELIVERY bookmark, which is NOT the gate's cursor.
-   *
-   * These answer two different questions and only one of them wants gap-safety:
-   *
-   *   the gate  — "has this connection seen EVERY leaf?"     must stop at a gap (safeCursorAdvance)
-   *   delivery  — "what have I already HANDED this connection?"  must not stop at anything
-   *
-   * Tier 1 shipped with delivery reading `connectionCursors`, and that is fatal, because a gap in a
-   * connection's received-only view is produced by the most ordinary thing in the protocol: a
-   * message this agent SENT from another connection. Leaf indices are contiguous across BOTH
-   * directions, so every sibling send is a hole. The bookmark could not cross it, so the same
-   * message was re-served on every call and the next one was never reached — an unbounded
-   * duplicate-delivery loop, with a Claude session on the other end of the shim replying to the
-   * same message forever. Strictly worse than the theft M8D exists to fix.
-   *
-   * The screened-out case is worse still and cannot self-heal: a security-gateway terminal block
-   * commits a leaf and writes NO transcript row, so that index is a permanent hole. Under a
-   * gap-stopping bookmark, one block would break `cello_receive` for that session on every
-   * connection, for the life of the session.
-   *
-   * Hence: monotonic MAX, never a contiguous walk. Delivering leaf N proves only that N was handed
-   * over, which is exactly and only what this bookmark claims. The gate keeps its own cursor,
-   * untouched — M8C-CURSOR-1's read-before-write guarantee is unchanged by this map's existence,
-   * because nothing consults it to authorize a send.
-   */
-  const connectionDeliveryBookmarks = new Map<string, Map<string, number>>();
-  function getDeliveryBookmark(connectionId: string, sessionId: string): number {
-    return connectionDeliveryBookmarks.get(connectionId)?.get(sessionId) ?? -1;
-  }
-  function advanceDeliveryBookmark(connectionId: string, sessionId: string, seq: number): void {
-    let byId = connectionDeliveryBookmarks.get(connectionId);
-    if (!byId) { byId = new Map(); connectionDeliveryBookmarks.set(connectionId, byId); }
-    const prior = byId.get(sessionId) ?? -1;
-    if (seq > prior) byId.set(sessionId, seq); // monotonic — a redelivery must never rewind it
-  }
+  // The per-connection DELIVERY bookmark that lived here is gone (2026-09-13). It started empty on
+  // every new connection, so a reconnect re-served the whole conversation. `cello_receive` now reads
+  // against the agent's persisted watermark — one bookmark per (agent, session).
 
   /**
    * DOD-CURSOR-DURABLE-1: the same hole-safe walk, applied to the PERSISTED per-(agent, session)
@@ -139,10 +106,6 @@ export function startBootConnectionState(deps: BootConnectionStateDeps) {
   function forgetConnection(connectionId: string): void {
     perConnectionState.delete(connectionId);
     connectionCursors.delete(connectionId); // M8C-CURSOR-1: cursor is connection-scoped, dies with it
-    // ...and so is the delivery bookmark (review F1). It is a SEPARATE map from the gate's cursor
-    // and would otherwise be the one per-connection structure that outlived its connection — an
-    // unbounded leak on a daemon the `cello` CLI reconnects to on every single command.
-    connectionDeliveryBookmarks.delete(connectionId);
   }
 
   // The two cursor MAPS are not returned — nothing outside reads them directly now that eviction
@@ -150,6 +113,6 @@ export function startBootConnectionState(deps: BootConnectionStateDeps) {
   return {
     perConnectionState, onlineAgents, explicitlyOfflineAgents, forgetConnection,
     getConnectionCursor, advanceConnectionCursor, safeCursorAdvance,
-    getDeliveryBookmark, advanceDeliveryBookmark, safeWatermarkAdvance,
+    safeWatermarkAdvance,
   };
 }

@@ -266,13 +266,11 @@ describe("Seam 4: full daemon-IPC two-daemon local orchestration", () => {
       let recv: Record<string, unknown> | null = null;
       for (let i = 0; i < 160; i++) {
         recv = await clientB.send("cello_receive", { session_id: SID_HEX }) as Record<string, unknown>;
-        if (recv && recv.content) break;
+        if (recv && Array.isArray(recv.messages)) break;
         await wait(25);
       }
       expect(recv).not.toBeNull();
-      expect(recv!.content).toBe(text);
-      expect(recv!.sequence_number).toBe(0);
-      expect(recv!.senderPubkey).toBe(alicePubkey);
+      expect(recv!.messages).toEqual([{ sequence: 0, content: text, from: alicePubkey }]);
 
       // ── A's awaiting-ACK resolved (the delivery-ACK round-tripped back over N_A's link).
       let acked = false;

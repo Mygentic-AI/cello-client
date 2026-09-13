@@ -10,7 +10,8 @@
  *
  * Both sessions are woken; both enter the 20 ms poll; whichever hits the next tick first gets the
  * message and REMOVES it. Tier 0 (`DOD-COATTEND-VISIBLE-1`) made that visible. This line makes it
- * stop happening: delivery reads a DURABLE RECORD against a PER-CONNECTION BOOKMARK.
+ * stop happening: delivery reads a DURABLE RECORD. (Since 2026-09-13 the bookmark is per AGENT,
+ * not per connection — see receive-all-unread.test.ts.)
  *
  * Only mechanism 3 changes. The doorbell STAYS multicast — AC 2 says so, and it was never the
  * defect. No attach is refused: exclusivity is rejected permanently (§3).
@@ -25,6 +26,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
 
 const SID = "cd".repeat(32);
+const contents = (r: Record<string, unknown>) => ((r.messages ?? []) as Array<{ content: string }>).map((m) => m.content);
 
 describe("DOD-COATTEND-1: two attached sessions BOTH receive the message", () => {
   let fx: TwoConnectionFixture;
@@ -37,7 +39,9 @@ describe("DOD-COATTEND-1: two attached sessions BOTH receive the message", () =>
     await fx.cleanup();
   });
 
-  it("T1 (AC1, THE LINE): one message, two attached sessions, BOTH get it — neither removes it", async () => {
+  // DELIVERY IS NOW ONE BOOKMARK PER AGENT (2026-09-13). Per-connection delivery re-served old
+  // messages on every reconnect, so T2–T4 (each session re-reads what a sibling read) are deleted.
+  it("T1 (rewritten): one message, two attached sessions — the first read takes it for the AGENT, the second gets nothing", async () => {
     await fx.createSession(SID, "alice");
     const connA = await fx.connectAs("alice");
     const connB = await fx.connectAs("alice");
@@ -45,80 +49,15 @@ describe("DOD-COATTEND-1: two attached sessions BOTH receive the message", () =>
     await fx.ingestReceived("alice", SID, "from bob");
 
     const a = (await connA.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>;
-    expect(a.content, "the first session receives it").toBe("from bob");
+    expect(contents(a), "the first session receives it").toEqual(["from bob"]);
 
-    // Before this line, B's poll found an empty buffer — A's read had REMOVED the message — and B
-    // was told nothing arrived, word for word what a quiet counterparty produces.
-    const b = (await connB.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>;
-    expect(b.content, "the SECOND session must receive the SAME message, not silence").toBe("from bob");
-    expect(b.sequence_number).toBe(a.sequence_number);
+    // One bookmark per (agent, session): B is the same agent, so the message is already read.
+    const b = (await connB.send("cello_receive", { session_id: SID, timeout_ms: 300 })) as Record<string, unknown>;
+    expect(b.messages).toBeUndefined();
+    expect(b.content).toBeNull();
 
-    // ...and reading twice did not duplicate the record. One message is one leaf, however many
-    // sessions read it — the tree is the agent's, not the connection's.
+    // Reading did not duplicate the record.
     expect(fx.snm.getSessionTree("alice", SID).size(), "delivery must not append").toBe(1);
-  });
-
-  it("T2 (AC1): each session's own bookmark advances independently — a re-read is not a re-delivery", async () => {
-    await fx.createSession(SID, "alice");
-    const connA = await fx.connectAs("alice");
-    const connB = await fx.connectAs("alice");
-
-    // A SENT leaf first (review: this clause previously ran at cursor -1 against seq 0 — the one
-    // arrangement where a gap-safe walk happens to work, so it passed one leaf short of the defect
-    // it exists to guard). A conversation has both directions in it; that is what makes it one.
-    fx.seedSent("alice", SID, "something a sibling connection sent");
-    await fx.ingestReceived("alice", SID, "first");
-    expect(((await connA.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>).content).toBe("first");
-
-    // A has read it, so A's next poll must NOT hand it back — otherwise a caught-up session loops
-    // on the same message forever. B has still never seen it and must still get it.
-    const aAgain = (await connA.send("cello_receive", { session_id: SID, timeout_ms: 300 })) as Record<string, unknown>;
-    expect(aAgain.content, "a session must not be re-served a message it already read").toBeNull();
-
-    const b = (await connB.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>;
-    expect(b.content, "B's bookmark is its own — A reading did not move it").toBe("first");
-  });
-
-  it("T3 (AC5, LISTENER MODE): THREE sessions all see the conversation — the property exclusivity would have cost", async () => {
-    // Asserted with three connections deliberately: two proves the bug is gone, three proves the
-    // capability co-attendance was chosen FOR (§3 — exclusivity forecloses listener mode, and
-    // co-attendance gets it free). A design that special-cases "the other one" passes at two.
-    await fx.createSession(SID, "alice");
-    const conns = [await fx.connectAs("alice"), await fx.connectAs("alice"), await fx.connectAs("alice")];
-
-    await fx.ingestReceived("alice", SID, "broadcast");
-
-    for (const [i, c] of conns.entries()) {
-      const r = (await c.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>;
-      expect(r.content, `session ${i} must see the conversation`).toBe("broadcast");
-    }
-  });
-
-  it("T4 (AC6): a session attaching MID-CONVERSATION catches up from its own bookmark", async () => {
-    await fx.createSession(SID, "alice");
-    const connA = await fx.connectAs("alice");
-
-    // "Mid-conversation" must MEAN mid-conversation (review): the first version of this clause
-    // seeded only received messages, so the late connection's cursor had no gap ahead of it and
-    // any gap-stopping implementation passed. A real conversation has this agent's own replies in
-    // it, and every one of them is a leaf the late connection never read.
-    fx.seedSent("alice", SID, "our earlier reply");
-    await fx.ingestReceived("alice", SID, "before you joined");
-    expect(((await connA.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>).content).toBe("before you joined");
-
-    // A THIRD party joins after the fact. Its bookmark starts behind, so the message it never saw
-    // is still deliverable to it — the record is the source of truth, not a drained buffer.
-    const late = await fx.connectAs("alice");
-    const caught = (await late.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>;
-    expect(caught.content, "a late session catches up from its own bookmark").toBe("before you joined");
-
-    // ...and KEEPS catching up. Stopping at the first message it finds is what made the original
-    // version of this clause hollow: a bookmark that never advances past the sent leaf at seq 0
-    // still returns "before you joined" here, so the assertion above passes on the broken build.
-    // Catching up means reaching the present, not receiving once.
-    await fx.ingestReceived("alice", SID, "and this came after");
-    const next = (await late.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>;
-    expect(next.content, "catching up means reaching the NEXT message too").toBe("and this came after");
   });
 
   it("T5 (AC3, CONTENT LOSS): a connection dying with the message unread loses NOTHING", async () => {
@@ -135,7 +74,7 @@ describe("DOD-COATTEND-1: two attached sessions BOTH receive the message", () =>
 
     const fresh = await fx.connectAs("alice");
     const got = (await fresh.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>;
-    expect(got.content, "content must survive the death of the connection that was going to read it").toBe("must survive");
+    expect(contents(got), "content must survive the death of the connection that was going to read it").toEqual(["must survive"]);
   });
 
   // ─── F1 (review, BLOCKING): the bookmark must not be the GATE's cursor ────────────────────────
@@ -157,14 +96,14 @@ describe("DOD-COATTEND-1: two attached sessions BOTH receive the message", () =>
 
     await fx.ingestReceived("alice", SID, "reply one");
     const first = (await connB.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>;
-    expect(first.content).toBe("reply one");
+    expect(contents(first)).toEqual(["reply one"]);
 
     await fx.ingestReceived("alice", SID, "reply two");
     const second = (await connB.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>;
     // Before the fix this was "reply one" again — and again, and again, unboundedly. Worse than the
     // theft this milestone exists to fix: the session is not merely missing a message, it is stuck
     // replying to the same one while the conversation moves on without it.
-    expect(second.content, "the NEXT message must be delivered, not the same one again").toBe("reply two");
+    expect(contents(second), "the NEXT message must be delivered, not the same one again").toEqual(["reply two"]);
   });
 
   it("T8 (AC1, F1 second shape): a screened-out leaf leaves a PERMANENT hole — delivery must cross it", async () => {
@@ -177,10 +116,10 @@ describe("DOD-COATTEND-1: two attached sessions BOTH receive the message", () =>
     const conn = await fx.connectAs("alice");
 
     await fx.ingestReceived("alice", SID, "one");
-    expect(((await conn.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>).content).toBe("one");
+    expect(contents((await conn.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>)).toEqual(["one"]);
     await fx.ingestReceived("alice", SID, "two");
     const second = (await conn.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>;
-    expect(second.content, "a permanent transcript hole must not stop delivery forever").toBe("two");
+    expect(contents(second), "a permanent transcript hole must not stop delivery forever").toEqual(["two"]);
   });
 
   // WHY THERE IS NO "AND THE SEND IS STILL REFUSED" CLAUSE HERE.

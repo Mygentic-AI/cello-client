@@ -308,7 +308,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
       // this also lets the existing recvOk assertions below move earlier without losing coverage.
       const recvOk = await client.send("cello_receive", { session_id: SID }) as Record<string, unknown>;
       expect(recvOk.ok).toBe(true);
-      expect(recvOk.content).toBe("from-bob");
+      expect((recvOk.messages as Array<{ content: string }>).map((m) => m.content)).toEqual(["from-bob"]);
       // M8C-AWAY-1: the agent was unattended when the message above was ingested, so the daemon
       // ALSO auto-acked it (a real, correct cross-unit interaction) — cello_get_transcript catches
       // up on that too (cello_receive only drains the received-content buffer, not the auto-ack).
@@ -405,7 +405,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
       const res = await client.send("cello_receive", { session_id: SID }) as Record<string, unknown>;
       expect(res.reason).not.toBe("not_implemented");
       expect(res.ok).toBe(true);
-      expect(res.content).toBe("from-bob");
+      expect((res.messages as Array<{ content: string }>).map((m) => m.content)).toEqual(["from-bob"]);
     } finally { client.close(); }
   });
 
@@ -750,7 +750,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
 
       const res = await recvPromise;
       expect(res.ok).toBe(true);
-      expect(res.content).toBe("delayed-hello");
+      expect((res.messages as Array<{ content: string }>).map((m) => m.content)).toEqual(["delayed-hello"]);
     } finally { client.close(); }
   });
 
@@ -915,7 +915,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
       const res = await client.send("cello_receive", { session_id: SID, timeout_ms: 500 }) as Record<string, unknown>;
 
       // The message must NOT be delivered as live content.
-      expect(res.content).toBeUndefined();
+      expect(res.messages).toBeUndefined();
       expect(res.type).toBe("session_sealed");
       expect(res.unread_count).toBe(1);
       // It is still on the record — the seal attests what each side actually consumed, so the

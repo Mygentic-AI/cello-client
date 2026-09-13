@@ -645,15 +645,14 @@ server.tool("cello_send", "Send a message in an active session. REQUIRED: every 
   return jsonText(result);
 });
 
-server.tool("cello_receive", "Receive a message from an active session. With since_seq, instead returns a batch of all messages received after that sequence number (stateless catch-up for away-then-return — no replay race).", {
+server.tool("cello_receive", "Read every unread message in a session, in order, as `messages`. Each read message is marked read, so it is never handed over again — including after a reconnect. If nothing is unread, waits up to timeout_ms for the next one.", {
   cello_session_id: z.string().describe("Session ID"),
-  timeout_ms: z.number().optional().describe("Timeout in milliseconds (default: 30000). Ignored when since_seq is set."),
-  since_seq: z.number().optional().describe("Catch-up mode: return all messages with sequence > since_seq as a batch, instead of waiting for the next live message."),
+  timeout_ms: z.number().optional().describe("How long to wait when nothing is unread, in milliseconds (default: 30000)."),
   agent: z.string().optional().describe("Agent to receive as (defaults to the current agent)"),
-}, async ({ cello_session_id: session_id, timeout_ms, since_seq, agent }) => {
+}, async ({ cello_session_id: session_id, timeout_ms, agent }) => {
   const result = await proxy.call("cello_receive", agent
-    ? { session_id, timeout_ms, since_seq, agent }
-    : { session_id, timeout_ms, since_seq });
+    ? { session_id, timeout_ms, agent }
+    : { session_id, timeout_ms });
   return jsonText(result);
 });
 

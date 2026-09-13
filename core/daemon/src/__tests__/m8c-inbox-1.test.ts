@@ -162,7 +162,7 @@ describe("M8C-INBOX-1: cello_check_notifications + watermark + F4", () => {
 
     // A real delivery — this is the only production path that advances the watermark.
     const recv = (await client.send("cello_receive", { session_id: s, timeout_ms: 1000 })) as R;
-    expect(recv["content"]).toBe("m0");
+    expect((recv["messages"] as Array<{ content: string }>).map((m) => m.content)).toEqual(["m0"]);
 
     res = (await client.send("cello_check_notifications", { scope: "current" })) as R;
     expect(agentsOf(res).find((x) => x.agent === "alice")!.total_unread).toBe(0); // delivery marked it read

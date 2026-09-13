@@ -120,12 +120,13 @@ describe("DOD-COATTEND-SENDWINDOW-1: two sessions cannot both reply to one messa
     const connA = await fx.connectAs("alice");
     const connB = await fx.connectAs("alice");
 
-    // One counterparty message, read by BOTH sessions. Both are legitimately caught up, so both
-    // legitimately pass the gate — that is the whole point: this is not two callers where one was
-    // already wrong, it is two callers who were both right at the moment they were checked.
+    // One counterparty message, read once for the AGENT (one bookmark per agent since 2026-09-13).
+    // Nothing is unread, so both sessions legitimately pass the gate — two callers who were both
+    // right at the moment they were checked.
     await fx.ingestReceived("alice", SID, "one question");
-    expect(((await connA.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>).content).toBe("one question");
-    expect(((await connB.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>).content).toBe("one question");
+    const readA = (await connA.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>;
+    expect((readA.messages as Array<{ content: string }>).map((m) => m.content)).toEqual(["one question"]);
+    expect(fx.snm.getUnreadReceivedCount("alice", SID)).toBe(0);
 
     const leavesBefore = fx.snm.getSessionTree("alice", SID).size();
 

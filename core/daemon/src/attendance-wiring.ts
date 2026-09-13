@@ -24,7 +24,7 @@ import { randomUUID } from "node:crypto";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { Logger } from "./types.js";
 import type { SecurityGatewayClient } from "@cello-protocol/gateway";
-import { countAttendance, ContentTakeLedger } from "./co-attendance.js";
+import { countAttendance } from "./co-attendance.js";
 import { markAsAutoReply, systemAwayText } from "./away-detection.js";
 import { LEAF_KIND_MSG } from "./session-relay-client.js";
 import { sentAuthorship } from "./session-content-handlers.js";
@@ -66,10 +66,6 @@ export function createAttendanceWiring(deps: AttendanceWiringDeps) {
   function attendanceCount(agentName: string): number {
     return countAttendance(perConnectionState, agentName);
   }
-  // Which connection consumed which leaf, so the session that finds an empty buffer can be told
-  // whether its counterparty is quiet or its sibling was faster. Written at the destructive drain in
-  // session-content-handlers; read at that handler's timeout. Delivery itself is unchanged.
-  const contentTakes = new ContentTakeLedger();
   /**
    * In-flight background seal ceremonies — `DOD-M15-CLOSEWAIT-1` review MEDIUM-6.
    *
@@ -248,5 +244,5 @@ export function createAttendanceWiring(deps: AttendanceWiringDeps) {
   // `isAttended` is NOT returned: its only caller in the repo is `sendAwayResponse`, which moved
   // with it. Returning it would make a private local reachable through an exported factory for no
   // consumer — new surface, which Rule D forbids.
-  return { attendanceCount, sendAwayResponse, contentTakes, backgroundSeals, awayAckSent };
+  return { attendanceCount, sendAwayResponse, backgroundSeals, awayAckSent };
 }

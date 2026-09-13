@@ -282,8 +282,8 @@ describe("DAEMON-004: IpcProxy forwards session_id verbatim (real proxy wire sha
     }
     // M9-FEED-001: cello_send also forwards the optional governance_decisions re-send map.
     expect(src.slice(src.indexOf('proxy.call("cello_send"'))).toMatch(/governance_decisions/);
-    // M8C-SINCESEQ-1: cello_receive forwards the catch-up cursor.
-    expect(src.slice(src.indexOf('proxy.call("cello_receive"'))).toMatch(/since_seq/);
+    // Catch-up mode is gone (2026-09-13): cello_receive no longer forwards a cursor.
+    expect(src.slice(src.indexOf('proxy.call("cello_receive"'), src.indexOf('proxy.call("cello_close_session"'))).not.toMatch(/since_seq/);
     // CC-5/F21: cello_close_session forwards the optional `force` flag (terminal-escape for an
     // unsealable half-open session) only when set — never unconditionally.
     const close = src.slice(src.indexOf('proxy.call("cello_close_session"'));

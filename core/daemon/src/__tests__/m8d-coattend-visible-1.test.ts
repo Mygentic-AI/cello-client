@@ -147,7 +147,9 @@ describe("DOD-COATTEND-VISIBLE-1: two sessions on one agent — the loser is tol
   // The `taken_by_sibling_session` discriminator itself is deliberately NOT deleted in this unit:
   // deadness is proven by deletion plus a red build, never by "nothing reaches it today", and the
   // drift and relay-degraded paths have not been re-examined against it. That is its own unit.
-  it("C10 (supersession): what WAS a theft is now a delivery — both sessions get the message", async () => {
+  // Rewritten 2026-09-13: one bookmark per agent, so the second session of the SAME agent gets
+  // nothing — and is not told about a theft, because the agent has read it.
+  it("C10 (supersession): the agent reads a message once — a second session gets a plain quiet answer", async () => {
     await fx.createSession(SID, "alice");
     const connA = await fx.connectAs("alice");
     const connB = await fx.connectAs("alice");
@@ -155,16 +157,14 @@ describe("DOD-COATTEND-VISIBLE-1: two sessions on one agent — the loser is tol
     await fx.ingestReceived("alice", SID, "from bob");
 
     const a = (await connA.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>;
-    const b = (await connB.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>;
+    const b = (await connB.send("cello_receive", { session_id: SID, timeout_ms: 300 })) as Record<string, unknown>;
 
-    expect(a.content).toBe("from bob");
-    expect(b.content, "the second session is no longer robbed — that is Tier 1").toBe("from bob");
-    // ...and neither is told about a theft, because none happened.
+    expect((a.messages as Array<{ content: string }>).map((m) => m.content)).toEqual(["from bob"]);
+    expect(b.messages).toBeUndefined();
+    expect(b).toMatchObject({ ok: true, content: null });
     expect(a.reason).toBeUndefined();
     expect(b.reason).toBeUndefined();
-    expect(fx.eventsNamed("session.receive.taken_by_sibling")).toHaveLength(0);
-    // Tier 0's logging is what survives, and it still fires for both readers.
-    expect(fx.eventsNamed("session.receive.delivered").length).toBeGreaterThanOrEqual(2);
+    expect(fx.eventsNamed("session.receive.delivered")).toHaveLength(1);
   });
 
   // ─── C11/C12 (review F3): the clauses C3 and C8 were carrying, re-pointed ─────────────────────
@@ -183,14 +183,14 @@ describe("DOD-COATTEND-VISIBLE-1: two sessions on one agent — the loser is tol
     await fx.ingestReceived("alice", SID, "sensitive words");
 
     const got = (await conn.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>;
-    expect(got.content).toBe("sensitive words");
+    expect((got.messages as Array<{ content: string }>).map((m) => m.content)).toEqual(["sensitive words"]);
 
     const delivered = fx.eventsNamed("session.receive.delivered");
     expect(delivered).toHaveLength(1);
     // The AC names these fields. `attendance` is the number the operator reads to understand WHY a
     // co-attendance answer looks the way it does, and correlationId is what threads the exits of a
     // handler that can block for 30 s.
-    expect(delivered[0].ctx).toMatchObject({ sessionId: SID, agentName: "alice", sequenceNumber: 0, attendance: 1 });
+    expect(delivered[0].ctx).toMatchObject({ sessionId: SID, agentName: "alice", count: 1, firstSequence: 0, lastSequence: 0, attendance: 1 });
     expect(typeof delivered[0].ctx.correlationId).toBe("string");
     expect(typeof delivered[0].ctx.connectionId).toBe("string");
 

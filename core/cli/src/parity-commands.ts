@@ -718,19 +718,18 @@ export function send(
 }
 
 /**
- * `cello receive <session-id> [--since-seq N] [--timeout-ms N]` → cello_receive.
- * Mirrors the MCP semantics exactly: with since_seq it is a stateless catch-up BATCH (no replay
- * race, timeout ignored); without it, it BLOCKS for the next live message until timeout_ms.
+ * `cello receive <session-id> [--timeout-ms N]` → cello_receive. Every unread message at once;
+ * waits up to timeout_ms only when nothing is unread.
  */
 export function receive(
   celloDir: string,
   sessionId: string,
-  opts: ParityOptions & { sinceSeq?: number; timeoutMs?: number },
+  opts: ParityOptions & { timeoutMs?: number },
 ): Promise<CliOutput> {
   return ipcCommand(
     celloDir,
     "cello_receive",
-    defined({ session_id: sessionId, timeout_ms: opts.timeoutMs, since_seq: opts.sinceSeq }),
+    defined({ session_id: sessionId, timeout_ms: opts.timeoutMs }),
     opts,
   );
 }

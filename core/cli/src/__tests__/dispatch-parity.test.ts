@@ -243,12 +243,11 @@ describe("Phases 1-2: parity commands forward the MCP params exactly", () => {
   });
 
   it("F5: a NON-NUMERIC numeric flag fails loud — it never silently changes what the command does", async () => {
-    // --since-seq abc used to be dropped, turning a catch-up BATCH into a 30s blocking live wait
-    // that answers "nothing new" to a question that was never asked.
-    const bad = await findCommand("receive")!.run(ctx, ["sid1", "--since-seq", "abc"]);
+    // --timeout-ms abc must not be dropped and silently replaced by the 30s default.
+    const bad = await findCommand("receive")!.run(ctx, ["sid1", "--timeout-ms", "abc"]);
     expect(bad.exitCode).toBe(1);
     expect(bad.stdout).toBe("");
-    expect(JSON.parse(bad.stderr)).toMatchObject({ ok: false, reason: "invalid_flag_value", flag: "--since-seq" });
+    expect(JSON.parse(bad.stderr)).toMatchObject({ ok: false, reason: "invalid_flag_value", flag: "--timeout-ms" });
     expect(parity.receive).not.toHaveBeenCalled(); // the command was NOT run
 
     const badTimeout = await findCommand("await-session")!.run(ctx, ["--timeout-ms", "soon"]);
@@ -285,15 +284,15 @@ describe("Phases 1-2: parity commands forward the MCP params exactly", () => {
     expect(parity.send).not.toHaveBeenCalled();
   });
 
-  it("receive: --since-seq and --timeout-ms reach the daemon as numbers, and neither eats the session id", async () => {
-    await run("receive", ["sid1", "--since-seq", "7", "--timeout-ms", "500"]);
+  it("receive: --timeout-ms reaches the daemon as a number, and does not eat the session id", async () => {
+    await run("receive", ["sid1", "--timeout-ms", "500"]);
     expect(parity.receive).toHaveBeenCalledWith(CELLO_DIR, "sid1", {
-      agent: undefined, pretty: false, sinceSeq: 7, timeoutMs: 500,
+      agent: undefined, pretty: false, timeoutMs: 500,
     });
     // Flags BEFORE the positional must not shift it — the value-flag consumption has to be exact.
     await run("receive", ["--timeout-ms", "500", "sid2"]);
     expect(parity.receive).toHaveBeenLastCalledWith(CELLO_DIR, "sid2", {
-      agent: undefined, pretty: false, sinceSeq: undefined, timeoutMs: 500,
+      agent: undefined, pretty: false, timeoutMs: 500,
     });
   });
 

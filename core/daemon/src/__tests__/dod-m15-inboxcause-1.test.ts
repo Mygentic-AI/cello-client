@@ -456,13 +456,8 @@ describe("DOD-M15-INBOXCAUSE-1: every park refusal reason has a path to cello_in
 
     const client = await connect();
     await client.send("cello_use_agent", { name: "alice" });
-    /**
-     * `since_seq: -1`, and the value is chosen from the PREDICATE rather than from intent. The
-     * catch-up batch is the exit that carries `refusalsField`, and it is entered only when
-     * `since_seq` is present — `-1` is the value the handler's own comment names for "everything",
-     * where `0` would mean "after the genesis leaf" and take a different path through the batch.
-     */
-    const res = (await client.send("cello_receive", { session_id: sid, since_seq: -1 })) as {
+    // since_seq is gone; the QUIET exit (live row, nothing unread, timeout 0) carries `refusalsField`.
+    const res = (await client.send("cello_receive", { session_id: sid, timeout_ms: 0 })) as {
       refusals?: Array<{ reason: string; recurrence?: string }>;
     };
 

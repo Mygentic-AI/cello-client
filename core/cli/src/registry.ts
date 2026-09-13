@@ -192,10 +192,9 @@ function takeValueFlag(args: string[], flag: string): { value?: string; rest: st
 /**
  * A numeric flag given a NON-NUMERIC value must fail loud, never be silently dropped.
  *
- * If `--since-seq abc` parsed to undefined, `defined()` would strip it, turning a stateless
- * CATCH-UP into a 30-second BLOCKING live wait that returns `content: null` — a script asking
- * "what did I miss?" would be answered "nothing new" to a question it never asked. Silently
- * changing the meaning of a command is worse than refusing it.
+ * If `--timeout-ms abc` parsed to undefined, `defined()` would strip it and the command would wait
+ * the default 30 seconds instead of what was asked. Silently changing the meaning of a command is
+ * worse than refusing it.
  *
  * Throws a BadFlagValue, which run() converts to a structured error + exit 1.
  */
@@ -838,28 +837,24 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
   {
     name: "receive",
     group: "Messaging",
-    summary: "Read the next message, or catch up on everything you missed with --since-seq.",
+    summary: "Read every unread message in a session.",
     help:
-      "Usage: cello receive <session-id> [--since-seq N] [--timeout-ms N] [--agent <name>] [--pretty]\n" +
-      "  Default: WAITS for the next message (up to --timeout-ms, default 30000).\n" +
-      "  With --since-seq N: returns every message after number N at once, immediately, without\n" +
-      "  waiting — this is how you catch up after being away. Mirrors cello_receive exactly.",
+      "Usage: cello receive <session-id> [--timeout-ms N] [--agent <name>] [--pretty]\n" +
+      "  Returns every unread message at once and marks them read. If nothing is unread, waits\n" +
+      "  for the next message (up to --timeout-ms, default 30000). Mirrors cello_receive exactly.",
     flags: [
       { name: "--agent", consumesValue: false },
       { name: "--timeout-ms", consumesValue: true },
-      { name: "--since-seq", consumesValue: true },
     ],
     ipcMethod: IPC_METHODS.receive,
     jsonOut: true,
     async run(ctx, args) {
       const { agent, pretty, positional } = parityOpts(args);
-      const since = takeValueFlag(positional, "--since-seq");
-      const timeout = takeValueFlag(since.rest, "--timeout-ms");
+      const timeout = takeValueFlag(positional, "--timeout-ms");
       try {
         return await receive(ctx.celloDir, timeout.rest[0] ?? "", {
           agent,
           pretty,
-          sinceSeq: numberOrUndefined(since.value, "--since-seq"),
           timeoutMs: numberOrUndefined(timeout.value, "--timeout-ms"),
         });
       } catch (err: unknown) {

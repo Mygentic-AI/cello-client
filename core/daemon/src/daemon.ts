@@ -308,7 +308,7 @@ async function startDaemonHoldingLock(
   const {
     perConnectionState, onlineAgents, explicitlyOfflineAgents, forgetConnection,
     getConnectionCursor, advanceConnectionCursor, safeCursorAdvance,
-    getDeliveryBookmark, advanceDeliveryBookmark, safeWatermarkAdvance,
+    safeWatermarkAdvance,
   } = startBootConnectionState({ sessionNodeManager });
 
   /**
@@ -331,7 +331,7 @@ async function startDaemonHoldingLock(
   // 040-DAEMONROOT unit 6: attendance and the away reply → attendance-wiring.ts.
   // DOD-M15-AWAYSCOPE-1 took the one-shot rejection out, and with it every seal dependency this
   // wiring used to hold — it can no longer initiate a seal at all, which is the point.
-  const { attendanceCount, sendAwayResponse, contentTakes, backgroundSeals, awayAckSent } =
+  const { attendanceCount, sendAwayResponse, backgroundSeals, awayAckSent } =
     createAttendanceWiring({ logger, sessionNodeManager, perConnectionState, securityGateway });
 
   // M8C-TGDOOR-1: the Telegram doorbell (telegram-doorbell.ts). Content-free by construction — the
@@ -901,12 +901,8 @@ async function startDaemonHoldingLock(
     NO_CURRENT_AGENT_RESPONSE,
     getConnectionCursor,
     advanceConnectionCursor,
-    safeCursorAdvance,
-    getDeliveryBookmark,
-    advanceDeliveryBookmark,
     clearTelegramRung,
     attendanceCount,
-    contentTakes,
   });
 
   // cello_check_notifications (notification-handlers.ts): the push-loss reconciler. Notifications are
@@ -1053,7 +1049,6 @@ async function startDaemonHoldingLock(
     getConnState: (connectionId: string) => perConnectionState.get(connectionId),
     countAttendanceFor: (agentName: string) => countAttendance(perConnectionState, agentName),
     forgetConnection,
-    forgetTakeLedger: (connectionId: string) => contentTakes.forget(connectionId),
     announceAttendance: (agentName, attendance) => sessionNodeManager.announceAttendance(agentName, attendance),
     inboundSessionWaiters,
     // A GETTER, though the dispatcher is a const 82 lines ABOVE — so that moving its construction

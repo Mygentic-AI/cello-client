@@ -23,7 +23,6 @@ import type { SessionNodeManager } from "./session-node-manager.js";
 import type { RetryQueue } from "./retry-queue.js";
 import type { Logger } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
-import type { ContentTakeLedger } from "./co-attendance.js";
 import { isAutoReplyMarked } from "./away-detection.js";
 import { REFUSAL_COUNT_GUIDANCE, REFUSAL_KIND_GUIDANCE, type RefusalKind } from "./refusal-reasons.js";
 import { extractErrorMessage } from "./error-message.js";
@@ -222,35 +221,18 @@ export interface SessionContentDeps {
   /** M8C-CURSOR-1: the per-connection read cursor (read-before-write gating). */
   getConnectionCursor: (connectionId: string, sessionId: string) => number;
   advanceConnectionCursor: (connectionId: string, sessionId: string, seq: number) => void;
-  /** Never vaults the cursor past a hole in the delivered sequence. */
-  safeCursorAdvance: (connectionId: string, sessionId: string, deliveredSeqs: ReadonlySet<number>) => void;
-  /**
-   * DOD-COATTEND-1 (review F1) — the DELIVERY bookmark, deliberately NOT the gate's cursor. The
-   * gate asks "has this connection seen every leaf?" and must stop at a gap; delivery asks "what
-   * have I already handed this connection?" and is destroyed by stopping. See daemon.ts for why
-   * reusing one for the other produced an unbounded redelivery loop.
-   */
-  getDeliveryBookmark: (connectionId: string, sessionId: string) => number;
-  advanceDeliveryBookmark: (connectionId: string, sessionId: string, seq: number) => void;
   /** M8C-TGDOOR-1: a read clears the doorbell's ring-once-until-read. */
   clearTelegramRung: (agentName: string, sessionId: string) => void;
   /** DOD-COATTEND-VISIBLE-1: how many connections attend this agent right now (reporting only). */
   attendanceCount: (agentName: string) => number;
-  /**
-   * DOD-COATTEND-VISIBLE-1: which connection consumed which leaf. Written here, at the one place
-   * the destructive drain happens, and read at the timeout to tell a robbed caller apart from a
-   * quiet counterparty. It does not change delivery — the drain stays `buf.shift()`.
-   */
-  contentTakes: ContentTakeLedger;
 }
 
 export function registerSessionContentHandlers(deps: SessionContentDeps): void {
   const {
     handlers, logger, sessionNodeManager, securityGateway, retryQueue,
     getConnState, resolveCurrentAgent, NO_CURRENT_AGENT_RESPONSE,
-    getConnectionCursor, advanceConnectionCursor, safeCursorAdvance,
-    getDeliveryBookmark, advanceDeliveryBookmark, clearTelegramRung,
-    attendanceCount, contentTakes,
+    getConnectionCursor, advanceConnectionCursor, clearTelegramRung,
+    attendanceCount,
   } = deps;
 
   /**
@@ -1134,143 +1116,91 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
       void sessionNodeManager.reviveIfNeededForRead(agentName, sessionId).catch(() => { /* logged inside */ });
     }
 
-    // M8C-SINCESEQ-1: stateless catch-up. When since_seq is provided, return a BATCH of received
-    // transcript messages with sequence > since_seq (durable transcript, not the ephemeral buffer —
-    // so concurrent arrivals don't shift what a given since_seq returns; no replay race). Replaces
-    // the cello_get_transcript workaround for away-then-return. Received-direction only (the messages
-    // you'd have gotten live). Advances the read watermark (delivery marks read — clears INBOX
-    // unread). A distinct early branch: the plain (no since_seq) receive is entirely unchanged.
-    const rawSince = params?.since_seq;
-    if (typeof rawSince === "number" && Number.isFinite(rawSince)) {
-      const sinceSeq = rawSince;
-      // D4b AC2: a transcript-only session has no record to attribute from — `from` is null,
-      // NEVER the string "unknown" (the transcript stores no counterparty; don't invent one).
-      const from = record ? record.counterparty_pubkey : null;
-      const { messages } = sessionNodeManager.readTranscript(agentName, sessionId);
-      const received = messages.filter((m) => m.direction === "received" && m.sequence > sinceSeq);
-      // Read ONCE, above both authorities below — the watermark walk and the connection cursor
-      // both need it, and reading the tree twice invites the two to disagree about the same leaf.
-      const leafKinds = sessionNodeManager.getSessionTree(agentName, sessionId).leaves();
-      /** A `doc`/`reject` leaf occupies a sequence but is not a message: present, never unread. */
-      const notAMessage = (seq: number) => {
-        const kind = leafKinds[seq]?.kind;
-        return kind === "doc" || kind === "reject";
+    // Catch-up mode is GONE (Andre, live test 2026-09-13): the ordinary read already returns
+    // everything unread. Refused by name so an old caller learns that, rather than being ignored.
+    if (params?.since_seq !== undefined) {
+      return {
+        ok: false,
+        reason: "since_seq_removed",
+        guidance: "since_seq no longer exists. Call cello_receive without it — it returns every unread message at once. For the whole conversation, use cello_transcript.",
       };
-      if (received.length > 0) {
-        // ─── review F8 (pre-existing, fixed here): this was a RAW VAULT to the highest received
-        //     sequence in the batch — `advanceLastDeliveredSeq(…, maxSeq)` — which jumps any leaf
-        //     in between. The leaf it jumps can be a transcript row that failed to decrypt:
-        //     `readTranscript` drops such a row from `messages`, but `getUnreadReceivedCount`
-        //     still counts it. So an undecryptable message was silently marked read, stopped
-        //     counting as unread, and cleared the send gate's second authority — a message nobody
-        //     could read, reported as read. That is precisely what CATCHUP AC3 forbids of a
-        //     catch-up path, on the door that was NOT chosen, which is why it survived this long.
-        //
-        //     TWO THINGS THE WALK MUST GET RIGHT, and I got the second one wrong first (review H1).
-        //
-        //     (a) SEEDED AT `sinceSeq`, not at the stored watermark. `since_seq: N` is the CALLER
-        //         ASSERTING it already holds through N, so rows at or below N are its claim and must
-        //         not block the advance. Seeding at the watermark makes ordinary catch-up stop dead
-        //         at the first row the caller skipped — M8C-SINCESEQ-1 S1/S2/S3 caught that.
-        //
-        //     (b) CONTIGUOUS OVER **BOTH DIRECTIONS**, not over the received-only batch. Leaf
-        //         indices are contiguous across both directions, so a SENT leaf — this agent's own
-        //         reply, or a sibling connection's — is a hole in any received-only set. Walking
-        //         `received` therefore stopped on the most ordinary event in the protocol, and
-        //         reading everything no longer cleared unread: the badge could not be cleared, and
-        //         a stateless CLI caller was refused forever through the very door the guidance
-        //         points at. That is CATCHUP §3b's own defect — a rule satisfiable only through a
-        //         door the caller is not pointed at — reintroduced on the watermark.
-        //
-        //     The same received-only-view mistake as DOD-COATTEND-1 review F1, made a second time
-        //     one file over: `daemon.ts` already says "every sibling send is a hole" in as many
-        //     words. `cello_get_transcript` gets this right by walking both directions; so does this
-        //     now. What still stops the walk is a genuinely absent index — an undecryptable row,
-        //     which has no transcript row at all and IS unread.
-        //
-        // ⚠️ **A SCREENED-OUT LEAF USED TO BE IN THAT LIST AND NO LONGER BELONGS — review F5.**
-        // Corrected rather than deleted, because the sentence was true when written and its change
-        // is a behaviour change worth seeing. `DOD-M15-REFUSEDEVIDENCE-1` gives a blocked message a
-        // transcript row (flagged `quarantined`), so the walk now CROSSES it — which is the right
-        // answer and the same one already reached for `doc` leaves below: a blocked message is not
-        // unread, never will be, and can never be delivered, so wedging the watermark behind it
-        // strands every later message forever. It is included deliberately, not incidentally.
-        let frontier = sinceSeq;
-        const presentSeqs = new Set(messages.map((m) => m.sequence));
-        // A DOCUMENT LEAF IS NOT A HOLE — it is a frame that was never a message.
-        //
-        // `doc` and `reject` leaves take a sequence number and deliberately write no transcript row
-        // ("A document frame is NOT a transcript message" — document-frame-router.ts), so from the
-        // transcript side they are indistinguishable from a row that is missing because it could
-        // never be read. The walk treated both as unread and stopped, permanently: a pair that had
-        // ever exchanged one document frame could never catch up again, and the send gate refused
-        // them while the guidance pointed at the very tool they had just used. Observed live, four
-        // holes in twenty minutes between two agents who never mentioned a document to each other.
-        //
-        // KEYED ON THE LEAF KIND, never on row-absence. That distinction is the entire fix: absent
-        // -and-unreadable and absent-because-not-a-message look identical from the transcript, and
-        // a test for a missing row would relocate the bug rather than close it.
-        while (presentSeqs.has(frontier + 1) || notAMessage(frontier + 1)) frontier += 1;
-        sessionNodeManager.advanceLastDeliveredSeq(agentName, sessionId, frontier); // MONOTONIC — takes MAX
-        clearTelegramRung(agentName, sessionId); // M8C-TGDOOR-1: read clears the ring
-      }
-      // M8C-CURSOR-1 (reviewer HIGH fix): only advance through the CONTIGUOUS run this batch
-      // actually delivered — if a sent leaf from another local connection sits in a gap, this
-      // correctly refuses to advance past it (cello_get_transcript is still required to catch up).
-      // The CONNECTION CURSOR needs the same treatment, and for the same reason. It is the second
-      // authority the send gate consults — the gate passes if EITHER is satisfied — so leaving this
-      // one keyed on received-rows-only means a document leaf still wedges it, and the caller is
-      // still refused after reading everything there is to read.
-      safeCursorAdvance(
-        connectionId,
-        sessionId,
-        new Set([
-          ...received.map((m) => m.sequence),
-          ...leafKinds.flatMap((leaf, index) => (leaf.kind === "doc" || leaf.kind === "reject" ? [index] : [])),
-        ]),
-      );
-      logger.info("session.receive.since_seq", { sessionId, agentName, since_seq: sinceSeq, count: received.length });
-      // DOD-M12B-AWAY-MARK-1: an away auto-reply arrives as an ordinary msg leaf at a real sequence,
-      // so without this the batch read is positive evidence a person answered. Two agents spent the
-      // morning of 2026-08-17 exchanging each other's away responders while both operators believed
-      // a conversation was happening. Per-message boolean first (a caller can branch on it), one
-      // guidance line second, and only when there is something to explain.
-      const autoReplyCount = received.filter((m) => isAutoReplyMarked(m.text)).length;
+    }
+
+    /**
+     * ─── ONE READ, EVERY UNREAD MESSAGE, ONE BOOKMARK ───────────────────────────────────────────
+     *
+     * The bookmark is the agent's persisted watermark for this session. Everything received after it
+     * is handed over together and the bookmark moves to the last of them.
+     *
+     * It replaced three bookmarks, and the live test on 2026-09-13 shows why: catch-up moved two of
+     * them, the plain read consulted a third that belonged to the CONNECTION and started empty on
+     * every new one — so after catching up the next read re-served the old message, and every `/mcp`
+     * reconnect or `cello` CLI command started over at the oldest message in the conversation.
+     *
+     * The bookmark moves to the LAST message handed over, not through a gap-stopping walk. A hole —
+     * a blocked message, a document frame, a row that could not be decrypted — would otherwise strand
+     * every later message, re-served on every call. A row that could not be written is reported on
+     * the empty answer (`content_undeliverable`) rather than by holding the bookmark behind it.
+     */
+    const from = record ? record.counterparty_pubkey : null;
+    const takeUnread = (): Array<{ sequence: number; text: string }> | null => {
+      const watermark = sessionNodeManager.getLastDeliveredSeq(agentName, sessionId);
+      // Asked ~47x/second while blocked, so the cheap SQL probe runs first and the transcript is
+      // decoded only when something is actually there.
+      if (!sessionNodeManager.findNextReceivedAfter(agentName, sessionId, watermark)) return null;
+      const unread = sessionNodeManager.readTranscript(agentName, sessionId).messages
+        .filter((m) => m.direction === "received" && m.sequence > watermark);
+      if (unread.length === 0) return null;
+      sessionNodeManager.advanceLastDeliveredSeq(agentName, sessionId, unread[unread.length - 1]!.sequence);
+      clearTelegramRung(agentName, sessionId); // M8C-TGDOOR-1: read clears the ring
+      return unread;
+    };
+    const deliver = (unread: Array<{ sequence: number; text: string }>, correlationId: string) => {
+      logger.info("session.receive.delivered", {
+        sessionId, agentName, connectionId, count: unread.length,
+        firstSequence: unread[0]!.sequence, lastSequence: unread[unread.length - 1]!.sequence,
+        attendance: attendanceCount(agentName), correlationId,
+      });
+      const lastText = unread[unread.length - 1]!.text.trimEnd();
+      // The turn signal belongs to the LAST message: it is what says whose move it is now.
+      const signalGuidance =
+        lastText.endsWith("[[WRAP]]")
+          ? "Counterparty wrapped. Call cello_close_session now — do not reply."
+          : lastText.endsWith("[[OVER]]")
+            ? "Counterparty's turn is done. Counterparty has indicated they are expecting a reply — use cello_send to reply."
+            : /\[\[STANDBY EST:\d+m\]\]$/.test(lastText)
+              ? "Counterparty is working and will follow up when done — no response expected. To block: call cello_receive with a longer timeout_ms. To check back later: schedule a cron and call cello_receive then."
+              : undefined;
+      // DOD-M12B-AWAY-MARK-1: an away auto-reply is an ordinary message leaf, so without the mark a
+      // read is positive evidence a person answered. The content is passed through WHOLE.
+      const autoReplyCount = unread.filter((m) => isAutoReplyMarked(m.text)).length;
       return {
         ok: true,
-        since_seq: sinceSeq,
-        count: received.length,
-        // DOD-M15-REFUSED-INBOUND-SILENT-1: refusals the operator has not been shown yet. Omitted
-        // entirely when there are none — an always-present empty array trains readers to skip the
-        // field, and this is the field that explains why a conversation went quiet.
-        ...refusalsField(sessionNodeManager, agentName, sessionId, connectionId),
-        ...(autoReplyCount > 0 ? { auto_reply_guidance: AUTO_REPLY_GUIDANCE } : {}),
-        // AC6 (review F1): the catch-up batch is THE stateless-client door — `cello receive <id>
-        // --since-seq -1` is a fresh connection every time, so it never saw a doorbell, and the
-        // `session_not_live` refusal below points callers here BY NAME. Shipping attendance on the
-        // live exits and not this one left the defect alive in the exact shape the AC exists for.
-        attendance: attendingNow(agentName),
-        // The content is passed through WHOLE — marker included, nothing stripped. The marker
-        // labels; it never suppresses, and a reader that never sees it cannot judge it.
-        messages: received.map((m) => ({
+        session_id: sessionId,
+        count: unread.length,
+        messages: unread.map((m) => ({
           sequence: m.sequence,
           content: m.text,
           from,
           ...(isAutoReplyMarked(m.text) ? { auto_reply: true } : {}),
         })),
+        ...(autoReplyCount > 0 ? { auto_reply_guidance: AUTO_REPLY_GUIDANCE } : {}),
+        ...refusalsField(sessionNodeManager, agentName, sessionId, connectionId),
+        attendance: attendingNow(agentName),
+        ...(signalGuidance !== undefined ? { guidance: signalGuidance } : {}),
       };
-    }
+    };
 
-    // D4b AC3: the plain (blocking) receive waits on a LIVE session's buffer — a transcript-only
-    // session has no live node and nothing will ever arrive. Waiting to a null timeout would be
-    // misleading and session_not_found would be a lie (the transcript exists). A distinct reason
-    // points the caller at the read that works.
+    // D4b: a transcript-only session has no live node, so nothing new will ever arrive. Hand over
+    // what is unread without waiting; if nothing is, say where the history is.
     if (transcriptOnly) {
+      const unread = takeUnread();
+      if (unread) return deliver(unread, randomUUID());
       return {
         ok: false,
         reason: "session_not_live",
         attendance: attendingNow(agentName),
-        guidance: "This session exists only as a durable transcript (no live session — it was never established or predates this daemon). Read it with cello_receive { since_seq } (e.g. since_seq: -1 for everything) or cello_transcript.",
+        guidance: "This session exists only as a stored transcript and nothing in it is unread. Read the whole conversation with cello_transcript.",
       };
     }
 
@@ -1329,103 +1259,8 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
             : "The session has been sealed by both parties. The full history is available via cello_transcript. No further actions are required on this session.",
         };
       }
-      // ─── DOD-COATTEND-1: read the DURABLE RECORD against THIS connection's bookmark ───
-      //
-      // This used to be `takeReceivedContent`, a `buf.shift()` on a buffer keyed
-      // (agentName, sessionId) and NOT by connection. The doorbell is multicast, so two attached
-      // sessions were both woken, both entered this loop, and whichever hit the next 20 ms tick
-      // first REMOVED the message from the other's view — which was then told, word for word, what
-      // a quiet counterparty produces.
-      //
-      // Now: the transcript is the source of truth and each connection has its own cursor, so
-      // reading is non-destructive by construction. Nothing one consumer does mutates state another
-      // consumer reads — which is exactly what `shift()` violated. The doorbell STAYS multicast
-      // (AC 2); the queue was the defect, not the wake-up.
-      //
-      // Ordering is safe: `#appendVerifiedContent` writes the transcript row (`:3996`) BEFORE it
-      // pushes to the buffer (`:4003`), so the record can never lag the queue this replaces.
-      //
-      // The bar is the DELIVERY BOOKMARK, not the gate's read cursor (review F1, BLOCKING). Using
-      // the cursor here pinned this connection below the first gap in its received-only view — and
-      // a sibling connection's SENT leaf is such a gap, as is a security-gateway block that leaves
-      // a permanent hole. The same message was then re-served on every call, forever. The gate's
-      // cursor stays exactly as it was; it simply is not the thing that answers this question.
-      const deliveredThrough = getDeliveryBookmark(connectionId, sessionId);
-      // Asked ~47x/second per blocked connection, so the predicate is in SQL and exactly one blob is
-      // decoded (review F5). The obvious `readTranscript().messages.find(...)` decoded the entire
-      // session on every tick and threw all of it away.
-      //
-      // Guarded on `record` (review F7 claimed this guard was dead — it is NOT, and the typecheck
-      // proved it): a TRANSCRIPT-ONLY session has received rows and no `sessions` row, and it does
-      // not return above, it falls through with `record === null`. Live delivery needs the
-      // counterparty pubkey, which only the record carries, so those sessions are read through the
-      // since_seq catch-up from the transcript alone — exactly as before this change. Dropping the
-      // guard is a null dereference on the one session shape that reaches here without a record.
-      const nextRow = record
-        ? sessionNodeManager.findNextReceivedAfter(agentName, sessionId, deliveredThrough)
-        : null;
-      const entry = nextRow
-        ? {
-          contentHex: Buffer.from(nextRow.text, "utf8").toString("hex"),
-          senderPubkey: record!.counterparty_pubkey,
-          sequenceNumber: nextRow.sequence,
-        }
-        : null;
-      if (entry) {
-        // M8C-INBOX-1 (N3): delivery marks read — advance the persisted read watermark so this
-        // message no longer counts as unread in cello_check_notifications. Monotonic (never lowers).
-        sessionNodeManager.advanceLastDeliveredSeq(agentName, sessionId, entry.sequenceNumber);
-        clearTelegramRung(agentName, sessionId); // M8C-TGDOOR-1: read clears the ring
-        // M8C-CURSOR-1 (reviewer HIGH fix): a single delivered message only proves THIS sequence
-        // was read — safeCursorAdvance refuses to vault past a gap (e.g. an unread sent leaf from
-        // another local connection) even though this specific sequence number is now known.
-        safeCursorAdvance(connectionId, sessionId, new Set([entry.sequenceNumber]));
-        // ...and separately, this connection has now BEEN HANDED this leaf. Monotonic, no gap walk:
-        // that is the whole distinction (review F1). Without this the read above re-finds the same
-        // row on the next call.
-        advanceDeliveryBookmark(connectionId, sessionId, entry.sequenceNumber);
-        // DOD-COATTEND-VISIBLE-1: the ledger of which connection was handed which leaf.
-        //
-        // It was written when this WAS a destructive drain, and the comment here used to say so —
-        // "the message has just been REMOVED from every co-attending session's view". That is no
-        // longer true and had become the most misleading sentence in the file (review F6): it
-        // asserted the very property this unit removed, at the one site a reader would come to
-        // check it. Delivery is non-destructive now; the ledger survives because the `taken_by_
-        // sibling_session` discriminator still reads it, and its deletion is its own unit.
-        contentTakes.record(agentName, sessionId, connectionId, entry.sequenceNumber);
-        logger.info("session.receive.delivered", {
-          sessionId, agentName, connectionId, sequenceNumber: entry.sequenceNumber,
-          attendance: attendanceCount(agentName), correlationId: receiveCorrelationId,
-        });
-        const contentText = Buffer.from(entry.contentHex, "hex").toString("utf8");
-        const trimmed = contentText.trimEnd();
-        const signalGuidance =
-          trimmed.endsWith("[[WRAP]]")
-            ? "Counterparty wrapped. Call cello_close_session now — do not reply."
-            : trimmed.endsWith("[[OVER]]")
-              ? "Counterparty's turn is done. Counterparty has indicated they are expecting a reply — use cello_send to reply."
-              : /\[\[STANDBY EST:\d+m\]\]$/.test(trimmed)
-                ? "Counterparty is working and will follow up when done — no response expected. To block: call cello_receive with a longer timeout_ms. To check back later: schedule a cron and call cello_receive then."
-                : undefined;
-        // DOD-M12B-AWAY-MARK-1: same fact on the live exit as on the batch exit above. This is the
-        // one an attended agent actually hits, so leaving it off here would have left the defect
-        // alive in the shape it was measured in.
-        const isAutoReply = isAutoReplyMarked(contentText);
-        return {
-          ok: true,
-          content: contentText,
-          ...(isAutoReply ? { auto_reply: true, auto_reply_guidance: AUTO_REPLY_GUIDANCE } : {}),
-          // AC6: every READ answer says whether this session is alone. The push already carried
-          // this; the read surfaces did not, so a session that never saw a doorbell — a fresh MCP
-          // connection, EVERY `cello` CLI invocation, anything that attached after the last
-          // arrival — had no way to learn it was co-attended. Live finding, journal Entry 33.
-          attendance: attendingNow(agentName),
-          sessionId,
-          sequence_number: entry.sequenceNumber,
-          senderPubkey: entry.senderPubkey,
-          ...(signalGuidance !== undefined ? { guidance: signalGuidance } : {}),
-        };
-      }
+      const unread = takeUnread();
+      if (unread) return deliver(unread, receiveCorrelationId);
       // 3) Out of time — non-blocking-equivalent empty answer.
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
@@ -1457,73 +1292,6 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         }
         const liveness = sessionNodeManager.getSessionLiveness(agentName, sessionId);
         const attendance = attendanceCount(agentName);
-        // ─── DOD-COATTEND-VISIBLE-1 AC1: the loser of the race gets a DIFFERENT answer ───
-        //
-        // The buffer is keyed (agentName, sessionId) and drained with `buf.shift()`, so when the
-        // multicast doorbell wakes two attending sessions the faster one REMOVES the message. Until
-        // this branch existed the slower one was told, word for word, what a quiet counterparty
-        // produces — and nothing was logged either, so the theft left no trace anywhere.
-        //
-        // The bar is this connection's own read cursor, not a time window: it reports content this
-        // connection genuinely has not seen, and it CLEARS itself once the caller catches up. The
-        // discriminator is `reason` — the field this very return already uses for its other branch —
-        // so a caller switching on it needs no new shape. `taken_by_sibling` carries the machine-
-        // readable detail; the prose below is the presentation of that, never a substitute for it.
-        const missed = contentTakes.missedBy(
-          agentName, sessionId, connectionId, getConnectionCursor(connectionId, sessionId),
-        );
-        if (missed) {
-          // The message a sibling took is described WITHOUT claiming that sibling still attends
-          // this agent (review MEDIUM). A connection may operate on the sole online agent through
-          // `resolveCurrentAgent` WITHOUT attending it, and it drains the same buffer — so a real
-          // thief need not be counted in `attendance`. The old wording produced sentences that
-          // contradicted themselves ("another session attending alice — 1 sessions are attending").
-          // `attendance` stays as its own field, meaning what it says: how many sessions SELECTED
-          // this agent.
-          const takenDetail = {
-            count: missed.count,
-            last_sequence: missed.lastSequence,
-            connections: missed.connections,
-            // `count` is a floor once the per-session cap has discarded older takes.
-            ...(missed.truncated ? { truncated: true } : {}),
-          };
-          logger.warn("session.receive.taken_by_sibling", {
-            sessionId, agentName, connectionId, timeoutMs, attendance, liveness,
-            takenCount: missed.count, lastTakenSeq: missed.lastSequence, takenBy: missed.connections,
-            truncated: missed.truncated, correlationId: receiveCorrelationId,
-          });
-          const missedText = `Another session on this daemon already received ${missed.count} message(s) on this session that you have not read (up to sequence ${missed.lastSequence}). Nothing was lost: read what you missed with cello_transcript ${sessionId}.`;
-          // BOTH conditions can be true, and `counterparty_gone` WINS the `reason` field when they
-          // are (review MEDIUM). `reason` is the machine-readable discriminator, and a caller
-          // switching on it must still see the TERMINAL, actionable condition: telling an operator
-          // to "read what you missed, then reply" to a counterparty whose connection is dead sends
-          // them to the wrong subsystem and the reply goes nowhere. The theft is additive
-          // information, so it rides as a field and as the first half of the guidance — nothing is
-          // hidden, but the answer names the condition that changes what the operator should DO.
-          if (liveness === "gone") {
-            return {
-              ok: true,
-              content: null,
-              reason: "counterparty_gone",
-              liveness: "gone",
-              // Same reasoning as the standalone `counterparty_gone` exit below.
-              ...refusalsField(sessionNodeManager, agentName, sessionId, connectionId),
-              taken_by_sibling: takenDetail,
-              attendance,
-              // Same wording rule as the standalone `counterparty_gone` exit below: name what was
-              // observed (a dropped connection), never a crash, and do not lead with the seal.
-              guidance: `${missedText} Note the direct connection to the counterparty's session peer has ALSO dropped (liveness: gone) — that is all that was observed, not that they crashed. No more content will arrive on the direct path and a reply cannot reach them there. Read the history first, and check \`refusals\` here and in cello_inbox before blaming the network — this side refusing their messages produces exactly this state. Sealing with cello_close_session ENDS the conversation permanently, so do it only once you are satisfied nothing is outstanding; if they never co-close, a unilateral seal becomes available after the directory's delivery-grace window.`,
-            };
-          }
-          return {
-            ok: true,
-            content: null,
-            reason: "taken_by_sibling_session",
-            taken_by_sibling: takenDetail,
-            attendance,
-            guidance: `${missedText} Then reply — do not resend your last message.`,
-          };
-        }
         // M8B F16: a dead session must not return the SAME null timeout as a
         // quiet-but-healthy one. The liveness signal (session.liveness.changed → gone,
         // tracked per session by the node manager) finally reaches the MCP surface here.

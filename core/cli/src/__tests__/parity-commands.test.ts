@@ -216,19 +216,6 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
       expect(Object.keys(err)).toContain("reason");
     });
 
-    it("`cello receive --since-seq N` passes since_seq through (catch-up mode, not a live wait)", async () => {
-      await createAgent(tempDir, "alice");
-      await useAgent(tempDir, "alice", {});
-      // since_seq must reach the daemon: in catch-up mode the call returns promptly rather than
-      // blocking for the timeout. An unknown session still errors — that is fine; what we assert is
-      // that it did NOT hang, i.e. the param was honored rather than dropped.
-      const started = Date.now();
-      const out = await receive(tempDir, "deadbeef", { sinceSeq: 0, timeoutMs: 30_000 });
-      expect(Date.now() - started).toBeLessThan(5_000);
-      expect(out.exitCode).toBe(1);
-      expect(out.stdout).toBe("");
-    });
-
     it("`cello receive` honors --timeout-ms (mirrors the MCP timeout semantics)", async () => {
       await createAgent(tempDir, "alice");
       await useAgent(tempDir, "alice", {});

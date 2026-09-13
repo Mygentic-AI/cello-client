@@ -175,8 +175,8 @@ describe("M8C-CURSOR-1: per-connection read cursor", () => {
     // connB drains ONLY the buffered received content (leaf 1) via live cello_receive — it has
     // still never read leaf 0 (connA's sent message).
     const recv = (await connB.send("cello_receive", { session_id: SID, timeout_ms: 500 })) as Record<string, unknown>;
-    expect(recv.content).toBe("from counterparty");
-    expect(recv.sequence_number).toBe(1);
+    const recvMsgs = recv.messages as Array<{ sequence: number; content: string }>;
+    expect(recvMsgs.map((m) => [m.sequence, m.content])).toEqual([[1, "from counterparty"]]);
 
     // DOD-CURSOR-DURABLE-1 (rewritten): connB has now READ the counterparty's message (leaf 1), so
     // the durable clause is satisfied — there is no unread received content. The only leaf it has
@@ -199,7 +199,7 @@ describe("M8C-CURSOR-1: per-connection read cursor", () => {
 
       // Connection 1 = `cello receive`. It reads, advancing the PERSISTED watermark, then exits.
       const reader = await fx.connectAs("alice");
-      const got = (await reader.send("cello_receive", { session_id: SID, since_seq: -1 })) as Record<string, unknown>;
+      const got = (await reader.send("cello_receive", { session_id: SID, timeout_ms: 500 })) as Record<string, unknown>;
       expect(got.count).toBe(1);
       reader.close();
 

@@ -44,6 +44,12 @@ import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/
 import type { SessionAssignment } from "@cello-protocol/protocol-types";
 import { extractErrorMessage } from "../error-message.js";
 
+/** cello_receive returns a `messages` array; null when nothing was delivered. */
+function recvText(r: Record<string, unknown> | undefined): string | null {
+  const msgs = r?.["messages"] as Array<{ content: string }> | undefined;
+  return msgs && msgs.length > 0 ? msgs.map((m) => m.content).join("\n") : null;
+}
+
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 
 function makeLogger(): { logger: Logger; events: LogEvent[] } {
@@ -333,10 +339,10 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     let recv: Record<string, unknown> | null = null;
     for (let i = 0; i < 160; i++) {
       recv = await clientB.send("cello_receive", { session_id: SID_HEX, timeout_ms: 0 }) as Record<string, unknown>;
-      if (recv && recv.content) break;
+      if (recv && recvText(recv) !== null) break;
       await wait(25);
     }
-    expect(recv?.content).toBe(text);
+    expect(recvText(recv)).toBe(text);
 
     // Fingerprint of the EXACT bytes — binds identity, not just length, so a daemon that screened
     // different content of equal length while sending the real bytes would fail this.
@@ -377,7 +383,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     // B must receive NOTHING — the content never went on the wire.
     for (let i = 0; i < 160; i++) { // poll the ABSENCE for ≥ the positive path's worst case (4s)
       const recv = await clientB.send("cello_receive", { session_id: SID_HEX, timeout_ms: 0 }) as Record<string, unknown>;
-      expect(recv.content == null).toBe(true);
+      expect(recvText(recv) === null).toBe(true);
       await wait(25);
     }
   }, 40_000);
@@ -399,7 +405,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     // is never populated. cello_receive stays empty across repeated polls.
     for (let i = 0; i < 160; i++) { // poll the ABSENCE for ≥ the positive path's worst case (4s)
       const recv = await clientB.send("cello_receive", { session_id: SID_HEX, timeout_ms: 0 }) as Record<string, unknown>;
-      expect(recv.content == null).toBe(true);
+      expect(recvText(recv) === null).toBe(true);
       await wait(25);
     }
 
@@ -482,13 +488,13 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       let recv: Record<string, unknown> | null = null;
       for (let i = 0; i < 160; i++) {
         recv = await clientB.send("cello_receive", { session_id: SID_HEX, timeout_ms: 0 }) as Record<string, unknown>;
-        if (recv && recv.content) break;
+        if (recv && recvText(recv) !== null) break;
         await wait(25);
       }
-      expect(typeof recv?.content).toBe("string");
-      expect(recv!.content as string).not.toContain("STOLEN"); // the data carrier is gone
-      expect(recv!.content as string).toContain("pic"); // but the surrounding text survives (no over-redaction)
-      expect(recv!.content as string).toContain("ok");
+      expect(typeof recvText(recv)).toBe("string");
+      expect(recvText(recv)!).not.toContain("STOLEN"); // the data carrier is gone
+      expect(recvText(recv)!).toContain("pic"); // but the surrounding text survives (no over-redaction)
+      expect(recvText(recv)!).toContain("ok");
     }, 40_000);
 
     it("warn (non-whitelisted PII) → NOT sent: governance_warn + flags; the peer receives nothing", async () => {
@@ -504,7 +510,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       expect(String(flags[0].category)).toMatch(/^pii:/);
       for (let i = 0; i < 160; i++) { // poll the ABSENCE for ≥ the positive path's worst case (4s)
         const recv = await clientB.send("cello_receive", { session_id: SID_HEX, timeout_ms: 0 }) as Record<string, unknown>;
-        expect(recv.content == null).toBe(true);
+        expect(recvText(recv) === null).toBe(true);
         await wait(25);
       }
     }, 40_000);
@@ -530,10 +536,10 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       let recv: Record<string, unknown> | null = null;
       for (let i = 0; i < 160; i++) {
         recv = await clientB.send("cello_receive", { session_id: SID_HEX, timeout_ms: 0 }) as Record<string, unknown>;
-        if (recv && recv.content) break;
+        if (recv && recvText(recv) !== null) break;
         await wait(25);
       }
-      expect(recv!.content as string).toContain("owner@self.example"); // delivered intact
+      expect(recvText(recv)!).toContain("owner@self.example"); // delivered intact
     }, 40_000);
 
     it("OUT-002 bulk: a contact DUMP warns ONCE (one governance_warn covering all the flagged contacts), not sent", async () => {
@@ -551,7 +557,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       expect(flags.every((f) => String(f.category).startsWith("pii:"))).toBe(true);
       for (let i = 0; i < 80; i++) { // the dump never reaches the peer
         const recv = await clientB.send("cello_receive", { session_id: SID_HEX, timeout_ms: 0 }) as Record<string, unknown>;
-        expect(recv.content == null).toBe(true);
+        expect(recvText(recv) === null).toBe(true);
         await wait(25);
       }
     }, 40_000);
@@ -571,7 +577,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       // Drain on B so its gateway has SCREENED the inbound content (the inbound producer) before we read.
       for (let i = 0; i < 160; i++) {
         const recv = await clientB.send("cello_receive", { session_id: SID_HEX, timeout_ms: 0 }) as Record<string, unknown>;
-        if (recv && recv.content) break;
+        if (recv && recvText(recv) !== null) break;
         await wait(25);
       }
 
@@ -622,10 +628,10 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       let recv: Record<string, unknown> | null = null;
       for (let i = 0; i < 160; i++) {
         recv = await clientB.send("cello_receive", { session_id: SID_HEX, timeout_ms: 0 }) as Record<string, unknown>;
-        if (recv && recv.content) break;
+        if (recv && recvText(recv) !== null) break;
         await wait(25);
       }
-      expect(recv!.content as string).toContain("owner@self.example"); // delivered intact
+      expect(recvText(recv)!).toContain("owner@self.example"); // delivered intact
     }, 40_000);
 
     it("OUT-004 rate limit: over-rate sends are throttled with a distinct rate_limited reason + guidance", async () => {
@@ -670,11 +676,11 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       let recv: Record<string, unknown> | null = null;
       for (let i = 0; i < 160; i++) {
         recv = await clientB.send("cello_receive", { session_id: SID_HEX, timeout_ms: 0 }) as Record<string, unknown>;
-        if (recv && recv.content) break;
+        if (recv && recvText(recv) !== null) break;
         await wait(25);
       }
-      expect(recv!.content as string).not.toContain("stranger@other.example"); // the email never reached the peer
-      expect(recv!.content as string).toContain("[REDACTED:pii:email]"); // the typed placeholder did
+      expect(recvText(recv)!).not.toContain("stranger@other.example"); // the email never reached the peer
+      expect(recvText(recv)!).toContain("[REDACTED:pii:email]"); // the typed placeholder did
     }, 40_000);
 
     it("FEED-001 inc4 SI-002: re-send {flagId: allow_once} with autonomous_override OFF (default) → RE-WARNED, NOT sent", async () => {
@@ -691,7 +697,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       expect(String(resend.guidance)).toMatch(/autonomous_override is OFF/i);
       for (let i = 0; i < 80; i++) { // the peer receives NOTHING
         const recv = await clientB.send("cello_receive", { session_id: SID_HEX, timeout_ms: 0 }) as Record<string, unknown>;
-        expect(recv.content == null).toBe(true);
+        expect(recvText(recv) === null).toBe(true);
         await wait(25);
       }
     }, 40_000);
@@ -713,7 +719,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       expect(sent.reason).toBe("redact_without_content");
       for (let i = 0; i < 60; i++) { // the original never reached B
         const recv = await clientB.send("cello_receive", { session_id: SID_HEX, timeout_ms: 0 }) as Record<string, unknown>;
-        expect(recv.content == null).toBe(true);
+        expect(recvText(recv) === null).toBe(true);
         await wait(25);
       }
     }, 40_000);
@@ -730,7 +736,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       expect(blocks[0].category).toBeDefined();
       for (let i = 0; i < 160; i++) { // poll the ABSENCE for ≥ the positive path's worst case (4s)
         const recv = await clientB.send("cello_receive", { session_id: SID_HEX, timeout_ms: 0 }) as Record<string, unknown>;
-        expect(recv.content == null).toBe(true);
+        expect(recvText(recv) === null).toBe(true);
         await wait(25);
       }
     }, 40_000);
@@ -745,11 +751,11 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       let recv: Record<string, unknown> | null = null;
       for (let i = 0; i < 160; i++) {
         recv = await clientB.send("cello_receive", { session_id: SID_HEX, timeout_ms: 0 }) as Record<string, unknown>;
-        if (recv && recv.content) break;
+        if (recv && recvText(recv) !== null) break;
         await wait(25);
       }
-      expect(recv!.content as string).not.toContain("AKIAABCDEFGHIJKLMNOP"); // the secret never reached the peer
-      expect(recv!.content as string).toContain("[REDACTED:"); // the typed placeholder did
+      expect(recvText(recv)!).not.toContain("AKIAABCDEFGHIJKLMNOP"); // the secret never reached the peer
+      expect(recvText(recv)!).toContain("[REDACTED:"); // the typed placeholder did
     }, 40_000);
 
     it("inbound TERMINAL block (non-English): B records a leaf + acks, but delivers nothing — distinct from the transient gateway-down hold", async () => {
@@ -793,7 +799,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       // The agent NEVER sees the content: cello_receive stays empty across the positive path's worst case.
       for (let i = 0; i < 80; i++) {
         const recv = await clientB.send("cello_receive", { session_id: SID_HEX, timeout_ms: 0 }) as Record<string, unknown>;
-        expect(recv.content == null).toBe(true);
+        expect(recvText(recv) === null).toBe(true);
         await wait(25);
       }
     }, 40_000);
@@ -839,10 +845,10 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       // are different assertions and only the second one is about this defect.
       for (let i = 0; i < 80; i++) {
         const recv = await clientB.send("cello_receive", { session_id: SID_HEX, timeout_ms: 0 }) as Record<string, unknown>;
-        const content = typeof recv.content === "string" ? recv.content : "";
+        const content = recvText(recv) ?? "";
         expect(content).not.toContain("uhctpykцuu");   // the Latinized form that WAS delivered
         expect(content).not.toContain("инструкции");   // and the original, for completeness
-        expect(recv.content == null).toBe(true);
+        expect(recvText(recv) === null).toBe(true);
         await wait(25);
       }
     }, 40_000);
@@ -858,11 +864,11 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       let recv: Record<string, unknown> | null = null;
       for (let i = 0; i < 160; i++) {
         recv = await clientB.send("cello_receive", { session_id: SID_HEX, timeout_ms: 0 }) as Record<string, unknown>;
-        if (recv && recv.content) break;
+        if (recv && recvText(recv) !== null) break;
         await wait(25);
       }
-      expect(typeof recv?.content).toBe("string");
-      expect(recv!.content as string).toContain("system"); // normalized from the Cyrillic lookalikes
+      expect(typeof recvText(recv)).toBe("string");
+      expect(recvText(recv)!).toContain("system"); // normalized from the Cyrillic lookalikes
     }, 40_000);
   });
 });

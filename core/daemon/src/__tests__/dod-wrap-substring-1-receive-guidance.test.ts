@@ -74,9 +74,8 @@ describe("DOD-WRAP-SUBSTRING-1: the close signal is read at the END, not found a
       await client.send("cello_use_agent", { name: "alice" });
     }
     const s = SID64(sessionSeed);
-    // A live `sessions` row, so cello_receive takes the LIVE single-message exit. That is the only
-    // exit that carries `guidance` — the batch (`since_seq`) exit returns a `messages` array and no
-    // guidance at all, so a fixture that reached it would assert nothing.
+    // A live `sessions` row, so cello_receive takes the LIVE loop. `guidance` reflects the LAST
+    // delivered message's trailing signal.
     const snm = handle.getSessionNodeManager();
     const db = snm.getDb()!;
     const row = db.prepare("SELECT agent_id FROM agents WHERE agent_name = ? AND state != 'retired'").get("alice") as { agent_id: string } | undefined;
@@ -89,8 +88,8 @@ describe("DOD-WRAP-SUBSTRING-1: the close signal is read at the END, not found a
     snm.recordTranscriptMessage("alice", s, 0, "received", new TextEncoder().encode(text), "seed");
 
     const res = (await clients[0]!.send("cello_receive", { session_id: s, timeout_ms: 2000 })) as Record<string, unknown>;
-    expect(res["messages"], "this must be the live exit, not the since_seq batch").toBeUndefined();
-    expect(res["content"], "the seeded message must come back").toBe(text);
+    const messages = res["messages"] as Array<{ content: string }> | undefined;
+    expect(messages?.map((m) => m.content), "the seeded message must come back").toEqual([text]);
     return res["guidance"] as string | undefined;
   }
 

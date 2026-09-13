@@ -41,7 +41,7 @@ describe("DOD-COATTEND-VISIBLE-1 AC6: the READ surfaces say whether this session
     await fx.ingestReceived("alice", SID, "from bob");
 
     const got = (await connA.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>;
-    expect(got.content).toBe("from bob");
+    expect((got.messages as Array<{ content: string }>).map((m) => m.content)).toEqual(["from bob"]);
     expect(got.attendance, "the read surface must carry what the push already carries").toBe(2);
     void connB;
   });
@@ -103,22 +103,6 @@ describe("DOD-COATTEND-VISIBLE-1 AC6: the READ surfaces say whether this session
       ((await connA.send("cello_receive", { session_id: SID, timeout_ms: 200 })) as Record<string, unknown>).attendance,
       "after the sibling goes, this session is alone again and must be told so",
     ).toBe(1);
-  });
-
-  it("V6 (review F1): the since_seq CATCH-UP exit carries it — the stateless door the AC exists for", async () => {
-    // `cello receive <id> --since-seq -1` is the away-then-return door, and it is a FRESH
-    // connection every time, so it never saw a doorbell. The `session_not_live` refusal points
-    // callers here BY NAME. Shipping attendance on the live exits and not this one leaves the
-    // defect alive in the exact shape the unit's own rationale invokes.
-    await fx.createSession(SID, "alice");
-    const connA = await fx.connectAs("alice");
-    const connB = await fx.connectAs("alice");
-    fx.seedReceived("alice", SID, "history");
-
-    const batch = (await connA.send("cello_receive", { session_id: SID, since_seq: -1 })) as Record<string, unknown>;
-    expect(batch.ok).toBe(true);
-    expect(batch.attendance, "the catch-up batch must say whether you are alone").toBe(2);
-    void connB;
   });
 
   it("V8 (review F3): the count is AGENT-SCOPED — a window on a DIFFERENT agent is not co-attendance", async () => {
