@@ -36,7 +36,10 @@
  */
 
 export interface TerminalRefusalDeps {
-  logger: { error(event: string, ctx: Record<string, unknown>): void };
+  logger: {
+    error(event: string, ctx: Record<string, unknown>): void;
+    warn(event: string, ctx: Record<string, unknown>): void;
+  };
   /**
    * Retire the local session row. REQUIRED — a no-op default would restore the exact defect this
    * module exists to remove, and it would do it silently.
@@ -48,6 +51,8 @@ export interface TerminalRefusalInput {
   sessionId: string;
   /** The relay's own reason — `session_sealed` or `session_not_found`. */
   reason: string;
+  /** The relay's own words, when it sent any. */
+  detail?: string;
   correlationId: string | undefined;
 }
 
@@ -67,6 +72,28 @@ export function terminalRelayRefusal(
   // RETIRE FIRST, THEN REPORT — and the code now matches the comment, which it did not. The logger
   // is an injected dependency and can throw; logging first meant a throw there left the row live,
   // which is the pre-fix state exactly. The retirement is the load-bearing act, so it goes first.
+  // The session is still sealing here — the other side closed first. It is NEVER retired (the seal
+  // has to complete on it), and neither the log nor the sentence may say it ended, or the operator
+  // goes looking for a problem that is not there. Refused here as well as by the caller's callback,
+  // so a callback that retires on every terminal reason cannot take a sealing session down.
+  if (input.reason === "session_closing") {
+    deps.logger.warn("session.relay.hash.submit.closing", {
+      sessionId: input.sessionId,
+      reason: input.reason,
+      ...(input.detail === undefined ? {} : { detail: input.detail }),
+      correlationId: input.correlationId,
+      impact: "the other participant has committed its seal, so this message was not added and was not sent; the session is still sealing",
+    });
+    return {
+      ok: false,
+      reason: input.reason,
+      error: "the other side closed this conversation before your message reached the relay",
+      durable: false,
+      guidance:
+        "Nothing was sent. The other side closed this conversation before your message arrived, so " +
+        "it is being sealed without it. Start a new session if there is more to say.",
+    };
+  }
   deps.retireSession(input.sessionId);
   deps.logger.error("session.relay.hash.submit.terminal", {
     sessionId: input.sessionId,
@@ -74,19 +101,6 @@ export function terminalRelayRefusal(
     correlationId: input.correlationId,
     impact: "the relay has ended this session — nothing sent now can ever be part of its record",
   });
-  // The session is still sealing here — the other side closed first. Nothing is retired, and the
-  // sentence must not say so, or they go looking for a problem that is not there.
-  if (input.reason === "session_closing") {
-    return {
-      ok: false,
-      reason: input.reason,
-      error: "the other side closed this conversation just before your message reached the relay",
-      durable: false,
-      guidance:
-        "Nothing was sent. The other side closed this conversation a moment before your message " +
-        "arrived, so it is being sealed as it stood without it. Start a new session if there is more to say.",
-    };
-  }
   return {
     ok: false,
     reason: input.reason,

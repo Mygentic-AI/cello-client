@@ -15,7 +15,10 @@ function fixture() {
   const retired: string[] = [];
   const errors: Array<{ event: string; ctx: Record<string, unknown> }> = [];
   const deps = {
-    logger: { error: (event: string, ctx: Record<string, unknown>) => { errors.push({ event, ctx }); } },
+    logger: {
+      error: (event: string, ctx: Record<string, unknown>) => { errors.push({ event, ctx }); },
+      warn: (event: string, ctx: Record<string, unknown>) => { errors.push({ event, ctx }); },
+    },
     retireSession: (id: string) => { retired.push(id); },
   };
   return { deps, retired, errors };
@@ -36,6 +39,9 @@ describe("session_closing — the other side closed before this message reached 
     expect(res.guidance).toContain("Nothing was sent");
     // The session is still sealing: saying it was retired would send them looking for a problem.
     expect(res.guidance).not.toContain("retired");
+    // ...and it is NOT retired, whatever the caller's callback would do — the seal completes on it.
+    expect(f.retired).toEqual([]);
+    expect(f.errors.map((e) => e.event)).toEqual(["session.relay.hash.submit.closing"]);
   });
 });
 
@@ -86,7 +92,7 @@ describe("a terminal relay refusal RETIRES the session, not just reports it", ()
   it("RETIRES BEFORE REPORTING — a throw on the way out must not leave the row live", () => {
     const order: string[] = [];
     const deps = {
-      logger: { error: () => { order.push("log"); } },
+      logger: { error: () => { order.push("log"); }, warn: () => { order.push("log"); } },
       retireSession: () => { order.push("retire"); },
     };
     terminalRelayRefusal(deps, { sessionId: "s-5", reason: "session_sealed", correlationId: "c-5" });

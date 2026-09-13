@@ -409,7 +409,7 @@ export class SessionContentSender {
                 void this.#ctx.destroySessionNode(agentName, id, "sealed");
               },
             },
-            { sessionId, reason: witnessed.reason, correlationId },
+            { sessionId, reason: witnessed.reason, ...(witnessed.detail === undefined ? {} : { detail: witnessed.detail }), correlationId },
           );
         } else {
           this.#ctx.logger.warn("session.relay.hash.submit.failed", {
