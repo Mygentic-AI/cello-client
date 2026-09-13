@@ -512,8 +512,8 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         // needed" imply the name went nowhere.
         ...(nameCheck.value !== null ? { session_name: nameCheck.value } : {}),
         guidance: nameCheck.value !== null
-          ? "This session is already sealed, so it was not closed again — but the name you gave WAS applied. Check cello_sessions to view its sealed record and the FROST notarization."
-          : "This session is already sealed. No further action is needed — check cello_sessions to view its sealed record and the FROST notarization.",
+          ? "Already sealed by both sides. Nothing more to do; the name you gave was applied. View the receipt with cello_sealed_receipt."
+          : "Already sealed by both sides. Nothing more to do; view the receipt with cello_sealed_receipt.",
       };
     }
 
