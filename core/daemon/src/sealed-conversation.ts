@@ -17,13 +17,14 @@ import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
 import { SessionTree } from "./session-tree.js";
 
-/** Relay leaf kind byte for a control (close) leaf. */
-const LEAF_KIND_CTRL = 2;
+/** Relay leaf kind bytes other than a message (session-relay-client.ts), named for an operator. */
+const NON_MESSAGE_KINDS: Record<number, SealedLeaf["kind"]> = { 2: "close", 4: "document", 5: "refusal" };
 
 export interface SealedLeaf {
   /** The relay's sequence number (from 1). Null only for a message the relay never numbered. */
   seq: number | null;
-  kind: "message" | "close";
+  /** `unknown` only when this side holds no signed record of the leaf's kind. */
+  kind: "message" | "close" | "document" | "refusal" | "unknown";
   from: string | null;
   from_pubkey: string | null;
   /** Messages only. Null when this side holds no text for it. */
@@ -124,7 +125,7 @@ export function readSealedConversation(
   for (const r of receipts) {
     const s = signed.get(r.seq);
     let matched = -1;
-    if (s?.kind !== LEAF_KIND_CTRL) {
+    if (s === undefined || NON_MESSAGE_KINDS[s.kind] === undefined) {
       for (let i = next; i < messages.length; i++) {
         if (messages[i]!.hash === r.hash) { matched = i; break; }
       }
@@ -138,7 +139,7 @@ export function readSealedConversation(
       const author = s?.author ?? null;
       leaves.push({
         seq: r.seq,
-        kind: "close",
+        kind: s ? (NON_MESSAGE_KINDS[s.kind] ?? "unknown") : "unknown",
         from: author ? a.nameFor(author) : null,
         from_pubkey: author,
         content_hash: r.hash,

@@ -138,6 +138,21 @@ describe("readSealedConversation", () => {
     expect(out.root_matches_my_transcript).toBe(true);
   });
 
+  it("labels a shared-document update as a document, never as a close", () => {
+    const m1 = h("hi"), doc = h("doc update"), c1 = h("c1"), c2 = h("c2");
+    message(0, "sent", m1, "hi");
+    receipt(1, m1, A, 0);
+    receipt(2, doc, B, 4);
+    receipt(3, c1, A, 2);
+    receipt(4, c2, B, 2);
+    const out = read(rootOf([m1, doc, c1, c2]));
+    expect(out.leaves.map((l) => [l.seq, l.kind, l.from])).toEqual([
+      [1, "message", "Alice"], [2, "document", "Bob"], [3, "close", "Alice"], [4, "close", "Bob"],
+    ]);
+    expect(out.closed_by).toEqual(["Alice", "Bob"]);
+    expect(out.root_matches_my_transcript).toBe(true);
+  });
+
   it("attributes identical bytes from both sides by position, not by hash", () => {
     const ok = h("ok"), c1 = h("c1"), c2 = h("c2");
     message(0, "sent", ok, "ok");
