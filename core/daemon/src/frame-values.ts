@@ -17,8 +17,8 @@ export function frameValueToHex(v: unknown): string | null {
 // M7-SESSION-004 (AC-005): normalise the wire `legibility` object — CBOR-decoded, so pubkeys
 // arrive as Uint8Array/Buffer — into a JSON-safe certificate with hex-encoded pubkeys. Returns
 // undefined for an absent or structurally-implausible object (pre-M7 frame, or a malformed
-// field), in which case nothing is persisted and the seal still completes. The receipt-not-
-// assent constants (attests/implies_assent/disclaimer) and the integers/booleans are carried
+// field), in which case nothing is persisted and the seal still completes. The constants
+// (attests/disclaimer) and the integers/booleans are carried
 // verbatim; only the byte fields are re-encoded. The daemon never invents or alters the
 // certificate's meaning — it is the directory's derivation, surfaced.
 export function normalizeLegibility(raw: unknown): unknown | undefined {
@@ -28,10 +28,8 @@ export function normalizeLegibility(raw: unknown): unknown | undefined {
   const participantsRaw = o["participants"];
   const finalRaw = o["final_message"];
   if (!Array.isArray(participantsRaw) || !finalRaw || typeof finalRaw !== "object") return undefined;
-  // Review finding (low): the disclaimer is the human-readable half of the receipt-not-assent
-  // property; a non-string value means a malformed/tampered frame, so REJECT the whole cert
-  // rather than surfacing an empty disclaimer (implies_assent:false alone is the machine-readable
-  // half, but we do not surface a half-formed certificate).
+  // Review finding (low): the disclaimer states what the certificate attests; a non-string value
+  // means a malformed/tampered frame, so REJECT the whole cert rather than surface a half-formed one.
   if (typeof o["disclaimer"] !== "string" || o["disclaimer"].length === 0) return undefined;
   // Review finding (low): validate attestation_mode against the closed enum — never surface an
   // arbitrary string from a malformed frame on the cert read surface (defensive parity with the
@@ -59,7 +57,6 @@ export function normalizeLegibility(raw: unknown): unknown | undefined {
   };
   return {
     attests: "receipt" as const,
-    implies_assent: false as const,
     disclaimer: o["disclaimer"],
     participants,
     final_message,

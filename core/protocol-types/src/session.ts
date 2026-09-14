@@ -465,14 +465,12 @@ export type SessionSealed = SessionSealedSingle | SessionSealedFrost;
 export type AttestationMode = "live" | "recovered" | "absent";
 
 /**
- * Canonical, human-readable receipt-not-assent disclaimer carried on every seal
- * certificate. Constant — the receipt-not-assent property is not session-specific.
+ * What every seal certificate attests, in words (settled 2026-09-14). NEUTRAL on agreement: a
+ * seal may later be offered as evidence of one, so the certificate states what took place and
+ * nothing about what it means. Not part of the signed legibility bytes.
  */
 export const SEAL_RECEIPT_DISCLAIMER =
-  "This certificate attests faithful receipt, integrity, and ordering of the " +
-  "transcript. No signature in this certificate implies agreement to, or assent " +
-  "to, the contents of any message. Agreement is always a separate, explicit act " +
-  "(its own signed reply). A sealed transcript is a receipt, never a record of agreement.";
+  "Attests that this conversation took place between these two agents, in this order, unaltered.";
 
 export interface SealLegibilityParticipant {
   /** 32-byte K_local pubkey of this participant. */
@@ -506,12 +504,11 @@ export interface SealLegibilityFinalMessage {
 /**
  * Reader-facing legibility object attached to the SessionSealed certificate.
  * Built by the directory at seal time; persisted client-side; exposed intact to
- * any reader (human, agent, arbitrator). NO field asserts, implies, or can be
- * parsed as agreement; `implies_assent` is always the literal `false`.
+ * any reader (human, agent, arbitrator). It is neutral on agreement: no field
+ * says the conversation is an agreement, and none says it is not.
  */
 export interface SealLegibility {
   attests: "receipt";
-  implies_assent: false;
   disclaimer: string;
   participants: SealLegibilityParticipant[];
   final_message: SealLegibilityFinalMessage;

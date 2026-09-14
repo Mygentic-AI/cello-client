@@ -13,9 +13,8 @@
  *
  * What the signature below says: **a machine holding this identity key received these exact bytes
  * in this exact session.** That is all. It is signed on INGEST, not when a human reads it, so it
- * says nothing about attention — and it is emphatically not agreement. A seal certificate's
- * `implies_assent` stays the literal `false`, and a delivery acknowledgement must never be
- * presented as consent to anything.
+ * says nothing about attention or about what the reader made of the message. It must never be
+ * presented as more than receipt of bytes.
  *
  * ─── What is signed, and why each field is in it ───────────────────────────────────────────────
  *

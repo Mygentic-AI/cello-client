@@ -7,9 +7,8 @@
  *
  * Design: an EXPLICIT, fixed byte layout (NOT canonical CBOR) so there is zero dependence on
  * a CBOR library's determinism. Only the TAMPERABLE facts are bound — the per-party frontiers
- * + attestation_mode and the final_message. The constants (attests / implies_assent /
- * disclaimer) are NOT bound: the daemon re-asserts attests/implies_assent as literals on the
- * read surface, so they cannot be meaningfully tampered; the disclaimer is informational.
+ * + attestation_mode and the final_message. The constants (attests / disclaimer) are NOT bound:
+ * the daemon re-asserts attests as a literal, and the disclaimer is informational.
  *
  * Hash = SHA-256( domain || u32(participantCount) ||
  *   for each participant (in array order): pubkey[32] || u32(content_frontier_seq) ||
