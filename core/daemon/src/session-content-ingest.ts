@@ -1543,6 +1543,7 @@ export class SessionContentIngest {
     const prev = this.#ctx.lastAck.get(key);
     if (prev && relaySeq <= prev.seq) return;
     this.#ctx.lastAck.set(key, { seq: relaySeq, hash: Uint8Array.from(contentHash) });
+    this.#ctx.records.recordLastAck(agentName, sessionId, relaySeq, contentHash);
     const entry = this.#ctx.activeNodes.get(key);
     const sessionIdHex = entry?.relaySessionIdBytes
       ? Buffer.from(entry.relaySessionIdBytes).toString("hex")

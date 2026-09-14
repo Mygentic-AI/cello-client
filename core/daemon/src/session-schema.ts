@@ -529,6 +529,21 @@ export function ensureSessionSchema(
    * answer's `delivery_ack`. A separate table, not rows in `delivery_acks`: both sides can send
    * identical bytes, and a shared key on the hash would let our own signature stand in for theirs.
    */
+  /**
+   * The last acknowledgement the live path made per session: the RELAY position and the content
+   * hash at it, exactly as signed into this side's claims. A resumed session starts from here, so a
+   * restart cannot reset it to 0 (every close refused as stale) or guess it from the local leaf
+   * index (which can drift one ahead of the relay). Forward-only.
+   */
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS session_last_ack (
+      agent_id   TEXT    NOT NULL,
+      session_id TEXT    NOT NULL,
+      relay_seq  INTEGER NOT NULL,
+      hash_hex   TEXT    NOT NULL,
+      PRIMARY KEY (agent_id, session_id)
+    )
+  `);
   db.exec(`
     CREATE TABLE IF NOT EXISTS delivery_acks_given (
       agent_id         TEXT    NOT NULL,

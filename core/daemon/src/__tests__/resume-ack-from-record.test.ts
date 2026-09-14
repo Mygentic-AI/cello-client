@@ -21,6 +21,7 @@ import { AgentRelayClient } from "../session-relay-client.js";
 import { SessionSealLeafStore } from "../session-seal-leaf-store.js";
 import { openEncryptedDatabase, type DaemonDatabase } from "../sqlcipher-db.js";
 import { ensureSessionSchema } from "../session-schema.js";
+import { recordLastAck } from "../resume-last-seen.js";
 import { makeFakeRelay, noopLogger, fakeRelayAnchor } from "./relay-client-fake.js";
 
 const GENESIS = new Uint8Array(32).fill(0x9c);
@@ -102,18 +103,42 @@ describe("resuming a session seeds the acknowledgement from the stored record", 
     db.prepare("INSERT INTO agents (agent_id, agent_name, k_local_pubkey) VALUES ('ag1', 'me', ?)").run(meHex);
     leaf(meHex, 1, THEM, hash("their first, via the relay"));
     leaf(meHex, 2, meHex, hash("my reply"));
-    // Their second message was placed from the direct stream: transcript + tree only, at index 2 (relay position 3).
+    // Their second message was placed from the direct stream at relay position 3. The live path
+    // acknowledged it, and that acknowledgement — position and hash — is what was recorded.
     const direct = hash("their second, direct");
-    db.prepare("INSERT INTO session_tree_leaves (agent_id, session_id, leaf_index, leaf_kind, leaf_hash_hex, created_at) VALUES ('ag1', ?, 2, 'msg', ?, 0)")
-      .run(SID_HEX, Buffer.from(direct).toString("hex"));
-    db.prepare("INSERT INTO transcript (agent_id, session_id, sequence, direction, blob, created_at) VALUES ('ag1', ?, 2, 'received', ?, 0)")
-      .run(SID_HEX, Buffer.from("their second, direct"));
+    recordLastAck(db, { agentId: "ag1", sessionId: SID_HEX, seq: 3, hash: direct });
 
     client.registerSession(SID_HEX, makeFakeRelay().node, undefined, await fakeRelayAnchor(), GENESIS);
 
     const ack = client.lastSeenAck(SID_HEX);
     expect(ack?.seq).toBe(3);
     expect(Buffer.from(ack!.hash).equals(Buffer.from(direct))).toBe(true);
+  });
+
+  it("never guesses a position from the local record, which can drift one ahead of the relay", async () => {
+    const { client, meHex } = await resumedClient();
+    db.prepare("INSERT INTO agents (agent_id, agent_name, k_local_pubkey) VALUES ('ag1', 'me', ?)").run(meHex);
+    // A first submit that failed left the local tree one AHEAD of the relay: a received row sits at
+    // local index 3, but the relay filed that message at position 3 (not 4), and the live path
+    // acknowledged position 3.
+    const theirs = hash("theirs");
+    leaf(meHex, 3, THEM, theirs);
+    db.prepare("INSERT INTO session_tree_leaves (agent_id, session_id, leaf_index, leaf_kind, leaf_hash_hex, created_at) VALUES ('ag1', ?, 3, 'msg', ?, 0)")
+      .run(SID_HEX, Buffer.from(theirs).toString("hex"));
+    db.prepare("INSERT INTO transcript (agent_id, session_id, sequence, direction, blob, created_at) VALUES ('ag1', ?, 3, 'received', ?, 0)")
+      .run(SID_HEX, Buffer.from("theirs"));
+    recordLastAck(db, { agentId: "ag1", sessionId: SID_HEX, seq: 3, hash: theirs });
+
+    client.registerSession(SID_HEX, makeFakeRelay().node, undefined, await fakeRelayAnchor(), GENESIS);
+
+    expect(client.lastSeenAck(SID_HEX)?.seq, "resume must not claim position 4 from the local index").toBe(3);
+  });
+
+  it("the recorded acknowledgement only moves forward", () => {
+    recordLastAck(db, { agentId: "ag1", sessionId: SID_HEX, seq: 5, hash: hash("five") });
+    recordLastAck(db, { agentId: "ag1", sessionId: SID_HEX, seq: 4, hash: hash("four, redelivered late") });
+    const row = db.prepare("SELECT relay_seq FROM session_last_ack WHERE agent_id = 'ag1' AND session_id = ?").get(SID_HEX) as { relay_seq: number };
+    expect(row.relay_seq).toBe(5);
   });
 
   it("a session with nothing from the other side still starts at the genesis", async () => {

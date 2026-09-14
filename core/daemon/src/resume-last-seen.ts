@@ -7,16 +7,30 @@
  * and the re-sign waits for a new message that never comes: the session could never seal (live,
  * 2026-09-14).
  *
- * Two durable sources, because the live path advances from two places:
- *   - the seal leaf store: every leaf the other side authored that reached this side via the relay,
- *     with the Structure 1 they signed;
- *   - the transcript: every message placed from the direct path, which never writes the store.
- * The highest of the two is where the live path would have been. Both hashes are the leaf's content
- * hash, which is what the relay's content check compares against.
+ * Two durable sources, both holding RELAY positions — never a position guessed from the local leaf
+ * index, which can drift one ahead of the relay:
+ *   - `session_last_ack`: what the live path acknowledged, written at the moment it did, for every
+ *     route a message can arrive by (relay, direct, recovered park, screened-out);
+ *   - the seal leaf store: every leaf the other side authored that the relay delivered, with the
+ *     Structure 1 they signed.
+ * The higher of the two is where the live path would have been.
  */
 import { decodeStructure1 } from "@cello-protocol/protocol-types";
 import type { SessionSealLeafStore } from "./session-seal-leaf-store.js";
+import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
+
+/** Record an acknowledgement the live path just made. Forward-only: an earlier position is ignored. */
+export function recordLastAck(
+  db: DaemonDatabase,
+  a: { agentId: string; sessionId: string; seq: number; hash: Uint8Array },
+): void {
+  db.prepare(
+    `INSERT INTO session_last_ack (agent_id, session_id, relay_seq, hash_hex) VALUES (?, ?, ?, ?)
+     ON CONFLICT (agent_id, session_id) DO UPDATE SET relay_seq = excluded.relay_seq, hash_hex = excluded.hash_hex
+     WHERE excluded.relay_seq > session_last_ack.relay_seq`,
+  ).run(a.agentId, a.sessionId, a.seq, Buffer.from(a.hash).toString("hex"));
+}
 
 export function lastSeenFromRecord(
   store: SessionSealLeafStore,
@@ -25,7 +39,7 @@ export function lastSeenFromRecord(
   sessionIdHex: string,
 ): { seq: number; hash: Uint8Array } | undefined {
   const own = Buffer.from(ownPubkey);
-  let best = store.receivedFrontier(own.toString("hex"), sessionIdHex);
+  let best = store.recordedAcknowledgement(own.toString("hex"), sessionIdHex);
   for (const leaf of store.getCarry(own.toString("hex"), sessionIdHex)) {
     const s1 = decodeStructure1(leaf.structure1Cbor);
     if (!s1.ok) {

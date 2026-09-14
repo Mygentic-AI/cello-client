@@ -22,6 +22,7 @@ import { type TranscriptEntry, UNREAD_RECEIVED_WHERE, TERMINAL_STATUSES } from "
 import { quarantineRedaction } from "./quarantine-framing.js";
 import { extractErrorMessage } from "./error-message.js";
 import { storeDeliveryAck, storeGivenDeliveryAck, sentContentHashExists } from "./session-delivery-acks.js";
+import { recordLastAck } from "./resume-last-seen.js";
 
 /** What this module needs from the manager, stated explicitly rather than handed `this`. */
 export interface SessionRecordsContext {
@@ -629,6 +630,19 @@ export class SessionRecords {
       agentId: this.#ctx.requireAgentId(agentName),
       agentName, sessionId, contentHashHex, signerPubkeyHex, signature, correlationId,
     });
+  }
+
+  /** Durably record the acknowledgement the live path just made, so a resumed session starts from it. */
+  recordLastAck(agentName: string, sessionId: string, relaySeq: number, contentHash: Uint8Array): void {
+    if (!this.#db) return;
+    try {
+      recordLastAck(this.#db, { agentId: this.#ctx.requireAgentId(agentName), sessionId, seq: relaySeq, hash: contentHash });
+    } catch (err: unknown) {
+      this.#ctx.logger.error("session.last_ack.record.failed", {
+        agentName, sessionId, relaySeq, reason: extractErrorMessage(err),
+        impact: "if this daemon restarts before the session closes, the close may be refused as stale",
+      });
+    }
   }
 
   /** Keep this side's own signed acknowledgement for a received message, for the seal answer. */
