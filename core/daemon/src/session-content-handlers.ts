@@ -27,6 +27,14 @@ import { isAutoReplyMarked } from "./away-detection.js";
 import { REFUSAL_COUNT_GUIDANCE, REFUSAL_KIND_GUIDANCE, type RefusalKind } from "./refusal-reasons.js";
 import { extractErrorMessage } from "./error-message.js";
 import { SESSION_CLOSED_GUIDANCE, SESSION_CLOSED_REASON, SESSION_SEALING_IMPACT, closedSessionImpact, isClosedStatus } from "./session-closed.js";
+import { replyLag, type ReplyLag } from "./reply-lag.js";
+
+/** Whether the other side's latest replies were written before they saw this side's newest message. */
+function replyLagFor(snm: { getDb(): import("./sqlcipher-db.js").DaemonDatabase; resolveAgentId(n: string): string }, agentName: string, sessionId: string): ReplyLag | undefined {
+  const db = snm.getDb();
+  const row = db.prepare("SELECT k_local_pubkey FROM agents WHERE agent_id = ?").get(snm.resolveAgentId(agentName)) as { k_local_pubkey: string } | undefined;
+  return row ? replyLag(db, row.k_local_pubkey, sessionId) : undefined;
+}
 
 /**
  * DOD-M12B-AWAY-MARK-1 — what a reader needs to know the moment it sees a marked message.
@@ -1183,7 +1191,12 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
       // the lower bound every later read would repeat the warning until a restart.
       const readFrom = unread.previousWatermark ?? -1;
       const crossed = sessionNodeManager.getUndeliverableSeqs(agentName, sessionId).filter((s) => s > readFrom && s <= lastSeq);
+      const lag = replyLagFor(sessionNodeManager, agentName, sessionId);
       return {
+        ...(lag ? {
+          reply_lag: lag,
+          reply_lag_guidance: `Their last ${lag.replies} replies were written before they saw your message at position ${lag.your_unseen_seq}, so they may be answering something older. Check whether it reached them before assuming they disagree.`,
+        } : {}),
         ok: true,
         session_id: sessionId,
         count: unread.length,
