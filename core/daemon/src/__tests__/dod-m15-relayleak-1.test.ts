@@ -67,7 +67,7 @@ const RELAY_ADDRS = ["/ip4/127.0.0.1/tcp/4001"];
  */
 type FakeRelayClient = Pick<
   AgentRelayClient,
-  "registerSession" | "unregisterSession" | "hasSessions" | "hasSession" | "close" | "submitLeaf"
+  "registerSession" | "unregisterSession" | "hasSessions" | "hasSession" | "close" | "submitLeaf" | "lastSeenAck"
 > & {
   closed: number;
   sessions: Set<string>;
@@ -99,6 +99,8 @@ function makeFakeRelayClient(): FakeRelayClient {
      * case that actually happens: a submit that COMPLETES, and a client that must be released after.
      */
     submitLeaf() { submits += 1; return Promise.resolve({ ok: true as const, sequence_number: 1 }); },
+    // Read by submitSealLeaf to tell whether a `seal_stale` retry can proceed.
+    lastSeenAck() { return undefined; },
     close() { (fake as { closed: number }).closed += 1; },
     getLastReaderError() { return undefined; },
     /** How many submits actually COMPLETED — proves the throw path is not what is being tested. */
