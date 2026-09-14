@@ -34,7 +34,7 @@ import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory } from "../session-node-manager.js";
 import { seedAgentKeys } from "./helpers/seed-agents.js";
-import { acceptParkedDeliveryAck, readDeliveryFacts } from "../session-delivery-acks.js";
+import { acceptParkedDeliveryAck } from "../session-delivery-acks.js";
 import type { DaemonDatabase } from "../sqlcipher-db.js";
 import type { Logger } from "../types.js";
 import { InMemoryKeyProvider, signDeliveryAck } from "@cello-protocol/crypto";
@@ -220,7 +220,7 @@ describe("DELIVERYACK/parked: an acknowledgement out of the mailbox is held to t
           mailboxSlotHex: slotHex ?? Buffer.from(parkedDeliveryAckMailboxHash(SESSION, ack.contentHash)).toString("hex"),
           counterpartyPubkeyHex: counterparty, ack, correlationId: "corr",
         }),
-      held: () => readDeliveryFacts(db, logger, agentId, SESSION).filter((f) => f.acknowledged !== null).length,
+      held: () => (db.prepare("SELECT COUNT(*) AS n FROM delivery_acks WHERE agent_id = ? AND session_id = ?").get(agentId, SESSION) as { n: number }).n,
     };
   }
 

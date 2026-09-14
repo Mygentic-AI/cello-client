@@ -32,7 +32,7 @@ import type { CelloNode } from "@cello-protocol/transport";
 import { LEAF_KIND_CTRL, type AgentRelayClient } from "./session-relay-client.js";
 import { RelayReceiptStore } from "./relay-receipt-store.js";
 import { SessionSealLeafStore, type SealCarryLeaf } from "./session-seal-leaf-store.js";
-import { withheldPositions } from "./withheld-content.js";
+import { withheldPositionsOrNone } from "./withheld-content.js";
 import type { SessionOwnChainStore } from "./session-own-chain-store.js";
 import type { SessionRecords } from "./session-records.js";
 import type { SessionQueries } from "./session-queries.js";
@@ -680,7 +680,7 @@ export class SessionSeal {
         const relaySidHex = Buffer.from(entry.relaySessionIdBytes).toString("hex");
         const seenBefore = entry.relayClient.lastSeenAck(relaySidHex)?.seq ?? 0;
         // A message the other side filed but never delivered would be claimed by this close and missing from its root; refuse by name (withheld-content.ts).
-        const withheld = this.#db ? withheldPositions(this.#db, { agentId: this.#ctx.requireAgentId(agentName), agentPubkeyHex: entry.relayClient.senderPubkeyHex, sessionId, relaySessionHex: relaySidHex, upToSeq: seenBefore }) : [];
+        const withheld = withheldPositionsOrNone(this.#db, this.#ctx.logger, () => ({ agentId: this.#ctx.requireAgentId(agentName), agentPubkeyHex: entry.relayClient.senderPubkeyHex, sessionId, relaySessionHex: relaySidHex, upToSeq: seenBefore }));
         if (withheld.length > 0) {
           this.#ctx.responderSealSubmitted.delete(sealKey);
           this.#ctx.logger.warn("session.seal.counterparty_content_missing", { sessionId, agentName, positions: withheld, correlationId });

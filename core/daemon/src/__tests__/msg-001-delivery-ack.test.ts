@@ -1,5 +1,4 @@
 import { LEAF_KIND_MSG } from "../session-relay-client.js";
-import { readDeliveryFacts } from "../session-delivery-acks.js";
 /**
  * CELLO-M7-MSG-001 — delivery ACK / TTF (send + receive), re-homed onto the daemon.
  *
@@ -205,10 +204,12 @@ describe("MSG-001: delivery ACK / TTF (daemon)", () => {
     const recorded = a.events.find((e) => e.event === "content.delivery.ack.recorded");
     expect(recorded, "the sender must keep the receiver's signature, not just verify it").toBeTruthy();
     expect(recorded?.context.signerPubkey).toBe(bobPub);
-    const facts = readDeliveryFacts(mgrA.getDb(), a.logger, mgrA.resolveAgentId("alice"), SID);
+    const facts = mgrA.getDb()
+      .prepare("SELECT signer_pubkey, signature FROM delivery_acks WHERE agent_id = ? AND session_id = ?")
+      .all(mgrA.resolveAgentId("alice"), SID) as Array<{ signer_pubkey: string; signature: Uint8Array }>;
     expect(facts.length).toBe(1);
-    expect(facts[0]?.acknowledged?.signer_pubkey).toBe(bobPub);
-    expect(facts[0]?.acknowledged?.signature.length).toBe(128); // 64 bytes, hex
+    expect(facts[0]?.signer_pubkey).toBe(bobPub);
+    expect(facts[0]?.signature.length).toBe(64);
     // No park / TTF-expiry happened (the ACK arrived well within the 60s TTF).
     expect(a.events.some((e) => e.event === "content.delivery.ttf_expired")).toBe(false);
   });

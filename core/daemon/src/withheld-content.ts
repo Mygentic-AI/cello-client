@@ -9,8 +9,24 @@
  */
 import { decodeStructure1 } from "@cello-protocol/protocol-types";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
+import { extractErrorMessage } from "./error-message.js";
 
 const LEAF_KIND_MSG = 0;
+
+/** The close-time form: the check guards a close, so it must never be the thing that breaks one. */
+export function withheldPositionsOrNone(
+  db: DaemonDatabase | null | undefined,
+  logger: { warn(event: string, ctx?: Record<string, unknown>): void },
+  args: () => Parameters<typeof withheldPositions>[1],
+): number[] {
+  if (!db) return [];
+  try {
+    return withheldPositions(db, args());
+  } catch (err: unknown) {
+    logger.warn("session.seal.withheld_check.failed", { reason: extractErrorMessage(err) });
+    return [];
+  }
+}
 
 export function withheldPositions(
   db: DaemonDatabase,
