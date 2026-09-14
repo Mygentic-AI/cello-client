@@ -41,6 +41,21 @@ import { isLocalCredentialRefusal } from "./session-relay-client.js";
  * always return. Telling the counterparty is worth a moment; it is not worth the escape hatch.
  */
 const ABANDON_NOTICE_DEADLINE_MS = 3_000;
+
+/**
+ * What a failed SEAL-leaf submit means, by reason. `seal_stale` used to share the "local and
+ * temporary" text, which sent an operator to agent startup and relay reachability while every retry
+ * failed the same way: the relay was refusing because it holds a message this side never recorded.
+ */
+function sealSubmitCause(reason: string): string {
+  if (reason === "seal_stale") {
+    return "The relay holds a message from the other side that this side has not recorded, so a close signed now would seal a conversation missing it. " +
+      "If they are still sending, wait for the message to arrive (cello_receive) and close again. " +
+      "If nothing arrives, retrying will fail the same way: report the session id — do not force-abandon, which forfeits the seal.";
+  }
+  return "That is usually local and temporary — an agent that is not started yet (cello_start_agent), or a relay this daemon cannot currently reach (cello_status). " +
+    "The conversation is intact either way; retry cello_close_session once the daemon reports healthy.";
+}
 import { SignalingManager } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { IpcHandler } from "./ipc-server.js";
@@ -939,8 +954,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
             seal_pending_reason: uni.reason,
             guidance:
               `The bilateral commitment is recorded, but this side could not post the SEAL leaf a notarization is requested with: ${uni.reason}. ` +
-              `That is usually local and temporary — an agent that is not started yet (cello_start_agent), or a relay this daemon cannot currently reach (cello_status). ` +
-              `Retry cello_close_session once the daemon reports healthy.`,
+              sealSubmitCause(uni.reason),
           };
         }
         if (uni.ok) return uni; // A REAL RECEIPT — the whole point of this line.
@@ -1540,8 +1554,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
                 `This one is NOT transient and retrying will not clear it — it is a defect in this daemon's seal path, refused locally before anything was sent. ` +
                 `The conversation is intact and nothing was disclosed. Report the reason code above; the daemon log carries the detail under session.relay.submit.*.`
               : `This session holds a bilateral commitment, but no notarization could be requested for it: ${uni.reason}. ` +
-                `That is usually local and temporary — an agent that is not started yet (cello_start_agent), or a relay this daemon cannot currently reach (cello_status). ` +
-                `The conversation is intact either way; retry cello_close_session once the daemon reports healthy.`,
+                sealSubmitCause(uni.reason),
           };
         }
         if (uni.ok) return uni;

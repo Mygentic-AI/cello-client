@@ -356,6 +356,21 @@ describe("DOD-M12B-PENDING-EXIT-1: a seal_interrupted_pending session can finall
     expect(String(res.guidance), "it must point at the local fix").toMatch(/cello_start_agent/);
   });
 
+  it("a seal_stale refusal names the missing message, not the agent or the relay", async () => {
+    // Live 2026-09-14: an interrupted session was refused as stale on every close, and the answer
+    // sent the operator to cello_start_agent and cello_status, neither of which could help.
+    const h = harness({
+      status: "seal_interrupted_pending",
+      flow: { ok: false, reason: "unused", guidance: "" },
+      directory: { ok: true, sealedRootHex: SEALED_ROOT },
+      submit: { ok: false, reason: "seal_stale" },
+    });
+    const res = (await h.close({ session_id: SESSION }, "conn-1")) as { reason?: string; guidance?: string };
+    expect(res.reason).toBe("seal_stale");
+    expect(String(res.guidance)).toMatch(/message from the other side that this side has not recorded/);
+    expect(String(res.guidance)).not.toMatch(/usually local and temporary|cello_start_agent/);
+  });
+
   it("★★ but a SEAL-PAYLOAD refusal is NOT transient, and must not be answered with 'retry later'", async () => {
     /**
      * ⚠️ `DOD-M15-SEALWIRE-1` bullets 3+4, review pass 2, MEDIUM-4. THE SENTENCE ABOVE WAS RIGHT FOR
