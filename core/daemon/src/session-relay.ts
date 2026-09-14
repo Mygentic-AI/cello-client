@@ -429,9 +429,8 @@ export class SessionRelay {
           this.#ctx.relayReceiptStore = new RelayReceiptStore(this.#db, this.#ctx.logger);
         }
         // FED-OPTIONB-SEAL-001: one shared seal-leaf log (keyed by agent_pubkey), same lazy lifecycle.
-        if (!this.#ctx.sealLeafStore && this.#db) {
-          this.#ctx.sealLeafStore = new SessionSealLeafStore(this.#db, this.#ctx.logger);
-        }
+        if (!this.#ctx.sealLeafStore && this.#db) this.#ctx.sealLeafStore = new SessionSealLeafStore(this.#db, this.#ctx.logger);
+        if (!this.#ctx.sealLeafStore) this.#ctx.logger.error("session.relay.stores_absent", { agentName, sessionId, correlationId, impact: "no leaf record: this session cannot resume after a restart and keeps no seal evidence" });
         client = new AgentRelayClient({
           relayPeerId: relay.relayPeerId,
           relayAddrs: relay.relayAddrs,
