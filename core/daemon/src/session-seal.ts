@@ -689,7 +689,9 @@ export class SessionSeal {
          */
         if (!result.ok && result.reason === "seal_stale") {
           const deadline = Date.now() + SEAL_STALE_WAIT_MS;
-          while ((entry.relayClient.lastSeenAck(relaySidHex)?.seq ?? 0) <= seenBefore && Date.now() < deadline) {
+          // Wait for the position the relay named; an older relay names none, so any advance will do.
+          const needed = ("awaited_seq" in result && result.awaited_seq !== undefined) ? result.awaited_seq : seenBefore + 1;
+          while ((entry.relayClient.lastSeenAck(relaySidHex)?.seq ?? 0) < needed && Date.now() < deadline) {
             await new Promise<void>((r) => { const t = setTimeout(r, 20); t.unref?.(); });
           }
           this.#ctx.logger.info("session.seal.leaf.stale_resign", {

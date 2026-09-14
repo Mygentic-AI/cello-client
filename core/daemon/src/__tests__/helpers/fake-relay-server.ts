@@ -47,7 +47,7 @@ export interface FakeRelayOpts {
    * Refuse a submit instead of ordering it: return a relay reason and it answers
    * `hash_submit_error` with that reason, taking no position. Default: never refuses.
    */
-  refuseSubmit?: (leafKind: number) => string | undefined;
+  refuseSubmit?: (leafKind: number, structure1?: Uint8Array) => string | { reason: string; awaited_seq?: number } | undefined;
 }
 
 export function makeFakeRelayServer(opts: FakeRelayOpts = {}) {
@@ -86,8 +86,8 @@ export function makeFakeRelayServer(opts: FakeRelayOpts = {}) {
             else if (frame["type"] === "client_record_assignment") push({ type: "assignment_ok" });
             else if (frame["type"] === "hash_submit") {
               const s1 = frame["structure1_cbor"];
-              const refusal = opts.refuseSubmit?.(typeof frame["leaf_kind"] === "number" ? (frame["leaf_kind"] as number) : 0);
-              if (refusal !== undefined) { push({ type: "hash_submit_error", reason: refusal }); continue; }
+              const refusal = opts.refuseSubmit?.(typeof frame["leaf_kind"] === "number" ? (frame["leaf_kind"] as number) : 0, s1 instanceof Uint8Array ? s1 : undefined);
+              if (refusal !== undefined) { push({ type: "hash_submit_error", ...(typeof refusal === "string" ? { reason: refusal } : refusal) }); continue; }
               const key = s1 instanceof Uint8Array ? Buffer.from(s1).toString("hex") : String(s1);
               const already = bySubmission.get(key);
               const leaf: OrderedLeaf = already ?? {

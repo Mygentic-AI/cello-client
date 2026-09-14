@@ -384,6 +384,8 @@ export type SubmitResult =
        * this out and resubmits rather than surfacing a throttle — see the retry loop there.
        */
       retry_after_ms?: number;
+      /** On `seal_stale`: the position the relay needs this side to have seen before a close files. */
+      awaited_seq?: number;
     };
 type AckResolver = (r: SubmitResult) => void;
 
@@ -1331,11 +1333,10 @@ export class AgentRelayClient {
       // dropped — `#doSubmit` waits it out and resubmits, so a throttle never reaches the operator.
       const rawRetry = frame["retry_after_ms"];
       const retry_after_ms = typeof rawRetry === "number" && Number.isFinite(rawRetry) && rawRetry > 0 ? rawRetry : undefined;
+      const awaited = frame["awaited_seq"];
       this.#settlePending({
-        ok: false,
-        reason,
-        ...(detail ? { detail } : {}),
-        ...(retry_after_ms !== undefined ? { retry_after_ms } : {}),
+        ok: false, reason, ...(detail ? { detail } : {}), ...(retry_after_ms !== undefined ? { retry_after_ms } : {}),
+        ...(typeof awaited === "number" && Number.isInteger(awaited) && awaited > 0 ? { awaited_seq: awaited } : {}),
       });
     } else if (type === "relay_release_ok") {
       // 054-SRSPLIT. `released` is the relay's own answer to "did I actually hold one?" — a

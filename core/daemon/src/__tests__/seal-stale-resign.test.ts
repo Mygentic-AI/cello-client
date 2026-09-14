@@ -22,6 +22,7 @@ import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-man
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
 import { makeFakeRelayServer, FakeRelayAwareNode, FAKE_RELAY_PEER_ID, FAKE_RELAY_ADDR } from "./helpers/fake-relay-server.js";
 import { fakeRelayAnchor } from "./relay-client-fake.js";
+import { decodeStructure1 } from "@cello-protocol/protocol-types";
 
 const SID_BYTES = Uint8Array.from(Array.from({ length: 16 }, (_, i) => i + 0x51 & 0xff));
 const SID_HEX = Buffer.from(SID_BYTES).toString("hex");
@@ -54,14 +55,25 @@ describe("seal_stale: a close signed before a filed message is re-signed once it
     await rm(tempDir, { recursive: true, force: true });
   });
 
-  async function setUp(opts: { messageLands: boolean }) {
+  async function setUp(opts: { messageLands: boolean; twoFiled?: boolean }) {
     const { logger, events } = makeLogger();
     let ctrlSubmits = 0;
+    const closeClaims: number[] = [];
     let relayClientRef: { noteReceivedLeaf(h: string, s: number, c: Uint8Array): void } | null = null;
     const relay = makeFakeRelayServer({
-      refuseSubmit: (kind) => {
+      refuseSubmit: (kind, s1) => {
         if (kind !== LEAF_KIND_CTRL) return undefined;
         ctrlSubmits += 1;
+        const d = s1 ? decodeStructure1(s1) : undefined;
+        if (d?.ok) closeClaims.push(d.fields.lastSeenSeq);
+        if (opts.twoFiled) {
+          // Two messages from the other side are filed (positions 5 and 6); they land 100 ms apart.
+          if (ctrlSubmits === 1) {
+            setTimeout(() => relayClientRef?.noteReceivedLeaf(SID_HEX, 5, new Uint8Array(32).fill(0x41)), 50);
+            setTimeout(() => relayClientRef?.noteReceivedLeaf(SID_HEX, 6, new Uint8Array(32).fill(0x42)), 150);
+          }
+          return closeClaims.at(-1)! >= 6 ? undefined : { reason: "seal_stale", awaited_seq: 6 };
+        }
         if (ctrlSubmits > 1) return opts.messageLands ? undefined : "seal_stale";
         // The other side's message is in the relay's log but not yet in our record. When the test
         // lets it land, our acknowledgement moves a moment later, as ingest would move it.
@@ -98,8 +110,17 @@ describe("seal_stale: a close signed before a filed message is re-signed once it
     await client.send("cello_use_agent", { name: "alice" });
     const sent = await client.send("cello_send", { session_id: SID_HEX, content: "hello" }) as Record<string, unknown>;
     expect(sent.ok, JSON.stringify(sent)).toBe(true);
-    return { client, events, ctrlSubmits: () => ctrlSubmits };
+    return { client, events, ctrlSubmits: () => ctrlSubmits, closeClaims };
   }
+
+  it("★★★ two messages filed: the close waits for the position the relay named, not the first to land", async () => {
+    const { client, events, ctrlSubmits, closeClaims } = await setUp({ messageLands: true, twoFiled: true });
+    await client.send("cello_close_session", { session_id: SID_HEX });
+    await wait(600);
+    expect(ctrlSubmits(), "one stale close, one re-signed close").toBe(2);
+    expect(closeClaims[1], "the re-signed close claims the awaited position").toBe(6);
+    expect(events.find((e) => e.event === "session.seal.leaf.submitted"), "and it was filed").toBeDefined();
+  }, 20_000);
 
   it("★★★ refused stale, the message lands, the close is signed again and filed", async () => {
     const { client, events, ctrlSubmits } = await setUp({ messageLands: true });
