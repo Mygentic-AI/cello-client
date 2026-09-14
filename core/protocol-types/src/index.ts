@@ -67,7 +67,7 @@ export {
   encodeScanResultSentinel,
 } from "./structure2.js";
 
-export { computeGenesisPrevRoot, encodeSealPayload, decodeSealPayload, buildSessionEstablishmentTbs, buildSealTbs, SEAL_RECEIPT_DISCLAIMER } from "./session.js";
+export { computeGenesisPrevRoot, computeChainAnchor,encodeSealPayload, decodeSealPayload, buildSessionEstablishmentTbs, buildSealTbs, SEAL_RECEIPT_DISCLAIMER } from "./session.js";
 export type {
   SessionAssignment, SessionAssignmentFrost, SessionAssignmentSingle, ParticipantInfo, RelayEndpointInfo, SealPayload,
   SessionAbandoned, SessionAbandonedNotice, SessionSealedSingle, SessionSealedFrost, SessionSealed, SealRejectionReason, SessionSealRejected, SealVerified,

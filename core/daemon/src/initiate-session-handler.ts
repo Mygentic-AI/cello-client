@@ -259,6 +259,8 @@ export function registerInitiateSessionHandler(deps: InitiateSessionDeps): {
       assignment.participant_a.pubkey,
       assignment.participant_b.pubkey,
       assignment.session_timestamp,
+      // The opening FROST signature: the genesis includes it, so the chain starts from it.
+      assignment.directory_signature,
       // 069-ORDERPROOF: the relay this session's ordering attestations verify under, recorded at
       // the same moment and from the same FROST-verified assignment as the starting point above.
       // Durable, because a session revived after a restart re-registers with no assignment.

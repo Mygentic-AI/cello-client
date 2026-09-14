@@ -25,7 +25,7 @@ import type { ActiveSessionEntry } from "./session-node-types.js";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { RelayAssignmentCarry } from "./session-relay-client.js";
 import type { SealFrontierLeaf } from "./seal-frontier-verify.js";
-import { computeGenesisPrevRoot } from "@cello-protocol/protocol-types";
+import { computeGenesisPrevRoot, computeChainAnchor } from "@cello-protocol/protocol-types";
 import { extractErrorMessage } from "./error-message.js";
 import { certifiedLeafSetFrom } from "./sealed-leaf-set.js";
 
@@ -97,12 +97,15 @@ export class SessionLeafRecords {
    */
   sessionGenesisPrevRoot(agentName: string, sessionId: string): Uint8Array | undefined {
     const assignment = this.#ctx.activeEntry(this.#ctx.sessionKey(agentName, sessionId))?.relayAssignment;
-    if (assignment) {
-      return computeGenesisPrevRoot(
-        assignment.participantA,
-        assignment.participantB,
-        Uint8Array.from(Buffer.from(sessionId, "hex")),
-        assignment.sessionTimestamp,
+    if (assignment?.sessionSignature) {
+      return computeChainAnchor(
+        computeGenesisPrevRoot(
+          assignment.participantA,
+          assignment.participantB,
+          Uint8Array.from(Buffer.from(sessionId, "hex")),
+          assignment.sessionTimestamp,
+        ),
+        assignment.sessionSignature,
       );
     }
     /**
@@ -199,11 +202,16 @@ export class SessionLeafRecords {
   persistGenesisPrevRoot(agentName: string, sessionId: string, assignment: RelayAssignmentCarry): void {
     let genesis: Uint8Array;
     try {
-      genesis = computeGenesisPrevRoot(
-        assignment.participantA,
-        assignment.participantB,
-        Uint8Array.from(Buffer.from(sessionId, "hex")),
-        assignment.sessionTimestamp,
+      // The chain starts from the genesis bound to the opening FROST signature (computeChainAnchor).
+      if (!assignment.sessionSignature) throw new Error("the assignment carries no session FROST signature to anchor the chain");
+      genesis = computeChainAnchor(
+        computeGenesisPrevRoot(
+          assignment.participantA,
+          assignment.participantB,
+          Uint8Array.from(Buffer.from(sessionId, "hex")),
+          assignment.sessionTimestamp,
+        ),
+        assignment.sessionSignature,
       );
     } catch (err: unknown) {
       /**
@@ -278,10 +286,11 @@ export class SessionLeafRecords {
     participantA: Uint8Array,
     participantB: Uint8Array,
     sessionTimestamp: number,
+    sessionSignature: Uint8Array | undefined,
     relayAnchorHex?: string,
   ): void {
     this.persistGenesisPrevRoot(agentName, sessionId, {
-      participantA, participantB, sessionTimestamp,
+      participantA, participantB, sessionTimestamp, sessionSignature,
     } as RelayAssignmentCarry);
     // 069-ORDERPROOF: the anchor is recorded at the same moment and from the same signed
     // assignment, so a session can never hold one without the other.

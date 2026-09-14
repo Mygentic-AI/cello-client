@@ -433,7 +433,7 @@ export class SessionNodeManager {
   clearOfferedDialer(agentName: string, sessionIdHex: string): void { return this.#receivers.clearOfferedDialer(agentName, sessionIdHex); }
   revokeOfferedDialer(agentName: string, sessionIdHex: string, offeredPeerId: string | null): void { return this.#receivers.revokeOfferedDialer(agentName, sessionIdHex, offeredPeerId); }
   /** ─── DELEGATORS — the leaf-record API other files call ─────────────────────────────── */
-recordSessionGenesis(agentName: string, sessionId: string, participantA: Uint8Array, participantB: Uint8Array, sessionTimestamp: number, relayAnchorHex?: string): void { return this.#leafRecords.recordSessionGenesis(agentName, sessionId, participantA, participantB, sessionTimestamp, relayAnchorHex); }
+recordSessionGenesis(agentName: string, sessionId: string, participantA: Uint8Array, participantB: Uint8Array, sessionTimestamp: number, sessionSignature: Uint8Array | undefined, relayAnchorHex?: string): void { return this.#leafRecords.recordSessionGenesis(agentName, sessionId, participantA, participantB, sessionTimestamp, sessionSignature, relayAnchorHex); }
 
   /** 069-ORDERPROOF: the relay key this session's ordering attestations are verified against. */
   sessionRelayAnchor(agentName: string, sessionId: string): string | undefined { return this.#leafRecords.sessionRelayAnchor(agentName, sessionId); }

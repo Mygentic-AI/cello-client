@@ -591,3 +591,26 @@ export function computeGenesisPrevRoot(
       .digest()
   );
 }
+
+/** Domain tag for the anchored chain start, so it can never collide with any other hash in the protocol. */
+const CHAIN_ANCHOR_DOMAIN = Buffer.from("cello/chain-anchor/v1", "utf8");
+
+/**
+ * The first link of a session's hash chain: the genesis prev_root bound to the directory's FROST
+ * signature over the session establishment.
+ *
+ * Without this the opening ceremony was verified and then dropped — the chain began from a value
+ * anyone holding the two keys, the id and the timestamp could compute, so only the seal end was
+ * bookended. Folding the signature in means the chain's first link exists only for a session the
+ * consortium actually established, and the directory re-checks it at seal time.
+ *
+ * The signature cannot go into `computeGenesisPrevRoot` itself: that value is inside the bytes the
+ * signature covers.
+ *
+ * Formula: SHA-256("cello/chain-anchor/v1" || genesis_prev_root(32) || frost_signature(64))
+ */
+export function computeChainAnchor(genesisPrevRoot: Uint8Array, frostSignature: Uint8Array): Uint8Array {
+  if (genesisPrevRoot.length !== 32) throw new Error(`computeChainAnchor: genesis must be 32 bytes, got ${genesisPrevRoot.length}`);
+  if (frostSignature.length !== 64) throw new Error(`computeChainAnchor: signature must be 64 bytes, got ${frostSignature.length}`);
+  return new Uint8Array(createHash("sha256").update(CHAIN_ANCHOR_DOMAIN).update(genesisPrevRoot).update(frostSignature).digest());
+}

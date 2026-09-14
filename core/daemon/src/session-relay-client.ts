@@ -30,7 +30,7 @@
 import { createHash } from "node:crypto";
 import * as lp from "it-length-prefixed";
 import { decode } from "cbor-x";
-import { encodeCbor, decodeSealPayload, encodeStructure1, decodeStructure1, computeGenesisPrevRoot } from "@cello-protocol/protocol-types";
+import { encodeCbor, decodeSealPayload, encodeStructure1, decodeStructure1, computeGenesisPrevRoot, computeChainAnchor } from "@cello-protocol/protocol-types";
 import {
   encodeSessionLivenessQuery,
   decodeSessionLivenessResponse,
@@ -530,6 +530,12 @@ export interface CarriedLeafClaim {
 }
 
 export interface RelayAssignmentCarry {
+  /**
+   * The directory's 64-byte FROST signature over the session establishment. It anchors the chain's
+   * first link (`computeChainAnchor`), so a session without it has no starting point and every
+   * submit on it is refused by name.
+   */
+  sessionSignature?: Uint8Array;
   participantA: Uint8Array;            // 32-byte initiator pubkey
   participantB: Uint8Array;            // 32-byte counterparty pubkey
   sessionTimestamp: number;            // Unix ms
@@ -572,12 +578,15 @@ function genesisFromAssignment(
   sessionIdHex: string,
   assignment: RelayAssignmentCarry | undefined,
 ): Uint8Array | undefined {
-  if (!assignment) return undefined;
-  return computeGenesisPrevRoot(
-    assignment.participantA,
-    assignment.participantB,
-    Uint8Array.from(Buffer.from(sessionIdHex, "hex")),
-    assignment.sessionTimestamp,
+  if (!assignment?.sessionSignature) return undefined;
+  return computeChainAnchor(
+    computeGenesisPrevRoot(
+      assignment.participantA,
+      assignment.participantB,
+      Uint8Array.from(Buffer.from(sessionIdHex, "hex")),
+      assignment.sessionTimestamp,
+    ),
+    assignment.sessionSignature,
   );
 }
 
@@ -962,6 +971,7 @@ export class AgentRelayClient {
       initiator_session_peer_id: a.initiatorSessionPeerId,
       counterparty_session_peer_id: a.counterpartySessionPeerId,
       assignment_signature: a.assignmentSignature,
+      session_signature: a.sessionSignature,
     }) as Uint8Array;
     let resolveRec!: (result: "ok" | "rejected" | "closed") => void;
     const ackPromise = new Promise<"ok" | "rejected" | "closed">((r) => { resolveRec = r; });

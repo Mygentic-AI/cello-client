@@ -407,6 +407,7 @@ export function buildResponderRelayAssignment(parsed: {
   initiatorPeerId: string;
   counterpartySessionPeerId: string | null;
   relayDirectorySignature: Uint8Array | undefined;
+  sessionSignature?: Uint8Array | undefined;
   // 069-ORDERPROOF: `relay_id` off the SAME frame whose FROST signature the responder verified,
   // so it is anchored by that signature rather than taken on the relay's word.
   relayIdHex: string | null;
@@ -420,6 +421,7 @@ export function buildResponderRelayAssignment(parsed: {
     initiatorSessionPeerId: parsed.initiatorPeerId || undefined,
     counterpartySessionPeerId: parsed.counterpartySessionPeerId ?? undefined,
     ...(parsed.relayDirectorySignature ? { assignmentSignature: parsed.relayDirectorySignature } : {}),
+    ...(parsed.sessionSignature ? { sessionSignature: parsed.sessionSignature } : {}),
     // `""` is a VALUE (a direct session names no relay) and must not become an anchor. Only a
     // real 64-hex key is carried; anything else leaves the carry without one, and an attestation
     // arriving on such a session is refused rather than verified against whatever it supplies.
@@ -453,6 +455,8 @@ export function extractInboundSessionAssignment(frame: Record<string, unknown>):
       // True when the field was PRESENT but not a well-formed 64-byte signature — a wire/version
       // bug, reported distinctly from "the directory issued none" (a legacy/direct session).
       relayDirectorySignatureMalformed: boolean;
+      /** The directory's 64-byte FROST signature over the session establishment; the genesis includes it. */
+      sessionSignature: Uint8Array | undefined;
       // 069-ORDERPROOF: the assigned relay's ack-signing pubkey, hex. `null` when the field is
       // absent, not a string, or `""` (a direct session, which names no relay).
       relayIdHex: string | null;
@@ -525,6 +529,8 @@ export function extractInboundSessionAssignment(frame: Record<string, unknown>):
     // has no client-presentable assignment" rather than producing a frame the relay rejects as
     // forged — which would mark the session recordRejected and terminally unwitnessed.
     relayDirectorySignature: toSignature64(a["relay_directory_signature"]),
+    // The opening FROST signature, which the genesis includes.
+    sessionSignature: toSignature64(a["directory_signature"]),
     relayDirectorySignatureMalformed:
       a["relay_directory_signature"] !== undefined && toSignature64(a["relay_directory_signature"]) === undefined,
     relayIdHex: typeof a["relay_id"] === "string" && /^[0-9a-f]{64}$/i.test(a["relay_id"]) ? a["relay_id"] : null,
@@ -952,6 +958,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         Buffer.from(parsed.participantAPubkeyHex, "hex"),
         Buffer.from(parsed.participantBPubkeyHex, "hex"),
         parsed.sessionTimestamp,
+        parsed.sessionSignature,
         // 069-ORDERPROOF: same moment, same verified assignment — see the initiator's copy.
         parsed.relayIdHex ?? undefined,
       );
