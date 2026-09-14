@@ -15,7 +15,11 @@ import { USAGE } from "../cli-args.js";
 describe("§1 — the help is grouped and logically ordered", () => {
   it("renders a section per group, in GROUP_ORDER", () => {
     const table = renderCommandsTable();
-    const positions = GROUP_ORDER.map((g) => table.indexOf(`${g}:`));
+    // A group with no commands (a paused feature) renders no section by design, so only the
+    // populated groups are required to appear.
+    const populated = GROUP_ORDER.filter((g) => COMMANDS.some((c) => c.group === g));
+    expect(populated.length).toBeGreaterThan(0);
+    const positions = populated.map((g) => table.indexOf(`${g}:`));
     for (const p of positions) expect(p).toBeGreaterThanOrEqual(0);
     // Strictly increasing → the sections appear in the declared order.
     expect(positions).toEqual([...positions].sort((a, b) => a - b));
