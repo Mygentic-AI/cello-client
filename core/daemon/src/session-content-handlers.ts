@@ -31,9 +31,15 @@ import { replyLag, type ReplyLag } from "./reply-lag.js";
 
 /** Whether the other side's latest replies were written before they saw this side's newest message. */
 function replyLagFor(snm: { getDb(): import("./sqlcipher-db.js").DaemonDatabase; resolveAgentId(n: string): string }, agentName: string, sessionId: string): ReplyLag | undefined {
-  const db = snm.getDb();
-  const row = db.prepare("SELECT k_local_pubkey FROM agents WHERE agent_id = ?").get(snm.resolveAgentId(agentName)) as { k_local_pubkey: string } | undefined;
-  return row ? replyLag(db, row.k_local_pubkey, sessionId) : undefined;
+  // Runs AFTER the read position moved, so a throw here would lose the messages being handed over.
+  // The warning is optional; the messages are not.
+  try {
+    const db = snm.getDb();
+    const row = db.prepare("SELECT k_local_pubkey FROM agents WHERE agent_id = ?").get(snm.resolveAgentId(agentName)) as { k_local_pubkey: string } | undefined;
+    return row ? replyLag(db, row.k_local_pubkey, sessionId) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**

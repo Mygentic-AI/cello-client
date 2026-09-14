@@ -49,8 +49,9 @@ const ABANDON_NOTICE_DEADLINE_MS = 3_000;
  */
 function sealSubmitCause(reason: string): string {
   if (reason === "counterparty_content_missing") {
-    return "The other side filed a message with the relay that never reached this side, so a close signed now would seal a conversation missing it. " +
-      "Ask them to resend, or wait for it to arrive (cello_receive), then close again. Do not force-abandon: that forfeits the seal.";
+    return "The other side filed a message with the relay that this side does not hold, so a close signed now would seal a conversation missing it. " +
+      "It may still be arriving: wait a moment and close again. If it keeps failing, this side refused or lost that message (check cello_inbox for a refusal), " +
+      "and this conversation cannot be sealed as it stands — closing with { force: true } ends it without a seal.";
   }
   if (reason === "seal_stale") {
     return "The relay holds a message from the other side that this side has not recorded, so a close signed now would seal a conversation missing it. " +
