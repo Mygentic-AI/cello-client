@@ -314,6 +314,20 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
     };
   });
 
+  // The stored seal certificate, as the directory signed it — per-side frontiers, attestation modes,
+  // whether the last message was answered. The seal ANSWER no longer carries it, so journeys and
+  // auditors read it here. IPC only, deliberately not a tool: an operator reads the conversation.
+  handlers.set("seal_certificate", async (params, connectionId) => {
+    const sessionId = params?.["session_id"];
+    if (typeof sessionId !== "string" || !sessionId) return { ok: false, reason: "missing_session_id" };
+    const agentName = resolveCurrentAgent(getConnState(connectionId), params?.agent as string | undefined);
+    if (!agentName) return NO_CURRENT_AGENT_RESPONSE;
+    const cert = sessionNodeManager.getSealCertificate(agentName, sessionId);
+    return cert
+      ? { ok: true, session_id: sessionId, sealed_root: cert.sealed_root, legibility: cert.legibility }
+      : { ok: false, reason: "not_sealed" };
+  });
+
   // DOD-LOG-1 (PERSIST-LOG-001): read the durable, decrypted conversation transcript for a session —
   // the readable sent+received messages in canonical-sequence order, recovered AFTER a daemon restart
   // (not just the opaque hash chain). The plaintext is decrypted from the encrypted-at-rest store here,

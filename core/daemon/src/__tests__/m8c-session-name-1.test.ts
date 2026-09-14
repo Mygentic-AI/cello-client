@@ -152,6 +152,16 @@ describe("DOD-SESSION-NAME-1: naming a session", () => {
     expect(JSON.stringify(res)).not.toMatch(/agreement|assent/i);
   });
 
+  it("the stored certificate stays readable over IPC (not a tool) for journeys and auditors", async () => {
+    const client = await setup();
+    const leg = { attests: "receipt", disclaimer: "d", participants: [{ pubkey: "aa", content_frontier_seq: 2 }], final_message: { answered: true } };
+    handle!.getSessionNodeManager().recordSealCertificate("alice", SID, "de".repeat(32), JSON.stringify(leg));
+    const res = await client.send("seal_certificate", { session_id: SID }) as Record<string, unknown>;
+    expect(res).toEqual({ ok: true, session_id: SID, sealed_root: "de".repeat(32), legibility: leg });
+    const missing = await client.send("seal_certificate", { session_id: "ff".repeat(32) }) as Record<string, unknown>;
+    expect(missing).toMatchObject({ ok: false, reason: "not_sealed" });
+  });
+
   it("AC-A9: a session that is not THIS agent's is session_not_found — ownership is the only scope", async () => {
     const client = await setup();
     const res = await client.send("cello_name_session", { session_id: "ff".repeat(32), session_name: "nope" }) as { ok: boolean; reason?: string };
