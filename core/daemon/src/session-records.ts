@@ -21,7 +21,7 @@ import { MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
 import { type TranscriptEntry, UNREAD_RECEIVED_WHERE, TERMINAL_STATUSES } from "./session-node-types.js";
 import { quarantineRedaction } from "./quarantine-framing.js";
 import { extractErrorMessage } from "./error-message.js";
-import { storeDeliveryAck, sentContentHashExists } from "./session-delivery-acks.js";
+import { storeDeliveryAck, storeGivenDeliveryAck, sentContentHashExists } from "./session-delivery-acks.js";
 
 /** What this module needs from the manager, stated explicitly rather than handed `this`. */
 export interface SessionRecordsContext {
@@ -628,6 +628,24 @@ export class SessionRecords {
     return storeDeliveryAck(this.#db, this.#ctx.logger, {
       agentId: this.#ctx.requireAgentId(agentName),
       agentName, sessionId, contentHashHex, signerPubkeyHex, signature, correlationId,
+    });
+  }
+
+  /** Keep this side's own signed acknowledgement for a received message, for the seal answer. */
+  recordGivenDeliveryAck(
+    agentName: string,
+    sessionId: string,
+    contentHashHex: string,
+    signature: Uint8Array,
+    correlationId?: string,
+  ): void {
+    if (!this.#db) return;
+    const agentId = this.#ctx.requireAgentId(agentName);
+    const signerPubkeyHex = (
+      this.#db.prepare("SELECT k_local_pubkey FROM agents WHERE agent_id = ?").get(agentId) as { k_local_pubkey: string } | undefined
+    )?.k_local_pubkey ?? "";
+    storeGivenDeliveryAck(this.#db, this.#ctx.logger, {
+      agentId, agentName, sessionId, contentHashHex, signerPubkeyHex, signature, correlationId,
     });
   }
 

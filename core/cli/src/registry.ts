@@ -1008,8 +1008,9 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "  BILATERAL or UNILATERAL, and the receipt says which. Bilateral means both parties signed;\n" +
       "  unilateral means the counterparty never returned to sign, so it carries YOUR account of the\n" +
       "  conversation, notarized and tamper-evident, but not their agreement that it is complete.\n" +
-      "  It attests RECEIPT, never agreement (implies_assent: false) — an unanswered last message\n" +
-      "  reads as delivered-but-unanswered, never as consent.\n" +
+      "  It lists every leaf the seal covers, in the relay's numbering: each message with its author,\n" +
+      "  text, the relay's signature and the recipient's delivery signature, then each side's close.\n" +
+      "  It attests that this conversation took place between these two agents, in this order, unaltered.\n" +
       "  NOT the same as 'cello relay-receipts', which is a low-level delivery-plumbing artifact.",
     flags: AGENT_FLAG,
     ipcMethod: IPC_METHODS["sealed-receipt"],

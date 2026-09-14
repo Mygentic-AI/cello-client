@@ -20,7 +20,7 @@ import { renderFrontierMismatch, type FrontierMismatchStore } from "./frontier-m
 import { describeSealFailed, type SealFailure } from "./seal-failure-store.js";
 import { contentEncryptionGuidanceFor } from "./content-encryption-status.js";
 import { frameQuarantinedPayload } from "./quarantine-framing.js";
-import { readDeliveryFacts } from "./session-delivery-acks.js";
+import { readSealedConversation } from "./sealed-conversation.js";
 
 /**
  * DOD-M15-AWAYSCOPE-1: one budget for ALL the attendance probes a list fires, not one each. Set by
@@ -91,67 +91,47 @@ export interface SessionReadDeps {
 }
 
 /**
- * DOD-M15-DELIVERYACK-1 — THREE FACTS PER SENT MESSAGE, AND NOT ONE WORD OF INFERENCE.
+ * The seal answer: the conversation the seal covers, one line per leaf, in the relay's numbering.
  *
- * A receipt that cannot distinguish *"they did not answer"* from *"it never reached them"* is not
- * evidence, which is why these are three SEPARATE facts rather than a status: **ordered** (the relay
- * assigned it a position), **delivered** (the relay handed the bytes over) and **acknowledged** (the
- * recipient's own signature). Each is present or absent on its own.
+ * Each leaf carries the two signatures that prove it — `relay_ack` (the relay numbered it) and, on
+ * messages, `delivery_ack` (the recipient's machine received it). A null signature is an absence
+ * of evidence and nothing more: an acknowledgement can be lost with a connection.
  *
- * 🚨 A MISSING FACT IS REPORTED AS MISSING AND NOTHING MORE. There is no combined status here, no
- * derived verdict, no count of absences, and no wording that reads as fault — because there are
- * many blameless reasons a fact is absent: the relay parked the content and never delivered it, the
- * recipient's daemon died between ordering and pull, their per-recipient queue hit its bound and
- * dropped the oldest frame, the screener refused it, or it was quarantined on arrival. `note` says
- * so in the payload rather than in prose a caller may never surface.
- *
- * 🚨 AND THIS IS NOT ASSENT. An acknowledgement says a machine received bytes, signed on ingest,
- * before any human read them. `legibility.implies_assent` stays the literal `false` and this
- * section adds nothing to it.
- *
- * ⚠️ IT IS NOT PART OF THE DIRECTORY-SIGNED `legibility`, DELIBERATELY. The legibility object's
- * canonical bytes are folded into the FROST-signed seal, and the directory never sees an
- * acknowledgement — putting these there would have the directory signing a per-message claim
- * supplied by one of the two parties, which proves nothing about it. `asserted_by` names who stands
- * behind each fact instead, and the acknowledgement carries the signature itself so a reader can
- * check it against the counterparty's key rather than taking this daemon's word.
+ * The answer states what the seal attests and stays silent on what it does not. It never says the
+ * conversation is or is not an agreement: seals may later be offered as evidence of one.
  */
-function deliverySection(
+function sealedAnswer(
   sessionNodeManager: SessionReadDeps["sessionNodeManager"],
   logger: Logger,
+  resolveWho: SessionReadDeps["resolveWho"],
   agentName: string,
   sessionId: string,
-): { delivery: unknown } {
-  // Read through the manager's own public boundary accessors — the stable agent id and the database
-  // handle — rather than a new delegator. The facts are a pure read over three tables; routing them
-  // through the manager would add surface to a file whose size ratchet exists to stop exactly that.
-  const messages = readDeliveryFacts(
-    sessionNodeManager.getDb(),
-    logger,
-    sessionNodeManager.resolveAgentId(agentName),
-    sessionId,
-  );
+  sealedRoot: string,
+): Record<string, unknown> {
+  const db = sessionNodeManager.getDb();
+  const agentId = sessionNodeManager.resolveAgentId(agentName);
+  const agentPubkey = (
+    db.prepare("SELECT k_local_pubkey FROM agents WHERE agent_id = ?").get(agentId) as { k_local_pubkey: string } | undefined
+  )?.k_local_pubkey ?? "";
+  const texts = new Map<number, string>();
+  for (const m of sessionNodeManager.readTranscript(agentName, sessionId).messages) texts.set(m.sequence, m.text);
+  const conversation = readSealedConversation(db, logger, {
+    agentId, agentPubkey, sessionId, sealedRoot, texts,
+    nameFor: (pk) => (pk === agentPubkey ? agentName : resolveWho(agentName, pk, sessionId).who),
+  });
   return {
-    delivery: {
-      messages,
-      note:
-        "Three independent facts per message you SENT. `ordered` is the relay's countersigned " +
-        "position. `delivered` is the relay confirming it handed the bytes over — this side holds " +
-        "no such evidence for any message today, because a relay answers the recipient on pickup " +
-        "and never tells the depositor, so it reads null throughout. `acknowledged` is the " +
-        "recipient's own signature over this session id and this content hash, which you can check " +
-        "against their public key. A null is an ABSENCE OF EVIDENCE, never a finding: a message " +
-        "with no acknowledgement may well have been delivered and read, and the acknowledgement " +
-        "lost with the connection. Nothing here implies agreement to anything.\n\n" +
-        "`acknowledged` is NOT `legibility.final_message.answered` and neither can stand in for the " +
-        "other. `answered` says the other party AUTHORED something after your last message. " +
-        "`acknowledged` says their MACHINE took delivery of it, signed before any human read it. " +
-        "The combination that carries the most meaning is the one they cannot express separately: " +
-        "answered false AND acknowledged present — it reached them and they did not reply. Neither " +
-        "is agreement.",
-    },
+    session_id: sessionId,
+    sealed: true,
+    sealed_root: sealedRoot,
+    root_matches_my_transcript: conversation.root_matches_my_transcript,
+    leaves: conversation.leaves,
+    closed_by: conversation.closed_by,
+    note: SEAL_NOTE,
   };
 }
+
+/** Settled wording (2026-09-14). Neutral on agreement: seals may later back commercial agreements. */
+const SEAL_NOTE = "Attests that this conversation took place between these two agents, in this order, unaltered.";
 
 export function registerSessionReadHandlers(deps: SessionReadDeps): void {
   const {
@@ -162,14 +142,9 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
       isSealing, getSealFailure,
 } = deps;
 
-  // ─── M7-SESSION-004 (AC-005/AC-006): read the sealed certificate's legibility ───
-  // The cert-read surface: returns the receipt-not-assent certificate for a sealed session —
-  // per-party content frontiers, attestation modes, and whether the final message was answered.
+  // ─── The sealed-receipt read surface ───
   // Reads the PERSISTED record, so it works after a daemon restart and from a DIFFERENT process
-  // than the one that built the certificate (an arbitrator reading the receiving side). The
-  // legibility states, as a first-class machine-readable property, that a signature attests
-  // receipt — never assent (implies_assent: false); a malicious unanswered tail reads as
-  // delivered-but-unanswered (final_message.answered: false), never agreed.
+  // than the one that built the certificate (an arbitrator reading the receiving side).
   handlers.set("cello_get_sealed_receipt", async (params, connectionId) => {
     // cello-mcp forwards this as { session_id } (snake_case, matching the other session tools).
     const sessionId = params?.["session_id"] as string | undefined;
@@ -203,34 +178,13 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
       // (content AND the control leaves the seal itself appends). `content_leaf_count` is the
       // messages, and it is the one comparable to a transcript length — conflating them would make
       // the check drift by the number of ctrl leaves and read as a defect when nothing is wrong.
-      const tree = sessionNodeManager.getSessionTree(agentName, sessionId);
-      const leaves = tree.leaves();
+      // `root_matches_my_transcript` is this side's own check, recomputed from the relay's numbered
+      // leaves and tied to the local transcript — never copied from the certificate, which both
+      // sides read identically and so could not show a certificate over the wrong leaf set.
       return {
         ok: true,
-        session_id: sessionId,
+        ...sealedAnswer(sessionNodeManager, logger, resolveWho, agentName, sessionId, cert.sealed_root),
         session_name: sessionName,
-        sealed_root: cert.sealed_root,
-        /**
-         * DOD-M15-SEALWIRE-1 bullet 8: THIS SIDE'S OWN ROOT, computed from its own leaves — never
-         * copied from the certificate.
-         *
-         * `sealed_root` above is the CERTIFICATE's root. Every spine journey asserted that both
-         * parties' `sealed_root` matched, and that assertion is hollow: both sides read the same
-         * field out of the same certificate, so it stays green **even if the directory certified a
-         * root over a completely different leaf set than the one either party actually holds**. It
-         * proves the two clients received identical bytes, which was never the question.
-         *
-         * The question is whether the certificate covers THIS party's conversation. Only a root
-         * derived locally can answer that, and until now nothing exposed one — so no test could
-         * make the assertion, which is why ten of them made the weaker one instead.
-         *
-         * Read-only and derived: `rootHex()` recomputes from the stored leaves.
-         */
-        local_tree_root: tree.rootHex(),
-        leaf_count: leaves.length,
-        content_leaf_count: leaves.filter((l) => l.kind === "msg").length,
-        legibility: cert.legibility,
-        ...deliverySection(sessionNodeManager, logger, agentName, sessionId),
       };
     }
     // M8C-INBOX-1 (F4): the single `sealed_receipt_not_found` conflated four distinct causes, so a
@@ -261,20 +215,14 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
           const recovered = sessionNodeManager.getSealCertificate(agentName, sessionId);
           if (recovered) {
             const recoveredName = sessionNodeManager.getSessionRecord(agentName, sessionId)?.session_name ?? null;
-            const recoveredLeaves = sessionNodeManager.getSessionTree(agentName, sessionId).leaves();
             logger.info("seal.certificate.recovered_on_read", {
               agentName, sessionId,
               impact: "the seal existed and this side had never been told; the receipt is now local",
             });
             return {
               ok: true,
-              session_id: sessionId,
+              ...sealedAnswer(sessionNodeManager, logger, resolveWho, agentName, sessionId, recovered.sealed_root),
               session_name: recoveredName,
-              sealed_root: recovered.sealed_root,
-              leaf_count: recoveredLeaves.length,
-              content_leaf_count: recoveredLeaves.filter((l) => l.kind === "msg").length,
-              legibility: recovered.legibility,
-              ...deliverySection(sessionNodeManager, logger, agentName, sessionId),
               verified: pulled.verified === true,
               ...(pulled.verified === true
                 ? {}

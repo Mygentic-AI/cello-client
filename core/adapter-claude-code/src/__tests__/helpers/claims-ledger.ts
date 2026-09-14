@@ -869,21 +869,19 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   },
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
-    claim: "sealed-receipt help: unilateral 'carries YOUR account… but not their agreement' / 'attests RECEIPT, never agreement (implies_assent: false)… never as consent.'",
+    claim: "sealed-receipt help: lists every leaf the seal covers / 'attests that this conversation took place between these two agents, in this order, unaltered.'",
     excerpts: [
-      "It attests RECEIPT, never agreement (implies_assent: false)",
-      "reads as delivered-but-unanswered, never as consent.",
+      "It attests that this conversation took place between these two agents, in this order, unaltered.",
+      "It lists every leaf the seal covers, in the relay's numbering: each message with its author,",
     ],
     enforcedBy: "structural",
     verdict: "true",
     evidence:
-      "The strongest disclosure in the CLI and it holds: `implies_assent: false` is a real field, " +
-      "not a turn of phrase, and the unilateral variant is a distinct type " +
-      "(`close-session-handler.ts:379`, `seal-escalation.ts:70`) rather than a flag on the " +
-      "bilateral one — so a caller cannot read a unilateral receipt as bilateral by ignoring a " +
-      "boolean. This matters more than it reads: a receipt that silently implied consent would " +
-      "turn an unanswered message into evidence of agreement, which is the one thing a " +
-      "notarization product must never do.",
+      "The seal answer is built from the relay's countersigned receipt for every position in the " +
+      "session (`sealed-conversation.ts`), both sides' messages and both closes, and " +
+      "`root_matches_my_transcript` recomputes the sealed root from those leaves rather than copying " +
+      "it. The wording is deliberately neutral on agreement (settled 2026-09-14): a seal may later " +
+      "be offered as evidence of one, so the copy states what it attests and nothing more.",
   },
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",

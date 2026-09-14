@@ -123,6 +123,8 @@ export async function sendDeliveryAck(
     });
     return;
   }
+  // Keep our own copy before sending: the seal answer shows it on this side's received messages.
+  ctx.records.recordGivenDeliveryAck(agentName, sessionId, Buffer.from(contentHash).toString("hex"), ackSig, correlationId);
   // Held outside the try so the catch can retire a stream that was opened and then failed to
   // write. Without it every failure leaks the OUTBOUND half of the stream the receiver-side
   // `finally` retires — same defect, other end, other cap. See the note on #handleContentStream.
@@ -470,6 +472,43 @@ export function storeDeliveryAck(
         "agent's database is writable; the acknowledgement cannot be re-requested afterwards.",
     });
     return false;
+  }
+}
+
+/**
+ * Keep a copy of the acknowledgement THIS side signed for a message it received, so the seal
+ * answer can show it. Without it the only copy left with the sender, and a received message read
+ * as unacknowledged from this side forever. A write failure is logged and not fatal: the
+ * acknowledgement still goes out.
+ */
+export function storeGivenDeliveryAck(
+  db: DaemonDatabase,
+  logger: Logger,
+  a: {
+    agentId: string;
+    agentName: string;
+    sessionId: string;
+    contentHashHex: string;
+    signerPubkeyHex: string;
+    signature: Uint8Array;
+    correlationId?: string;
+  },
+): void {
+  try {
+    db.prepare(
+      `INSERT OR IGNORE INTO delivery_acks_given
+         (agent_id, session_id, content_hash_hex, signer_pubkey, signature, recorded_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(a.agentId, a.sessionId, a.contentHashHex, a.signerPubkeyHex, Buffer.from(a.signature), Date.now());
+  } catch (err: unknown) {
+    logger.error("content.delivery.ack.given.record.failed", {
+      agentName: a.agentName, sessionId: a.sessionId, contentHash: a.contentHashHex, correlationId: a.correlationId,
+      reason: extractErrorMessage(err),
+      impact:
+        "the acknowledgement was signed and sent, but this side kept no copy, so its seal answer " +
+        "will show this received message without a delivery signature",
+      guidance: "This is a LOCAL storage fault. Check free disk space and that the agent's database is writable.",
+    });
   }
 }
 

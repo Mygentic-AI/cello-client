@@ -524,6 +524,22 @@ export function ensureSessionSchema(
       PRIMARY KEY (agent_id, session_id, content_hash_hex)
     )
   `);
+  /**
+   * The acknowledgements THIS side signed for messages it received — the other half of the seal
+   * answer's `delivery_ack`. A separate table, not rows in `delivery_acks`: both sides can send
+   * identical bytes, and a shared key on the hash would let our own signature stand in for theirs.
+   */
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS delivery_acks_given (
+      agent_id         TEXT    NOT NULL,
+      session_id       TEXT    NOT NULL,
+      content_hash_hex TEXT    NOT NULL,
+      signer_pubkey    TEXT    NOT NULL,
+      signature        BLOB    NOT NULL,
+      recorded_at      INTEGER NOT NULL,
+      PRIMARY KEY (agent_id, session_id, content_hash_hex)
+    )
+  `);
 
   // M8C-INBOX-1 (N2): per-agent, per-session read watermark. `last_delivered_seq` is the highest
   // RECEIVED transcript sequence the operator has been shown via cello_receive (delivery marks
