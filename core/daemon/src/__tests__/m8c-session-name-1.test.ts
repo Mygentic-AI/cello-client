@@ -135,6 +135,23 @@ describe("DOD-SESSION-NAME-1: naming a session", () => {
     expect(after.sealed_root).toBe(before.sealed_root);
   });
 
+  it("the sealed receipt has the redesigned shape: leaves and the settled note, and none of the removed fields", async () => {
+    const client = await setup();
+    handle!.getSessionNodeManager().recordSealCertificate("alice", SID, "de".repeat(32), JSON.stringify({ implies_assent: false }));
+    await client.send("cello_name_session", { session_id: SID, session_name: "shape check" });
+    const res = await client.send("cello_get_sealed_receipt", { session_id: SID }) as Record<string, unknown>;
+    expect(res).toMatchObject({
+      ok: true, session_id: SID, sealed: true, sealed_root: "de".repeat(32), session_name: "shape check",
+      leaves: [], closed_by: [],
+      note: "Attests that this conversation took place between these two agents, in this order, unaltered.",
+    });
+    expect(typeof res["root_matches_my_transcript"]).toBe("boolean");
+    for (const gone of ["local_tree_root", "leaf_count", "content_leaf_count", "legibility", "delivery"]) {
+      expect(res).not.toHaveProperty(gone);
+    }
+    expect(JSON.stringify(res)).not.toMatch(/agreement|assent/i);
+  });
+
   it("AC-A9: a session that is not THIS agent's is session_not_found — ownership is the only scope", async () => {
     const client = await setup();
     const res = await client.send("cello_name_session", { session_id: "ff".repeat(32), session_name: "nope" }) as { ok: boolean; reason?: string };

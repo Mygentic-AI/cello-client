@@ -112,7 +112,12 @@ function sealedAnswer(
   const agentId = sessionNodeManager.resolveAgentId(agentName);
   const agentPubkey = (
     db.prepare("SELECT k_local_pubkey FROM agents WHERE agent_id = ?").get(agentId) as { k_local_pubkey: string } | undefined
-  )?.k_local_pubkey ?? "";
+  )?.k_local_pubkey;
+  if (!agentPubkey) {
+    // The agent was resolved a step earlier, so a row with no key is a corrupt local database. An
+    // empty key would match no relay record and read as a conversation with nothing numbered.
+    throw new Error(`agent_pubkey_unresolved: agent '${agentName}' has no identity key in this database`);
+  }
   const texts = new Map<number, string>();
   for (const m of sessionNodeManager.readTranscript(agentName, sessionId).messages) texts.set(m.sequence, m.text);
   const conversation = readSealedConversation(db, logger, {
@@ -124,6 +129,7 @@ function sealedAnswer(
     sealed: true,
     sealed_root: sealedRoot,
     root_matches_my_transcript: conversation.root_matches_my_transcript,
+    ...(conversation.root_mismatch_reason ? { root_mismatch_reason: conversation.root_mismatch_reason } : {}),
     leaves: conversation.leaves,
     closed_by: conversation.closed_by,
     note: SEAL_NOTE,
@@ -166,18 +172,9 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
       // hold the id, so the name is free context. It is display only: nothing in the certificate,
       // the sealed root, or the legibility object is derived from it.
       const sessionName = sessionNodeManager.getSessionRecord(agentName, sessionId)?.session_name ?? null;
-      // DOD-FIRSTMSG-WITNESS-1 AC8: say HOW MUCH the certificate covers.
-      //
-      // §7a's defect was a certificate issued over a record short one message — the conversation's
-      // opening message, dropped because its relay submit was rejected and never retried. It was
-      // invisible precisely because the receipt reported no size: seal RATE was unaffected (75% vs
-      // 72%), so every surface said "sealed" while the notarized record was incomplete. Rate was
-      // never the measure; coverage is, and coverage was not reported anywhere.
-      //
-      // Both counts, because they answer different questions. `leaf_count` is the whole sealed tree
-      // (content AND the control leaves the seal itself appends). `content_leaf_count` is the
-      // messages, and it is the one comparable to a transcript length — conflating them would make
-      // the check drift by the number of ctrl leaves and read as a defect when nothing is wrong.
+      // DOD-FIRSTMSG-WITNESS-1 AC8: say HOW MUCH the certificate covers — a certificate once sealed a
+      // record short its opening message and every surface still said "sealed". The leaves list is
+      // the coverage now, and a message the relay never numbered is listed, unnumbered.
       // `root_matches_my_transcript` is this side's own check, recomputed from the relay's numbered
       // leaves and tied to the local transcript — never copied from the certificate, which both
       // sides read identically and so could not show a certificate over the wrong leaf set.

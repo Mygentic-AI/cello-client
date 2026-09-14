@@ -643,7 +643,15 @@ export class SessionRecords {
     const agentId = this.#ctx.requireAgentId(agentName);
     const signerPubkeyHex = (
       this.#db.prepare("SELECT k_local_pubkey FROM agents WHERE agent_id = ?").get(agentId) as { k_local_pubkey: string } | undefined
-    )?.k_local_pubkey ?? "";
+    )?.k_local_pubkey;
+    if (!signerPubkeyHex) {
+      this.#ctx.logger.error("content.delivery.ack.given.record.failed", {
+        agentName, sessionId, contentHash: contentHashHex, correlationId, reason: "agent_pubkey_unresolved",
+        impact: "the acknowledgement went out, but this side kept no copy, so its seal answer shows this message without one",
+        guidance: "This is a LOCAL fault: the agent row carries no identity key. Check cello_status for this agent.",
+      });
+      return;
+    }
     storeGivenDeliveryAck(this.#db, this.#ctx.logger, {
       agentId, agentName, sessionId, contentHashHex, signerPubkeyHex, signature, correlationId,
     });

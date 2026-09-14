@@ -123,8 +123,6 @@ export async function sendDeliveryAck(
     });
     return;
   }
-  // Keep our own copy before sending: the seal answer shows it on this side's received messages.
-  ctx.records.recordGivenDeliveryAck(agentName, sessionId, Buffer.from(contentHash).toString("hex"), ackSig, correlationId);
   // Held outside the try so the catch can retire a stream that was opened and then failed to
   // write. Without it every failure leaks the OUTBOUND half of the stream the receiver-side
   // `finally` retires — same defect, other end, other cap. See the note on #handleContentStream.
@@ -170,6 +168,9 @@ export async function sendDeliveryAck(
     // this log claimed the ACK went out while the sender's TTF fired and parked, and the abort in
     // the catch below (the thing that frees the stream slot) became unreachable.
     await stream.close();
+    // Our own copy, kept only once it went out, so the seal answer never shows an acknowledgement
+    // the sender does not hold. The parked route keeps its copy when the mailbox accepts it.
+    ctx.records.recordGivenDeliveryAck(agentName, sessionId, Buffer.from(contentHash).toString("hex"), ackSig, correlationId);
     // AFTER the close, because that is when it is true. The receiver-side counterpart to the
     // sender's content.delivery.acked: B has acknowledged this content `persisted`, so the sender
     // stops retrying/parking. Emitted for BOTH a normally delivered message AND a terminal-screen
@@ -245,6 +246,7 @@ async function parkDeliveryAck(
     const slotHex = Buffer.from(parkedDeliveryAckMailboxHash(sessionId, contentHash)).toString("hex");
     const attempt = await ctx.park.parkOutOfBand(agentName, sessionId, slotHex, payload);
     if (attempt.outcome === "parked") {
+      ctx.records.recordGivenDeliveryAck(agentName, sessionId, hashHex, ackSig, correlationId);
       ctx.logger.info("content.delivery.ack.parked", {
         agentName, sessionId, contentHash: hashHex, correlationId, why,
         impact:

@@ -15,6 +15,7 @@ import { encodeStructure1 } from "@cello-protocol/protocol-types";
 import { openEncryptedDatabase, type DaemonDatabase } from "../sqlcipher-db.js";
 import { ensureSessionSchema } from "../session-schema.js";
 import { RelayReceiptStore } from "../relay-receipt-store.js";
+import { SessionSealLeafStore } from "../session-seal-leaf-store.js";
 import { SessionTree } from "../session-tree.js";
 import { readSealedConversation } from "../sealed-conversation.js";
 import { storeDeliveryAck, storeGivenDeliveryAck } from "../session-delivery-acks.js";
@@ -32,12 +33,15 @@ function h(label: string): string {
 
 let dir: string;
 let db: DaemonDatabase;
+let receipts: RelayReceiptStore;
+let sealLeaves: SessionSealLeafStore;
 
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "sealed-conv-"));
   db = openEncryptedDatabase(join(dir, "s.db"), randomBytes(32));
   ensureSessionSchema(db, logger, () => {});
-  new RelayReceiptStore(db, logger);
+  receipts = new RelayReceiptStore(db, logger);
+  sealLeaves = new SessionSealLeafStore(db, logger);
 });
 afterEach(async () => {
   db.close();
@@ -56,12 +60,21 @@ function s1(hashHex: string, senderHex: string): Uint8Array {
   });
 }
 
-function receipt(seq: number, hashHex: string, sender: string, kind: number | null): void {
-  db.prepare(
-    `INSERT INTO relay_ack_receipts (agent_pubkey, session_id, sequence_number, hash_hex, relay_id,
-       relay_pubkey_hex, relay_timestamp, signature_hex, stored_at, structure1_cbor, leaf_kind)
-     VALUES (?, ?, ?, ?, 'relay-1', 'ee', ?, ?, 0, ?, ?)`,
-  ).run(A, SID, seq, hashHex, 1_789_000_000_000 + seq * 1000, `relaysig${seq}`, Buffer.from(s1(hashHex, sender)), kind);
+/**
+ * Written the way production writes them: the receipt row exactly as `evaluateRelayAck` builds it
+ * (no Structure 1, no leaf kind), and the signed leaf through `SessionSealLeafStore`. An earlier
+ * version put the author on the receipt row, which production never does, so it passed while every
+ * author in the real answer was null.
+ */
+function receipt(seq: number, hashHex: string, sender: string, kind: 0 | 2): void {
+  receipts.store({
+    hashHex, agentPubkeyHex: A, sessionIdHex: SID, relayId: "ee".repeat(32), relayPubkeyHex: "ee".repeat(32),
+    sequenceNumber: seq, timestamp: 1_789_000_000_000 + seq * 1000, signatureHex: `relaysig${seq}`, runningRootHex: "00".repeat(32),
+  }, 0);
+  sealLeaves.store(A, SID, {
+    sequenceNumber: seq, leafKind: kind, senderPubkeyHex: sender,
+    structure2Cbor: new Uint8Array([1]), structure1Cbor: s1(hashHex, sender),
+  }, 0);
 }
 
 function message(index: number, direction: "sent" | "received", hashHex: string, text: string): void {
@@ -100,10 +113,10 @@ describe("readSealedConversation", () => {
     const m1 = h("hello"), m2 = h("hi back"), c1 = h("close-b"), c2 = h("close-a");
     message(0, "sent", m1, "hello");
     message(1, "received", m2, "hi back");
-    receipt(1, m1, A, null);
-    receipt(2, m2, B, null);
+    receipt(1, m1, A, 0);
+    receipt(2, m2, B, 0);
     receipt(3, c1, B, 2);
-    receipt(4, c2, A, null); // leaf_kind unset on some receipts in the field
+    receipt(4, c2, A, 2);
     storeDeliveryAck(db, logger, { agentId: AGENT_ID, agentName: "Alice", sessionId: SID, contentHashHex: m1, signerPubkeyHex: B, signature: Buffer.from("bobsig") });
     storeGivenDeliveryAck(db, logger, { agentId: AGENT_ID, agentName: "Alice", sessionId: SID, contentHashHex: m2, signerPubkeyHex: A, signature: Buffer.from("alicesig") });
 
@@ -116,7 +129,8 @@ describe("readSealedConversation", () => {
       [4, "close", "Alice"],
     ]);
     expect(out.leaves[0]).toMatchObject({ text: "hello", content_hash: m1, relay_ack: "relaysig1", delivery_ack: Buffer.from("bobsig").toString("hex") });
-    expect(out.leaves[1]).toMatchObject({ text: "hi back", delivery_ack: Buffer.from("alicesig").toString("hex") });
+    expect(out.leaves[1]).toMatchObject({ text: "hi back", from_pubkey: B, delivery_ack: Buffer.from("alicesig").toString("hex") });
+    expect(out.leaves[2]).toMatchObject({ from_pubkey: B });
     expect(out.leaves[2]).not.toHaveProperty("text");
     expect(out.leaves[2]).not.toHaveProperty("delivery_ack");
     expect(out.leaves[0].at).toBe(new Date(1_789_000_001_000).toISOString());
@@ -128,8 +142,8 @@ describe("readSealedConversation", () => {
     const ok = h("ok"), c1 = h("c1"), c2 = h("c2");
     message(0, "sent", ok, "ok");
     message(1, "received", ok, "ok");
-    receipt(1, ok, A, null);
-    receipt(2, ok, B, null);
+    receipt(1, ok, A, 0);
+    receipt(2, ok, B, 0);
     receipt(3, c1, A, 2);
     receipt(4, c2, B, 2);
     const out = read(rootOf([ok, ok, c1, c2]));
@@ -142,18 +156,21 @@ describe("readSealedConversation", () => {
   it("reports a root mismatch when the certificate does not cover this record", () => {
     const m1 = h("x"), c1 = h("c1");
     message(0, "sent", m1, "x");
-    receipt(1, m1, A, null);
+    receipt(1, m1, A, 0);
     receipt(2, c1, A, 2);
-    expect(read(h("some other root")).root_matches_my_transcript).toBe(false);
+    const out = read(h("some other root"));
+    expect(out.root_matches_my_transcript).toBe(false);
+    expect(out.root_mismatch_reason).toBe("root_differs");
   });
 
   it("keeps a message the relay never numbered, unnumbered and last, and says the root does not match", () => {
     const m1 = h("one"), m2 = h("lost"), c1 = h("c1");
     message(0, "sent", m1, "one");
     message(1, "sent", m2, "lost");
-    receipt(1, m1, A, null);
+    receipt(1, m1, A, 0);
     receipt(2, c1, A, 2);
     const out = read(rootOf([m1, c1]));
+    expect(out.root_mismatch_reason).toBe("unnumbered_messages");
     expect(out.leaves.map((l) => [l.seq, l.kind, l.text])).toEqual([
       [1, "message", "one"], [2, "close", undefined], [null, "message", "lost"],
     ]);

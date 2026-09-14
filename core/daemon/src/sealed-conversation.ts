@@ -1,12 +1,15 @@
 /**
  * The seal answer's conversation — every leaf the seal covers, in the relay's numbering.
  *
- * The relay countersigns every leaf in a session, both sides' messages and both closes, and this
- * daemon keeps that countersignature for each one. So the relay's receipts are the spine: one row
- * per numbered position. The transcript supplies the text, and the two acknowledgement tables
- * supply the delivery signature for each message, whichever side sent it.
+ * Three stores, each supplying what only it holds:
+ *   - `relay_ack_receipts`: the relay's countersignature for every numbered position, both sides'
+ *     leaves and both closes. This is the spine: one row per position.
+ *   - `session_seal_leaves`: the signed Structure 1 and leaf kind at each position — the AUTHOR.
+ *     Receipts never carry these, so the author must come from here.
+ *   - the transcript and the two acknowledgement tables: text, and the delivery signature for each
+ *     message, whichever side sent it.
  *
- * Matching a receipt to a message is done IN ORDER, never by hash alone: both sides can send
+ * Matching a position to a message is done IN ORDER, never by hash alone: both sides can send
  * identical bytes ("ok"), and a hash lookup would hand one side's message to the other.
  */
 import { decodeStructure1 } from "@cello-protocol/protocol-types";
@@ -23,8 +26,8 @@ export interface SealedLeaf {
   kind: "message" | "close";
   from: string | null;
   from_pubkey: string | null;
-  /** Messages only. */
-  text?: string;
+  /** Messages only. Null when this side holds no text for it. */
+  text?: string | null;
   content_hash: string;
   /** When the relay numbered it (ISO 8601), the one independent time in the record. */
   at: string | null;
@@ -34,10 +37,13 @@ export interface SealedLeaf {
   delivery_ack?: string | null;
 }
 
+export type RootMismatchReason = "unnumbered_messages" | "sequence_gap" | "no_relay_record" | "root_differs";
+
 export interface SealedConversation {
   leaves: SealedLeaf[];
   closed_by: string[];
   root_matches_my_transcript: boolean;
+  root_mismatch_reason?: RootMismatchReason;
 }
 
 export function readSealedConversation(
@@ -64,42 +70,50 @@ export function readSealedConversation(
     )
     .all(a.agentId, a.sessionId) as Array<{ idx: number; hash: string; direction: string }>;
 
-  const relayTablePresent =
-    db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'relay_ack_receipts'").get() !== undefined;
-  const receipts = relayTablePresent
+  // The two relay stores are created by their own classes the first time a session goes through a
+  // relay, not by the session schema, so on a daemon that has never used one they do not exist yet.
+  // That is the same fact as holding no relay record, not a degraded read.
+  const receipts = tableExists(db, "relay_ack_receipts")
     ? (db
         .prepare(
-          `SELECT sequence_number AS seq, hash_hex AS hash, relay_timestamp AS ts, signature_hex AS sig,
-                  structure1_cbor AS s1, leaf_kind AS kind
+          `SELECT sequence_number AS seq, hash_hex AS hash, relay_timestamp AS ts, signature_hex AS sig
              FROM relay_ack_receipts WHERE agent_pubkey = ? AND session_id = ?
             ORDER BY sequence_number ASC`,
         )
-        .all(a.agentPubkey, a.sessionId) as Array<{ seq: number; hash: string; ts: number; sig: string; s1: Uint8Array | null; kind: number | null }>)
+        .all(a.agentPubkey, a.sessionId) as Array<{ seq: number; hash: string; ts: number; sig: string }>)
     : [];
+  const signed = new Map<number, { author: string | null; kind: number }>();
+  if (tableExists(db, "session_seal_leaves")) {
+    for (const r of db
+      .prepare(
+        `SELECT sequence_number AS seq, leaf_kind AS kind, structure1_cbor AS s1
+           FROM session_seal_leaves WHERE agent_pubkey = ? AND session_id = ?`,
+      )
+      .all(a.agentPubkey, a.sessionId) as Array<{ seq: number; kind: number; s1: Uint8Array }>) {
+      // The author is read from the bytes they signed, not from the stored sender column.
+      const d = decodeStructure1(r.s1 instanceof Uint8Array ? r.s1 : new Uint8Array(r.s1));
+      signed.set(r.seq, { author: d.ok ? Buffer.from(d.fields.senderPubkey).toString("hex") : null, kind: r.kind });
+    }
+  }
 
   const acksReceived = ackMap(db, "delivery_acks", a.agentId, a.sessionId);
   const acksGiven = ackMap(db, "delivery_acks_given", a.agentId, a.sessionId);
 
-  const authorOf = (s1: Uint8Array | null): string | null => {
-    if (!s1) return null;
-    const d = decodeStructure1(s1 instanceof Uint8Array ? s1 : new Uint8Array(s1));
-    return d.ok ? Buffer.from(d.fields.senderPubkey).toString("hex") : null;
-  };
   const messageLeaf = (
     m: { idx: number; hash: string; direction: string },
-    seq: number | null, at: number | null, relaySig: string | null, s1Author: string | null,
+    r: { seq: number; ts: number; sig: string } | null,
   ): SealedLeaf => {
     const received = m.direction !== "sent";
-    const pubkey = s1Author ?? (received ? null : a.agentPubkey);
+    const pubkey = (r ? signed.get(r.seq)?.author : null) ?? (received ? null : a.agentPubkey);
     return {
-      seq,
+      seq: r?.seq ?? null,
       kind: "message",
       from: pubkey ? a.nameFor(pubkey) : null,
       from_pubkey: pubkey,
-      text: a.texts.get(m.idx) ?? "",
+      text: a.texts.get(m.idx) ?? null,
       content_hash: m.hash,
-      at: at === null ? null : new Date(at).toISOString(),
-      relay_ack: relaySig,
+      at: r ? new Date(r.ts).toISOString() : null,
+      relay_ack: r?.sig ?? null,
       delivery_ack: (received ? acksGiven : acksReceived).get(m.hash) ?? null,
     };
   };
@@ -108,19 +122,20 @@ export function readSealedConversation(
   const unnumbered: SealedLeaf[] = [];
   let next = 0;
   for (const r of receipts) {
-    const author = authorOf(r.s1);
+    const s = signed.get(r.seq);
     let matched = -1;
-    if (r.kind !== LEAF_KIND_CTRL) {
+    if (s?.kind !== LEAF_KIND_CTRL) {
       for (let i = next; i < messages.length; i++) {
         if (messages[i]!.hash === r.hash) { matched = i; break; }
       }
     }
     if (matched >= 0) {
       // Any message passed over here was never numbered by the relay.
-      for (let i = next; i < matched; i++) unnumbered.push(messageLeaf(messages[i]!, null, null, null, null));
-      leaves.push(messageLeaf(messages[matched]!, r.seq, r.ts, r.sig, author));
+      for (let i = next; i < matched; i++) unnumbered.push(messageLeaf(messages[i]!, null));
+      leaves.push(messageLeaf(messages[matched]!, r));
       next = matched + 1;
     } else {
+      const author = s?.author ?? null;
       leaves.push({
         seq: r.seq,
         kind: "close",
@@ -132,17 +147,25 @@ export function readSealedConversation(
       });
     }
   }
-  for (let i = next; i < messages.length; i++) unnumbered.push(messageLeaf(messages[i]!, null, null, null, null));
+  for (let i = next; i < messages.length; i++) unnumbered.push(messageLeaf(messages[i]!, null));
 
   const tree = SessionTree.empty();
   for (const r of receipts) tree.appendLeafHash("msg", r.hash);
-  const contiguous = receipts.every((r, i) => r.seq === i + 1);
-  const rootMatches = unnumbered.length === 0 && contiguous && tree.rootHex() === a.sealedRoot;
-  if (!rootMatches) {
+  const computedRoot = tree.rootHex();
+  const reason: RootMismatchReason | undefined =
+    receipts.length === 0 ? "no_relay_record"
+    : unnumbered.length > 0 ? "unnumbered_messages"
+    : !receipts.every((r, i) => r.seq === i + 1) ? "sequence_gap"
+    : computedRoot !== a.sealedRoot ? "root_differs"
+    : undefined;
+  if (reason) {
     logger.warn("session.sealed_conversation.root_mismatch", {
       sessionId: a.sessionId,
+      reason,
+      receiptCount: receipts.length,
       unnumberedMessages: unnumbered.length,
-      contiguous,
+      computedRoot,
+      sealedRoot: a.sealedRoot,
       impact: "the seal answer reports that the sealed root does not match this side's record of the conversation",
     });
   }
@@ -150,14 +173,18 @@ export function readSealedConversation(
   return {
     leaves: [...leaves, ...unnumbered],
     closed_by: leaves.filter((l) => l.kind === "close").map((l) => l.from ?? "unknown"),
-    root_matches_my_transcript: rootMatches,
+    root_matches_my_transcript: reason === undefined,
+    ...(reason ? { root_mismatch_reason: reason } : {}),
   };
 }
 
+function tableExists(db: DaemonDatabase, name: string): boolean {
+  return db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== undefined;
+}
+
+/** Both acknowledgement tables are created by the session schema, so a missing one throws. */
 function ackMap(db: DaemonDatabase, table: "delivery_acks" | "delivery_acks_given", agentId: string, sessionId: string): Map<string, string> {
-  const present = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) !== undefined;
   const out = new Map<string, string>();
-  if (!present) return out;
   for (const r of db
     .prepare(`SELECT content_hash_hex AS hash, signature AS sig FROM ${table} WHERE agent_id = ? AND session_id = ?`)
     .all(agentId, sessionId) as Array<{ hash: string; sig: Uint8Array }>) {

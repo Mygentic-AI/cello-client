@@ -234,6 +234,14 @@ describe("DELIVERYACK/producer: an acknowledgement with nowhere to go goes to th
       }).ok,
       "the acknowledgement in the mailbox does not verify against this agent's own key",
     ).toBe(true);
+
+    // This side keeps the SAME signature it sent, so its seal answer can show it.
+    const kept = a.mgr.getDb().prepare(
+      "SELECT signer_pubkey, signature FROM delivery_acks_given WHERE session_id = ? AND content_hash_hex = ?",
+    ).get(SID, Buffer.from(a.contentHash).toString("hex")) as { signer_pubkey: string; signature: Uint8Array } | undefined;
+    expect(kept, "no copy of the sent acknowledgement was kept").toBeDefined();
+    expect(kept!.signer_pubkey).toBe(a.alicePubHex);
+    expect(Buffer.from(kept!.signature).equals(Buffer.from(parked!.ackSig))).toBe(true);
   });
 
   it("★★ it goes through the SAME park hook content does — so it is signed and sealed by the same code", async () => {
