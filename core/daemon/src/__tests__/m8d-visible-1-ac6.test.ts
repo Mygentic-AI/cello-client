@@ -55,7 +55,8 @@ describe("DOD-COATTEND-VISIBLE-1 AC6: the READ surfaces say whether this session
     const connB = await fx.connectAs("alice");
 
     const quiet = (await connA.send("cello_receive", { session_id: SID, timeout_ms: 300 })) as Record<string, unknown>;
-    expect(quiet.content).toBeNull();
+    expect(quiet).toMatchObject({ count: 0, messages: [] });
+    expect(quiet).not.toHaveProperty("content");
     expect(quiet.attendance, "an empty read must still say whether you are alone").toBe(2);
     void connB;
   });

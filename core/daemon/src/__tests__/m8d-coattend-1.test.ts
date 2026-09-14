@@ -53,8 +53,8 @@ describe("DOD-COATTEND-1: two attached sessions share ONE bookmark — the first
 
     // One bookmark per (agent, session): B is the same agent, so the message is already read.
     const b = (await connB.send("cello_receive", { session_id: SID, timeout_ms: 300 })) as Record<string, unknown>;
-    expect(b.messages).toBeUndefined();
-    expect(b.content).toBeNull();
+    expect(b).toMatchObject({ count: 0, messages: [] });
+    expect(b).not.toHaveProperty("content");
 
     // Reading did not duplicate the record.
     expect(fx.snm.getSessionTree("alice", SID).size(), "delivery must not append").toBe(1);

@@ -2,7 +2,7 @@
  * DOD-COATTEND-VISIBLE-1 — make the theft VISIBLE (M8D Tier 0, the launch gate).
  *
  * Two sessions attend one agent. A message arrives. One session gets it; the other is told
- * `{ ok: true, content: null, guidance: "No content arrived within timeout_ms…" }` — word for word
+ * `{ ok: true, count: 0, messages: [], guidance: "No content arrived within timeout_ms…" }` — word for word
  * what a QUIET COUNTERPARTY produces — and the plain blocking receive writes nothing to the log on
  * either outcome, so the theft leaves no trace anywhere.
  *
@@ -49,7 +49,7 @@ describe("DOD-COATTEND-VISIBLE-1: two sessions on one agent — the loser is tol
     await fx.connectAs("alice"); // attended by two, but NOTHING ever arrives
 
     const quiet = (await connA.send("cello_receive", { session_id: SID, timeout_ms: 100 })) as Record<string, unknown>;
-    expect(quiet).toMatchObject({ ok: true, content: null });
+    expect(quiet).toMatchObject({ ok: true, count: 0, messages: [] });
     // No theft happened, so no theft is claimed. Without this, C1 is satisfied by labelling every
     // empty receive a theft — which tells the operator nothing and is worse than the silence.
     expect(quiet.reason).toBeUndefined();
@@ -160,8 +160,7 @@ describe("DOD-COATTEND-VISIBLE-1: two sessions on one agent — the loser is tol
     const b = (await connB.send("cello_receive", { session_id: SID, timeout_ms: 300 })) as Record<string, unknown>;
 
     expect((a.messages as Array<{ content: string }>).map((m) => m.content)).toEqual(["from bob"]);
-    expect(b.messages).toBeUndefined();
-    expect(b).toMatchObject({ ok: true, content: null });
+    expect(b).toMatchObject({ ok: true, count: 0, messages: [] });
     expect(a.reason).toBeUndefined();
     expect(b.reason).toBeUndefined();
     expect(fx.eventsNamed("session.receive.delivered")).toHaveLength(1);
@@ -196,7 +195,8 @@ describe("DOD-COATTEND-VISIBLE-1: two sessions on one agent — the loser is tol
 
     // ...and the empty exit, which after C3's deletion had no test at all.
     const quiet = (await conn.send("cello_receive", { session_id: SID, timeout_ms: 300 })) as Record<string, unknown>;
-    expect(quiet.content).toBeNull();
+    expect(quiet).toMatchObject({ count: 0, messages: [] });
+    expect(quiet).not.toHaveProperty("content");
     const empty = fx.eventsNamed("session.receive.empty");
     expect(empty.length).toBeGreaterThanOrEqual(1);
     expect(empty[0].ctx).toMatchObject({ sessionId: SID, agentName: "alice" });

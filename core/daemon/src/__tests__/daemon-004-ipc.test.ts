@@ -774,7 +774,8 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
       await client.send("cello_use_agent", { name: "alice" });
       const res = await client.send("cello_receive", { session_id: SID, timeout_ms: 60 }) as Record<string, unknown>;
       expect(res.ok).toBe(true);
-      expect(res.content).toBeNull();
+      expect(res).toMatchObject({ count: 0, messages: [] });
+      expect(res).not.toHaveProperty("content");
     } finally { client.close(); }
   });
 

@@ -445,7 +445,8 @@ describe("M8B F16: counterparty-gone surfaces on cello_receive and cello_status"
     try {
       const recv = (await clientA.send("cello_receive", { session_id: SID_HEX, timeout_ms: 200 })) as Record<string, unknown>;
       expect(recv.ok).toBe(true);
-      expect(recv.content).toBeNull();
+      expect(recv).toMatchObject({ count: 0, messages: [] });
+      expect(recv).not.toHaveProperty("content");
       expect(recv.reason).toBeUndefined();
 
       const status = (await clientA.send("status", {})) as Record<string, unknown>;

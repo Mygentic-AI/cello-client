@@ -64,7 +64,7 @@ Keep a long-timeout receive open. When a message arrives, reply and loop.
 loop:
   cello_receive({ cello_session_id, timeout_ms: 60000 })
   → { messages: [{ content: "..." }, ...] }  → read them all, reply with cello_send, loop
-  → { content: null }                        → nothing arrived yet, loop
+  → { count: 0, messages: [] }               → nothing arrived yet, loop
 ```
 
 **Read before you write.** If the other side has spoken and you have not read it, `cello_send` is REFUSED with `session_not_current` and tells you how many messages are waiting. Read them (`cello_receive`, or `cello_transcript` for the whole conversation), then send again. You cannot reply to something you never saw.

@@ -1297,7 +1297,8 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
           });
           return {
             ok: true,
-            content: null,
+            count: 0,
+            messages: [],
             reason: "content_undeliverable",
             attendance: attendingNow(agentName),
             // A local write failure and a refused message look identical from the operator's chair —
@@ -1319,7 +1320,8 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
           });
           return {
             ok: true,
-            content: null,
+            count: 0,
+            messages: [],
             attendance: attendingNow(agentName),
             // DOD-M15-NO-SILENT-REFUSAL-1 — the exit that does not merely stay silent, it MISLEADS.
             // A version-skewed peer never gets an ACK, so it eventually drops the direct path and
@@ -1382,7 +1384,8 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
             : "";
           return {
             ok: true,
-            content: null,
+            count: 0,
+            messages: [],
             attendance: attendingNow(agentName),
             reason: "delivery_impaired",
             liveness: "impaired",
@@ -1415,7 +1418,9 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         const quietRefusals = refusalsField(sessionNodeManager, agentName, sessionId, connectionId);
         return {
           ok: true,
-          content: null,
+          // The same shape as a read that found messages, so a caller reads `messages` either way.
+          count: 0,
+          messages: [],
           attendance: attendingNow(agentName),
           ...quietRefusals,
           // ONE source for the refusal advice (see `refusalsField`). It used to be written out
