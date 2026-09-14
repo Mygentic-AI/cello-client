@@ -236,3 +236,23 @@ export async function makeSignedAssignmentFrame(
     },
   };
 }
+
+/**
+ * The genesis includes the session's FROST signature, so both sides of a fixture session must hold
+ * the same one. A stub negotiator hands the initiator an assignment before the responder's signed
+ * frame exists; this gives the initiator the signature that frame actually carries.
+ */
+export function alignInitiatorGenesis(
+  initiatorManager: { recordSessionGenesis(a: string, s: string, pa: Uint8Array, pb: Uint8Array, ts: number, sig: Uint8Array | undefined): void },
+  frame: { assignment: { directory_signature: Uint8Array } },
+  alicePubkeyHex: string,
+  bobPubkeyHex: string,
+  sessionIdHex: string,
+  sessionTimestamp: number,
+): void {
+  initiatorManager.recordSessionGenesis(
+    "alice", sessionIdHex,
+    Uint8Array.from(Buffer.from(alicePubkeyHex, "hex")), Uint8Array.from(Buffer.from(bobPubkeyHex, "hex")),
+    sessionTimestamp, frame.assignment.directory_signature,
+  );
+}

@@ -278,6 +278,7 @@ describe("AgentRelayClient: client_record_assignment (FED-OPTIONB-SETUP-001)", (
     participantB: new Uint8Array(32).fill(0xb2),
     sessionTimestamp: 1_750_000_000_000,
     assignmentSignature: new Uint8Array(64).fill(0xc3),
+    sessionSignature: new Uint8Array(64).fill(0xd4),
     relayPubkeyHex: await fakeRelayPubkeyHex(),
   });
 
@@ -373,6 +374,7 @@ describe("AgentRelayClient: session_not_found is transient, not terminal (DOD-FI
     participantB: new Uint8Array(32).fill(0xb2),
     sessionTimestamp: 1_750_000_000_000,
     assignmentSignature: new Uint8Array(64).fill(0xc3),
+    sessionSignature: new Uint8Array(64).fill(0xd4),
     relayPubkeyHex: await fakeRelayPubkeyHex(),
   });
 

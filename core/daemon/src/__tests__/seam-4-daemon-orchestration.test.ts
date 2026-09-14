@@ -39,7 +39,7 @@ import { createNode } from "@cello-protocol/transport";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
-import { makeSignedAssignmentFrame, registerFixtureSigner } from "./helpers/signed-assignment.js";
+import { makeSignedAssignmentFrame, registerFixtureSigner, alignInitiatorGenesis } from "./helpers/signed-assignment.js";
 import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { SessionNegotiator } from "../transport-selector.js";
@@ -233,6 +233,9 @@ describe("Seam 4: full daemon-IPC two-daemon local orchestration", () => {
         counterpartySessionPeerId: "bob-session-peer-id",
         sessionTimestamp: TS,
       });
+      // The genesis includes the session's FROST signature, so both sides must hold the same one:
+      // alice's stub negotiator could not know the signature this frame carries, so give it to her.
+      alignInitiatorGenesis(A.getSessionNodeManager(), assignmentFrame, alicePubkey, bobPubkey, SID_HEX, TS);
       injectB.inject!(assignmentFrame);
 
       // ── B discovers the session via the blocked await (proves seam-2 acceptSession ran).
