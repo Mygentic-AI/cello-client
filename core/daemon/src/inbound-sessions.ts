@@ -1002,7 +1002,8 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       );
       const genesisPrevRootHex = parsed.sessionSignature
         ? Buffer.from(computeChainAnchor(bareGenesis, parsed.sessionSignature)).toString("hex")
-        : null;
+        // No signature means the session has no chain start at all; show none rather than a value it never uses.
+        : "";
 
       logger.info("session.inbound.accepted", {
         sessionId: parsed.sessionIdHex,

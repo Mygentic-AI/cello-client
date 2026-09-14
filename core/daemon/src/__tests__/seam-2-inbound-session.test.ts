@@ -35,7 +35,7 @@ import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { FileKeyProvider } from "@cello-protocol/crypto";
-import { computeGenesisPrevRoot } from "@cello-protocol/protocol-types";
+import { computeGenesisPrevRoot, computeChainAnchor } from "@cello-protocol/protocol-types";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
@@ -228,10 +228,12 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     return frame;
   }
 
-  function expectedGenesisHex(initiatorHex: string, counterpartyHex: string, sid: Uint8Array, ts: number): string {
-    return Buffer.from(
+  /** The chain start the session uses: the genesis including the assignment's FROST signature. */
+  function expectedGenesisHex(initiatorHex: string, counterpartyHex: string, sid: Uint8Array, ts: number, sig: Uint8Array): string {
+    return Buffer.from(computeChainAnchor(
       computeGenesisPrevRoot(Buffer.from(initiatorHex, "hex"), Buffer.from(counterpartyHex, "hex"), sid, ts),
-    ).toString("hex");
+      sig,
+    )).toString("hex");
   }
 
   it("turns a pushed session_assignment into an active inbound session that cello_await_session returns", async () => {
@@ -249,11 +251,13 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     await snm.ensureStandingReceiverForAgent("bob");
     const initiatorPubkey = fixtureIdentity().pubkeyHex;
 
-    injectRef.inject!(await signedAssignmentFrame({
+    const pushed = await signedAssignmentFrame({
       initiatorPubkeyHex: initiatorPubkey,
       counterpartyPubkeyHex: bobPubkey,
       initiatorPeerId: "alice-session-peer-id",
-    }));
+    });
+    const sessionSignature = (pushed["assignment"] as { directory_signature: Uint8Array }).directory_signature;
+    injectRef.inject!(pushed);
     await wait(120); // async inbound handler (accept may wait on standing receiver)
 
     // (1) Session-core observable: bob now has an ACTIVE session row bound to alice.
@@ -296,7 +300,7 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
       expect(res.type).toBe("new_session");
       expect(res.session_id).toBe(SID_HEX);
       expect(res.counterparty_pubkey).toBe(initiatorPubkey);
-      expect(res.genesis_prev_root).toBe(expectedGenesisHex(initiatorPubkey, bobPubkey, SID_BYTES, TS));
+      expect(res.genesis_prev_root).toBe(expectedGenesisHex(initiatorPubkey, bobPubkey, SID_BYTES, TS, sessionSignature));
     } finally { client.close(); }
   });
 
