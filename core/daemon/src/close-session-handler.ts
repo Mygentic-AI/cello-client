@@ -48,6 +48,10 @@ const ABANDON_NOTICE_DEADLINE_MS = 3_000;
  * failed the same way: the relay was refusing because it holds a message this side never recorded.
  */
 function sealSubmitCause(reason: string): string {
+  if (reason === "counterparty_content_missing") {
+    return "The other side filed a message with the relay that never reached this side, so a close signed now would seal a conversation missing it. " +
+      "Ask them to resend, or wait for it to arrive (cello_receive), then close again. Do not force-abandon: that forfeits the seal.";
+  }
   if (reason === "seal_stale") {
     return "The relay holds a message from the other side that this side has not recorded, so a close signed now would seal a conversation missing it. " +
       "If they are still sending, wait for the message to arrive (cello_receive) and close again. " +
