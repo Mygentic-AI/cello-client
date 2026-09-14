@@ -13,7 +13,7 @@
  *  1. `main` has moved. Remeasured 2026-09-12: 87 registered, 14 of them `cello_doc_*`, so 73 off.
  *  2. **Every daemon in this file starts with `CELLO_ENV=test`, which registers 13 verbs from
  *     `test-handlers.ts` that an operator's socket never answers.** So neither 87 nor 73 is what an
- *     operator sees; the production surface is 74 on and 60 off.
+ *     operator sees; the production surface is 75 on and 61 off.
  *
  * Pinning a clause to a test-env total is how a magic number gets "fixed" by editing it the next time
  * an unrelated verb is added. So the counts asserted below EXCLUDE the test-only verbs, and the three
@@ -156,10 +156,10 @@ describe("074-DOCSFLAG clauses 2/5/6/9 — the daemon's three document surfaces,
 
   // ── Clause 2: the IPC verb count, and no doc verb among them ────────────────────────────────
 
-  it("OFF: the operator's socket answers 60 verbs, exactly 14 fewer than ON, and no doc verb", async () => {
+  it("OFF: the operator's socket answers 61 verbs, exactly 14 fewer than ON, and no doc verb", async () => {
     const off = await start("off");
     const offKeys = productionVerbs(off);
-    expect(offKeys).toHaveLength(60);
+    expect(offKeys).toHaveLength(61);
     expect(offKeys.filter((k) => k.startsWith("cello_doc_"))).toEqual([]);
     for (const verb of DOC_VERBS) expect(offKeys).not.toContain(verb);
 
@@ -168,7 +168,7 @@ describe("074-DOCSFLAG clauses 2/5/6/9 — the daemon's three document surfaces,
 
     const on = await start("on");
     const onKeys = productionVerbs(on);
-    expect(onKeys).toHaveLength(74);
+    expect(onKeys).toHaveLength(75);
     // The three assertions that survive any unrelated verb being added or removed.
     expect(onKeys.length - offKeys.length).toBe(14);
     expect(onKeys.filter((k) => k.startsWith("cello_doc_")).sort()).toEqual([...DOC_VERBS].sort());
