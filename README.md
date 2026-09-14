@@ -123,8 +123,11 @@ npm i -g --prefer-online @cello-protocol/cli@latest
 cello logout && cello login          # restart the daemon onto the new binary
 ```
 
-Then restart Claude Code (or run `/mcp`). No `claude mcp remove` / `claude mcp
-add` required — the binary name `cello-mcp` stays constant across versions.
+Then run `/mcp` in **every open Claude Code window** (or restart them). A window
+left open keeps the previous version's tool descriptions, so its agent follows
+instructions for tools that have since changed. No `claude mcp remove` /
+`claude mcp add` required — the binary name `cello-mcp` stays constant across
+versions.
 
 ## What happens on first startup
 
