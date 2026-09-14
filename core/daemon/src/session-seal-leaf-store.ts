@@ -119,6 +119,29 @@ export class SessionSealLeafStore {
   }
 
   /**
+   * The last message from the other side that this agent PLACED in its transcript, as the relay
+   * position the live path acknowledges (leaf index + 1) and that leaf's hash.
+   *
+   * A message that arrives on the direct path is placed and acknowledged without ever being written
+   * to this table — its relay copy may have been lost with the process. So a resumed session must
+   * also read the transcript, or it resumes one message short and every close is refused as stale.
+   * Joined through `agents` on the stable agent_id, never the name.
+   */
+  receivedFrontier(agentPubkeyHex: string, sessionIdHex: string): { seq: number; hash: Uint8Array } | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT l.leaf_index AS idx, l.leaf_hash_hex AS hash
+           FROM session_tree_leaves l
+           JOIN transcript t ON t.agent_id = l.agent_id AND t.session_id = l.session_id AND t.sequence = l.leaf_index
+           JOIN agents a ON a.agent_id = l.agent_id
+          WHERE a.k_local_pubkey = ? AND l.session_id = ? AND t.direction = 'received'
+          ORDER BY l.leaf_index DESC LIMIT 1`,
+      )
+      .get(agentPubkeyHex, sessionIdHex) as { idx: number; hash: string } | undefined;
+    return row ? { seq: row.idx + 1, hash: new Uint8Array(Buffer.from(row.hash, "hex")) } : undefined;
+  }
+
+  /**
    * The complete carried leaf chain for a session's UNILATERAL seal, ordered by canonical sequence. The
    * directory rebuilds + verifies this tree OFFLINE. Returns ALL recorded leaves (both parties); the caller
    * carries them verbatim and the directory enforces contiguity + the per-leaf relay-receipt teeth.

@@ -893,7 +893,7 @@ export class AgentRelayClient {
     const genesis = genesisPrevRoot ?? genesisFromAssignment(sessionIdHex, carriedAssignment);
     if (genesis) this.#genesis.set(sessionIdHex, genesis);
     if (!this.#lastSeen.has(sessionIdHex) && genesis) this.#lastSeen.set(sessionIdHex, { seq: 0, hash: genesis });
-    const resumed = this.#sealLeafStore ? lastSeenFromRecord(this.#sealLeafStore, this.#senderPubkey, sessionIdHex) : undefined;
+    const resumed = this.#sealLeafStore ? lastSeenFromRecord(this.#sealLeafStore, this.#logger, this.#senderPubkey, sessionIdHex) : undefined;
     if (resumed) this.#bumpLastSeen(sessionIdHex, resumed.seq, resumed.hash);
     // Eagerly present the assignment so the relay records the session (binds peer IDs, creates the
     // session entry) BEFORE the first hash_submit or the counterparty's leaves arrive — the relay

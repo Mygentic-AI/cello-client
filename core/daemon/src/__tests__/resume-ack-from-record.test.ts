@@ -20,6 +20,7 @@ import { encodeStructure1 } from "@cello-protocol/protocol-types";
 import { AgentRelayClient } from "../session-relay-client.js";
 import { SessionSealLeafStore } from "../session-seal-leaf-store.js";
 import { openEncryptedDatabase, type DaemonDatabase } from "../sqlcipher-db.js";
+import { ensureSessionSchema } from "../session-schema.js";
 import { makeFakeRelay, noopLogger, fakeRelayAnchor } from "./relay-client-fake.js";
 
 const GENESIS = new Uint8Array(32).fill(0x9c);
@@ -34,6 +35,8 @@ let store: SessionSealLeafStore;
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "resume-ack-"));
   db = openEncryptedDatabase(join(dir, "s.db"), randomBytes(32));
+  ensureSessionSchema(db, noopLogger, () => {});
+  db.exec("CREATE TABLE IF NOT EXISTS agents (agent_id TEXT PRIMARY KEY, agent_name TEXT, k_local_pubkey TEXT NOT NULL)");
   store = new SessionSealLeafStore(db, noopLogger);
 });
 afterEach(async () => {
@@ -92,6 +95,25 @@ describe("resuming a session seeds the acknowledgement from the stored record", 
     const ack = client.lastSeenAck(SID_HEX);
     expect(ack?.seq).toBe(5);
     expect(Buffer.from(ack!.hash).equals(Buffer.from(theirLast))).toBe(true);
+  });
+
+  it("counts a message that arrived on the DIRECT path, which never writes the seal leaf store", async () => {
+    const { client, meHex } = await resumedClient();
+    db.prepare("INSERT INTO agents (agent_id, agent_name, k_local_pubkey) VALUES ('ag1', 'me', ?)").run(meHex);
+    leaf(meHex, 1, THEM, hash("their first, via the relay"));
+    leaf(meHex, 2, meHex, hash("my reply"));
+    // Their second message was placed from the direct stream: transcript + tree only, at index 2 (relay position 3).
+    const direct = hash("their second, direct");
+    db.prepare("INSERT INTO session_tree_leaves (agent_id, session_id, leaf_index, leaf_kind, leaf_hash_hex, created_at) VALUES ('ag1', ?, 2, 'msg', ?, 0)")
+      .run(SID_HEX, Buffer.from(direct).toString("hex"));
+    db.prepare("INSERT INTO transcript (agent_id, session_id, sequence, direction, blob, created_at) VALUES ('ag1', ?, 2, 'received', ?, 0)")
+      .run(SID_HEX, Buffer.from("their second, direct"));
+
+    client.registerSession(SID_HEX, makeFakeRelay().node, undefined, await fakeRelayAnchor(), GENESIS);
+
+    const ack = client.lastSeenAck(SID_HEX);
+    expect(ack?.seq).toBe(3);
+    expect(Buffer.from(ack!.hash).equals(Buffer.from(direct))).toBe(true);
   });
 
   it("a session with nothing from the other side still starts at the genesis", async () => {
