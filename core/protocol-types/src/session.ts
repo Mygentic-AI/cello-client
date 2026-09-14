@@ -416,7 +416,7 @@ export interface SessionSealedSingle {
   sealed_root: Uint8Array;         // 32-byte final Merkle root
   directory_signature: Uint8Array; // 64-byte Ed25519 over canonical CBOR([session_id, sealed_root, close_timestamp])
   close_timestamp: number;         // Unix ms
-  legibility?: SealLegibility;     // receipt-not-assent + frontiers + final_message
+  legibility?: SealLegibility;     // frontiers + attestation modes + final_message
 }
 
 /**
@@ -432,7 +432,7 @@ export interface SessionSealedFrost {
   signer_pubkey: Uint8Array;       // 32-byte initiator primary_pubkey (group public key)
   close_timestamp: number;         // Unix ms
   leaf_count?: number;             // total leaves in the sealed tree
-  legibility?: SealLegibility;     // receipt-not-assent + frontiers + final_message
+  legibility?: SealLegibility;     // frontiers + attestation modes + final_message
 }
 
 /** Discriminated union: current senders emit SessionSealedFrost; SessionSealedSingle is the legacy wire format. */
@@ -440,17 +440,15 @@ export type SessionSealed = SessionSealedSingle | SessionSealedFrost;
 
 // ─── Seal certificate legibility ──────────────────────────────────────────────
 //
-// The seal certificate carries a first-class, machine-readable `legibility` object
-// stating that its signatures attest RECEIPT — not assent — and publishing each
+// The seal certificate carries a machine-readable `legibility` object publishing each
 // party's content-frontier, a per-attestation live-vs-recovered marker, and whether
-// the final message was answered. A signature over a hash chain can prove exactly
-// three things — these bytes existed, in this order, delivered to/from me — and is
-// cryptographically INCAPABLE of proving agreement. "Sealed" must never be read as
-// "agreed".
+// the final message was answered. What the signatures prove: these bytes existed, in
+// this order, delivered to and from these parties, unaltered. The certificate states
+// that and stays neutral on what the conversation means (settled 2026-09-14).
 //
 // These properties are DERIVED by the directory at seal time from the leaves it
 // already verifies (the signed last_seen_seq, sender pubkeys, sequence numbers)
-// and the receipt-not-assent constant; they are carried on this wire frame and
+// and the wording constant; they are carried on this wire frame and
 // persisted CLIENT-SIDE in SQLite. No persisted directory column backs them.
 
 /**

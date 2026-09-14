@@ -318,7 +318,7 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
   // signaling stream after FROST notarization, once BOTH parties have submitted their SEAL
   // ctrl leaf — resolves it with the sealed_root.
   // M7-SESSION-004: the bilateral seal resolves with the sealed_root AND the legibility
-  // certificate (receipt-not-assent, per-party frontiers, attestation modes, final_message).
+  // certificate (per-party frontiers, attestation modes, final_message).
   const pendingSealWaiters = new Map<string, (completion: SealCompletion) => void>();
 
   // M7 DOD-SPINE-7: register the session_sealed completion handler on a signaling manager — per-agent
@@ -465,7 +465,7 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
 
         // M7-SESSION-004 (AC-005): normalise the wire legibility (Uint8Array pubkeys → hex) into a
         // JSON-safe certificate and persist it with the sealed record so it survives a restart and
-        // is readable via cello_get_sealed_receipt — receipt-not-assent, per-party frontiers,
+        // is readable via the seal_certificate IPC read — per-party frontiers,
         // attestation modes, and final_message.answered.
         const legibility = normalizeLegibility(frame["legibility"]);
         logger.info("session.sealed.received", {

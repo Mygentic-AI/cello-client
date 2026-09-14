@@ -1297,8 +1297,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
           logger.info("session.seal.completed", { sessionId, sealedRoot: succeeded.rootHex, role: "bilateral", correlationId });
           crossNodeBrokerBySession.delete(`${record.agent_name}:${sessionId}`); // Fix #1 review: evict on terminal seal success (a FAILED close keeps the entry so a retry can still reconnect).
           // M7-SESSION-004 (AC-006): return the legibility certificate on the seal completion so
-          // a reader gets it on the same surface that proves the seal — receipt-not-assent,
-          // per-party frontiers, attestation modes, and final_message.answered.
+          // a reader gets it on the same surface that proves the seal — per-party frontiers, attestation modes, and final_message.answered.
           return { ok: true, sealed_root: succeeded.rootHex, legibility: succeeded.legibility };
         }
 

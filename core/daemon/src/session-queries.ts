@@ -636,7 +636,7 @@ export class SessionQueries {
    * Returns the sealed root and the parsed legibility object (JSON-safe, hex pubkeys), or
    * null if the session is unknown or not yet sealed. This is the cert-read surface a
    * reader (operator, agent, arbitrator) — possibly in a DIFFERENT process than the one
-   * that built the certificate — uses to determine receipt-not-assent, per-party frontiers,
+   * that built the certificate — uses to determine per-party frontiers,
    * attestation modes, and whether the final message was answered.
    */
   getSealCertificate(agentName: string, sessionId: string): { sealed_root: string; legibility: unknown } | null {
