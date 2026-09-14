@@ -20,7 +20,7 @@ import type { SessionNodeManager } from "./session-node-manager.js";
 import type { AgentInfo, Logger, SessionRecord } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
 import { frameValueToHex } from "./frame-values.js";
-import { computeGenesisPrevRoot, decodeTrustSignalEnvelope, hashTrustSignalEnvelope, verifyTrustSignalHash, decodeCbor, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
+import { computeGenesisPrevRoot, computeChainAnchor, decodeTrustSignalEnvelope, hashTrustSignalEnvelope, verifyTrustSignalHash, decodeCbor, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
 import { TrustSignalStore } from "./trust-signal-store.js";
 import { verifyInboundAssignment } from "./assignment-verify.js";
 import { REFUSAL_REASONS, type RefusalReason, type AnyRefusalReason } from "./refusal-reasons.js";
@@ -993,14 +993,16 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       //
       // Shown to the operator. The copy this daemon USES was recorded before `acceptSession`
       // above — see the note there for why the order matters.
-      const genesisPrevRootHex = Buffer.from(
-        computeGenesisPrevRoot(
-          Buffer.from(parsed.participantAPubkeyHex, "hex"),
-          Buffer.from(parsed.participantBPubkeyHex, "hex"),
-          Buffer.from(parsed.sessionIdHex, "hex"),
-          parsed.sessionTimestamp,
-        ),
-      ).toString("hex");
+      // The chain start the conversation actually uses: the genesis including the FROST signature.
+      const bareGenesis = computeGenesisPrevRoot(
+        Buffer.from(parsed.participantAPubkeyHex, "hex"),
+        Buffer.from(parsed.participantBPubkeyHex, "hex"),
+        Buffer.from(parsed.sessionIdHex, "hex"),
+        parsed.sessionTimestamp,
+      );
+      const genesisPrevRootHex = parsed.sessionSignature
+        ? Buffer.from(computeChainAnchor(bareGenesis, parsed.sessionSignature)).toString("hex")
+        : null;
 
       logger.info("session.inbound.accepted", {
         sessionId: parsed.sessionIdHex,
