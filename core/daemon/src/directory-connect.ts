@@ -70,8 +70,7 @@ export function createDirectoryConnect(deps: DirectoryConnectDeps) {
       ? {
           participantA: assignment.participant_a.pubkey,
           participantB: assignment.participant_b.pubkey,
-          sessionTimestamp: assignment.session_timestamp,
-          sessionSignature: assignment.directory_signature,
+          sessionTimestamp: assignment.session_timestamp, sessionSignature: assignment.directory_signature,
           initiatorSessionPeerId: assignment.initiator_session_peer_id,
           counterpartySessionPeerId: assignment.counterparty_session_peer_id,
           ...(relayDirSig ? { assignmentSignature: relayDirSig } : {}),

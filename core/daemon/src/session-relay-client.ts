@@ -530,12 +530,7 @@ export interface CarriedLeafClaim {
 }
 
 export interface RelayAssignmentCarry {
-  /**
-   * The directory's 64-byte FROST signature over the session establishment. It anchors the chain's
-   * first link (`computeChainAnchor`), so a session without it has no starting point and every
-   * submit on it is refused by name.
-   */
-  sessionSignature?: Uint8Array;
+  sessionSignature?: Uint8Array;       // directory FROST sig over the establishment; the genesis includes it
   participantA: Uint8Array;            // 32-byte initiator pubkey
   participantB: Uint8Array;            // 32-byte counterparty pubkey
   sessionTimestamp: number;            // Unix ms
@@ -579,15 +574,8 @@ function genesisFromAssignment(
   assignment: RelayAssignmentCarry | undefined,
 ): Uint8Array | undefined {
   if (!assignment?.sessionSignature) return undefined;
-  return computeChainAnchor(
-    computeGenesisPrevRoot(
-      assignment.participantA,
-      assignment.participantB,
-      Uint8Array.from(Buffer.from(sessionIdHex, "hex")),
-      assignment.sessionTimestamp,
-    ),
-    assignment.sessionSignature,
-  );
+  const genesis = computeGenesisPrevRoot(assignment.participantA, assignment.participantB, Uint8Array.from(Buffer.from(sessionIdHex, "hex")), assignment.sessionTimestamp);
+  return computeChainAnchor(genesis, assignment.sessionSignature);
 }
 
 function toU8(v: unknown): Uint8Array {
