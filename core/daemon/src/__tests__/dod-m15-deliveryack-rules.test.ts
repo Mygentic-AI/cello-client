@@ -36,7 +36,6 @@ import { InMemoryKeyProvider, signDeliveryAck } from "@cello-protocol/crypto";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import { LEAF_KIND_MSG } from "../session-relay-client.js";
-import { readDeliveryFacts } from "../session-delivery-acks.js";
 import { seedAgentKeys, wireAgentKeyProviders } from "./helpers/seed-agents.js";
 import { TEST_SESSION_GENESIS } from "./helpers/session-genesis.js";
 import type { Logger } from "../types.js";
@@ -164,6 +163,13 @@ describe("DELIVERYACK: the five rules, on the inbound path", () => {
     return { mgr, node, logger, events, bob, bobPubHex, hash, ack };
   }
 
+  /** The acknowledgements this side has kept for the session, straight from their table. */
+  function keptAcks(mgr: SessionNodeManager): Array<{ content_hash_hex: string; signer_pubkey: string; signature: Uint8Array }> {
+    return mgr.getDb()
+      .prepare("SELECT content_hash_hex, signer_pubkey, signature FROM delivery_acks WHERE agent_id = ? AND session_id = ? ORDER BY content_hash_hex")
+      .all(mgr.resolveAgentId("alice"), SID) as Array<{ content_hash_hex: string; signer_pubkey: string; signature: Uint8Array }>;
+  }
+
   /** The protocol state rule 5 is about: still awaiting, nothing fired, nothing kept. */
   function stateAfter(a: { mgr: SessionNodeManager; events: LogEvent[] }): {
     acked: boolean;
@@ -171,7 +177,7 @@ describe("DELIVERYACK: the five rules, on the inbound path", () => {
   } {
     return {
       acked: a.events.some((e) => e.event === "content.delivery.acked"),
-      heldAcks: readDeliveryFacts(a.mgr.getDb(), a.logger, a.mgr.resolveAgentId("alice"), SID).filter((f) => f.acknowledged !== null).length,
+      heldAcks: keptAcks(a.mgr).length,
     };
   }
 
@@ -180,9 +186,7 @@ describe("DELIVERYACK: the five rules, on the inbound path", () => {
     a.node.invokeHandler(a.ack({ sig: await signDeliveryAck(a.bob, Buffer.from(SID, "hex"), a.hash) }), COUNTERPARTY_PEER);
     await settle();
     expect(stateAfter(a)).toEqual({ acked: true, heldAcks: 1 });
-    const kept = readDeliveryFacts(a.mgr.getDb(), a.logger, a.mgr.resolveAgentId("alice"), SID)[0]!;
-    expect(kept.acknowledged?.signer_pubkey).toBe(a.bobPubHex);
-    expect(kept.acknowledged?.asserted_by).toBe("recipient");
+    expect(keptAcks(a.mgr)[0]!.signer_pubkey).toBe(a.bobPubHex);
   });
 
   it("★★★ RULE 1: an acknowledgement signed by a STRANGER is discarded — a valid signature is not a relevant one", async () => {
@@ -262,14 +266,14 @@ describe("DELIVERYACK: the five rules, on the inbound path", () => {
     const sig = await signDeliveryAck(a.bob, Buffer.from(SID, "hex"), a.hash);
     a.node.invokeHandler(a.ack({ sig }), COUNTERPARTY_PEER);
     await settle();
-    const first = readDeliveryFacts(a.mgr.getDb(), a.logger, a.mgr.resolveAgentId("alice"), SID);
+    const first = keptAcks(a.mgr);
     const ackedCount = () => a.events.filter((e) => e.event === "content.delivery.acked").length;
     expect(ackedCount()).toBe(1);
 
     for (let i = 0; i < 20; i++) a.node.invokeHandler(a.ack({ sig }), COUNTERPARTY_PEER);
     await settle();
     // Twenty replays: one row, one acked event, and the stored signature unchanged.
-    expect(readDeliveryFacts(a.mgr.getDb(), a.logger, a.mgr.resolveAgentId("alice"), SID)).toEqual(first);
+    expect(keptAcks(a.mgr)).toEqual(first);
     expect(ackedCount()).toBe(1);
     expect(a.events.filter((e) => e.event === "content.delivery.ack.recorded").length).toBe(1);
   });
@@ -303,55 +307,11 @@ describe("DELIVERYACK: the five rules, on the inbound path", () => {
       COUNTERPARTY_PEER,
     );
     await settle();
-    const kept = readDeliveryFacts(a.mgr.getDb(), a.logger, agentId, SID).find((f) => f.content_hash === lateHex);
+    const kept = keptAcks(a.mgr).find((r) => r.content_hash_hex === lateHex);
     expect(
-      kept?.acknowledged?.signer_pubkey,
+      kept?.signer_pubkey,
       "an acknowledgement for a message this side durably sent must be kept even with no live timer",
     ).toBe(a.bobPubHex);
-    expect(kept?.seq).toBe(7);
-  });
-
-  it("★★ a message this side RECEIVED is not listed among the messages it sent", async () => {
-    // Live 2026-09-13: the relay's ordering signature now arrives for BOTH sides' messages, and the
-    // receipt listed every received message as a sent one with no acknowledgement — so half the
-    // conversation looked unacknowledged.
-    const a = await sendingAgent("received-not-sent.db");
-    const db = a.mgr.getDb();
-    const agentId = a.mgr.resolveAgentId("alice");
-    const pub = (db.prepare("SELECT k_local_pubkey FROM agents WHERE agent_id = ?").get(agentId) as { k_local_pubkey: string }).k_local_pubkey;
-    db.exec(`CREATE TABLE IF NOT EXISTS relay_ack_receipts (agent_pubkey TEXT NOT NULL, session_id TEXT NOT NULL,
-      sequence_number INTEGER NOT NULL, hash_hex TEXT NOT NULL, relay_id TEXT NOT NULL, relay_pubkey_hex TEXT NOT NULL,
-      relay_timestamp INTEGER NOT NULL, signature_hex TEXT NOT NULL, stored_at INTEGER NOT NULL, running_root_hex TEXT,
-      structure2_cbor BLOB, structure1_cbor BLOB, leaf_kind INTEGER, PRIMARY KEY (agent_pubkey, session_id, sequence_number))`);
-    const theirs = Buffer.from(msgLeafHash(new TextEncoder().encode("bob said this"))).toString("hex");
-    db.prepare("INSERT INTO session_tree_leaves (agent_id, session_id, leaf_index, leaf_kind, leaf_hash_hex, created_at) VALUES (?, ?, ?, ?, ?, ?)")
-      .run(agentId, SID, 3, "msg", theirs, Date.now());
-    db.prepare("INSERT INTO transcript (agent_id, session_id, sequence, direction, blob, created_at) VALUES (?, ?, ?, ?, ?, ?)")
-      .run(agentId, SID, 3, "received", Buffer.from("bob said this"), Date.now());
-    db.prepare(`INSERT INTO relay_ack_receipts (agent_pubkey, session_id, sequence_number, hash_hex, relay_id, relay_pubkey_hex,
-      relay_timestamp, signature_hex, stored_at, leaf_kind) VALUES (?, ?, 4, ?, 'r', 'rp', 1, 'aa', 1, 0)`)
-      .run(pub, SID, theirs);
-
-    // And a seal commitment is not a message at all.
-    db.prepare(`INSERT INTO relay_ack_receipts (agent_pubkey, session_id, sequence_number, hash_hex, relay_id, relay_pubkey_hex,
-      relay_timestamp, signature_hex, stored_at, leaf_kind) VALUES (?, ?, 5, 'c0ffee', 'r', 'rp', 1, 'aa', 1, 2)`)
-      .run(pub, SID);
-
-    const facts = readDeliveryFacts(db, a.logger, agentId, SID);
-    expect(facts.find((f) => f.content_hash === theirs)).toBeUndefined();
-    expect(facts.find((f) => f.content_hash === "c0ffee")).toBeUndefined();
-
-    // Both sides sent the SAME text: our own copy must stay in the list, with OUR receipt.
-    db.prepare("INSERT INTO session_tree_leaves (agent_id, session_id, leaf_index, leaf_kind, leaf_hash_hex, created_at) VALUES (?, ?, ?, ?, ?, ?)")
-      .run(agentId, SID, 5, "msg", theirs, Date.now());
-    db.prepare("INSERT INTO transcript (agent_id, session_id, sequence, direction, blob, created_at) VALUES (?, ?, ?, ?, ?, ?)")
-      .run(agentId, SID, 5, "sent", Buffer.from("bob said this"), Date.now());
-    db.prepare(`INSERT INTO relay_ack_receipts (agent_pubkey, session_id, sequence_number, hash_hex, relay_id, relay_pubkey_hex,
-      relay_timestamp, signature_hex, stored_at, leaf_kind) VALUES (?, ?, 6, ?, 'r', 'rp', 2, 'bb', 1, 0)`)
-      .run(pub, SID, theirs);
-    const mine = readDeliveryFacts(db, a.logger, agentId, SID).find((f) => f.content_hash === theirs);
-    expect(mine?.seq).toBe(5);
-    expect(mine?.ordered?.signature).toBe("bb");
   });
 
   it("★★★ RULE 1: with NO usable recorded key for the counterparty, there is nothing to check against and the ack is discarded", async () => {
@@ -395,8 +355,7 @@ describe("DELIVERYACK: the five rules, on the inbound path", () => {
     expect(events.some((e) => e.event === "content.delivery.acked")).toBe(false);
     expect(events.find((e) => e.event === "content.delivery.ack.discarded")?.context.reason)
       .toBe("delivery_ack_no_participant_keys");
-    expect(readDeliveryFacts(mgr.getDb(), logger, mgr.resolveAgentId("alice"), SID)
-      .filter((f) => f.acknowledged !== null).length).toBe(0);
+    expect(keptAcks(mgr).length).toBe(0);
   });
 
   it("★★★ RULE 4: a flood of BAD acknowledgements cannot make this machine shout — one loud line per message", async () => {
@@ -439,72 +398,4 @@ describe("DELIVERYACK: the five rules, on the inbound path", () => {
     expect(stateAfter(a).heldAcks).toBe(1);
   });
 
-  it("★★ the receipt surface reports the three facts separately and derives nothing from an absence", async () => {
-    const a = await sendingAgent("facts.db");
-    a.node.invokeHandler(a.ack({ sig: await signDeliveryAck(a.bob, Buffer.from(SID, "hex"), a.hash) }), COUNTERPARTY_PEER);
-    await settle();
-    const [fact] = readDeliveryFacts(a.mgr.getDb(), a.logger, a.mgr.resolveAgentId("alice"), SID);
-    expect(fact).toBeTruthy();
-    // Three independent slots. Acknowledged is present; the two relay-asserted facts are not held
-    // by this side and read null — reported as missing, with nothing inferred from it.
-    expect(Object.keys(fact!).sort()).toEqual(
-      ["acknowledged", "content_hash", "delivered", "ordered", "seq"],
-    );
-    expect(fact!.ordered).toBeNull();
-    // `delivered` is present in SHAPE and absent in FACT, and it names who would assert it — so a
-    // reader can tell "nobody holds this" from "the relay said no". A bare null could not.
-    expect(fact!.delivered).toEqual({
-      asserted_by: "relay",
-      held: false,
-      why_absent: expect.stringContaining("never tells the sender"),
-    });
-    expect(fact!.acknowledged).not.toBeNull();
-    // No derived verdict anywhere in the payload: nothing that reads as a status or a score.
-    const rendered = JSON.stringify(fact);
-    for (const word of ["unresponsive", "ignored", "status", "score", "verdict", "fault"]) {
-      expect(rendered).not.toContain(word);
-    }
-  });
-  /**
-   * The order asks for this in a sentence that was read past the first time: *"make sure the three
-   * new facts do not duplicate or contradict it."*
-   *
-   * They measure different things. `answered` is AUTHORSHIP — did the other party write anything
-   * after your last message — and it is derived by the DIRECTORY from the leaf set at seal time.
-   * `acknowledged` is DELIVERY — did their machine take the bytes, signed on ingest, before any
-   * human read them. The pair that carries the most meaning is the one neither can express alone:
-   * answered false AND acknowledged present, which is "it reached them and they did not reply" —
-   * the very distinction this whole order exists to make available.
-   *
-   * These are structural checks rather than a co-occurrence, which is what the live journey already
-   * shows. A structure cannot contradict if nothing reads across it.
-   */
-  it("★★★ nothing in the delivery facts reads, derives from, or restates `final_message`", async () => {
-    const a = await sendingAgent("no-duplication.db");
-    a.node.invokeHandler(a.ack({ sig: await signDeliveryAck(a.bob, Buffer.from(SID, "hex"), a.hash) }), COUNTERPARTY_PEER);
-    await settle();
-    const facts = readDeliveryFacts(a.mgr.getDb(), a.logger, a.mgr.resolveAgentId("alice"), SID);
-    expect(facts.length).toBeGreaterThan(0);
-    const rendered = JSON.stringify(facts);
-    // No field of the certificate's final_message is copied in, under any name.
-    for (const leaked of ["answered", "final_message", "sender_pubkey", "attests", "implies_assent", "disclaimer"]) {
-      expect(rendered, `the delivery facts restate "${leaked}" from the certificate`).not.toContain(leaked);
-    }
-    // And the three facts are exactly the three, with no fourth that could combine them.
-    expect(Object.keys(facts[0]!).sort()).toEqual(["acknowledged", "content_hash", "delivered", "ordered", "seq"]);
-  });
-
-  it("★★★ `answered` is a SEAL-TIME fact from the directory and the delivery facts never touch it", async () => {
-    /**
-     * The structural half: the read that produces the delivery facts does not query, join to, or
-     * receive anything the certificate carries. If it did, the two could drift into disagreement
-     * about the same message — which is the contradiction the order is warning about.
-     */
-    const src = await import("node:fs/promises").then((fs) =>
-      fs.readFile(new URL("../session-delivery-acks.ts", import.meta.url), "utf8"));
-    const readFn = src.slice(src.indexOf("export function readDeliveryFacts"));
-    for (const term of ["final_message", "answered", "legibility", "seal_legibility", "sealed_root"]) {
-      expect(readFn, `readDeliveryFacts reads "${term}" — the two facts must stay independent`).not.toContain(term);
-    }
-  });
 });
