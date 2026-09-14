@@ -44,6 +44,7 @@ import { verify, type KeyProvider } from "@cello-protocol/crypto";
 import type { Logger } from "./types.js";
 import { extractErrorMessage } from "./error-message.js";
 import { evaluateRelayAck, readSubmittedLeaf, type RelayReceiptStore } from "./relay-receipt-store.js";
+import { lastSeenFromRecord } from "./resume-last-seen.js";
 import type { SessionSealLeafStore } from "./session-seal-leaf-store.js";
 import type { SessionOwnChainStore } from "./session-own-chain-store.js";
 
@@ -884,18 +885,16 @@ export class AgentRelayClient {
       recordTimedOut: existing?.recordTimedOut ?? false,
     });
     /**
-     * SEED THE ACKNOWLEDGEMENT, and only when there is nothing to lose.
-     *
-     * A session that has already received a leaf holds a REAL `{ seq, hash }`; overwriting it with
-     * the genesis on a re-registration would walk the acknowledgement backwards to "I have seen
-     * nothing" for a conversation that is well underway — and the relay would then answer the next
-     * submit from a position we had already passed.
+     * SEED THE ACKNOWLEDGEMENT, never backwards. A session that already received a leaf holds a REAL
+     * `{ seq, hash }`; the genesis must not overwrite it. And a RESUMED session starts from what its
+     * durable record says it saw, never from 0 — the gap that left interrupted sessions unsealable
+     * (see resume-last-seen.ts).
      */
     const genesis = genesisPrevRoot ?? genesisFromAssignment(sessionIdHex, carriedAssignment);
     if (genesis) this.#genesis.set(sessionIdHex, genesis);
-    if (!this.#lastSeen.has(sessionIdHex)) {
-      if (genesis) this.#lastSeen.set(sessionIdHex, { seq: 0, hash: genesis });
-    }
+    if (!this.#lastSeen.has(sessionIdHex) && genesis) this.#lastSeen.set(sessionIdHex, { seq: 0, hash: genesis });
+    const resumed = this.#sealLeafStore ? lastSeenFromRecord(this.#sealLeafStore, this.#senderPubkey, sessionIdHex) : undefined;
+    if (resumed) this.#bumpLastSeen(sessionIdHex, resumed.seq, resumed.hash);
     // Eagerly present the assignment so the relay records the session (binds peer IDs, creates the
     // session entry) BEFORE the first hash_submit or the counterparty's leaves arrive — the relay
     // rejects frames for a session it has not recorded. Best-effort + serialized on the submit chain
