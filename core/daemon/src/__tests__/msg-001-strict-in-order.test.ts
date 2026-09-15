@@ -357,29 +357,30 @@ describe("DOD-MSG-4: ordering-record verification is adversarially exercised", (
    * the mailbox one — whose ordering record was verified and then kept only in memory. No seal-leaf
    * row was written, so the seal answer could not place either message and reported a mismatch.
    */
-  it("★★★ a VERIFIED mailbox ordering record is kept as the counterparty's seal leaf at its relay position", async () => {
+  it("★★★ a VERIFIED mailbox ordering record keeps its position and author — and writes NO seal leaf", async () => {
     const kp = generateKeypair();
-    const mgr = await managerWithCounterparty(kp, "sealleaf.db");
+    const mgr = await managerWithCounterparty(kp, "recovered.db");
     const cpHex = Buffer.from(await kp.getPublicKey()).toString("hex");
     const rec = await buildRecord(kp, enc("sent while asleep"), 1);
-    mgr.recordOrderingRecord("alice", sid, rec.structure1Cbor, rec.structure2Cbor, rec.contentHash, undefined, 0);
-    const rows = mgr.getDb()
-      .prepare("SELECT sequence_number AS seq, leaf_kind AS kind, sender_pubkey_hex AS sender, relay_signature AS sig FROM session_seal_leaves WHERE session_id = ?")
-      .all(sid) as Array<{ seq: number; kind: number; sender: string; sig: string | null }>;
-    expect(rows, "the verified position must survive beyond this process's memory").toEqual([
-      { seq: 1, kind: 0, sender: cpHex, sig: null },
-    ]);
+    mgr.recordOrderingRecord("alice", sid, rec.structure1Cbor, rec.structure2Cbor, rec.contentHash);
+    const db = mgr.getDb();
+    expect(
+      db.prepare("SELECT relay_seq AS seq, hash_hex AS hash, sender_hex AS sender FROM session_recovered_positions WHERE session_id = ?").all(sid),
+      "the verified position must survive beyond this process's memory",
+    ).toEqual([{ seq: 1, hash: Buffer.from(rec.contentHash).toString("hex"), sender: cpHex }]);
+    const sealTable = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_seal_leaves'").get() !== undefined;
+    expect(
+      sealTable ? (db.prepare("SELECT COUNT(*) AS n FROM session_seal_leaves WHERE session_id = ?").get(sid) as { n: number }).n : 0,
+      "the position is the sender's claim, not relay-signed, so it must never enter the seal carry",
+    ).toBe(0);
   });
 
-  it("an UNVERIFIED mailbox ordering record writes no seal leaf", async () => {
+  it("an UNVERIFIED mailbox ordering record keeps no position", async () => {
     const kp = generateKeypair();
-    const mgr = await managerWithCounterparty(kp, "sealleaf-bad.db");
+    const mgr = await managerWithCounterparty(kp, "recovered-bad.db");
     const rec = await buildRecord(kp, enc("forged"), 1, { corruptSig: true });
-    mgr.recordOrderingRecord("alice", sid, rec.structure1Cbor, rec.structure2Cbor, rec.contentHash, undefined, 0);
-    const db = mgr.getDb();
-    const hasTable = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_seal_leaves'").get() !== undefined;
-    const n = hasTable ? (db.prepare("SELECT COUNT(*) AS n FROM session_seal_leaves WHERE session_id = ?").get(sid) as { n: number }).n : 0;
-    expect(n, "a record that failed verification must not become evidence").toBe(0);
+    mgr.recordOrderingRecord("alice", sid, rec.structure1Cbor, rec.structure2Cbor, rec.contentHash);
+    expect(mgr.getDb().prepare("SELECT COUNT(*) AS n FROM session_recovered_positions WHERE session_id = ?").get(sid)).toEqual({ n: 0 });
   });
 
   it("BAD SIGNATURE is REJECTED — no ordering recorded, bad_signature warn, content still delivered (fail-closed, no loss)", async () => {

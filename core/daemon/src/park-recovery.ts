@@ -47,8 +47,6 @@ export interface ParkContext {
     structure2Cbor: Uint8Array,
     contentHash: Uint8Array,
     correlationId?: string,
-    /** The envelope's leaf kind (v4); absent on older envelopes, which carried messages. */
-    leafKind?: number,
   ): number | null;
   ingestReceivedContent(
     agentName: string,
@@ -570,7 +568,7 @@ export class ParkRecovery {
     // tell a redelivery (same position) from a genuinely new identical message (new position).
     let recoveredSeq: number | null = null;
     if (env.structure1Cbor && env.structure2Cbor) {
-      recoveredSeq = this.#ctx.recordOrderingRecord(agentName, sessionId, env.structure1Cbor, env.structure2Cbor, contentHash, correlationId, env.leafKind);
+      recoveredSeq = this.#ctx.recordOrderingRecord(agentName, sessionId, env.structure1Cbor, env.structure2Cbor, contentHash, correlationId);
     }
 
     this.#ctx.logger.info("content.recover.verified", {

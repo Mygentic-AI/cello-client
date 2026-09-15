@@ -83,7 +83,7 @@ export function readSealedConversation(
         )
         .all(a.agentPubkey, a.sessionId) as Array<{ seq: number; hash: string; ts: number; sig: string }>)
     : [];
-  const signed = new Map<number, { author: string | null; kind: number; hash: string | null }>();
+  const signed = new Map<number, { author: string | null; kind: number }>();
   if (tableExists(db, "session_seal_leaves")) {
     for (const r of db
       .prepare(
@@ -93,26 +93,35 @@ export function readSealedConversation(
       .all(a.agentPubkey, a.sessionId) as Array<{ seq: number; kind: number; s1: Uint8Array }>) {
       // The author is read from the bytes they signed, not from the stored sender column.
       const d = decodeStructure1(r.s1 instanceof Uint8Array ? r.s1 : new Uint8Array(r.s1));
-      signed.set(r.seq, {
-        author: d.ok ? Buffer.from(d.fields.senderPubkey).toString("hex") : null,
-        kind: r.kind,
-        hash: d.ok ? Buffer.from(d.fields.contentHash).toString("hex") : null,
-      });
+      signed.set(r.seq, { author: d.ok ? Buffer.from(d.fields.senderPubkey).toString("hex") : null, kind: r.kind });
     }
   }
 
   /**
-   * EVERY POSITION THIS SIDE HOLDS A RECORD OF, not only the ones with a relay acknowledgement.
+   * POSITIONS FOR MESSAGES NO RELAY ACKNOWLEDGEMENT REACHED — see `recovered-position.ts`.
    *
    * Live 2026-09-15: a laptop slept while the counterparty sent two messages. The relay wrote both
-   * `leaf_deliver` frames onto the dead connection, so no acknowledgement arrived, and the text came
-   * later from the mailbox with its signed leaf. Reading acknowledgements alone listed both as
-   * unnumbered and reported a mismatch on a conversation that sealed correctly. A position known from
-   * the signed leaf is numbered; its `relay_ack` stays null, because this side holds none.
+   * `leaf_deliver` frames onto the dead connection, and the text came later from the mailbox. Reading
+   * acknowledgements alone listed both as unnumbered and reported a mismatch on a correct seal.
+   *
+   * A recovered position is the SENDER's claim, not the relay's, so it fills only a position with no
+   * acknowledgement, carries `relay_ack: null`, and is trusted only as far as the root check below:
+   * the sealed root was computed from relay-signed leaves, so a wrong claim cannot reproduce it. One
+   * that disagrees with an acknowledgement at the same position is reported, never papered over.
    */
   const bySeq = new Map<number, { seq: number; hash: string; ts: number | null; sig: string | null }>();
   for (const r of receipts) bySeq.set(r.seq, r);
-  for (const [seq, s] of signed) if (!bySeq.has(seq) && s.hash) bySeq.set(seq, { seq, hash: s.hash, ts: null, sig: null });
+  let recoveredConflict = false;
+  const recoveredAuthor = new Map<number, string>();
+  for (const p of db
+    .prepare("SELECT relay_seq AS seq, hash_hex AS hash, sender_hex AS sender FROM session_recovered_positions WHERE agent_id = ? AND session_id = ?")
+    .all(a.agentId, a.sessionId) as Array<{ seq: number; hash: string; sender: string }>) {
+    const acked = bySeq.get(p.seq);
+    if (acked === undefined) {
+      bySeq.set(p.seq, { seq: p.seq, hash: p.hash, ts: null, sig: null });
+      recoveredAuthor.set(p.seq, p.sender);
+    } else if (acked.hash !== p.hash) recoveredConflict = true;
+  }
   const positions = [...bySeq.values()].sort((x, y) => x.seq - y.seq);
 
   const acksReceived = ackMap(db, "delivery_acks", a.agentId, a.sessionId);
@@ -123,7 +132,7 @@ export function readSealedConversation(
     r: { seq: number; ts: number | null; sig: string | null } | null,
   ): SealedLeaf => {
     const received = m.direction !== "sent";
-    const pubkey = (r ? signed.get(r.seq)?.author : null) ?? (received ? null : a.agentPubkey);
+    const pubkey = (r ? signed.get(r.seq)?.author ?? recoveredAuthor.get(r.seq) : null) ?? (received ? null : a.agentPubkey);
     return {
       seq: r?.seq ?? null,
       kind: "message",
@@ -175,7 +184,7 @@ export function readSealedConversation(
     positions.length === 0 ? "no_relay_record"
     : unnumbered.length > 0 ? "unnumbered_messages"
     : !positions.every((r, i) => r.seq === i + 1) ? "sequence_gap"
-    : computedRoot !== a.sealedRoot ? "root_differs"
+    : recoveredConflict || computedRoot !== a.sealedRoot ? "root_differs"
     : undefined;
   if (reason) {
     logger.warn("session.sealed_conversation.root_mismatch", {

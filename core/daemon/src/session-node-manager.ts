@@ -82,7 +82,7 @@ import { sendDeliveryAck } from "./session-delivery-acks.js";
 import { SESSION_CLOSED_REASON, sessionClosedState } from "./session-closed.js";
 import { StandingReceivers } from "./standing-receivers.js";
 import { RelayReceiptStore } from "./relay-receipt-store.js";
-import { SessionSealLeafStore } from "./session-seal-leaf-store.js"; import { storeRecoveredSealLeaf } from "./recovered-seal-leaf.js";
+import { SessionSealLeafStore } from "./session-seal-leaf-store.js"; import { storeRecoveredPosition } from "./recovered-position.js";
 import { SessionOwnChainStore } from "./session-own-chain-store.js";
 import type { SealFrontierLeaf } from "./seal-frontier-verify.js";
 import { type SecurityGatewayClient } from "@cello-protocol/gateway";
@@ -1121,7 +1121,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       getSessionRecord: (a, sid) => this.#queries.getSessionRecord(a, sid),
       getSealCarry: (pk, sid) => this.#seal.getSealCarry(pk, sid),
       getSessionTree: (a, sid) => this.getSessionTree(a, sid),
-      recordOrderingRecord: (a, sid, s1, s2, h, cid, kind) => this.recordOrderingRecord(a, sid, s1, s2, h, cid, kind),
+      recordOrderingRecord: (a, sid, s1, s2, h, cid) => this.recordOrderingRecord(a, sid, s1, s2, h, cid),
       ingestReceivedContent: (a, sid, c, h, cid, seq, alg) => this.ingestReceivedContent(a, sid, c, h, cid, seq, alg),
       witnessReceivedLeaf: (a, sid, h, s1, sig, kind, cid) => this.#contentIn.witnessReceivedLeaf(a, sid, h, s1, sig, kind, cid),
       noteAcknowledgeable: (a, sid, seq, h) => this.#contentIn.noteAcknowledgeable(a, sid, seq, h),
@@ -2776,7 +2776,6 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     structure2Cbor: Uint8Array,
     contentHash: Uint8Array,
     correlationId?: string,
-    leafKind = 0, // the parked envelope's own kind; absent on pre-v4 envelopes, which were messages
     // DOD-FRONTIER-STRAND-1 AC1: returns the verified canonical position (null when absent, malformed, or not
     // signed by this session's counterparty) so the park-recovery caller can key dedup on position, not hash.
   ): number | null {
@@ -2786,8 +2785,8 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     // A second refusal on the ordering record would gate mail on a record the relay-degraded path may omit.
     // The live direct path is where the ordering record IS the proof, and that is where `fatal` is consumed.
     const seq = this.#refusals.recordFrameOrdering(agentName, sessionId, structure1Cbor, structure2Cbor, contentHash, correlationId, "park").seq;
-    const pk = this.#queries.ownPubkeyHex(agentName); // a verified position becomes a durable seal leaf — see recovered-seal-leaf.ts
-    if (seq !== null && pk && this.#db) storeRecoveredSealLeaf({ store: (this.#sealLeafStore ??= new SessionSealLeafStore(this.#db, this.#logger)), logger: this.#logger, agentPubkeyHex: pk, sessionId, canonicalSeq: seq, leafKind, structure1Cbor, structure2Cbor });
+    let agentId: string | null = null; try { agentId = this.#requireAgentId(agentName); } catch { /* reported by storeRecoveredPosition */ }
+    if (seq !== null) storeRecoveredPosition({ db: this.#db, logger: this.#logger, agentId, sessionId, canonicalSeq: seq, contentHash, structure1Cbor }); // see recovered-position.ts
     return seq;
   }
 

@@ -535,6 +535,22 @@ export function ensureSessionSchema(
    * restart cannot reset it to 0 (every close refused as stale) or guess it from the local leaf
    * index (which can drift one ahead of the relay). Forward-only.
    */
+  /**
+   * Where a MAILBOX-recovered message sits, as its sender's ordering record claims. Not seal
+   * evidence and never carried to a seal: that record is not relay-signed. The seal answer uses it
+   * only to place a message no relay acknowledgement reached, and the sealed root decides whether
+   * the claimed positions were right.
+   */
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS session_recovered_positions (
+      agent_id   TEXT    NOT NULL,
+      session_id TEXT    NOT NULL,
+      relay_seq  INTEGER NOT NULL,
+      hash_hex   TEXT    NOT NULL,
+      sender_hex TEXT    NOT NULL,
+      PRIMARY KEY (agent_id, session_id, relay_seq)
+    )
+  `);
   db.exec(`
     CREATE TABLE IF NOT EXISTS session_last_ack (
       agent_id   TEXT    NOT NULL,

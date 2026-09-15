@@ -198,17 +198,18 @@ describe("readSealedConversation", () => {
    * and the text arrived later from the mailbox. The answer then listed both as unnumbered and
    * reported `root_matches_my_transcript: false` on a conversation that sealed correctly.
    */
-  it("★★★ numbers a message known only from its signed seal leaf, with no relay acknowledgement, and the root matches", () => {
+  function recovered(seq: number, hashHex: string, sender: string): void {
+    db.prepare("INSERT INTO session_recovered_positions (agent_id, session_id, relay_seq, hash_hex, sender_hex) VALUES (?, ?, ?, ?, ?)")
+      .run(AGENT_ID, SID, seq, hashHex, sender);
+  }
+
+  it("★★★ numbers a mailbox-recovered message no relay acknowledgement reached, and the root matches", () => {
     const m1 = h("before sleep"), m2 = h("sent while asleep"), m3 = h("after wake"), c1 = h("c1");
     message(0, "sent", m1, "before sleep");
     message(1, "received", m2, "sent while asleep");
     message(2, "sent", m3, "after wake");
     receipt(1, m1, A, 0);
-    // Recovered from the mailbox: the signed leaf is stored, the relay acknowledgement never arrived.
-    sealLeaves.store(A, SID, {
-      sequenceNumber: 2, leafKind: 0, senderPubkeyHex: B,
-      structure2Cbor: new Uint8Array([1]), structure1Cbor: s1(m2, B),
-    }, 0);
+    recovered(2, m2, B); // the relay acknowledgement never arrived; the mailbox copy did
     receipt(3, m3, A, 0);
     receipt(4, c1, A, 2);
     const out = read(rootOf([m1, m2, m3, c1]));
@@ -219,6 +220,39 @@ describe("readSealedConversation", () => {
       [4, "close", "Alice", null, "relaysig4"],
     ]);
     expect(out.root_mismatch_reason).toBeUndefined();
+    expect(out.root_matches_my_transcript).toBe(true);
+  });
+
+  it("a recovered position that disagrees with a relay acknowledgement is reported, not trusted", () => {
+    const m1 = h("real"), forged = h("claimed"), c1 = h("c1");
+    message(0, "received", m1, "real");
+    receipt(1, m1, B, 0);
+    recovered(1, forged, B);
+    receipt(2, c1, A, 2);
+    const out = read(rootOf([m1, c1]));
+    expect(out.root_mismatch_reason).toBe("root_differs");
+    expect(out.root_matches_my_transcript).toBe(false);
+  });
+
+  it("a recovered position claimed wrongly cannot reproduce the sealed root", () => {
+    const m1 = h("one"), m2 = h("two"), c1 = h("c1");
+    message(0, "sent", m1, "one");
+    message(1, "received", m2, "two");
+    receipt(1, m1, A, 0);
+    recovered(3, m2, B); // claimed position 3; the relay put it at 2
+    receipt(2, c1, A, 2);
+    const out = read(rootOf([m1, m2, c1]));
+    expect(out.root_matches_my_transcript).toBe(false);
+  });
+
+  it("a seal leaf with no relay acknowledgement is NOT taken as a position", () => {
+    const m1 = h("one"), c1 = h("c1"), carried = h("carried close");
+    message(0, "sent", m1, "one");
+    receipt(1, m1, A, 0);
+    receipt(2, c1, A, 2);
+    sealLeaves.store(A, SID, { sequenceNumber: 3, leafKind: 2, senderPubkeyHex: B, structure2Cbor: new Uint8Array([1]), structure1Cbor: s1(carried, B) }, 0);
+    const out = read(rootOf([m1, c1]));
+    expect(out.leaves.map((l) => l.seq)).toEqual([1, 2]);
     expect(out.root_matches_my_transcript).toBe(true);
   });
 });
