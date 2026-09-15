@@ -20,10 +20,16 @@ const SRC = join(dirname(fileURLToPath(import.meta.url)), "..");
 describe("relay client construction", () => {
   it("★★★ every `new AgentRelayClient({` in production source passes ownChainStore", () => {
     const sites: Array<{ file: string; carries: boolean }> = [];
-    for (const file of readdirSync(SRC).filter((f) => f.endsWith(".ts"))) {
+    const files = (readdirSync(SRC, { recursive: true }) as string[])
+      .filter((f) => f.endsWith(".ts") && !f.split(/[\\/]/).includes("__tests__"));
+    for (const file of files) {
       const text = readFileSync(join(SRC, file), "utf8");
       for (let i = text.indexOf("new AgentRelayClient({"); i !== -1; i = text.indexOf("new AgentRelayClient({", i + 1)) {
-        const block = text.slice(i, text.indexOf("});", i));
+        // The options object ends at the first line closing at the construction's own indentation.
+        const lineStart = text.lastIndexOf("\n", i) + 1;
+        const indent = /^\s*/.exec(text.slice(lineStart, i))![0];
+        const end = text.indexOf(`\n${indent}});`, i);
+        const block = text.slice(i, end === -1 ? undefined : end);
         sites.push({ file, carries: block.includes("ownChainStore") });
       }
     }

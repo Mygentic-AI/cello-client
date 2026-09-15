@@ -2396,12 +2396,12 @@ export class AgentRelayClient {
   async #reconnectFromAnySession(): Promise<void> {
     if (this.#reconnecting) return;
     this.#reconnecting = true;
+    const stranded = () => !this.#closed && this.#stream === null && this.#sessions.size > 0;
     await reconnectWithBackoff({
-      tryOnce: async () => { for (const { node } of this.#sessions.values()) if (await this.#ensureConnected(node)) return true; return false; },
-      shouldStop: () => this.#closed || this.#stream !== null || this.#sessions.size === 0,
-      baseMs: this.#reconnectRetryMs,
-      onScheduled: (attempt, retryInMs) => this.#logger.info("session.relay.reconnect.scheduled", { relayPeerId: this.#relayPeerId, attempt, retryInMs }),
+      relayPeerId: this.#relayPeerId, logger: this.#logger, baseMs: this.#reconnectRetryMs, shouldStop: () => !stranded(), refusal: () => this.#lastAuthRefusal,
+      connectOnce: async () => { for (const { node } of this.#sessions.values()) if (await this.#ensureConnected(node)) return true; return false; },
     }).finally(() => { this.#reconnecting = false; });
+    if (stranded()) void this.#reconnectFromAnySession(); // a reader that ended during the loop's exit saw the flag set
   }
 
   /**
