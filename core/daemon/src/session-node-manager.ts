@@ -92,6 +92,7 @@ import { type SecurityGatewayClient } from "@cello-protocol/gateway";
  * `(witness relay, session)`, so a repeated observation raises `occurrences` rather than taking
  * another slot in a bounded list.
  */
+import { mergeRelayEndpoints } from "./relay-endpoints.js"; // directory pool beats saved rows
 import { ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL, heldRelayIdsOf, PARKED_DRAIN_BACKSTOP_DEFAULT_MS, type ActiveSessionEntry, SALT_AGREEMENT_WAIT_MS, type AwaitingAckEntry, CONTENT_MAX_INBOUND_STREAMS, type ISessionNodeFactory, LEAF_FETCH_GRACE_MS, type ParkedDrainReason, type QuarantinedRecord, type RefusalNotice, type SessionImpairment, type SessionRevivalIdentity, type TranscriptEntry, type WitnessAlertNotice } from "./session-node-types.js";
 
 // Re-exported so this module's public surface is unchanged by the split: every existing
@@ -495,7 +496,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
   getSealInterruptedArtifacts(agentName: string, sessionId: string): { role: string; ownLeaf: unknown; counterpartyLeaf: unknown; merkleRoot: string; nonce: string; } | null { return this.#queries.getSealInterruptedArtifacts(agentName, sessionId); }
   getSessionsByStatus(status: "active" | "sealed" | "interrupted"): SessionRecord[] { return this.#queries.getSessionsByStatus(status); }
   recordRefusedSession(agentName: string, sessionId: string, reason: string): void { return this.#queries.recordRefusedSession(agentName, sessionId, reason); }
-  getAgentRelayEndpoints(agentName: string): Array<{ relayPeerId: string; relayAddrs: string[] }> { return this.#queries.getAgentRelayEndpoints(agentName); }
+  getAgentRelayEndpoints(agentName: string): Array<{ relayPeerId: string; relayAddrs: string[] }> { return mergeRelayEndpoints(this.#directoryRelayEndpoints.get(agentName), this.#queries.getAgentRelayEndpoints(agentName)); }
   countActiveSessionsFromUnknownSenders(agentName: string): number { return this.#queries.countActiveSessionsFromUnknownSenders(agentName); }
   getSealCertificate(agentName: string, sessionId: string): { sealed_root: string; legibility: unknown } | null { return this.#queries.getSealCertificate(agentName, sessionId); }
   setSessionName(agentName: string, sessionId: string, sessionName: string | null): boolean { return this.#queries.setSessionName(agentName, sessionId, sessionName); }
@@ -2349,7 +2350,6 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
         return this.#salts.saltStatusOf(row, row.agent_name ?? null);
       }) as unknown as SessionRecord[];
   }
-
 
   // ─── The session-lifecycle path's public surface, kept on the manager ──────────────────────
   //

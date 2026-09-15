@@ -38,6 +38,7 @@ import type { StandingReceivers } from "./standing-receivers.js";
 import type { WitnessAlerts } from "./witness-alerts.js";
 import type { SessionContentIngest } from "./session-content-ingest.js";
 import { AgentRelayClient, type RelayAuthRefusal, type RelayAssignmentCarry } from "./session-relay-client.js";
+import { mergeRelayEndpoints } from "./relay-endpoints.js";
 import {
   RELAY_QUARANTINE_MS,
   SR_RESERVATION_MAX_RETRIES,
@@ -1010,10 +1011,9 @@ export class SessionRelay {
       });
       persisted = [];
     }
-    const merged = new Map<string, { relayPeerId: string; relayAddrs: string[] }>();
-    for (const ep of [...(this.#ctx.directoryRelayEndpoints.get(agentName) ?? []), ...persisted]) {
-      if (!merged.has(ep.relayPeerId)) merged.set(ep.relayPeerId, ep);
-    }
+    const merged = new Map(
+      mergeRelayEndpoints(this.#ctx.directoryRelayEndpoints.get(agentName), persisted).map((ep) => [ep.relayPeerId, ep]),
+    );
     /**
      * DOD-M15-RELAYSLOTS-1 — **THE FAILOVER.** Skip relays that refused this agent for a fault of
      * their own (today: a relay holding no directory public key, which can verify nobody and is

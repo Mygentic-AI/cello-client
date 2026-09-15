@@ -593,7 +593,8 @@ export class SessionQueries {
   getAgentRelayEndpoints(agentName: string): Array<{ relayPeerId: string; relayAddrs: string[] }> {
     if (!this.#db) return [];
     const rows = this.#db
-      .prepare("SELECT DISTINCT relay_peer_id, relay_addrs FROM sessions WHERE agent_id = ? AND relay_peer_id IS NOT NULL")
+      // Newest first, so the first row kept per relay is its most recent address, not an arbitrary one.
+      .prepare("SELECT relay_peer_id, relay_addrs FROM sessions WHERE agent_id = ? AND relay_peer_id IS NOT NULL ORDER BY updated_at DESC")
       .all(this.#ctx.requireAgentId(agentName)) as Array<{ relay_peer_id?: string | null; relay_addrs?: string | null }>;
     const byPeer = new Map<string, { relayPeerId: string; relayAddrs: string[] }>();
     for (const row of rows) {
