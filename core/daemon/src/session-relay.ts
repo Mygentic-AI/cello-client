@@ -440,6 +440,7 @@ export class SessionRelay {
           logger: this.#ctx.logger,
           receiptStore: this.#ctx.relayReceiptStore ?? undefined,
           sealLeafStore: this.#ctx.sealLeafStore ?? undefined,
+          ownChainStore: this.#ctx.ownChainStore ?? undefined, // absent = own leaves not durably chained
           // DOD-M15-RELAYSLOTS-1: read at each auth, never snapshotted — the token expires hourly.
           onlineToken: () => this.#ctx.getDirectoryOnlineToken(agentName),
           // DOD-M15-CORROBORATE-1: a relay's witness alert reaches the operator's inbox from here.
