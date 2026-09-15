@@ -47,6 +47,7 @@ import { evaluateRelayAck, readSubmittedLeaf, type RelayReceiptStore } from "./r
 import { lastSeenFromRecord } from "./resume-last-seen.js";
 import type { SessionSealLeafStore } from "./session-seal-leaf-store.js";
 import type { SessionOwnChainStore } from "./session-own-chain-store.js";
+import { reconnectWithBackoff, RELAY_RECONNECT_BASE_MS } from "./relay-reconnect.js";
 
 /**
  * DOD-M15-AWAYSCOPE-1 — what a liveness query answers with.
@@ -426,8 +427,7 @@ export interface AgentRelayClientOpts {
    * constructed with a snapshot would work for the first hour of an agent's life and then present
    * an expired token forever, losing its slot for a reason nothing on this side reports.
    *
-   * Optional so a caller with no directory connection at all (tests of unrelated paths) still
-   * compiles; production always supplies it.
+   * Optional so a caller with no directory connection (tests of unrelated paths) compiles; production always supplies it.
    */
   onlineToken?: () => Uint8Array | undefined;
   /**
@@ -445,6 +445,8 @@ export interface AgentRelayClientOpts {
    * a session or a party.
    */
   onWitnessUnreadable?: (relayPeerId: string, why: string) => void;
+  /** First re-dial delay for a lost stream (doubles to a minute). Default `RELAY_RECONNECT_BASE_MS`. */
+  reconnectRetryMs?: number;
 }
 
 /**
@@ -699,6 +701,7 @@ export class AgentRelayClient {
   #stream: Stream | null = null;
   #connecting: Promise<boolean> | null = null;
   #closed = false;
+  #reconnectRetryMs = RELAY_RECONNECT_BASE_MS; #reconnecting = false;
   /**
    * PER-SESSION acknowledgement state (session_id hex → the position AND the content at it).
    *
@@ -824,6 +827,7 @@ export class AgentRelayClient {
     this.#onlineToken = opts.onlineToken;
     this.#onWitnessAlert = opts.onWitnessAlert;
     this.#onWitnessUnreadable = opts.onWitnessUnreadable;
+    if (opts.reconnectRetryMs !== undefined) this.#reconnectRetryMs = opts.reconnectRetryMs;
   }
 
   /** The agent's K_local public key as hex — the responder identity for auto-acknowledge. */
@@ -2377,29 +2381,27 @@ export class AgentRelayClient {
         // wait the full timeout on a dropped stream. "closed" is transient (not a directory rejection) ⇒
         // recorded stays false and it is retried after reconnect.
         { const r = this.#pendingRecord; this.#pendingRecord = null; if (r) r("closed"); }
-        // 054-SRSPLIT: settle an in-flight release too, so it does not wait its full timeout on a
-        // stream that is already gone. `false` is honest — the relay was not told.
+        // 054-SRSPLIT: settle an in-flight release too — `false`, because the relay was not told.
         { const r = this.#pendingRelease; this.#pendingRelease = null; if (r) r(false); }
         // DOD-M15-AWAYSCOPE-1: and an in-flight liveness query, so a status read does not wait its
         // whole timeout on a stream that is already gone. "unknown" is the honest answer.
         { for (const r of this.#pendingLiveness.values()) r({ liveness: "unknown", observedAt: 0 }); this.#pendingLiveness.clear(); }
-        // A pure-receiver session issues no submit, so it would never trigger a re-dial
-        // after the node that owned the stream is torn down. If sessions remain, proactively
-        // re-establish from any still-live registered session node so queued leaf_delivers
-        // are drained (the relay queues by pubkey and re-delivers on reconnect).
-        if (!this.#closed && this.#sessions.size > 0) {
-          void this.#reconnectFromAnySession();
-        }
+        // A receiving session never submits, so nothing else re-dials: reconnect so queued leaf_delivers arrive.
+        if (!this.#closed && this.#sessions.size > 0) void this.#reconnectFromAnySession();
       }
     })();
   }
 
-  /** Re-establish the shared stream from any registered session's node (first that dials). */
+  /** Re-establish the shared stream from any session's node, retrying while one depends on it — see `relay-reconnect.ts`. */
   async #reconnectFromAnySession(): Promise<void> {
-    if (this.#closed || this.#stream) return;
-    for (const { node } of this.#sessions.values()) {
-      if (await this.#ensureConnected(node)) return;
-    }
+    if (this.#reconnecting) return;
+    this.#reconnecting = true;
+    await reconnectWithBackoff({
+      tryOnce: async () => { for (const { node } of this.#sessions.values()) if (await this.#ensureConnected(node)) return true; return false; },
+      shouldStop: () => this.#closed || this.#stream !== null || this.#sessions.size === 0,
+      baseMs: this.#reconnectRetryMs,
+      onScheduled: (attempt, retryInMs) => this.#logger.info("session.relay.reconnect.scheduled", { relayPeerId: this.#relayPeerId, attempt, retryInMs }),
+    }).finally(() => { this.#reconnecting = false; });
   }
 
   /**
