@@ -82,7 +82,7 @@ import { sendDeliveryAck } from "./session-delivery-acks.js";
 import { SESSION_CLOSED_REASON, sessionClosedState } from "./session-closed.js";
 import { StandingReceivers } from "./standing-receivers.js";
 import { RelayReceiptStore } from "./relay-receipt-store.js";
-import { SessionSealLeafStore } from "./session-seal-leaf-store.js";
+import { SessionSealLeafStore } from "./session-seal-leaf-store.js"; import { storeRecoveredSealLeaf } from "./recovered-seal-leaf.js";
 import { SessionOwnChainStore } from "./session-own-chain-store.js";
 import type { SealFrontierLeaf } from "./seal-frontier-verify.js";
 import { type SecurityGatewayClient } from "@cello-protocol/gateway";
@@ -1121,7 +1121,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       getSessionRecord: (a, sid) => this.#queries.getSessionRecord(a, sid),
       getSealCarry: (pk, sid) => this.#seal.getSealCarry(pk, sid),
       getSessionTree: (a, sid) => this.getSessionTree(a, sid),
-      recordOrderingRecord: (a, sid, s1, s2, h, cid) => this.recordOrderingRecord(a, sid, s1, s2, h, cid),
+      recordOrderingRecord: (a, sid, s1, s2, h, cid, kind) => this.recordOrderingRecord(a, sid, s1, s2, h, cid, kind),
       ingestReceivedContent: (a, sid, c, h, cid, seq, alg) => this.ingestReceivedContent(a, sid, c, h, cid, seq, alg),
       witnessReceivedLeaf: (a, sid, h, s1, sig, kind, cid) => this.#contentIn.witnessReceivedLeaf(a, sid, h, s1, sig, kind, cid),
       noteAcknowledgeable: (a, sid, seq, h) => this.#contentIn.noteAcknowledgeable(a, sid, seq, h),
@@ -2776,19 +2776,19 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     structure2Cbor: Uint8Array,
     contentHash: Uint8Array,
     correlationId?: string,
-    // DOD-FRONTIER-STRAND-1 AC1: returns the verified canonical position (null when the record is
-    // absent, malformed, or not signed by this session's counterparty) so the park-recovery caller
-    // can key dedup on the position rather than on the content hash.
+    leafKind = 0, // the parked envelope's own kind; absent on pre-v4 envelopes, which were messages
+    // DOD-FRONTIER-STRAND-1 AC1: returns the verified canonical position (null when absent, malformed, or not
+    // signed by this session's counterparty) so the park-recovery caller can key dedup on position, not hash.
   ): number | null {
-    // DOD-M15-FRAME-1: the POSITION only, deliberately — this path does not act on `fatal`, and the
-    // reason is that its identity proof is somewhere else and is already fail-closed. Parked content
-    // arrives inside a sealed envelope carrying the sender's signature over
-    // (session_id, recipient_pubkey, content_hash), and recovery already refuses a missing, bad, or
-    // wrong-signer envelope. Adding a second, weaker refusal here on the ordering record would gate
-    // mail retrieval on a record the relay-degraded path is allowed to omit, which is the
-    // false-positive shape this unit is careful to avoid. The live direct path is where the ordering
-    // record IS the proof, and that is where `fatal` is consumed.
-    return this.#refusals.recordFrameOrdering(agentName, sessionId, structure1Cbor, structure2Cbor, contentHash, correlationId, "park").seq;
+    // DOD-M15-FRAME-1: the POSITION only — this path does not act on `fatal`, because its identity proof is
+    // elsewhere and already fail-closed: the sealed envelope carries the sender's signature over
+    // (session_id, recipient_pubkey, content_hash), and a missing, bad, or wrong-signer envelope is refused.
+    // A second refusal on the ordering record would gate mail on a record the relay-degraded path may omit.
+    // The live direct path is where the ordering record IS the proof, and that is where `fatal` is consumed.
+    const seq = this.#refusals.recordFrameOrdering(agentName, sessionId, structure1Cbor, structure2Cbor, contentHash, correlationId, "park").seq;
+    const pk = this.#queries.ownPubkeyHex(agentName); // a verified position becomes a durable seal leaf — see recovered-seal-leaf.ts
+    if (seq !== null && pk && this.#db) storeRecoveredSealLeaf({ store: (this.#sealLeafStore ??= new SessionSealLeafStore(this.#db, this.#logger)), logger: this.#logger, agentPubkeyHex: pk, sessionId, canonicalSeq: seq, leafKind, structure1Cbor, structure2Cbor });
+    return seq;
   }
 
   /**

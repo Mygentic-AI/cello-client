@@ -351,6 +351,37 @@ describe("DOD-MSG-4: ordering-record verification is adversarially exercised", (
     expect(mgr.getSessionTree("alice", sid).size()).toBe(1);
   });
 
+  /**
+   * Live 2026-09-15: a laptop slept while the counterparty sent two messages. The relay's
+   * `leaf_deliver` frames went onto the dead connection, so the only copy that reached this side was
+   * the mailbox one — whose ordering record was verified and then kept only in memory. No seal-leaf
+   * row was written, so the seal answer could not place either message and reported a mismatch.
+   */
+  it("★★★ a VERIFIED mailbox ordering record is kept as the counterparty's seal leaf at its relay position", async () => {
+    const kp = generateKeypair();
+    const mgr = await managerWithCounterparty(kp, "sealleaf.db");
+    const cpHex = Buffer.from(await kp.getPublicKey()).toString("hex");
+    const rec = await buildRecord(kp, enc("sent while asleep"), 1);
+    mgr.recordOrderingRecord("alice", sid, rec.structure1Cbor, rec.structure2Cbor, rec.contentHash, undefined, 0);
+    const rows = mgr.getDb()
+      .prepare("SELECT sequence_number AS seq, leaf_kind AS kind, sender_pubkey_hex AS sender, relay_signature AS sig FROM session_seal_leaves WHERE session_id = ?")
+      .all(sid) as Array<{ seq: number; kind: number; sender: string; sig: string | null }>;
+    expect(rows, "the verified position must survive beyond this process's memory").toEqual([
+      { seq: 1, kind: 0, sender: cpHex, sig: null },
+    ]);
+  });
+
+  it("an UNVERIFIED mailbox ordering record writes no seal leaf", async () => {
+    const kp = generateKeypair();
+    const mgr = await managerWithCounterparty(kp, "sealleaf-bad.db");
+    const rec = await buildRecord(kp, enc("forged"), 1, { corruptSig: true });
+    mgr.recordOrderingRecord("alice", sid, rec.structure1Cbor, rec.structure2Cbor, rec.contentHash, undefined, 0);
+    const db = mgr.getDb();
+    const hasTable = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_seal_leaves'").get() !== undefined;
+    const n = hasTable ? (db.prepare("SELECT COUNT(*) AS n FROM session_seal_leaves WHERE session_id = ?").get(sid) as { n: number }).n : 0;
+    expect(n, "a record that failed verification must not become evidence").toBe(0);
+  });
+
   it("BAD SIGNATURE is REJECTED — no ordering recorded, bad_signature warn, content still delivered (fail-closed, no loss)", async () => {
     const kp = generateKeypair();
     const mgr = await managerWithCounterparty(kp, "badsig.db");

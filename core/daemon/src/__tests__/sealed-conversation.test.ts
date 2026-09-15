@@ -191,4 +191,34 @@ describe("readSealedConversation", () => {
     ]);
     expect(out.root_matches_my_transcript).toBe(false);
   });
+
+  /**
+   * Live 2026-09-15: the Mac slept while its counterparty sent two messages. The relay wrote both
+   * `leaf_deliver` frames onto the dead connection, so no relay acknowledgement ever reached the Mac,
+   * and the text arrived later from the mailbox. The answer then listed both as unnumbered and
+   * reported `root_matches_my_transcript: false` on a conversation that sealed correctly.
+   */
+  it("★★★ numbers a message known only from its signed seal leaf, with no relay acknowledgement, and the root matches", () => {
+    const m1 = h("before sleep"), m2 = h("sent while asleep"), m3 = h("after wake"), c1 = h("c1");
+    message(0, "sent", m1, "before sleep");
+    message(1, "received", m2, "sent while asleep");
+    message(2, "sent", m3, "after wake");
+    receipt(1, m1, A, 0);
+    // Recovered from the mailbox: the signed leaf is stored, the relay acknowledgement never arrived.
+    sealLeaves.store(A, SID, {
+      sequenceNumber: 2, leafKind: 0, senderPubkeyHex: B,
+      structure2Cbor: new Uint8Array([1]), structure1Cbor: s1(m2, B),
+    }, 0);
+    receipt(3, m3, A, 0);
+    receipt(4, c1, A, 2);
+    const out = read(rootOf([m1, m2, m3, c1]));
+    expect(out.leaves.map((l) => [l.seq, l.kind, l.from, l.text ?? null, l.relay_ack])).toEqual([
+      [1, "message", "Alice", "before sleep", "relaysig1"],
+      [2, "message", "Bob", "sent while asleep", null],
+      [3, "message", "Alice", "after wake", "relaysig3"],
+      [4, "close", "Alice", null, "relaysig4"],
+    ]);
+    expect(out.root_mismatch_reason).toBeUndefined();
+    expect(out.root_matches_my_transcript).toBe(true);
+  });
 });
