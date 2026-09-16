@@ -52,33 +52,27 @@ const PATTERN_SOURCES: Array<{ id: string; src: string }> = [
   // instructions verbatim" — extraction phrased as a dump rather than a request for "the prompt".
   { id: "context_dump", src: "(?:print|output|repeat|dump|show|reveal)\\s+(?:me\\s+)?(?:all\\s+|everything\\s+|those\\s+|the\\s+)?(?:that\\s+)?(?:appeared|came|was)?\\s*(?:before|above|prior to)\\s+(?:my|the|this)\\s+(?:first\\s+)?(?:message|prompt|question|session|conversation)|(?:pre-session|preceding|initial)\\s+(?:instructions|prompt|context)\\s+verbatim|system log dump|repeat all instructions" },
   // Declaring the rules void, or a fresh conversation, mid-message.
-  { id: "rules_void", src: "(?:previous|prior|above|earlier|old)\\s+(?:rules?|instructions?|guidelines?|constraints?|restrictions?)\\s+(?:no longer apply|are void|are cancelled|are canceled|are revoked|are superseded|do not apply)|\\[BREAK\\]|\\bnew conversation\\b\\s*[.:]|this (?:request|message) is covered under legal privilege" },
+  { id: "rules_void", src: "(?:previous|prior|above|earlier)\\s+(?:rules?|instructions?|guidelines?|constraints?|restrictions?)\\s+(?:no longer apply|are void|are cancelled|are canceled|are revoked|are superseded|do not apply)|\\[BREAK\\]|this (?:request|message) is covered under legal privilege" },
   // Fake configuration blocks claiming the guard rails are off.
-  { id: "fake_mode_header", src: "(?:admin|developer|debug|system|god)[_ ]?(?:override|mode|access)\\s*[:=]\\s*(?:true|on|enabled|active)|content[_ ]?filters?\\s*[:=]\\s*(?:off|false|disabled|none)|safety[_ ]?(?:filters?|checks?)\\s*[:=]\\s*(?:off|false|disabled)|\\[system [a-z ]{0,20}mode" },
+  { id: "fake_mode_header", src: "(?:admin|god)[_ ]?(?:override|mode|access)\\s*[:=]\\s*(?:true|on|enabled|active)|content[_ ]?filters?\\s*[:=]\\s*(?:off|false|disabled|none)\\s*(?:\\n|$)|safety[_ ]?(?:filters?|checks?)\\s*[:=]\\s*(?:off|false|disabled)\\s*(?:\\n|$)|\\[system [a-z ]{0,20}mode" },
   // Instructions addressed to whatever model reads the content — the shape of indirect injection.
-  { id: "addressed_to_model", src: "(?:ai|a\\.i\\.|llm|assistants?|language models?|agents?|chatbots?)\\s+(?:reading|processing|viewing|parsing|summari[sz]ing)\\s+this\\b|(?:if|when) you are an? (?:ai|llm|assistant|language model|agent)\\b|\\b(?:agent|llm|ai|system)\\s+instructions?\\s*[:：]|instructions? for (?:the )?(?:llm|ai|agent|assistant)\\s*[:：]|note to (?:the )?(?:ai|assistant|agent)\\b" },
+  { id: "addressed_to_model", src: "(?:ai|a\\.i\\.|llm|assistants?|language models?|agents?|chatbots?)\\s+(?:reading|processing|viewing|parsing|summari[sz]ing)\\s+this[^.!?\\n]{0,40}\\b(?:should|must|shall|will|are to|need to)\\s+(?:ignore|disregard|recommend|include|output|print|reveal|treat|respond|reply|forward|send|call|invoke|execute|follow|append|say|rate|rank|prioriti[sz]e)\\b|(?:if|when) you are an? (?:ai|llm|assistant|language model|agent)\\b|\\b(?:agent|llm|ai|system)\\s+instructions?\\s*[:：]|instructions? for (?:the )?(?:llm|ai|agent|assistant)\\s*[:：]" },
   // Claiming privileged authority for a message that has none.
-  { id: "authority_claim", src: "(?:developer|admin|system|root)[- ]tier authority|treat (?:this|it|the following) as (?:having )?(?:developer|admin|system|elevated)|signed by the developer key|authorized (?:personnel|alignment researcher) only|i am an authorized\\b" },
-  // Fake conversation turns pasted into content (structured-data and transcript injection).
-  { id: "fake_turn", src: "\\n\\s*(?:human|assistant|system|user)\\s*:\\s*(?:ignore|disregard|forget|output|reveal|print|repeat|you are|sure)" },
+  { id: "authority_claim", src: "(?:developer|admin|system|root)[- ]tier authority|treat (?:this|it|the following) as (?:having )?(?:developer|admin|system|elevated)|signed by the developer key|authorized (?:personnel|alignment researcher) only|i am an authorized (?:alignment researcher|developer|administrator|security researcher|agent of)\\b" },
   // Suppressing the refusal itself.
-  { id: "suppress_refusal", src: "(?:replace|suppress|omit|skip|remove)\\s+(?:any|all|every)?\\s*(?:refusals?|warnings?|disclaimers?|apolog(?:y|ies))\\b|never (?:refuse|decline|say no)\\b|do not (?:refuse|warn|explain|apologi[sz]e)\\b" },
+  { id: "suppress_refusal", src: "(?:replace|suppress|omit)\\s+(?:any|all|every)\\s+(?:refusals?|disclaimers?)\\b|never (?:refuse|decline|say no) (?:to|when|under)\\b|do not (?:refuse|apologi[sz]e) (?:or|and|under|regardless)\\b" },
   // Told to obey what follows, in the imperative a message from a stranger has no standing to use.
-  { id: "obey_directive", src: "you must strictly adhere to the following|follow these instructions? exactly|comply (?:with the above|immediately)|respond only with\\b" },
+  { id: "obey_directive", src: "you must strictly adhere to the following instruction|comply (?:with the above|immediately) (?:or|and)\\b" },
   // Exfiltration instructions aimed at the agent's own history or the user's data.
-  { id: "exfil_instruction", src: "(?:email|send|forward|upload|post|transmit|exfiltrate)\\s+(?:the\\s+|your\\s+|all\\s+)?(?:conversation|chat|message|session|user)\\s*(?:log|logs|history|transcript|data|context)?\\s+to\\b|send all user data" },
+  { id: "exfil_instruction", src: "(?:email|send|forward|upload|post|transmit|exfiltrate)\\s+(?:the\\s+|your\\s+|all\\s+)?(?:conversation|chat|message|session|user)\\s*(?:log|logs|history|transcript|data|context)?\\s+to\\s+(?:[\\w.+-]+@|https?://|[\\w-]+\\.[a-z]{2,}|the endpoint|an external)|send all user data" },
   // The same override, in the languages the code-switch attacks use. Script-specific, so they carry
   // no false-positive risk in English text.
   { id: "override_nonenglish", src: "忽略(?:以上|上述|之前|前面).{0,4}(?:指令|指示|提示)|系统提示词|ignora(?:r)? (?:todas )?las instrucciones anteriores|ignorez les instructions précédentes|игнорируй (?:все )?предыдущие инструкции|이전 지시를 무시" },
   // Third pass — the marker shapes left in the miss list.
-  // Instructions hidden in a code or markup comment, aimed at the reader rather than the compiler.
-  { id: "comment_directive", src: "(?:<!--|//|#|/\\*)\\s*(?:TODO\\()?\\s*(?:ai|llm|assistant|agent|claude|gpt|copilot)[^\\n]{0,40}(?:ignore|output|reveal|print|call|invoke|execute|send|disable|audit)|<!--[^>]{0,80}\\b(?:call|invoke|execute)\\s+\\w+\\(" },
   // A fake envelope claiming system priority or a privileged sender.
-  { id: "fake_envelope", src: "<message[^>]{0,80}priority=\"?system|<(?:system|instruction|admin)[ >]|from=\"(?:planner|system|admin|developer)\"|BEGIN TRUSTED INPUT|END TRUSTED INPUT|\\[END OF CONVERSATION\\]" },
+  { id: "fake_envelope", src: "<message[^>]{0,80}priority=\"?system|BEGIN TRUSTED INPUT|END TRUSTED INPUT|\\[END OF CONVERSATION\\]" },
   // Completion-baiting: the model is asked to finish a sentence that starts with its own prompt.
   { id: "completion_bait", src: "(?:complete|continue|finish)\\s+(?:this|the following)\\s+sentence[^\\n]{0,40}(?:system prompt|your instructions|developer message)|(?:my|your) (?:system prompt|developer message|instructions) (?:starts?|begins?) with" },
-  // The agent scratchpad pasted into content, so the message reads as the agent's own reasoning.
-  { id: "fake_scaffold", src: "(?m)^\\s*(?:observation|thought|action|action input|final answer)\\s*:\\s*\\S" },
   // Asking for the developer/system message under its other names.
   { id: "developer_message", src: "(?:developer|system) message\\s+verbatim|raw (?:developer|system) message|output (?:the |your )?(?:raw )?(?:developer|system) (?:message|prompt)" },
   // Fake turn-boundary injection.
