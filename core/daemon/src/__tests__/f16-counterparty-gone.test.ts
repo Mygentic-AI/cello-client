@@ -64,6 +64,40 @@ const SID_BYTES = Uint8Array.from(Array.from({ length: 16 }, (_, i) => i + 81));
 const SID_HEX = Buffer.from(SID_BYTES).toString("hex");
 const TS = 1_700_000_000_000;
 
+/**
+ * The primer is a PRECONDITION, and it has to WAIT for one rather than assert it is already met.
+ *
+ * `establishSession()` returning means the link is alive; it does not mean a message can be sent.
+ * The content-key exchange and the first content stream settle independently of it, so the earliest
+ * send can still be refused — `content_key` before the key is agreed, `session_stream_unavailable`
+ * before the stream opens. Both are invisible on a laptop and wide enough to matter on a loaded CI
+ * runner: this file passed locally and failed in CI on identical code twice (the v0.0.301 and
+ * v0.0.310 tag runs), which is the shape that gets mislabelled as flakiness.
+ *
+ * A failed attempt is a real failed send, so it leaves its own impairment and refusal notice behind.
+ * Those belong to the precondition, not to the case under test — the tests below count the notices
+ * the INJECTED fault produces — so a successful primer clears them. Nothing is swallowed: if no
+ * attempt ever succeeds the test fails, carrying the last answer.
+ */
+async function primeSession(
+  client: Awaited<ReturnType<typeof connectToDaemon>>,
+  snm: { dismissContentRefusals: (agentName: string, sessionId: string) => number },
+): Promise<void> {
+  let last: Record<string, unknown> = {};
+  for (let attempt = 0; attempt < 40; attempt++) {
+    last = (await client.send("cello_send", {
+      session_id: SID_HEX, content: "primer — proves the content key is established", signal: "over",
+    })) as Record<string, unknown>;
+    if (last.ok === true) {
+      // Only the attempts BEFORE this one can have left anything, and only if there were any.
+      if (attempt > 0) snm.dismissContentRefusals("alice", SID_HEX);
+      return;
+    }
+    await wait(50);
+  }
+  expect.fail(`the primer send never succeeded, so no message can be sealed on this session: ${JSON.stringify(last)}`);
+}
+
 describe("M8B F16: counterparty-gone surfaces on cello_receive and cello_status", () => {
   let tempDir: string;
   let priorCelloEnv: string | undefined;
@@ -287,15 +321,9 @@ describe("M8B F16: counterparty-gone surfaces on cello_receive and cello_status"
     const { A, clientA, clientB } = await establishSession();
     try {
       const snm = A.getSessionNodeManager();
-      // PRIMER FIRST — the same precondition the delivery_impaired test below spells out. Session
-      // setup and the content-key exchange finish independently; a send issued before the key is
-      // agreed fails as `content_key` WITHOUT opening a stream, so the injected fault is never
-      // consumed and lands on the next send instead. Measured in CI on the v0.0.301 tag run: the
-      // recovery send failed `session_stream_unavailable`.
-      const primer = (await clientA.send("cello_send", {
-        session_id: SID_HEX, content: "primer — proves the content key is established", signal: "over",
-      })) as Record<string, unknown>;
-      expect(primer.ok, `the primer send must succeed: ${JSON.stringify(primer)}`).toBe(true);
+      // PRIMER FIRST — see `primeSession`. The injected fault must land on a send that reaches the
+      // transport, and a send issued before the content key is agreed never gets that far.
+      await primeSession(clientA, snm);
       snm.injectSendFault(1);
       await clientA.send("cello_send", { session_id: SID_HEX, content: "does not land", signal: "over" });
 
@@ -337,15 +365,9 @@ describe("M8B F16: counterparty-gone surfaces on cello_receive and cello_status"
     const { A, clientA, clientB } = await establishSession();
     try {
       const snm = A.getSessionNodeManager();
-      // PRIMER FIRST — the same precondition the delivery_impaired test below spells out. Session
-      // setup and the content-key exchange finish independently; a send issued before the key is
-      // agreed fails as `content_key` WITHOUT opening a stream, so the injected fault is never
-      // consumed and lands on the next send instead. Measured in CI on the v0.0.301 tag run: the
-      // recovery send failed `session_stream_unavailable`.
-      const primer = (await clientA.send("cello_send", {
-        session_id: SID_HEX, content: "primer — proves the content key is established", signal: "over",
-      })) as Record<string, unknown>;
-      expect(primer.ok, `the primer send must succeed: ${JSON.stringify(primer)}`).toBe(true);
+      // PRIMER FIRST — see `primeSession`. The count asserted at the end is the number of messages
+      // the INJECTED fault destroyed, so the precondition must not contribute to it.
+      await primeSession(clientA, snm);
       snm.injectSendFault(1);
       await clientA.send("cello_send", { session_id: SID_HEX, content: "does not land", signal: "over" });
       if (snm.getSessionImpairment("alice", SID_HEX)?.retained !== "lost") return; // covered above
@@ -387,11 +409,8 @@ describe("M8B F16: counterparty-gone surfaces on cello_receive and cello_status"
       //
       // A send that SUCCEEDS proves the key is there, using only the public API. Waiting on an
       // internal accessor instead would have meant growing the session-node-manager god file past
-      // its line ratchet, which exists precisely to stop that.
-      const primer = (await clientA.send("cello_send", {
-        session_id: SID_HEX, content: "primer — proves the content key is established", signal: "over",
-      })) as Record<string, unknown>;
-      expect(primer.error, `the primer send must succeed, or the transport stage is unreachable (got ${JSON.stringify(primer)})`).toBeUndefined();
+      // its line ratchet, which exists precisely to stop that. `primeSession` waits for it.
+      await primeSession(clientA, A.getSessionNodeManager());
 
       // One real failed send over a real connection — the fault is injected after the stream opens,
       // so libp2p fires no disconnect and the old code left this session reporting `alive`.
