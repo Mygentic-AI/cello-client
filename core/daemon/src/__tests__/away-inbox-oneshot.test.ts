@@ -44,6 +44,10 @@ function makeHarness(opts: {
   awayAcked?: boolean;
   status?: SessionRecord["status"];
   diverged?: boolean;
+  /** A send from this side is on the wire — spoken, but not yet in the transcript. */
+  sendInFlight?: boolean;
+  /** A send went out and its transcript row did not land. */
+  sentRowHole?: boolean;
 }): Harness {
   const sent: string[] = [];
   const events: string[] = [];
@@ -73,11 +77,18 @@ function makeHarness(opts: {
   };
 
   const awayAckSent = new Set<string>();
-  if (opts.awayAcked !== false) awayAckSent.add(`${AGENT}:${SID}:request`);
+  if (opts.awayAcked !== false) awayAckSent.add(`${AGENT}:${SID}:greeted`);
 
   const deps: AwayInboxOneshotDeps = {
     logger,
     sessionNodeManager: manager,
+    sendClaims: {
+      claim() {}, release() {},
+      claimedAt: () => (opts.sendInFlight ? 1 : undefined),
+      held: () => opts.sendInFlight ?? false,
+      noteRowMissing() {},
+      rowMissing: () => opts.sentRowHole ?? false,
+    },
     awayAckSent,
     keyProviders: new Map(),
     sealKey: (a, s) => `${a}:${s}`,
@@ -170,6 +181,34 @@ describe("DOD-INBOX-ONESHOT-1: an away inbox accepts one message, then closes it
     const h = makeHarness({ received: ["a message in an ordinary conversation"], awayAcked: false });
     await h.close(AGENT, SID);
     expect(h.sent, "the away reply is what promises one message per visit; without it there is no promise").toEqual([]);
+    expect(h.sealSubmits).toBe(0);
+  });
+
+  /**
+   * THE WORST OUTCOME AVAILABLE HERE, and the transcript cannot see it. An outbound row is written
+   * AFTER the send resolves, so for the whole round trip of an operator's reply a human has spoken
+   * and `weSpoke` reads false. Closing there seals a conversation someone is mid-sentence in.
+   */
+  it("★★★ a reply ON THE WIRE counts as spoken — the visit is not closed under an operator's send", async () => {
+    const h = makeHarness({ received: ["their message"], sendInFlight: true });
+    await h.close(AGENT, SID);
+    expect(h.sent, "the transcript has no row for it yet, and that is not the same as silence").toEqual([]);
+    expect(h.sealSubmits).toBe(0);
+    expect(h.events).toContain("session.away.inbox.oneshot.skipped_send_in_flight");
+  });
+
+  it("★★★ a session whose SENT ROW failed to write is 'cannot tell', never 'nobody spoke'", async () => {
+    const h = makeHarness({ received: ["their message"], sentRowHole: true });
+    await h.close(AGENT, SID);
+    expect(h.sent, "this side said something the transcript cannot show — only one of those answers may end a session").toEqual([]);
+    expect(h.sealSubmits).toBe(0);
+    expect(h.events).toContain("session.away.inbox.oneshot.skipped_unreadable_record");
+  });
+
+  it("★★ a session that is no longer ACTIVE is left alone", async () => {
+    const h = makeHarness({ received: ["their message"], status: "sealed" as SessionRecord["status"] });
+    await h.close(AGENT, SID);
+    expect(h.sent).toEqual([]);
     expect(h.sealSubmits).toBe(0);
   });
 

@@ -58,6 +58,7 @@ import { documentsEnabled } from "./document-flag.js";
 import { createSignalingWiring } from "./signaling-wiring.js";
 import { createAttendanceWiring } from "./attendance-wiring.js";
 import { createAwayInboxOneshot } from "./away-inbox-oneshot.js";
+import { createSendClaims } from "./send-claims.js";
 import { startBootCore } from "./boot-core.js";
 import { startBootAgents } from "./boot-agents.js";
 import { startBootConnectionState } from "./boot-connection-state.js";
@@ -334,10 +335,9 @@ async function startDaemonHoldingLock(
   // wiring used to hold — it can no longer initiate a seal at all, which is the point.
   const { attendanceCount, sendAwayResponse, backgroundSeals, awayAckSent } =
     createAttendanceWiring({ logger, sessionNodeManager, perConnectionState, securityGateway });
-
-  // DOD-INBOX-ONESHOT-1: enforcing what the away reply promised. Its own file — that one answers the
-  // door, this one ends the call; merging them is how both were deleted together.
-  const { closeInboxIfIgnored } = createAwayInboxOneshot({ logger, sessionNodeManager, awayAckSent,
+  // DOD-INBOX-ONESHOT-1 enforces what the away reply promised, in its own file — merging it with the
+  // greeting is how both were deleted together. `sendClaims` is shared with cello_send.
+  const sendClaims = createSendClaims();  const { closeInboxIfIgnored } = createAwayInboxOneshot({ logger, sessionNodeManager, awayAckSent, sendClaims,
     keyProviders, sealKey, sealInterruptedInProgress, pendingSealWaiters, pendingUnilateralWaiters, sendOver, handleActiveSealFlow });
 
   // M8C-TGDOOR-1: the Telegram doorbell (telegram-doorbell.ts). Content-free by construction — the
@@ -902,6 +902,7 @@ async function startDaemonHoldingLock(
     sessionNodeManager,
     securityGateway,
     retryQueue,
+    sendClaims,
     getConnState: (connectionId) => perConnectionState.get(connectionId),
     resolveCurrentAgent,
     NO_CURRENT_AGENT_RESPONSE,
@@ -993,8 +994,7 @@ async function startDaemonHoldingLock(
     // MONIKER-4 AC2: the message doorbell names the sender the same way the session doorbell does.
     notificationDispatcher.dispatchCelloMessage(agentName, sessionId, senderPubkey, resolveWho(agentName, senderPubkey, sessionId));
     // DOD-M15-AWAYSCOPE-1 — THE AWAY GREETING FIRED HERE and took a leaf no seal could certify; it is
-    // NOT coming back. DOD-INBOX-ONESHOT-1 is the half deleted with it: the away text promises "one
-    // message per visit" and nothing enforced it. See away-inbox-oneshot.ts.
+    // NOT coming back. DOD-INBOX-ONESHOT-1 is the half deleted with it. See away-inbox-oneshot.ts.
     void closeInboxIfIgnored(agentName, sessionId);
     // M8C-TGDOOR-1: message-waiting — coalesced (ring-once-until-read) inside sendTelegramDoorbell.
     void sendTelegramDoorbell(agentName, sessionId, "message_waiting", "New message waiting");

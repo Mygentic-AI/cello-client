@@ -37,6 +37,19 @@
  * — suppress a machine answering a machine — is the correct one. The broad rule ("never notarize a
  * session where we only sent away traffic") was tried and reverted: it also disabled closing the
  * inbox on a real caller who ignores the instruction, which is the behaviour this file exists for.
+ *
+ * ⚠️ `isOwnAwayAutoReply`, NOT the marker alone. The marker only catches a marker-aware peer; the
+ * recogniser's LEGACY branch also catches this daemon's older default wording, which is what an
+ * un-upgraded CELLO agent still sends. Two away agents on mixed versions sealing a conversation
+ * nobody had is `DOD-AWAY-MUTUAL-SEAL-1`, and it became reachable again the moment this file could
+ * seal. Its documented limit stands: an old peer with a CONFIGURED away message is unmatched.
+ *
+ * ⚠️ THE MARKER IS TEXT, SO IT IS ADVISORY — say it rather than imply a rule. It is a token at the
+ * front of the message body, not a signed frame field, so any caller who types it is never counted
+ * and never closed on. What that buys them is the PRE-FIX behaviour: the session stays open until
+ * the operator returns. It buys them no leaf, no seal, no reply and nothing this side would not
+ * otherwise have given them. Closing that off means carrying the flag in the frame beside the text,
+ * which is a wire change on both sides and is not worth it for an opt-out into waiting longer.
  */
 import { randomUUID } from "node:crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
@@ -44,10 +57,11 @@ import type { Logger, SessionRecord } from "./types.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { ActiveSealResult } from "./seal-flows.js";
 import type { SealCompletion, UnilateralResult } from "./seal-coordinator.js";
-import { markAsAutoReply, isAutoReplyMarked } from "./away-detection.js";
+import { markAsAutoReply, isOwnAwayAutoReply } from "./away-detection.js";
 import { isLocalCredentialRefusal, LEAF_KIND_MSG } from "./session-relay-client.js";
 import { sentAuthorship } from "./session-content-handlers.js";
 import { escalateToUnilateralSeal as runUnilateralEscalation, UNILATERAL_SEAL_TIMEOUT_MS } from "./seal-escalation.js";
+import type { SendClaims } from "./send-claims.js";
 
 /** The one line this file ever sends. Marked as machine-generated; [[WRAP]] stays at the END. */
 const ONESHOT_REJECT_TEXT = "This inbox only accepts one message per visit. Closing. [[WRAP]]";
@@ -55,6 +69,14 @@ const ONESHOT_REJECT_TEXT = "This inbox only accepts one message per visit. Clos
 export interface AwayInboxOneshotDeps {
   logger: Logger;
   sessionNodeManager: SessionNodeManager;
+  /**
+   * Sends on the wire right now — the half `weSpoke` cannot see.
+   *
+   * An outbound transcript row is written AFTER the send resolves, so for the whole round trip of
+   * an operator's reply there is a human speaking and no record of it. Reading `weSpoke` in that
+   * window answers "nobody spoke here" about a live conversation, and this path is terminal.
+   */
+  sendClaims: SendClaims;
   /**
    * The away wiring's own guard set, shared rather than copied: this file must fire only for a
    * session that was ACTUALLY told "one message per visit", and that set is what records it. It
@@ -76,7 +98,7 @@ export function createAwayInboxOneshot(deps: AwayInboxOneshotDeps): {
   closeInboxIfIgnored: (agentName: string, sessionId: string) => Promise<void>;
 } {
   const {
-    logger, sessionNodeManager, awayAckSent, keyProviders,
+    logger, sessionNodeManager, sendClaims, awayAckSent, keyProviders,
     sealKey, sealInterruptedInProgress, pendingSealWaiters, pendingUnilateralWaiters,
     sendOver, handleActiveSealFlow,
   } = deps;
@@ -100,14 +122,14 @@ export function createAwayInboxOneshot(deps: AwayInboxOneshotDeps): {
       if (m.direction === "sent") {
         // ANYTHING of ours that is not the greeting means a human spoke here. See `weSpoke` at the
         // call site: it is the line between an answering machine and a conversation.
-        if (!isAutoReplyMarked(m.text)) weSpoke = true;
+        if (!isOwnAwayAutoReply(m.text)) weSpoke = true;
         continue;
       }
       if (m.direction !== "received") continue;
       // `latest` is the last thing they sent WHATEVER it was, because the auto-reply case is a
       // decision this makes (never answer a machine), not one it can make by never seeing it.
       latest = m.text;
-      if (isAutoReplyMarked(m.text)) continue;
+      if (isOwnAwayAutoReply(m.text)) continue;
       theirCount += 1;
     }
     return { theirCount, latest, weSpoke };
@@ -117,14 +139,18 @@ export function createAwayInboxOneshot(deps: AwayInboxOneshotDeps): {
     /**
      * THIS IS THE AWAY CASE AND ONLY THE AWAY CASE — the session was answered by the machine at the
      * door, because nobody was at the desk OR because this caller's tier says do not engage (a
-     * private agent, which IS attended and still away). The greeting having been sent for THIS
-     * session is what says so, and it is why attendance is not consulted here: the tier case would
-     * fail an attendance test while being exactly the case this exists for.
+     * private agent, which IS attended and still away). The greeting having REACHED the caller is
+     * what says so, and it is why attendance is not consulted here: the tier case would fail an
+     * attendance test while being exactly the case this exists for.
+     *
+     * ⚠️ `:greeted`, NEVER `:request`. The latter is set before the send and stays set when the
+     * outbound screen blocks the greeting — so keying on it would close a visit on a caller who was
+     * never told the rule they are being held to.
      *
      * A conversation that was under way when someone dropped is a DIFFERENT case with its own
      * machinery (recovery and the relay mailbox). Nothing here may reach it — see `weSpoke`.
      */
-    if (!awayAckSent.has(`${agentName}:${sessionId}:request`)) return;
+    if (!awayAckSent.has(`${agentName}:${sessionId}:greeted`)) return;
 
     const rejectedKey = `${agentName}:${sessionId}:rejected`;
     if (awayAckSent.has(rejectedKey)) return;
@@ -143,11 +169,29 @@ export function createAwayInboxOneshot(deps: AwayInboxOneshotDeps): {
      * closing it destroys nothing.
      */
     if (weSpoke) return;
+    // A send whose transcript row failed is a message this side made that the transcript cannot
+    // show. "Cannot tell" is not "nobody spoke", and only one of those may end a session.
+    if (sendClaims.rowMissing(agentName, sessionId)) {
+      logger.warn("session.away.inbox.oneshot.skipped_unreadable_record", {
+        agentName, sessionId,
+        impact: "this side sent something the transcript does not hold, so whether a human spoke here cannot be decided — the visit is left open",
+      });
+      return;
+    }
+    // AND the same question for a reply that is on the wire but not yet on disk. Without this, the
+    // window between `sendContent` resolving and its transcript row being written reads as silence.
+    if (sendClaims.held(agentName, sessionId)) {
+      logger.info("session.away.inbox.oneshot.skipped_send_in_flight", {
+        agentName, sessionId,
+        impact: "a reply from this side is on the wire, so this is a conversation — the visit is not closed",
+      });
+      return;
+    }
     // THE ARRIVAL ITSELF IS A MACHINE'S: never answered, never counted, and checked before the
     // count so two away agents cannot reach the seal below by trading greetings.
-    if (isAutoReplyMarked(latest)) {
+    if (isOwnAwayAutoReply(latest)) {
       logger.info("session.away.mutual.skipped", {
-        agentName, sessionId, matched: "marker",
+        agentName, sessionId,
         impact: "no one-shot close — two away agents must not notarize a conversation nobody had",
       });
       return;
@@ -205,6 +249,19 @@ export function createAwayInboxOneshot(deps: AwayInboxOneshotDeps): {
      * diverged record; this autonomous path must too, and the LOG is its whole surface because
      * there is no caller awaiting an answer.
      */
+    /**
+     * ASKED AGAIN, BECAUSE THE SEND ABOVE TOOK A ROUND TRIP. The checks at entry were true when the
+     * caller's message arrived; an operator who started replying during our own send would not have
+     * been visible then. Sealing is the irreversible half, so the last thing before it is the same
+     * question, freshly asked.
+     */
+    if (sendClaims.held(agentName, sessionId) || readSession(agentName, sessionId).weSpoke) {
+      logger.info("session.away.inbox.oneshot.seal_skipped_operator_returned", {
+        agentName, sessionId,
+        impact: "the operator spoke while this was closing, so the session is NOT sealed — it is theirs to close",
+      });
+      return;
+    }
     const readiness = sessionNodeManager.sealReadiness(agentName, sessionId);
     if (readiness.diverged) {
       logger.warn("session.away.inbox.oneshot.seal_skipped_diverged", {

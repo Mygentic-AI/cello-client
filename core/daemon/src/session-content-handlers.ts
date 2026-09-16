@@ -20,6 +20,7 @@ import { TIER } from "./contacts-tier-migration.js";
 import { GATEWAY_UNAVAILABLE, GOVERNANCE_TIMEOUT, type SecurityGatewayClient } from "@cello-protocol/gateway";
 import type { IpcHandler } from "./ipc-server.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
+import type { SendClaims } from "./send-claims.js";
 import type { RetryQueue } from "./retry-queue.js";
 import type { Logger } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
@@ -239,6 +240,8 @@ export interface SessionContentDeps {
   clearTelegramRung: (agentName: string, sessionId: string) => void;
   /** DOD-COATTEND-VISIBLE-1: how many connections attend this agent right now (reporting only). */
   attendanceCount: (agentName: string) => number;
+  /** Sends on the wire right now — shared with the away one-shot, which must not close under one. */
+  sendClaims: SendClaims;
 }
 
 export function registerSessionContentHandlers(deps: SessionContentDeps): void {
@@ -246,7 +249,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     handlers, logger, sessionNodeManager, securityGateway, retryQueue,
     getConnState, resolveCurrentAgent, NO_CURRENT_AGENT_RESPONSE,
     getConnectionCursor, advanceConnectionCursor, clearTelegramRung,
-    attendanceCount,
+    attendanceCount, sendClaims,
   } = deps;
 
   /**
@@ -283,22 +286,6 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
    */
   const attendingNow = (agentName: string): number => Math.max(1, attendanceCount(agentName));
 
-  const sendInFlight = new Map<string, number>();
-  /**
-   * How long a claim is honored before a sibling may proceed anyway (review H3).
-   *
-   * `finally` covers throw and reject. It does NOT cover a promise that NEVER SETTLES, and
-   * `sendContent` awaits `node.newStream` and `stream.close` with no timeout or abort signal —
-   * only the relay submit is bounded. Before the claim existed, a hung libp2p stream hung ONE
-   * call; with an unbounded claim it would refuse every sibling send on that conversation until
-   * the daemon restarted, behind guidance that says "wait a moment" forever. Trading a permanent
-   * outage for a small chance of the duplicate this line prevents is the wrong way round: the
-   * defect is a bad conversation, the wedge is a dead one.
-   *
-   * Generous relative to the honest worst case (~30 s of bounded relay retries plus an unbounded
-   * stream tail), so it expires hangs rather than races.
-   */
-  const SEND_CLAIM_TTL_MS = 60_000;
 
   // ─── CELLO-M7-DAEMON-004: cello_send (live send + daemon-owned tree append) ──
   handlers.set("cello_send", async (params, connectionId) => {
@@ -590,9 +577,8 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     // is stated AGAINST it rather than around it — this asks a question the watermark cannot
     // answer: "did the session move under me while I was gone?"
     const frontierNow = sessionNodeManager.getSessionTree(agentName, sessionId).size();
-    const inFlightKey = `${agentName}\u0000${sessionId}`;
-    const claimedAt = sendInFlight.get(inFlightKey);
-    if (claimedAt !== undefined && Date.now() - claimedAt < SEND_CLAIM_TTL_MS) {
+    const claimedAt = sendClaims.claimedAt(agentName, sessionId);
+    if (claimedAt !== undefined) {
       // A sibling is between its own frontier check and its append RIGHT NOW. Its leaf does not
       // exist yet, so the comparison below cannot see it — this is the half of the window a
       // frontier check structurally cannot cover, whatever it is compared against.
@@ -644,12 +630,12 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     // moved (append happened → its own frontier comparison catches it) or the send failed and
     // nothing was committed (→ it is free to try). `finally` rather than a plain call so a throw
     // cannot wedge the session into permanent refusal.
-    sendInFlight.set(inFlightKey, Date.now());
+    sendClaims.claim(agentName, sessionId);
     let sendResult: Awaited<ReturnType<typeof sessionNodeManager.sendContent>>;
     try {
       sendResult = await sessionNodeManager.sendContent(record.agent_name, sessionId, sendBytes, new Uint8Array(contentHash), correlationId, LEAF_KIND_MSG, contentHashAlg);
     } finally {
-      sendInFlight.delete(inFlightKey);
+      sendClaims.release(agentName, sessionId);
     }
     if (!sendResult.ok) {
       // DB-001 / dead-channel contract: never silently drop, never desync. Preserve
@@ -856,7 +842,26 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     // M9 merge fix: use sendBytes (the ALTERED bytes on a redact verdict), never the pre-redaction
     // contentBytes — the leaf hash above already binds sendBytes; the transcript must match what
     // actually went on the wire, not the pre-redaction draft (M9's own stated seam invariant).
-    sessionNodeManager.recordTranscriptMessage(record.agent_name, sessionId, leafIndex, "sent", sendBytes, correlationId, sentAuthorship(sendResult));
+    /**
+     * ⚠️ THE RESULT IS READ, and a `false` is a HOLE in the record of what this side said.
+     *
+     * The leaf exists; the row does not. The operator's own message is then invisible to every
+     * reader of the transcript — including `away-inbox-oneshot.ts`, which asks exactly one question
+     * of it: "has a human spoken in this session?" A silent `false` answers no about a message that
+     * went out, and that answer ends the session. The inbound path has handled this case since
+     * `content_undeliverable`; the outbound path ignored it.
+     */
+    const rowWritten = sessionNodeManager.recordTranscriptMessage(record.agent_name, sessionId, leafIndex, "sent", sendBytes, correlationId, sentAuthorship(sendResult));
+    if (!rowWritten) {
+      sendClaims.noteRowMissing(record.agent_name, sessionId);
+      logger.error("session.send.transcript_row_failed", {
+        sessionId, agentName: record.agent_name, sequenceNumber: leafIndex, correlationId,
+        impact:
+          "the message was sent and its leaf committed, but this side holds no readable copy of it. " +
+          "The transcript under-reports what this agent said, and nothing that reads the transcript " +
+          "to decide whether a human spoke here may treat this session as unspoken-in.",
+      });
+    }
     // M8C-CURSOR-1: the sender authored this leaf — advance ITS OWN cursor so it doesn't get
     // blocked by session_not_current on its own just-sent message.
     advanceConnectionCursor(connectionId, sessionId, leafIndex);

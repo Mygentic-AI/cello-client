@@ -87,6 +87,14 @@ export function createAttendanceWiring(deps: AttendanceWiringDeps) {
    * rather than defaulted: a second value is what let this function be reached from an existing
    * session, and a default would leave that call compiling.
    */
+  /**
+   * "WE GREETED THEM" — DOD-INBOX-ONESHOT-1, NOT the same fact as `dedupKey`, which is set before the
+   * send and stays set on the screened-out branch where nothing reached the caller. The one-shot
+   * closes a visit for having told the caller the rule, so it keys off a greeting that went out; a
+   * queued one counts — witnessed, leafed, on its way.
+   */
+  const markGreeted = (agentName: string, sessionId: string): void => void awayAckSent.add(`${agentName}:${sessionId}:greeted`);
+
   async function sendAwayResponse(agentName: string, sessionId: string): Promise<void> {
     if (isAttended(agentName)) return;
     /**
@@ -212,6 +220,7 @@ export function createAttendanceWiring(deps: AttendanceWiringDeps) {
           committed: placedQueued.placed,
           reason: sendResult.reason, cause: sendResult.cause,
         });
+      markGreeted(agentName, sessionId);
         return;
       }
       // DOD-M12B-INDEX-1: the away responder fires while inbound is still arriving, so it is the
@@ -225,6 +234,8 @@ export function createAttendanceWiring(deps: AttendanceWiringDeps) {
         sequenceNumber: placedReply.placed ? placedReply.leafIndex : placedReply.heldAt,
         committed: placedReply.placed,
       });
+      markGreeted(agentName, sessionId);
+
     } catch (err: unknown) {
       // Same as above: the clear is correct and currently unreachable — nothing re-enters this
       // function for a session whose request has already been answered. `txtKey` is deliberately

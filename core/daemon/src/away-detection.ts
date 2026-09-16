@@ -81,9 +81,11 @@ export const AWAY_AUTO_REPLY_MARKER = "[[AUTO-REPLY]]";
 /**
  * The unmarked bodies. Kept separate so the legacy detector below matches an un-upgraded peer.
  *
- * ⚠️ `ONESHOT_BODY` IS NO LONGER SENT, AND NOTHING READS IT EITHER. DOD-M15-AWAYSCOPE-1 deleted the
- * branch that sent it AND the only production call site of `isOwnAwayAutoReply`, which was in the
- * same branch. An earlier version of this comment said the legacy recogniser "is what stops this
+ * ⚠️ `ONESHOT_BODY` IS NO LONGER SENT — `away-inbox-oneshot.ts` sends its own line — but it IS read
+ * again. DOD-M15-AWAYSCOPE-1 deleted the branch that sent it and the only production call site of
+ * `isOwnAwayAutoReply` along with it; DOD-INBOX-ONESHOT-1 gave that recogniser a caller again,
+ * because a file that can SEAL must recognise an un-upgraded peer's away traffic, not just a
+ * marker-aware one. An earlier version of this comment said the legacy recogniser "is what stops this
  * side treating that machine traffic as a person" — review caught that, and it is false: the only
  * live recogniser is `isAutoReplyMarked`, which matches the MARKER and therefore does NOT match an
  * un-upgraded peer's unmarked body.
