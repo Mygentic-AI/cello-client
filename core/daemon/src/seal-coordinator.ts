@@ -397,7 +397,7 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
            * carry can accuse.
            */
           const rootCheck = sessionNodeManager.verifyCertifiedRoot(
-            agentPubkeyHex, sidHex, sealedRootBytes, leafCount,
+            agentPubkeyHex, sidHex, sealedRootBytes, leafCount, undefined,
           );
           if (rootCheck.verdict === "mismatch") {
             /**

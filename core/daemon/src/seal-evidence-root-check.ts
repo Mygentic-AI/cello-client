@@ -33,13 +33,17 @@
  * With all three, the root this side signs is over a leaf set that agrees with everything it saw,
  * whose remaining leaves the participants themselves signed, and which the certificate describes.
  *
+ *   4. EACH SENDER'S LEAVES FORM AN UNBROKEN CHAIN FROM THE SESSION ANCHOR, IN EVIDENCE ORDER. Every
+ *      Structure 1 names its sender's previous leaf, and the relay refused any link that was not the
+ *      immediate predecessor. Walking those links is what fixes the position of a leaf this side
+ *      never saw — without it, a gap could be filled with a replay of a genuinely signed earlier
+ *      leaf. No two leaves may be byte-identical.
+ *
  * ─── What this deliberately does NOT establish ─────────────────────────────────────────────────
  *
- * The ORDER of leaves this side never held rests on the directory's rebuild, not on this side's own
- * witness. Every leaf this side DID hold is pinned to its position; a gap could in principle be filled
- * in a different order. The participants' own signed approvals — carried on their SEAL leaves and
- * checked by every co-signing directory under DOD-M15-SEALPARTIES-1 — are what bound that, not this
- * file. Saying so rather than implying a stronger property than the code has.
+ * How the two senders' chains INTERLEAVE in positions this side never held. Each sender's own order
+ * is pinned; the relative order of one sender's unseen leaf against the other's rests on the
+ * directory's rebuild. `lastSeenHash` could narrow that and is not used here yet.
  *
  * Crypto refs: RFC 8032 (Ed25519 signature verification), RFC 6962 §2.1 (Merkle hash trees).
  */
@@ -62,6 +66,8 @@ export type EvidenceVerdict =
 export function parseEvidenceLeaf(raw: unknown): EvidenceLeaf | null {
   if (typeof raw !== "object" || raw === null) return null;
   const o = raw as Record<string, unknown>;
+  // Arrays accepted as well as Uint8Array for the same reason the ceremony's own frontier parser
+  // accepts ArrayLike: the frame reaches here re-encoded across the daemon's IPC as well as off CBOR.
   const bytes = (v: unknown): Uint8Array | null =>
     v instanceof Uint8Array ? v : Array.isArray(v) ? Uint8Array.from(v as number[]) : null;
   const s1 = bytes(o["structure1_cbor"]);
@@ -80,9 +86,17 @@ export function verifyCertifiedRootFromEvidence(args: {
   participantsHex: readonly string[];
   certifiedRoot: Uint8Array;
   certifiedLeafCount: number;
+  /**
+   * The session's chain anchor — what every sender's FIRST leaf must name as its previous leaf. From
+   * this side's own record, like the participants. It is the same value before and after a restart:
+   * the stored copy is written from the live one.
+   */
+  genesis: Uint8Array | undefined;
 }): EvidenceVerdict {
-  const { ownCarry, evidence, sessionIdHex, participantsHex, certifiedRoot, certifiedLeafCount } = args;
+  const { ownCarry, evidence, sessionIdHex, participantsHex, certifiedRoot, certifiedLeafCount, genesis } = args;
   if (participantsHex.length !== 2) return { verdict: "cannot_judge", reason: "participants_unknown" };
+  // Without the anchor the chains cannot be walked, and an unwalked gap is exactly what a replay needs.
+  if (!genesis) return { verdict: "cannot_judge", reason: "genesis_unknown" };
   if (evidence.length === 0) return { verdict: "cannot_judge", reason: "no_evidence" };
   if (evidence.length !== certifiedLeafCount) {
     return { verdict: "mismatch", detail: `evidence_size_disagrees: ${evidence.length} leaves, certificate claims ${certifiedLeafCount}` };
@@ -90,6 +104,25 @@ export function verifyCertifiedRootFromEvidence(args: {
 
   const participants = new Set(participantsHex.map((p) => p.toLowerCase()));
   const hashes: Uint8Array[] = [];
+  /**
+   * ⚠️ EACH LEAF CHECKED ALONE PROVES NOTHING ABOUT WHERE IT SITS — review, HIGH.
+   *
+   * A signed Structure 1 is valid wherever it is placed, and the root is built from content hashes
+   * only. So the first version accepted a set in which positions this side never saw held COPIES of
+   * a participant's earlier, genuinely signed leaves: a counterparty's "I withdraw the offer" and
+   * their closing leaf replaced by replays of their greeting. Every per-leaf check passed, the count
+   * and root agreed, and this agent's key went on a conversation that did not happen. What bounded it
+   * was the honest co-signing directories — i.e. nothing, against the colluding threshold this check
+   * exists to stand against.
+   *
+   * The leaves already say how they link. `prevOwnHash` names the SAME sender's previous leaf, and
+   * the relay refused every submission whose link was not the immediate predecessor — SEAL leaves
+   * included. So walking each sender's leaves in evidence order must reproduce that chain exactly,
+   * starting from the session anchor. A replay breaks it, a reordering breaks it, and a message
+   * dropped from the middle of a run breaks it. Byte-identical leaves are refused outright too.
+   */
+  const seen = new Set<string>();
+  const lastBySender = new Map<string, Uint8Array>();
   for (let i = 0; i < evidence.length; i++) {
     const leaf = parseEvidenceLeaf(evidence[i]);
     if (!leaf) return { verdict: "cannot_judge", reason: `evidence_leaf_malformed: position ${i + 1}` };
@@ -111,6 +144,14 @@ export function verifyCertifiedRootFromEvidence(args: {
     if (Buffer.from(s1.fields.sessionId).toString("hex") !== sessionIdHex.toLowerCase()) {
       return { verdict: "mismatch", detail: `evidence_leaf_is_for_another_session: position ${i + 1}` };
     }
+    const bytesHex = Buffer.from(leaf.structure1_cbor).toString("hex");
+    if (seen.has(bytesHex)) return { verdict: "mismatch", detail: `evidence_leaf_repeated: position ${i + 1}` };
+    seen.add(bytesHex);
+    const expectedPrev = lastBySender.get(senderHex) ?? genesis;
+    if (Buffer.compare(Buffer.from(s1.fields.prevOwnHash), Buffer.from(expectedPrev)) !== 0) {
+      return { verdict: "mismatch", detail: `evidence_self_chain_broken: position ${i + 1}` };
+    }
+    lastBySender.set(senderHex, s1.fields.contentHash);
     hashes.push(s1.fields.contentHash);
   }
 
@@ -156,9 +197,11 @@ export function judgeFromEvidence(
     evidence: readonly unknown[];
   },
 ): { verdict: "match" } | { verdict: "mismatch"; ownRootHex: string | null; detail: string } | { verdict: "cannot_judge"; reason: string } {
+  const record = sessionFromRecord(deps.db, a.agentPubkeyHex, a.sessionIdHex);
   const checked = verifyCertifiedRootFromEvidence({
     ownCarry: deps.ownCarry, evidence: a.evidence, sessionIdHex: a.sessionIdHex,
-    participantsHex: participantsFromRecord(deps.db, a.agentPubkeyHex, a.sessionIdHex),
+    participantsHex: record?.participantsHex ?? [],
+    genesis: record?.genesis,
     certifiedRoot: a.certifiedRoot, certifiedLeafCount: a.certifiedLeafCount,
   });
   if (checked.verdict === "match") {
@@ -174,17 +217,26 @@ export function judgeFromEvidence(
 }
 
 /**
- * Both participants of a session, from THIS side's own record — never from a frame, because the
- * frame is what is being checked. Empty when the record is missing, which the verifier refuses on.
+ * Both participants and the session's chain anchor, from THIS side's own record — never from a frame,
+ * because the frame is what is being checked. `null` when the record is missing, which refuses.
+ *
+ * ⚠️ BY `agent_id`, WITH NO AGENT NAME ANYWHERE. The first version selected `agent_name` to key the
+ * anchor lookup, which is the mutable-label join `DOD-AGENT-ID-JOINKEY-1` exists to stop — a retired
+ * name reused by another keypair would hand this check the wrong session's anchor. The row already
+ * holds the anchor: `genesis_prev_root` is written from the same live value the leaves were chained
+ * from, and it is the copy a restarted daemon reads anyway.
  */
-function participantsFromRecord(
+function sessionFromRecord(
   db: { prepare(sql: string): { get(...params: unknown[]): unknown } } | null,
   agentPubkeyHex: string,
   sessionIdHex: string,
-): string[] {
-  if (!db) return [];
+): { participantsHex: string[]; genesis: Uint8Array | undefined } | null {
+  if (!db) return null;
   const row = db
-    .prepare("SELECT s.counterparty_pubkey AS cp FROM sessions s JOIN agents a ON a.agent_id = s.agent_id WHERE a.k_local_pubkey = ? AND s.session_id = ?")
-    .get(agentPubkeyHex, sessionIdHex) as { cp: string } | undefined;
-  return row ? [agentPubkeyHex.toLowerCase(), row.cp.toLowerCase()] : [];
+    .prepare("SELECT s.counterparty_pubkey AS cp, s.genesis_prev_root AS g FROM sessions s JOIN agents a ON a.agent_id = s.agent_id WHERE a.k_local_pubkey = ? AND s.session_id = ?")
+    .get(agentPubkeyHex, sessionIdHex) as { cp: string; g: unknown } | undefined;
+  if (!row) return null;
+  const g = row.g instanceof Uint8Array ? row.g : Buffer.isBuffer(row.g) ? new Uint8Array(row.g) : null;
+  // A stored value of the wrong width is not an anchor; refusing beats walking a chain from garbage.
+  return { participantsHex: [agentPubkeyHex.toLowerCase(), row.cp.toLowerCase()], genesis: g && g.length === 32 ? g : undefined };
 }

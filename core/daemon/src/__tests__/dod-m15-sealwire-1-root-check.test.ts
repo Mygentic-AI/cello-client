@@ -139,7 +139,7 @@ const rootOf = (hashes: Uint8Array[]) =>
 describe("DOD-M15-SEALWIRE-1: the client checks what its key is about to endorse", () => {
   it("★ a root over OUR leaves matches", () => {
     const { mgr, hashes } = managerWithCarry([contentHash(1), contentHash(2), contentHash(3)]);
-    expect(mgr.verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf(hashes), hashes.length)).toEqual({ verdict: "match" });
+    expect(mgr.verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf(hashes), hashes.length, undefined)).toEqual({ verdict: "match" });
   });
 
   it("★ a root over a DIFFERENT conversation is caught", () => {
@@ -150,26 +150,39 @@ describe("DOD-M15-SEALWIRE-1: the client checks what its key is about to endorse
      */
     const { mgr, hashes } = managerWithCarry([contentHash(1), contentHash(2), contentHash(3)]);
     const theirs = [contentHash(9), contentHash(8), contentHash(7), contentHash(6), contentHash(5)];
-    const v = mgr.verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf(theirs), hashes.length);
+    const v = mgr.verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf(theirs), hashes.length, undefined);
     expect(v.verdict).toBe("mismatch");
+  });
+
+  /**
+   * Review MEDIUM (evidence co-sign). The evidence is for a side that CANNOT JUDGE. A side whose own
+   * complete carry already says the certificate is wrong must not be talked out of that by evidence
+   * the directory supplies — that would let the party being checked overrule the check.
+   */
+  it("★★★ a MISMATCH from this side's own complete carry is never overruled by evidence", () => {
+    const { mgr, hashes } = managerWithCarry([contentHash(1), contentHash(2), contentHash(3)]);
+    const theirs = [contentHash(9), contentHash(8), contentHash(7), contentHash(6), contentHash(5)];
+    const evidence = [{ structure1_cbor: new Uint8Array(8), sender_pubkey: new Uint8Array(32), sender_signature: new Uint8Array(64) }];
+    const v = mgr.verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf(theirs), hashes.length, evidence);
+    expect(v.verdict, "evidence is consulted only when this side cannot judge; it cannot turn an accusation into a signature").toBe("mismatch");
   });
 
   it("★ a REORDERED leaf set is caught — order is part of what a transcript means", () => {
     const { mgr, hashes } = managerWithCarry([contentHash(1), contentHash(2), contentHash(3)]);
     const swapped = [hashes[1]!, hashes[0]!, ...hashes.slice(2)];
-    expect(mgr.verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf(swapped), hashes.length).verdict).toBe("mismatch");
+    expect(mgr.verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf(swapped), hashes.length, undefined).verdict).toBe("mismatch");
   });
 
   it("★ a SUBSTITUTED leaf is caught even with the count unchanged", () => {
     // The shape a dropped-and-replaced message takes: same leaf count, different content.
     const { mgr, hashes } = managerWithCarry([contentHash(1), contentHash(2), contentHash(3)]);
     const tampered = [hashes[0]!, contentHash(0xee), ...hashes.slice(2)];
-    expect(mgr.verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf(tampered), hashes.length).verdict).toBe("mismatch");
+    expect(mgr.verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf(tampered), hashes.length, undefined).verdict).toBe("mismatch");
   });
 
   it("★ the mismatch carries OUR root, so the two can be compared by a human", () => {
     const { mgr, hashes } = managerWithCarry([contentHash(1)]);
-    const v = mgr.verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf([contentHash(2), contentHash(3), contentHash(4)]), hashes.length);
+    const v = mgr.verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf([contentHash(2), contentHash(3), contentHash(4)]), hashes.length, undefined);
     expect(v.verdict === "mismatch" && v.ownRootHex).toBe(Buffer.from(rootOf(hashes)).toString("hex"));
   });
 });
@@ -184,13 +197,13 @@ describe("DOD-M15-SEALWIRE-1: 'I cannot judge' is not 'you are lying'", () => {
      */
     // Only ONE ctrl leaf has landed — this side's. The counterparty's is what triggered the seal.
     const rows = completeCarry([contentHash(1)], contentHash(0xc1), contentHash(0xc2)).slice(0, 2);
-    const v = managerWith(rows).verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf([contentHash(1)]), 3);
+    const v = managerWith(rows).verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf([contentHash(1)]), 3, undefined);
     expect(v.verdict).toBe("cannot_judge");
     expect(v.verdict === "cannot_judge" && v.reason, "and it must say WHICH half is missing").toMatch(/1 of 2 SEAL ctrl/);
   });
 
   it("★ an EMPTY carry cannot accuse either", () => {
-    expect(managerWith([]).verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf([contentHash(1)]), 1).verdict).toBe("cannot_judge");
+    expect(managerWith([]).verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf([contentHash(1)]), 1, undefined).verdict).toBe("cannot_judge");
   });
 
   it("★ an undecodable leaf cannot accuse — a local defect is not the counterparty's fault", () => {
@@ -199,7 +212,7 @@ describe("DOD-M15-SEALWIRE-1: 'I cannot judge' is not 'you are lying'", () => {
     // local storage defect is not evidence against the counterparty.
     const rows = completeCarry([contentHash(1)], contentHash(0xc1), contentHash(0xc2));
     (rows[0] as { structure1Cbor: Uint8Array }).structure1Cbor = new Uint8Array([0xff, 0xff]);
-    const v = managerWith(rows).verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf([contentHash(1)]), rows.length);
+    const v = managerWith(rows).verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf([contentHash(1)]), rows.length, undefined);
     expect(v.verdict).toBe("cannot_judge");
   });
 
@@ -217,7 +230,7 @@ describe("DOD-M15-SEALWIRE-1: 'I cannot judge' is not 'you are lying'", () => {
       lastSeenHash: new Uint8Array(32).fill(0x11),
       prevOwnHash: new Uint8Array(32).fill(0x22),
     });
-    const v = managerWith(rows).verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf([contentHash(1)]), rows.length);
+    const v = managerWith(rows).verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf([contentHash(1)]), rows.length, undefined);
     expect(v.verdict).toBe("cannot_judge");
     expect(v.verdict === "cannot_judge" && v.reason).toMatch(/content_hash/);
   });
@@ -255,7 +268,7 @@ describe("DOD-M15-UNILATERAL-1: the solo path must be able to co-sign its own se
     const hashes = [contentHash(1), contentHash(2), contentHash(0xc1)];
     const mgr = managerWith(soloCarry([contentHash(1), contentHash(2)], contentHash(0xc1)));
     expect(
-      mgr.verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf(hashes), hashes.length),
+      mgr.verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf(hashes), hashes.length, undefined),
       "the certificate is over exactly the leaves this daemon sent — there is nothing left to judge",
     ).toEqual({ verdict: "match" });
   });
@@ -268,7 +281,7 @@ describe("DOD-M15-UNILATERAL-1: the solo path must be able to co-sign its own se
      */
     const mgr = managerWith(soloCarry([contentHash(1), contentHash(2)], contentHash(0xc1)));
     const theirs = [contentHash(9), contentHash(8), contentHash(7)];
-    expect(mgr.verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf(theirs), 3).verdict).not.toBe("match");
+    expect(mgr.verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf(theirs), 3, undefined).verdict).not.toBe("match");
   });
 
   it("★★ a matching root with a DISAGREEING leaf count is not a match — the certificate contradicts itself", () => {
@@ -279,7 +292,7 @@ describe("DOD-M15-UNILATERAL-1: the solo path must be able to co-sign its own se
      */
     const hashes = [contentHash(1), contentHash(2), contentHash(0xc1)];
     const mgr = managerWith(soloCarry([contentHash(1), contentHash(2)], contentHash(0xc1)));
-    expect(mgr.verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf(hashes), 99).verdict).not.toBe("match");
+    expect(mgr.verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf(hashes), 99, undefined).verdict).not.toBe("match");
   });
 
   it("★★★ THE BOUNDARY IS DERIVED FROM THE CARRY, AND IT IS NOT ALWAYS ZERO", () => {
@@ -349,7 +362,7 @@ describe("DOD-M15-UNILATERAL-1: the solo path must be able to co-sign its own se
     // produces a different root, falls through, and answers "cannot judge" — never "you are lying".
     const rows = completeCarry([contentHash(1)], contentHash(0xc1), contentHash(0xc2)).slice(0, 2);
     const v = managerWith(rows).verifyCertifiedRoot(
-      AGENT_PUB, SESSION, rootOf([contentHash(1), contentHash(0xc1), contentHash(0xc2)]), 3,
+      AGENT_PUB, SESSION, rootOf([contentHash(1), contentHash(0xc1), contentHash(0xc2)]), 3, undefined,
     );
     expect(v.verdict).toBe("cannot_judge");
   });
