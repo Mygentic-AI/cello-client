@@ -72,12 +72,14 @@ export interface SanitizeResult {
    */
   decodedForScan: string;
   /**
-   * The ASCII shadowed by Unicode Tag characters (U+E0000 block) in the input, in order — for
-   * DETECTION ONLY. The invisible strip removes tag characters from delivery, which also removes the
-   * evidence: a sentence written in tags reaches no one, but it was an attack, and the pattern
-   * matcher should say so. Empty when the input carries none.
+   * The text carried by invisible codepoints — Unicode Tag characters (U+E0000 block) shadowing
+   * ASCII, and variation selectors used as a byte channel after an emoji. DETECTION ONLY.
+   *
+   * The invisible strip removes both from delivery, which also removes the evidence: the hidden
+   * sentence reaches no one, but it was an attack, and the pattern matcher should say so. Empty when
+   * the input carries none.
    */
-  tagText: string;
+  hiddenText: string;
   /** Per-step detection notes (only steps that fired). */
   notes: SanitizationNote[];
   /** A suspicion signal for high-entropy (encoded-blob) content. 0 = nothing suspicious. */
@@ -260,6 +262,32 @@ function stripSpecialTokens(text: string): { text: string; removed: number } {
   return { text: out, removed };
 }
 
+/**
+ * The text hidden in invisible codepoints, for DETECTION ONLY (see `SanitizeResult.hiddenText`).
+ *
+ * Two channels, both invisible to the operator and both read as text by a model:
+ *  - **Tag characters** (U+E0000 block) shadow ASCII one-for-one.
+ *  - **Variation selectors** carry arbitrary bytes after an emoji: U+FE00–U+FE0F are bytes 0–15 and
+ *    U+E0100–U+E01EF are bytes 16–255. Decoded as UTF-8; a run that is not valid UTF-8 yields
+ *    nothing rather than mojibake.
+ */
+export function readHiddenChannels(text: string): string {
+  let tagged = "";
+  const bytes: number[] = [];
+  for (const ch of text) {
+    const cp = ch.codePointAt(0)!;
+    if (cp > 0xe0000 && cp < 0xe007f) tagged += String.fromCodePoint(cp - 0xe0000);
+    else if (cp >= 0xfe00 && cp <= 0xfe0f) bytes.push(cp - 0xfe00);
+    else if (cp >= 0xe0100 && cp <= 0xe01ef) bytes.push(cp - 0xe0100 + 16);
+  }
+  let fromBytes = "";
+  if (bytes.length >= 4) {
+    const decoded = new TextDecoder("utf-8", { fatal: false }).decode(new Uint8Array(bytes));
+    if (!decoded.includes("�")) fromBytes = decoded;
+  }
+  return [tagged, fromBytes].filter((s) => s.length > 0).join(" ");
+}
+
 // ── The pipeline ─────────────────────────────────────────────────────────────
 export function sanitizeInbound(content: Uint8Array, opts: SanitizeOptions = {}): SanitizeResult {
   const maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
@@ -270,7 +298,7 @@ export function sanitizeInbound(content: Uint8Array, opts: SanitizeOptions = {})
     return {
       text: "",
       scriptScanText: "",
-      tagText: "",
+      hiddenText: "",
       decodedForScan: "",
       notes: [],
       entropySuspicion: 0,
@@ -284,11 +312,7 @@ export function sanitizeInbound(content: Uint8Array, opts: SanitizeOptions = {})
 
   let text = new TextDecoder("utf-8", { fatal: false }).decode(content);
 
-  let tagText = "";
-  for (const ch of text) {
-    const cp = ch.codePointAt(0)!;
-    if (cp > 0xe0000 && cp < 0xe007f) tagText += String.fromCodePoint(cp - 0xe0000);
-  }
+  const hiddenText = readHiddenChannels(text);
 
   const inv = stripInvisible(text);
   if (inv.removed > 0) notes.push({ step: "invisible_strip", detail: "stripped invisible/smuggled-Unicode codepoints", count: inv.removed });
@@ -327,5 +351,5 @@ export function sanitizeInbound(content: Uint8Array, opts: SanitizeOptions = {})
   const entropySuspicion = scoreEntropy(decodedForScan);
   if (entropySuspicion > 0) notes.push({ step: "entropy", detail: "high-entropy encoded-blob segment(s) detected", count: entropySuspicion });
 
-  return { text, scriptScanText, decodedForScan, tagText, notes, entropySuspicion };
+  return { text, scriptScanText, decodedForScan, hiddenText, notes, entropySuspicion };
 }

@@ -176,7 +176,7 @@ export class InboundScreener {
     // One event per pattern id; the first variant that surfaces it is named, so the operator sees
     // which disguise was unmasked.
     const seen = new Set<string>();
-    for (const variant of scanVariants(r.decodedForScan, r.tagText)) {
+    for (const variant of scanVariants(r.decodedForScan, r.hiddenText)) {
       for (const id of scanInjectionPatterns(variant.text)) {
         if (seen.has(id)) continue;
         seen.add(id);

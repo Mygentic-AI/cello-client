@@ -23,12 +23,19 @@ const PATTERN_SOURCES: Array<{ id: string; src: string }> = [
   // Override commands.
   // Up to three filler words between the verb and "previous" ("ignore all of your previous…"), and
   // the space-free form a joined-words disguise leaves ("ignoreallpreviousinstructions").
-  { id: "override", src: "(?:ignore|disregard|forget)\\s+(?:\\w+\\s+){0,3}(?:previous|prior|above|earlier|the)\\s+(?:instructions|prompts?|context|messages?|rules?|directions?)|(?:ignore|disregard|forget)(?:all|your|the|any)*(?:previous|prior|above|earlier)(?:instructions|prompts?|rules?|directions?)" },
-  { id: "override_explicit", src: "forget everything (?:above|before)|your new instructions are|new[_ ]paradigm" },
+  // DOD-M9C-SCREENBASE-1 widened the verbs and the nouns: "disregard all previous guidelines",
+  // "bypass your safety restrictions", "override your programming" were flagged by none of these.
+  { id: "override", src: "(?:ignore|disregard|forget|bypass|override|skip|abandon|set aside)\\s+(?:\\w+\\s+){0,3}(?:previous|prior|above|earlier|the|your|all|any|safety|content|ethical)\\s+(?:\\w+\\s+)?(?:instructions|prompts?|context|messages?|rules?|directions?|guidelines|polic(?:y|ies)|constraints|restrictions|programming|directives|safeguards|filters|limitations)|(?:ignore|disregard|forget)(?:all|your|the|any)*(?:previous|prior|above|earlier)(?:instructions|prompts?|rules?|directions?|guidelines)" },
+  { id: "override_explicit", src: "forget everything (?:above|before|you know)|your new instructions are|new[_ ]paradigm|from now on,?\\s+you (?:are|will|must|shall)\\b|you (?:are|will) no longer (?:bound|restricted|limited)|you are no longer an? (?:ai|assistant|language model)" },
   // Persona replacement / mode unlocks.
-  { id: "persona", src: "\\byou are now\\b|\\bdeveloper mode\\b|\\bdo anything now\\b|\\bDAN mode\\b" },
-  // Jailbreak structural markers (L1B3RT4S).
-  { id: "jailbreak", src: "jailbreak\\s*[:>]|<jailbreak>|\\[liberated\\]|<new_paradigm>" },
+  { id: "persona", src: "\\byou are now\\b|\\bdeveloper mode\\b|\\bdo anything now\\b|\\bDAN mode\\b|\\bpretend (?:you are|that you are) (?:an? )?(?:ai|assistant|model|chatbot) (?:with(?:out)?|that has no)\\b|\\bstay in character\\b|\\b(?:unfiltered|uncensored|unrestricted|jailbroken) (?:mode|ai|assistant|version|response)|\\bwithout any (?:restrictions|filters|limitations|censorship)\\b|\\bno (?:ethical|moral) (?:guidelines|restrictions|constraints)\\b" },
+  // Jailbreak structural markers (L1B3RT4S) and template placeholders left in pasted jailbreaks.
+  { id: "jailbreak", src: "jailbreak\\s*[:>]|<jailbreak>|\\[liberated\\]|<new_paradigm>|\\[insert prompt here\\]|\\bjailbroken\\b" },
+  // Attempts to read the agent's own instructions out.
+  { id: "prompt_extraction", src: "(?:reveal|show|print|repeat|output|display|tell me|give me|share|leak)\\s+(?:\\w+\\s+){0,3}(?:system prompt|initial (?:instructions|prompt)|hidden (?:instructions|prompt)|(?:your|the) (?:instructions|prompt|rules) (?:above|verbatim|word for word))|what (?:is|are|were) your (?:system prompt|initial instructions|original instructions)" },
+  // Demands for secrets, often with a threat attached.
+  { id: "secret_request", src: "(?:provide|give|share|send|tell|reveal)\\s+(?:me\\s+)?(?:\\w+\\s+){0,2}(?:confidential|sensitive|private|secret|classified|internal) (?:information|data|details|records|files)|(?:share|reveal|give me|send me|tell me) (?:your|the) (?:password|passwords|api keys?|credentials|secret keys?|private keys?|access tokens?)" },
+  { id: "coercion", src: "\\bor (?:else )?i will (?:expose|leak|report|publish|delete|destroy|shut)|\\bor face (?:severe |serious )?consequences\\b" },
   // Fake turn-boundary injection.
   { id: "boundary", src: "-{3,}\\s*end of (?:user|system) (?:message|prompt)|={3,}\\s*end system prompt" },
   // Leetspeak variants (1337.mkd).

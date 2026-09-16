@@ -14,7 +14,7 @@
  * Linear time: every transform is a single pass over code points or a regex with no nested
  * quantifiers, because this runs on adversary-controlled content before any pattern engine.
  */
-import { decodeEncoded, stripInvisible } from "./sanitize.js";
+import { decodeEncoded, readHiddenChannels, stripInvisible } from "./sanitize.js";
 
 export interface ScanVariant {
   /** Stable name of the disguise this variant undoes — carried into the governance event. */
@@ -101,7 +101,8 @@ function untag(text: string): string {
     const cp = ch.codePointAt(0)!;
     out += cp > 0xe0000 && cp < 0xe007f ? String.fromCodePoint(cp - 0xe0000) : ch;
   }
-  return out;
+  const hidden = readHiddenChannels(text);
+  return hidden.length > 0 ? `${out} ${hidden}` : out;
 }
 
 /** A decoded blob counts only if it reads as text — binary data (an image, a hash) is left alone. */
@@ -132,14 +133,14 @@ function decodeHexRuns(text: string): string {
 
 /**
  * @param decodedForScan the sanitizer's detection copy.
- * @param tagText the ASCII shadowed by tag characters the sanitizer stripped (see `SanitizeResult`).
+ * @param hiddenText what the stripped invisible codepoints carried (see `SanitizeResult.hiddenText`).
  */
-export function scanVariants(decodedForScan: string, tagText = ""): ScanVariant[] {
+export function scanVariants(decodedForScan: string, hiddenText = ""): ScanVariant[] {
   const variants: ScanVariant[] = [{ kind: "decoded", text: decodedForScan }];
   const add = (kind: string, text: string): void => {
     if (text.length > 0 && !variants.some((v) => v.text === text)) variants.push({ kind, text });
   };
-  add("unicode_tags_stripped", tagText);
+  add("hidden_codepoints", hiddenText);
 
   // decodedForScan has had ONE decode pass; nested encodings (%2520) need more. Three is enough for
   // any nesting a model would still unwrap, and bounds the work.
