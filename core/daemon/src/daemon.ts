@@ -57,6 +57,7 @@ import { wireDocumentGate } from "./document-gate-wiring.js";
 import { documentsEnabled } from "./document-flag.js";
 import { createSignalingWiring } from "./signaling-wiring.js";
 import { createAttendanceWiring } from "./attendance-wiring.js";
+import { createAwayInboxOneshot } from "./away-inbox-oneshot.js";
 import { startBootCore } from "./boot-core.js";
 import { startBootAgents } from "./boot-agents.js";
 import { startBootConnectionState } from "./boot-connection-state.js";
@@ -333,6 +334,11 @@ async function startDaemonHoldingLock(
   // wiring used to hold — it can no longer initiate a seal at all, which is the point.
   const { attendanceCount, sendAwayResponse, backgroundSeals, awayAckSent } =
     createAttendanceWiring({ logger, sessionNodeManager, perConnectionState, securityGateway });
+
+  // DOD-INBOX-ONESHOT-1: enforcing what the away reply promised. Its own file — that one answers the
+  // door, this one ends the call; merging them is how both were deleted together.
+  const { closeInboxIfIgnored } = createAwayInboxOneshot({ logger, sessionNodeManager, awayAckSent,
+    keyProviders, sealKey, sealInterruptedInProgress, pendingSealWaiters, pendingUnilateralWaiters, sendOver, handleActiveSealFlow });
 
   // M8C-TGDOOR-1: the Telegram doorbell (telegram-doorbell.ts). Content-free by construction — the
   // module is never handed message text, so it cannot leak any (DOD-INV-CONTENTFREE), and it has no
@@ -986,11 +992,10 @@ async function startDaemonHoldingLock(
   sessionNodeManager.setOnContentArrived((agentName, sessionId, senderPubkey) => {
     // MONIKER-4 AC2: the message doorbell names the sender the same way the session doorbell does.
     notificationDispatcher.dispatchCelloMessage(agentName, sessionId, senderPubkey, resolveWho(agentName, senderPubkey, sessionId));
-    // DOD-M15-AWAYSCOPE-1 — THE AWAY REPLY FIRED HERE, and it was the defect: an unattended agent
-    // auto-acked every inbound message on an already-accepted session, and that greeting took a
-    // hash-chain leaf no seal could then certify. Nothing replaces it here — the counterparty learns
-    // this side is online-but-unattended out of band, on the liveness frame, which takes no leaf.
-    // The doorbell above is the only thing an arriving message may trigger. See attendance-wiring.
+    // DOD-M15-AWAYSCOPE-1 — THE AWAY GREETING FIRED HERE and took a leaf no seal could certify; it is
+    // NOT coming back. DOD-INBOX-ONESHOT-1 is the half deleted with it: the away text promises "one
+    // message per visit" and nothing enforced it. See away-inbox-oneshot.ts.
+    void closeInboxIfIgnored(agentName, sessionId);
     // M8C-TGDOOR-1: message-waiting — coalesced (ring-once-until-read) inside sendTelegramDoorbell.
     void sendTelegramDoorbell(agentName, sessionId, "message_waiting", "New message waiting");
   });

@@ -44,7 +44,7 @@ const SRC = join(import.meta.dirname, "..");
  * out of `daemon.ts` and this entry is why the suite went red instead of silent. Every later unit
  * that moves leaf-placing code adds its file here in the same commit.
  */
-const CALLERS = ["daemon.ts", "session-content-handlers.ts", "document-wiring.ts", "attendance-wiring.ts"] as const;
+const CALLERS = ["daemon.ts", "session-content-handlers.ts", "document-wiring.ts", "attendance-wiring.ts", "away-inbox-oneshot.ts"] as const;
 
 interface Call { file: string; line: number; text: string }
 

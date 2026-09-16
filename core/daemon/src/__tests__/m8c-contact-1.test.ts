@@ -378,10 +378,16 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
      * commits its leaf), and this reads two identical entries instead of one.
      */
     const sent = snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent");
-    expect(sent.map((s) => s.text)).toEqual([markAsAutoReply("Dispatched.")]);
-    // Named, not merely counted: the tree is what the seal is taken over, and a transcript with one
-    // row over a tree with two leaves is the exact shape that refused `leaf_count_mismatch`.
-    expect(snm.getSessionTree("bob", SID_HEX).size(), "the greeting and the stranger's message, nothing else").toBe(2);
+    // DOD-INBOX-ONESHOT-1: the greeting answers the knock, and the stranger's one message ends the
+    // visit — so the second entry is the CLOSING line, never a second greeting. Two identical
+    // entries is still the strand this test exists for, and still fails it.
+    expect(sent.map((s) => s.text)).toEqual([
+      markAsAutoReply("Dispatched."),
+      markAsAutoReply("This inbox only accepts one message per visit. Closing. [[WRAP]]"),
+    ]);
+    // Named, not merely counted: the tree is what the seal is taken over, and a transcript row count
+    // that disagrees with the leaf count is the exact shape that refused `leaf_count_mismatch`.
+    expect(snm.getSessionTree("bob", SID_HEX).size(), "the greeting, the stranger's message, and the close").toBe(3);
     // The suppression path is NOT reached any more, and saying so is the verification the order
     // asked for. A `suppressed_duplicate` here would mean a second ack was computed and caught late
     // rather than never attempted.
@@ -484,7 +490,12 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     const sent = snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent");
-    expect(sent.map((s) => s.text)).toEqual([markAsAutoReply("Back in an hour.")]);
+    // DOD-INBOX-ONESHOT-1: the configured greeting once, then the fixed closing line. The point of
+    // this test is that the GREETING is not repeated — a second "Back in an hour." still fails it.
+    expect(sent.map((s) => s.text)).toEqual([
+      markAsAutoReply("Back in an hour."),
+      markAsAutoReply("This inbox only accepts one message per visit. Closing. [[WRAP]]"),
+    ]);
   });
 
   it("DOD-M15-AWAYSCOPE-1: a KNOWN contact on the DEFAULT text gets the GREETING and nothing for the message", async () => {
@@ -516,25 +527,35 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     const sent = snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent");
-    expect(sent.length, "the knock is answered; the message is not").toBe(1);
+    // The knock is answered with the GREETING; the message is answered only by the close, never by a
+    // second greeting — that repetition is what AWAYSCOPE-1 removed and this line still guards.
+    expect(sent.length, "the greeting, then the close — nothing else").toBe(2);
     expect(sent[0]?.text).toContain("is currently away. Leave a message"); // offerFor(agentName)
+    expect(sent[1]?.text).toContain("one message per visit");
     // Named, so a future widening back into the session is caught by the artifact the seal is taken
     // over rather than only by a transcript count.
-    expect(snm.getSessionTree("bob", SID_HEX).size(), "greeting + the caller's message").toBe(2);
+    expect(snm.getSessionTree("bob", SID_HEX).size(), "greeting + the caller's message + the close").toBe(3);
   });
 
-  it("DOD-M15-AWAYSCOPE-1: a caller who keeps talking to an empty room is left alone, and the session stays open", async () => {
+  it("DOD-INBOX-ONESHOT-1: a caller talking to an empty room gets one close, and the session ends", async () => {
     /**
-     * THIS TEST INVERTED. It used to assert `DOD-INBOX-ONESHOT-1`: a second message from a caller
-     * who ignored the leave-one-message instruction drew a `[[WRAP]]` rejection and an immediate
-     * seal, so the inbox could not be talked at indefinitely.
+     * THIS TEST INVERTED TWICE, and the second inversion is the one that resolves it.
      *
-     * That closed the session from the side with nobody watching, and closing it is what destroyed
-     * the receipt: the rejection took a leaf the counterparty had already sealed past. Andre's
-     * principle 4 — a session with nobody live must not be terminal — and principle 8 — the party
-     * who comes back is the one who closes. So the cost of a chatty caller is now a few queued
-     * messages, and the session is still there, still active, still sealable, when the operator
-     * returns. That is the trade this order makes deliberately, and this is where it is pinned.
+     * `DOD-M15-AWAYSCOPE-1` deleted the one-shot close along with the away greeting that fired
+     * mid-conversation, and pinned "left alone, session stays open" here, citing principle 4 — a
+     * session with nobody live must not be terminal — and principle 8 — the party who comes back
+     * closes.
+     *
+     * Andre ruled on 2026-09-16 that principle 4 was aimed at a CONVERSATION: the live failure
+     * behind it was a machine greeting landing in an exchange two operators were having, taking a
+     * leaf the counterparty had already sealed past. A session whose only outbound line is the
+     * greeting is not a conversation — nobody had it — and leaving it open forever was never the
+     * intent. The away message and a dropped mid-conversation connection are two different cases,
+     * and conflating them is what produced both inversions.
+     *
+     * So: an away-answered session closes after the caller's one message, and the guard that keeps
+     * principle 4 intact is `weSpoke` — see the sibling test below, where this side has spoken and
+     * nothing closes.
      */
     const { logger, events } = makeLogger();
     const bobPubkey = await makeAgentDir("bob");
@@ -555,13 +576,15 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     await snm.ingestReceivedContent("bob", SID_HEX, m2, msgLeafHash(m2), "c2");
     await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
-    // Nothing is said back, on either message, and nothing closes the session.
-    expect(events.filter((e) => e.event.startsWith("session.away.inbox.oneshot"))).toHaveLength(0);
+    // The visit ends on their FIRST message, so the second one arrives at a session already closing
+    // and draws nothing further — the close fires once, not once per message.
+    const rejected = events.filter((e) => e.event === "session.away.inbox.oneshot.rejected");
+    expect(rejected, "one close for the visit, however much the caller says").toHaveLength(1);
     const sent = snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent");
-    expect(sent.map((s) => s.text), "the greeting only — no rejection, no [[WRAP]]")
-      .toEqual([markAsAutoReply("Dispatched.")]);
-    expect(snm.getSessionTree("bob", SID_HEX).size(), "greeting + the caller's two messages").toBe(3);
-    expect(snm.getSessionRecord("bob", SID_HEX)?.status, "the returning operator still has a session to close").toBe("active");
+    expect(sent.map((s) => s.text), "the greeting, then one closing line carrying [[WRAP]]").toEqual([
+      markAsAutoReply("Dispatched."),
+      markAsAutoReply("This inbox only accepts one message per visit. Closing. [[WRAP]]"),
+    ]);
   });
 
   it("K3 (CC-1): the operator replying INTO an inbound session (cello_send) promotes the sender to a known contact", async () => {
