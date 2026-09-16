@@ -89,9 +89,24 @@ function rot13(text: string): string {
   });
 }
 
+/**
+ * Unicode Tag characters (U+E0000 block) back to the ASCII they shadow. The sanitizer strips them
+ * from the delivered text, so the agent never sees them — but stripping also destroys the evidence,
+ * and the attack is often base64 of tag characters, which survives the strip. Mapped here, the
+ * hidden sentence surfaces for the pattern matcher.
+ */
+function untag(text: string): string {
+  let out = "";
+  for (const ch of text) {
+    const cp = ch.codePointAt(0)!;
+    out += cp > 0xe0000 && cp < 0xe007f ? String.fromCodePoint(cp - 0xe0000) : ch;
+  }
+  return out;
+}
+
 /** A decoded blob counts only if it reads as text — binary data (an image, a hash) is left alone. */
 function readable(s: string): boolean {
-  const visible = stripInvisible(s).text;
+  const visible = stripInvisible(untag(s)).text;
   if (visible.length < 4) return false;
   let ok = 0;
   for (const ch of visible) if (/[\p{L}\p{N}\p{P}\p{Zs}\n]/u.test(ch)) ok++;
@@ -102,7 +117,7 @@ function readable(s: string): boolean {
 function decodeBase64Runs(text: string): string {
   return text.replace(/[A-Za-z0-9+/_-]{16,}={0,2}/g, (run) => {
     const s = Buffer.from(run.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
-    return readable(s) ? stripInvisible(s).text : run;
+    return readable(s) ? stripInvisible(untag(s)).text : run;
   });
 }
 
@@ -115,11 +130,16 @@ function decodeHexRuns(text: string): string {
   });
 }
 
-export function scanVariants(decodedForScan: string): ScanVariant[] {
+/**
+ * @param decodedForScan the sanitizer's detection copy.
+ * @param tagText the ASCII shadowed by tag characters the sanitizer stripped (see `SanitizeResult`).
+ */
+export function scanVariants(decodedForScan: string, tagText = ""): ScanVariant[] {
   const variants: ScanVariant[] = [{ kind: "decoded", text: decodedForScan }];
   const add = (kind: string, text: string): void => {
-    if (!variants.some((v) => v.text === text)) variants.push({ kind, text });
+    if (text.length > 0 && !variants.some((v) => v.text === text)) variants.push({ kind, text });
   };
+  add("unicode_tags_stripped", tagText);
 
   // decodedForScan has had ONE decode pass; nested encodings (%2520) need more. Three is enough for
   // any nesting a model would still unwrap, and bounds the work.
@@ -130,6 +150,8 @@ export function scanVariants(decodedForScan: string): ScanVariant[] {
     redecoded = d.text;
   }
   add("nested_encoding", redecoded);
+
+  add("unicode_tags", stripInvisible(untag(redecoded)).text);
 
   const base = stripInvisible(redecoded).text;
   add("base64", decodeBase64Runs(base));
