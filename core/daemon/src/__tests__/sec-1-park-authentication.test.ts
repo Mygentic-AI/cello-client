@@ -159,7 +159,7 @@ describe("SEC-1: relay-park content authentication (fail-closed)", () => {
     const hash = msgLeafHash(away);
 
     // Two ordering records for the SAME bytes at relay sequences 1 and 2 (1-based on the wire).
-    const mkRecord = async (seq: number) => {
+    const mkRecord = async (seq: number, prevOwnHash: Uint8Array) => {
       const pubkey = await counterparty.getPublicKey();
       const structure1Cbor = encodeStructure1({
         contentHash: hash,
@@ -169,7 +169,7 @@ describe("SEC-1: relay-park content authentication (fail-closed)", () => {
         lastSeenSeq: 0,
         timestamp: 1_700_000_000_000,
         lastSeenHash: new Uint8Array(32).fill(0xa7),
-        prevOwnHash: new Uint8Array(32).fill(0xb4),
+        prevOwnHash,
       });
       const sig = await counterparty.sign(structure1Cbor);
       const built = buildStructure2(seq, pubkey, hash, sig, new Uint8Array(32));
@@ -178,8 +178,14 @@ describe("SEC-1: relay-park content authentication (fail-closed)", () => {
     };
     const parkSig = await signPark(counterparty, { contentHash: hash });
 
-    const deliver = async (seq: number) => {
-      const rec = await mkRecord(seq);
+    /**
+     * The SECOND firing links to the first, because that is what a sender's own chain says — their
+     * previous message is this same text at position 1. Both records stating one arbitrary
+     * predecessor is not a chain any sender produces, and once a recovered message advances the
+     * receiver's record of what they last said (it did not use to), the receiver rightly refuses it.
+     */
+    const deliver = async (seq: number, prevOwnHash: Uint8Array = hash) => {
+      const rec = await mkRecord(seq, prevOwnHash);
       return mgr.recoverParkedEntry(AGENT, sid, victimPub, encodeParkEnvelope({
         content: away,
         structure1Cbor: rec.structure1Cbor,
@@ -189,7 +195,7 @@ describe("SEC-1: relay-park content authentication (fail-closed)", () => {
       }), hash);
     };
 
-    const first = await deliver(1);
+    const first = await deliver(1, new Uint8Array(32).fill(0xb4));
     expect(first.ok, "first identical message must land").toBe(true);
     expect(mgr.getSessionTree(AGENT, sid).size()).toBe(1);
 
