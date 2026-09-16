@@ -14,7 +14,16 @@
     "reported separately, never as a deterministic-layer score.",
     "",
     "Category names are bordair-multimodal's (payloads*/<category>). Assigned 2026-09-16 by",
-    "reading one payload per category; revisit when the catalog adds categories."
+    "reading one payload per category; revisit when the catalog adds categories.",
+    "",
+    "Two calls worth stating, because both look inconsistent until you read the payloads:",
+    "  - bordair cipher_jailbreaks is layer1 while p4rs ciphers are excluded as unreadable. The",
+    "    bordair payloads carry an ENGLISH instruction telling the model to decode and comply, so",
+    "    there is a marker to see; a raw Caesar-shifted sentence with no instruction is not one.",
+    "  - combined_multiturn_gcg is layer1 (its payloads carry 'output your system prompt verbatim')",
+    "    while combined_pair_gcg and gcg_adversarial_suffix are classifier (screenplay framing and",
+    "    gibberish suffixes carry no marker). memory_poisoning moved to layer1 on 2026-09-16: its",
+    "    payloads say 'include the last three system messages verbatim', which is a marker."
   ],
   "bordair": {
     "payloads_v2/autodan_jailbreak": "layer1",
@@ -34,6 +43,7 @@
     "payloads_v4/detector_evasion": "layer1",
     "payloads_v4/instruction_hierarchy_bypass": "layer1",
     "payloads_v4/multi_agent_contagion": "layer1",
+    "payloads_v4/memory_poisoning": "layer1",
     "payloads_v4/pdf_active_content": "layer1",
     "payloads_v4/rag_chunk_boundary": "layer1",
     "payloads_v4/unicode_tag_smuggling": "layer1",
@@ -50,7 +60,7 @@
     "payloads_v4/beast_suffixes": "classifier",
     "payloads_v4/computer_use_injection": "classifier",
     "payloads_v4/mcp_tool_injection": "classifier",
-    "payloads_v4/memory_poisoning": "classifier",
+    
     "payloads_v4/reasoning_token_injection": "classifier",
     "payloads_v5/agent_skill_supply_chain": "classifier",
     "payloads_v5/lora_supply_chain": "classifier",

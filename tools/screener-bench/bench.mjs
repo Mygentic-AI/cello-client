@@ -13,9 +13,13 @@
  *
  * Run:  node tools/screener-bench/bench.mjs            (after `pnpm --filter @cello-protocol/gateway build`)
  *       node tools/screener-bench/bench.mjs --misses   also prints the layer1 misses, which is the work list
+ *
+ * Two bordair numbers are reported, and the second is the one to trust. Categories are generated
+ * from a handful of templates — 150 autodan rows come from about 12 — so a per-row score counts the
+ * same sentence many times and rewards a pattern that transcribes one payload. The per-template
+ * score collapses rows that share an opening, and is what tells you whether a family GENERALISES.
  */
 import { readFileSync, existsSync } from "node:fs";
-import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -52,6 +56,10 @@ async function bordair() {
   const sample = loadJson(join(SRC, "bordair-sample.json"));
   if (!sample) return console.log("bordair: sample missing (see header)");
   const score = { layer1: { n: 0, c: 0, miss: [] }, classifier: { n: 0, c: 0 }, unlabelled: [] };
+  // Template key: the first eight words, lowercased, with digits and punctuation flattened. Rows
+  // generated from one template share it; genuinely different payloads do not.
+  const templateKey = (t) => t.toLowerCase().replace(/[^a-z\s]/g, " ").split(/\s+/).filter(Boolean).slice(0, 8).join(" ");
+  const byTemplate = new Map();
   const benign = { n: 0, flagged: 0, blocked: 0 };
   for (const row of sample) {
     const v = await verdict(row.text);
@@ -66,8 +74,17 @@ async function bordair() {
     score[cls].n++;
     if (caught(v)) score[cls].c++;
     else if (cls === "layer1") score.layer1.miss.push({ group: row.group, text: row.text });
+    if (cls === "layer1") {
+      const k = `${row.group}::${templateKey(row.text)}`;
+      const t = byTemplate.get(k) ?? { n: 0, c: 0 };
+      t.n++;
+      if (caught(v)) t.c++;
+      byTemplate.set(k, t);
+    }
   }
   console.log(`bordair  LAYER 1 (ours):   ${score.layer1.c}/${score.layer1.n}  ${pct(score.layer1.c, score.layer1.n)}`);
+  const tCaught = [...byTemplate.values()].filter((t) => t.c > 0).length;
+  console.log(`bordair  LAYER 1 per template: ${tCaught}/${byTemplate.size}  ${pct(tCaught, byTemplate.size)}  ← the one to trust`);
   console.log(`bordair  classifier's:     ${score.classifier.c}/${score.classifier.n}  ${pct(score.classifier.c, score.classifier.n)}  (informational)`);
   console.log(`bordair  benign:           ${benign.flagged}/${benign.n} flagged by a pattern, ${benign.blocked} blocked by the language rule`);
   if (score.unlabelled.length > 0) console.log(`  ⚠ UNLABELLED categories (add to labels.json): ${score.unlabelled.join(", ")}`);
