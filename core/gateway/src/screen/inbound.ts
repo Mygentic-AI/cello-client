@@ -25,6 +25,7 @@
 import { operatorCanRun, noOperatorOverride } from "./affordance.js";
 import { sanitizeInbound } from "../detect/sanitize.js";
 import { scanInjectionPatterns } from "../detect/injection-patterns.js";
+import { scanVariants } from "../detect/scan-variants.js";
 import { screenInboundLanguage, type LanguageOptions } from "../detect/language.js";
 import { InjectionScanner } from "../detect/injection-scanner.js";
 import type { GovernanceEvent } from "./outbound.js";
@@ -169,13 +170,25 @@ export class InboundScreener {
     // via RE2 (ReDoS-safe). High-signal but reported as `observe` — the agent + the Layer-2 semantic
     // scanner / policy decide; CELLO surfaces evidence, it does not police content (a block on a
     // single pattern would brick legitimate discussion of prompt injection).
-    for (const id of scanInjectionPatterns(r.decodedForScan)) {
-      events.push({
-        stage: "injection_scan",
-        disposition: "observe",
-        category: `injection:${id}`,
-        reason: `matched known injection pattern '${id}' in the decoded content`,
-      });
+    //
+    // Each scan variant undoes one disguise a receiving LLM can still read (accents, spaced letters,
+    // leetspeak, joined words…). Variants are pattern-matched ONLY — the delivered text is untouched.
+    // One event per pattern id; the first variant that surfaces it is named, so the operator sees
+    // which disguise was unmasked.
+    const seen = new Set<string>();
+    for (const variant of scanVariants(r.decodedForScan)) {
+      for (const id of scanInjectionPatterns(variant.text)) {
+        if (seen.has(id)) continue;
+        seen.add(id);
+        events.push({
+          stage: "injection_scan",
+          disposition: "observe",
+          category: `injection:${id}`,
+          reason: variant.kind === "decoded"
+            ? `matched known injection pattern '${id}' in the decoded content`
+            : `matched known injection pattern '${id}' after undoing a disguise (${variant.kind})`,
+        });
+      }
     }
 
     const mutated = r.notes.some((n) => MUTATING.has(n.step));

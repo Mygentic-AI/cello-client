@@ -21,7 +21,9 @@ const PATTERN_SOURCES: Array<{ id: string; src: string }> = [
   // Role-hijacking / chat-template markers (the delimiter tokens from instruction-tuned training).
   { id: "role_marker", src: "\\[/?(?:system|inst|sys)\\]|<\\|im_(?:start|end)\\|>|<\\|(?:system|user|assistant)\\|>|<</?sys>>|\\bsystem prompt:" },
   // Override commands.
-  { id: "override", src: "(?:ignore|disregard|forget)\\s+(?:all\\s+|your\\s+|the\\s+|any\\s+|previously\\s+)*(?:previous|prior|above|earlier|the)\\s+(?:instructions|prompts?|context|messages?|rules?|directions?)" },
+  // Up to three filler words between the verb and "previous" ("ignore all of your previous…"), and
+  // the space-free form a joined-words disguise leaves ("ignoreallpreviousinstructions").
+  { id: "override", src: "(?:ignore|disregard|forget)\\s+(?:\\w+\\s+){0,3}(?:previous|prior|above|earlier|the)\\s+(?:instructions|prompts?|context|messages?|rules?|directions?)|(?:ignore|disregard|forget)(?:all|your|the|any)*(?:previous|prior|above|earlier)(?:instructions|prompts?|rules?|directions?)" },
   { id: "override_explicit", src: "forget everything (?:above|before)|your new instructions are|new[_ ]paradigm" },
   // Persona replacement / mode unlocks.
   { id: "persona", src: "\\byou are now\\b|\\bdeveloper mode\\b|\\bdo anything now\\b|\\bDAN mode\\b" },

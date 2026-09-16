@@ -47,8 +47,15 @@ export interface LanguageOptions {
  */
 export function scriptOf(cp: number): Script | null {
   // Returns the script for a LETTER codepoint, or null for non-letters (digits/punct/space/emoji).
+  // Combining marks carry no script of their own — counted as letters they let a few underline or
+  // Zalgo marks outvote the Latin they decorate (DOD-M9C-SCREENBASE-1).
+  if ((cp >= 0x300 && cp <= 0x36f) || (cp >= 0x1ab0 && cp <= 0x1aff) || (cp >= 0x1dc0 && cp <= 0x1dff) ||
+      (cp >= 0x20d0 && cp <= 0x20ff) || (cp >= 0xfe20 && cp <= 0xfe2f)) return null;
+  // IPA extensions, phonetic extensions and Latin Extended-C/D hold small caps and turned letters —
+  // decorated Latin, not a foreign language.
   if ((cp >= 0x41 && cp <= 0x5a) || (cp >= 0x61 && cp <= 0x7a) ||
-      (cp >= 0xc0 && cp <= 0x24f) || (cp >= 0x1e00 && cp <= 0x1eff)) return "latin";
+      (cp >= 0xc0 && cp <= 0x2af) || (cp >= 0x1d00 && cp <= 0x1dbf) || (cp >= 0x1e00 && cp <= 0x1eff) ||
+      (cp >= 0x2c60 && cp <= 0x2c7f) || (cp >= 0xa720 && cp <= 0xa7ff)) return "latin";
   if (cp >= 0x400 && cp <= 0x4ff) return "cyrillic";
   if ((cp >= 0x370 && cp <= 0x3ff) || (cp >= 0x1f00 && cp <= 0x1fff)) return "greek";
   if ((cp >= 0x600 && cp <= 0x6ff) || (cp >= 0x750 && cp <= 0x77f)) return "arabic";
