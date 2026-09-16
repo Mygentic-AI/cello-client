@@ -86,7 +86,7 @@ export function registerAgentAdminHandlers(deps: AgentAdminDeps): void {
       persistence: getPersistence(agentName),
       agentPubkeyHex: loaded.pubkey,
       // DOD-M15-SEALWIRE-1 bullet 2 (review F1): gate the co-signature on the root check.
-      verifyCertifiedRoot: (pub, sid, root, leaves) => sessionNodeManager.verifyCertifiedRoot(pub, sid, root, leaves),
+      verifyCertifiedRoot: (pub, sid, root, leaves, evidence) => sessionNodeManager.verifyCertifiedRoot(pub, sid, root, leaves, evidence),
       keyProvider: loaded.keyProvider,
       getNode: entry.getNode,
       getDirectoryEndpoint: getFailoverEndpoint,

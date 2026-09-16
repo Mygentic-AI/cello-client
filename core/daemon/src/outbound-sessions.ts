@@ -682,7 +682,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
       persistence: getPersistence(agentName),
       agentPubkeyHex,
       // DOD-M15-SEALWIRE-1 bullet 2 (review F1): gate the co-signature on the root check.
-      verifyCertifiedRoot: (pub, sid, root, leaves) => sessionNodeManager.verifyCertifiedRoot(pub, sid, root, leaves),
+      verifyCertifiedRoot: (pub, sid, root, leaves, evidence) => sessionNodeManager.verifyCertifiedRoot(pub, sid, root, leaves, evidence),
       keyProvider: agentKeyProvider,
       getNode: () => nodeRef,
       getDirectoryEndpoint: getFailoverEndpoint,
@@ -702,7 +702,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
       persistence: getPersistence(agentName),
       agentPubkeyHex,
       // DOD-M15-SEALWIRE-1 bullet 2 (review F1): gate the co-signature on the root check.
-      verifyCertifiedRoot: (pub, sid, root, leaves) => sessionNodeManager.verifyCertifiedRoot(pub, sid, root, leaves),
+      verifyCertifiedRoot: (pub, sid, root, leaves, evidence) => sessionNodeManager.verifyCertifiedRoot(pub, sid, root, leaves, evidence),
       keyProvider: agentKeyProvider,
       getNode: () => nodeRef,
       getDirectoryEndpoint: getFailoverEndpoint,

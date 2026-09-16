@@ -223,7 +223,7 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
       // DOD-M15-SEALWIRE-1 bullet 2 (review F1): the co-sign path must check the root before this
       // agent's key endorses it. Same predicate as the receiving path — one implementation, so the
       // two halves cannot drift about what a mismatch is.
-      verifyCertifiedRoot: (pub, sid, root, leaves) => sessionNodeManager.verifyCertifiedRoot(pub, sid, root, leaves),
+      verifyCertifiedRoot: (pub, sid, root, leaves, evidence) => sessionNodeManager.verifyCertifiedRoot(pub, sid, root, leaves, evidence),
       keyProvider: agentKeyProvider,
       getNode: entry.getNode,
       getDirectoryEndpoint: getFailoverEndpoint,
@@ -243,7 +243,7 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
       // DOD-M15-SEALWIRE-1 bullet 2 (review F1): the co-sign path must check the root before this
       // agent's key endorses it. Same predicate as the receiving path — one implementation, so the
       // two halves cannot drift about what a mismatch is.
-      verifyCertifiedRoot: (pub, sid, root, leaves) => sessionNodeManager.verifyCertifiedRoot(pub, sid, root, leaves),
+      verifyCertifiedRoot: (pub, sid, root, leaves, evidence) => sessionNodeManager.verifyCertifiedRoot(pub, sid, root, leaves, evidence),
       keyProvider: agentKeyProvider,
       getNode: entry.getNode,
       getDirectoryEndpoint: getFailoverEndpoint,
@@ -345,7 +345,7 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
       persistence: getPersistence(agent.name),
       agentPubkeyHex: agent.pubkey,
       // DOD-M15-SEALWIRE-1 bullet 2 (review F1): gate the co-signature on the root check.
-      verifyCertifiedRoot: (pub, sid, root, leaves) => sessionNodeManager.verifyCertifiedRoot(pub, sid, root, leaves),
+      verifyCertifiedRoot: (pub, sid, root, leaves, evidence) => sessionNodeManager.verifyCertifiedRoot(pub, sid, root, leaves, evidence),
       keyProvider: agent.keyProvider,
       getNode: noSharedDirectoryNode,
       getDirectoryEndpoint: getFailoverEndpoint,
@@ -362,7 +362,7 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
       persistence: getPersistence(agent.name),
       agentPubkeyHex: agent.pubkey,
       // DOD-M15-SEALWIRE-1 bullet 2 (review F1): gate the co-signature on the root check.
-      verifyCertifiedRoot: (pub, sid, root, leaves) => sessionNodeManager.verifyCertifiedRoot(pub, sid, root, leaves),
+      verifyCertifiedRoot: (pub, sid, root, leaves, evidence) => sessionNodeManager.verifyCertifiedRoot(pub, sid, root, leaves, evidence),
       keyProvider: agent.keyProvider,
       getNode: noSharedDirectoryNode,
       getDirectoryEndpoint: getFailoverEndpoint,

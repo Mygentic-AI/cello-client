@@ -21,7 +21,7 @@
 import { createHash } from "node:crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { closeOverCarriedEvidence } from "./seal-carried-close.js";
-import { verifyCertifiedRoot as judgeCertifiedRoot } from "./seal-certified-root-check.js";
+import { verifyCertifiedRoot as judgeCertifiedRoot } from "./seal-certified-root-check.js"; import { judgeFromEvidence } from "./seal-evidence-root-check.js";
 import { encodeSealPayload, decodeStructure1 } from "@cello-protocol/protocol-types";
 import { AUTOACK_BROKER_GRACE_MS } from "./session-node-types.js";
 import type { SealUpgradeReadiness } from "./seal-upgrade.js";
@@ -307,8 +307,11 @@ export class SessionSeal {
     sessionIdHex: string,
     certifiedRoot: Uint8Array,
     certifiedLeafCount: number,
+    evidence?: readonly unknown[], // the request's signed leaf set — see seal-evidence-root-check.ts
   ): { verdict: "match" } | { verdict: "mismatch"; ownRootHex: string | null; detail: string } | { verdict: "cannot_judge"; reason: string } {
-    return judgeCertifiedRoot((pk, sid) => this.getSealCarry(pk, sid), agentPubkeyHex, sessionIdHex, certifiedRoot, certifiedLeafCount);
+    const own = judgeCertifiedRoot((pk, sid) => this.getSealCarry(pk, sid), agentPubkeyHex, sessionIdHex, certifiedRoot, certifiedLeafCount);
+    if (own.verdict !== "cannot_judge" || !evidence || evidence.length === 0) return own;
+    return judgeFromEvidence({ ownCarry: this.getSealCarry(agentPubkeyHex, sessionIdHex), db: this.#ctx.db(), logger: this.#ctx.logger }, { ownReason: own.reason, agentPubkeyHex, sessionIdHex, certifiedRoot, certifiedLeafCount, evidence });
   }
 
   /**

@@ -337,6 +337,8 @@ export interface CeremonyWiringDeps {
     sessionIdHex: string,
     certifiedRoot: Uint8Array,
     certifiedLeafCount: number,
+    /** The request's own signed leaf set — used only when this side's carry cannot judge. */
+    evidence?: readonly unknown[],
   ) => { verdict: "match" } | { verdict: "mismatch"; ownRootHex: string | null; detail: string } | { verdict: "cannot_judge"; reason: string };
   /**
    * SEC-2: the agent's K_local signer — authenticates every FROST commit/sign request the ceremony
@@ -747,7 +749,9 @@ export function wireSealCeremonyHandler(deps: CeremonyWiringDeps): () => void {
        * it. The safe default is opposite in each direction: tolerate on the way in, refuse on the way
        * out.
        */
-      const rootCheck = deps.verifyCertifiedRoot(deps.agentPubkeyHex, sidHex, sealedRoot, leafCount);
+      // The evidence travels too: a side that restarted mid-session can never receive the counterparty's
+      // SEAL leaf, but the request it is being asked to sign already carries it, signed.
+      const rootCheck = deps.verifyCertifiedRoot(deps.agentPubkeyHex, sidHex, sealedRoot, leafCount, sealEvidenceLeaves);
       if (rootCheck.verdict !== "match") {
         deps.logger.error("session.seal.ceremony.abort", {
           agentName: deps.agentName, sessionId: sidHex,
