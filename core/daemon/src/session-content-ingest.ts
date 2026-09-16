@@ -1094,6 +1094,26 @@ export class SessionContentIngest {
     // A just-appended leaf may unblock held out-of-order arrivals whose turn is now next.
     // appendedCount = this leaf + any held leaves released by it, so a caller (recover) can tally the
     // leaves ACTUALLY written, not just the directly-ingested one (review #3).
+    /**
+     * ─── THE SENDER'S SELF CHAIN ADVANCES HERE, WHERE EVERY ROUTE PASSES ─────────────────────────
+     *
+     * `noteReceivedFromCounterparty` records "the last message we accepted from them", which is what
+     * `#verifySenderSelfChain` compares their NEXT message's `prevOwnHash` against.
+     *
+     * It used to be called by the live content-frame caller only, so a message recovered from the
+     * relay mailbox was ingested without advancing it. Measured live 2026-09-16: a machine came back
+     * from a blackout, took both parked messages, and the SECOND one named the first as its
+     * predecessor — which this side had just accepted but not recorded. The chain check called it a
+     * predecessor we do not hold, the ordering record was thrown away, and the seal answer told the
+     * operator their copy did not match a seal that was correct.
+     *
+     * Here it is on the one path every route ends at, and only for a leaf actually appended: a HELD
+     * frame returns earlier (it is not accepted yet), and so does a DEDUP hit — which is also a fix,
+     * because advancing on a duplicate would rewind the head to an older message when a late copy
+     * arrives. Both callers verify the chain BEFORE they call this, so the comparison still happens
+     * against the previous message and never against this one.
+     */
+    this.#ctx.authorship.noteReceivedFromCounterparty(agentName, sessionId, contentHash);
     const released = this.#ctx.held.releaseHeld(agentName, sessionId, senderPubkey);
     return { ok: true, leafIndex, sequenceNumber: leafIndex, appendedCount: 1 + released, ...(terminalBlock ? { screenedOut: true } : {}) };
   }
@@ -2083,19 +2103,17 @@ export class SessionContentIngest {
       // missing-earlier message is fetchable, and dedup absorbs the redundant copy.
       if (ingest.ok && !ingest.held) {
         /**
-         * ─── THE SELF CHAIN IS PURELY CONTENT, SO IT ADVANCES HERE — `DOD-M15-SELFCHAIN-1` ───────
+         * ─── THE SELF CHAIN ADVANCES INSIDE `ingestReceivedContent`, NOT HERE — `DOD-M15-SELFCHAIN-1`
          *
-         * ⚠️ NOT INSIDE `#noteAcknowledgeable`, and that placement was the bug. The acknowledgement
-         * is a (POSITION, content) pair and needs the relay's number, so on a session the relay
-         * never witnessed it is never written at all. The self link needs no position — it is one
-         * party's hash chain over their own messages — so tying it to the acknowledgement meant the
-         * receiver's record never moved on an unwitnessed session, and the counterparty's SECOND
-         * message was refused as a broken chain for the rest of the conversation.
+         * It was called here, and this is the live content-frame path only: a message recovered from
+         * the relay mailbox never reached it. It moved down into the ingest's durable-append point,
+         * which every route ends at — see the comment there for what that cost live.
          *
-         * That is the path this unit exists for: a conversation that ran while the relay was down is
-         * precisely the one whose order gets disputed later.
+         * The reason it is not inside `#noteAcknowledgeable` still stands and is why it did not move
+         * there: the acknowledgement is a (POSITION, content) pair needing the relay's number, so on
+         * a session the relay never witnessed it is never written, while the self link needs no
+         * position at all — it is one party's hash chain over their own messages.
          */
-        this.#ctx.authorship.noteReceivedFromCounterparty(agentName, sessionId, contentHash);
         /**
          * 033-ACKEMIT review F1 — ACKNOWLEDGE WHAT ARRIVED, HERE, not when the relay gets round to
          * delivering its copy back to us.

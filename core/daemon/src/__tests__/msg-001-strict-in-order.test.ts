@@ -33,6 +33,7 @@ import { buildStructure2, encodeStructure2 } from "@cello-protocol/protocol-type
 import { encodeStructure1 } from "@cello-protocol/protocol-types";
 import { encodeParkEnvelope } from "../park-envelope.js";
 import { seedAgents } from "./helpers/seed-agents.js";
+import { TEST_SESSION_GENESIS } from "./helpers/session-genesis.js";
 import { receivedCount, receivedRows } from "./helpers/received-rows.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
@@ -309,7 +310,7 @@ describe("DOD-MSG-4: ordering-record verification is adversarially exercised", (
     kp: ReturnType<typeof generateKeypair>,
     content: Uint8Array,
     seq: number,
-    opts: { corruptSig?: boolean } = {},
+    opts: { corruptSig?: boolean; prevOwnHash?: Uint8Array; lastSeenHash?: Uint8Array } = {},
   ): Promise<{ structure1Cbor: Uint8Array; structure2Cbor: Uint8Array; contentHash: Uint8Array }> {
     const pubkey = await kp.getPublicKey();
     const contentHash = msgLeafHash(content); // 32-byte msg leaf hash, as the sender submits
@@ -322,8 +323,8 @@ describe("DOD-MSG-4: ordering-record verification is adversarially exercised", (
       sessionId: Uint8Array.from(Buffer.from(sid, "hex")),
       lastSeenSeq: 0,
       timestamp: 1_700_000_000_000,
-      lastSeenHash: new Uint8Array(32).fill(0xa7),
-      prevOwnHash: new Uint8Array(32).fill(0xb4),
+      lastSeenHash: opts.lastSeenHash ?? new Uint8Array(32).fill(0xa7),
+      prevOwnHash: opts.prevOwnHash ?? new Uint8Array(32).fill(0xb4),
     });
     let sig = await kp.sign(structure1Cbor); // 64-byte Ed25519 over the exact structure1 bytes
     if (opts.corruptSig) { sig = new Uint8Array(sig); sig[0] ^= 0xff; }
@@ -373,6 +374,47 @@ describe("DOD-MSG-4: ordering-record verification is adversarially exercised", (
       sealTable ? (db.prepare("SELECT COUNT(*) AS n FROM session_seal_leaves WHERE session_id = ?").get(sid) as { n: number }).n : 0,
       "the position is the sender's claim, not relay-signed, so it must never enter the seal carry",
     ).toBe(0);
+  });
+
+  /**
+   * Live 2026-09-16, the retest of the case above: the machine came back from a blackout and took
+   * BOTH parked messages. The first kept its position; the second did not, and the receipt again
+   * told the operator their copy did not match a correct seal.
+   *
+   * Accepting a message did not advance this side's record of "the last thing they said to me", so
+   * the second message — which links to the first — named a predecessor this side had just accepted
+   * and not recorded. The chain check called that a message they never sent, and the position was
+   * thrown away. Only the recovery path was affected, because only it ingests without the live
+   * content-frame path that used to do the advancing.
+   */
+  it("★★★ a SECOND recovered message, linking to the first, keeps its position too", async () => {
+    const kp = generateKeypair();
+    const mgr = await managerWithCounterparty(kp, "recovered-chain.db");
+    const db = mgr.getDb();
+    /**
+     * THE SESSION MUST HAVE A STARTING POINT, or this test proves nothing. With none, this side has
+     * nothing to compare a self link against, every link is accepted as unverifiable, and these
+     * assertions pass against a build with the fix removed. A real session always has one.
+     */
+    mgr.setSessionGenesisForTest("alice", sid, TEST_SESSION_GENESIS);
+
+    const first = enc("sent while asleep 1");
+    const rec1 = await buildRecord(kp, first, 1, { prevOwnHash: TEST_SESSION_GENESIS, lastSeenHash: TEST_SESSION_GENESIS });
+    mgr.recordOrderingRecord("alice", sid, rec1.structure1Cbor, rec1.structure2Cbor, rec1.contentHash);
+    expect((await mgr.ingestReceivedContent("alice", sid, first, rec1.contentHash)).ok, "the first recovered message is accepted").toBe(true);
+
+    // Their SECOND message links to their first — the honest chain, which is the whole point.
+    const rec2 = await buildRecord(kp, enc("sent while asleep 2"), 2, { prevOwnHash: rec1.contentHash, lastSeenHash: TEST_SESSION_GENESIS });
+    mgr.recordOrderingRecord("alice", sid, rec2.structure1Cbor, rec2.structure2Cbor, rec2.contentHash);
+
+    expect(
+      fired("session.content.ordering.malformed"),
+      "the predecessor was accepted moments earlier, so calling it a message they never sent is this side's own gap",
+    ).toBe(false);
+    expect(
+      (db.prepare("SELECT relay_seq AS seq FROM session_recovered_positions WHERE session_id = ? ORDER BY relay_seq").all(sid) as Array<{ seq: number }>).map((r) => r.seq),
+      "both recovered messages must hold a position, or the seal answer reports a mismatch on a correct seal",
+    ).toEqual([1, 2]);
   });
 
   it("an UNVERIFIED mailbox ordering record keeps no position", async () => {
