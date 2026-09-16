@@ -86,6 +86,46 @@ function reverse(text: string): string {
   return [...text].reverse().join("");
 }
 
+/** Caesar shift by n — the scan tries every shift, so ROT13/ROT5/any rotation is covered. */
+function caesar(text: string, n: number): string {
+  return text.replace(/[a-z]/gi, (c) => {
+    const base = c <= "Z" ? 65 : 97;
+    return String.fromCharCode(((c.charCodeAt(0) - base + n) % 26) + base);
+  });
+}
+
+/** Atbash: a↔z, b↔y. Its own inverse. */
+function atbash(text: string): string {
+  return text.replace(/[a-z]/gi, (c) => {
+    const base = c <= "Z" ? 65 : 97;
+    return String.fromCharCode(base + 25 - (c.charCodeAt(0) - base));
+  });
+}
+
+/** ROT47 over printable ASCII. */
+function rot47(text: string): string {
+  return text.replace(/[!-~]/g, (c) => String.fromCharCode(33 + ((c.charCodeAt(0) - 33 + 47) % 94)));
+}
+
+/** "01001001 01100111" → the ASCII it spells. */
+function decodeBinaryRuns(text: string): string {
+  return text.replace(/(?:[01]{8}[\s,]{0,2}){4,}/g, (run) => {
+    const bits = run.replace(/[^01]/g, "");
+    let out = "";
+    for (let i = 0; i + 8 <= bits.length; i += 8) out += String.fromCharCode(parseInt(bits.slice(i, i + 8), 2));
+    return /^[\x20-\x7e\n]+$/.test(out) ? out : run;
+  });
+}
+
+/** "9-14-7-15-18-5" → the letters those positions spell (A1Z26). */
+function decodeA1Z26(text: string): string {
+  return text.replace(/(?:\d{1,2}[-\s]){4,}\d{1,2}/g, (run) => {
+    const nums = run.split(/[-\s]+/).map(Number);
+    if (nums.some((n) => n < 1 || n > 26)) return run;
+    return nums.map((n) => String.fromCharCode(96 + n)).join("");
+  });
+}
+
 function rot13(text: string): string {
   return text.replace(/[a-z]/gi, (c) => {
     const base = c <= "Z" ? 65 : 97;
@@ -167,6 +207,13 @@ export function scanVariants(decodedForScan: string, hiddenText = ""): ScanVaria
   add("upside_down", reverse(turned));
   add("upside_down_unreversed", turned);
   add("rot13", rot13(base));
+  add("atbash", atbash(base));
+  add("rot47", rot47(base));
+  add("binary", decodeBinaryRuns(base));
+  add("a1z26", decodeA1Z26(base));
+  // Every other Caesar shift. A shift is one pass and the pattern set is small, so trying all of
+  // them costs less than guessing which one an attacker picked.
+  for (let n = 1; n < 26; n++) if (n !== 13) add(`caesar_${n}`, caesar(base, n));
   add("folded_letters", folded);
   add("spaced_letters_joined", joinSpacedLetters(folded));
   add("joined_words_split", foldLetters(splitJoinedWords(base)));
