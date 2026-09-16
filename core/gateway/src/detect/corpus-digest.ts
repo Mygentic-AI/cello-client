@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { injectionPatternIds } from "./injection-patterns.js";
-import { secretRuleIds } from "./secrets.js";
+import { injectionPatternDigestInputs } from "./injection-patterns.js";
+import { secretRuleDigestInputs } from "./secrets.js";
 
 /**
  * M10B / DOD-END-SCAN-1 (`M10B-D15`) — a stable digest of the ACTIVE detector corpus.
@@ -14,18 +14,22 @@ import { secretRuleIds } from "./secrets.js";
  * stable, perfectly meaningless value that a fail-closed caller could not distinguish from a real
  * one — so the absence is reported as absence (§5a), and the caller refuses.
  *
+ * Hashes each rule's SOURCE alongside its id. Ids alone go stale the moment a regex is edited under
+ * the same id — which is what happened when DOD-M9C-SCREENBASE-1 rewrote `override` — and a stale
+ * digest is notarized as evidence of a scan that did not happen.
+ *
  * SORTED before hashing, because corpus ORDER is not a property anyone should depend on: reordering
  * the source array changes nothing about which text is caught, and a digest that moved on a reorder
  * would force a spurious `scanner_version` change and read as a rule change to anyone auditing it.
  * What the digest MUST track is the SET of active rules.
  */
 export function detectorCorpusDigest(): string | null {
-  const patterns = injectionPatternIds();
-  const secrets = secretRuleIds();
+  const patterns = injectionPatternDigestInputs();
+  const secrets = secretRuleDigestInputs();
   if (patterns === null || secrets === null) return null;
   const canonical = JSON.stringify({
-    injection: [...patterns].sort(),
-    secrets: [...secrets].sort(),
+    injection: patterns.map((p) => `${p.id}\u0000${p.src}`).sort(),
+    secrets: secrets.map((r) => `${r.id}\u0000${r.src}`).sort(),
   });
   return createHash("sha256").update(canonical, "utf8").digest("hex");
 }

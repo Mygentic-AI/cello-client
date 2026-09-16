@@ -13,7 +13,7 @@
  */
 import { LinearRegex } from "./linear-regex.js";
 
-interface CompiledPattern { id: string; re: LinearRegex }
+interface CompiledPattern { id: string; src: string; re: LinearRegex }
 
 let compiled: CompiledPattern[] | null = null;
 
@@ -23,18 +23,27 @@ const PATTERN_SOURCES: Array<{ id: string; src: string }> = [
   // Override commands.
   // Up to three filler words between the verb and "previous" ("ignore all of your previous…"), and
   // the space-free form a joined-words disguise leaves ("ignoreallpreviousinstructions").
-  // DOD-M9C-SCREENBASE-1 widened the verbs and the nouns: "disregard all previous guidelines",
-  // "bypass your safety restrictions", "override your programming" were flagged by none of these.
-  { id: "override", src: "(?:ignore|disregard|forget|bypass|override|skip|abandon|set aside)\\s+(?:\\w+\\s+){0,3}(?:previous|prior|above|earlier|the|your|all|any|safety|content|ethical)\\s+(?:\\w+\\s+)?(?:instructions|prompts?|context|messages?|rules?|directions?|guidelines|polic(?:y|ies)|constraints|restrictions|programming|directives|safeguards|filters|limitations)|(?:ignore|disregard|forget)(?:all|your|the|any)*(?:previous|prior|above|earlier)(?:instructions|prompts?|rules?|directions?|guidelines)" },
+  // DOD-M9C-SCREENBASE-1 widened the verbs and the nouns: "disregard all previous guidelines" and
+  // "bypass your safety restrictions" were flagged by none of these.
+  //
+  // The word after the filler must be an ATTACK ANCHOR (previous / safety / ethical / …), never
+  // "the|your|all|any": anchored on those, the widened rule fired on ordinary work chat — "our
+  // linter should skip any rules marked experimental", "you can override the default policy in
+  // settings". A flag that fires on normal conversation stops carrying information.
+  { id: "override", src: "(?:ignore|disregard|forget|bypass|override|skip|abandon|set aside)\\s+(?:\\w+\\s+){0,3}(?:previous|prior|above|earlier|original|initial|safety|ethical|content|system)\\s+(?:instructions|prompts?|context|messages?|rules?|directions?|guidelines|polic(?:y|ies)|constraints|restrictions|programming|directives|safeguards|filters|limitations)|(?:ignore|disregard)(?:all|your|the|any)*(?:previous|prior|above|earlier)(?:instructions|prompts?|rules?|directions?|guidelines)" },
   { id: "override_explicit", src: "forget everything (?:above|before|you know)|your new instructions are|new[_ ]paradigm|from now on,?\\s+you (?:are|will|must|shall)\\b|you (?:are|will) no longer (?:bound|restricted|limited)|you are no longer an? (?:ai|assistant|language model)" },
   // Persona replacement / mode unlocks.
   { id: "persona", src: "\\byou are now\\b|\\bdeveloper mode\\b|\\bdo anything now\\b|\\bDAN mode\\b|\\bpretend (?:you are|that you are) (?:an? )?(?:ai|assistant|model|chatbot) (?:with(?:out)?|that has no)\\b|\\bstay in character\\b|\\b(?:unfiltered|uncensored|unrestricted|jailbroken) (?:mode|ai|assistant|version|response)|\\bwithout any (?:restrictions|filters|limitations|censorship)\\b|\\bno (?:ethical|moral) (?:guidelines|restrictions|constraints)\\b" },
   // Jailbreak structural markers (L1B3RT4S) and template placeholders left in pasted jailbreaks.
   { id: "jailbreak", src: "jailbreak\\s*[:>]|<jailbreak>|\\[liberated\\]|<new_paradigm>|\\[insert prompt here\\]|\\bjailbroken\\b" },
   // Attempts to read the agent's own instructions out.
-  { id: "prompt_extraction", src: "(?:reveal|show|print|repeat|output|display|tell me|give me|share|leak)\\s+(?:\\w+\\s+){0,3}(?:system prompt|initial (?:instructions|prompt)|hidden (?:instructions|prompt)|(?:your|the) (?:instructions|prompt|rules) (?:above|verbatim|word for word))|what (?:is|are|were) your (?:system prompt|initial instructions|original instructions)" },
+  // "your original instructions" alone is ordinary English ("what were your original instructions
+  // for the recipe?") — the anchor is the SYSTEM prompt, or a demand to repeat instructions verbatim.
+  { id: "prompt_extraction", src: "(?:reveal|show|print|repeat|output|display|tell me|give me|share|leak)\\s+(?:\\w+\\s+){0,3}(?:system prompt|initial prompt|hidden (?:instructions|prompt)|(?:your|the) (?:instructions|prompt|rules) (?:above|verbatim|word for word))|what (?:is|are|were) your (?:system prompt|initial instructions)" },
   // Demands for secrets, often with a threat attached.
-  { id: "secret_request", src: "(?:provide|give|share|send|tell|reveal)\\s+(?:me\\s+)?(?:\\w+\\s+){0,2}(?:confidential|sensitive|private|secret|classified|internal) (?:information|data|details|records|files)|(?:share|reveal|give me|send me|tell me) (?:your|the) (?:password|passwords|api keys?|credentials|secret keys?|private keys?|access tokens?)" },
+  // The credential half ends the phrase: "share your password manager recommendations" is a benign
+  // request whose noun happens to start with one of these words.
+  { id: "secret_request", src: "(?:provide|give|share|send|tell|reveal)\\s+(?:me\\s+)?(?:\\w+\\s+){0,2}(?:confidential|sensitive|private|secret|classified|internal) (?:information|data|details|records|files)|(?:share|reveal|give me|send me|tell me) (?:your|the) (?:password|passwords|api keys?|credentials|secret keys?|private keys?|access tokens?)\\s*(?:[.!?,;]|with me|to me|now|$)" },
   { id: "coercion", src: "\\bor (?:else )?i will (?:expose|leak|report|publish|delete|destroy|shut)|\\bor face (?:severe |serious )?consequences\\b" },
   // Fake turn-boundary injection.
   { id: "boundary", src: "-{3,}\\s*end of (?:user|system) (?:message|prompt)|={3,}\\s*end system prompt" },
@@ -44,7 +53,7 @@ const PATTERN_SOURCES: Array<{ id: string; src: string }> = [
 
 /** Compile the pattern set. Call once at gateway startup, after `initLinearRegex()` resolves. */
 export function compileInjectionPatterns(): void {
-  compiled = PATTERN_SOURCES.map(({ id, src }) => ({ id, re: new LinearRegex(src, "i") }));
+  compiled = PATTERN_SOURCES.map(({ id, src }) => ({ id, src, re: new LinearRegex(src, "i") }));
 }
 
 /**
@@ -59,6 +68,15 @@ export function compileInjectionPatterns(): void {
  */
 export function injectionPatternIds(): string[] | null {
   return compiled === null ? null : compiled.map((c) => c.id);
+}
+
+/**
+ * The active patterns as (id, source) pairs — the digest input. IDs alone are not enough: this unit
+ * rewrote `override` under its own id, and a digest over ids would not have moved for that edit,
+ * which is exactly the staleness `detectorCorpusDigest` exists to prevent.
+ */
+export function injectionPatternDigestInputs(): Array<{ id: string; src: string }> | null {
+  return compiled === null ? null : compiled.map((c) => ({ id: c.id, src: c.src }));
 }
 
 /** Whether the patterns are compiled (the RE2 engine was initialized). */

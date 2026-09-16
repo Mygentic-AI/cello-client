@@ -268,24 +268,35 @@ function stripSpecialTokens(text: string): { text: string; removed: number } {
  * Two channels, both invisible to the operator and both read as text by a model:
  *  - **Tag characters** (U+E0000 block) shadow ASCII one-for-one.
  *  - **Variation selectors** carry arbitrary bytes after an emoji: U+FE00–U+FE0F are bytes 0–15 and
- *    U+E0100–U+E01EF are bytes 16–255. Decoded as UTF-8; a run that is not valid UTF-8 yields
- *    nothing rather than mojibake.
+ *    U+E0100–U+E01EF are bytes 16–255. Each run between visible characters is decoded on its own as
+ *    UTF-8, and whatever decodes is kept — one invalid byte must not hide the rest.
  */
 export function readHiddenChannels(text: string): string {
+  const parts: string[] = [];
   let tagged = "";
-  const bytes: number[] = [];
+  let run: number[] = [];
+  // A run ENDS at the next visible character: selectors after different base characters are separate
+  // payloads, and merging them splices an ordinary emoji selector (FE0F) into a smuggled sentence.
+  const flushRun = (): void => {
+    if (run.length >= 4) {
+      const decoded = new TextDecoder("utf-8", { fatal: false }).decode(new Uint8Array(run));
+      // Keep what decoded. Dropping the whole run on one invalid byte let an attacker disable the
+      // channel by appending a single 0xFF — the smuggled sentence then produced no evidence at all.
+      const kept = decoded.replace(/\ufffd/g, "");
+      if (kept.length > 0) parts.push(kept);
+    }
+    run = [];
+  };
   for (const ch of text) {
     const cp = ch.codePointAt(0)!;
-    if (cp > 0xe0000 && cp < 0xe007f) tagged += String.fromCodePoint(cp - 0xe0000);
-    else if (cp >= 0xfe00 && cp <= 0xfe0f) bytes.push(cp - 0xfe00);
-    else if (cp >= 0xe0100 && cp <= 0xe01ef) bytes.push(cp - 0xe0100 + 16);
+    if (cp > 0xe0000 && cp < 0xe007f) { tagged += String.fromCodePoint(cp - 0xe0000); continue; }
+    if (cp >= 0xfe00 && cp <= 0xfe0f) { run.push(cp - 0xfe00); continue; }
+    if (cp >= 0xe0100 && cp <= 0xe01ef) { run.push(cp - 0xe0100 + 16); continue; }
+    flushRun();
   }
-  let fromBytes = "";
-  if (bytes.length >= 4) {
-    const decoded = new TextDecoder("utf-8", { fatal: false }).decode(new Uint8Array(bytes));
-    if (!decoded.includes("�")) fromBytes = decoded;
-  }
-  return [tagged, fromBytes].filter((s) => s.length > 0).join(" ");
+  flushRun();
+  if (tagged.length > 0) parts.unshift(tagged);
+  return parts.join(" ");
 }
 
 // ── The pipeline ─────────────────────────────────────────────────────────────

@@ -24,7 +24,7 @@
  */
 import { operatorCanRun, noOperatorOverride } from "./affordance.js";
 import { sanitizeInbound } from "../detect/sanitize.js";
-import { scanInjectionPatterns } from "../detect/injection-patterns.js";
+import { injectionPatternsReady, scanInjectionPatterns } from "../detect/injection-patterns.js";
 import { scanVariants } from "../detect/scan-variants.js";
 import { screenInboundLanguage, type LanguageOptions } from "../detect/language.js";
 import { InjectionScanner } from "../detect/injection-scanner.js";
@@ -175,6 +175,16 @@ export class InboundScreener {
     // leetspeak, joined words…). Variants are pattern-matched ONLY — the delivered text is untouched.
     // One event per pattern id; the first variant that surfaces it is named, so the operator sees
     // which disguise was unmasked.
+    // Uncompiled patterns return no matches, which is indistinguishable from "nothing matched" —
+    // a screener that quietly stopped screening. Say so instead.
+    if (!injectionPatternsReady()) {
+      events.push({
+        stage: "injection_scan",
+        disposition: "observe",
+        category: "injection:patterns_unavailable",
+        reason: "the injection patterns are not compiled (initLinearRegex/compileInjectionPatterns did not run) — no pattern screening ran on this message",
+      });
+    }
     const seen = new Set<string>();
     for (const variant of scanVariants(r.decodedForScan, r.hiddenText)) {
       for (const id of scanInjectionPatterns(variant.text)) {

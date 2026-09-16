@@ -15,7 +15,7 @@
 import { LinearRegex } from "./linear-regex.js";
 import { GITLEAKS_RULES, GITLEAKS_STOPWORDS, GITLEAKS_ALLOW_REGEXES } from "./gitleaks-rules.js";
 
-interface CompiledRule { id: string; re: LinearRegex; keywords: string[]; entropy: number }
+interface CompiledRule { id: string; src: string; re: LinearRegex; keywords: string[]; entropy: number }
 
 let RULES: CompiledRule[] | null = null;
 
@@ -27,6 +27,11 @@ let RULES: CompiledRule[] | null = null;
 export function secretRuleIds(): string[] | null {
   return RULES === null ? null : RULES.map((r) => r.id);
 }
+/** The active rules as (id, source) pairs — see `injectionPatternDigestInputs` for why not ids. */
+export function secretRuleDigestInputs(): Array<{ id: string; src: string }> | null {
+  return RULES === null ? null : RULES.map((r) => ({ id: r.id, src: r.src }));
+}
+
 let STOPWORDS: string[] = [];
 let ALLOW: LinearRegex[] = [];
 
@@ -35,7 +40,7 @@ export function compileSecretRules(): { compiled: number; total: number } {
   const compiled: CompiledRule[] = [];
   for (const r of GITLEAKS_RULES) {
     try {
-      compiled.push({ id: r.id, re: new LinearRegex(r.regex), keywords: r.keywords, entropy: r.entropy });
+      compiled.push({ id: r.id, src: r.regex, re: new LinearRegex(r.regex), keywords: r.keywords, entropy: r.entropy });
     } catch {
       // A rule that does not compile under RE2 is skipped rather than crashing the gateway.
     }

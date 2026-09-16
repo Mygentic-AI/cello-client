@@ -4,8 +4,10 @@
  * in here as a block stage. The daemon-side delivery of the sanitized text + notes to the agent via
  * cello_receive's security_context is M9-FEED-001 / the gate.
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeAll } from "vitest";
 import { InboundScreener } from "./inbound.js";
+import { initLinearRegex } from "../detect/linear-regex.js";
+import { compileInjectionPatterns } from "../detect/injection-patterns.js";
 
 const enc = (s: string) => new TextEncoder().encode(s);
 const dec = (u: Uint8Array) => new TextDecoder().decode(u);
@@ -13,6 +15,13 @@ const tag = (ch: string) => String.fromCodePoint(0xe0000 + ch.charCodeAt(0));
 const hasSmuggled = (s: string) => [...s].some((c) => { const cp = c.codePointAt(0)!; return cp === 0x200b || (cp >= 0xe0000 && cp <= 0xe007f); });
 
 describe("InboundScreener — composed inbound gateway screen", () => {
+  // Without this the patterns are never compiled, so pattern screening silently does nothing and
+  // every expectation below describes a screener running at half strength.
+  beforeAll(async () => {
+    await initLinearRegex();
+    compileInjectionPatterns();
+  });
+
   it("a clean message → allow, content unchanged, no events", async () => {
     const s = new InboundScreener();
     const v = await s.screen(enc("hi, are we still on for tomorrow?"));

@@ -51,9 +51,13 @@ function joinSpacedLetters(text: string): string {
     .join(" ");
 }
 
-/** snake_case, kebab-case, dotted and camelCase identifiers split back into words. */
+/**
+ * snake_case, kebab-case, dotted and camelCase identifiers split back into words. The separator must
+ * sit BETWEEN letters: splitting a sentence-ending "." joined two sentences into one phrase, and
+ * "Don't forget. Previous instructions still apply." read as an override command.
+ */
 function splitJoinedWords(text: string): string {
-  return text.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/[_\-.]+/g, " ");
+  return text.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/([a-zA-Z])[_\-.]+([a-zA-Z])/g, "$1 $2");
 }
 
 const LEET: Record<string, string> = {
@@ -90,10 +94,10 @@ function rot13(text: string): string {
 }
 
 /**
- * Unicode Tag characters (U+E0000 block) back to the ASCII they shadow. The sanitizer strips them
- * from the delivered text, so the agent never sees them — but stripping also destroys the evidence,
- * and the attack is often base64 of tag characters, which survives the strip. Mapped here, the
- * hidden sentence surfaces for the pattern matcher.
+ * Unicode Tag characters (U+E0000 block) back to the ASCII they shadow, plus whatever the other
+ * invisible channels carry. The sanitizer strips tag characters before `decodedForScan` exists, so
+ * this matters for text that only BECOMES tag characters later — the decoding of a base64 run, or a
+ * nested HTML-entity escape. The sanitizer's own `hiddenText` covers what arrived as tags directly.
  */
 function untag(text: string): string {
   let out = "";
@@ -157,15 +161,18 @@ export function scanVariants(decodedForScan: string, hiddenText = ""): ScanVaria
   const base = stripInvisible(redecoded).text;
   add("base64", decodeBase64Runs(base));
   add("hex", decodeHexRuns(base));
-  add("reversed", reverse(foldLetters(base)));
-  add("upside_down", reverse(unturn(base)));
-  add("upside_down_unreversed", unturn(base));
-  add("rot13", rot13(base));
   const folded = foldLetters(base);
+  const turned = unturn(base);
+  add("reversed", reverse(folded));
+  add("upside_down", reverse(turned));
+  add("upside_down_unreversed", turned);
+  add("rot13", rot13(base));
   add("folded_letters", folded);
   add("spaced_letters_joined", joinSpacedLetters(folded));
   add("joined_words_split", foldLetters(splitJoinedWords(base)));
   add("leetspeak", foldLeet(folded));
-  add("spaces_removed", folded.replace(/[\s_\-.]+/g, ""));
+  // Sentence punctuation stays: removing "." would join "…forget. Previous instructions…" into one
+  // phrase and read as an override command.
+  add("spaces_removed", folded.replace(/[\s_-]+/g, ""));
   return variants;
 }
