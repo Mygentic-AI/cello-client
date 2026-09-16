@@ -144,7 +144,7 @@ function normalizeConfusables(text: string): { text: string; changed: boolean; c
 // surfaces for downstream pattern matching. (Base64/other-radix BLOCKS are handled by entropy
 // scoring + the Step-7 hidden-instruction handling, not decoded blindly here.)
 const NAMED_ENTITIES: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " };
-function decodeEncoded(text: string): { text: string; changed: boolean; count: number } {
+export function decodeEncoded(text: string): { text: string; changed: boolean; count: number } {
   let count = 0;
   let out = text;
   out = out.replace(/&#x([0-9a-f]+);/gi, (_m, h: string) => { count++; return safeFromCodePoint(parseInt(h, 16)); });
