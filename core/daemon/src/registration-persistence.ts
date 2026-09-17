@@ -131,6 +131,30 @@ const FILE_AGENT_USER_LINK = "agent-user-link.json";
 
 const SECRET_FILE_MODE = 0o600;
 
+/**
+ * M16: the channel facts of a registration write, checked. A channel without an admin is refused,
+ * and so is any write that would CHANGE the facts already recorded for a registered identity:
+ * `channel` and `adminPubkey` are fixed at registration. Writing the same facts again is allowed.
+ * Shared by both stores so they cannot disagree.
+ */
+export function checkChannelFacts(
+  incoming: { channel?: boolean; adminPubkey?: string },
+  existing: { channel: boolean; adminPubkey: string } | null,
+): { channel: boolean; adminPubkey: string } {
+  const channel = incoming.channel === true;
+  const adminPubkey = channel ? (incoming.adminPubkey ?? "") : "";
+  if (channel && adminPubkey === "") {
+    throw new Error("invalid_channel_registration: a channel must name its admin pubkey");
+  }
+  if (existing && (existing.channel !== channel || existing.adminPubkey !== adminPubkey)) {
+    throw new Error(
+      `channel_fields_immutable: this identity is registered with channel=${existing.channel}` +
+        `${existing.channel ? ` and admin ${existing.adminPubkey}` : ""}; a registration write cannot change that`,
+    );
+  }
+  return { channel, adminPubkey };
+}
+
 const hex = (b: Uint8Array): string => Buffer.from(b).toString("hex");
 const unhex = (s: string): Uint8Array => new Uint8Array(Buffer.from(s, "hex"));
 
@@ -191,6 +215,7 @@ export class FileRegistrationPersistence implements DaemonRegistrationPersistenc
     channel?: boolean;
     adminPubkey?: string;
   }): Promise<void> {
+    const facts = checkChannelFacts(opts, await this.loadRegistrationState());
     await this.#writeJsonAtomic(FILE_REGISTRATION_STATE, {
       agentId: opts.agentId,
       primaryPubkey: opts.primaryPubkey,
@@ -199,8 +224,8 @@ export class FileRegistrationPersistence implements DaemonRegistrationPersistenc
       // 038-KEYBIND: a public signature, not a secret — but it lives with the rest of the
       // registration record because it is meaningless apart from the two keys it names.
       keyBinding: opts.keyBinding,
-      channel: opts.channel === true,
-      adminPubkey: opts.channel === true ? (opts.adminPubkey ?? "") : "",
+      channel: facts.channel,
+      adminPubkey: facts.adminPubkey,
       status: "active",
     });
     this.#logger.info("registration.state.persisted", {

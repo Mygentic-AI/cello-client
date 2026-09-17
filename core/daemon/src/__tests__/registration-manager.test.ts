@@ -499,4 +499,56 @@ describe("M16 004-IDENTITY-WIRE: channel registration (client side)", () => {
     expect(await promise).toMatchObject({ error: "directory_missing_channel_support" });
     expect(calls.reg).toHaveLength(0);
   });
+
+  it("an already_registered reply at the FINAL stage without the echo also fails", async () => {
+    // Review: the second already_registered branch (after the ceremony) had no test of its own.
+    const { persistence, calls } = makeRecordingPersistence(GROUP);
+    const h = makeCapturingCtx(persistence);
+    const mgr = new RegistrationManager(h.ctx);
+    const promise = mgr.register("", "token", { channel: true, adminPubkeyHex: ADMIN });
+    const result = await driveToRegisterSuccess(h, promise, {
+      type: "register_error", reason: "already_registered", ml_dsa_pubkey: "dd".repeat(32),
+    });
+    expect(result).toMatchObject({ error: "directory_missing_channel_support" });
+    expect(calls.reg).toHaveLength(0);
+  });
+
+  it("a truthy-but-not-true echo is not an echo", async () => {
+    const { persistence, calls } = makeRecordingPersistence(GROUP);
+    const h = makeCapturingCtx(persistence);
+    const mgr = new RegistrationManager(h.ctx);
+    const promise = mgr.register("", "token", { channel: true, adminPubkeyHex: ADMIN });
+    const result = await driveToRegisterSuccess(h, promise, { channel: "true" });
+    expect(result).toMatchObject({ error: "directory_missing_channel_support" });
+    expect(calls.reg).toHaveLength(0);
+  });
+
+  it("a failed echo after the ceremony says the identity is now an ordinary agent, not 'retry'", async () => {
+    // Review F2: by the time register_success arrives, the directory has stored the profile. A
+    // retry gets already_registered with no echo, forever, so "retry" is advice that cannot work.
+    const h = makeCapturingCtx(makeRecordingPersistence(GROUP).persistence);
+    const mgr = new RegistrationManager(h.ctx);
+    const promise = mgr.register("", "token", { channel: true, adminPubkeyHex: ADMIN });
+    const result = (await driveToRegisterSuccess(h, promise, {})) as { error: string; detail?: string };
+    expect(result.error).toBe("directory_missing_channel_support");
+    expect(result.detail).toMatch(/ordinary agent/);
+    expect(result.detail).toMatch(/new identity/);
+    expect(result.detail).not.toMatch(/retry/i);
+  });
+
+  it("re-registering a directory-recorded channel WITHOUT channel params is refused", async () => {
+    // Review F1: the directory says this identity is a channel. Registering it as an ordinary agent
+    // would overwrite the local channel flag with false.
+    const { persistence, calls } = makeRecordingPersistence(GROUP);
+    const h = makeCapturingCtx(persistence);
+    const mgr = new RegistrationManager(h.ctx);
+    const promise = mgr.register("", "token");
+    await vi.waitFor(() => expect(h.getPendingDkg()).not.toBeNull());
+    h.deliverDkg({
+      type: "register_error", reason: "already_registered", channel: true,
+      agent_id: "agent-news", primary_pubkey: GROUP, ml_dsa_pubkey: "dd".repeat(32),
+    });
+    expect(await promise).toMatchObject({ error: "channel_fields_immutable" });
+    expect(calls.reg).toHaveLength(0);
+  });
 });

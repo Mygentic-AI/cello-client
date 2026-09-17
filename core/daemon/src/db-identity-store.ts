@@ -17,6 +17,7 @@ import { randomUUID } from "node:crypto";
 import { MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
+import { checkChannelFacts } from "./registration-persistence.js";
 import type {
   DaemonRegistrationPersistence,
   RegistrationStateRecord,
@@ -437,12 +438,12 @@ export class DbRegistrationPersistence implements DaemonRegistrationPersistence 
     channel?: boolean;
     adminPubkey?: string;
   }): Promise<void> {
-    const channel = opts.channel === true;
+    const { channel, adminPubkey } = checkChannelFacts(opts, await this.loadRegistrationState());
     this.#updateRow(
       "reg_agent_id = ?, reg_primary_pubkey = ?, reg_ml_dsa_pubkey = ?, reg_registered_at = ?, reg_key_binding = ?, channel = ?, admin_pubkey = ?, reg_status = 'active', state = 'registered'",
       [
         opts.agentId, opts.primaryPubkey, opts.mlDsaPubkey, opts.registeredAt, opts.keyBinding,
-        channel ? 1 : 0, channel ? (opts.adminPubkey ?? "") : "",
+        channel ? 1 : 0, adminPubkey,
       ],
     );
     this.#logger.info("registration.state.persisted", {

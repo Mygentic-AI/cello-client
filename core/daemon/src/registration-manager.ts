@@ -182,18 +182,31 @@ export class RegistrationManager {
     correlationId: string,
     kLocalPubkeyHex: string,
   ): { error: string; detail: string } | null {
-    if (!channelOpts || frame["channel"] === true) return null;
+    // Immutability, the other direction: the directory holds this identity as a channel, and this
+    // registration asked for an ordinary agent. Accepting it would record the channel locally as an
+    // agent that may converse.
+    if (!channelOpts) {
+      if (frame["channel"] !== true) return null;
+      return {
+        error: "channel_fields_immutable",
+        detail:
+          "The directory holds this identity as a broadcast channel, and a channel stays a channel. Register it with its channel settings, or use a different agent for ordinary conversations.",
+      };
+    }
+    if (frame["channel"] === true) return null;
     this.#ctx.logger.error("registration.channel.echo_missing", {
       correlationId,
       k_local_pubkey: kLocalPubkeyHex,
       frameType: frame["type"],
-      impact: "a channel registration was answered without channel: true, so the directory did not record this identity as a channel; the registration failed and nothing was persisted",
+      impact: "a channel registration was answered without channel: true, so the directory did not record this identity as a channel; the registration failed and no registration state was persisted",
     });
-    return {
-      error: "directory_missing_channel_support",
-      detail:
-        "The directory completed the registration without confirming it stored this identity as a channel, so it was not saved. The directory nodes need an update that supports channels. Nothing was registered locally; retry once they have it.",
-    };
+    // A `register_success` means the directory has just STORED this identity, as an ordinary agent.
+    // Retrying cannot change that: every later attempt gets `already_registered`. An
+    // `already_registered` answer can mean the same, or nodes that predate channel support.
+    const detail = frame["type"] === "register_success"
+      ? "The directory registered this identity as an ordinary agent, not a channel: its nodes do not support channels yet. That profile is now fixed, so this identity cannot become a channel. Once the directory supports channels, register the channel under a new identity."
+      : "The directory already holds this identity without a channel flag. Either it was registered as an ordinary agent, which cannot change, or the directory nodes do not support channels yet. Register the channel under a new identity once they do.";
+    return { error: "directory_missing_channel_support", detail };
   }
 
   /**

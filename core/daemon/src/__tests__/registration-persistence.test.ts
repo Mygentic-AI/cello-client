@@ -297,4 +297,52 @@ describe("registration-persistence (daemon)", () => {
       db.close();
     }
   });
+
+  it("channel fields are immutable once registered (both stores)", async () => {
+    // Review F1: a second registration write must not flip a channel back to an agent, or swap its
+    // admin. It throws; it does not silently keep the old value either.
+    const OTHER_ADMIN = "12".repeat(32);
+    const file = new FileRegistrationPersistence({ agentDir, logger });
+    await file.persistRegistrationState({ agentId: "agent-f", ...REG, channel: true, adminPubkey: ADMIN });
+    await expect(file.persistRegistrationState({ agentId: "agent-f", ...REG })).rejects.toThrow(/channel_fields_immutable/);
+    await expect(
+      file.persistRegistrationState({ agentId: "agent-f", ...REG, channel: true, adminPubkey: OTHER_ADMIN }),
+    ).rejects.toThrow(/channel_fields_immutable/);
+    expect((await file.loadRegistrationState())!.adminPubkey).toBe(ADMIN);
+    // The same values again are not a change.
+    await file.persistRegistrationState({ agentId: "agent-f", ...REG, channel: true, adminPubkey: ADMIN });
+
+    const { db, store, persistenceFor } = dbPersistenceFor("news", "alice");
+    try {
+      await persistenceFor("news").persistRegistrationState({ agentId: "agent-n", ...REG, channel: true, adminPubkey: ADMIN });
+      await expect(persistenceFor("news").persistRegistrationState({ agentId: "agent-n", ...REG }))
+        .rejects.toThrow(/channel_fields_immutable/);
+      await expect(
+        persistenceFor("news").persistRegistrationState({ agentId: "agent-n", ...REG, channel: true, adminPubkey: OTHER_ADMIN }),
+      ).rejects.toThrow(/channel_fields_immutable/);
+      expect(store.isChannelAgent("news")).toBe(true);
+      expect((await persistenceFor("news").loadRegistrationState())!.adminPubkey).toBe(ADMIN);
+      // An ordinary agent cannot be turned INTO a channel by a later write either.
+      await persistenceFor("alice").persistRegistrationState({ agentId: "agent-a", ...REG });
+      await expect(
+        persistenceFor("alice").persistRegistrationState({ agentId: "agent-a", ...REG, channel: true, adminPubkey: ADMIN }),
+      ).rejects.toThrow(/channel_fields_immutable/);
+      expect(store.isChannelAgent("alice")).toBe(false);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("a channel without an admin pubkey is refused by both stores", async () => {
+    // Review F3.
+    const file = new FileRegistrationPersistence({ agentDir, logger });
+    await expect(file.persistRegistrationState({ agentId: "agent-f", ...REG, channel: true })).rejects.toThrow(/admin/);
+    const { db, persistenceFor } = dbPersistenceFor("news");
+    try {
+      await expect(persistenceFor("news").persistRegistrationState({ agentId: "agent-n", ...REG, channel: true, adminPubkey: "" }))
+        .rejects.toThrow(/admin/);
+    } finally {
+      db.close();
+    }
+  });
 });
