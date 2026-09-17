@@ -53,7 +53,14 @@ export interface AppendResult {
 
 export type ChannelLogErrorCode =
   | "channel_unknown" | "seq_not_next" | "epoch_mismatch" | "prev_root_mismatch"
-  | "position_taken" | "artifact_invalid";
+  | "position_taken" | "artifact_invalid"
+  // closeEpoch: the root being sealed is not the open epoch's current root (a publish landed while
+  // the seal was being signed, the epoch was already closed, or it is empty).
+  | "epoch_changed"
+  // closeEpoch: the sealed root is not 32 bytes, which would wedge every later append.
+  | "sealed_root_invalid"
+  // readRange: a stored row no longer decodes, or no longer matches its own leaf hash.
+  | "log_row_corrupt";
 
 export class ChannelLogError extends Error {
   readonly code: ChannelLogErrorCode;
@@ -118,40 +125,41 @@ export class ChannelLogStore {
 
   /** Append an already-signed artifact. Throws ChannelLogError — never silently skips. */
   append(channelPubkeyHex: string, artifact: BroadcastArtifact, publishedAtMs: number, correlationId?: string): AppendResult {
-    const s = this.#state(channelPubkeyHex);
-    const nextSeq = Number(s.next_seq);
-    const openEpoch = Number(s.open_epoch_index);
-    const firstInEpoch = Number(s.open_epoch_first_seq) === 0;
-
-    if (artifact.seq !== nextSeq) {
-      throw new ChannelLogError("seq_not_next", `artifact seq ${artifact.seq}, next is ${nextSeq}`);
-    }
-    if (artifact.epoch_index !== openEpoch) {
-      throw new ChannelLogError("epoch_mismatch", `artifact epoch ${artifact.epoch_index}, open epoch is ${openEpoch}`);
-    }
-    if (firstInEpoch) {
-      if (!bytesEqual(artifact.prev_epoch_root, toBytes(s.prev_epoch_root))) {
-        throw new ChannelLogError("prev_root_mismatch", "the first artifact of an epoch must carry the previous epoch's sealed root");
-      }
-    } else if (artifact.prev_epoch_root !== null) {
-      throw new ChannelLogError("prev_root_mismatch", "only the first artifact of an epoch carries prev_epoch_root");
-    }
-
-    // Never trust the in-memory object: it must survive its own wire encoding.
-    let cbor: Uint8Array;
-    try {
-      cbor = encodeBroadcastArtifact(artifact);
-    } catch (err) {
-      throw new ChannelLogError("artifact_invalid", extractErrorMessage(err));
-    }
-    const decoded = decodeBroadcastArtifact(cbor);
-    if (!decoded.ok) {
-      throw new ChannelLogError("artifact_invalid", `${decoded.reason}: ${decoded.detail}`);
-    }
-    const leafHash = broadcastArtifactLeafHash(decoded.artifact);
+    this.#state(channelPubkeyHex);
 
     this.#db.exec("BEGIN IMMEDIATE");
     try {
+      // The position checks run UNDER the write lock: a second daemon on this DB could otherwise
+      // close the epoch between the read and the insert, filing this row in an epoch already sealed.
+      const s = this.#state(channelPubkeyHex);
+      const nextSeq = Number(s.next_seq);
+      const openEpoch = Number(s.open_epoch_index);
+      const firstInEpoch = Number(s.open_epoch_first_seq) === 0;
+      if (artifact.seq !== nextSeq) {
+        throw new ChannelLogError("seq_not_next", `artifact seq ${artifact.seq}, next is ${nextSeq}`);
+      }
+      if (artifact.epoch_index !== openEpoch) {
+        throw new ChannelLogError("epoch_mismatch", `artifact epoch ${artifact.epoch_index}, open epoch is ${openEpoch}`);
+      }
+      if (firstInEpoch) {
+        if (!bytesEqual(artifact.prev_epoch_root, toBytes(s.prev_epoch_root))) {
+          throw new ChannelLogError("prev_root_mismatch", "the first artifact of an epoch must carry the previous epoch's sealed root");
+        }
+      } else if (artifact.prev_epoch_root !== null) {
+        throw new ChannelLogError("prev_root_mismatch", "only the first artifact of an epoch carries prev_epoch_root");
+      }
+      // Never trust the in-memory object: it must survive its own wire encoding.
+      let cbor: Uint8Array;
+      try {
+        cbor = encodeBroadcastArtifact(artifact);
+      } catch (err) {
+        throw new ChannelLogError("artifact_invalid", extractErrorMessage(err));
+      }
+      const decoded = decodeBroadcastArtifact(cbor);
+      if (!decoded.ok) {
+        throw new ChannelLogError("artifact_invalid", `${decoded.reason}: ${decoded.detail}`);
+      }
+      const leafHash = broadcastArtifactLeafHash(decoded.artifact);
       const inserted = this.#db
         .prepare(
           `INSERT OR IGNORE INTO channel_log
@@ -173,7 +181,17 @@ export class ChannelLogStore {
           : [nextSeq + 1, channelPubkeyHex]));
       this.#db.exec("COMMIT");
     } catch (err) {
-      try { this.#db.exec("ROLLBACK"); } catch { /* the failing statement may have ended the transaction */ }
+      try {
+        this.#db.exec("ROLLBACK");
+      } catch (rollbackErr) {
+        // Usually harmless: the failing statement already ended the transaction. If it did not, the
+        // handle is still inside one, and the next append fails naming the wrong cause — so say so.
+        this.#logger.warn("channel.log.rollback_failed", {
+          channel_pubkey: channelPubkeyHex,
+          error: extractErrorMessage(rollbackErr),
+          original_error: extractErrorMessage(err),
+        });
+      }
       throw err;
     }
 
@@ -211,22 +229,45 @@ export class ChannelLogStore {
 
   /** Range read for repair and for verification. Inclusive, seq order. */
   readRange(channelPubkeyHex: string, fromSeq: number, toSeq: number): BroadcastArtifact[] {
+    this.#state(channelPubkeyHex);
     const rows = this.#db
-      .prepare(`SELECT seq, artifact_cbor FROM channel_log WHERE channel_pubkey = ? AND seq BETWEEN ? AND ? ORDER BY seq ASC`)
-      .all(channelPubkeyHex, fromSeq, toSeq) as Array<{ seq: number | bigint; artifact_cbor: Uint8Array }>;
+      .prepare(`SELECT seq, leaf_hash, artifact_cbor FROM channel_log WHERE channel_pubkey = ? AND seq BETWEEN ? AND ? ORDER BY seq ASC`)
+      .all(channelPubkeyHex, fromSeq, toSeq) as Array<{ seq: number | bigint; leaf_hash: Uint8Array; artifact_cbor: Uint8Array }>;
     return rows.map((r) => {
+      // A stored row that no longer decodes, or no longer matches the leaf hash the epoch root was
+      // built over, is corruption — never something to skip past or hand to a repairing subscriber.
       const d = decodeBroadcastArtifact(new Uint8Array(r.artifact_cbor));
       if (!d.ok) {
-        // A stored row that no longer decodes is corruption, not something to skip past quietly.
-        throw new ChannelLogError("artifact_invalid", `stored seq ${Number(r.seq)} does not decode: ${d.reason}`);
+        throw new ChannelLogError("log_row_corrupt", `stored seq ${Number(r.seq)} does not decode: ${d.reason}`);
+      }
+      if (!bytesEqual(broadcastArtifactLeafHash(d.artifact), new Uint8Array(r.leaf_hash))) {
+        throw new ChannelLogError("log_row_corrupt", `stored seq ${Number(r.seq)} does not match its leaf hash`);
       }
       return d.artifact;
     });
   }
 
-  /** Called by the epoch sealer after a seal: advances to epoch+1 with prev_epoch_root = sealedRoot. */
+  /**
+   * Called by the epoch sealer after a seal: advances to epoch+1 with prev_epoch_root = sealedRoot.
+   *
+   * ⚠️ A COMPARE-AND-SET, not a blind advance. The seal is signed over a root read earlier; if a
+   * publish landed in between, the open epoch now holds a leaf that root does not cover, and
+   * advancing anyway would leave that artifact in an epoch no seal includes. So the close is refused
+   * unless `sealedRoot` IS the open epoch's current root over at least one leaf — which also refuses
+   * a repeated close (the next epoch is empty) and an empty one. Opens no transaction of its own,
+   * so the sealer can run it inside the transaction that records the seal.
+   */
   closeEpoch(channelPubkeyHex: string, sealedRoot: Uint8Array): void {
-    this.#state(channelPubkeyHex);
+    if (!(sealedRoot instanceof Uint8Array) || sealedRoot.length !== 32) {
+      throw new ChannelLogError("sealed_root_invalid", "a sealed epoch root must be 32 bytes");
+    }
+    const open = this.openEpochRoot(channelPubkeyHex);
+    if (open.leaf_count === 0) {
+      throw new ChannelLogError("epoch_changed", "the open epoch has no leaves: nothing was sealed over it, or it was already closed");
+    }
+    if (!bytesEqual(open.root, sealedRoot)) {
+      throw new ChannelLogError("epoch_changed", `the open epoch's root no longer matches the sealed root (it now holds ${open.leaf_count} leaves)`);
+    }
     this.#db
       .prepare(
         `UPDATE channel_epoch_state
