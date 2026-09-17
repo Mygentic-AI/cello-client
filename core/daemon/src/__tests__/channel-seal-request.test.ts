@@ -238,5 +238,12 @@ describe("M16 011-SEALREQ: the cello_channel_seal IPC verb", () => {
     clock += HOUR;
     const empty = (await h({ agent: "news" }, "conn-1")) as Record<string, unknown>;
     expect(empty).toEqual({ honored: false, reason: "epoch_empty", latest_epoch_index: 0, latest_epoch_root: hx(latest!.epoch_root) });
+
+    // Refusals with no seal to report still tell the operator what to do.
+    await publish(hex, 1);
+    keys.delete(hex);
+    const noKey = (await handler()({ agent: "news" }, "conn-1")) as Record<string, unknown>;
+    expect(noKey).toMatchObject({ honored: false, reason: "key_unavailable" });
+    expect(typeof noKey["guidance"]).toBe("string");
   });
 });

@@ -145,6 +145,9 @@ export function registerChannelSealHandler(deps: ChannelSealHandlerDeps): void {
     if (outcome.reason === "rate_limited" || outcome.reason === "epoch_empty") {
       return { ...outcome, latest_epoch_root: hex(outcome.latest_epoch_root) };
     }
-    return outcome;
+    const guidance = outcome.reason === "channel_unknown"
+      ? `Channel '${name}' has no log yet because it has not published anything, so there is nothing to seal. Publish first, then retry.`
+      : `Channel '${name}''s signing key is not loaded on this daemon, so the epoch cannot be sealed. Start the agent, then retry.`;
+    return { ...outcome, guidance };
   });
 }
