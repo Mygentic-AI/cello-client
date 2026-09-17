@@ -12,13 +12,13 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { loadInjectionClassifier } from "../detect/injection-classifier-onnx.js";
-import { DEBERTA_MODEL } from "../detect/deberta-model-manifest.js";
+import { SCREENER_MODEL } from "../detect/screener-model-manifest.js";
 import { installModel } from "../detect/model-installer.js";
 
 /** A directory that satisfies `isModelInstalled` — the files exist; contents are irrelevant here. */
 async function fakeModelDir(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "cello-model-"));
-  for (const f of DEBERTA_MODEL.files) {
+  for (const f of SCREENER_MODEL.files) {
     await mkdir(dirname(join(dir, f.path)), { recursive: true });
     await writeFile(join(dir, f.path), "x");
   }
@@ -123,24 +123,23 @@ describe("the classifier reports P(injection), not P(whatever won)", () => {
  * corner that gets cut when a feature is switched on in a hurry, so refusing is the default and
  * taking the risk is an argument someone has to write.
  */
-describe("installModel — unpinned digests are a decision, not a default", () => {
-  it("refuses by default, naming what is missing and what it costs", async () => {
+describe("installModel — every file is pinned, so consent is the only gate", () => {
+  // The manifest's type makes a digest-less file unrepresentable (DOD-M9C-SCREENINSTALL-1), so the
+  // old `allowUnpinnedDigests` escape hatch is gone rather than defaulted. What remains is consent.
+  it("requires consent before a single byte is requested", async () => {
     const dir = await mkdtemp(join(tmpdir(), "cello-install-"));
     let fetched = 0;
     const res = await installModel({
       dir,
-      consent: true,
+      consent: false,
       fetchImpl: (() => { fetched++; return Promise.reject(new Error("should not be reached")); }) as unknown as typeof fetch,
     });
-    expect(res.installed).toBe(false);
-    expect(res.error).toContain("pinned SHA-256");
-    expect(fetched).toBe(0); // refused BEFORE a byte was requested
+    expect(res).toMatchObject({ installed: false, needsConsent: true });
+    expect(fetched).toBe(0);
   });
 
-  it("still requires consent first — the refusal does not become a way past it", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "cello-install-"));
-    const res = await installModel({ dir, consent: false, allowUnpinnedDigests: true });
-    expect(res).toMatchObject({ installed: false, needsConsent: true });
+  it("every manifest file carries a digest, so nothing can install unverified", () => {
+    for (const f of SCREENER_MODEL.files) expect(f.sha256).toMatch(/^[0-9a-f]{64}$/);
   });
 });
 
