@@ -160,6 +160,21 @@ export async function screenerState(opts: ScreenerStateOptions): Promise<Screene
   return { ...base, state: "ready", missing: [] };
 }
 
+/**
+ * May the classifier be loaded? Only from a `ready` install.
+ *
+ * `broken` is the state this exists for: the files are present, so an existence check says yes, and
+ * the gateway then announces `layer2=active` over a model whose digests do not match. Presence is
+ * not integrity, and the decision belongs at the composition root, where the state is already known.
+ */
+export function classifierLoadable(s: ScreenerStatus): { load: boolean; reason?: string } {
+  if (s.state === "ready") return { load: true };
+  if (s.state === "broken") {
+    return { load: false, reason: `model FAILED verification and was NOT loaded: ${s.problem ?? "unknown fault"} — repair it with 'cello screener install --repair'` };
+  }
+  return { load: false, reason: `classifier not installed (${s.state}) — install it with 'cello screener install'` };
+}
+
 /** One sentence per state, and every sentence that is not `ready` names the command that fixes it. */
 export function describeScreenerState(s: ScreenerStatus): string {
   const fix = "Run: cello screener install";

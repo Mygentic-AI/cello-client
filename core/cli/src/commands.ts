@@ -5,6 +5,7 @@
 import { join } from "node:path";
 import { CO_OWNERSHIP_NOTE } from "@cello-protocol/protocol-types";
 import { screenerState, screenerModelDir, runtimeAvailable } from "@cello-protocol/gateway";
+import { DOWNLOAD_MB } from "./screener-commands.js";
 import {
   connectOrStart,
   connectToDaemon,
@@ -144,9 +145,16 @@ export async function screenerLoginLine(
       ? await stateImpl()
       : await screenerState({ dir: screenerModelDir(), runtimePresent: await runtimeAvailable() });
     if (status.state === "ready") return "";
-    return `Screening: 1 of 2 layers active. Install the classifier (~241 MB): cello screener install`;
-  } catch {
-    return "";
+    if (status.state === "broken") {
+      return `Screening: the classifier is BROKEN: ${status.problem ?? "unknown fault"}. Fix it with: cello screener install --repair`;
+    }
+    // The size comes from the command that quotes it, so the two cannot drift apart.
+    return `Screening: 1 of 2 layers active. Install the classifier (~${DOWNLOAD_MB} MB): cello screener install`;
+  } catch (err) {
+    // Silence here means login stops nagging because the CHECK broke, which is indistinguishable
+    // from the classifier being installed. Say what happened instead; never throw, because a
+    // screener check that breaks sign-in is worse than the gap it reports.
+    return `Screening: state UNKNOWN — the screener check failed: ${err instanceof Error ? err.message : String(err)}`;
   }
 }
 

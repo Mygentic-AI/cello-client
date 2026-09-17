@@ -354,12 +354,14 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "       cello screener install             — ask, then download the model and its runtime\n" +
       "       cello screener install --yes       — same, without asking (CI, servers, agent harnesses)\n" +
       "       cello screener install --manual    — print what to download and where, and fetch nothing\n" +
+      "       cello screener install --repair    — re-fetch files that failed verification\n" +
       "  CELLO's deterministic rules always run. The classifier is the second layer, and it is not\n" +
       "  bundled: it is about 241 MB to download and about 618 MB on disk, so it is asked for, never\n" +
       "  assumed. Every file is checked against its published SHA-256, whoever downloaded it.",
     flags: [
       { name: "--yes", consumesValue: false },
       { name: "--manual", consumesValue: false },
+      { name: "--repair", consumesValue: false },
     ],
     async run(ctx, args) {
       const sub = args.find((a) => !a.startsWith("--")) ?? "";
@@ -371,6 +373,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
         return screenerInstallCommand({
           logger: ctx.logger,
           assumeYes: args.includes("--yes"),
+          repair: args.includes("--repair"),
           // A prompt with nobody to answer it is a hang, and a hung install reads as a broken one.
           interactive: process.stdin.isTTY === true,
         });

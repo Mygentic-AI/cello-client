@@ -1,6 +1,12 @@
 /**
  * DOD-DOC-SCREEN-CLASSIFIER-1 — the production classifier, and the reason it loads lazily.
  *
+ * INTEGRITY IS THE CALLER'S TO CHECK, and `bin/cello-gateway.ts` checks it: this function gates on
+ * file EXISTENCE, which cannot tell a swapped model from the verified one. The composition root
+ * asks `screenerState` first and refuses to call this at all when the digests do not match
+ * (DOD-M9C-SCREENINSTALL-1). Calling it directly over unverified files is a way to load a model
+ * nobody checked.
+ *
  * `InjectionScanner` has always taken an `InjectionClassifier` and has always been unit-tested with
  * a fake one. What never existed was an implementation backed by the real model, and — more to the
  * point — nothing ever CONSTRUCTED one: the gateway built `new InboundScreener()` with no

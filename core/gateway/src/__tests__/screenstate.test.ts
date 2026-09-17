@@ -11,6 +11,7 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { SCREENER_MODEL } from "../detect/screener-model-manifest.js";
 import { screenerState, describeScreenerState, screenerModelDir, runtimeAvailable, resolveScreenerRuntime, SCREENER_RUNTIME_MODULE } from "../detect/screener-state.js";
+import { classifierLoadable } from "../detect/screener-state.js";
 
 /**
  * Write every manifest file at its exact declared size (sparse, so the 96 MB graph costs nothing).
@@ -123,5 +124,36 @@ describe("SCREENINSTALL: the runtime is resolved by FILE, not by bare specifier"
     expect(await runtimeAvailable()).toBe(true);
     await rm(fake, { recursive: true, force: true });
     if (prev === undefined) delete process.env["CELLO_SCREENER_RUNTIME_DIR"]; else process.env["CELLO_SCREENER_RUNTIME_DIR"] = prev;
+  });
+});
+
+describe("SCREENINSTALL: a corrupt model is never loaded", () => {
+  it("refuses to load from a BROKEN install, naming the file — presence is not integrity", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "cello-corrupt-"));
+    for (const f of SCREENER_MODEL.files) {
+      const dest = join(dir, f.path);
+      await mkdir(dirname(dest), { recursive: true });
+      await writeFile(dest, "");
+      await truncate(dest, f.size); // right size, wrong bytes — what a swapped mirror looks like
+    }
+    // `loadInjectionClassifier` gates on EXISTENCE, so it would load these happily and the gateway
+    // would announce layer2=active over a model nobody verified. The composition root asks this
+    // first, and this is the decision it asks.
+    const decision = classifierLoadable(await screenerState({ dir, runtimePresent: true }));
+    expect(decision.load).toBe(false);
+    expect(decision.reason).toContain("FAILED verification");
+    expect(decision.reason).toContain(SCREENER_MODEL.files[0]!.path);
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("loads only from a ready install, and says which state stopped it otherwise", async () => {
+    const ready = { state: "ready" as const, revision: SCREENER_MODEL.revision, runtimePresent: true,
+      model: { filesPresent: 5, filesExpected: 5, verified: true }, missing: [] };
+    expect(classifierLoadable(ready)).toEqual({ load: true });
+    const absent = { ...ready, state: "not_installed" as const, model: { filesPresent: 0, filesExpected: 5, verified: false }, missing: ["model" as const, "runtime" as const] };
+    expect(classifierLoadable(absent).load).toBe(false);
+    expect(classifierLoadable(absent).reason).toContain("not_installed");
+    const half = { ...absent, state: "half_installed" as const };
+    expect(classifierLoadable(half).reason).toContain("half_installed");
   });
 });

@@ -178,8 +178,18 @@ describe("SCREENINSTALL: the login line", () => {
     expect(await screenerLoginLine(async () => ({ state: "ready" }))).toBe("");
   });
 
-  it("never breaks login when the check itself fails", async () => {
-    expect(await screenerLoginLine(async () => { throw new Error("disk on fire"); })).toBe("");
+  it("reports a failed check as UNKNOWN rather than falling silent", async () => {
+    // Silence would be indistinguishable from "installed", so a broken check would quietly stop the
+    // nag for the one operator who most needs it.
+    const line = await screenerLoginLine(async () => { throw new Error("disk on fire"); });
+    expect(line).toContain("UNKNOWN");
+    expect(line).toContain("disk on fire");
+  });
+
+  it("points a BROKEN classifier at --repair, not at the plain install", async () => {
+    const line = await screenerLoginLine(async () => ({ state: "broken", problem: "config.json does not match" }));
+    expect(line).toContain("--repair");
+    expect(line).toContain("config.json");
   });
 });
 
@@ -246,5 +256,90 @@ describe("SCREENINSTALL: observability and the fetch boundary", () => {
       expect(SCREENER_MODEL.files.some((f) => url === SCREENER_MODEL.baseUrl + f.path), url).toBe(true);
       expect(url).not.toContain("/l2/");
     }
+  });
+});
+
+describe("SCREENINSTALL: repairing a broken install", () => {
+  let dir: string;
+  beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "cello-repair-")); });
+  afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
+
+  it("refuses without --repair, and names the command instead of asking for homework", async () => {
+    await writeVerifiedModel(dir); // right sizes, wrong bytes: verification fails
+    const r = await screenerInstallCommand({ dir, runtimePresent: true, assumeYes: true, interactive: false });
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain("BROKEN");
+    expect(r.stderr).toContain("--repair");
+    expect(r.stderr).not.toMatch(/delete .* by hand/i);
+  });
+
+  it("with --repair, removes the failed files and fetches them again", async () => {
+    await writeVerifiedModel(dir);
+    let refetched = 0;
+    // Digest verification stays ON: this fixture can never satisfy it, so the command must re-fetch
+    // AND then refuse to claim success — which is the honest outcome for a mirror serving bad bytes.
+    const r = await screenerInstallCommand({
+      dir, runtimePresent: true, assumeYes: true, repair: true, interactive: false,
+      installModelImpl: async () => {
+        // installModel no-ops when every path exists, so repair must have DELETED them first.
+        const { access } = await import("node:fs/promises");
+        await expect(access(join(dir, "config.json"))).rejects.toThrow();
+        refetched++;
+        await writeVerifiedModel(dir);
+        return { installed: true };
+      },
+      installRuntime: async () => {},
+      runtimeCheckAfterInstall: async () => true,
+    });
+    expect(refetched).toBe(1);
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain("Install did not complete");
+  });
+});
+
+describe("SCREENINSTALL: the prompt accepts an answer", () => {
+  let dir: string;
+  beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "cello-ask-")); });
+  afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
+
+  const run = (askImpl: (q: string) => Promise<string>, onInstall: () => void) =>
+    screenerInstallCommand({
+      dir, runtimePresent: false, assumeYes: false, interactive: true, verifyDigests: false, askImpl,
+      installModelImpl: async () => { onInstall(); await writeVerifiedModel(dir); return { installed: true }; },
+      installRuntime: async () => {},
+      runtimeCheckAfterInstall: async () => true,
+    });
+
+  it("asks the approved question, and 'y' installs", async () => {
+    let asked = "";
+    let installed = false;
+    const r = await run(async (q) => { asked = q; return "y"; }, () => { installed = true; });
+    expect(asked).toContain("Install now? [Y/n]");
+    expect(installed).toBe(true);
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("treats a bare Enter as yes — the capital Y in [Y/n] is a promise", async () => {
+    let installed = false;
+    await run(async () => "", () => { installed = true; });
+    expect(installed).toBe(true);
+  });
+
+  it("'n' downloads nothing and says how to come back", async () => {
+    let installed = false;
+    const r = await run(async () => "n", () => { installed = true; });
+    expect(installed).toBe(false);
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toContain("Nothing was downloaded");
+  });
+
+  it("never asks when there is no terminal", async () => {
+    let asked = false;
+    const r = await screenerInstallCommand({
+      dir, runtimePresent: false, assumeYes: false, interactive: false,
+      askImpl: async () => { asked = true; return "y"; },
+    });
+    expect(asked).toBe(false);
+    expect(r.stdout).toContain("--yes");
   });
 });

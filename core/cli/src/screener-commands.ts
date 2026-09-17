@@ -14,6 +14,8 @@
  * silently drops the download size fails.
  */
 import { spawn } from "node:child_process";
+import { rm } from "node:fs/promises";
+import { join } from "node:path";
 import {
   SCREENER_MODEL,
   describeScreenerState,
@@ -49,7 +51,7 @@ function newCorrelationId(): string {
  * the operator is NOT on — `DOD-M9C-RUNTIME-SLIM-1`, post-launch). An operator waits on the
  * download and lives with the disk, so the prompt states both.
  */
-const DOWNLOAD_MB = 241;
+export const DOWNLOAD_MB = 241;
 const DISK_MB = 618;
 
 /** Andre's consent prompt, verbatim. */
@@ -69,6 +71,7 @@ export function consentPrompt(): string {
     `Total: about ${DOWNLOAD_MB} MB to download, about ${DISK_MB} MB on disk.`,
     "Every file is checked against its published SHA-256.",
     "",
+    "Install now? [Y/n]",
     "Prefer to do it yourself? For instructions, run: cello screener install --manual",
   ].join("\n");
 }
@@ -129,8 +132,18 @@ export async function screenerStatusCommand(opts: ScreenerCommandOptions = {}): 
 export interface ScreenerInstallOptions extends ScreenerCommandOptions {
   /** `--yes`: proceed without asking. Required on a machine with nobody at the keyboard. */
   assumeYes: boolean;
+  /**
+   * `--repair`: delete what failed verification and fetch it again.
+   *
+   * An interrupted download is the likeliest way to reach `broken`, and telling the operator to
+   * delete a directory by hand is not a fix — it is homework. Repair is explicit rather than
+   * automatic because silently overwriting a failed install hides a mirror serving bad bytes.
+   */
+  repair?: boolean;
   /** Whether a human can answer. False in CI, under `npx`, inside an agent harness. */
   interactive: boolean;
+  /** Injected for tests. Production reads one line from the terminal. */
+  askImpl?: (question: string) => Promise<string>;
   fetchImpl?: typeof fetch;
   /** Injected for tests. Production downloads and verifies through the gateway's installer. */
   installModelImpl?: (dir: string) => Promise<InstallResult>;
@@ -150,6 +163,17 @@ export interface ScreenerInstallOptions extends ScreenerCommandOptions {
  * does not help because ESM ignores it. `--prefix` puts it somewhere we can resolve from, and an
  * npm upgrade of the CLI cannot wipe it.
  */
+/** One line from the terminal. Closed as soon as it answers, so the CLI never hangs on an open handle. */
+async function askOnTerminal(question: string): Promise<string> {
+  const { createInterface } = await import("node:readline/promises");
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    return await rl.question(question);
+  } finally {
+    rl.close();
+  }
+}
+
 async function npmInstallRuntime(): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const child = spawn("npm", ["install", "--prefix", screenerRuntimeDir(), SCREENER_RUNTIME_MODULE], { stdio: "inherit" });
@@ -168,28 +192,53 @@ export async function screenerInstallCommand(opts: ScreenerInstallOptions): Prom
     log?.info("screener.install.skipped", { correlationId, reason: "already_installed" });
     return { stdout: `Already installed and verified.\n${describeScreenerState(status)}\n`, stderr: "", exitCode: 0 };
   }
-  if (status.state === "broken") {
-    // Loudest state: files are present and wrong. Never quietly re-download over them — say what is
-    // wrong first, because a corrupted install that silently "fixes itself" hides a real fault.
+  if (status.state === "broken" && !opts.repair) {
+    // Loudest state: files are present and wrong. Never quietly re-download over them — a corrupt
+    // install that silently "fixes itself" hides a mirror serving bad bytes. But the operator gets a
+    // command, not homework.
     log?.error("screener.install.refused", { correlationId, reason: "broken_install", problem: status.problem });
     return {
       stdout: "",
-      stderr: `The installed classifier is BROKEN: ${status.problem}\nDelete ${dir} and run this command again to reinstall.\n`,
+      stderr:
+        `The installed classifier is BROKEN: ${status.problem}\n` +
+        `Fetch it again with: cello screener install --repair\n`,
       exitCode: 1,
     };
   }
+  let repaired = false;
+  if (status.state === "broken" && opts.repair) {
+    log?.info("screener.install.repair", { correlationId, problem: status.problem });
+    repaired = true;
+    // Remove the model files before re-fetching: `installModel` no-ops when every path merely
+    // EXISTS, so a partial that happens to be complete-looking would never heal itself.
+    await Promise.all(SCREENER_MODEL.files.map((f) => rm(join(dir, f.path), { force: true })));
+  }
 
   // Consent. Without it nothing is fetched — not the model, not the runtime.
-  if (!opts.assumeYes) {
+  let consented = opts.assumeYes;
+  if (!consented) {
     log?.info("screener.install.consent_required", { correlationId, interactive: opts.interactive });
-    const tail = opts.interactive
-      ? "\nRun `cello screener install --yes` to proceed."
-      : "\nNo terminal to ask at. Run `cello screener install --yes` to proceed.";
-    return { stdout: consentPrompt() + tail + "\n", stderr: "", exitCode: 1 };
+    if (!opts.interactive) {
+      // A prompt with nobody to answer it is a hang, and a hung install reads as a broken one.
+      return {
+        stdout: consentPrompt() + "\nNo terminal to ask at. Run `cello screener install --yes` to proceed.\n",
+        stderr: "", exitCode: 1,
+      };
+    }
+    // The approved copy ends "Install now? [Y/n]", so the command must accept an answer. Printing a
+    // question the program will not read is worse than not asking.
+    const answer = (await (opts.askImpl ?? askOnTerminal)(consentPrompt() + "\n> ")).trim().toLowerCase();
+    consented = answer === "" || answer === "y" || answer === "yes";
+    if (!consented) {
+      log?.info("screener.install.declined", { correlationId });
+      return { stdout: "Nothing was downloaded. Run `cello screener install` again whenever you want it.\n", stderr: "", exitCode: 1 };
+    }
   }
 
   const progress = opts.onProgress ?? ((line: string) => process.stderr.write(line + "\n"));
-  const needModel = status.model.filesPresent === 0 || !status.model.verified;
+  // `broken` returns above unless --repair just deleted the bad files, so the model is fetched when
+  // none of it is on disk or when a repair emptied it. "Present but unverified" cannot reach here.
+  const needModel = repaired || status.model.filesPresent === 0;
   const needRuntime = !status.runtimePresent;
 
   if (needModel) {
@@ -200,7 +249,14 @@ export async function screenerInstallCommand(opts: ScreenerInstallOptions): Prom
           dir,
           consent: true,
           ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
-          onProgress: (file, index, total) => progress(`  [${index + 1}/${total}] ${file}`),
+          onProgress: (file, index, total) => {
+            const f = SCREENER_MODEL.files.find((x) => x.path === file);
+            const mb = f ? ` (${Math.round(f.size / 1_000_000)} MB)` : "";
+            // The size matters more than the count: 96 MB of the 131 is one file, so `[1/5]` alone
+            // is a progress bar that sits still through three quarters of the wait and reads as a
+            // hang — and an operator's fix for a hang is to kill it.
+            progress(`  [${index + 1}/${total}] ${file}${mb}`);
+          },
         });
     if (!install.installed) {
       log?.error("screener.model.install.failed", { correlationId, error: install.error });
