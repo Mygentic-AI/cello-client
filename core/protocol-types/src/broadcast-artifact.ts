@@ -59,6 +59,7 @@ export type BroadcastDecodeReason =
 
 type FieldFailure = { reason: BroadcastDecodeReason; detail: string };
 
+const UNPAIRED_SURROGATE = /\p{Surrogate}/u;
 // NUL through US, plus DEL.
 const CONTROL_CHARS = /[\u0000-\u001F\u007F]/u;
 
@@ -73,6 +74,11 @@ export function validateBroadcastTitle(
     return { ok: false, reason: "bad_title", detail: `title is ${chars} code points, max ${MAX_BROADCAST_TITLE_CHARS}` };
   }
   if (CONTROL_CHARS.test(title)) return { ok: false, reason: "bad_title", detail: "title contains a control character" };
+  // UTF-8 encoding rewrites an unpaired surrogate to U+FFFD, so such a title would sign and then
+  // fail verification for every subscriber. Refused here so the signer hears about it instead.
+  if (UNPAIRED_SURROGATE.test(title)) {
+    return { ok: false, reason: "bad_title", detail: "title contains an unpaired surrogate" };
+  }
   return { ok: true };
 }
 

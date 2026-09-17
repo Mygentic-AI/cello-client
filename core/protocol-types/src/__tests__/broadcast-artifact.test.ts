@@ -141,7 +141,7 @@ describe("002-ARTIFACT — broadcast artifact", () => {
     }
   });
 
-  it("4. title validation", () => {
+  it("4. title validation", async () => {
     expect(validateBroadcastTitle("").ok).toBe(false);
     expect(validateBroadcastTitle("🚨".repeat(200)).ok).toBe(true);
     expect(validateBroadcastTitle("🚨".repeat(201)).ok).toBe(false);
@@ -149,6 +149,11 @@ describe("002-ARTIFACT — broadcast artifact", () => {
     expect(validateBroadcastTitle("a\nb").ok).toBe(false);
     expect(validateBroadcastTitle("a\u007Fb").ok).toBe(false);
     expect(validateBroadcastTitle("a".repeat(MAX_BROADCAST_TITLE_CHARS)).ok).toBe(true);
+    // An unpaired surrogate is rewritten to U+FFFD by UTF-8 encoding, so a title carrying one signs
+    // fine and then fails verification for every subscriber. Refuse it before signing.
+    expect(validateBroadcastTitle("t\uD800x").ok).toBe(false);
+    expect(validateBroadcastTitle("t\uDC00x").ok).toBe(false);
+    await expect(signBroadcastArtifact(generateKeypair(), makeFields({ title: "t\uD800x" }))).rejects.toThrow(RangeError);
     const refused = validateBroadcastTitle(42);
     expect(refused.ok).toBe(false);
     if (!refused.ok) expect(refused.reason).toBe("bad_title");
