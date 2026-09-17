@@ -63,7 +63,7 @@ import { startBootCore } from "./boot-core.js";
 import { startBootAgents } from "./boot-agents.js";
 import { startBootConnectionState } from "./boot-connection-state.js";
 import { startBootParkedContent } from "./boot-parked-content.js";
-import { startBootSweeps } from "./boot-sweeps.js";
+import { startBootSweeps } from "./boot-sweeps.js"; import { startChannelEpochTick } from "./channel-epoch-tick.js";
 import { createSessionViews } from "./session-views.js";
 import { createAgentSelection } from "./agent-selection-root.js";
 import { createStartAgent } from "./start-agent.js";
@@ -1091,7 +1091,7 @@ async function startDaemonHoldingLock(
   async function stop(reason: string): Promise<void> {
     // 074-DOCSFLAG: `undefined` when documents are gated off — there is then no sweep to stop.
     if (reconcileSweepTimer !== undefined) clearInterval(reconcileSweepTimer);
-    clearInterval(revivalBoundSweepTimer);
+    clearInterval(revivalBoundSweepTimer); clearInterval(channelEpochTick.timer);
     // DOD-M15-RELAYABUSE-1: scheduled park retries. Unref'd, so they never held the process open —
     // cleared so an in-process restart cannot leave one draining into a torn-down manager.
     for (const t of parkRetryTimers) clearTimeout(t);
@@ -1326,7 +1326,7 @@ async function startDaemonHoldingLock(
   restartSealResolver.start();
 
   // 040-DAEMONROOT unit 9: the revival-bound sweep and its re-arming timer → boot-sweeps.ts.
-  const { revivalBoundSweepTimer } = startBootSweeps({ logger, sessionNodeManager });
+  const { revivalBoundSweepTimer } = startBootSweeps({ logger, sessionNodeManager }); const channelEpochTick = startChannelEpochTick({ logger, sessionNodeManager, agents, getKeyProvider: (n) => keyProviders.get(n) }); // M16 008: the epoch cap
 
   /**
    * The live handler map.

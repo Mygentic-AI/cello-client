@@ -39,7 +39,11 @@ export const CHANNEL_LOG_CREATE_SQL = `
     open_epoch_first_seq  INTEGER NOT NULL,
     open_epoch_opened_at  INTEGER NOT NULL,
     prev_epoch_root       BLOB,
-    next_seq              INTEGER NOT NULL
+    next_seq              INTEGER NOT NULL,
+    -- M16 008-EPOCH: this channel's epoch cap. Defaults are the protocol maxima (24h, 1,000 leaves);
+    -- a channel may only shorten them, which the sealer enforces.
+    max_age_ms            INTEGER NOT NULL DEFAULT 86400000,
+    max_leaves            INTEGER NOT NULL DEFAULT 1000
   );
 `;
 
@@ -97,6 +101,20 @@ export class ChannelLogStore {
     this.#db = db;
     this.#logger = logger;
     this.#db.exec(CHANNEL_LOG_CREATE_SQL);
+    // 008-EPOCH extends 007's state table. CREATE TABLE IF NOT EXISTS leaves a table created before
+    // that untouched, so each column is PRAGMA-guarded, independently.
+    const cols = new Set((this.#db.prepare(`PRAGMA table_info(channel_epoch_state)`).all() as Array<{ name: string }>).map((c) => c.name));
+    if (!cols.has("max_age_ms")) this.#db.exec(`ALTER TABLE channel_epoch_state ADD COLUMN max_age_ms INTEGER NOT NULL DEFAULT 86400000`);
+    if (!cols.has("max_leaves")) this.#db.exec(`ALTER TABLE channel_epoch_state ADD COLUMN max_leaves INTEGER NOT NULL DEFAULT 1000`);
+  }
+
+  /** M16 008-EPOCH: the channel's declared epoch cap, as stored. The sealer validates it against the maxima. */
+  epochPolicy(channelPubkeyHex: string): { maxAgeMs: number; maxLeaves: number } {
+    this.#state(channelPubkeyHex);
+    const row = this.#db
+      .prepare(`SELECT max_age_ms, max_leaves FROM channel_epoch_state WHERE channel_pubkey = ?`)
+      .get(channelPubkeyHex) as { max_age_ms: number | bigint; max_leaves: number | bigint };
+    return { maxAgeMs: Number(row.max_age_ms), maxLeaves: Number(row.max_leaves) };
   }
 
   /** Idempotent: creates the state row {epoch 0, first_seq 0, opened_at 0, prev NULL, next_seq 1}. */
