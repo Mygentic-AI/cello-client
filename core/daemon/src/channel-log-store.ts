@@ -101,11 +101,6 @@ export class ChannelLogStore {
     this.#db = db;
     this.#logger = logger;
     this.#db.exec(CHANNEL_LOG_CREATE_SQL);
-    // 008-EPOCH extends 007's state table. CREATE TABLE IF NOT EXISTS leaves a table created before
-    // that untouched, so each column is PRAGMA-guarded, independently.
-    const cols = new Set((this.#db.prepare(`PRAGMA table_info(channel_epoch_state)`).all() as Array<{ name: string }>).map((c) => c.name));
-    if (!cols.has("max_age_ms")) this.#db.exec(`ALTER TABLE channel_epoch_state ADD COLUMN max_age_ms INTEGER NOT NULL DEFAULT 86400000`);
-    if (!cols.has("max_leaves")) this.#db.exec(`ALTER TABLE channel_epoch_state ADD COLUMN max_leaves INTEGER NOT NULL DEFAULT 1000`);
   }
 
   /** M16 008-EPOCH: the channel's declared epoch cap, as stored. The sealer validates it against the maxima. */
