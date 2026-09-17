@@ -38,7 +38,7 @@ import type { CelloNode, IDirectoryChallengeVerifier } from "@cello-protocol/tra
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { LoadedAgent } from "./agent-loader.js";
 import type { DirectorySignalingState, Logger } from "./types.js";
-import type { DbRegistrationPersistence } from "./db-identity-store.js";
+import { channelAgentLookup, type DbRegistrationPersistence } from "./db-identity-store.js";
 import type { ConsortiumEndpoint } from "./directory-bootstrap.js";
 import type { DirectoryEndpoint } from "./signaling-connect.js";
 import type { SubmissionRetryQueue } from "./submission-retry.js";
@@ -263,8 +263,8 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
       agentName,
       getStandingReceiverEndpoint: () => sessionNodeManager.getStandingReceiverInfo(agentName),
       admitOfferedDialer: (peerId, sessionIdHex) => sessionNodeManager.admitOfferedDialer(agentName, peerId, sessionIdHex),
-      // RELAYONLY-1: tells "relay-only emptied the addresses" from "none yet" — opposite answers.
-      reserveOnDemand: (c, sid) => sessionNodeManager.takeReservationForSession(agentName, c, sid, sid), // 055-ONDEMAND
+      // RELAYONLY-1: tells "relay-only emptied the addresses" from "none yet" — opposite answers. M16: a channel rejects first.
+      reserveOnDemand: (c, sid) => sessionNodeManager.takeReservationForSession(agentName, c, sid, sid), isChannelAgent: () => channelAgentLookup(sessionNodeManager, logger)(agentName),
       isRelayOnly: () => relayOnlyState((key) => sessionNodeManager.getSetting(agentName, key), sessionNodeManager.hasDatabase()) !== "off",
       signaling: mgr,
       logger,
@@ -378,7 +378,7 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
       agentName: agent.name,
       getStandingReceiverEndpoint: () => sessionNodeManager.getStandingReceiverInfo(agent.name),
       admitOfferedDialer: (peerId, sessionIdHex) => sessionNodeManager.admitOfferedDialer(agent.name, peerId, sessionIdHex),
-      reserveOnDemand: (c, sid) => sessionNodeManager.takeReservationForSession(agent.name, c, sid, sid), // 055-ONDEMAND: both sites
+      reserveOnDemand: (c, sid) => sessionNodeManager.takeReservationForSession(agent.name, c, sid, sid), isChannelAgent: () => channelAgentLookup(sessionNodeManager, logger)(agent.name), // 055-ONDEMAND + M16: both sites
       isRelayOnly: () => relayOnlyState((key) => sessionNodeManager.getSetting(agent.name, key), sessionNodeManager.hasDatabase()) !== "off",
       signaling: mgr,
       logger,

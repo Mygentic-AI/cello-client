@@ -12,14 +12,22 @@
  */
 
 import { describe, it, expect, afterEach } from "vitest";
-import { generateKeypair } from "@cello-protocol/crypto";
-import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
+import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
+import type { CelloNode, ConnectResult, SignalingStream } from "@cello-protocol/transport";
+import { startTwoConnectionFixture, FakeNode, FixedFactory, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
 import { createInboundSessions, type InboundSessionDeps } from "../inbound-sessions.js";
+import { wireSessionOfferHandler } from "../session-ceremony.js";
+import { startDaemon } from "../daemon.js";
+import { DbRegistrationPersistence } from "../db-identity-store.js";
 import { REFUSAL_GUIDANCE, REFUSAL_REASONS } from "../refusal-reasons.js";
 import { TIER } from "../contacts-tier-migration.js";
-import { makeSignedAssignmentFrame, fixtureIdentity } from "./helpers/signed-assignment.js";
+import { makeSignedAssignmentFrame, fixtureIdentity, registerFixtureSigner } from "./helpers/signed-assignment.js";
 import type { SessionNegotiator } from "../transport-selector.js";
-import type { Logger } from "../types.js";
+import type { DaemonConfig, Logger } from "../types.js";
 
 // ─── Outbound ──────────────────────────────────────────────────────────────────────────────────
 
@@ -81,7 +89,7 @@ const ALICE_PUBKEY = "a1".repeat(32);
 const COUNTERPARTY = fixtureIdentity().pubkeyHex;
 const DIALER = "12D3KooWInitiator";
 
-function inboundHarness() {
+function inboundHarness(opts: { tier?: number } = {}) {
   const events: Array<{ event: string; context: Record<string, unknown> }> = [];
   const push = () => (event: string, context?: Record<string, unknown>) => {
     events.push({ event, context: context ?? {} });
@@ -89,15 +97,21 @@ function inboundHarness() {
   const logger: Logger = { debug: push(), info: push(), warn: push(), error: push() };
   let inbound: ((frame: Record<string, unknown>) => void) | null = null;
   const durable: Array<{ agent: string; session: string; reason: string }> = [];
+  /** Re-closing the receiver gate to the offered dialer — half of what `refuseInboundSession` does. */
+  const revoked: Array<{ agent: string; session: string; dialer: string | null }> = [];
+  /** Frames sent back to the counterparty — the `session_refused` notice a KNOWN+ caller earns. */
+  const sentFrames: Array<Record<string, unknown>> = [];
 
   const sessionNodeManager = {
     getOfferedDialer: () => DIALER,
     clearOfferedDialer: () => {},
-    revokeOfferedDialer: async () => {},
+    revokeOfferedDialer: async (agent: string, session: string, dialer: string | null) => {
+      revoked.push({ agent, session, dialer });
+    },
     recordRefusedSession: (agent: string, session: string, reason: string) => {
       durable.push({ agent, session, reason });
     },
-    getTier: () => TIER.UNKNOWN,
+    getTier: () => opts.tier ?? TIER.UNKNOWN,
     resolveTierBound: () => 3,
     getPinnedCounterpartyPrimary: () => null,
     getSessionRecord: () => undefined,
@@ -126,7 +140,10 @@ function inboundHarness() {
         return () => {};
       },
     },
-    sendOver: async () => ({ ok: true }),
+    sendOver: async (_agent: string, frame: Record<string, unknown>) => {
+      sentFrames.push(frame);
+      return { ok: true };
+    },
     isExplicitlyOffline: () => false,
     getConnState: () => undefined,
     resolveCurrentAgent: () => null,
@@ -142,15 +159,20 @@ function inboundHarness() {
 
   const api = createInboundSessions(deps);
 
-  async function inject(toPubkeyHex: string, sessionId: Uint8Array, opts: { breakSignature?: boolean } = {}) {
+  async function inject(
+    toPubkeyHex: string,
+    sessionId: Uint8Array,
+    injectOpts: { breakSignature?: boolean; noCounterpartyEndpoint?: boolean } = {},
+  ) {
     const { frame } = await makeSignedAssignmentFrame({
       sessionId,
       initiatorPubkey: Buffer.from(COUNTERPARTY, "hex"),
       responderPubkey: Buffer.from(toPubkeyHex, "hex"),
       initiatorSessionPeerId: DIALER,
+      ...(injectOpts.noCounterpartyEndpoint ? { counterpartySessionPeerId: "" } : {}),
       signWith: generateKeypair(),
     });
-    if (opts.breakSignature) {
+    if (injectOpts.breakSignature) {
       const assignment = frame["assignment"] as { directory_signature: Uint8Array };
       const sig = Uint8Array.from(assignment.directory_signature);
       sig[0] ^= 0x01;
@@ -163,6 +185,8 @@ function inboundHarness() {
     inject,
     events,
     durable,
+    revoked,
+    sentFrames,
     operatorSees: (agent: string) => (api.refusedSessionRequests.get(agent) ?? []) as Array<{ reason: string }>,
     enqueued: (agent: string) => api.inboundSessionQueues.get(agent) ?? [],
   };
@@ -182,6 +206,28 @@ describe("M16 006-NOCONVERSE: a channel refuses an inbound session", () => {
     ]);
     expect(h.operatorSees(CHAN).map((r) => r.reason)).toEqual([REFUSAL_REASONS.SESSION_TO_CHANNEL_IDENTITY]);
     expect(h.enqueued(CHAN)).toHaveLength(0);
+    // Through the refusal machinery, not a bare record: the gate is re-closed to the offered dialer.
+    expect(h.revoked).toEqual([{ agent: CHAN, session: "01".repeat(16), dialer: DIALER }]);
+  });
+
+  it("a KNOWN caller refused by a channel is told to reach the admin", async () => {
+    const h = inboundHarness({ tier: TIER.KNOWN });
+    await h.inject(CHAN_PUBKEY, new Uint8Array(16).fill(4));
+    await settle();
+    const notice = h.sentFrames.find((f) => f["type"] === "session_refused");
+    expect(notice, "a KNOWN caller must be told why").toBeDefined();
+    expect(notice!["reason"]).toBe(REFUSAL_REASONS.SESSION_TO_CHANNEL_IDENTITY);
+    expect(String(notice!["guidance"])).toMatch(/admin/);
+  });
+
+  it("an assignment with no counterparty endpoint re-closes the gate to the offered dialer", async () => {
+    // Review LOW [pre-existing]: this refusal was a bare return, leaving the receiver open to the
+    // dialer the offer named until the next offer reused it.
+    const h = inboundHarness();
+    await h.inject(ALICE_PUBKEY, new Uint8Array(16).fill(5), { noCounterpartyEndpoint: true });
+    await settle();
+    expect(h.enqueued(ALICE)).toHaveLength(0);
+    expect(h.revoked).toEqual([{ agent: ALICE, session: "05".repeat(16), dialer: DIALER }]);
   });
 
   it("the same assignment to a NON-channel agent is accepted", async () => {
@@ -205,5 +251,135 @@ describe("M16 006-NOCONVERSE: a channel refuses an inbound session", () => {
     expect(typeof guidance).toBe("string");
     expect(guidance.length).toBeGreaterThan(0);
     expect(guidance).toMatch(/admin/);
+  });
+});
+
+// ─── Offer: a channel rejects before revealing where it can be dialled ────────────────────────
+
+describe("M16 006-NOCONVERSE: a channel rejects a session offer", () => {
+  function wireOffer(isChannel: boolean) {
+    const sent: Array<Record<string, unknown>> = [];
+    let handler: ((frame: Record<string, unknown>) => void) | null = null;
+    const reservations: string[] = [];
+    const admitted: string[] = [];
+    const events: Array<{ event: string; context: Record<string, unknown> }> = [];
+    const push = () => (event: string, context?: Record<string, unknown>) => { events.push({ event, context: context ?? {} }); };
+    wireSessionOfferHandler({
+      agentName: "chan",
+      getStandingReceiverEndpoint: () => ({ peerId: "12D3KooWChanReceiver", addrs: ["/ip4/127.0.0.1/tcp/9"] }),
+      reserveOnDemand: async (circuitAddr) => { reservations.push(circuitAddr); return true; },
+      admitOfferedDialer: (peerId) => { admitted.push(peerId); return "narrowed" as const; },
+      isChannelAgent: () => isChannel,
+      signaling: {
+        status: "connected",
+        async sendRaw(frame: unknown) { sent.push(frame as Record<string, unknown>); return { ok: true as const }; },
+        registerInboundHandler(h: (frame: Record<string, unknown>) => void) { handler = h; return () => { handler = null; }; },
+      } as unknown as Parameters<typeof wireSessionOfferHandler>[0]["signaling"],
+      logger: { debug: push(), info: push(), warn: push(), error: push() },
+    });
+    const offer = {
+      type: "session_offer",
+      session_id: new Uint8Array(16).fill(6),
+      initiator_session_peer_id: "12D3KooWInitiator",
+      relay_endpoint: { peer_id: "12D3KooWRelay", multiaddrs: ["/ip4/127.0.0.1/tcp/5/p2p/12D3KooWRelay"] },
+    };
+    return { sent, reservations, admitted, events, fire: () => handler?.(offer) };
+  }
+
+  it("a channel answers an offer with a reject, and takes no relay slot and advertises no endpoint", async () => {
+    // Review MEDIUM: accepting first sent the channel's session peer id and addresses to the caller
+    // and spent a relay reservation, all before the assignment refusal. "Is THIS local agent a
+    // channel?" needs no authenticated frame, so it can be answered here.
+    const w = wireOffer(true);
+    w.fire();
+    await settle();
+    const reject = w.sent.find((f) => f["type"] === "session_offer_reject");
+    expect(reject?.["reason"]).toBe("channel_identity");
+    expect(w.sent.find((f) => f["type"] === "session_offer_accept")).toBeUndefined();
+    expect(w.reservations).toEqual([]);
+    expect(w.admitted).toEqual([]);
+  });
+
+  it("a non-channel still accepts the same offer", async () => {
+    const w = wireOffer(false);
+    w.fire();
+    await settle();
+    expect(w.sent.find((f) => f["type"] === "session_offer_accept")).toBeDefined();
+    expect(w.reservations).toHaveLength(1);
+  });
+});
+
+// ─── The running daemon wires the inbound refusal ─────────────────────────────────────────────
+
+describe("M16 006-NOCONVERSE: a real daemon refuses an inbound session to its channel", () => {
+  let tempDir: string | undefined;
+  let handle: Awaited<ReturnType<typeof startDaemon>> | undefined;
+
+  afterEach(async () => {
+    if (handle) { try { await handle.stop("test_cleanup"); } catch { /* already stopped */ } }
+    handle = undefined;
+    if (tempDir) await rm(tempDir, { recursive: true, force: true });
+    tempDir = undefined;
+  });
+
+  it("the stored channel flag, not a test stub, refuses the assignment; a plain neighbour accepts", async () => {
+    // Review HIGH: every other inbound test hands createInboundSessions its own isChannelAgent. This
+    // one goes through startDaemon, the stored flag and the real refused_sessions table, so breaking
+    // the daemon's wiring turns it red.
+    tempDir = await mkdtemp(join(tmpdir(), "cello-m16-006-inbound-"));
+    const pubkeys = new Map<string, string>();
+    for (const name of ["chan", "bob"]) {
+      const dir = join(tempDir, "agents", name);
+      await mkdir(dir, { recursive: true });
+      const kp = await FileKeyProvider.load(join(dir, "key"));
+      const hex = Buffer.from(await kp.getPublicKey()).toString("hex");
+      registerFixtureSigner(hex, kp);
+      pubkeys.set(name, hex);
+    }
+    let inbound: ((frame: unknown) => void) | null = null;
+    const stream: SignalingStream = {
+      send: async () => {},
+      onMessage: (h: (frame: unknown) => void) => { inbound = h; },
+      close: () => {},
+    };
+    const config: DaemonConfig = {
+      securityGateway: new PassthroughGatewayClient(),
+      celloDir: tempDir,
+      socketPath: join(tempDir, "daemon.sock"),
+      lockFilePath: join(tempDir, "daemon.lock"),
+      maxConnections: 16,
+      version: "0.0.1-test",
+      logger: { debug() {}, info() {}, warn() {}, error() {} },
+      sessionNodeFactory: new FixedFactory(new FakeNode() as unknown as CelloNode),
+      signalingConnect: async (): Promise<ConnectResult> => ({ stream, directoryNodeId: "fake-dir", manifestVersion: 1 }),
+    };
+    handle = await startDaemon(config);
+    await new Promise((r) => setTimeout(r, 50));
+    const snm = handle.getSessionNodeManager();
+    await new DbRegistrationPersistence({ db: snm.getDb(), agentName: "chan", logger: config.logger }).persistRegistrationState({
+      agentId: "fixture-channel-chan", primaryPubkey: "5b".repeat(32), mlDsaPubkey: "6c".repeat(32),
+      registeredAt: Date.now(), keyBinding: "7d".repeat(64), channel: true, adminPubkey: pubkeys.get("bob")!,
+    });
+    await snm.ensureStandingReceiverForAgent("chan");
+    await snm.ensureStandingReceiverForAgent("bob");
+
+    const push = async (to: string, fill: number) => {
+      const { frame } = await makeSignedAssignmentFrame({
+        sessionId: new Uint8Array(16).fill(fill),
+        initiatorPubkey: Buffer.from(COUNTERPARTY, "hex"),
+        responderPubkey: Buffer.from(pubkeys.get(to)!, "hex"),
+        initiatorSessionPeerId: "12D3KooWInitiator",
+        counterpartySessionPeerId: "12D3KooWReceiver",
+      });
+      inbound?.(frame);
+    };
+    await push("chan", 7);
+    await push("bob", 8);
+    await new Promise((r) => setTimeout(r, 150));
+
+    expect(snm.wasSessionRefused("chan", "07".repeat(16)), "the refusal must land in the real store").toBe(true);
+    expect(snm.getSessionRecord("chan", "07".repeat(16))).toBeFalsy();
+    expect(snm.wasSessionRefused("bob", "08".repeat(16))).toBe(false);
+    expect(snm.getSessionRecord("bob", "08".repeat(16))?.status).toBe("active");
   });
 });

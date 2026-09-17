@@ -1412,6 +1412,9 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         sessionId: parsed.sessionIdHex,
         correlationId,
       });
+      // The offer handler may already have narrowed the receiver to this session's dialer. Nothing
+      // will be accepted, so close that door rather than leave it open until the next offer.
+      sessionNodeManager.revokeOfferedDialer(localAgent.name, parsed.sessionIdHex, offered);
       return;
     }
 

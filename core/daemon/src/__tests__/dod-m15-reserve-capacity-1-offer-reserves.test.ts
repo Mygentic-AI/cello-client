@@ -98,6 +98,7 @@ function harness(opts: HarnessOpts = {}) {
       return peerId === "" ? "no_peer_named" : "narrowed";
     },
     ...(opts.relayOnly === undefined ? {} : { isRelayOnly: () => opts.relayOnly! }),
+    isChannelAgent: () => false,
     reserveOnDemand: async (circuitAddr: string, sessionIdHex: string) => {
       asked.push({ circuitAddr, sessionIdHex });
       sequence.push(`reserved:${circuitAddr}`);

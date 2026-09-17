@@ -78,6 +78,12 @@ export function wireSessionOfferHandler(deps: {
    * does not reserve.
    */
   reserveOnDemand: (circuitAddr: string, sessionIdHex: string) => Promise<boolean>;
+  /**
+   * M16: is THIS agent a broadcast channel? A channel never holds a session, so it rejects the offer
+   * before taking a relay slot or advertising where it can be dialled. Required, so no caller can
+   * forget it (the lesson of `reserveOnDemand` above).
+   */
+  isChannelAgent: () => boolean;
   signaling: SignalingSeam;
   logger: Logger;
 }): () => void {
@@ -124,6 +130,19 @@ export function wireSessionOfferHandler(deps: {
       if (!sessionId) {
         deps.logger.warn("session.offer.abort", { agentName: deps.agentName, reason: "no_session_id" });
         await sendOfferReject(null, "no_session_id");
+        return;
+      }
+      /**
+       * M16: A CHANNEL NEVER CONVERSES — and it says so BEFORE it gives anything away. Accepting here
+       * would take a relay reservation and send the caller this agent's session peer id and
+       * addresses, all for a session the verified assignment is then refused over. The offer is
+       * unauthenticated, but this question is about the LOCAL agent only, so a forged offer can do
+       * no more than trigger a refusal that was coming anyway. The assignment gate in
+       * inbound-sessions.ts stays as the authenticated line.
+       */
+      if (deps.isChannelAgent()) {
+        deps.logger.warn("session.offer.abort", { agentName: deps.agentName, reason: "channel_identity" });
+        await sendOfferReject(sessionId, "channel_identity");
         return;
       }
       let sr = deps.getStandingReceiverEndpoint();

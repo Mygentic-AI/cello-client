@@ -278,6 +278,7 @@ describe("DOD-M15-ASSIGN-1 (b) — the offer narrows the gate before advertising
        * reserve happens", which is what made the whole suite green on a handler that never reserved.
        */
       reserveOnDemand: async () => false,
+      isChannelAgent: () => false,
       admitOfferedDialer: (peerId) => {
         admitted.push(peerId);
         sequence.push(`narrowed:${peerId}`);

@@ -225,6 +225,7 @@ describe("DOD-OFFER-REJECT-1: wireSessionOfferHandler answers with session_offer
        * reserve happens", which is what made the whole suite green on a handler that never reserved.
        */
       reserveOnDemand: async () => false,
+      isChannelAgent: () => false,
       // DOD-M15-ASSIGN-1: the receiver is narrowed to the offered dialer before the accept goes
       // out. These tests are about the REJECT contract, so the narrowing succeeds and stays out of
       // their way; the narrowing itself is pinned in dod-m15-assign-1-receiver-gate.test.ts.
