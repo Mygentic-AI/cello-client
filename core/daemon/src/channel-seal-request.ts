@@ -38,6 +38,12 @@ export class ChannelSealRequestGate {
   readonly #deps: { sealer: ChannelEpochSealer; sealStore: ChannelEpochSealStore; logger: Logger; now: () => number };
   /** channel pubkey hex → when its last request was HONORED. Nothing else writes it. */
   readonly #lastHonoredAt = new Map<string, number>();
+  /**
+   * channel pubkey hex → the seal currently being attempted for it. The window check and this
+   * reservation happen with no await between them, so a request arriving mid-seal waits for that
+   * seal and then meets the window it set, instead of starting a second seal of the same epoch.
+   */
+  readonly #inFlight = new Map<string, Promise<unknown>>();
 
   constructor(deps: { sealer: ChannelEpochSealer; sealStore: ChannelEpochSealStore; logger: Logger; now: () => number }) {
     this.#deps = deps;
@@ -51,7 +57,12 @@ export class ChannelSealRequestGate {
       return { latest_epoch_index: l?.epoch_index ?? null, latest_epoch_root: l?.epoch_root ?? null };
     };
 
-    // Pseudocode: elapsed < WINDOW → report the latest seal, seal nothing; elapsed >= WINDOW honors.
+    // A request that finds a seal in flight waits for it; that seal's own caller sees its outcome or error.
+    for (let pending = this.#inFlight.get(channelPubkeyHex); pending; pending = this.#inFlight.get(channelPubkeyHex)) {
+      await pending.catch(() => undefined);
+    }
+
+    // elapsed < WINDOW → report the latest seal, seal nothing; elapsed >= WINDOW honors.
     const last = this.#lastHonoredAt.get(channelPubkeyHex);
     const t = now();
     if (last !== undefined && t - last < SEAL_REQUEST_WINDOW_MS) {
@@ -60,7 +71,14 @@ export class ChannelSealRequestGate {
       return { honored: false, reason: "rate_limited", ...latest(), retry_after_ms };
     }
 
-    const outcome = await sealer.sealNow(channelPubkeyHex, correlationId);
+    const attempt = sealer.sealNow(channelPubkeyHex, correlationId);
+    this.#inFlight.set(channelPubkeyHex, attempt);
+    let outcome: Awaited<typeof attempt>;
+    try {
+      outcome = await attempt;
+    } finally {
+      this.#inFlight.delete(channelPubkeyHex);
+    }
     if (!outcome.sealed) {
       // Nothing was sealed, so the window stays open.
       if (outcome.reason === "epoch_empty") return { honored: false, reason: "epoch_empty", ...latest() };

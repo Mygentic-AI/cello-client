@@ -160,6 +160,17 @@ describe("M16 011-SEALREQ: ChannelSealRequestGate", () => {
     expect(events.find((e) => e.event === "channel.seal_request.rate_limited")?.ctx["requester"]).toBe("ab".repeat(32));
   });
 
+  it("two requests at once: one is honored, the other is rate-limited, one seal is recorded", async () => {
+    const ch = await newChannel();
+    const g = gate();
+    await publish(ch, 2);
+    const [a, b] = await Promise.all([g.requestSeal(ch, "publisher", "rc1"), g.requestSeal(ch, "ab".repeat(32), "rc2")]);
+    expect([a, b].filter((r) => r.honored)).toHaveLength(1);
+    expect([a, b].filter((r) => !r.honored && r.reason === "rate_limited")).toHaveLength(1);
+    expect(sealStore.latest(ch)?.epoch_index).toBe(0);
+    expect(events.filter((e) => e.event === "channel.epoch.sealed")).toHaveLength(1);
+  });
+
   it("two channels have independent windows", async () => {
     const a = await newChannel();
     const b = await newChannel();
