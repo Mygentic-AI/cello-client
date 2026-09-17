@@ -61,6 +61,14 @@ export interface InboundScreenerOptions {
 export const INBOUND_INJECTION_BLOCKED = "inbound_injection_blocked";
 
 /**
+ * A DIFFERENT refusal from the semantic one, and it must stay distinguishable: this one is
+ * structural — an instruction in a channel with no legitimate use — while the semantic block is a
+ * model's judgement with a threshold behind it. Collapsing them would make a certainty read as an
+ * opinion.
+ */
+export const INBOUND_HIDDEN_INSTRUCTION_BLOCKED = "inbound_hidden_instruction_blocked";
+
+/**
  * DOD-M9C-SCREENPASSIVE-1 — the warning that travels WITH flagged content.
  *
  * Until this existed the screener did the work and threw the answer away: `screen()` returned an
@@ -237,6 +245,38 @@ export class InboundScreener {
 
     // Only a step that actually changed the DELIVERED bytes is a `redact`. Confusables and the
     // marker strip no longer do — they run on the scan copy — so they are `observe` notes now.
+    // THE ONE NEW BLOCK (Andre, 2026-09-16): an attack instruction carried in an invisible channel.
+    //
+    // Everything visible only warns, because people discuss prompt injection legitimately and
+    // blocking that conversation is the failure mode we refuse. A sentence written in tag characters
+    // or emoji variation selectors is different in kind: it is invisible to the operator, read as
+    // text by the model, and has no innocent version. Same test as the removal list — legitimate
+    // use — applied to meaning rather than to codepoints.
+    if (r.hiddenText.length > 0) {
+      const hiddenHits = scanInjectionPatterns(r.hiddenText);
+      if (hiddenHits.length > 0) {
+        return {
+          disposition: "block",
+          content,
+          events: [...events, {
+            stage: "injection_scan",
+            disposition: "block",
+            category: `injection:hidden_channel:${hiddenHits[0]}`,
+            reason: `an instruction was hidden in invisible codepoints and matched '${hiddenHits.join(", ")}' — invisible to you, read as text by a model`,
+          }],
+          terminal: true,
+          reason: INBOUND_HIDDEN_INSTRUCTION_BLOCKED,
+          guidance:
+            "This message carried an instruction written in invisible characters — a channel you cannot see and a model reads as text. " +
+            "It was not delivered.\n" +
+            noOperatorOverride(
+              "There is no legitimate reason to write a sentence in invisible codepoints, so this one is refused rather than flagged. " +
+              "If you believe the sender did it by accident, ask them to resend the message as ordinary text.",
+            ),
+        };
+      }
+    }
+
     // The findings travel WITH the content. An injection finding is what the agent most needs to
     // know before reading a message, and until now it reached nobody: the daemon read only the
     // disposition and the events were dropped.
