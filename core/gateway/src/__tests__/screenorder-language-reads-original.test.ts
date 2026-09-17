@@ -185,7 +185,7 @@ describe("027-SCREENORDER — the screener holds the attack and over-holds nothi
 
     // The delivered form is what was WRITTEN — name the value, do not settle for "not blocked".
     const delivered = dec(v.content);
-    expect(delivered).toBe(homoglyph);
+    expect(delivered).toContain(homoglyph); // plus the flag warning DOD-M9C-SCREENPASSIVE-1 adds
     expect(delivered).toContain("о"); // the Cyrillic lookalike is still there — the agent can see the trick
     // The disguise is REPORTED rather than silently repaired, and reported as an observation
     // because nothing delivered was changed.

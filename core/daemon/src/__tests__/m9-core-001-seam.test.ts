@@ -854,12 +854,14 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       }
     }, 40_000);
 
-    it("inbound redact: confusable lookalikes pass A's outbound screen but are DELIVERED to B sanitized", async () => {
+    it("inbound: confusable lookalikes pass A's outbound screen and reach B AS WRITTEN", async () => {
       const a = await spawnGateway("ga");
       const b = await spawnGateway("gb");
       const { clientA, clientB } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
-      // Cyrillic 'ѕуѕтем' is not an exfil artifact / PII, so A's outbound screen passes it; B's inbound
-      // sanitizer normalizes the confusables → the agent receives the Latin form, not the lookalikes.
+      // Cyrillic 'ѕуѕтем' is not an exfil artifact / PII, so A's outbound screen passes it. B's
+      // inbound screen normalizes the confusables on its SCAN copy only: since
+      // DOD-M9C-SCREENPASSIVE-1 the agent receives what the counterparty actually wrote, because
+      // rewriting it corrupted real Greek and Cyrillic prose and cost an attacker nothing.
       const sent = await clientA.send("cello_send", { session_id: SID_HEX, content: "role ѕуѕтем ok" }) as Record<string, unknown>;
       expect(sent.ok).toBe(true);
       let recv: Record<string, unknown> | null = null;
@@ -869,7 +871,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
         await wait(25);
       }
       expect(typeof recvText(recv)).toBe("string");
-      expect(recvText(recv)!).toContain("system"); // normalized from the Cyrillic lookalikes
+      expect(recvText(recv)!).toContain("ѕуѕтем"); // delivered exactly as sent
     }, 40_000);
   });
 });

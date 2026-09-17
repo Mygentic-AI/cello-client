@@ -207,11 +207,15 @@ describe("review findings — the ways this rule can silently stop working", () 
 });
 
 describe("the message path and the document path share ONE pipe pattern", () => {
-  it("strips in the sanitizer exactly what the document rule refuses", () => {
+  it("the two paths judge the same markers — the document REFUSES them, the message SCANS them", () => {
+    // Same list, different remedy, and DOD-M9C-SCREENPASSIVE-1 sharpened the message side: a marker
+    // is removed from the copy the patterns read, not from what the recipient is handed. Deleting
+    // `<|im_start|>` from delivery broke two agents exchanging prompt-building code.
     for (const marker of ["<|im_start|>", "<|assistant|>", "<|user|>", "<|IM_END|>"]) {
       expect(screenText(`a ${marker} b`), `document refuses ${marker}`).not.toBeNull();
-      const stripped = sanitizeInbound(new TextEncoder().encode(`a ${marker} b`)).text;
-      expect(stripped, `message strips ${marker}`).not.toContain(marker);
+      const r = sanitizeInbound(new TextEncoder().encode(`a ${marker} b`));
+      expect(r.decodedForScan, `message scan copy strips ${marker}`).not.toContain(marker);
+      expect(r.text, `message delivery keeps ${marker}`).toContain(marker);
     }
   });
 });
