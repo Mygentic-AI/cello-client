@@ -191,6 +191,12 @@ export const REFUSAL_REASONS = {
    * past the notice that matters.
    */
   ASSIGNMENT_UNREADABLE: "assignment_unreadable",
+  /**
+   * M16 — a verified session assignment addressed TO one of this daemon's broadcast channels. A
+   * channel publishes and never converses; the directory refuses to broker these, and this is the
+   * line that holds on the channel's own daemon even if a directory does not.
+   */
+  SESSION_TO_CHANNEL_IDENTITY: "session_to_channel_identity",
 } as const;
 
 export type RefusalReason = (typeof REFUSAL_REASONS)[keyof typeof REFUSAL_REASONS];
@@ -305,6 +311,12 @@ export const REFUSAL_GUIDANCE: Record<RefusalReason, string> = {
     "nothing is wrong on your side — the other party has been told to start a new session. If the " +
     "SAME counterparty keeps failing this way, stop treating it as noise: confirm out of band that " +
     "they are the one dialling you, and until they answer, do not accept a session from them.",
+  [REFUSAL_REASONS.SESSION_TO_CHANNEL_IDENTITY]:
+    "REFUSED ON PURPOSE. This identity is a broadcast channel. Channels publish; they do not hold " +
+    "sessions, so someone trying to open one with it was turned away and nothing was accepted. There " +
+    "is nothing wrong and nothing for you to retry. To reach the operator behind it, a caller opens a " +
+    "session with the channel's admin agent instead; they have been told so if you know them. To " +
+    "talk to them yourself, use cello_initiate_session from a non-channel agent.",
   [REFUSAL_REASONS.INBOUND_ASSIGNMENT_INVALID]:
     "REFUSED ON PURPOSE. The session assignment did not verify, so this agent would have been " +
     "opening its receiver to a peer named by a document it could not check. Nothing was accepted. " +

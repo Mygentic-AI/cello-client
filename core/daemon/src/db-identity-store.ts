@@ -387,6 +387,19 @@ export class DbIdentityStore {
 }
 
 /**
+ * M16: the "is this local agent a broadcast channel?" accessor, bound to the daemon's DB, for the
+ * session openers and the inbound-assignment path. Each call reads the agent's row, so a channel
+ * registered after startup is covered without a restart. Lives here rather than in the composition
+ * root so `daemon.ts` does not grow.
+ */
+export function channelAgentLookup(
+  sessionNodeManager: { getDb(): DaemonDatabase },
+  logger: Logger,
+): (agentName: string) => boolean {
+  return (agentName) => new DbIdentityStore(sessionNodeManager.getDb(), logger).isChannelAgent(agentName);
+}
+
+/**
  * DB-backed `DaemonRegistrationPersistence`. Scoped to a single agent's row. All persist operations
  * are single-row UPSERTs that update the named agent's row; a register-success therefore implies the
  * material is durably committed. A persist against a non-existent agent throws — the row is created by

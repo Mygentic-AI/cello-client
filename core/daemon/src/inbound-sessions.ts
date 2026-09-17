@@ -158,6 +158,11 @@ export interface InboundSessionDeps {
    * counterparty — never this agent.
    */
   isDeliveryOpenToAgent: (openerPubkey: string, targetAgentName: string) => boolean;
+  /**
+   * M16: is this LOCAL agent a broadcast channel? Answers about this daemon's own identities only;
+   * nothing here can know whether a REMOTE counterparty is a channel.
+   */
+  isChannelAgent: (agentName: string) => boolean;
 }
 
 /**
@@ -547,7 +552,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     NO_CURRENT_AGENT_RESPONSE, getKeyProvider, sharedSignaling,
     handleInboundSealInterruptedRequest, reapDeadHalfOpenSessions,
     sendAwayResponse, dispatchSessionStateChangedWithTelegram, sendTelegramDoorbell,
-    isDeliveryOpenToAgent,
+    isDeliveryOpenToAgent, isChannelAgent,
   } = deps;
 
   // ─── Seam 2: inbound session establishment (counterparty side) ─────────────
@@ -1633,6 +1638,32 @@ export function createInboundSessions(deps: InboundSessionDeps) {
      * Two checks for one property is how they drift: the survivor gets fixed and the dead one keeps
      * asserting the old rule to anyone reading.
      */
+
+    /**
+     * M16: A CHANNEL NEVER CONVERSES. The directory refuses to broker a session to a channel; this is
+     * the line that holds on the channel's own daemon if a directory does not.
+     *
+     * ⚠️ AFTER VERIFICATION, deliberately. Gating on an unverified assignment relocates trust rather
+     * than closing it, and an invalid assignment must be refused as invalid, not masked as this.
+     * Through `refuseInboundSession`, so the refusal is durable, the dialer is revoked, and a
+     * KNOWN+ counterparty is told to reach the channel's admin instead.
+     */
+    if (isChannelAgent(localAgent.name)) {
+      refuseInboundSession({
+        agentName: localAgent.name,
+        sessionIdHex: parsed.sessionIdHex,
+        counterpartyPubkeyHex: parsed.participantAPubkeyHex,
+        reason: REFUSAL_REASONS.SESSION_TO_CHANNEL_IDENTITY,
+        offeredDialer: offered,
+        counterpartyGuidance:
+          "They refused this session: the identity you tried to reach is a broadcast channel. Channels " +
+          "publish and never hold sessions. To reach the operator behind it, open a session with the " +
+          "channel's admin agent instead.",
+        correlationId,
+      });
+      return;
+    }
+
     inboundInFlight.add(offerKey(localAgent.name, parsed.sessionIdHex));
     // Serialize: the next accept does not begin until this one (and any standing-receiver
     // rebuild it triggers) settles. A throw inside one accept must not break the chain.

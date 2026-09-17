@@ -64,6 +64,7 @@ function newOpener() {
     autoNatService: { getDialability: () => ({ dialable: false }) } as unknown as IAutoNatService,
     buildRelayConnectParams: async () => undefined,
     getRelayCircuitAddress: () => "",
+    isChannelAgent: () => false,
   });
   return { openSessionFor, openSessionAs, seen };
 }

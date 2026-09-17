@@ -85,6 +85,7 @@ function harness() {
     dispatchSessionStateChangedWithTelegram: () => {},
     sendTelegramDoorbell: async () => {},
     isDeliveryOpenToAgent: () => false,
+    isChannelAgent: () => false,
   } as unknown as InboundSessionDeps);
 
   api.wirePerAgentSessionInbound(

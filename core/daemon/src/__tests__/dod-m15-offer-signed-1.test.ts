@@ -148,6 +148,7 @@ function harness(opts: {
     dispatchSessionStateChangedWithTelegram: () => {},
     sendTelegramDoorbell: async () => {},
     isDeliveryOpenToAgent: () => false,
+    isChannelAgent: () => false,
   } as unknown as InboundSessionDeps;
 
   // The RETURN VALUE, not discarded. `refusedSessionRequests` is the in-memory list `cello_inbox`

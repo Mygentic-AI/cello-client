@@ -184,6 +184,7 @@ async function makeHarness(opts: {
     },
     autoNatService: { getDialability: () => ({ dialable: false, publicAddr: null }) },
     buildRelayConnectParams: async () => undefined,
+    isChannelAgent: () => false,
   } as unknown as InitiateSessionDeps);
 
   return { openSessionAs, events, dials, sessionNodesCreated, counterpartyConnects, counterpartyPrimaries };

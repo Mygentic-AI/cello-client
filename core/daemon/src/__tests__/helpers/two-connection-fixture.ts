@@ -23,6 +23,7 @@ import { tmpdir } from "node:os";
 import { FileKeyProvider, msgLeafHash, generateKeypair } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../../daemon.js";
+import { DbRegistrationPersistence } from "../../db-identity-store.js";
 import { connectToDaemon, type IpcClient } from "../../ipc-client.js";
 import type { Logger, DaemonConfig } from "../../types.js";
 import type { SessionNodeManager, ISessionNodeFactory, SessionNodeConfig } from "../../session-node-manager.js";
@@ -139,6 +140,18 @@ export interface TwoConnectionFixtureOpts {
    * and with a passthrough it closes faster than any test can aim at.
    */
   securityGateway?: SecurityGatewayClient;
+  /**
+   * M16 006-NOCONVERSE: agents (from `agents`) to register as broadcast CHANNELS. Written through the
+   * production registration writer, `DbRegistrationPersistence.persistRegistrationState`, so the row
+   * is the one a real channel registration leaves. Default absent: nobody is a channel.
+   */
+  channelAgents?: string[];
+  /**
+   * M16 006-NOCONVERSE: replace the session negotiator — what `cello_initiate_session` asks to broker
+   * a session with the directory. A recording negotiator is how a test sees whether an initiate got
+   * past its entry gates at all. Default absent: the daemon's own.
+   */
+  sessionNegotiator?: DaemonConfig["sessionNegotiator"];
 }
 
 export interface TwoConnectionFixture {
@@ -222,8 +235,21 @@ export async function startTwoConnectionFixture(
     version: "0.0.1-test",
     logger: opts.logger ?? capturing,
     sessionNodeFactory: new FixedFactory(opts.node ?? (new FakeNode() as unknown as CelloNode)),
+    ...(opts.sessionNegotiator ? { sessionNegotiator: opts.sessionNegotiator } : {}),
   };
   const handle = await startDaemon(config);
+  for (const name of opts.channelAgents ?? []) {
+    await new DbRegistrationPersistence({ db: handle.getSessionNodeManager().getDb(), agentName: name, logger: capturing })
+      .persistRegistrationState({
+        agentId: `fixture-channel-${name}`,
+        primaryPubkey: "5b".repeat(32),
+        mlDsaPubkey: "6c".repeat(32),
+        registeredAt: Date.now(),
+        keyBinding: "7d".repeat(64),
+        channel: true,
+        adminPubkey: generateKeypair().toJSON()["publicKey"]!,
+      });
+  }
   const clients: IpcClient[] = [];
 
   async function connect(): Promise<IpcClient> {

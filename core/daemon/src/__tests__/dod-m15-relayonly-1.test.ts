@@ -300,6 +300,7 @@ describe("DOD-M15-RELAYONLY-1 — the DIAL, driven through the real handler", ()
       autoNatService: { getDialability: () => ({ dialable: false }) } as unknown as IAutoNatService,
       buildRelayConnectParams: async () => undefined,
       getRelayCircuitAddress: () => "",
+      isChannelAgent: () => false,
     });
     return { openSessionAs, dialled };
   }

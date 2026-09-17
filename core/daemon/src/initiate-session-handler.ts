@@ -36,6 +36,11 @@ export interface InitiateSessionDeps {
   autoNatService: IAutoNatService;
   buildRelayConnectParams: (agentName: string, assignment: SessionAssignment) => Promise<RelayConnectParams | undefined>;
   getRelayCircuitAddress?: () => string;
+  /**
+   * M16: is this LOCAL agent a broadcast channel? A channel never opens a session, so the opener
+   * refuses before any directory traffic.
+   */
+  isChannelAgent: (agentName: string) => boolean;
 }
 
 /**
@@ -69,7 +74,7 @@ export function registerInitiateSessionHandler(deps: InitiateSessionDeps): {
   const {
     handlers, logger, sessionNodeManager, getConnState, resolveCurrentAgent,
     NO_CURRENT_AGENT_RESPONSE, resolvedSessionNegotiator, transportSelector, autoNatService,
-    buildRelayConnectParams, getRelayCircuitAddress,
+    buildRelayConnectParams, getRelayCircuitAddress, isChannelAgent,
   } = deps;
 
   // ─── CELLO-M7-TRANSPORT-001: cello_initiate_session ─────────────────────────
@@ -104,6 +109,22 @@ export function registerInitiateSessionHandler(deps: InitiateSessionDeps): {
     params: Record<string, unknown> | undefined,
   ): Promise<Record<string, unknown>> {
     const correlationId = randomUUID();
+
+    /**
+     * M16: A CHANNEL NEVER CONVERSES, and this daemon is the only place its key lives. Refused here,
+     * in the agent-scoped opener rather than only in the IPC handler, so a worker opening a session
+     * for this agent is refused too. Before any directory traffic: nothing about the attempt leaves
+     * this machine.
+     */
+    if (isChannelAgent(agentName)) {
+      logger.warn("session.initiate.refused_channel", { correlationId, agent_name: agentName });
+      return {
+        ok: false,
+        reason: "channel_cannot_initiate",
+        guidance:
+          "This agent is a broadcast channel and cannot open sessions. Publish to the channel instead, or act as a non-channel agent.",
+      };
+    }
 
     // AC-004/AC-019: the advertised address is chosen from the standing receiver's
     // current dialability. Not dialable (or AutoNAT unavailable) → relay circuit.

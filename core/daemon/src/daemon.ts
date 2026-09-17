@@ -40,7 +40,7 @@ import { SessionNodeManager } from "./session-node-manager.js";
 import { registerGatewayConfigHandlers } from "./gateway-config-handlers.js";
 import { NonceDedupStore } from "./nonce-dedup.js";
 import { NotificationDispatcher } from "./notification-dispatcher.js";
-import { DbIdentityStore } from "./db-identity-store.js";
+import { DbIdentityStore, channelAgentLookup } from "./db-identity-store.js";
 
 // CELLO-M7-MSG-001 (AC-013/AC-018): the single application content-size cap, enforced
 // at the send point here (the receive point lives in the transport content decode).
@@ -506,7 +506,7 @@ async function startDaemonHoldingLock(
     sendAwayResponse,
     dispatchSessionStateChangedWithTelegram,
     sendTelegramDoorbell,
-    isDeliveryOpenToAgent,
+    isDeliveryOpenToAgent, isChannelAgent: channelAgentLookup(sessionNodeManager, logger), // M16
   });
 
   if (!sharedSignaling) {
@@ -737,7 +737,7 @@ async function startDaemonHoldingLock(
     transportSelector,
     autoNatService,
     buildRelayConnectParams,
-    getRelayCircuitAddress,
+    getRelayCircuitAddress, isChannelAgent: channelAgentLookup(sessionNodeManager, logger), // M16
   });
 
   // cello_close_session (close-session-handler.ts). Fifteen dependencies — a long list, but a KNOWN
