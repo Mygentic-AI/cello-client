@@ -12,6 +12,7 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { SCREENER_MODEL } from "@cello-protocol/gateway";
 import { screenerStatusCommand, screenerInstallCommand, screenerManualInstructions } from "../screener-commands.js";
+import { screenerLoginLine } from "../commands.js";
 
 async function writeVerifiedModel(dir: string): Promise<void> {
   for (const f of SCREENER_MODEL.files) {
@@ -157,5 +158,27 @@ describe("SCREENINSTALL: cello screener", () => {
       expect(text).toContain(SCREENER_MODEL.files[0]!.sha256);
       expect(text).toContain(SCREENER_MODEL.revision);
     });
+  });
+});
+
+describe("SCREENINSTALL: the login line", () => {
+  it("appears when the classifier is absent, naming the command and the size", async () => {
+    const line = await screenerLoginLine(async () => ({ state: "not_installed" }));
+    expect(line).toContain("cello screener install");
+    expect(line).toContain("241 MB");
+    expect(line).toContain("1 of 2");
+  });
+
+  it("appears again for a half-installed or broken screener — postponing is not deciding", async () => {
+    expect(await screenerLoginLine(async () => ({ state: "half_installed" }))).not.toBe("");
+    expect(await screenerLoginLine(async () => ({ state: "broken", problem: "x" }))).not.toBe("");
+  });
+
+  it("is silent once the classifier is installed and verified", async () => {
+    expect(await screenerLoginLine(async () => ({ state: "ready" }))).toBe("");
+  });
+
+  it("never breaks login when the check itself fails", async () => {
+    expect(await screenerLoginLine(async () => { throw new Error("disk on fire"); })).toBe("");
   });
 });

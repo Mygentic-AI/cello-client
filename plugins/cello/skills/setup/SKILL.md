@@ -80,7 +80,31 @@ agent that is online but not receiver-ready will silently fail to take calls.
 
 ---
 
-## Step 4 — The configuration worth choosing now
+## Step 4 — Turn on both screening layers
+
+CELLO screens everything that arrives before your agent reads it, and screening has two layers.
+The deterministic rules run from the moment the daemon starts. The **prompt-injection classifier**
+is the second layer, and it is not bundled — it is downloaded only if you ask for it.
+
+```bash
+cello screener status     # which layers are active
+cello screener install    # asks first, then downloads and verifies
+```
+
+It downloads about 241 MB (the Patronus Wolf Defender model from Hugging Face, and the
+Transformers.js runtime from npm) and uses about 618 MB on disk. Every file is checked against its
+published SHA-256.
+
+- On a machine with nobody at the keyboard — a server, CI, an unattended agent — add `--yes`.
+- To fetch it yourself instead, `cello screener install --manual` prints every URL, size and digest
+  and downloads nothing.
+
+**Until it is installed, incoming messages are screened by the rules alone**, and CELLO says so on
+each new session rather than leaving you to guess.
+
+---
+
+## Step 5 — The configuration worth choosing now
 
 None of this is required to send a first message. All of it is easier to decide now than to discover
 later, because the defaults are permissive on purpose.
@@ -192,7 +216,7 @@ cello refresh       # rotate an agent's signing-key shares to a fresh epoch (rou
 
 ---
 
-## Step 5 — Turn on the doorbell
+## Step 6 — Turn on the doorbell
 
 So the session wakes on an incoming message instead of you polling:
 

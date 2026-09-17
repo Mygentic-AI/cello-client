@@ -21,10 +21,9 @@ import { GatewayConfigStore } from "../config/config-store.js";
 import { stderrStoreEventSink } from "../store/encrypted-db.js";
 import { GatewayRecordStore, type RecordDisposition } from "../records/record-store.js";
 import { createHash } from "node:crypto";
-import { join } from "node:path";
-import { homedir } from "node:os";
 import { InjectionScanner } from "../detect/injection-scanner.js";
 import { loadInjectionClassifier } from "../detect/injection-classifier-onnx.js";
+import { screenerModelDir, screenerState, runtimeAvailable } from "../detect/screener-state.js";
 import type { ScreenVerdict } from "../types.js";
 
 /**
@@ -123,13 +122,18 @@ async function main(): Promise<void> {
   // The state is ANNOUNCED either way, on stderr, at startup. "Is semantic screening on?" must be
   // answerable by reading a log line rather than by reading this file — that is the whole reason
   // the gap survived as long as it did.
-  const modelDir = process.env["CELLO_GATEWAY_MODEL_DIR"] || join(homedir(), ".cello", "gateway-model");
+  // DOD-M9C-SCREENINSTALL-1: one function decides where the model lives, so the CLI that installs
+  // it and the gateway that loads it cannot disagree about the directory.
+  const modelDir = screenerModelDir();
   const load = await loadInjectionClassifier(modelDir);
   // ON STDOUT, and specifically on the line the PARENT reads. Written to stderr this was drained
   // into an in-memory tail that the spawner only ever surfaces when the spawn FAILS — so on a
   // successful boot the answer to "is semantic screening on?" was captured and thrown away. That is
   // the exact shape of the defect this whole unit exists to fix: a state nothing can report.
   const layer2 = load.classifier ? "active" : `off:${load.reason ?? "unknown"}`;
+  // The same four states the CLI prints, on the daemon's own startup line: "is the classifier
+  // usable?" must be answerable from the log, not only by running a command.
+  const screener = await screenerState({ dir: modelDir, runtimePresent: await runtimeAvailable() });
   const inbound = new InboundScreener(
     load.classifier ? { injectionScanner: new InjectionScanner(load.classifier) } : {},
   );
@@ -223,7 +227,10 @@ async function main(): Promise<void> {
     // was false — the id reached `applied` and stopped there.
     process.stderr.write(`${JSON.stringify({ level: "info", event: "gateway.boot", correlationId: bootCorrelationId, socketPath })}\n`);
   }
-  process.stdout.write(`${GATEWAY_READY_TOKEN} ${socketPath} regex-engine=${engine} layer2=${layer2.replace(/\s+/g, " ")}\n`);
+  process.stdout.write(
+    `${GATEWAY_READY_TOKEN} ${socketPath} regex-engine=${engine} layer2=${layer2.replace(/\s+/g, " ")} ` +
+      `screener=${screener.state} screener-model-dir=${modelDir}\n`,
+  );
 
   let stopping = false;
   const shutdown = (signal: string) => {

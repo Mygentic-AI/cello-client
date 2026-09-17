@@ -4,6 +4,7 @@
 
 import { join } from "node:path";
 import { CO_OWNERSHIP_NOTE } from "@cello-protocol/protocol-types";
+import { screenerState, screenerModelDir, runtimeAvailable } from "@cello-protocol/gateway";
 import {
   connectOrStart,
   connectToDaemon,
@@ -116,10 +117,36 @@ export async function login(
     } finally {
       result.client.close();
     }
-    return { exitCode: 0, output: `${head}\n${summary}` };
+    // DOD-M9C-SCREENINSTALL-1: the screener line, EVERY login until it is installed.
+    //
+    // It repeats deliberately. An operator who skipped it once has postponed, not decided, and a
+    // one-time notice at the end of a busy install is indistinguishable from no notice at all. It
+    // rides on `guidance` (stderr), so a script parsing login's stdout is unaffected.
+    const screener = await screenerLoginLine();
+    return { exitCode: 0, output: `${head}\n${summary}`, ...(screener ? { guidance: screener } : {}) };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     return { exitCode: 1, output: `Failed to start daemon: ${message}` };
+  }
+}
+
+/**
+ * One line when the classifier is not installed-and-verified, empty when it is.
+ *
+ * Never throws and never blocks login: a screener check that could break sign-in would be a worse
+ * defect than the one it reports.
+ */
+export async function screenerLoginLine(
+  stateImpl?: () => Promise<{ state: string; problem?: string }>,
+): Promise<string> {
+  try {
+    const status = stateImpl
+      ? await stateImpl()
+      : await screenerState({ dir: screenerModelDir(), runtimePresent: await runtimeAvailable() });
+    if (status.state === "ready") return "";
+    return `Screening: 1 of 2 layers active. Install the classifier (~241 MB): cello screener install`;
+  } catch {
+    return "";
   }
 }
 
