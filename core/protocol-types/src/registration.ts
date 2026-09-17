@@ -75,6 +75,12 @@ export interface RegisterRequest {
    * Absent on the single-node back-compat path (no manifest).
    */
   reachable_node_ids?: string[];
+  /** True when this identity is a broadcast channel (publish-only; never converses).
+   *  Immutable after registration. Omitted entirely for ordinary agents. */
+  channel?: true;
+  /** Hex-encoded 32-byte pubkey of the administering agent. REQUIRED when channel is set;
+   *  must be absent otherwise. Immutable after registration. */
+  admin_pubkey?: string;
 }
 
 /**
@@ -147,6 +153,9 @@ export interface RegisterSuccess {
    * picks a token up on its next signaling reconnect.
    */
   online_token?: Uint8Array;
+  /** Echoed by the directory when the profile was stored with channel = true. A client
+   *  registering a channel MUST refuse success without this echo. */
+  channel?: true;
 }
 
 /**
@@ -168,7 +177,8 @@ export type RegisterErrorReason =
   | "invalid_verification"   // phone_stub is empty or otherwise invalid
   | "dkg_failed"             // FROST DKG below threshold or ceremony failure
   | "not_authenticated"      // register_request arrived before signaling_auth_ok
-  | "dkg_verification_failed"; // primary_pubkey from dkg_complete doesn't match DKG commitments
+  | "dkg_verification_failed" // primary_pubkey from dkg_complete doesn't match DKG commitments
+  | "invalid_channel_registration"; // channel/admin_pubkey fields malformed or inconsistent
 
 // ─── AgentProfile (stored in DirectoryStore) ────────────────────────────────
 
@@ -210,6 +220,10 @@ export interface AgentProfile {
    * mints the binding from key material the daemon already holds.
    */
   key_binding?: string;
+  /** True when this identity is a broadcast channel. Immutable. */
+  channel: boolean;
+  /** Hex admin pubkey when channel === true; "" otherwise. Immutable. */
+  admin_pubkey: string;
 }
 
 // ─── RegistrationState (stored locally by client) ────────────────────────────

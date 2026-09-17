@@ -75,6 +75,22 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
     if (!preAuthToken) {
       return { ok: false, reason: "missing_preauth_token", guidance: "Registration requires a 'preAuthToken' issued by the CELLO Operations Agent (Telegram). Obtain one, then retry 'cello register-agent'." };
     }
+    // M16: a broadcast channel is registered with `channel: true` AND the administering agent's
+    // pubkey. The two travel together or not at all. The manager checks the pubkey's shape.
+    const channelParam = params?.channel;
+    const adminPubkeyParam = params?.adminPubkeyHex;
+    if (channelParam !== undefined && channelParam !== true) {
+      return { ok: false, reason: "invalid_channel_registration", guidance: "'channel' must be true to register a broadcast channel, or omitted for an ordinary agent." };
+    }
+    if (channelParam === true && typeof adminPubkeyParam !== "string") {
+      return { ok: false, reason: "invalid_channel_registration", guidance: "Registering a channel requires 'adminPubkeyHex': the public key of the agent that will administer it." };
+    }
+    if (channelParam === undefined && adminPubkeyParam !== undefined) {
+      return { ok: false, reason: "invalid_channel_registration", guidance: "'adminPubkeyHex' only applies to a channel registration. Pass 'channel: true' with it, or omit both for an ordinary agent." };
+    }
+    const channelOpts = channelParam === true
+      ? { channel: true as const, adminPubkeyHex: adminPubkeyParam as string }
+      : undefined;
     const keyProvider = keyProviders.get(name);
     if (!keyProvider) {
       return { ok: false, reason: "agent_not_found", guidance: `Agent '${name}' does not exist. Create it first with 'cello create-agent ${name}', then retry 'cello register-agent'.` };
@@ -237,7 +253,7 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
         logger,
       });
       try {
-        const result = await new RegistrationManager(ctx).register(phoneStub, preAuthToken);
+        const result = await new RegistrationManager(ctx).register(phoneStub, preAuthToken, channelOpts);
         if ("error" in result) {
           logger.warn("registration.failed", { agentName: name, reason: result.error });
           // Terminal failure for THIS agent — drop its dedicated signaling manager so it

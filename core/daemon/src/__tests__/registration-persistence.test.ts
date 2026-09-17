@@ -24,6 +24,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { mlDsaKeygenWithBytes, mlDsaVerify, InMemoryMlDsaKeyProvider } from "@cello-protocol/crypto";
 import { FileRegistrationPersistence } from "../registration-persistence.js";
+import { DbIdentityStore, DbRegistrationPersistence } from "../db-identity-store.js";
+import { openTestDb } from "./helpers/encrypted-db.js";
 import type { Logger } from "../types.js";
 
 describe("registration-persistence (daemon)", () => {
@@ -241,6 +243,58 @@ describe("registration-persistence (daemon)", () => {
     for (const f of secretFiles) {
       const s = await stat(join(agentDir, f));
       expect(s.mode & 0o777).toBe(0o600);
+    }
+  });
+
+  // ─── M16 004-IDENTITY-WIRE: the daemon knows which of its own identities are channels ──────────
+
+  const REG = { primaryPubkey: "aa".repeat(32), mlDsaPubkey: "bb".repeat(32), registeredAt: 1, keyBinding: "cd".repeat(64) };
+  const ADMIN = "ef".repeat(32);
+
+  function dbPersistenceFor(...names: string[]) {
+    const db = openTestDb(join(root, "sessions.db"));
+    const store = new DbIdentityStore(db, logger);
+    for (const n of names) store.createAgent(n, new Uint8Array(32).fill(names.indexOf(n) + 1), `${n}-pubkey`);
+    return { db, store, persistenceFor: (n: string) => new DbRegistrationPersistence({ db, agentName: n, logger }) };
+  }
+
+  it("records default to non-channel", async () => {
+    const file = new FileRegistrationPersistence({ agentDir, logger });
+    await file.persistRegistrationState({ agentId: "agent-f", ...REG });
+    const fileLoaded = await file.loadRegistrationState();
+    expect(fileLoaded!.channel).toBe(false);
+    expect(fileLoaded!.adminPubkey).toBe("");
+
+    const { db, persistenceFor } = dbPersistenceFor("alice");
+    try {
+      await persistenceFor("alice").persistRegistrationState({ agentId: "agent-d", ...REG });
+      const dbLoaded = await persistenceFor("alice").loadRegistrationState();
+      expect(dbLoaded!.channel).toBe(false);
+      expect(dbLoaded!.adminPubkey).toBe("");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("channel fields round-trip", async () => {
+    const file = new FileRegistrationPersistence({ agentDir, logger });
+    await file.persistRegistrationState({ agentId: "agent-f", ...REG, channel: true, adminPubkey: ADMIN });
+    const fileLoaded = await file.loadRegistrationState();
+    expect(fileLoaded!.channel).toBe(true);
+    expect(fileLoaded!.adminPubkey).toBe(ADMIN);
+
+    const { db, store, persistenceFor } = dbPersistenceFor("news", "alice");
+    try {
+      await persistenceFor("news").persistRegistrationState({ agentId: "agent-n", ...REG, channel: true, adminPubkey: ADMIN });
+      await persistenceFor("alice").persistRegistrationState({ agentId: "agent-a", ...REG });
+      const dbLoaded = await persistenceFor("news").loadRegistrationState();
+      expect(dbLoaded!.channel).toBe(true);
+      expect(dbLoaded!.adminPubkey).toBe(ADMIN);
+      expect(store.isChannelAgent("news")).toBe(true);
+      expect(store.isChannelAgent("alice")).toBe(false);
+      expect(store.isChannelAgent("nobody"), "an unknown agent is not a channel").toBe(false);
+    } finally {
+      db.close();
     }
   });
 });

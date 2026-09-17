@@ -9,7 +9,8 @@
  * assertion) by blocking the directory endpoint resolver.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { RegistrationManager } from "../registration-manager.js";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -175,5 +176,67 @@ describe("DOD-M15-EXPIRY-CONSUMER-POLICY-1: a lapsed manifest is reported, and d
       "and it must have gone ON to resolve the roster — the PERMIT half. Refusing here would strand " +
         "a running daemon, since a restart without a replacement manifest never comes back",
     ).toBe(true);
+  });
+});
+
+/**
+ * M16 004-IDENTITY-WIRE — the IPC surface for registering a broadcast channel. The two params travel
+ * together or not at all; the handler refuses an inconsistent pair before any directory work.
+ */
+describe("M16 004-IDENTITY-WIRE: cello_register channel params", () => {
+  const ADMIN = "ab".repeat(32);
+
+  function makeHandler() {
+    const handlers = new Map<string, (p: Record<string, unknown> | undefined, c: string) => Promise<unknown>>();
+    registerRegisterHandler({
+      handlers: handlers as never,
+      logger: { debug() {}, info() {}, warn() {}, error() {} },
+      keyProviders: new Map([["alice", { getPublicKey: async () => new Uint8Array(32).fill(1) } as never]]),
+      getPersistence: () => ({}) as never,
+      getAgentSignaling: () => ({
+        signaling: { registerInboundHandler: () => () => {} } as never,
+        getNode: () => null,
+      }),
+      waitForSignalingConnected: async () => true,
+      dropAgentSignaling: async () => {},
+      startAgentInternal: () => ({ ok: true }),
+      directoryEndpointResolver: async () => ({ peerId: "12D3KooWX", multiaddr: "/ip4/127.0.0.1/tcp/1" }) as never,
+      loadedAgents: [{ name: "alice", pubkey: "11".repeat(32), keyProvider: {} as never }],
+      registrationGuidance: () => "guidance",
+    });
+    return handlers.get("cello_register")!;
+  }
+
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it("channel without adminPubkeyHex is refused", async () => {
+    const spy = vi.spyOn(RegistrationManager.prototype, "register");
+    const result = (await makeHandler()({ agent: "alice", preAuthToken: "t", channel: true }, "c")) as {
+      ok: boolean; reason?: string;
+    };
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("invalid_channel_registration");
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("adminPubkeyHex without channel is refused", async () => {
+    const spy = vi.spyOn(RegistrationManager.prototype, "register");
+    const result = (await makeHandler()({ agent: "alice", preAuthToken: "t", adminPubkeyHex: ADMIN }, "c")) as {
+      ok: boolean; reason?: string;
+    };
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("invalid_channel_registration");
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("well-formed channel params reach the manager", async () => {
+    let received: unknown[] | undefined;
+    vi.spyOn(RegistrationManager.prototype, "register").mockImplementation(async (...args: unknown[]) => {
+      received = args;
+      return { error: "stopped_here_by_test" };
+    });
+    await makeHandler()({ agent: "alice", preAuthToken: "t", channel: true, adminPubkeyHex: ADMIN }, "c");
+    expect(received, "the manager must have been invoked").toBeDefined();
+    expect(received![2]).toEqual({ channel: true, adminPubkeyHex: ADMIN });
   });
 });

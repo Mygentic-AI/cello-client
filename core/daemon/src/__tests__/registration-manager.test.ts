@@ -14,6 +14,30 @@
  */
 
 import { describe, it, expect, vi } from "vitest";
+
+/**
+ * M16 004-IDENTITY-WIRE: the `register_success` echo check sits AFTER the FROST DKG, and a real
+ * ceremony cannot complete against this harness's stub node. So `runNetworkDkg` delegates to the
+ * REAL implementation by default — every pre-existing test here still reaches the real ceremony and
+ * fails in it — and only the channel tests below hand it one ceremony result, so they can reach
+ * the frame the unit exists to check. Nothing about the ceremony is asserted through this seam.
+ */
+const dkgSeam = vi.hoisted(() => ({ nextResult: null as unknown }));
+vi.mock("../network-directory-node.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../network-directory-node.js")>();
+  return {
+    ...actual,
+    runNetworkDkg: async (...args: Parameters<typeof actual.runNetworkDkg>) => {
+      if (dkgSeam.nextResult !== null) {
+        const r = dkgSeam.nextResult;
+        dkgSeam.nextResult = null;
+        return r as Awaited<ReturnType<typeof actual.runNetworkDkg>>;
+      }
+      return actual.runNetworkDkg(...args);
+    },
+  };
+});
+
 import { RegistrationManager, type RegistrationContext, type SignalingSendResult } from "../registration-manager.js";
 import type { ConsortiumEndpoint } from "../directory-bootstrap.js";
 import type { DaemonRegistrationPersistence } from "../registration-persistence.js";
@@ -53,6 +77,7 @@ function makeRecordingPersistence(sharePrimaryHex: string | null = "cc".repeat(3
 }
 
 function makeFakeCtx(opts: Partial<{
+  logger: Logger;
   persistence: DaemonRegistrationPersistence | null;
   getNode: () => CelloNode | null;
   getDirectoryEndpoint: () => { peer_id: string; multiaddrs: string[] } | null;
@@ -71,7 +96,7 @@ function makeFakeCtx(opts: Partial<{
 
   const ctx: RegistrationContext = {
     keyProvider: stubKeyProvider,
-    logger: noopLogger,
+    logger: opts.logger ?? noopLogger,
     persistence: opts.persistence ?? null,
     mlDsaKeyFile: undefined,
     getNode: opts.getNode ?? (() => stubNode),
@@ -94,6 +119,7 @@ function makeFakeCtx(opts: Partial<{
     deliverDkg: (f: Record<string, unknown>) => pendingDkg?.(f),
     deliverReg: (f: Record<string, unknown>) => pendingReg?.(f),
     getPendingDkg: () => pendingDkg,
+    getPendingReg: () => pendingReg,
   };
 }
 
@@ -338,6 +364,139 @@ describe("038-KEYBIND: the binding this daemon MINTS", () => {
     // other says this machine has nothing to disagree with, and the remedies are not the same.
     expect(result).toMatchObject({ error: "registration_share_missing" });
     expect((result as { detail?: string }).detail, "a refusal carries its next step").toBeTruthy();
+    expect(calls.reg).toHaveLength(0);
+  });
+});
+
+/**
+ * M16 004-IDENTITY-WIRE — a broadcast channel is a registered identity marked `channel` + the admin's
+ * pubkey. Until the directory stores those (order 005), a directory ignores them, and a channel that
+ * silently registered as a plain agent would be a corrupt identity nobody notices. So the client
+ * REQUIRES the directory to echo `channel: true`, and fails the registration without it.
+ */
+describe("M16 004-IDENTITY-WIRE: channel registration (client side)", () => {
+  const GROUP = "cc".repeat(32);
+  const ADMIN = generateKeypair().toJSON()["publicKey"]!;
+
+  function makeCapturingCtx(persistence: DaemonRegistrationPersistence | null = null) {
+    const frames: Array<Record<string, unknown>> = [];
+    const errors: Array<{ event: string; ctx: Record<string, unknown> }> = [];
+    const logger: Logger = {
+      debug() {}, info() {}, warn() {},
+      error(event, ctx) { errors.push({ event, ctx: (ctx ?? {}) as Record<string, unknown> }); },
+    };
+    const h = makeFakeCtx({
+      logger,
+      persistence,
+      getConsortiumEndpoints: () => null,
+      sendSignalingFrame: async (f) => { frames.push(f); return { ok: true }; },
+    });
+    return { ...h, frames, errors };
+  }
+
+  /** Drive register() through a completed ceremony to the register_success frame. */
+  async function driveToRegisterSuccess(
+    h: ReturnType<typeof makeCapturingCtx>,
+    promise: Promise<unknown>,
+    success: Record<string, unknown>,
+  ): Promise<unknown> {
+    await vi.waitFor(() => expect(h.getPendingDkg()).not.toBeNull());
+    dkgSeam.nextResult = {
+      signer: {},
+      primaryPubkey: new Uint8Array(Buffer.from(GROUP, "hex")),
+      signingShare: new Uint8Array([1, 2, 3]),
+      identifier: "client:test",
+      commitments: [],
+      verifyingShares: {},
+      threshold: 2,
+      participants: 1,
+    };
+    h.deliverDkg({ type: "dkg_ready", epochId: "e1", participants: 1, threshold: 2 });
+    await vi.waitFor(() => expect(h.getPendingReg()).not.toBeNull());
+    h.deliverReg({ type: "register_success", agent_id: "agent-ch", primary_pubkey: GROUP, ...success });
+    return promise;
+  }
+
+  it("channel registration sends channel and admin_pubkey in register_request", async () => {
+    const h = makeCapturingCtx();
+    const mgr = new RegistrationManager(h.ctx);
+    void mgr.register("", "token", { channel: true, adminPubkeyHex: ADMIN });
+    await vi.waitFor(() => expect(h.frames.length).toBeGreaterThan(0));
+    const frame = h.frames[0]!;
+    expect(frame["type"]).toBe("register_request");
+    expect(frame["channel"]).toBe(true);
+    expect(frame["admin_pubkey"]).toBe(ADMIN);
+  });
+
+  it("ordinary registration frame carries neither key", async () => {
+    const h = makeCapturingCtx();
+    const mgr = new RegistrationManager(h.ctx);
+    void mgr.register("", "token");
+    await vi.waitFor(() => expect(h.frames.length).toBeGreaterThan(0));
+    const frame = h.frames[0]!;
+    expect(frame["type"]).toBe("register_request");
+    expect("channel" in frame).toBe(false);
+    expect("admin_pubkey" in frame).toBe(false);
+  });
+
+  it("self-administered channel is refused before sending", async () => {
+    const h = makeCapturingCtx();
+    const mgr = new RegistrationManager(h.ctx);
+    const result = await mgr.register("", "token", { channel: true, adminPubkeyHex: stubKeyProviderPubkeyHex });
+    expect(result).toMatchObject({ error: "invalid_channel_registration" });
+    expect(h.frames).toHaveLength(0);
+  });
+
+  it("malformed admin pubkey is refused before sending", async () => {
+    for (const bad of [ADMIN.slice(0, 63), "A" + ADMIN.slice(1)]) {
+      const h = makeCapturingCtx();
+      const mgr = new RegistrationManager(h.ctx);
+      const result = await mgr.register("", "token", { channel: true, adminPubkeyHex: bad });
+      expect(result, bad).toMatchObject({ error: "invalid_channel_registration" });
+      expect(h.frames, bad).toHaveLength(0);
+    }
+  });
+
+  it("register_success WITH the echo persists channel fields", async () => {
+    const { persistence, calls } = makeRecordingPersistence(GROUP);
+    const h = makeCapturingCtx(persistence);
+    const mgr = new RegistrationManager(h.ctx);
+    const promise = mgr.register("", "token", { channel: true, adminPubkeyHex: ADMIN });
+    const result = await driveToRegisterSuccess(h, promise, { channel: true });
+    expect(result).toMatchObject({ agent_id: "agent-ch", status: "active" });
+    expect(calls.reg).toHaveLength(1);
+    expect(calls.reg[0]).toMatchObject({ agentId: "agent-ch", channel: true, adminPubkey: ADMIN });
+  });
+
+  it("register_success WITHOUT the echo fails the registration", async () => {
+    const { persistence, calls } = makeRecordingPersistence(GROUP);
+    const h = makeCapturingCtx(persistence);
+    const mgr = new RegistrationManager(h.ctx);
+    const promise = mgr.register("", "token", { channel: true, adminPubkeyHex: ADMIN });
+    const result = await driveToRegisterSuccess(h, promise, {});
+    expect(result).toMatchObject({ error: "directory_missing_channel_support" });
+    expect(calls.reg, "a channel the directory did not record must not be persisted as registered").toHaveLength(0);
+    expect(mgr.getRegistrationState(), "nor cached as registered in memory").toBeNull();
+    const logged = h.errors.find((e) => e.event === "registration.channel.echo_missing");
+    expect(logged, "the operator must see why the registration failed").toBeDefined();
+    expect(logged!.ctx["k_local_pubkey"]).toBe(stubKeyProviderPubkeyHex);
+    expect(typeof logged!.ctx["correlationId"]).toBe("string");
+  });
+
+  it("an already_registered reply WITHOUT the echo also fails a channel registration", async () => {
+    // The other way a registration "succeeds": no ceremony, the directory hands back an existing
+    // profile. Persisting channel = true over a profile the directory holds as a plain agent is the
+    // same silent downgrade reached by a different frame.
+    const { persistence, calls } = makeRecordingPersistence(GROUP);
+    const h = makeCapturingCtx(persistence);
+    const mgr = new RegistrationManager(h.ctx);
+    const promise = mgr.register("", "token", { channel: true, adminPubkeyHex: ADMIN });
+    await vi.waitFor(() => expect(h.getPendingDkg()).not.toBeNull());
+    h.deliverDkg({
+      type: "register_error", reason: "already_registered",
+      agent_id: "agent-old", primary_pubkey: GROUP, ml_dsa_pubkey: "dd".repeat(32),
+    });
+    expect(await promise).toMatchObject({ error: "directory_missing_channel_support" });
     expect(calls.reg).toHaveLength(0);
   });
 });

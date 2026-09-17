@@ -73,6 +73,11 @@ const CREATE_AGENTS_SQL = `
     -- (k_local_pubkey, reg_primary_pubkey). Minted once at the tail of registration — the only
     -- moment both keys are on this machine together — and never re-derived by a second DKG.
     reg_key_binding        TEXT,
+    -- M16: 1 when this identity is a broadcast channel (publish-only, never converses), with the
+    -- hex pubkey of the agent that administers it. Written once, from the directory's echo at
+    -- registration; nothing updates either column afterwards.
+    channel                INTEGER NOT NULL DEFAULT 0,
+    admin_pubkey           TEXT NOT NULL DEFAULT '',
     -- agent↔user link captured at registration.
     link_agent_id          TEXT,
     link_pre_auth_token    TEXT,
@@ -177,6 +182,13 @@ export function ensureIdentitySchema(db: DaemonDatabase): void {
       // assignment over — and the remedy for that is the same re-registration that fills this in.
       db.exec("ALTER TABLE agents ADD COLUMN reg_key_binding TEXT");
     }
+    if (!cols.some((c) => c.name === "channel")) {
+      // M16: every existing row is an ordinary agent — channels did not exist before this column.
+      db.exec("ALTER TABLE agents ADD COLUMN channel INTEGER NOT NULL DEFAULT 0");
+    }
+    if (!cols.some((c) => c.name === "admin_pubkey")) {
+      db.exec("ALTER TABLE agents ADD COLUMN admin_pubkey TEXT NOT NULL DEFAULT ''");
+    }
   }
   db.exec(CREATE_ACTIVE_NAME_INDEX_SQL);
   // M10-D18: DROP the M8 `trust_signals` scaffold. It held canonical-JSON records keyed by a RAW hash;
@@ -203,6 +215,10 @@ export interface AgentRow {
   kLocalSeed: Uint8Array;
   kLocalPubkey: string;
   state: string;
+  /** M16: true when this identity is a broadcast channel. */
+  channel: boolean;
+  /** M16: hex pubkey of the administering agent; "" when `channel` is false. */
+  adminPubkey: string;
 }
 
 export class DbIdentityStore {
@@ -303,16 +319,32 @@ export class DbIdentityStore {
   listAgents(): AgentRow[] {
     const rows = this.#db
       .prepare(
-        "SELECT agent_id, agent_name, k_local_seed, k_local_pubkey, state FROM agents WHERE state != 'retired' ORDER BY agent_name ASC",
+        "SELECT agent_id, agent_name, k_local_seed, k_local_pubkey, state, channel, admin_pubkey FROM agents WHERE state != 'retired' ORDER BY agent_name ASC",
       )
-      .all() as Array<{ agent_id: string; agent_name: string; k_local_seed: unknown; k_local_pubkey: string; state: string }>;
+      .all() as Array<{
+        agent_id: string; agent_name: string; k_local_seed: unknown; k_local_pubkey: string; state: string;
+        channel: number | bigint; admin_pubkey: string;
+      }>;
     return rows.map((r) => ({
       agentId: r.agent_id,
       agentName: r.agent_name,
       kLocalSeed: toBytes(r.k_local_seed),
       kLocalPubkey: r.k_local_pubkey,
       state: r.state,
+      channel: Number(r.channel) === 1,
+      adminPubkey: r.admin_pubkey,
     }));
+  }
+
+  /**
+   * M16: is the ACTIVE agent with this name a broadcast channel? False for an unknown agent: an
+   * unknown agent is not a channel, and it is refused by the gates that require an agent at all.
+   */
+  isChannelAgent(agentName: string): boolean {
+    const row = this.#db
+      .prepare("SELECT channel FROM agents WHERE agent_name = ? AND state != 'retired'")
+      .get(agentName) as { channel: number | bigint } | undefined;
+    return row !== undefined && Number(row.channel) === 1;
   }
 
   /**
@@ -402,10 +434,16 @@ export class DbRegistrationPersistence implements DaemonRegistrationPersistence 
     mlDsaPubkey: string;
     registeredAt: number;
     keyBinding: string;
+    channel?: boolean;
+    adminPubkey?: string;
   }): Promise<void> {
+    const channel = opts.channel === true;
     this.#updateRow(
-      "reg_agent_id = ?, reg_primary_pubkey = ?, reg_ml_dsa_pubkey = ?, reg_registered_at = ?, reg_key_binding = ?, reg_status = 'active', state = 'registered'",
-      [opts.agentId, opts.primaryPubkey, opts.mlDsaPubkey, opts.registeredAt, opts.keyBinding],
+      "reg_agent_id = ?, reg_primary_pubkey = ?, reg_ml_dsa_pubkey = ?, reg_registered_at = ?, reg_key_binding = ?, channel = ?, admin_pubkey = ?, reg_status = 'active', state = 'registered'",
+      [
+        opts.agentId, opts.primaryPubkey, opts.mlDsaPubkey, opts.registeredAt, opts.keyBinding,
+        channel ? 1 : 0, channel ? (opts.adminPubkey ?? "") : "",
+      ],
     );
     this.#logger.info("registration.state.persisted", {
       agentId: opts.agentId,
@@ -484,6 +522,8 @@ export class DbRegistrationPersistence implements DaemonRegistrationPersistence 
       // callers the four characters "null" as if they were a signature, which is why this is a
       // typeof check and not the String() every field above uses.
       keyBinding: typeof r["reg_key_binding"] === "string" ? r["reg_key_binding"] : null,
+      channel: Number(r["channel"]) === 1,
+      adminPubkey: typeof r["admin_pubkey"] === "string" ? r["admin_pubkey"] : "",
     };
   }
 

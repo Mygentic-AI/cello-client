@@ -12,6 +12,7 @@
  * otherwise unchanged.
  */
 
+import { randomUUID } from "node:crypto";
 import { encodeCbor } from "@cello-protocol/protocol-types";
 import { mlDsaKeygen, mlDsaKeygenWithBytes, FileMlDsaKeyProvider, buildKeyBindingTbs } from "@cello-protocol/crypto";
 import type { IThresholdSigner, MlDsaKeyProvider } from "@cello-protocol/crypto";
@@ -75,6 +76,15 @@ export interface RegistrationContext {
   setPendingRegisterResolve(resolve: ((frame: Record<string, unknown>) => void) | null): void;
 }
 
+/** M16: registering a broadcast channel. Both facts are fixed at registration and never change. */
+export interface ChannelRegistrationOpts {
+  channel: true;
+  /** 64 lowercase hex chars: the pubkey of the agent that administers the channel. */
+  adminPubkeyHex: string;
+}
+
+const ADMIN_PUBKEY_HEX_RE = /^[0-9a-f]{64}$/;
+
 export class RegistrationManager {
   readonly #ctx: RegistrationContext;
 
@@ -134,6 +144,7 @@ export class RegistrationManager {
     mlDsaPubkeyHex: string,
     mlDsaSecretKeyBlob: Uint8Array | null,
     keyBinding: string,
+    channelOpts: ChannelRegistrationOpts | undefined,
   ): Array<() => Promise<void>> {
     const persistence = this.#ctx.persistence!;
     const ops: Array<() => Promise<void>> = [];
@@ -146,8 +157,43 @@ export class RegistrationManager {
       mlDsaPubkey: state.ml_dsa_pubkey,
       registeredAt: state.registered_at,
       keyBinding,
+      // Only ever reached after #channelEchoed passed, so a persisted channel is one the directory
+      // recorded as a channel.
+      ...(channelOpts ? { channel: true, adminPubkey: channelOpts.adminPubkeyHex } : {}),
     }));
     return ops;
+  }
+
+  /**
+   * M16: a CHANNEL registration only counts when the directory says it stored a channel.
+   *
+   * ⚠️ NO SILENT DOWNGRADE. A directory that does not know the `channel` field ignores it and
+   * registers an ordinary agent. Accepting that answer would leave an identity this daemon treats as
+   * a channel and every directory treats as an agent that may converse, which nobody would notice.
+   * So a missing echo FAILS the registration: nothing persisted, nothing cached, one error event.
+   * This applies to every frame that ends a registration, including an `already_registered`
+   * answer, which hands back an existing profile without running a ceremony.
+   *
+   * Returns null when the registration may proceed, or the error to return verbatim.
+   */
+  #channelEchoed(
+    channelOpts: ChannelRegistrationOpts | undefined,
+    frame: Record<string, unknown>,
+    correlationId: string,
+    kLocalPubkeyHex: string,
+  ): { error: string; detail: string } | null {
+    if (!channelOpts || frame["channel"] === true) return null;
+    this.#ctx.logger.error("registration.channel.echo_missing", {
+      correlationId,
+      k_local_pubkey: kLocalPubkeyHex,
+      frameType: frame["type"],
+      impact: "a channel registration was answered without channel: true, so the directory did not record this identity as a channel; the registration failed and nothing was persisted",
+    });
+    return {
+      error: "directory_missing_channel_support",
+      detail:
+        "The directory completed the registration without confirming it stored this identity as a channel, so it was not saved. The directory nodes need an update that supports channels. Nothing was registered locally; retry once they have it.",
+    };
   }
 
   /**
@@ -229,11 +275,16 @@ export class RegistrationManager {
    * Register this agent with the directory.
    * REG-001: ML-DSA keygen → signaling stream → register_request → DKG → register_success.
    */
-  async register(phoneStub: string = "", preAuthToken?: string): Promise<RegistrationState | { error: string; detail?: string }> {
+  async register(
+    phoneStub: string = "",
+    preAuthToken?: string,
+    channelOpts?: ChannelRegistrationOpts,
+  ): Promise<RegistrationState | { error: string; detail?: string }> {
     // Step 1: already registered
     if (this.#registrationState) {
       return { error: "already_registered" };
     }
+    const correlationId = randomUUID();
 
     // Step 2: generate or load ML-DSA-44 keypair
     let mlDsaProvider: MlDsaKeyProvider;
@@ -263,6 +314,23 @@ export class RegistrationManager {
     }
     const kLocalPubkeyHex = this.#ctx.getMyPubkeyHex()!;
 
+    // Step 4a (M16): a channel names its administrator, and cannot administer itself. Refused
+    // before anything reaches the directory.
+    if (channelOpts) {
+      if (!ADMIN_PUBKEY_HEX_RE.test(channelOpts.adminPubkeyHex)) {
+        return {
+          error: "invalid_channel_registration",
+          detail: "adminPubkeyHex must be exactly 64 lowercase hex characters (a 32-byte public key).",
+        };
+      }
+      if (channelOpts.adminPubkeyHex === kLocalPubkeyHex.toLowerCase()) {
+        return {
+          error: "invalid_channel_registration",
+          detail: "A channel cannot administer itself: adminPubkeyHex must be a different agent's public key.",
+        };
+      }
+    }
+
     // Step 5: send register_request (SignalingManager CBOR/lp-encodes the frame)
     // M8B quorum: include the nodeIds we can reach right now (our resolved roster) so the directory can
     // pick the DKG quorum Q = these ∩ its manifest, |Q| ≥ T=majority(N). getConsortiumEndpoints() is
@@ -275,6 +343,9 @@ export class RegistrationManager {
       k_local_pubkey: kLocalPubkeyHex,
       ml_dsa_pubkey: mlDsaPubkeyHex,
       ...(reachableNodeIds ? { reachable_node_ids: reachableNodeIds } : {}),
+      // M16: present only for a channel. An ordinary registration carries neither key — absent
+      // means not a channel, and there is no `channel: false` on the wire.
+      ...(channelOpts ? { channel: true, admin_pubkey: channelOpts.adminPubkeyHex } : {}),
     });
     if (!regSent.ok) {
       return { error: regSent.reason ?? "directory_unreachable" };
@@ -310,6 +381,8 @@ export class RegistrationManager {
           registered_at: Date.now(),
           status: "active",
         };
+        const echo = this.#channelEchoed(channelOpts, dkgReadyFrame, correlationId, kLocalPubkeyHex);
+        if (echo) return echo;
         // SI-003: persist BEFORE caching the in-memory registered state, so a persist failure does
         // not leave a phantom "registered" manager (which would short-circuit a retry). Registration
         // state is persisted whenever persistence is present — NOT gated on the ml-dsa blob (so an
@@ -319,7 +392,7 @@ export class RegistrationManager {
           // reply — checked against this machine's own share before K_local signs over it (F4).
           const minted = await this.#mintCorroboratedKeyBinding(kLocalPubkeyHex, state.primary_pubkey);
           if (!minted.ok) return { error: minted.error, detail: minted.detail };
-          const ok = await this.#persistAll(this.#identityPersistOps(state, mlDsaPubkeyHex, mlDsaSecretKeyBlob, minted.keyBinding));
+          const ok = await this.#persistAll(this.#identityPersistOps(state, mlDsaPubkeyHex, mlDsaSecretKeyBlob, minted.keyBinding, channelOpts));
           if (!ok) return { error: "identity_persist_failed" };
         }
         this.#registrationState = state;
@@ -531,6 +604,8 @@ export class RegistrationManager {
           registered_at: Date.now(),
           status: "active",
         };
+        const echo = this.#channelEchoed(channelOpts, responseWithTimeout, correlationId, kLocalPubkeyHex);
+        if (echo) return echo;
         // SI-003: persist before caching the registered state (see the dkg_ready branch).
         if (this.#ctx.persistence) {
           // 038-KEYBIND: the DKG ran, but the directory already held a profile and answered with
@@ -539,7 +614,7 @@ export class RegistrationManager {
           // more authoritative value.
           const minted = await this.#mintCorroboratedKeyBinding(kLocalPubkeyHex, state.primary_pubkey);
           if (!minted.ok) return { error: minted.error, detail: minted.detail };
-          const ok = await this.#persistAll(this.#identityPersistOps(state, mlDsaPubkeyHex, mlDsaSecretKeyBlob, minted.keyBinding));
+          const ok = await this.#persistAll(this.#identityPersistOps(state, mlDsaPubkeyHex, mlDsaSecretKeyBlob, minted.keyBinding, channelOpts));
           if (!ok) return { error: "identity_persist_failed" };
         }
         this.#registrationState = state;
@@ -548,6 +623,11 @@ export class RegistrationManager {
       }
       return { error: reason };
     }
+
+    // Step 6a (M16): the echo check. A channel the directory did not store as a channel is a failed
+    // registration, not an ordinary agent.
+    const echo = this.#channelEchoed(channelOpts, responseWithTimeout, correlationId, kLocalPubkeyHex);
+    if (echo) return echo;
 
     // Step 7: build RegistrationState and cache
     const agentId = responseWithTimeout["agent_id"] as string;
@@ -595,7 +675,7 @@ export class RegistrationManager {
     // state only after they commit — a register-success guarantees a durable identity row.
     if (this.#ctx.persistence) {
       const ok = await this.#persistAll(this.#identityPersistOps(
-        state, mlDsaPubkeyHex, mlDsaSecretKeyBlob, keyBinding,
+        state, mlDsaPubkeyHex, mlDsaSecretKeyBlob, keyBinding, channelOpts,
       ));
       if (!ok) return { error: "identity_persist_failed" };
     }

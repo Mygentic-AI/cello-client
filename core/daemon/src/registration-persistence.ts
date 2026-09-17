@@ -40,6 +40,13 @@ export interface RegistrationStateRecord {
    * re-upload does not have to re-derive it from a value a directory supplied.
    */
   keyBinding: string | null;
+  /**
+   * M16: true when this identity is a broadcast channel. Recorded at registration from what the
+   * directory ECHOED, never changed. False for an ordinary agent and for a record written without it.
+   */
+  channel: boolean;
+  /** M16: hex pubkey of the agent that administers this channel; "" when `channel` is false. */
+  adminPubkey: string;
 }
 
 export interface MlDsaKeypairRecord {
@@ -92,6 +99,9 @@ export interface DaemonRegistrationPersistence {
      * material that is only ever together on this machine.
      */
     keyBinding: string;
+    /** M16: set only for a channel the directory echoed as one. Absent means an ordinary agent. */
+    channel?: boolean;
+    adminPubkey?: string;
   }): Promise<void>;
   persistFrostKeyShare(opts: {
     epochId: string;
@@ -178,6 +188,8 @@ export class FileRegistrationPersistence implements DaemonRegistrationPersistenc
     mlDsaPubkey: string;
     registeredAt: number;
     keyBinding: string;
+    channel?: boolean;
+    adminPubkey?: string;
   }): Promise<void> {
     await this.#writeJsonAtomic(FILE_REGISTRATION_STATE, {
       agentId: opts.agentId,
@@ -187,6 +199,8 @@ export class FileRegistrationPersistence implements DaemonRegistrationPersistenc
       // 038-KEYBIND: a public signature, not a secret — but it lives with the rest of the
       // registration record because it is meaningless apart from the two keys it names.
       keyBinding: opts.keyBinding,
+      channel: opts.channel === true,
+      adminPubkey: opts.channel === true ? (opts.adminPubkey ?? "") : "",
       status: "active",
     });
     this.#logger.info("registration.state.persisted", {
@@ -259,6 +273,8 @@ export class FileRegistrationPersistence implements DaemonRegistrationPersistenc
       // NOT `reqStr`: a file written before 038-KEYBIND has no such field, and that is a value to
       // report (null), not a corrupt-file throw that would make the agent unloadable.
       keyBinding: typeof obj["keyBinding"] === "string" ? obj["keyBinding"] : null,
+      channel: obj["channel"] === true,
+      adminPubkey: obj["channel"] === true && typeof obj["adminPubkey"] === "string" ? obj["adminPubkey"] : "",
     };
   }
 
