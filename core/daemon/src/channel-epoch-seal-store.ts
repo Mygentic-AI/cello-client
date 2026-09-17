@@ -15,7 +15,7 @@
  */
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
-import { encodeChannelEpochSeal, type ChannelEpochSeal } from "@cello-protocol/protocol-types";
+import { decodeChannelEpochSeal, encodeChannelEpochSeal, type ChannelEpochSeal } from "@cello-protocol/protocol-types";
 import { extractErrorMessage } from "./error-message.js";
 
 export const CHANNEL_EPOCH_SEALS_CREATE_SQL = `
@@ -30,9 +30,11 @@ export const CHANNEL_EPOCH_SEALS_CREATE_SQL = `
   );
 `;
 
+export type ChannelEpochSealStoreErrorCode = "seal_position_taken" | "seal_not_found" | "seal_already_notarized" | "seal_mismatch";
+
 export class ChannelEpochSealStoreError extends Error {
-  readonly code: "seal_position_taken" | "seal_not_found";
-  constructor(code: "seal_position_taken" | "seal_not_found", message: string) {
+  readonly code: ChannelEpochSealStoreErrorCode;
+  constructor(code: ChannelEpochSealStoreErrorCode, message: string) {
     super(`${code}: ${message}`);
     this.name = "ChannelEpochSealStoreError";
     this.code = code;
@@ -100,13 +102,35 @@ export class ChannelEpochSealStore {
     return row ? toStored(row) : null;
   }
 
-  /** The ONLY update this table permits: the notarized version of the same seal (order 009). */
+  /**
+   * The ONLY update this table permits: the notarized version of the same seal (order 009), once.
+   * Everything but the notarization slot must re-encode byte-identically to the stored seal, or a
+   * wiring slip could overwrite the publisher's commitment with another seal and still read notarized.
+   */
   markNotarized(channelPubkeyHex: string, epochIndex: number, notarizedSealCbor: Uint8Array): void {
+    const stored = this.get(channelPubkeyHex, epochIndex);
+    if (!stored) {
+      throw new ChannelEpochSealStoreError("seal_not_found", `no seal recorded for epoch ${epochIndex} of this channel`);
+    }
+    if (stored.notarized) {
+      throw new ChannelEpochSealStoreError("seal_already_notarized", `epoch ${epochIndex} of this channel is already notarized`);
+    }
+    const incoming = decodeChannelEpochSeal(notarizedSealCbor);
+    if (!incoming.ok) {
+      throw new ChannelEpochSealStoreError("seal_mismatch", `the notarized seal does not decode: ${incoming.reason}`);
+    }
+    if (incoming.seal.notarization === null) {
+      throw new ChannelEpochSealStoreError("seal_mismatch", "the notarized seal's notarization slot is empty");
+    }
+    const withoutSlot = encodeChannelEpochSeal({ ...incoming.seal, notarization: null });
+    if (!Buffer.from(withoutSlot).equals(Buffer.from(stored.seal_cbor))) {
+      throw new ChannelEpochSealStoreError("seal_mismatch", "the notarized seal differs from the recorded seal outside the notarization slot");
+    }
     const info = this.#db
-      .prepare(`UPDATE channel_epoch_seals SET seal_cbor = ?, notarized = 1 WHERE channel_pubkey = ? AND epoch_index = ?`)
+      .prepare(`UPDATE channel_epoch_seals SET seal_cbor = ?, notarized = 1 WHERE channel_pubkey = ? AND epoch_index = ? AND notarized = 0`)
       .run(Buffer.from(notarizedSealCbor), channelPubkeyHex, epochIndex);
     if (Number(info.changes) === 0) {
-      throw new ChannelEpochSealStoreError("seal_not_found", `no seal recorded for epoch ${epochIndex} of this channel`);
+      throw new ChannelEpochSealStoreError("seal_already_notarized", `epoch ${epochIndex} of this channel was notarized concurrently`);
     }
   }
 

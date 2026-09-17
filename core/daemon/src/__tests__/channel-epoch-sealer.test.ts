@@ -15,6 +15,7 @@ import type { InMemoryKeyProvider } from "@cello-protocol/crypto";
 import {
   checkEpochChainLink,
   decodeChannelEpochSeal,
+  encodeChannelEpochSeal,
   signBroadcastArtifact,
   verifyChannelEpochSealSignature,
   type ChannelEpochSeal,
@@ -202,14 +203,29 @@ describe("M16 008-EPOCH: ChannelEpochSealer", () => {
     await publish(1);
     const r = await sealer().sealNow(hex, "c9");
     if (!r.sealed) throw new Error("expected a seal");
-    const notarizedCbor = new Uint8Array([9, 9, 9]);
+    const codeOf = (fn: () => unknown): string | undefined => {
+      try { fn(); } catch (err) { return (err as { code?: string }).code; }
+      return undefined;
+    };
+    const original = decoded(r);
+    const notarizedCbor = encodeChannelEpochSeal({ ...original, notarization: new Uint8Array(64).fill(7) });
+
+    // Review F4: only the SAME seal with its notarization slot filled may replace the row.
+    expect(codeOf(() => sealStore.markNotarized(hex, 0, new Uint8Array([9, 9, 9]))), "garbage").toBe("seal_mismatch");
+    expect(codeOf(() => sealStore.markNotarized(hex, 0, r.seal_cbor)), "slot still empty").toBe("seal_mismatch");
+    const otherRoot = encodeChannelEpochSeal({ ...original, epoch_root: new Uint8Array(32).fill(1), notarization: new Uint8Array(64) });
+    expect(codeOf(() => sealStore.markNotarized(hex, 0, otherRoot)), "a different seal").toBe("seal_mismatch");
+    expect(sealStore.get(hex, 0)!.notarized, "refusals wrote nothing").toBe(false);
+
     sealStore.markNotarized(hex, 0, notarizedCbor);
     const got = sealStore.get(hex, 0)!;
     expect(hx(got.seal_cbor)).toBe(hx(notarizedCbor));
     expect(got.notarized).toBe(true);
-    let code: string | undefined;
-    try { sealStore.record(hex, decoded(r)); } catch (err) { code = (err as { code?: string }).code; }
-    expect(code).toBe("seal_position_taken");
+    const again = encodeChannelEpochSeal({ ...original, notarization: new Uint8Array(64).fill(8) });
+    expect(codeOf(() => sealStore.markNotarized(hex, 0, again)), "a second notarization").toBe("seal_already_notarized");
+    expect(hx(sealStore.get(hex, 0)!.seal_cbor)).toBe(hx(notarizedCbor));
+    expect(codeOf(() => sealStore.markNotarized(hex, 5, notarizedCbor))).toBe("seal_not_found");
+    expect(codeOf(() => sealStore.record(hex, original))).toBe("seal_position_taken");
   });
 
   it("a channel with no key is refused with key_unavailable", async () => {
