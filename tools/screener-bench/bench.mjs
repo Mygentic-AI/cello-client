@@ -13,6 +13,12 @@
  *
  * Run:  node tools/screener-bench/bench.mjs            (after `pnpm --filter @cello-protocol/gateway build`)
  *       node tools/screener-bench/bench.mjs --misses   also prints the layer1 misses, which is the work list
+ *       node tools/screener-bench/bench.mjs --layer2   loads the REAL classifier and scores both layers
+ *
+ * `--layer2` needs an installed model (`cello screener install`) and the runtime resolvable from
+ * CELLO's own directory. It is slow — a model load plus ~40 ms a message — and it never runs in the
+ * normal gate: a check that needs 131 MB of weights on a clean checkout is a check someone disables,
+ * and a disabled check reads green.
  *
  * Two bordair numbers are reported, and the second is the one to trust. Categories are generated
  * from a handful of templates — 150 autodan rows come from about 12 — so a per-row score counts the
@@ -30,17 +36,52 @@ const GATEWAY = join(HERE, "..", "..", "core", "gateway", "dist");
 const labels = JSON.parse(readFileSync(join(HERE, "labels.json"), "utf8"));
 const showMisses = process.argv.includes("--misses");
 
+const withLayer2 = process.argv.includes("--layer2");
+
 const { initLinearRegex } = await import(join(GATEWAY, "detect/linear-regex.js"));
 const { compileInjectionPatterns } = await import(join(GATEWAY, "detect/injection-patterns.js"));
 const { InboundScreener } = await import(join(GATEWAY, "screen/inbound.js"));
 await initLinearRegex();
 compileInjectionPatterns();
-const screener = new InboundScreener();
+
+// The REAL classifier, never a stub: a mocked model measures our branching, which is the hollow
+// test this milestone was warned to expect right here.
+let layer2Note = "Layer 2 OFF (rules only)";
+let screener = new InboundScreener();
+if (withLayer2) {
+  const { loadInjectionClassifier } = await import(join(GATEWAY, "detect/injection-classifier-onnx.js"));
+  const { InjectionScanner } = await import(join(GATEWAY, "detect/injection-scanner.js"));
+  const { screenerModelDir, screenerState, runtimeAvailable, classifierLoadable } = await import(join(GATEWAY, "detect/screener-state.js"));
+  const state = await screenerState({ dir: screenerModelDir(), runtimePresent: await runtimeAvailable() });
+  const decision = classifierLoadable(state);
+  if (!decision.load) {
+    console.error(`--layer2 asked for, but the classifier cannot load: ${decision.reason}`);
+    process.exit(1);
+  }
+  const t0 = Date.now();
+  const load = await loadInjectionClassifier(screenerModelDir());
+  if (!load.classifier) {
+    console.error(`--layer2 asked for, but the model did not load: ${load.reason}`);
+    process.exit(1);
+  }
+  screener = new InboundScreener({ injectionScanner: new InjectionScanner(load.classifier) });
+  layer2Note = `Layer 2 ON (${state.revision.slice(0, 8)}, loaded in ${((Date.now() - t0) / 1000).toFixed(1)}s)`;
+}
+console.log(layer2Note);
 const enc = new TextEncoder();
+
+let totalMs = 0;
+let totalScreened = 0;
+let slowest = { ms: 0, bytes: 0 };
 
 /** BLOCKED / FLAGGED / PASSES — "caught" is either of the first two. */
 async function verdict(text) {
+  const started = Date.now();
   const v = await screener.screen(enc.encode(text));
+  const took = Date.now() - started;
+  totalMs += took;
+  totalScreened++;
+  if (took > slowest.ms) slowest = { ms: took, bytes: text.length };
   if (v.disposition === "block") return `BLOCKED:${v.reason}`;
   return v.events.some((e) => String(e.category).startsWith("injection:")) ? "FLAGGED" : "PASSES";
 }
@@ -142,3 +183,9 @@ async function p4rs() {
 await bordair();
 await mindgard();
 await p4rs();
+
+// Latency sits in the path of every inbound message, so it is a headline number, not a footnote.
+console.log(
+  `latency: ${(totalMs / Math.max(totalScreened, 1)).toFixed(1)} ms/message over ${totalScreened} messages; ` +
+    `slowest ${slowest.ms} ms at ${slowest.bytes} chars (${layer2Note})`,
+);
