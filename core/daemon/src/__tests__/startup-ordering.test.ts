@@ -231,7 +231,10 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // channel epoch is ever force-sealed, so the window in which a
     // channel can show two subscribers two different histories stays open forever. That is the
     // one property the cap exists to bound.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(104);
+    //
+    // 104 → 105 for M16 011-SEALREQ's `registerChannelSealHandler` (channel-seal-request.ts), wired
+    // in daemon.ts beside the tick; unwired, a publisher has no way to seal its channel early.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(105);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",

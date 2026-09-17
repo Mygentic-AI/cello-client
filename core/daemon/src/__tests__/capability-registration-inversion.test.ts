@@ -67,6 +67,7 @@ const EXEMPT = new Map<string, string>([
    * working, one release later than it should have.
    */
   ["cello_get_inclusion_proof", "MCP-only, as it was before it was implemented — the caller is an agent holding a session it is already acting in, and the proof is an object to hand on rather than a line to read in a terminal"],
+  ["cello_channel_seal", "M16 011-SEALREQ: IPC-only by the order — the MCP tool is a later tier, and the relay-borne subscriber request calls the same gate, not this verb"],
   ["cello_verify_inclusion_proof", "MCP-only for now, matching the tool it checks. ⚠️ THE WEAKER HALF OF THE PAIR, and stated plainly: the verifier reads no session and no database precisely so a SCEPTIC can run it, and a sceptic is likelier to have a terminal than an MCP client. A CLI twin is recorded under 'Newly discovered' on the 009-PROOF work order rather than built here"],
 ]);
 

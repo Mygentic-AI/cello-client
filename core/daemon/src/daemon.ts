@@ -63,7 +63,7 @@ import { startBootCore } from "./boot-core.js";
 import { startBootAgents } from "./boot-agents.js";
 import { startBootConnectionState } from "./boot-connection-state.js";
 import { startBootParkedContent } from "./boot-parked-content.js";
-import { startBootSweeps } from "./boot-sweeps.js"; import { startChannelEpochTick } from "./channel-epoch-tick.js";
+import { startBootSweeps } from "./boot-sweeps.js"; import { startChannelEpochTick } from "./channel-epoch-tick.js"; import { registerChannelSealHandler } from "./channel-seal-request.js";
 import { createSessionViews } from "./session-views.js";
 import { createAgentSelection } from "./agent-selection-root.js";
 import { createStartAgent } from "./start-agent.js";
@@ -1326,7 +1326,7 @@ async function startDaemonHoldingLock(
   restartSealResolver.start();
 
   // 040-DAEMONROOT unit 9: the revival-bound sweep and its re-arming timer → boot-sweeps.ts.
-  const { revivalBoundSweepTimer } = startBootSweeps({ logger, sessionNodeManager }); const channelEpochTick = startChannelEpochTick({ logger, sessionNodeManager, agents, getKeyProvider: (n) => keyProviders.get(n) }); // M16 008: the epoch cap
+  const { revivalBoundSweepTimer } = startBootSweeps({ logger, sessionNodeManager }); const channelEpochTick = startChannelEpochTick({ logger, sessionNodeManager, agents, getKeyProvider: (n) => keyProviders.get(n) }); registerChannelSealHandler({ handlers, logger, sessionNodeManager, getKeyProvider: (n) => keyProviders.get(n) }); // M16 008: the epoch cap; 011: the requested seal
 
   /**
    * The live handler map.
