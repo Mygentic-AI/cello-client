@@ -128,7 +128,13 @@ export function registerChannelSealHandler(deps: ChannelSealHandlerDeps): void {
     }
     const store = identities();
     const agent = store.listAgents().find((a) => a.agentName === name && a.state !== "retired");
-    if (!agent || !store.isChannelAgent(name)) {
+    if (!agent) {
+      return {
+        ok: false, reason: "agent_not_found",
+        guidance: `No agent named '${name}' exists on this daemon. Check the name with cello_agents, then retry with the channel agent's exact name.`,
+      };
+    }
+    if (!store.isChannelAgent(name)) {
       return {
         ok: false, reason: "not_a_channel",
         guidance: `'${name}' is not a broadcast channel on this daemon, so it has no epoch to seal. Pass the name of a channel agent (one registered with channel: true).`,

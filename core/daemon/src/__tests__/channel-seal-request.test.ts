@@ -216,6 +216,8 @@ describe("M16 011-SEALREQ: the cello_channel_seal IPC verb", () => {
     expect(r.reason).toBe("not_a_channel");
     expect(typeof r.guidance).toBe("string");
     expect(sealStore.latest(hex), "a non-channel must not be sealed").toBeNull();
+    const unknown = (await handler()({ agent: "plian" }, "conn-1")) as { ok?: boolean; reason?: string };
+    expect(unknown).toMatchObject({ ok: false, reason: "agent_not_found" });
   });
 
   it("IPC cello_channel_seal on a channel returns the honored outcome", async () => {
