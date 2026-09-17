@@ -18,13 +18,13 @@
  */
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { encodeChannelEpochSeal, signChannelEpochSeal } from "@cello-protocol/protocol-types";
-import { ChannelLogError, type ChannelLogStore } from "./channel-log-store.js";
+import { ChannelLogError, EPOCH_MAX_LEAVES, type ChannelLogStore } from "./channel-log-store.js";
 import type { ChannelEpochSealStore } from "./channel-epoch-seal-store.js";
 import type { Logger } from "./types.js";
 import { extractErrorMessage } from "./error-message.js";
 
 export const EPOCH_MAX_AGE_MS = 24 * 60 * 60 * 1000; // protocol maximum
-export const EPOCH_MAX_LEAVES = 1000; // protocol maximum
+export { EPOCH_MAX_LEAVES }; // protocol maximum; defined beside the append that enforces it
 
 export interface ChannelEpochPolicy { maxAgeMs: number; maxLeaves: number }
 

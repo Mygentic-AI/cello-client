@@ -22,6 +22,9 @@ import { buildMerkleTree, merkleRoot } from "@cello-protocol/crypto";
 import { encodeBroadcastArtifact, decodeBroadcastArtifact, broadcastArtifactLeafHash } from "@cello-protocol/protocol-types";
 import type { BroadcastArtifact } from "@cello-protocol/protocol-types";
 
+/** Protocol maximum leaves per epoch (008-EPOCH). Lives here because `append` enforces it. */
+export const EPOCH_MAX_LEAVES = 1000;
+
 export const CHANNEL_LOG_CREATE_SQL = `
   CREATE TABLE IF NOT EXISTS channel_log (
     channel_pubkey   TEXT    NOT NULL,
@@ -58,6 +61,8 @@ export interface AppendResult {
 export type ChannelLogErrorCode =
   | "channel_unknown" | "seq_not_next" | "epoch_mismatch" | "prev_root_mismatch"
   | "position_taken" | "artifact_invalid"
+  // append: the open epoch already holds its leaf cap; it must be sealed before the next publish.
+  | "epoch_full"
   // closeEpoch: the root being sealed is not the open epoch's current root (a publish landed while
   // the seal was being signed, the epoch was already closed, or it is empty).
   | "epoch_changed"
@@ -81,6 +86,7 @@ interface StateRow {
   open_epoch_opened_at: number | bigint;
   prev_epoch_root: Uint8Array | null;
   next_seq: number | bigint;
+  max_leaves: number | bigint;
 }
 
 const toBytes = (v: unknown): Uint8Array | null =>
@@ -153,6 +159,14 @@ export class ChannelLogStore {
       }
       if (artifact.epoch_index !== openEpoch) {
         throw new ChannelLogError("epoch_mismatch", `artifact epoch ${artifact.epoch_index}, open epoch is ${openEpoch}`);
+      }
+      // The leaf cap holds HERE, not only at the once-a-minute tick, or a burst inside one minute
+      // seals as one oversized epoch. A stored cap never lifts the protocol maximum.
+      const storedCap = Number(s.max_leaves);
+      const leafCap = Number.isSafeInteger(storedCap) && storedCap >= 1 && storedCap <= EPOCH_MAX_LEAVES ? storedCap : EPOCH_MAX_LEAVES;
+      const openLeaves = firstInEpoch ? 0 : nextSeq - Number(s.open_epoch_first_seq);
+      if (openLeaves >= leafCap) {
+        throw new ChannelLogError("epoch_full", `the open epoch holds ${openLeaves} leaves (cap ${leafCap}); seal it before publishing again`);
       }
       if (firstInEpoch) {
         if (!bytesEqual(artifact.prev_epoch_root, toBytes(s.prev_epoch_root))) {
@@ -292,7 +306,7 @@ export class ChannelLogStore {
 
   #state(channelPubkeyHex: string): StateRow {
     const row = this.#db
-      .prepare(`SELECT open_epoch_index, open_epoch_first_seq, open_epoch_opened_at, prev_epoch_root, next_seq FROM channel_epoch_state WHERE channel_pubkey = ?`)
+      .prepare(`SELECT open_epoch_index, open_epoch_first_seq, open_epoch_opened_at, prev_epoch_root, next_seq, max_leaves FROM channel_epoch_state WHERE channel_pubkey = ?`)
       .get(channelPubkeyHex) as StateRow | undefined;
     if (!row) throw new ChannelLogError("channel_unknown", `no channel log for ${channelPubkeyHex.slice(0, 16)}; call ensureChannel first`);
     return row;

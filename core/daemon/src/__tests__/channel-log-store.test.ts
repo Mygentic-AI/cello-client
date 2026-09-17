@@ -276,6 +276,27 @@ describe("M16 007-PUBLOG: ChannelLogStore", () => {
     expect(store.nextPosition(hex).epoch_index, "a repeated close does not skip an epoch").toBe(1);
   });
 
+  it("a full open epoch refuses the next append until it is sealed (epoch_full)", async () => {
+    // 008 review: the leaf cap was only checked by the once-a-minute tick, so a burst of 5,000
+    // publishes inside one minute sealed as ONE epoch. The cap has to hold at the append.
+    const { kp, hex } = await channel();
+    db.prepare("UPDATE channel_epoch_state SET max_leaves = 2 WHERE channel_pubkey = ?").run(hex);
+    await publish(kp, hex);
+    await publish(kp, hex);
+    const third = await signAt(kp, hex);
+    expectCode(() => store.append(hex, third, 1), "epoch_full");
+    expect(store.openEpochRoot(hex).leaf_count, "nothing was filed").toBe(2);
+    store.closeEpoch(hex, store.openEpochRoot(hex).root);
+    await publish(kp, hex); // the next epoch accepts again
+
+    // A stored cap above the protocol maximum does not lift the maximum.
+    const other = await channel();
+    db.prepare("UPDATE channel_epoch_state SET max_leaves = 5000 WHERE channel_pubkey = ?").run(other.hex);
+    db.prepare("UPDATE channel_epoch_state SET next_seq = 1001, open_epoch_first_seq = 1 WHERE channel_pubkey = ?").run(other.hex);
+    const over = await signAt(other.kp, other.hex);
+    expectCode(() => store.append(other.hex, over, 1), "epoch_full");
+  });
+
   it("readRange refuses a stored row that no longer matches its leaf hash", async () => {
     const { kp, hex } = await channel();
     await publish(kp, hex);
