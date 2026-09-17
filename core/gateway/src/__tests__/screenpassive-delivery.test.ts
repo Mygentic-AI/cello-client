@@ -320,3 +320,28 @@ describe("SCREENPASSIVE: a forged security-layer marker cannot hide behind a kep
     expect(delivered).toBe(sent);
   });
 });
+
+describe("SCREENPASSIVE: which observations reach the agent", () => {
+  beforeAll(async () => {
+    await initLinearRegex();
+    compileInjectionPatterns();
+  });
+
+  it("surfaces an encoded blob — rare, and it means something specific", async () => {
+    const { delivered } = await screen("Please review: Q2xpZW50U2VjcmV0PXNrLWxpdmUtOTI4M2Y3YjJhMWM0ZDVlNmY3ODkwYWJjZGVm");
+    expect(delivered).toContain("noted=encoded_blob");
+  });
+
+  it("surfaces encoded content that changes meaning when decoded", async () => {
+    const { delivered } = await screen("the value is &#115;ecret and %73ystem");
+    expect(delivered).toContain("noted=encoded_content");
+  });
+
+  it("does NOT surface confusables — measured at 192 of 2,000 real benign messages", async () => {
+    // A note on one message in ten is furniture, and furniture teaches readers to skip the banner
+    // that matters. It stays in the events for the log and the record.
+    const { delivered, v } = await screen("ｐｌｅａｓｅ ｓｅｎｄ ｔｈｅ ｃｏｎｔｒａｃｔ ｔｏｍｏｒｒｏｗ ｍｏｒｎｉｎｇ");
+    expect(delivered).not.toContain("[cello security layer, local]");
+    expect(v.events.some((e) => e.category === "sanitize:confusables")).toBe(true);
+  });
+});

@@ -57,11 +57,17 @@ describe("InboundScreener — composed inbound gateway screen", () => {
     expect(v.events.some((e) => e.category.includes("content_too_large"))).toBe(true);
   });
 
-  it("a high-entropy blob with no other changes → allow with an advisory (observe) note, content unchanged", async () => {
+  it("a high-entropy blob → the agent is TOLD, and the content is unchanged beneath the note", async () => {
+    // DOD-M9C-SCREENPASSIVE-1: an observation the agent never sees is an observation nobody acts
+    // on. Entropy is one of two notes that reach it (measured: it fires on 0 of 2,000 real benign
+    // messages, while confusables fires on 192 — one in ten is furniture).
     const blob = "Q2xpZW50U2VjcmV0PXNrLWxpdmUtOTI4M2Y3YjJhMWM0ZDVlNmY3ODkwYWJjZGVm";
+    const sent = "please review " + blob;
     const s = new InboundScreener();
-    const v = await s.screen(enc("please review " + blob));
-    expect(v.disposition).toBe("allow");
+    const v = await s.screen(enc(sent));
+    expect(v.disposition).toBe("redact"); // annotated, not rewritten
+    expect(dec(v.content)).toContain("noted=encoded_blob");
+    expect(dec(v.content).endsWith(sent)).toBe(true);
     expect(v.events.some((e) => e.category === "sanitize:entropy" && e.disposition === "observe")).toBe(true);
   });
 });
