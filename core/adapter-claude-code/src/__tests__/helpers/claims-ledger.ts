@@ -1390,6 +1390,61 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
       "postures on both status surfaces, and a hardcoded fingerprint planted in status-handler.ts " +
       "was confirmed to redden the overridden case.",
   },
+  {
+    surface: "plugins/cello/skills/setup/SKILL.md",
+    claim: "Until the classifier is installed, incoming messages are screened by the rules alone, and CELLO says so",
+    excerpts: [
+      "**Until it is installed, incoming messages are screened by the rules alone**, and CELLO says so on",
+    ],
+    verdict: "true",
+    /**
+     * Two halves: the rules run without the classifier, and the operator is told. The telling is
+     * scoped by the code to an inbox that has something in it — see the evidence — which matches
+     * "on each new session" rather than overstating it as every read.
+     */
+    enforcedBy: "daemon-local",
+    evidence:
+      "`core/daemon/src/screening-status.ts` screeningSessionNoticeFrom() returns " +
+      "\"Screening: 1 of 2 layers active (classifier not installed)\" when the classifier is not " +
+      "ready, and `notification-handlers.ts` attaches it as `screening_notice` whenever a pending " +
+      "session request or unread message is present. The classifier is the only layer gated on " +
+      "`gateway/src/detect/screener-state.ts` reporting `ready`; the deterministic rules are not. " +
+      "Adjudicated 2026-09-17 while releasing DOD-M9C-SCREENINSTALL-1.",
+  },
+  {
+    surface: "core/cli/src/registry.ts (operator-facing strings)",
+    claim: "`cello screener status` reports whether the classifier is installed, verified and runnable",
+    excerpts: [
+      "Usage: cello screener status              — is the classifier installed, verified and runnable?\\n",
+    ],
+    verdict: "true",
+    enforcedBy: "daemon-local",
+    evidence:
+      "`gateway/src/detect/screener-state.ts` hashes every model file with sha256File() against the " +
+      "pinned manifest digest and sets `model.verified` only when every expected file is present and " +
+      "none mismatches; `cli/src/screener-commands.ts` status prints \"(all digests verified)\" only " +
+      "from that flag. `ready` additionally requires the runtime to resolve. Adjudicated 2026-09-17.",
+  },
+  {
+    surface: "core/cli/src/registry.ts (operator-facing strings)",
+    claim: "The classifier is asked for, never assumed: nothing is downloaded without consent",
+    excerpts: [
+      "  bundled: it is about 241 MB to download and about 618 MB on disk, so it is asked for, never\\n",
+    ],
+    verdict: "true",
+    /**
+     * Holds because there is exactly ONE caller of the download, and it sits behind the consent
+     * check. A second caller (the daemon fetching on boot, say) would make this false without
+     * touching this string — which is why the evidence names the caller count.
+     */
+    enforcedBy: "daemon-local",
+    evidence:
+      "`installModel` (gateway/src/detect/model-installer.ts) has one production caller, " +
+      "`screenerInstallCommand` in cli/src/screener-commands.ts, which proceeds only when " +
+      "`assumeYes` (--yes) is set or the operator answers yes at a terminal; with no terminal it " +
+      "prints the prompt and exits 1 having fetched nothing, and a declined answer returns " +
+      "\"Nothing was downloaded\". No daemon or gateway path calls it. Adjudicated 2026-09-17.",
+  },
 ];
 /**
  * DELIBERATELY NOT ADJUDICATED, and worth saying why rather than leaving a silent gap.
