@@ -31,6 +31,21 @@ export {
 } from "./submission.js";
 export type { SubmissionBody, SubmissionOp, SignedSubmission } from "./submission.js";
 
+// M16 / DOD-M16-ARTIFACT-1 — the signed broadcast artifact wire format.
+export {
+  BROADCAST_ARTIFACT_DOMAIN,
+  MAX_BROADCAST_TITLE_CHARS,
+  MAX_BROADCAST_BODY_BYTES,
+  validateBroadcastTitle,
+  buildBroadcastArtifactTbs,
+  signBroadcastArtifact,
+  encodeBroadcastArtifact,
+  decodeBroadcastArtifact,
+  verifyBroadcastArtifact,
+  broadcastArtifactLeafHash,
+} from "./broadcast-artifact.js";
+export type { BroadcastArtifact, BroadcastDecodeReason } from "./broadcast-artifact.js";
+
 export type {
   MessageEnvelope,
   MessageEnvelopeV1,
