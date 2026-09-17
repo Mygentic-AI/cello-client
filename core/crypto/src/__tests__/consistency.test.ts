@@ -155,6 +155,25 @@ describe("consistency proofs (RFC 6962 §2.1.2 / RFC 9162 §2.1.4.2)", () => {
     expect(verifyConsistency(5, new Uint8Array(31), 13, newRoot, proof)).toBe(false);
     expect(verifyConsistency(5, oldRoot, 13, newRoot, short)).toBe(false);
     expect(verifyConsistency(5, oldRoot, 13, newRoot, [])).toBe(false);
+
+    // Sizes that are not whole numbers, or do not fit in 32 bits: the >>> shifts would round or
+    // wrap them into a size the real proof matches. Review F1.
+    const L7 = makeLeaves(7);
+    const root4 = rootOf(L7.slice(0, 4));
+    const root7 = rootOf(L7);
+    const proof47 = consistencyProof(L7, 4);
+    expect(verifyConsistency(4, root4, 7, root7, proof47)).toBe(true);
+    expect(verifyConsistency(4.5, root4, 7, root7, proof47)).toBe(false);
+    expect(verifyConsistency(4, root4, 7.9, root7, proof47)).toBe(false);
+    expect(verifyConsistency(4, root4, 2 ** 32 + 7, root7, proof47)).toBe(false);
+    expect(verifyConsistency(2 ** 32 + 4, root4, 2 ** 32 + 7, root7, proof47)).toBe(false);
+
+    // Non-byte values, as a wire decoder could produce: false, not a TypeError. Review F2.
+    const notBytes = null as unknown as Uint8Array;
+    expect(verifyConsistency(5, notBytes, 13, newRoot, proof)).toBe(false);
+    expect(verifyConsistency(5, oldRoot, 13, notBytes, proof)).toBe(false);
+    expect(verifyConsistency(5, oldRoot, 13, newRoot, [...proof, notBytes])).toBe(false);
+    expect(verifyConsistency(5, oldRoot, 13, newRoot, null as unknown as Uint8Array[])).toBe(false);
   });
 
   it("consistencyProof rejects bad input with RangeError", () => {

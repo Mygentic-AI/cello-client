@@ -78,9 +78,16 @@ export function verifyConsistency(
   newRoot: Uint8Array,
   proof: readonly Uint8Array[],
 ): boolean {
-  if (oldRoot.length !== 32 || newRoot.length !== 32) return false;
+  // Callers decode these off the wire, so the declared types are not a guarantee: a non-byte
+  // value is malformed input and returns false rather than throwing.
+  if (!isHash(oldRoot) || !isHash(newRoot) || !Array.isArray(proof)) return false;
   for (const entry of proof) {
-    if (entry.length !== 32) return false;
+    if (!isHash(entry)) return false;
+  }
+  // The >>> shifts below silently truncate fractions and wrap values at 2^32, which would let a
+  // real proof match a size it was never built for. Such sizes are malformed.
+  if (!Number.isInteger(oldSize) || !Number.isInteger(newSize) || newSize > 0xffffffff) {
+    return false;
   }
   if (oldSize < 1 || newSize < 1 || oldSize > newSize) return false;
 
@@ -160,6 +167,10 @@ function largestPowerOfTwoBelow(n: number): number {
   let k = 1;
   while (k * 2 < n) k *= 2;
   return k;
+}
+
+function isHash(value: unknown): boolean {
+  return value instanceof Uint8Array && value.length === 32;
 }
 
 function isPowerOfTwo(m: number): boolean {
