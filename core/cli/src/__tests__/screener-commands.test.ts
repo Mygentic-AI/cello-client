@@ -182,3 +182,69 @@ describe("SCREENINSTALL: the login line", () => {
     expect(await screenerLoginLine(async () => { throw new Error("disk on fire"); })).toBe("");
   });
 });
+
+describe("SCREENINSTALL: observability and the fetch boundary", () => {
+  let dir: string;
+  beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "cello-obs-")); });
+  afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
+
+  it("names every event domain.noun.verb and threads ONE correlationId through the install", async () => {
+    const events: Array<{ event: string; fields?: Record<string, unknown> }> = [];
+    const logger = {
+      info: (event: string, fields?: Record<string, unknown>) => events.push({ event, fields }),
+      error: (event: string, fields?: Record<string, unknown>) => events.push({ event, fields }),
+    };
+    await screenerInstallCommand({
+      dir, runtimePresent: false, assumeYes: true, interactive: false, verifyDigests: false, logger,
+      installModelImpl: async () => { await writeVerifiedModel(dir); return { installed: true }; },
+      installRuntime: async () => {},
+      runtimeCheckAfterInstall: async () => true,
+    });
+    expect(events.map((e) => e.event)).toEqual(["screener.install.started", "screener.install.complete"]);
+    for (const e of events) expect(e.event).toMatch(/^[a-z]+\.[a-z_]+\.[a-z_]+$/);
+    const ids = new Set(events.map((e) => e.fields?.["correlationId"]));
+    expect(ids.size).toBe(1);
+    expect([...ids][0]).toBeTypeOf("string");
+  });
+
+  it("names the CAUSE when the model install fails, not just the exit point", async () => {
+    const events: Array<{ event: string; fields?: Record<string, unknown> }> = [];
+    const logger = {
+      info: (event: string, fields?: Record<string, unknown>) => events.push({ event, fields }),
+      error: (event: string, fields?: Record<string, unknown>) => events.push({ event, fields }),
+    };
+    await screenerInstallCommand({
+      dir, runtimePresent: true, assumeYes: true, interactive: false, logger,
+      installModelImpl: async () => ({ installed: false, error: "checksum mismatch for config.json" }),
+      installRuntime: async () => {},
+    });
+    const failure = events.find((e) => e.event === "screener.model.install.failed");
+    expect(failure).toBeDefined();
+    expect(String(failure!.fields?.["error"])).toContain("checksum mismatch");
+  });
+
+  it("requests ONLY the manifest's files — nothing else from the repository", async () => {
+    // The upstream repo also holds a GPL-3.0 l2/ directory. A fetch that walked the repo, or a
+    // manifest someone extended carelessly, would pull it in; this records every URL asked for.
+    const requested: string[] = [];
+    await screenerInstallCommand({
+      dir, runtimePresent: true, assumeYes: true, interactive: false, verifyDigests: false,
+      fetchImpl: (async (url: string) => {
+        requested.push(String(url));
+        const f = SCREENER_MODEL.files.find((x) => String(url).endsWith(x.path))!;
+        await mkdir(dirname(join(dir, f.path)), { recursive: true });
+        await writeFile(join(dir, f.path), "");
+        await truncate(join(dir, f.path), f.size);
+        return new Response("");
+      }) as unknown as typeof fetch,
+      installRuntime: async () => {},
+      runtimeCheckAfterInstall: async () => true,
+    });
+    expect(requested.length).toBeGreaterThan(0);
+    for (const url of requested) {
+      expect(url.startsWith(SCREENER_MODEL.baseUrl), url).toBe(true);
+      expect(SCREENER_MODEL.files.some((f) => url === SCREENER_MODEL.baseUrl + f.path), url).toBe(true);
+      expect(url).not.toContain("/l2/");
+    }
+  });
+});

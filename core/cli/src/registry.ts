@@ -361,7 +361,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       { name: "--yes", consumesValue: false },
       { name: "--manual", consumesValue: false },
     ],
-    async run(_ctx, args) {
+    async run(ctx, args) {
       const sub = args.find((a) => !a.startsWith("--")) ?? "";
       if (sub === "status") return screenerStatusCommand();
       if (sub === "install") {
@@ -369,6 +369,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
           return { stdout: screenerManualInstructions(screenerModelDir()) + "\n", stderr: "", exitCode: 0 };
         }
         return screenerInstallCommand({
+          logger: ctx.logger,
           assumeYes: args.includes("--yes"),
           // A prompt with nobody to answer it is a hang, and a hung install reads as a broken one.
           interactive: process.stdin.isTTY === true,

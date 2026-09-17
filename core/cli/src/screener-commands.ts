@@ -27,6 +27,21 @@ import {
 
 export interface CliOutput { stdout: string; stderr: string; exitCode: number }
 
+/** The gateway's logger shape, narrowed to what this file emits. */
+export interface ScreenerLogger {
+  info(event: string, fields?: Record<string, unknown>): void;
+  error(event: string, fields?: Record<string, unknown>): void;
+}
+
+/**
+ * `domain.noun.verb`, with one correlationId minted per install and threaded through every event of
+ * that install — so a failed download and the state it left behind are one story in the log rather
+ * than two unrelated lines.
+ */
+function newCorrelationId(): string {
+  return `screener-install-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
 /**
  * Measured on 2026-09-17, not estimated: the model is 130.7 MB and the runtime's packages are
  * 110 MB compressed, unpacking to 487 MB (224 MB of which is prebuilt binaries for the platforms
@@ -123,6 +138,7 @@ export interface ScreenerInstallOptions extends ScreenerCommandOptions {
   /** Injected for tests: does the runtime resolve once we have installed it? */
   runtimeCheckAfterInstall?: () => Promise<boolean>;
   onProgress?: (line: string) => void;
+  logger?: ScreenerLogger;
 }
 
 async function npmInstallRuntime(): Promise<void> {
@@ -135,13 +151,18 @@ async function npmInstallRuntime(): Promise<void> {
 
 export async function screenerInstallCommand(opts: ScreenerInstallOptions): Promise<CliOutput> {
   const { dir, status } = await currentState(opts);
+  const correlationId = newCorrelationId();
+  const log = opts.logger;
+  log?.info("screener.install.started", { correlationId, state: status.state, dir, revision: status.revision });
 
   if (status.state === "ready") {
+    log?.info("screener.install.skipped", { correlationId, reason: "already_installed" });
     return { stdout: `Already installed and verified.\n${describeScreenerState(status)}\n`, stderr: "", exitCode: 0 };
   }
   if (status.state === "broken") {
     // Loudest state: files are present and wrong. Never quietly re-download over them — say what is
     // wrong first, because a corrupted install that silently "fixes itself" hides a real fault.
+    log?.error("screener.install.refused", { correlationId, reason: "broken_install", problem: status.problem });
     return {
       stdout: "",
       stderr: `The installed classifier is BROKEN: ${status.problem}\nDelete ${dir} and run this command again to reinstall.\n`,
@@ -151,6 +172,7 @@ export async function screenerInstallCommand(opts: ScreenerInstallOptions): Prom
 
   // Consent. Without it nothing is fetched — not the model, not the runtime.
   if (!opts.assumeYes) {
+    log?.info("screener.install.consent_required", { correlationId, interactive: opts.interactive });
     const tail = opts.interactive
       ? "\nRun `cello screener install --yes` to proceed."
       : "\nNo terminal to ask at. Run `cello screener install --yes` to proceed.";
@@ -172,6 +194,7 @@ export async function screenerInstallCommand(opts: ScreenerInstallOptions): Prom
           onProgress: (file, index, total) => progress(`  [${index + 1}/${total}] ${file}`),
         });
     if (!install.installed) {
+      log?.error("screener.model.install.failed", { correlationId, error: install.error });
       return { stdout: "", stderr: `The model install FAILED: ${install.error ?? "unknown error"}\nNothing unverified was left on disk.\n`, exitCode: 1 };
     }
   }
@@ -181,6 +204,7 @@ export async function screenerInstallCommand(opts: ScreenerInstallOptions): Prom
     try {
       await (opts.installRuntime ?? npmInstallRuntime)();
     } catch (err) {
+      log?.error("screener.runtime.install.failed", { correlationId, error: err instanceof Error ? err.message : String(err) });
       return { stdout: "", stderr: `The runtime install FAILED: ${err instanceof Error ? err.message : String(err)}\nThe model is installed; the classifier cannot run until the runtime is too.\n`, exitCode: 1 };
     }
   }
@@ -196,7 +220,9 @@ export async function screenerInstallCommand(opts: ScreenerInstallOptions): Prom
     ...(opts.verifyDigests !== undefined ? { verifyDigests: opts.verifyDigests } : {}),
   });
   if (after.state !== "ready") {
+    log?.error("screener.install.incomplete", { correlationId, state: after.state, problem: after.problem });
     return { stdout: "", stderr: `Install did not complete: ${describeScreenerState(after)}\n`, exitCode: 1 };
   }
+  log?.info("screener.install.complete", { correlationId, dir, revision: after.revision, filesVerified: after.model.filesPresent });
   return { stdout: `${describeScreenerState(after)}\nModel directory: ${dir}\n`, stderr: "", exitCode: 0 };
 }
