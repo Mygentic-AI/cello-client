@@ -187,20 +187,30 @@ export function decodeBroadcastArtifact(
   if (!isBytes(signature, SIGNATURE_BYTES)) {
     return { ok: false, reason: "bad_signature_shape", detail: `signature must be ${SIGNATURE_BYTES} bytes` };
   }
-  return {
-    ok: true,
-    artifact: {
-      channel_pubkey: new Uint8Array(channel_pubkey as Uint8Array),
-      seq: seq as number,
-      epoch_index: epoch_index as number,
-      title: title as string,
-      body_ciphertext: new Uint8Array(body_ciphertext as Uint8Array),
-      supersedes: supersedes as number | null,
-      prev_epoch_root: prev_epoch_root === null ? null : new Uint8Array(prev_epoch_root as Uint8Array),
-      ext: null,
-      signature: new Uint8Array(signature),
-    },
+  const artifact: BroadcastArtifact = {
+    channel_pubkey: new Uint8Array(channel_pubkey as Uint8Array),
+    seq: seq as number,
+    epoch_index: epoch_index as number,
+    title: title as string,
+    body_ciphertext: new Uint8Array(body_ciphertext as Uint8Array),
+    supersedes: supersedes as number | null,
+    prev_epoch_root: prev_epoch_root === null ? null : new Uint8Array(prev_epoch_root as Uint8Array),
+    ext: null,
+    signature: new Uint8Array(signature),
   };
+  // One artifact, one wire form. The decoder also reads floats for integers and tag-64 typed arrays
+  // for bytes; admitting those would give one signed artifact several byte forms, and anything that
+  // hashes or dedups the RECEIVED bytes would disagree with the channel log's leaf.
+  if (!bytesEqual(encodeBroadcastArtifact(artifact), bytes)) {
+    return { ok: false, reason: "wrong_shape", detail: "non-canonical encoding" };
+  }
+  return { ok: true, artifact };
+}
+
+function bytesEqual(x: Uint8Array, y: Uint8Array): boolean {
+  if (x.length !== y.length) return false;
+  for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+  return true;
 }
 
 /** Never throws: crypto's `verify` returns false on any failure. */

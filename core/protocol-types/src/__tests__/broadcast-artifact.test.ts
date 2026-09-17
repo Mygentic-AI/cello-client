@@ -68,6 +68,18 @@ function withSlot(a: BroadcastArtifact, index: number, value: unknown): Uint8Arr
   return encodeCbor(slots);
 }
 
+/**
+ * The same signed artifact with `seq` written as float64 3.0 instead of the integer 3. Values are
+ * identical and the signature still verifies, but the bytes are a second wire form of one artifact.
+ * Offset 64 = array header (1) + domain text (2 + 27) + pubkey bytes (2 + 32).
+ */
+function floatSeq(a: BroadcastArtifact): Uint8Array {
+  const canonical = encodeBroadcastArtifact(a);
+  if (a.seq !== 3 || canonical[64] !== 0x03) throw new Error("fixture drift: seq is not at offset 64");
+  const float3 = [0xfb, 0x40, 0x08, 0, 0, 0, 0, 0, 0];
+  return new Uint8Array([...canonical.slice(0, 64), ...float3, ...canonical.slice(65)]);
+}
+
 async function signed(overrides: Partial<Fields> = {}): Promise<BroadcastArtifact> {
   return signBroadcastArtifact(generateKeypair(), makeFields(overrides));
 }
@@ -185,6 +197,7 @@ describe("002-ARTIFACT — broadcast artifact", () => {
       ],
       ["ext_not_null", withSlot(a, 8, 7)],
       ["bad_signature_shape", withSlot(a, 9, new Uint8Array(63))],
+      ["wrong_shape", floatSeq(a)],
     ];
     for (const [reason, bytes] of cases) {
       const d = decodeBroadcastArtifact(bytes);
