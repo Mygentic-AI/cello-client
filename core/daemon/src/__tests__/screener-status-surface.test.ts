@@ -40,7 +40,7 @@ describe("SCREENINSTALL: cello_status screening block", () => {
     }
     const info = toScreeningInfo(await screenerState({ dir, runtimePresent: true }));
     expect(info.classifier).toBe("broken");
-    expect(info.problem).toContain(SCREENER_MODEL.files[0]!.path);
+    expect(info.problem).toContain(localPathOf(SCREENER_MODEL.files[0]!));
     expect(info.summary).toContain("BROKEN");
   });
 
