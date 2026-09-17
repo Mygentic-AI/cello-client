@@ -46,6 +46,19 @@ export {
 } from "./broadcast-artifact.js";
 export type { BroadcastArtifact, BroadcastDecodeReason } from "./broadcast-artifact.js";
 
+// M16 / DOD-M16-SEAL-TYPE-1 — the one-party channel-epoch-seal receipt.
+export {
+  CHANNEL_EPOCH_SEAL_DOMAIN,
+  CHANNEL_EPOCH_SEAL_ATTESTS,
+  buildChannelEpochSealTbs,
+  signChannelEpochSeal,
+  encodeChannelEpochSeal,
+  decodeChannelEpochSeal,
+  verifyChannelEpochSealSignature,
+  checkEpochChainLink,
+} from "./channel-epoch-seal.js";
+export type { ChannelEpochSeal, EpochSealDecodeReason, EpochChainReason } from "./channel-epoch-seal.js";
+
 export type {
   MessageEnvelope,
   MessageEnvelopeV1,
