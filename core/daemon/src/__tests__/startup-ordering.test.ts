@@ -227,8 +227,8 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // did before, and the only symptom is a receipt that does not appear — which is
     // indistinguishable from the bug the module was written to remove.
     //
-    // 103 → 104 for M16 008-EPOCH's `startChannelEpochTick` (channel-epoch-tick.ts), caught on the
-    // first full run. Unwired, no channel epoch is ever force-sealed, so the window in which a
+    // 103 → 104 for M16 008-EPOCH's `startChannelEpochTick` (channel-epoch-tick.ts). Unwired, no
+    // channel epoch is ever force-sealed, so the window in which a
     // channel can show two subscribers two different histories stays open forever. That is the
     // one property the cap exists to bound.
     expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(104);
