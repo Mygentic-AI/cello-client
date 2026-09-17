@@ -20,6 +20,7 @@ import {
   installModel,
   runtimeAvailable,
   screenerModelDir,
+  screenerRuntimeDir,
   screenerState,
   SCREENER_RUNTIME_MODULE,
   type InstallResult,
@@ -86,7 +87,7 @@ export function screenerManualInstructions(dir: string): string {
     "",
     `2. Put them under, keeping the paths above:  ${dir}`,
     "",
-    `3. Install the runtime:  npm install -g ${SCREENER_RUNTIME_MODULE}`,
+    `3. Install the runtime:  npm install --prefix ${screenerRuntimeDir()} ${SCREENER_RUNTIME_MODULE}`,
     "",
     "4. Verify what you installed:  cello screener status",
     "",
@@ -141,9 +142,17 @@ export interface ScreenerInstallOptions extends ScreenerCommandOptions {
   logger?: ScreenerLogger;
 }
 
+/**
+ * Into CELLO's own directory, NOT `npm install -g`.
+ *
+ * A globally installed package is unreachable from an ESM `import` in a globally installed CLI —
+ * measured 2026-09-17, the model verified 5/5 while the runtime still read as missing, and NODE_PATH
+ * does not help because ESM ignores it. `--prefix` puts it somewhere we can resolve from, and an
+ * npm upgrade of the CLI cannot wipe it.
+ */
 async function npmInstallRuntime(): Promise<void> {
   await new Promise<void>((resolve, reject) => {
-    const child = spawn("npm", ["install", "-g", SCREENER_RUNTIME_MODULE], { stdio: "inherit" });
+    const child = spawn("npm", ["install", "--prefix", screenerRuntimeDir(), SCREENER_RUNTIME_MODULE], { stdio: "inherit" });
     child.on("error", reject);
     child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`npm exited ${code}`))));
   });

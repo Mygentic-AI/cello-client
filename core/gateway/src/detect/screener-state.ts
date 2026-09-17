@@ -19,6 +19,8 @@
 import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { createRequire } from "node:module";
 import { SCREENER_MODEL } from "./screener-model-manifest.js";
 import { sha256File } from "./model-installer.js";
 
@@ -35,17 +37,56 @@ export function screenerModelDir(): string {
 export const SCREENER_RUNTIME_MODULE = "@huggingface/transformers";
 
 /**
+ * Where the runtime is installed, and why it is not `npm install -g`.
+ *
+ * A global npm install puts the package in npm's global root, and **Node's ESM resolver does not
+ * look there**: a bare `import("@huggingface/transformers")` from a globally installed CLI resolves
+ * against that CLI's own package tree and fails. Proven on 2026-09-17 — the model verified 5/5 and
+ * the runtime still read as missing with the package installed, and `NODE_PATH` does not help
+ * either, because ESM ignores it.
+ *
+ * So the runtime lives in a directory CELLO owns and is imported by ABSOLUTE path. That also
+ * survives an npm upgrade of the CLI, which would otherwise wipe anything written into its tree.
+ */
+export function screenerRuntimeDir(): string {
+  return process.env["CELLO_SCREENER_RUNTIME_DIR"] || join(homedir(), ".cello", "screener-runtime");
+}
+
+/**
+ * The absolute file the loader imports, or null when the runtime is not installed there.
+ *
+ * Resolved with `require.resolve` FROM the runtime directory, because that honours the package's
+ * `exports` map. Importing the package DIRECTORY instead picks its CommonJS `main` with no
+ * conditions applied, and Node then refuses it with ERR_AMBIGUOUS_MODULE_SYNTAX — measured
+ * 2026-09-17, and it is why this returns a file rather than a directory.
+ */
+export function resolveScreenerRuntime(): string | null {
+  try {
+    const require = createRequire(join(screenerRuntimeDir(), "resolver.cjs"));
+    return require.resolve(SCREENER_RUNTIME_MODULE);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Does the runtime resolve from here? A dynamic import in a try/catch, deliberately: the gateway
  * must not take a hard dependency on a 487 MB package that most installs will never have.
  */
 export async function runtimeAvailable(importImpl?: (s: string) => Promise<unknown>): Promise<boolean> {
   const doImport = importImpl ?? ((s: string) => import(/* @vite-ignore */ s));
-  try {
-    await doImport(SCREENER_RUNTIME_MODULE);
-    return true;
-  } catch {
-    return false;
+  // CELLO's own directory first — that is where `cello screener install` puts it. The bare
+  // specifier second, for a workspace or an operator who installed it as a dependency themselves.
+  const resolved = resolveScreenerRuntime();
+  for (const specifier of [...(resolved ? [pathToFileURL(resolved).href] : []), SCREENER_RUNTIME_MODULE]) {
+    try {
+      await doImport(specifier);
+      return true;
+    } catch {
+      /* try the next */
+    }
   }
+  return false;
 }
 
 export type ScreenerStateName = "not_installed" | "half_installed" | "broken" | "ready";

@@ -27,6 +27,8 @@
  */
 import { join } from "node:path";
 import { isModelInstalled } from "./model-installer.js";
+import { resolveScreenerRuntime } from "./screener-state.js";
+import { pathToFileURL } from "node:url";
 import type { InjectionClassifier } from "./injection-scanner.js";
 
 /** The transformers.js entry point, resolved at runtime. Absent in a default install by design. */
@@ -70,12 +72,18 @@ export async function loadInjectionClassifier(
     };
   }
 
+  // DOD-M9C-SCREENINSTALL-1: the runtime lives in CELLO's own directory (see `screener-state.ts`
+  // for why a global npm install is unreachable from an ESM import), so the loader asks for the
+  // file that resolution found, and falls back to the bare specifier for a workspace install.
+  const resolvedRuntime = resolveScreenerRuntime();
+  const runtimeSpecifier = resolvedRuntime ? pathToFileURL(resolvedRuntime).href : RUNTIME_MODULE;
+
   let mod: unknown;
   try {
     // Indirection through a variable: a bare dynamic import of a name that is not a dependency is
     // resolved eagerly by some bundlers, which would turn an optional runtime into a hard one.
     const doImport = importImpl ?? ((s: string) => import(/* @vite-ignore */ s));
-    mod = await doImport(RUNTIME_MODULE);
+    mod = await doImport(runtimeSpecifier);
   } catch (err) {
     return {
       classifier: null,

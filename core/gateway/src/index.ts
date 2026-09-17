@@ -38,7 +38,7 @@ export type { InjectionClassifier, InjectionVerdict, ScanResult } from "./detect
 export { isModelInstalled, installModel, sha256File } from "./detect/model-installer.js";
 export type { InstallResult, InstallOptions } from "./detect/model-installer.js";
 export { SCREENER_MODEL, screenerModelTotalBytes } from "./detect/screener-model-manifest.js";
-export { screenerState, describeScreenerState, screenerModelDir, runtimeAvailable, SCREENER_RUNTIME_MODULE, type ScreenerStatus, type ScreenerStateName } from "./detect/screener-state.js";
+export { screenerState, describeScreenerState, screenerModelDir, screenerRuntimeDir, resolveScreenerRuntime, runtimeAvailable, SCREENER_RUNTIME_MODULE, type ScreenerStatus, type ScreenerStateName } from "./detect/screener-state.js";
 export { loadInjectionClassifier } from "./detect/injection-classifier-onnx.js";
 export type { ClassifierLoad } from "./detect/injection-classifier-onnx.js";
 export { GatewayConfigStore } from "./config/config-store.js";

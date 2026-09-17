@@ -10,7 +10,7 @@ import { mkdtemp, rm, writeFile, mkdir, truncate } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { SCREENER_MODEL } from "../detect/screener-model-manifest.js";
-import { screenerState, describeScreenerState, screenerModelDir, runtimeAvailable, SCREENER_RUNTIME_MODULE } from "../detect/screener-state.js";
+import { screenerState, describeScreenerState, screenerModelDir, runtimeAvailable, resolveScreenerRuntime, SCREENER_RUNTIME_MODULE } from "../detect/screener-state.js";
 
 /**
  * Write every manifest file at its exact declared size (sparse, so the 96 MB graph costs nothing).
@@ -92,5 +92,36 @@ describe("SCREENINSTALL: screener state", () => {
     }
     const ready = describeScreenerState({ state: "ready", revision: SCREENER_MODEL.revision, model: { filesPresent: 5, filesExpected: 5, verified: true }, runtimePresent: true, missing: [], problem: undefined });
     expect(ready).toMatch(/2 of 2|both layers/i);
+  });
+});
+
+describe("SCREENINSTALL: the runtime is resolved by FILE, not by bare specifier", () => {
+  it("returns null when nothing is installed in CELLO's runtime directory", () => {
+    const prev = process.env["CELLO_SCREENER_RUNTIME_DIR"];
+    process.env["CELLO_SCREENER_RUNTIME_DIR"] = "/tmp/definitely-not-installed-here";
+    expect(resolveScreenerRuntime()).toBeNull();
+    if (prev === undefined) delete process.env["CELLO_SCREENER_RUNTIME_DIR"]; else process.env["CELLO_SCREENER_RUNTIME_DIR"] = prev;
+  });
+
+  it("resolves through the package's exports map, never to its directory", async () => {
+    // Importing the package DIRECTORY picks its CommonJS main with no conditions applied, and Node
+    // refuses that with ERR_AMBIGUOUS_MODULE_SYNTAX — which is how a correctly installed runtime
+    // read as 'missing' with the model verified 5/5. The resolved value must be a FILE.
+    const prev = process.env["CELLO_SCREENER_RUNTIME_DIR"];
+    const fake = await mkdtemp(join(tmpdir(), "cello-rt-"));
+    const pkgDir = join(fake, "node_modules", "@huggingface", "transformers");
+    await mkdir(join(pkgDir, "dist"), { recursive: true });
+    await writeFile(join(pkgDir, "dist", "transformers.node.cjs"), "module.exports={pipeline(){}};");
+    await writeFile(join(pkgDir, "package.json"), JSON.stringify({
+      name: "@huggingface/transformers", version: "0.0.0", type: "module",
+      main: "./dist/transformers.node.cjs",
+      exports: { node: { require: "./dist/transformers.node.cjs", import: "./dist/transformers.node.cjs" } },
+    }));
+    process.env["CELLO_SCREENER_RUNTIME_DIR"] = fake;
+    const resolved = resolveScreenerRuntime();
+    expect(resolved).toContain("transformers.node.cjs");
+    expect(await runtimeAvailable()).toBe(true);
+    await rm(fake, { recursive: true, force: true });
+    if (prev === undefined) delete process.env["CELLO_SCREENER_RUNTIME_DIR"]; else process.env["CELLO_SCREENER_RUNTIME_DIR"] = prev;
   });
 });
