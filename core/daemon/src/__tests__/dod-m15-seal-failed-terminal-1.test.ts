@@ -26,7 +26,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { SealFailureStore, describeSealFailed } from "../seal-failure-store.js";
+import { SealFailureStore, describeSealFailed, counterpartyHasClosed } from "../seal-failure-store.js";
 
 const AGENT = "agent-a";
 const SESSION = "ab".repeat(16);
@@ -105,6 +105,47 @@ describe("DOD-M15-SEAL-FAILED-TERMINAL-1: what the agent is told", () => {
     ).toMatch(/seal_counterparty_pending|other side has not closed/i);
   });
 
+  /**
+   * Live 2026-09-17, session d8b15d09: both sides closed, the signer lost the directories, and both
+   * were told "the other side has not closed yet" and to wait or retry. Both had closed, and a retry
+   * with everyone online failed identically. The words sent them to chase a counterparty who had
+   * done everything right.
+   */
+  it("★ when the other side HAS closed, it says so, blames CELLO, and keeps the record", () => {
+    const d = describeSealFailed({
+      sessionId: SESSION,
+      failure: { reason: "seal_unilateral_timeout", at: AT, kind: "unresolved" },
+      counterpartyClosed: true,
+    });
+    const g = String(d["guidance"]);
+    expect(d["reason"]).toBe("seal_failed");
+    expect(g, "it must not tell them to wait for a close that already happened").not.toMatch(/has not closed/i);
+    expect(g).toBe(
+      "Both sides closed, but this seal couldn't be completed right now. The failure is on CELLO's " +
+        "side, not yours. Your conversation and both closes are safely recorded on your machine, and " +
+        "a future update will seal it from that record. Leave the session as it is. Do not use " +
+        "force: true, which would discard that record.",
+    );
+  });
+
+  it("when the other side has NOT closed, the waiting guidance is unchanged", () => {
+    const d = describeSealFailed({
+      sessionId: SESSION,
+      failure: { reason: "seal_unilateral_timeout", at: AT, kind: "unresolved" },
+      counterpartyClosed: false,
+    });
+    expect(String(d["guidance"])).toMatch(/other side has not closed yet/);
+  });
+
+  it("the counterparty's close is read from the carry: a SEAL leaf from someone other than us", () => {
+    const own = "aa".repeat(32);
+    const them = "bb".repeat(32);
+    const leaf = (senderPubkeyHex: string, leafKind: number) => ({ senderPubkeyHex, leafKind });
+    expect(counterpartyHasClosed([leaf(own, 0), leaf(them, 0), leaf(own, 2)], own), "only our own close").toBe(false);
+    expect(counterpartyHasClosed([leaf(them, 0), leaf(own, 2), leaf(them, 2)], own), "both closes held").toBe(true);
+    expect(counterpartyHasClosed([], own)).toBe(false);
+  });
+
   it("★ it carries the UPSTREAM cause, not a label invented here", () => {
     /**
      * "The seal failed" tells an operator nothing about whether their directory is unreachable,
@@ -152,7 +193,12 @@ describe("DOD-M15-SEAL-FAILED-TERMINAL-1: the daemon actually wires the store", 
   const AGENT2 = "agent-a";
   const SESSION2 = "cd".repeat(16);
 
-  async function readHandlerWith(failure: { reason: string; at: string; kind: "unresolved" | "threw" } | undefined, sealing: boolean) {
+  const OWN_PK = "aa".repeat(32);
+  async function readHandlerWith(
+    failure: { reason: string; at: string; kind: "unresolved" | "threw" } | undefined,
+    sealing: boolean,
+    carry: Array<{ senderPubkeyHex: string; leafKind: number }> = [],
+  ) {
     const { registerSessionReadHandlers } = await import("../session-read-handlers.js");
     const handlers = new Map<string, (p: Record<string, unknown>, c: string) => Promise<unknown>>();
     registerSessionReadHandlers({
@@ -164,6 +210,8 @@ describe("DOD-M15-SEAL-FAILED-TERMINAL-1: the daemon actually wires the store", 
         getSessionTree: () => ({ leaves: () => [] }),
         listSessions: () => [],
         resolveAgentId: () => "aid",
+        getDb: () => ({ prepare: () => ({ get: () => ({ k_local_pubkey: OWN_PK }) }) }),
+        getSealCarry: () => carry,
       },
       loadedAgents: [{ name: AGENT2 }],
       getConnState: () => ({ currentAgent: AGENT2 }),
@@ -190,6 +238,14 @@ describe("DOD-M15-SEAL-FAILED-TERMINAL-1: the daemon actually wires the store", 
         "from a session that was never closed, while the agent holds an ok:true from the close",
     ).toBe("seal_failed");
     expect(res["seal_failure_reason"]).toBe("directory_below_threshold");
+  });
+
+  it("★ with the counterparty's close held, cello_sealed_receipt gives the both-closed words", async () => {
+    const carry = [{ senderPubkeyHex: OWN_PK, leafKind: 2 }, { senderPubkeyHex: "bb".repeat(32), leafKind: 2 }];
+    const h = await readHandlerWith({ reason: "seal_unilateral_timeout", at: AT, kind: "unresolved" }, false, carry);
+    const res = (await h({ session_id: SESSION2 }, "c1")) as Record<string, unknown>;
+    expect(res["both_closed"]).toBe(true);
+    expect(String(res["guidance"])).toMatch(/^Both sides closed/);
   });
 
   it("★ a RUNNING ceremony outranks an old failure — the re-close remedy must not read as dead", async () => {

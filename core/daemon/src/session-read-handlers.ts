@@ -17,7 +17,7 @@ import type { ConnState } from "./contact-handlers.js";
 import { classifySession, type SessionCategory } from "./session-category.js";
 import { validateSessionName } from "./session-name.js";
 import { renderFrontierMismatch, type FrontierMismatchStore } from "./frontier-mismatch.js";
-import { describeSealFailed, type SealFailure } from "./seal-failure-store.js";
+import { describeSealFailed, counterpartyHasClosed, type SealFailure } from "./seal-failure-store.js";
 import { contentEncryptionGuidanceFor } from "./content-encryption-status.js";
 import { frameQuarantinedPayload } from "./quarantine-framing.js";
 import { readSealedConversation } from "./sealed-conversation.js";
@@ -273,7 +273,17 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
        * fresh ceremony reports as running rather than as the old failure.
        */
       const failure = getSealFailure(agentName, sessionId);
-      if (failure) return describeSealFailed({ sessionId, failure });
+      if (failure) {
+        // Whether THEY closed decides the words: "wait for them" is wrong once their close is held.
+        const agentId = sessionNodeManager.resolveAgentId(agentName);
+        const ownPubkey = (
+          sessionNodeManager.getDb().prepare("SELECT k_local_pubkey FROM agents WHERE agent_id = ?").get(agentId) as { k_local_pubkey: string } | undefined
+        )?.k_local_pubkey;
+        const counterpartyClosed = ownPubkey
+          ? counterpartyHasClosed(sessionNodeManager.getSealCarry(ownPubkey, sessionId), ownPubkey)
+          : false;
+        return describeSealFailed({ sessionId, failure, counterpartyClosed });
+      }
 
       // The session is THIS agent's — it simply has no seal certificate yet, no ceremony is running
       // for it, and none is remembered as having failed.

@@ -150,11 +150,53 @@ export class SealFailureStore {
  * a re-close after a failure starts a new ceremony and the old marker must not shadow it. The read
  * handler checks `isSealing` first.
  */
+/**
+ * Has the counterparty closed? True when this side holds a SEAL (control, kind 2) leaf authored by
+ * someone other than itself — the relay delivered their close, so they did everything a close needs.
+ */
+export function counterpartyHasClosed(
+  carry: ReadonlyArray<{ senderPubkeyHex: string; leafKind: number }>,
+  ownPubkeyHex: string,
+): boolean {
+  const own = ownPubkeyHex.toLowerCase();
+  return carry.some((l) => l.leafKind === 2 && l.senderPubkeyHex.toLowerCase() !== own);
+}
+
+/**
+ * Agreed with Andre 2026-09-17 (option D), verbatim. For a failed seal where BOTH sides closed.
+ *
+ * Live, session d8b15d09: both sides closed, the signer lost the directories, and both were told
+ * "the other side has not closed yet" and to wait or retry. They had closed, and a retry with both
+ * online failed identically. Everything a seal needs — both closes, the signed messages, the relay's
+ * acknowledgements — stays on the operator's machine, and the per-party seal redesign seals from
+ * exactly that record; that commitment is what makes "a future update will seal it" true. Keep them
+ * in step: if that redesign is dropped, this sentence must change with it.
+ */
+const BOTH_CLOSED_GUIDANCE =
+  "Both sides closed, but this seal couldn't be completed right now. The failure is on CELLO's " +
+  "side, not yours. Your conversation and both closes are safely recorded on your machine, and " +
+  "a future update will seal it from that record. Leave the session as it is. Do not use " +
+  "force: true, which would discard that record.";
+
 export function describeSealFailed(opts: {
   sessionId: string;
   failure: SealFailure;
+  /** From `counterpartyHasClosed` — decides between "wait for them" and "they already closed". */
+  counterpartyClosed?: boolean;
 }): Record<string, unknown> {
   const threw = opts.failure.kind === "threw";
+  if (opts.counterpartyClosed === true && !threw && opts.failure.kind !== "refused") {
+    return {
+      ok: false,
+      reason: "seal_failed",
+      seal_status: "unresolved",
+      session_id: opts.sessionId,
+      seal_failure_reason: opts.failure.reason,
+      seal_failed_at: opts.failure.at,
+      both_closed: true,
+      guidance: BOTH_CLOSED_GUIDANCE,
+    };
+  }
   /**
    * DOD-M15-SEALREFUSED-STUCK-1 — a REFUSAL is neither of the other two, and the difference decides
    * what the operator does next. `unresolved` invites them to wait for a counterparty who has not
