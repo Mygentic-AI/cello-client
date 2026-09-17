@@ -15,6 +15,7 @@ import { describe, it, expect } from "vitest";
 import { buildWindows, aggregateWindowScores } from "../detect/injection-windows.js";
 import { SCREENER_MODEL } from "../detect/screener-model-manifest.js";
 import { injectionProbabilityOf } from "../detect/injection-classifier-onnx.js";
+import { scoreToVerdict, BLOCK_THRESHOLD, FLAG_THRESHOLD } from "../detect/injection-scanner.js";
 
 /** Token ids stand in for text: the real tokenizer's output is a number[] of exactly this shape. */
 const ids = (n: number): number[] => Array.from({ length: n }, (_, i) => i);
@@ -81,5 +82,22 @@ describe("SCREENWIRE: this model's labels", () => {
 
   it("THROWS on a label set it does not know rather than inventing a score", () => {
     expect(() => injectionProbabilityOf([{ label: "LABEL_0", score: 0.5 }])).toThrow(/no INJECTION, BENIGN or SAFE/);
+  });
+});
+
+describe("SCREENWIRE: the block bar is provisional and high", () => {
+  it("flags a confident-but-not-certain score instead of blocking it", () => {
+    // Measured 2026-09-17: at the old bar of 70 the model scored 2.1% of 1,200 real benign messages
+    // as injection — one ordinary message in fifty refused. Flagged content is still delivered with
+    // the finding attached, which is where most of the defence lives.
+    expect(scoreToVerdict(97)).toBe("flag");
+    expect(scoreToVerdict(70)).toBe("flag");
+    expect(scoreToVerdict(BLOCK_THRESHOLD)).toBe("block");
+    expect(BLOCK_THRESHOLD).toBeGreaterThanOrEqual(99);
+  });
+
+  it("still passes what the model is unsure of, rather than flagging everything", () => {
+    expect(scoreToVerdict(34)).toBe("pass");
+    expect(scoreToVerdict(FLAG_THRESHOLD)).toBe("flag");
   });
 });

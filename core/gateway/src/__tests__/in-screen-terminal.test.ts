@@ -61,8 +61,10 @@ describe("M9-IN-002 live wiring — semantic injection scanner as a terminal blo
     expect(v.events.some((e) => e.category === "injection:semantic")).toBe(false);
   });
 
-  it("a high-score injection (score ≥ 70) → TERMINAL block with a semantic event", async () => {
-    const scanner = new InjectionScanner(fakeClassifier((t) => (t.includes("EVILMARKER") ? 0.95 : 0.01)));
+  it("a near-certain injection → TERMINAL block with a semantic event", async () => {
+    // DOD-M9C-SCREENWIRE-1 raised the block bar to 99 after measuring 2.1% of real benign messages
+    // at the old bar of 70. 0.95 now FLAGS (covered below); only near-certainty blocks.
+    const scanner = new InjectionScanner(fakeClassifier((t) => (t.includes("EVILMARKER") ? 0.999 : 0.01)));
     const v = await new InboundScreener({ injectionScanner: scanner }).screen(enc("benign-looking text EVILMARKER hidden payload"));
     expect(v.disposition).toBe("block");
     expect(v.terminal).toBe(true);
@@ -70,9 +72,18 @@ describe("M9-IN-002 live wiring — semantic injection scanner as a terminal blo
     expect(v.events.some((e) => e.stage === "injection_scan" && e.disposition === "block" && e.category === "injection:semantic")).toBe(true);
   });
 
-  it("a flagged injection (35 ≤ score < 70) is an OBSERVE signal and is DELIVERED, not blocked", async () => {
+  it("a flagged injection is an OBSERVE signal and is DELIVERED, not blocked", async () => {
     const scanner = new InjectionScanner(fakeClassifier((t) => (t.includes("MAYBE") ? 0.5 : 0.01)));
     const v = await new InboundScreener({ injectionScanner: scanner }).screen(enc("ordinary message MAYBE slightly odd phrasing here"));
+    expect(v.disposition).not.toBe("block");
+    expect(v.events.some((e) => e.stage === "injection_scan" && e.disposition === "observe" && e.category === "injection:semantic")).toBe(true);
+  });
+
+  it("a CONFIDENT injection below the bar is delivered with the finding, not refused", async () => {
+    // The case the bar moved for: 0.95 blocked before, and 2.1% of ordinary messages scored that
+    // high. The agent still learns what was found.
+    const scanner = new InjectionScanner(fakeClassifier((t) => (t.includes("EVILMARKER") ? 0.95 : 0.01)));
+    const v = await new InboundScreener({ injectionScanner: scanner }).screen(enc("benign-looking text EVILMARKER hidden payload"));
     expect(v.disposition).not.toBe("block");
     expect(v.events.some((e) => e.stage === "injection_scan" && e.disposition === "observe" && e.category === "injection:semantic")).toBe(true);
   });

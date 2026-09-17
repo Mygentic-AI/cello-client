@@ -17,8 +17,18 @@
 
 export type InjectionVerdict = "block" | "flag" | "pass";
 
-/** Score thresholds (0–100). Score GOVERNS the verdict — a label that disagrees never overrides it. */
-export const BLOCK_THRESHOLD = 70;
+/**
+ * Score thresholds (0–100). Score GOVERNS the verdict — a label that disagrees never overrides it.
+ *
+ * **The block bar is PROVISIONAL and deliberately high (DOD-M9C-SCREENWIRE-1).** Measured on
+ * 2026-09-17 against 1,200 real benign messages, the shipped model scores 2.1% of them at ≥70 —
+ * one ordinary message in fifty refused. A screener that blocks one in fifty of a stranger's
+ * messages is not a screener anyone will keep installed, so until `002-SCREENCORPUS` measures the
+ * bar the classifier FLAGS what it is unsure of and blocks only what it is nearly certain about.
+ * Flagged content is still delivered with the finding attached, which is where most of the defence
+ * lives anyway.
+ */
+export const BLOCK_THRESHOLD = 99;
 export const FLAG_THRESHOLD = 35;
 
 export function scoreToVerdict(score: number): InjectionVerdict {
