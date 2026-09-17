@@ -10,13 +10,13 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, writeFile, mkdir, truncate } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import { SCREENER_MODEL } from "@cello-protocol/gateway";
+import { SCREENER_MODEL, localPathOf } from "@cello-protocol/gateway";
 import { screenerStatusCommand, screenerInstallCommand, screenerManualInstructions } from "../screener-commands.js";
 import { screenerLoginLine } from "../commands.js";
 
 async function writeVerifiedModel(dir: string): Promise<void> {
   for (const f of SCREENER_MODEL.files) {
-    const dest = join(dir, f.path);
+    const dest = join(dir, localPathOf(f));
     await mkdir(dirname(dest), { recursive: true });
     await writeFile(dest, "");
     await truncate(dest, f.size);
@@ -242,9 +242,9 @@ describe("SCREENINSTALL: observability and the fetch boundary", () => {
       fetchImpl: (async (url: string) => {
         requested.push(String(url));
         const f = SCREENER_MODEL.files.find((x) => String(url).endsWith(x.path))!;
-        await mkdir(dirname(join(dir, f.path)), { recursive: true });
-        await writeFile(join(dir, f.path), "");
-        await truncate(join(dir, f.path), f.size);
+        await mkdir(dirname(join(dir, localPathOf(f))), { recursive: true });
+        await writeFile(join(dir, localPathOf(f)), "");
+        await truncate(join(dir, localPathOf(f)), f.size);
         return new Response("");
       }) as unknown as typeof fetch,
       installRuntime: async () => {},

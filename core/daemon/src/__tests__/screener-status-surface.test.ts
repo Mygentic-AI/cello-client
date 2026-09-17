@@ -10,9 +10,9 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, writeFile, mkdir, truncate } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import { SCREENER_MODEL, screenerState, describeScreenerState } from "@cello-protocol/gateway";
+import { SCREENER_MODEL, localPathOf, screenerState, describeScreenerState } from "@cello-protocol/gateway";
 import type { ScreeningStatusInfo } from "../types.js";
-import { screeningSessionNoticeFrom } from "../screening-status.js";
+import { screeningSessionNoticeFrom, screeningStatus } from "../screening-status.js";
 
 /** Exactly what `daemon-status-report.ts` builds, kept in one place so the shape is asserted once. */
 function toScreeningInfo(s: Awaited<ReturnType<typeof screenerState>>): ScreeningStatusInfo {
@@ -33,7 +33,7 @@ describe("SCREENINSTALL: cello_status screening block", () => {
 
   it("reports a BROKEN classifier as broken, naming the file — never as 'not installed'", async () => {
     for (const f of SCREENER_MODEL.files) {
-      const dest = join(dir, f.path);
+      const dest = join(dir, localPathOf(f));
       await mkdir(dirname(dest), { recursive: true });
       await writeFile(dest, "");
       await truncate(dest, f.size); // right size, wrong bytes: only the digest can tell
@@ -57,6 +57,20 @@ describe("SCREENINSTALL: cello_status screening block", () => {
   });
 });
 
+describe("SCREENINSTALL: screeningStatus is the real function every surface calls", () => {
+  it("answers with a state and a sentence, and never throws", async () => {
+    // The mapping above is asserted against a reimplementation; this calls the SHIPPED function, so
+    // a status block that stopped being built fails here rather than passing a private copy.
+    const prev = process.env["CELLO_GATEWAY_MODEL_DIR"];
+    process.env["CELLO_GATEWAY_MODEL_DIR"] = "/tmp/cello-screener-definitely-absent";
+    const info = await screeningStatus();
+    expect(info).toBeDefined();
+    expect(["not_installed", "half_installed", "broken", "ready", "unknown"]).toContain(info.classifier);
+    expect(info.summary).toMatch(/Screening:/);
+    if (prev === undefined) delete process.env["CELLO_GATEWAY_MODEL_DIR"]; else process.env["CELLO_GATEWAY_MODEL_DIR"] = prev;
+  });
+});
+
 describe("SCREENINSTALL: the per-session notice", () => {
   it("is silent when both layers are running", async () => {
     // A notice on a healthy inbox is furniture, and furniture is what teaches readers to skip.
@@ -75,8 +89,15 @@ describe("SCREENINSTALL: the per-session notice", () => {
     expect(notice).toBeDefined();
   });
 
-  it("stays silent rather than throwing when the check itself fails", async () => {
-    const notice = await screeningSessionNoticeFrom(async () => undefined);
-    expect(notice).toBeUndefined();
+  it("says UNKNOWN when the check itself failed, rather than implying the content was judged", async () => {
+    const notice = await screeningSessionNoticeFrom(async () => ({ classifier: "unknown", summary: "x", problem: "permission denied" }));
+    expect(notice).toContain("UNKNOWN");
+    expect(notice).toContain("permission denied");
+  });
+
+  it("points a BROKEN classifier at --repair and says it did NOT judge the content", async () => {
+    const notice = await screeningSessionNoticeFrom(async () => ({ classifier: "broken", summary: "x", problem: "tokenizer.json does not match" }));
+    expect(notice).toContain("did NOT judge");
+    expect(notice).toContain("--repair");
   });
 });

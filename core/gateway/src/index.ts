@@ -37,7 +37,7 @@ export { InjectionScanner, scoreToVerdict, BLOCK_THRESHOLD, FLAG_THRESHOLD } fro
 export type { InjectionClassifier, InjectionVerdict, ScanResult } from "./detect/injection-scanner.js";
 export { isModelInstalled, installModel, sha256File } from "./detect/model-installer.js";
 export type { InstallResult, InstallOptions } from "./detect/model-installer.js";
-export { SCREENER_MODEL, screenerModelTotalBytes } from "./detect/screener-model-manifest.js";
+export { SCREENER_MODEL, screenerModelTotalBytes, localPathOf } from "./detect/screener-model-manifest.js";
 export { screenerState, describeScreenerState, screenerModelDir, screenerRuntimeDir, resolveScreenerRuntime, runtimeAvailable, SCREENER_RUNTIME_MODULE, type ScreenerStatus, type ScreenerStateName } from "./detect/screener-state.js";
 export { loadInjectionClassifier } from "./detect/injection-classifier-onnx.js";
 export type { ClassifierLoad } from "./detect/injection-classifier-onnx.js";

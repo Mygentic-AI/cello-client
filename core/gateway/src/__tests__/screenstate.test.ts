@@ -9,7 +9,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, writeFile, mkdir, truncate } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import { SCREENER_MODEL } from "../detect/screener-model-manifest.js";
+import { SCREENER_MODEL, localPathOf } from "../detect/screener-model-manifest.js";
 import { screenerState, describeScreenerState, screenerModelDir, runtimeAvailable, resolveScreenerRuntime, SCREENER_RUNTIME_MODULE } from "../detect/screener-state.js";
 import { classifierLoadable } from "../detect/screener-state.js";
 
@@ -19,7 +19,7 @@ import { classifierLoadable } from "../detect/screener-state.js";
  */
 async function writeRightSizedFiles(dir: string): Promise<void> {
   for (const f of SCREENER_MODEL.files) {
-    const dest = join(dir, f.path);
+    const dest = join(dir, localPathOf(f));
     await mkdir(dirname(dest), { recursive: true });
     await writeFile(dest, "");
     await truncate(dest, f.size);
@@ -55,7 +55,7 @@ describe("SCREENINSTALL: screener state", () => {
     await writeRightSizedFiles(dir);
     const s = await screenerState({ dir, runtimePresent: true });
     expect(s.state).toBe("broken");
-    expect(s.problem).toContain(SCREENER_MODEL.files[0]!.path);
+    expect(s.problem).toContain(localPathOf(SCREENER_MODEL.files[0]!));
   });
 
   it("reports broken — naming the file — when one model file is missing", async () => {
@@ -131,7 +131,7 @@ describe("SCREENINSTALL: a corrupt model is never loaded", () => {
   it("refuses to load from a BROKEN install, naming the file — presence is not integrity", async () => {
     const dir = await mkdtemp(join(tmpdir(), "cello-corrupt-"));
     for (const f of SCREENER_MODEL.files) {
-      const dest = join(dir, f.path);
+      const dest = join(dir, localPathOf(f));
       await mkdir(dirname(dest), { recursive: true });
       await writeFile(dest, "");
       await truncate(dest, f.size); // right size, wrong bytes — what a swapped mirror looks like
@@ -142,7 +142,7 @@ describe("SCREENINSTALL: a corrupt model is never loaded", () => {
     const decision = classifierLoadable(await screenerState({ dir, runtimePresent: true }));
     expect(decision.load).toBe(false);
     expect(decision.reason).toContain("FAILED verification");
-    expect(decision.reason).toContain(SCREENER_MODEL.files[0]!.path);
+    expect(decision.reason).toContain(localPathOf(SCREENER_MODEL.files[0]!));
     await rm(dir, { recursive: true, force: true });
   });
 

@@ -12,15 +12,15 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { loadInjectionClassifier } from "../detect/injection-classifier-onnx.js";
-import { SCREENER_MODEL } from "../detect/screener-model-manifest.js";
+import { SCREENER_MODEL, localPathOf } from "../detect/screener-model-manifest.js";
 import { installModel } from "../detect/model-installer.js";
 
 /** A directory that satisfies `isModelInstalled` — the files exist; contents are irrelevant here. */
 async function fakeModelDir(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "cello-model-"));
   for (const f of SCREENER_MODEL.files) {
-    await mkdir(dirname(join(dir, f.path)), { recursive: true });
-    await writeFile(join(dir, f.path), "x");
+    await mkdir(dirname(join(dir, localPathOf(f))), { recursive: true });
+    await writeFile(join(dir, localPathOf(f)), "x");
   }
   return dir;
 }

@@ -17,7 +17,7 @@ import { mkdir, stat, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { SCREENER_MODEL } from "./screener-model-manifest.js";
+import { SCREENER_MODEL, localPathOf } from "./screener-model-manifest.js";
 
 /** SHA-256 of a file on disk (streamed — never loads the whole 96 MB graph into memory). */
 export function sha256File(path: string): Promise<string> {
@@ -34,7 +34,7 @@ export function sha256File(path: string): Promise<string> {
 export async function isModelInstalled(dir: string): Promise<boolean> {
   for (const f of SCREENER_MODEL.files) {
     try {
-      await stat(join(dir, f.path));
+      await stat(join(dir, localPathOf(f)));
     } catch {
       return false;
     }
@@ -73,7 +73,7 @@ export async function installModel(opts: InstallOptions): Promise<InstallResult>
   for (let i = 0; i < total; i++) {
     const f = SCREENER_MODEL.files[i];
     opts.onProgress?.(f.path, i, total);
-    const dest = join(opts.dir, f.path);
+    const dest = join(opts.dir, localPathOf(f));
     await mkdir(dirname(dest), { recursive: true });
     let res: Response;
     try {

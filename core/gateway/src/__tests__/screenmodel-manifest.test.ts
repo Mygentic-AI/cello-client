@@ -53,3 +53,16 @@ describe("SCREENINSTALL: the screener model manifest", () => {
     expect(SCREENER_MODEL.windowOverlapTokens).toBe(64);
   });
 });
+
+describe("SCREENINSTALL: the superseded manifest is GONE from what ships", () => {
+  it("has no deberta manifest in the built artifact — deadness is proven on dist, not on src", async () => {
+    // A deleted source file leaves its dist/ artifact behind, and the artifact is what an importer
+    // resolves. Asserting absence in src would pass while the old model manifest still shipped.
+    const { readdirSync } = await import("node:fs");
+    const { dirname, join } = await import("node:path");
+    const { fileURLToPath } = await import("node:url");
+    const distDetect = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "dist", "detect");
+    const orphans = readdirSync(distDetect).filter((f) => f.toLowerCase().includes("deberta"));
+    expect(orphans).toEqual([]);
+  });
+});

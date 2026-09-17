@@ -18,6 +18,7 @@ import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
   SCREENER_MODEL,
+  localPathOf,
   describeScreenerState,
   installModel,
   runtimeAvailable,
@@ -79,12 +80,13 @@ export function consentPrompt(): string {
 /** What `--manual` prints. Every value is read from the manifest — a second copy would drift. */
 export function screenerManualInstructions(dir: string): string {
   const files = SCREENER_MODEL.files
-    .map((f) => `  ${f.path}\n    ${SCREENER_MODEL.baseUrl}${f.path}\n    ${f.size} bytes   sha256 ${f.sha256}`)
+    .map((f) => `  save as: ${localPathOf(f)}\n    from:    ${SCREENER_MODEL.baseUrl}${f.path}\n    ${f.size} bytes   sha256 ${f.sha256}`)
     .join("\n");
   return [
     "Manual install. Nothing has been downloaded.",
     "",
-    `1. Download these files from ${SCREENER_MODEL.repo} at revision ${SCREENER_MODEL.revision}:`,
+    `1. Download these files from ${SCREENER_MODEL.repo} at revision ${SCREENER_MODEL.revision}.`,
+    "   The graph is saved under a SHORTER path than it has in the repository — the loader expects it there:",
     "",
     files,
     "",
@@ -211,7 +213,7 @@ export async function screenerInstallCommand(opts: ScreenerInstallOptions): Prom
     repaired = true;
     // Remove the model files before re-fetching: `installModel` no-ops when every path merely
     // EXISTS, so a partial that happens to be complete-looking would never heal itself.
-    await Promise.all(SCREENER_MODEL.files.map((f) => rm(join(dir, f.path), { force: true })));
+    await Promise.all(SCREENER_MODEL.files.map((f) => rm(join(dir, localPathOf(f)), { force: true })));
   }
 
   // Consent. Without it nothing is fetched — not the model, not the runtime.

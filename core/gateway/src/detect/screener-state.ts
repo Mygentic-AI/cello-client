@@ -21,7 +21,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
-import { SCREENER_MODEL } from "./screener-model-manifest.js";
+import { SCREENER_MODEL, localPathOf } from "./screener-model-manifest.js";
 import { sha256File } from "./model-installer.js";
 
 /**
@@ -122,20 +122,20 @@ export async function screenerState(opts: ScreenerStateOptions): Promise<Screene
   const absent: string[] = [];
 
   for (const f of SCREENER_MODEL.files) {
-    const path = join(opts.dir, f.path);
+    const path = join(opts.dir, localPathOf(f));
     let size: number;
     try {
       size = (await stat(path)).size;
     } catch {
-      absent.push(f.path); // judged below: some present + some absent is a half-written install
+      absent.push(localPathOf(f)); // judged below: some present + some absent is a half-written install
       continue;
     }
     present++;
     if (problem !== undefined) continue;
     if (size !== f.size) {
-      problem = `${f.path} is ${size} bytes, expected ${f.size}`;
+      problem = `${localPathOf(f)} is ${size} bytes, expected ${f.size}`;
     } else if (verify && (await sha256File(path)) !== f.sha256) {
-      problem = `${f.path} does not match its pinned SHA-256 — the file is not the one we verified`;
+      problem = `${localPathOf(f)} does not match its pinned SHA-256 — the file is not the one we verified`;
     }
   }
 

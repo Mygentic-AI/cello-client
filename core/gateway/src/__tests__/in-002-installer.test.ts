@@ -9,7 +9,7 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { sha256File, isModelInstalled, installModel } from "../detect/model-installer.js";
-import { SCREENER_MODEL } from "../detect/screener-model-manifest.js";
+import { SCREENER_MODEL, localPathOf } from "../detect/screener-model-manifest.js";
 
 describe("M9-IN-002 model installer", () => {
   let dir: string;
@@ -32,7 +32,7 @@ describe("M9-IN-002 model installer", () => {
   it("isModelInstalled: false on an empty dir, true once every model file is present", async () => {
     expect(await isModelInstalled(dir)).toBe(false);
     for (const f of SCREENER_MODEL.files) {
-      const dest = join(dir, f.path);
+      const dest = join(dir, localPathOf(f));
       await mkdir(dirname(dest), { recursive: true });
       await writeFile(dest, "");
     }
