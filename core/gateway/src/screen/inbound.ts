@@ -96,7 +96,10 @@ export function screeningWarning(findings: ReadonlyArray<{ what: string; why: st
   // Each finding carries WHY, not just what: "override" alone tells an agent a rule fired;
   // "override, found after undoing a disguise (spaced_letters_joined)" tells it what the
   // counterparty did, which is the part worth reporting to an operator.
-  const what = findings.map((f) => (f.why ? `${f.what} (${f.why})` : f.what)).join("; ");
+  // LABELLED, because a bare "override" only means something to a reader who knows our rule names.
+  // `cause=override disguise=spaced_letters_joined` is self-describing: an agent relaying it to an
+  // operator carries the meaning with it (Andre, 2026-09-17).
+  const what = findings.map((f) => (f.why ? `cause=${f.what} disguise=${f.why}` : `cause=${f.what}`)).join("; ");
   const removed = removals.length > 0 ? ` ${removals.join(" ")}` : "";
   // TONE: a warning, not an order and not a disclaimer.
   //
