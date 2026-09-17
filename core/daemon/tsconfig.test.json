@@ -43,6 +43,7 @@
     "src/__tests__/channel-epoch-tick.test.ts",
     "src/__tests__/m16-008-epoch-cap-enforcer.test.ts",
     "src/__tests__/channel-seal-request.test.ts",
+    "src/__tests__/m16-011-seal-request-enforcer.test.ts",
     "src/__tests__/m16-channel-refusal-reason.test.ts",
     "src/__tests__/m16-006-noconverse-enforcer.test.ts",
     "src/__tests__/helpers/signed-assignment.ts",
