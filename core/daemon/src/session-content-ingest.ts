@@ -824,6 +824,25 @@ export class SessionContentIngest {
       ? inboundVerdict.content
       : content;
 
+    // DOD-M9C-SCREENPASSIVE-1: the log says what the AGENT was told. A wrap and a removal change
+    // what the recipient reads, and until now neither left a trace anywhere — an operator asking
+    // "why did my agent see a warning on that message?" had nothing to read. `correlationId` is the
+    // ingest's own, so the finding, the leaf and the delivery are one story.
+    if (inboundVerdict.disposition === "redact") {
+      const findings = (inboundVerdict.events ?? [])
+        .filter((e) => String(e.category).startsWith("injection:"))
+        .map((e) => String(e.category));
+      const removals = (inboundVerdict.events ?? [])
+        .filter((e) => e.disposition === "redact")
+        .map((e) => String(e.category));
+      this.#ctx.logger.info("security.screen.inbound.annotated", {
+        sessionId, contentHashHex, correlationId,
+        findings, removals,
+        deliveredBytes: deliverContent.length,
+        originalBytes: content.length,
+      });
+    }
+
     // screenInbound above is the ONLY suspension point in this method, and it splits the dedup check
     // (indexOfHash, above) from the leaf append (below). Across that await, two concurrent ingests of
     // the SAME content hash — e.g. a direct retry and a park-recovery racing on reconnect — can BOTH

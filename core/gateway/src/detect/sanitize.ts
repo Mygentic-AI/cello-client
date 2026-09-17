@@ -130,9 +130,15 @@ function isSmuggled(cp: number): boolean {
  * INSIDE a flag sequence (🏴󠁧󠁢󠁳󠁣󠁴󠁿 is spelled with them).
  */
 function hasNoLegitimateUse(cp: number, insideFlagSequence: boolean): boolean {
+  // The ruled table says "soft hyphen MID-WORD" and "a byte-order mark INSIDE the text". Both are
+  // removed wherever they appear, and that is deliberate rather than an oversight: a leading BOM is
+  // a file-encoding marker with no meaning in a message body, and a soft hyphen at a word edge is a
+  // hyphenation hint for a renderer nobody here runs. Removing them everywhere keeps one rule
+  // instead of a position-dependent one — and a position-dependent rule is a seam an attacker aims
+  // at. Both removals are reported, so nothing is silent (DOD-M9C-SCREENPASSIVE-1, review F7).
   if (cp === 0x00ad) return true; // soft hyphen — a typesetting hint that breaks word matching
   if (cp === 0x200b) return true; // zero-width space
-  if (cp === 0xfeff) return true; // BOM, mid-text
+  if (cp === 0xfeff) return true; // byte-order mark
   if (cp >= 0x2060 && cp <= 0x2064) return true; // word joiner + invisible operators
   if (cp === 0x202d || cp === 0x202e) return true; // bidi OVERRIDES — display text as what it is not
   if (cp >= 0xe0100 && cp <= 0xe01ef) return true; // variation-selector supplement: the byte channel
@@ -369,6 +375,8 @@ export function stripForgedMarkers(text: string): { text: string; removed: numbe
     const end = visible[hit + m[0].length - 1]!.at;
     for (let i = start; i <= end; i++) drop.add(i);
   }
+  // The forgery is DELETED, not replaced by a space: inserting a character the sender did not send
+  // is a delivery-equality deviation the ruled tables do not list (review F6).
   if (removed === 0) return { text, removed: 0 };
   return { text: chars.filter((_, i) => !drop.has(i)).join(""), removed };
 }
