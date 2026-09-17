@@ -22,6 +22,7 @@
   },
   "dependencies": {
     "@cello-protocol/daemon": "workspace:*",
+    "@cello-protocol/gateway": "workspace:*",
     "@cello-protocol/protocol-types": "workspace:*"
   },
   "devDependencies": {

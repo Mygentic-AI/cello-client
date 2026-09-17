@@ -32,6 +32,8 @@ import {
   type CommandResult,
 } from "./commands.js";
 import { splitAgentFlag } from "./arg-parse.js";
+import { screenerStatusCommand, screenerInstallCommand, screenerManualInstructions } from "./screener-commands.js";
+import { screenerModelDir } from "@cello-protocol/gateway";
 import {
   IPC_METHODS,
   listSessions,
@@ -341,6 +343,38 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       // "Daemon stopped." — the immediate progress line tells the operator the command
       // activated and the short pause is expected.
       return legacy(await logout(ctx.celloDir, ctx.onProgress));
+    },
+  },
+  {
+    name: "screener",
+    group: "Setup",
+    summary: "Install or check the prompt-injection classifier — screening's second layer.",
+    help:
+      "Usage: cello screener status              — is the classifier installed, verified and runnable?\n" +
+      "       cello screener install             — ask, then download the model and its runtime\n" +
+      "       cello screener install --yes       — same, without asking (CI, servers, agent harnesses)\n" +
+      "       cello screener install --manual    — print what to download and where, and fetch nothing\n" +
+      "  CELLO's deterministic rules always run. The classifier is the second layer, and it is not\n" +
+      "  bundled: it is about 241 MB to download and about 618 MB on disk, so it is asked for, never\n" +
+      "  assumed. Every file is checked against its published SHA-256, whoever downloaded it.",
+    flags: [
+      { name: "--yes", consumesValue: false },
+      { name: "--manual", consumesValue: false },
+    ],
+    async run(_ctx, args) {
+      const sub = args.find((a) => !a.startsWith("--")) ?? "";
+      if (sub === "status") return screenerStatusCommand();
+      if (sub === "install") {
+        if (args.includes("--manual")) {
+          return { stdout: screenerManualInstructions(screenerModelDir()) + "\n", stderr: "", exitCode: 0 };
+        }
+        return screenerInstallCommand({
+          assumeYes: args.includes("--yes"),
+          // A prompt with nobody to answer it is a hang, and a hung install reads as a broken one.
+          interactive: process.stdin.isTTY === true,
+        });
+      }
+      return { stdout: "", stderr: "Usage: cello screener <status|install> [--yes|--manual]\n", exitCode: 2 };
     },
   },
   {

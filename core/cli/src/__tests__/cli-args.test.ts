@@ -44,6 +44,8 @@ describe("F1: usage string lists every command", () => {
         "login", "logout", "status", "create-agent", "register-agent", "remove-agent",
         // DOD-M15-BACKUP-1: a lost machine used to lose the agent permanently.
         "backup", "restore",
+        // DOD-M9C-SCREENINSTALL-1: the classifier is asked for, never assumed.
+        "screener",
         // Agents
         "agents", "start-agent", "use-agent", "stop-using-agent", "set-agent-offline", "refresh",
         // Messaging
