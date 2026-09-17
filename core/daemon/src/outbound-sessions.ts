@@ -23,7 +23,7 @@ import type { DbRegistrationPersistence } from "./db-identity-store.js";
 import type { ConsortiumEndpoint } from "./directory-bootstrap.js";
 import type { SessionNegotiator, SessionNegotiationResult } from "./transport-selector.js";
 import { classifyOnlineResult, type DiscoveryOutcome } from "./cross-node-negotiation.js";
-import { parseDiscoveryLookupResult, discoveryLookupErrorReason, parseSessionAssignment, sessionRequestErrorReason, resolveOutboundMoniker } from "./session-assignment-parser.js";
+import { parseDiscoveryLookupResult, discoveryLookupErrorReason, parseSessionAssignment, sessionRequestErrorReason, sessionRequestErrorGuidance, resolveOutboundMoniker } from "./session-assignment-parser.js";
 import { DbIdentityStore } from "./db-identity-store.js";
 import { verifyAssignmentSignature } from "./assignment-verify.js";
 import { createSignalingConnect } from "./signaling-connect.js";
@@ -491,7 +491,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
       }
       if (frame["type"] === "session_request_error") {
         const reason = sessionRequestErrorReason(frame);
-        return { ok: false, reason, guidance: `The directory refused the session request (${reason}). Ensure the counterparty is registered and online.` };
+        return { ok: false, reason, guidance: sessionRequestErrorGuidance(reason) };
       }
       // M12-P18: the COUNTERPARTY refused, and told us why (only KNOWN+ senders get this — a
       // stranger still gets silence, so no block/throttle oracle). Surface their guidance verbatim.

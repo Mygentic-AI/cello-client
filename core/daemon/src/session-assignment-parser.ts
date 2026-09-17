@@ -312,8 +312,29 @@ export function sessionRequestErrorReason(frame: Record<string, unknown>): strin
     // healthy directory and a COUNTERPARTY that declined — the wrong subsystem, which is what makes
     // such bugs cost days.
     "counterparty_did_not_accept",
+    // M16: the initiator or target is a broadcast channel, which never holds a session. Collapsed to
+    // `directory_unreachable`, a caller trying to reach a channel was sent to debug their network.
+    "channel_participant",
+    // M16: the directory could not check whether a side is a channel, and refused rather than broker
+    // unchecked. Its own reason, so a database fault is never reported as "that is a channel".
+    "channel_check_failed",
   ]);
   return typeof reason === "string" && known.has(reason) ? reason : "directory_unreachable";
+}
+
+/**
+ * The guidance returned with a `session_request_error`. Most reasons share one sentence; the M16
+ * channel refusals get their own, because "ensure the counterparty is registered and online" is
+ * the wrong advice for an identity that is online and simply never converses.
+ */
+export function sessionRequestErrorGuidance(reason: string): string {
+  if (reason === "channel_participant") {
+    return "The directory refused the session request (channel_participant): one side is a broadcast channel. Channels publish and never hold sessions. To reach the operator behind a channel, open a session with the channel's admin agent instead.";
+  }
+  if (reason === "channel_check_failed") {
+    return "The directory refused the session request (channel_check_failed): it could not check whether either side is a broadcast channel, and does not broker a session it could not check. Retry; if it repeats, the directory node is failing to read its own records.";
+  }
+  return `The directory refused the session request (${reason}). Ensure the counterparty is registered and online.`;
 }
 
 // ─── The offer-moniker validation seams ──────────────────────────
