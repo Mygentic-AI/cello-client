@@ -1,7 +1,9 @@
 /**
  * The whole-daemon status — what `cello status` at a terminal renders.
  *
- * The widest READ in the daemon, and this module is where that breadth is honest: it takes TWELVE readers and writes nothing — at the order's bound, not under it. The per-connection view is a different surface with a different answer
+ * The widest READ in the daemon, and this module is where that breadth is honest: it takes TWELVE
+ * readers and writes nothing — at the order's bound, not under it. The per-connection view is a
+ * different surface with a different answer
  * (`status-handler.ts`), and the difference is deliberate — collapsing them is how an operator ends
  * up reading another connection's state as their own.
  *
@@ -16,6 +18,7 @@ import type {
   ActiveSessionInfo, AgentInfo, AgentState, DaemonStatusResponse, DirectorySignalingState,
   InterruptedSessionInfo,
 } from "./types.js";
+import { screeningStatus } from "./screening-status.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { RetryQueue } from "./retry-queue.js";
 import type { ConsortiumManifest } from "@cello-protocol/protocol-types";
@@ -52,23 +55,20 @@ export function createDaemonStatusReport(deps: DaemonStatusDeps) {
     manifestProvider, directoryHttpUrl, challengeVerifier, enforcedConsortium,
   } = deps;
 
-  // Build status response factory
   async function getStatus(): Promise<DaemonStatusResponse> {
-    // M7-SESSION-001 AC-006/AC-007: surface interrupted sessions
+    // M7-SESSION-001 AC-006/AC-007: interrupted sessions. DOD-M9C-SCREENINSTALL-1: screening layers.
     const interrupted_sessions: InterruptedSessionInfo[] = buildInterruptedSessions();
+    const screening = await screeningStatus();
 
     return {
       daemon: "running",
+      ...(screening ? { screening } : {}),
       directory_signaling: directorySignalingStatus(),
-      // CAN I ACTUALLY REACH THE DIRECTORY — the same block cello_status carries, and for longer.
-      //
-      // This is the CLI's surface (`cello status`), and it is the one an operator at a terminal
-      // actually runs — it is what was run on 2026-07-31 while every session failed. It was silent,
-      // because this block existed on the MCP tool only. The agent list below says `online` and
-      // `standing_receiver_ready: true` whether or not a single directory endpoint resolves, so
-      // without this the two states render identically and the operator believes the healthy one.
-      //
-      // Omitted entirely when nothing is failing, so a healthy status stays quiet.
+      // CAN I ACTUALLY REACH THE DIRECTORY — the block cello_status carries, here too because this
+      // is what an operator runs: on 2026-07-31 it was silent while every session failed, since the
+      // block existed on the MCP tool only. The agent list below reads `online` and
+      // `standing_receiver_ready: true` whether or not any directory endpoint resolves, so without
+      // this the healthy and broken states render identically. Omitted when nothing is failing.
       ...(unresolvedNodesForStatus() ?? {}),
       // DOD-M15-MANIFEST-EXPIRY-LIVE-1: contributes NOTHING while the manifest is comfortably in
       // window. A field present on every status read for the years a manifest is valid is furniture,

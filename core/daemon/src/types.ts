@@ -194,8 +194,26 @@ export interface ConnectionInfo {
 
 export type DirectorySignalingState = "connected" | "reconnecting" | "lost";
 
+export interface ScreeningStatusInfo {
+  /** `not_installed` | `half_installed` | `broken` | `ready` — the shared four states. */
+  classifier: string;
+  /** The sentence an operator reads, identical to the CLI's and the daemon startup line's. */
+  summary: string;
+  /** Present only when something is wrong, naming the file or the missing half. */
+  problem?: string;
+}
+
 export interface DaemonStatusResponse {
   daemon: "running";
+  /**
+   * DOD-M9C-SCREENINSTALL-1 — which screening layers are actually running.
+   *
+   * Reported in EVERY state, healthy included, for the reason the directory-auth block above is:
+   * "the classifier is on" and "the classifier silently never loaded" otherwise differ only by the
+   * absence of a line, and an operator cannot confirm a defence by failing to find evidence
+   * against it.
+   */
+  screening?: ScreeningStatusInfo;
   directory_signaling: DirectorySignalingState;
   agents: AgentInfo[];
   // No `connections` field: an always-empty placeholder conveys nothing and reads as a mock. The
