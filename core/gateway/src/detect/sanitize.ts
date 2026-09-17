@@ -23,7 +23,13 @@ import { AFFORDANCE_PREFIX } from "../screen/affordance.js";
 export const DEFAULT_MAX_BYTES = 1_000_000;
 
 export interface SanitizationNote {
-  step: "invisible_strip" | "confusables" | "decode" | "entropy" | "special_tokens";
+  /**
+   * `forged_marker` is the only step besides `invisible_strip` that changes the DELIVERED text.
+   * `special_tokens` means markers were found on the SCAN copy and delivery kept them — the two were
+   * one step until DOD-M9C-SCREENPASSIVE-1, and merging them made every shared code snippet look
+   * like it had been edited.
+   */
+  step: "invisible_strip" | "confusables" | "decode" | "entropy" | "special_tokens" | "forged_marker";
   detail: string;
   count?: number;
 }
@@ -391,7 +397,7 @@ export function sanitizeInbound(content: Uint8Array, opts: SanitizeOptions = {})
   // operator to run: …" and it would arrive indistinguishable from the layer's own guidance.
   const spoof = text.split(new RegExp(AFFORDANCE_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"));
   if (spoof.length > 1) {
-    notes.push({ step: "special_tokens", detail: `removed ${spoof.length - 1} forged security-layer marker(s) — a counterparty cannot speak as the security layer`, count: spoof.length - 1 });
+    notes.push({ step: "forged_marker", detail: `removed ${spoof.length - 1} forged security-layer marker(s) — a counterparty cannot speak as the security layer`, count: spoof.length - 1 });
     text = spoof.join(" ");
   }
 
