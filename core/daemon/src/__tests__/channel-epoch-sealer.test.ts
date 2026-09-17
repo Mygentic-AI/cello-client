@@ -195,7 +195,7 @@ describe("M16 008-EPOCH: ChannelEpochSealer", () => {
     await expect(s.sealNow(hex, "c8b")).rejects.toThrow(/epoch_changed/);
     expect(sealStore.latest(hex)).toBeNull();
     expect(log.nextPosition(hex).epoch_index).toBe(0);
-    expect(events.some((e) => e.event === "channel.epoch.seal_failed" && e.ctx["reason"] === "epoch_changed")).toBe(true);
+    expect(events.some((e) => e.event === "channel.epoch.seal_retry" && e.level === "info" && e.ctx["reason"] === "epoch_changed")).toBe(true);
   });
 
   it("markNotarized is the only mutation", async () => {

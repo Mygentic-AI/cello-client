@@ -35,6 +35,12 @@ export type SealRefusal = { sealed: false; reason: "epoch_empty" | "channel_unkn
 
 type Trigger = "explicit" | "cap_age" | "cap_leaves";
 
+/** Errors the sealer has already logged before rethrowing, so a caller does not log them twice. */
+const LOGGED = new WeakSet<object>();
+export function sealerAlreadyLogged(err: unknown): boolean {
+  return typeof err === "object" && err !== null && LOGGED.has(err);
+}
+
 export interface ChannelEpochSealerDeps {
   log: ChannelLogStore;
   sealStore: ChannelEpochSealStore;
@@ -129,11 +135,20 @@ export class ChannelEpochSealer {
         log.closeEpoch(channelPubkeyHex, seal.epoch_root);
       });
     } catch (err) {
-      const reason = err instanceof ChannelLogError ? err.code : extractErrorMessage(err);
-      logger.error("channel.epoch.seal_failed", {
-        correlationId, channel_pubkey: channelPubkeyHex, epoch_index: seal.epoch_index, reason,
-        impact: "nothing was recorded and the epoch stays open; the next seal attempt covers whatever it holds then",
-      });
+      if (err instanceof ChannelLogError && err.code === "epoch_changed") {
+        // The designed compare-and-set refusal on a busy channel, not a fault.
+        logger.info("channel.epoch.seal_retry", {
+          correlationId, channel_pubkey: channelPubkeyHex, epoch_index: seal.epoch_index, reason: err.code,
+          impact: "a publish landed while the seal was being signed; nothing was recorded and the next attempt seals the larger epoch",
+        });
+      } else {
+        const reason = err instanceof ChannelLogError ? err.code : extractErrorMessage(err);
+        logger.error("channel.epoch.seal_failed", {
+          correlationId, channel_pubkey: channelPubkeyHex, epoch_index: seal.epoch_index, reason,
+          impact: "nothing was recorded and the epoch stays open; the next seal attempt covers whatever it holds then",
+        });
+      }
+      if (typeof err === "object" && err !== null) LOGGED.add(err);
       throw err;
     }
 
