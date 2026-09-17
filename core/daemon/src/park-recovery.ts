@@ -779,6 +779,23 @@ export class ParkRecovery {
     if (result.ok && result.held !== true && result.screenedOut !== true) {
       this.#ctx.sendDeliveryAck(agentName, sessionId, contentHash, correlationId);
     }
+    /**
+     * Move the acknowledgement a CLOSE will sign, exactly as the live content-frame path does.
+     *
+     * This was declared on the context and never called, so a message recovered from the mailbox
+     * was placed in the tree while the acknowledgement stayed at the last message the relay had
+     * delivered directly. The relay refuses a close that acknowledges less than the other side filed
+     * (`seal_stale`), and the close's retry waits for an advance nothing on this path makes. Live
+     * 2026-09-17, session 4d0aaa41: back from 7 minutes offline, the agent read the message and could
+     * not close, twice.
+     *
+     * Gated on `held` but NOT on `screenedOut`: a screened-out message is still a leaf in the root
+     * the close signs, so its position is one this side has to acknowledge. `recoveredSeq` null means
+     * no verified ordering record, and there is no position to claim.
+     */
+    if (result.ok && result.held !== true && recoveredSeq !== null) {
+      this.#ctx.noteAcknowledgeable(agentName, sessionId, recoveredSeq, contentHash);
+    }
     return result;
   }
   /**

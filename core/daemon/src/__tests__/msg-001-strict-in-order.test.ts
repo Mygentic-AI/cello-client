@@ -31,7 +31,7 @@ import type { Stream } from "@libp2p/interface";
 import { generateKeypair } from "@cello-protocol/crypto";
 import { buildStructure2, encodeStructure2 } from "@cello-protocol/protocol-types";
 import { encodeStructure1 } from "@cello-protocol/protocol-types";
-import { encodeParkEnvelope } from "../park-envelope.js";
+import { encodeParkEnvelope, sealParkEnvelope } from "../park-envelope.js";
 import { seedAgents } from "./helpers/seed-agents.js";
 import { TEST_SESSION_GENESIS } from "./helpers/session-genesis.js";
 import { receivedCount, receivedRows } from "./helpers/received-rows.js";
@@ -415,6 +415,38 @@ describe("DOD-MSG-4: ordering-record verification is adversarially exercised", (
       (db.prepare("SELECT relay_seq AS seq FROM session_recovered_positions WHERE session_id = ? ORDER BY relay_seq").all(sid) as Array<{ seq: number }>).map((r) => r.seq),
       "both recovered messages must hold a position, or the seal answer reports a mismatch on a correct seal",
     ).toEqual([1, 2]);
+  });
+
+  /**
+   * Live 2026-09-17, session 4d0aaa41: Hermes was cut off the network for 7 minutes while the Mac
+   * sent it a message. On return it took that message from the mailbox, read it, and then could not
+   * close — refused `seal_stale` twice. It sealed only because the Mac closed.
+   *
+   * The relay refuses a close whose acknowledgement is behind the last message the other side filed.
+   * Recovery placed the message at its position but never moved the acknowledgement, so the close
+   * claimed position 1 against a message at 4, and the retry waited for an advance nothing makes.
+   */
+  it("★★★ a message recovered from the mailbox moves the acknowledgement a close will claim", async () => {
+    const kp = generateKeypair();
+    const mgr = await managerWithCounterparty(kp, "recovered-ack.db");
+    const recipient = generateKeypair();
+    const recipientPub = await recipient.getPublicKey();
+    const content = enc("sent while you were offline");
+    // Position 1, so it is the next leaf this side expects and is appended rather than held.
+    const rec = await buildRecord(kp, content, 1);
+    const structure1Signature = await kp.sign(rec.structure1Cbor);
+    const sealed = await sealParkEnvelope({
+      signer: kp, sessionIdHex: sid, recipientPubkey: recipientPub, content, contentHash: rec.contentHash,
+      structure1Cbor: rec.structure1Cbor, structure2Cbor: rec.structure2Cbor, structure1Signature,
+    });
+    const plaintext = await recipient.openContentSeal!(sealed);
+    const res = await mgr.recoverParkedEntry("alice", sid, recipientPub, plaintext!, rec.contentHash, "corr");
+    expect(res.ok, "the parked message is accepted").toBe(true);
+
+    expect(
+      mgr.getDb().prepare("SELECT relay_seq AS seq, hash_hex AS hash FROM session_last_ack WHERE session_id = ?").get(sid),
+      "a close signs this position; if it stays behind a message this side has read, the relay refuses the close as stale",
+    ).toEqual({ seq: 1, hash: Buffer.from(rec.contentHash).toString("hex") });
   });
 
   it("an UNVERIFIED mailbox ordering record keeps no position", async () => {
