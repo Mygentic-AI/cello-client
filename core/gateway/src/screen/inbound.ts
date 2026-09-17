@@ -92,7 +92,10 @@ export class InboundScreener {
 
     // Only steps that change the DELIVERED text are `redact`; decode (detection-only) and entropy
     // are advisory `observe` notes on otherwise-unchanged content (M1 review).
-    const MUTATING = new Set(["invisible_strip", "confusables", "special_tokens"]);
+    // `special_tokens` stays in this set for ONE case: the layer's own affordance prefix, which is
+    // removed from delivery so a counterparty cannot speak as the security layer. Every other marker
+    // is delivered as written.
+    const MUTATING = new Set(["invisible_strip", "special_tokens"]);
     const events: GovernanceEvent[] = r.notes.map((n) => ({
       stage: "sanitize",
       disposition: MUTATING.has(n.step) ? "redact" : "observe",
@@ -100,9 +103,15 @@ export class InboundScreener {
       reason: n.detail,
     }));
 
-    // The text the agent would actually see — sanitized (confusables normalized, invisibles stripped).
-    // The injection scanner judges THIS, not the raw bytes: a confusable-Latin word is Latin here.
+    // DOD-M9C-SCREENPASSIVE-1: two texts, two jobs.
+    //
+    // `deliveredText` is what the counterparty sent, minus only codepoints with no legitimate use —
+    // it is what the agent receives, and it is NOT rewritten (that is what corrupted emoji, Greek
+    // and shared code). `scanText` is the detection copy: invisibles stripped, lookalikes folded,
+    // markers removed, encodings decoded. The classifier judges the SCAN copy, because a
+    // confusable-Latin word must be judged as the Latin it imitates.
     const deliveredText = r.text;
+    const scanText = r.decodedForScan;
 
     // IN-003: language allowlist. A message confidently in a non-allowlisted script (default: only
     // Latin/English) is held — a TERMINAL block (the same bytes are the same language on redelivery).
@@ -134,7 +143,7 @@ export class InboundScreener {
     // IN-002: semantic injection scanner (Layer-2). Off when no model is loaded — available()===false,
     // so the call short-circuits and inbound behaviour is unchanged until the model is installed.
     if (this.#injection.available()) {
-      const scan = await this.#injection.scan(deliveredText);
+      const scan = await this.#injection.scan(scanText);
       if (scan.verdict === "block") {
         return {
           disposition: "block",
@@ -201,6 +210,8 @@ export class InboundScreener {
       }
     }
 
+    // Only a step that actually changed the DELIVERED bytes is a `redact`. Confusables and the
+    // marker strip no longer do — they run on the scan copy — so they are `observe` notes now.
     const mutated = r.notes.some((n) => MUTATING.has(n.step));
     return {
       disposition: mutated ? "redact" : "allow",

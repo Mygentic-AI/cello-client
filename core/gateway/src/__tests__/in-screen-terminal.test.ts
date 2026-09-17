@@ -40,14 +40,18 @@ describe("M9-IN-003 live wiring — language allowlist as a terminal block", () 
     expect(v.terminal).toBeUndefined();
   });
 
-  it("a mostly-Latin message with confusable lookalikes → delivered, not held", async () => {
+  it("a mostly-Latin message with confusable lookalikes → delivered AS WRITTEN, not held", async () => {
     // 'ѕуѕтем' is Cyrillic confusables for 'system'. The language stage reads the text as WRITTEN
     // (027-SCREENORDER), and as written this is 27 Latin letters to 6 Cyrillic — dominantly Latin,
-    // so it is allowed on its own merits, not because normalization hid the Cyrillic. It takes the
-    // inbound-redact path: normalized, then delivered.
-    const v = await new InboundScreener().screen(enc("the role ѕуѕтем looks fine to me overall"));
-    expect(v.disposition).toBe("redact");
-    expect(new TextDecoder().decode(v.content)).toBe("the role system looks fine to me overall");
+    // so it is allowed on its own merits, not because normalization hid the Cyrillic.
+    //
+    // DOD-M9C-SCREENPASSIVE-1: it is now delivered unchanged, with the lookalikes reported. The
+    // agent sees the trick; rewriting it is what corrupted real Greek and Cyrillic prose.
+    const sent = "the role ѕуѕтем looks fine to me overall";
+    const v = await new InboundScreener().screen(enc(sent));
+    expect(v.disposition).not.toBe("block");
+    expect(new TextDecoder().decode(v.content)).toBe(sent);
+    expect(v.events.some((e) => e.category === "sanitize:confusables")).toBe(true);
   });
 });
 
