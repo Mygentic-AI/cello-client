@@ -38,6 +38,7 @@
     "src/__tests__/m16-004-channel-register-enforcer.test.ts",
     // M16 006-NOCONVERSE. New and clean on creation.
     "src/__tests__/m16-noconverse.test.ts",
+    "src/__tests__/m16-006-noconverse-enforcer.test.ts",
     "src/__tests__/helpers/signed-assignment.ts",
     "src/__tests__/dod-m15-bootstrap-auth-1-poisoned-coordinate.test.ts",
     "src/__tests__/dod-m15-relayleak-1.test.ts",
