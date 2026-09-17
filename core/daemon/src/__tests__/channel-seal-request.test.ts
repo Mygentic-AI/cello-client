@@ -146,6 +146,12 @@ describe("M16 011-SEALREQ: ChannelSealRequestGate", () => {
     await publish(ch, 1);
     const r = await g.requestSeal(ch, "publisher", "r4b");
     expect(r).toMatchObject({ honored: true, epoch_index: 0, leaf_count: 1 });
+
+    // With a seal present, the empty reply reports it — never hard-coded nulls.
+    clock += HOUR;
+    const afterSeal = await g.requestSeal(ch, "publisher", "r4c");
+    if (!r.honored) throw new Error("expected honored");
+    expect(afterSeal).toEqual({ honored: false, reason: "epoch_empty", latest_epoch_index: 0, latest_epoch_root: r.epoch_root });
   });
 
   it("publisher and subscriber share one window", async () => {
@@ -220,10 +226,15 @@ describe("M16 011-SEALREQ: the cello_channel_seal IPC verb", () => {
       keyBinding: "cd".repeat(64), channel: true, adminPubkey: "ef".repeat(32),
     });
     await publish(hex, 2);
-    const r = (await handler()({ agent: "news" }, "conn-1")) as Record<string, unknown>;
+    const h = handler();
+    const r = (await h({ agent: "news" }, "conn-1")) as Record<string, unknown>;
     const latest = sealStore.latest(hex);
     expect(latest).not.toBeNull();
     expect(r).toEqual({ honored: true, epoch_index: 0, epoch_root: hx(latest!.epoch_root), leaf_count: 2 });
     expect(events.find((e) => e.event === "channel.seal_request.honored")?.ctx["requester"]).toBe("publisher");
+
+    clock += HOUR;
+    const empty = (await h({ agent: "news" }, "conn-1")) as Record<string, unknown>;
+    expect(empty).toEqual({ honored: false, reason: "epoch_empty", latest_epoch_index: 0, latest_epoch_root: hx(latest!.epoch_root) });
   });
 });
