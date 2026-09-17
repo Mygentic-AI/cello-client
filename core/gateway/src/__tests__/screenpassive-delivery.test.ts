@@ -122,6 +122,8 @@ describe("SCREENPASSIVE: detection did not get weaker", () => {
     expect(delivered.startsWith("[cello security layer, local]")).toBe(true);
     expect(delivered).toContain("FLAGGED and NOT blocked");
     expect(delivered).toContain("override");
+    // …and WHY it fired: the disguise that was undone, which is the part worth relaying.
+    expect(delivered).toMatch(/override \([a-z_0-9]+\)/);
   });
 
   it("the warning does NOT quote the unmasked attack back at the agent", async () => {
