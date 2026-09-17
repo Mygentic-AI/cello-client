@@ -13,8 +13,7 @@
  *  1. `main` has moved. Remeasured 2026-09-12: 87 registered, 14 of them `cello_doc_*`, so 73 off.
  *  2. **Every daemon in this file starts with `CELLO_ENV=test`, which registers 13 verbs from
  *     `test-handlers.ts` that an operator's socket never answers.** So neither 87 nor 73 is what an
- *     operator sees; the production surface is 75 on and 61 off — 76 and 62 since M16 011-SEALREQ
- *     added `cello_channel_seal`.
+ *     operator sees; the production surface is 76 on and 62 off.
  *
  * Pinning a clause to a test-env total is how a magic number gets "fixed" by editing it the next time
  * an unrelated verb is added. So the counts asserted below EXCLUDE the test-only verbs, and the three

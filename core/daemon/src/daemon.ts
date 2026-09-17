@@ -1326,7 +1326,7 @@ async function startDaemonHoldingLock(
   restartSealResolver.start();
 
   // 040-DAEMONROOT unit 9: the revival-bound sweep and its re-arming timer → boot-sweeps.ts.
-  const { revivalBoundSweepTimer } = startBootSweeps({ logger, sessionNodeManager }); const channelEpochTick = startChannelEpochTick({ logger, sessionNodeManager, agents, getKeyProvider: (n) => keyProviders.get(n) }); registerChannelSealHandler({ handlers, logger, sessionNodeManager, getKeyProvider: (n) => keyProviders.get(n) }); // M16 008: the epoch cap; 011: the requested seal
+  const { revivalBoundSweepTimer } = startBootSweeps({ logger, sessionNodeManager }); const channelEpochTick = startChannelEpochTick({ logger, sessionNodeManager, agents, getKeyProvider: (n) => keyProviders.get(n) }); registerChannelSealHandler({ handlers, logger, sessionNodeManager, getKeyProvider: (n) => keyProviders.get(n) }); // M16: the epoch cap, and the rate-limited early seal
 
   /**
    * The live handler map.
