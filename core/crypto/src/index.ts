@@ -13,6 +13,7 @@ export {
 export { hash, msgLeafHash, nodeHash, ctrlLeafHash, docLeafHash, rejectLeafHash, opaqueLeafHash, buildRelayAckTbs, RELAY_ORDER_DOMAIN } from "./hashing.js";
 export type { MerkleTree, LeafInput } from "./merkle.js";
 export { buildMerkleTree, merkleRoot, inclusionProof, verifyInclusion } from "./merkle.js";
+export { consistencyProof, verifyConsistency } from "./consistency.js";
 export type {
   IThresholdSigner,
   ThresholdSignature,
