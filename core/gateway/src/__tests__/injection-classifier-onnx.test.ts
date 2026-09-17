@@ -113,7 +113,7 @@ describe("the classifier reports P(injection), not P(whatever won)", () => {
     // A fabricated 0 would leave the gateway reporting Layer 2 as available while blocking nothing
     // — strictly worse than reporting it off, because nothing would say so.
     const c = await withScores([{ label: "LABEL_0", score: 0.5 }]);
-    await expect(c.classify("x")).rejects.toThrow(/no INJECTION or SAFE label/);
+    await expect(c.classify("x")).rejects.toThrow(/no INJECTION, BENIGN or SAFE label/);
   });
 });
 
