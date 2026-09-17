@@ -123,6 +123,14 @@ describe("M16 003-SEALTYPE: channel-epoch-seal receipt", () => {
     for (const [name, variant] of variants) {
       expect(verifyChannelEpochSealSignature(variant), name).toBe(false);
     }
+    // Hand-built garbage is false, never a throw. Review LOW-1.
+    const garbage: [string, unknown][] = [
+      ["null seal", null],
+      ["symbol epoch_index", { ...seal, epoch_index: Symbol("x") }],
+    ];
+    for (const [name, g] of garbage) {
+      expect(verifyChannelEpochSealSignature(g as ChannelEpochSeal), name).toBe(false);
+    }
   });
 
   it("notarization is OUTSIDE the publisher's signature", async () => {
@@ -159,7 +167,8 @@ describe("M16 003-SEALTYPE: channel-epoch-seal receipt", () => {
     }
     // The float case is a second byte form of a VALID seal: it must be the encoding refused.
     const floatResult = decodeChannelEpochSeal(floatLeafCount(seal));
-    if (!floatResult.ok) expect(floatResult.detail).toBe("non-canonical encoding");
+    expect(floatResult.ok).toBe(false);
+    expect(floatResult.ok ? "" : floatResult.detail).toBe("non-canonical encoding");
   });
 
   it("epoch 0 shape", async () => {
@@ -211,6 +220,27 @@ describe("M16 003-SEALTYPE: channel-epoch-seal receipt", () => {
       }
     });
 
+    it("chain link refuses hand-built malformed seals without throwing", async () => {
+      // Review MEDIUM: a seal built by hand, not decoded, must neither crash the check nor pass
+      // a link over values no real seal can hold.
+      const { a, b } = await pair();
+      const cases: [string, unknown, unknown][] = [
+        ["channel_mismatch", { ...a, channel_pubkey: undefined }, b],
+        ["channel_mismatch", a, null],
+        ["channel_mismatch", null, b],
+        ["epoch_index_not_next", { ...a, epoch_index: -1 }, { ...b, epoch_index: 0 }],
+        ["epoch_index_not_next", { ...a, epoch_index: 0.5 }, { ...b, epoch_index: 1.5 }],
+        ["prev_root_mismatch", { ...a, epoch_root: "not bytes" }, { ...b, prev_epoch_root: "not bytes" }],
+        ["seq_not_contiguous", { ...a, first_seq: 1.5, leaf_count: 4.5 }, b],
+        ["seq_not_contiguous", { ...a, first_seq: 0, leaf_count: 6 }, b],
+      ];
+      for (const [reason, prev, next] of cases) {
+        const result = checkEpochChainLink(prev as ChannelEpochSeal, next as ChannelEpochSeal);
+        expect(result.ok, reason).toBe(false);
+        expect(result.ok ? "" : result.reason, reason).toBe(reason);
+      }
+    });
+
     it("a gap hidden between epochs is caught", async () => {
       const { kp, a, bFields } = await pair();
       // A covers seqs 1..5. B claims to start at 8, silently dropping 6 and 7.
@@ -227,11 +257,16 @@ describe("M16 003-SEALTYPE: channel-epoch-seal receipt", () => {
     await expect(
       signChannelEpochSeal(kp, makeSealFields({ epoch_index: 1, prev_epoch_root: null })),
     ).rejects.toThrow(RangeError);
+    await expect(
+      signChannelEpochSeal(kp, makeSealFields({ epoch_root: new Uint8Array(31) })),
+    ).rejects.toThrow(/bad_epoch_root/);
   });
 
   it("the honesty statement is exported and immutable in shape", () => {
+    expect(CHANNEL_EPOCH_SEAL_ATTESTS.attests).toBe("publisher-commitment");
     expect(CHANNEL_EPOCH_SEAL_ATTESTS.counterparty_approved).toBe(false);
     expect(CHANNEL_EPOCH_SEAL_ATTESTS.disclaimer).toContain("No counterparty");
+    expect(Object.isFrozen(CHANNEL_EPOCH_SEAL_ATTESTS)).toBe(true);
   });
 
   it("the TBS slot order is pinned against the spec", async () => {

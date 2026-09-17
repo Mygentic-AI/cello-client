@@ -29,14 +29,15 @@ import { encodeCbor, decodeCbor } from "./cbor.js";
 export const CHANNEL_EPOCH_SEAL_DOMAIN = "cello-channel-epoch-seal-v1";
 
 /** What this receipt proves, and what it does not. Rendered wherever the receipt is shown. */
-export const CHANNEL_EPOCH_SEAL_ATTESTS = {
+// Frozen, not only `as const`: the claim must not be strengthened at runtime either.
+export const CHANNEL_EPOCH_SEAL_ATTESTS = Object.freeze({
   attests: "publisher-commitment",
   counterparty_approved: false,
   disclaimer:
     "One-party record. The publisher committed to this exact epoch tree, and the directory " +
     "consortium notarized that the commitment existed at this time. No counterparty approved " +
     "the contents; notarization attests existence and timing, not truth.",
-} as const;
+} as const);
 
 const PUBKEY_BYTES = 32;
 const ROOT_BYTES = 32;
@@ -224,24 +225,54 @@ function bytesEqual(x: Uint8Array, y: Uint8Array): boolean {
   return true;
 }
 
+function isObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null;
+}
+
 /**
  * Checks the PUBLISHER's signature only. It does not check the notarization: that needs the
- * consortium key and lands in Tier 1. Never throws: crypto's `verify` returns false on any failure.
+ * consortium key and lands in Tier 1. Never throws: a hand-built seal with a field the encoder
+ * cannot take is false before the TBS is built, and crypto's `verify` returns false on failure.
  */
 export function verifyChannelEpochSealSignature(s: ChannelEpochSeal): boolean {
+  if (!isObject(s) || checkTbsFields(s) !== null || !isBytes(s.publisher_signature, SIGNATURE_BYTES)) {
+    return false;
+  }
   return verify(s.channel_pubkey, buildChannelEpochSealTbs(s), s.publisher_signature);
+}
+
+function isIndex(v: unknown): v is number {
+  return Number.isSafeInteger(v) && (v as number) >= 0;
+}
+
+function isPositive(v: unknown): v is number {
+  return Number.isSafeInteger(v) && (v as number) >= 1;
 }
 
 /**
  * Structure only, no crypto: does `next` directly follow `prev` on the same channel? A dropped
  * artifact between two epochs shows up as `seq_not_contiguous`. Returns the first failure.
+ *
+ * Never throws. A hand-built seal holding a value no real seal can hold (a missing pubkey, a
+ * negative or fractional index or sequence number) fails the comparison that reads that field,
+ * under that comparison's reason, rather than crashing or linking.
  */
 export function checkEpochChainLink(
   prev: ChannelEpochSeal,
   next: ChannelEpochSeal,
 ): { ok: true } | { ok: false; reason: EpochChainReason; detail: string } {
-  if (!bytesEqual(prev.channel_pubkey, next.channel_pubkey)) {
+  if (!isObject(prev) || !isObject(next)) {
+    return { ok: false, reason: "channel_mismatch", detail: "both arguments must be seal objects" };
+  }
+  if (
+    !isBytes(prev.channel_pubkey, PUBKEY_BYTES) ||
+    !isBytes(next.channel_pubkey, PUBKEY_BYTES) ||
+    !bytesEqual(prev.channel_pubkey, next.channel_pubkey)
+  ) {
     return { ok: false, reason: "channel_mismatch", detail: "the two seals belong to different channels" };
+  }
+  if (!isIndex(prev.epoch_index) || !isIndex(next.epoch_index)) {
+    return { ok: false, reason: "epoch_index_not_next", detail: "epoch_index must be a safe integer >= 0 on both seals" };
   }
   if (next.epoch_index !== prev.epoch_index + 1) {
     return {
@@ -250,8 +281,19 @@ export function checkEpochChainLink(
       detail: `expected epoch_index ${prev.epoch_index + 1}, got ${next.epoch_index}`,
     };
   }
-  if (next.prev_epoch_root === null || !bytesEqual(next.prev_epoch_root, prev.epoch_root)) {
+  if (
+    !isBytes(prev.epoch_root, ROOT_BYTES) ||
+    !isBytes(next.prev_epoch_root, ROOT_BYTES) ||
+    !bytesEqual(next.prev_epoch_root, prev.epoch_root)
+  ) {
     return { ok: false, reason: "prev_root_mismatch", detail: "prev_epoch_root does not match the previous epoch_root" };
+  }
+  if (!isPositive(prev.first_seq) || !isPositive(prev.leaf_count) || !isPositive(next.first_seq)) {
+    return {
+      ok: false,
+      reason: "seq_not_contiguous",
+      detail: "first_seq and leaf_count must be safe integers >= 1",
+    };
   }
   if (next.first_seq !== prev.first_seq + prev.leaf_count) {
     return {
