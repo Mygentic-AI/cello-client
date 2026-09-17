@@ -31,10 +31,11 @@ describe("loadInjectionClassifier — never a silent null", () => {
     const load = await loadInjectionClassifier(dir);
     expect(load.classifier).toBeNull();
     expect(load.reason).toContain("OFF");
-    // The installer has no CLI caller yet. Pointing at `cello gateway install-model` would be the
-    // same defect this branch fixed in cello_doc_remove's description: guidance naming a verb
-    // nobody built. It names the environment variable an operator can actually set.
+    // It names the command that now EXISTS (DOD-M9C-SCREENINSTALL-1 built it) and the environment
+    // variable for an operator who placed the files themselves. `cello gateway install-model` was
+    // the old invented verb and must never come back.
     expect(load.reason).not.toContain("install-model");
+    expect(load.reason).toContain("cello screener install");
     expect(load.reason).toContain("CELLO_GATEWAY_MODEL_DIR");
   });
 

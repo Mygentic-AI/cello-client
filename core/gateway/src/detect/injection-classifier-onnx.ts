@@ -60,12 +60,13 @@ export async function loadInjectionClassifier(
   if (!(await isModelInstalled(modelDir))) {
     return {
       classifier: null,
-      // NAMES WHAT EXISTS. Pointing at a command nobody built is the same defect this branch fixed in
-    // cello_doc_remove's tool description; the installer has no CLI caller yet, so say so.
-    reason:
-      `no model at ${modelDir} — semantic injection screening is OFF. The weights are not fetched ` +
-      `by any command yet (DOD-DOC-SCREEN-CLASSIFIER-1 owes one); set CELLO_GATEWAY_MODEL_DIR to a ` +
-      `directory holding them to enable it`,
+      // NAMES WHAT EXISTS. This used to say the weights were "not fetched by any command yet",
+      // which was true and is no longer: DOD-M9C-SCREENINSTALL-1 built the command. Guidance that
+      // names a verb nobody built is a defect; so is guidance that outlives the gap it described.
+      reason:
+        `no model at ${modelDir} — semantic injection screening is OFF. Install it with ` +
+        `'cello screener install' (about 241 MB), or set CELLO_GATEWAY_MODEL_DIR to a directory ` +
+        `that already holds the model files`,
     };
   }
 

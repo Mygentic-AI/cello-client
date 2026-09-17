@@ -12,6 +12,7 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { SCREENER_MODEL, screenerState, describeScreenerState } from "@cello-protocol/gateway";
 import type { ScreeningStatusInfo } from "../types.js";
+import { screeningSessionNoticeFrom } from "../screening-status.js";
 
 /** Exactly what `daemon-status-report.ts` builds, kept in one place so the shape is asserted once. */
 function toScreeningInfo(s: Awaited<ReturnType<typeof screenerState>>): ScreeningStatusInfo {
@@ -53,5 +54,29 @@ describe("SCREENINSTALL: cello_status screening block", () => {
     });
     expect(info.classifier).toBe("ready");
     expect(info.summary).toContain("2 of 2 layers");
+  });
+});
+
+describe("SCREENINSTALL: the per-session notice", () => {
+  it("is silent when both layers are running", async () => {
+    // A notice on a healthy inbox is furniture, and furniture is what teaches readers to skip.
+    const notice = await screeningSessionNoticeFrom(async () => ({ classifier: "ready", summary: "2 of 2" }));
+    expect(notice).toBeUndefined();
+  });
+
+  it("names the state and the command while the classifier is absent", async () => {
+    const notice = await screeningSessionNoticeFrom(async () => ({ classifier: "not_installed", summary: "x" }));
+    expect(notice).toContain("1 of 2 layers");
+    expect(notice).toContain("cello screener install");
+  });
+
+  it("fires for a BROKEN classifier too — broken is not running", async () => {
+    const notice = await screeningSessionNoticeFrom(async () => ({ classifier: "broken", summary: "x", problem: "y" }));
+    expect(notice).toBeDefined();
+  });
+
+  it("stays silent rather than throwing when the check itself fails", async () => {
+    const notice = await screeningSessionNoticeFrom(async () => undefined);
+    expect(notice).toBeUndefined();
   });
 });

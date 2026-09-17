@@ -16,6 +16,7 @@ import type { Logger } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
 import type { InboundSessionEvent, ExpiredSessionRequest, RefusedSessionRequest } from "./inbound-sessions.js";
 import { resolveNamedAgent } from "./resolve-named-agent.js";
+import { screeningSessionNotice } from "./screening-status.js";
 import type { AgentInfo } from "./types.js";
 import { extractErrorMessage } from "./error-message.js";
 
@@ -338,6 +339,10 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
       agentNames = [current];
     }
 
+    // DOD-M9C-SCREENINSTALL-1: read once per poll, not once per agent — the answer is the machine's,
+    // not the agent's, and it is cached for a minute inside screeningStatus.
+    const screeningNotice = await screeningSessionNotice();
+
     const agents = agentNames.map((agent) => {
       reapExpiredInboundSessions(agent); // M8C-TTL-1: expired ones surface below, not as "pending"
       // DOD-M12B-INBOX-TRUTH-1: `accepted` is not decoration — it is the correction. Everything in
@@ -444,6 +449,10 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
         // it may not read.
         return {
           agent, pending_session_requests: pending, expired_session_requests: expired,
+          // DOD-M9C-SCREENINSTALL-1: an agent reading inbound content is told which screening
+          // layers judged it. Only when something arrived, and only while a layer is missing — a
+          // healthy inbox stays quiet, and a notice on an empty one is furniture.
+          ...(screeningNotice && (pending.length > 0 || unread.length > 0) ? { screening_notice: screeningNotice } : {}),
           ...pendingGuidance, ...expiredGuidance,
           // DOD-M12B-INBOX-TRUTH-1 (found while fixing the above): `refused_session_requests` was
           // present on the other return and absent here, so an agent that happened to have any
@@ -495,7 +504,9 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
               "cello_close_session. Check `status` and `notarized` per entry — do not treat this list as one kind.",
         };
       }
-      return { agent, pending_session_requests: pending, expired_session_requests: expired, ...pendingGuidance, ...expiredGuidance, ...(refused.length > 0 ? { refused_session_requests: refused } : {}), unread, total_unread, rename_notices, ...documentSection(agent), ...witnessSection(agent), ...refusalSection(agent, connectionId) };
+      return { agent, pending_session_requests: pending, expired_session_requests: expired,
+        ...(screeningNotice && (pending.length > 0 || unread.length > 0) ? { screening_notice: screeningNotice } : {}),
+        ...pendingGuidance, ...expiredGuidance, ...(refused.length > 0 ? { refused_session_requests: refused } : {}), unread, total_unread, rename_notices, ...documentSection(agent), ...witnessSection(agent), ...refusalSection(agent, connectionId) };
     });
 
     const totalUnread = agents.reduce((sum, a) => sum + a.total_unread, 0);
