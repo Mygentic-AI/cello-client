@@ -14,7 +14,6 @@ import { generateKeypair } from "@cello-protocol/crypto";
 import type { InMemoryKeyProvider } from "@cello-protocol/crypto";
 import { signBroadcastArtifact } from "@cello-protocol/protocol-types";
 import { ChannelLogStore } from "../channel-log-store.js";
-import { ChannelEpochSealStore } from "../channel-epoch-seal-store.js";
 import { EPOCH_MAX_AGE_MS } from "../channel-epoch-sealer.js";
 import { CHANNEL_EPOCH_TICK_MS, channelEpochTickIntervalMs, startChannelEpochTick } from "../channel-epoch-tick.js";
 import { DbIdentityStore, DbRegistrationPersistence } from "../db-identity-store.js";
