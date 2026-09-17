@@ -82,7 +82,7 @@ import { sendDeliveryAck } from "./session-delivery-acks.js";
 import { SESSION_CLOSED_REASON, sessionClosedState } from "./session-closed.js";
 import { StandingReceivers } from "./standing-receivers.js";
 import { RelayReceiptStore } from "./relay-receipt-store.js";
-import { SessionSealLeafStore } from "./session-seal-leaf-store.js"; import { storeRecoveredPosition } from "./recovered-position.js";
+import { SessionSealLeafStore } from "./session-seal-leaf-store.js"; import { storeRecoveredPosition } from "./recovered-position.js"; import { ChannelLogStore } from "./channel-log-store.js";
 import { SessionOwnChainStore } from "./session-own-chain-store.js";
 import type { SealFrontierLeaf } from "./seal-frontier-verify.js";
 import { type SecurityGatewayClient } from "@cello-protocol/gateway";
@@ -142,6 +142,7 @@ export class SessionNodeManager {
   #relayReceiptStore: RelayReceiptStore | null = null;
   /** FED-OPTIONB-SEAL-001: the per-session leaf log (both parties) carried at a unilateral seal. */
   #sealLeafStore: SessionSealLeafStore | null = null;
+  #channelLogStore: ChannelLogStore | null = null; /** M16 007-PUBLOG: every artifact a local channel published, beside the seal-leaf log. */ getChannelLogStore(): ChannelLogStore { return (this.#channelLogStore ??= new ChannelLogStore(this.getDb(), this.#logger)); }
   /** `DOD-M15-SELFCHAIN-1` — this agent's own last message per session, so the next one links to it. */
   #ownChainStore: SessionOwnChainStore | null = null;
   // M9-CORE-001: the inbound screening seam. Every byte that reaches the agent passes

@@ -38,6 +38,7 @@
     "src/__tests__/m16-004-channel-register-enforcer.test.ts",
     // M16 006-NOCONVERSE. New and clean on creation.
     "src/__tests__/m16-noconverse.test.ts",
+    "src/__tests__/channel-log-store.test.ts",
     "src/__tests__/m16-channel-refusal-reason.test.ts",
     "src/__tests__/m16-006-noconverse-enforcer.test.ts",
     "src/__tests__/helpers/signed-assignment.ts",
