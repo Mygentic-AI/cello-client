@@ -38,6 +38,14 @@ function makeFields(overrides: Partial<Fields> = {}): Fields {
   };
 }
 
+/** Epoch-first shape with supersedes set: no two adjacent optional slots hold equal values. */
+const DISTINCT_SLOTS: Partial<Fields> = {
+  seq: 3,
+  epoch_index: 1,
+  supersedes: 2,
+  prev_epoch_root: new Uint8Array(32).fill(0xab),
+};
+
 /** The ten wire slots of a valid encoded artifact, for building malformed variants by hand. */
 function slotsOf(a: BroadcastArtifact): unknown[] {
   return [
@@ -67,7 +75,9 @@ async function signed(overrides: Partial<Fields> = {}): Promise<BroadcastArtifac
 describe("002-ARTIFACT — broadcast artifact", () => {
   it("1. sign → encode → decode → verify round-trips", async () => {
     const kp = generateKeypair();
-    const fields = makeFields();
+    // Every nullable slot NON-null and distinct, so the inline preimage below pins their order:
+    // with all three null, swapping two of them leaves the bytes identical.
+    const fields = makeFields(DISTINCT_SLOTS);
     const a = await signBroadcastArtifact(kp, fields);
     const d = decodeBroadcastArtifact(encodeBroadcastArtifact(a));
     expect(d.ok).toBe(true);
@@ -77,8 +87,8 @@ describe("002-ARTIFACT — broadcast artifact", () => {
     expect(d.artifact.epoch_index).toBe(fields.epoch_index);
     expect(d.artifact.title).toBe(fields.title);
     expect(d.artifact.body_ciphertext).toEqual(fields.body_ciphertext);
-    expect(d.artifact.supersedes).toBeNull();
-    expect(d.artifact.prev_epoch_root).toBeNull();
+    expect(d.artifact.supersedes).toBe(2);
+    expect(d.artifact.prev_epoch_root).toEqual(new Uint8Array(32).fill(0xab));
     expect(d.artifact.ext).toBeNull();
     expect(d.artifact.signature).toEqual(a.signature);
     expect(verifyBroadcastArtifact(d.artifact)).toBe(true);
@@ -206,7 +216,7 @@ describe("002-ARTIFACT — broadcast artifact", () => {
   });
 
   it("9. leaf hash commits to the signature", async () => {
-    const fields = makeFields();
+    const fields = makeFields(DISTINCT_SLOTS);
     const a = await signBroadcastArtifact(generateKeypair(), fields);
     const b = await signBroadcastArtifact(generateKeypair(), fields);
     expect(broadcastArtifactLeafHash(a)).not.toEqual(broadcastArtifactLeafHash(b));
