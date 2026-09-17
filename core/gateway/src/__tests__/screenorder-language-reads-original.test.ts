@@ -180,7 +180,9 @@ describe("027-SCREENORDER — the screener holds the attack and over-holds nothi
     expect(scriptShare(homoglyph, "cyrillic").share).toBeLessThan(0.5);
 
     const v = await new InboundScreener().screen(enc(homoglyph));
-    expect(v.disposition).not.toBe("block");
+    // The pattern matcher sees through the lookalikes, so this is FLAGGED and delivered wrapped —
+    // `not.toBe("block")` would pass for a build that dropped the wrapper, so name the value.
+    expect(v.disposition).toBe("redact");
     expect(v.terminal).toBeUndefined();
 
     // The delivered form is what was WRITTEN — name the value, do not settle for "not blocked".

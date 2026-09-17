@@ -300,14 +300,19 @@ export class InboundScreener {
     // The findings travel WITH the content. An injection finding is what the agent most needs to
     // know before reading a message, and until now it reached nobody: the daemon read only the
     // disposition and the events were dropped.
+    // `patterns_unavailable` is OUR outage, not a finding about the counterparty. Left in the list
+    // it wrapped every message in a gateway whose patterns never compiled with "FLAGGED:
+    // patterns_unavailable" — a warning on every message is furniture, and blaming the sender for
+    // our own broken startup is worse.
     const findings = events
-      .filter((e) => String(e.category).startsWith("injection:"))
+      .filter((e) => String(e.category).startsWith("injection:") && e.category !== "injection:patterns_unavailable")
       .map((e) => ({
         what: String(e.category).replace(/^injection:/, ""),
         // The disguise, when the finding came from one — never the decoded attack text itself.
         why: /after undoing a disguise \(([a-z_0-9]+)\)/.exec(String(e.reason))?.[1] ?? "",
       }));
     const flagged = findings.length > 0;
+    const patternsDown = events.some((e) => e.category === "injection:patterns_unavailable");
     // What was taken OUT of the delivered text, in the agent's own words.
     const removals = r.notes
       .filter((n) => MUTATING.has(n.step))
@@ -315,11 +320,16 @@ export class InboundScreener {
         ? `${n.count ?? 0} forged security-layer marker(s) were removed — a counterparty cannot speak as this layer.`
         : `${n.count ?? 0} character(s) with no legitimate use in a message were removed (invisible codepoints).`));
     const mutated = removals.length > 0;
-    const wrapped = flagged || mutated ? `${screeningWarning(findings, removals)}\n\n${deliveredText}` : deliveredText;
+    const outage = patternsDown
+      ? [`${AFFORDANCE_PREFIX} Pattern screening did not run on this message: the rules are not compiled in this gateway.`]
+      : [];
+    const wrapped = flagged || mutated || patternsDown
+      ? `${screeningWarning(findings, [...removals, ...outage])}\n\n${deliveredText}`
+      : deliveredText;
 
     return {
-      disposition: mutated || flagged ? "redact" : "allow",
-      content: mutated || flagged ? TEXT_ENCODER.encode(wrapped) : content,
+      disposition: mutated || flagged || patternsDown ? "redact" : "allow",
+      content: mutated || flagged || patternsDown ? TEXT_ENCODER.encode(wrapped) : content,
       events,
     };
   }

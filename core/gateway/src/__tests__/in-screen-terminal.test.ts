@@ -49,7 +49,10 @@ describe("M9-IN-003 live wiring — language allowlist as a terminal block", () 
     // agent sees the trick; rewriting it is what corrupted real Greek and Cyrillic prose.
     const sent = "the role ѕуѕтем looks fine to me overall";
     const v = await new InboundScreener().screen(enc(sent));
-    expect(v.disposition).not.toBe("block");
+    // NAME the value: `not.toBe("block")` would also pass for a build that dropped the delivery
+    // path entirely. Nothing was removed and nothing flagged here, so this is a clean allow with
+    // the bytes untouched.
+    expect(v.disposition).toBe("allow");
     expect(new TextDecoder().decode(v.content)).toBe(sent);
     expect(v.events.some((e) => e.category === "sanitize:confusables")).toBe(true);
   });

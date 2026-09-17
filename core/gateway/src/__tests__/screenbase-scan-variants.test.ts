@@ -121,8 +121,10 @@ describe("SCREENBASE: disguised attacks are flagged via scan variants", () => {
     const { delivered, injection } = await screen(text);
     expect(injection.length).toBeGreaterThan(0);
     // DOD-M9C-SCREENPASSIVE-1 prefixes a warning to flagged content; the counterparty's own text is
-    // still there, character for character, with none of the folding the scan copy did.
-    expect(delivered).toContain(text);
+    // still there, character for character, with none of the folding the scan copy did — and ONLY a
+    // warning was added, which `toContain` alone would not pin.
+    expect(delivered.startsWith("[cello security layer, local]")).toBe(true);
+    expect(delivered.endsWith(text)).toBe(true);
   });
 
   it("a hidden payload survives one invalid byte and an unrelated emoji selector", async () => {
