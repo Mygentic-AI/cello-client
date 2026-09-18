@@ -18,7 +18,20 @@
 #
 # Idempotent and safe to run at any time: an existing real `dist` is moved into place rather than
 # deleted, so nothing that was built is lost.
+#
+# ⚠️ macOS ONLY, AND THAT GUARD IS LOAD-BEARING — it was missing for one release and broke it.
+# `pnpm publish` packs `dist/`, and packing a SYMLINKED directory drops its contents: v0.0.320
+# shipped a `protocol-types` tarball holding ONE file where the previous version held 128. The
+# packages were structurally empty. Nothing reached an operator only because `latest` had not moved
+# — which is exactly why promotion is a separate step from publishing.
+#
+# CI runs on Linux, where there is no iCloud and nothing to exclude, so the fix is to do nothing
+# there. `CI` is checked as well as the platform, so a macOS runner could not reintroduce it either.
 set -euo pipefail
+
+if [ "$(uname)" != "Darwin" ] || [ "${CI:-}" = "true" ]; then
+  exit 0
+fi
 
 cd "$(dirname "$0")/.."
 

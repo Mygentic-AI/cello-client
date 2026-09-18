@@ -317,6 +317,36 @@ jobs:
           pnpm run typecheck
           test -d dist && test "$(ls -A dist)" || (echo "ERROR: dist/ is empty after build" && exit 1)
 
+      # ⚠️ WHAT A TARBALL CONTAINS, not what the wiring says it should. The completeness guard above
+      # checks that every package is referenced and has a publish line; it says nothing about what
+      # `pnpm pack` actually put in the archive. v0.0.320 shipped `protocol-types` holding ONE file
+      # where the previous version held 128 — a `dist` symlink (a macOS iCloud workaround that
+      # should never have run in CI) packed as an empty directory. Every unit test passed, the
+      # publish job reported success, and the packages were structurally empty.
+      #
+      # So: count the built files on disk, count what packing would ship, and refuse if packing
+      # dropped them. This runs BEFORE the publish, so a burned version is never created.
+      - name: Pack-integrity — the tarball carries what was built
+        run: |
+          FAILED=0
+          for d in core/*/; do
+            pkg="${d%/}"
+            name=$(node -p "require('./$pkg/package.json').name")
+            priv=$(node -p "require('./$pkg/package.json').private === true")
+            [ "$priv" = "true" ] && continue
+            built=$(find "$pkg/dist" -name '*.js' 2>/dev/null | wc -l | tr -d ' ')
+            packed=$( (cd "$pkg" && pnpm pack --pack-destination "$RUNNER_TEMP" 2>/dev/null | tail -1) )
+            shipped=$(tar tzf "$packed" 2>/dev/null | grep -c '^package/dist/.*\.js$' || true)
+            if [ "$built" -gt 0 ] && [ "$shipped" -lt "$built" ]; then
+              echo "FAIL: $name built $built dist/*.js but the tarball carries $shipped."
+              echo "      Packing dropped files — a symlinked dist is the known cause. NOT publishing."
+              FAILED=1
+            else
+              echo "OK: $name — $shipped of $built built files are in the tarball"
+            fi
+          done
+          exit $FAILED
+
       - name: Publish to npm (beta)
         run: |
           TAG="beta"
