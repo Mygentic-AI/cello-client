@@ -118,6 +118,21 @@ describe("M16 019 Part D — subscription state", () => {
     expect(subs.active()).toEqual([]);
   });
 
+  it("21c. the gate's lookup takes an agent ID — a NAME matches nothing, and nothing reads as allow", () => {
+    /**
+     * ⚠️ **THE DEFECT THIS PINS WAS INVISIBLE FROM BOTH SIDES.** The inbound path hands the gate
+     * `localAgent.name`; this store queries `agent_id`. Passing the name matched no row, a missing
+     * row means "not a channel", and "not a channel" is ALLOW — so the refusal never fired and
+     * nothing anywhere said so. Test 21 could not see it: its harness replaces this lookup with a
+     * name-keyed stub, so it proves the refusal BRANCH works and nothing about whether it is reached.
+     *
+     * The subscription above is stored under the id `agent-1`. A daemon that passed a display name
+     * would ask a question this store cannot answer yes to.
+     */
+    expect(subs.isSubscribedChannel(AGENT, CHANNEL), "by id — the column that is queried").toBe(true);
+    expect(subs.isSubscribedChannel("Alice's Agent", CHANNEL), "a display name finds nothing").toBe(false);
+  });
+
   it("20. isSubscribedChannel answers for the channel KEY, per agent", () => {
     // The inbound-session gate asks this of a sender's pubkey: a channel never opens a session, so
     // one arriving FROM a channel this agent subscribes to is a signal worth refusing on.
@@ -130,6 +145,27 @@ describe("M16 019 Part D — subscription state", () => {
     // suspicious. Answering false here would reopen the hole the moment somebody unsubscribed.
     subs.markLeft(AGENT, CHANNEL);
     expect(subs.isSubscribedChannel(AGENT, CHANNEL)).toBe(true);
+  });
+
+  it("20c. subscribing to a channel writes NO contact — a subscription is not a relationship", () => {
+    /**
+     * ⚠️ Order test 20. A channel is somebody you READ, not somebody you know: it never converses,
+     * so a contact row for one would put an identity in `cello_contacts` that can never hold a
+     * session, and every trust surface that walks contacts would have to learn to skip it. The two
+     * live in different tables and nothing bridges them — this is what pins that.
+     */
+    db.exec(`CREATE TABLE IF NOT EXISTS contacts (
+      agent_name TEXT NOT NULL, pubkey TEXT NOT NULL, added_at INTEGER NOT NULL,
+      PRIMARY KEY (agent_name, pubkey))`);
+
+    subs.upsert({
+      agent_id: AGENT, channel_pubkey: "ee".repeat(32), admin_pubkey: ADMIN,
+      access: "open", relays: [RELAY_A],
+    });
+    subs.addKey(AGENT, "ee".repeat(32), { generation: 1, key: new Uint8Array(32) }, 1000);
+
+    const rows = db.prepare(`SELECT COUNT(*) AS n FROM contacts`).get() as { n: number | bigint };
+    expect(Number(rows.n), "no contact was created by subscribing").toBe(0);
   });
 
   it("20b. a moniker is a LOCAL label and never changes the identity", () => {

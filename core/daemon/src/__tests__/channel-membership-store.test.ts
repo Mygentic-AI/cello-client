@@ -74,6 +74,33 @@ describe("M16 019 — the publisher's membership records", () => {
     expect(members.activeMembers(CHANNEL)).toEqual([ALICE]);
   });
 
+  it("12c. if the generation bump FAILS, the status flip rolls back with it", () => {
+    members.admit(CHANNEL, ALICE, "active", 1000);
+    members.admit(CHANNEL, BOB, "active", 1000);
+    const before = members.settings(CHANNEL)?.key_generation ?? -1;
+
+    /**
+     * ⚠️ **THE REVERT THE DoD ASKS FOR, AND TEST 12 CANNOT DETECT IT.** Test 12 asserts the OUTCOME —
+     * generation up by one, the right member left — so moving the bump outside the transaction
+     * leaves it green: both statements still run, just not atomically. Only deleting the bump makes
+     * it red, which is a weaker claim than the one the DoD quotes.
+     *
+     * This asserts the ATOMICITY instead, with a trigger that aborts the BUMP specifically — after
+     * the status flip has run, inside the same transaction. Reads still work, so the eject gets as
+     * far as it can before failing. Either both facts commit or neither does, so BOB stays active.
+     */
+    db.exec(`CREATE TRIGGER block_bump BEFORE UPDATE OF key_generation ON channel_config
+             BEGIN SELECT RAISE(ABORT, 'bump blocked'); END`);
+    let threw = false;
+    try { members.eject(CHANNEL, BOB); } catch { threw = true; }
+    db.exec(`DROP TRIGGER block_bump`);
+
+    expect(threw, "the bump could not run").toBe(true);
+    expect(members.statusOf(CHANNEL, BOB), "the status flip went back with it").toBe("active");
+    expect(members.settings(CHANNEL)?.key_generation).toBe(before);
+    expect(members.activeMembers(CHANNEL).sort()).toEqual([ALICE, BOB].sort());
+  });
+
   it("12b. ejecting somebody who is not an active member changes NOTHING, generation included", () => {
     members.admit(CHANNEL, ALICE, "active", 1000);
     const before = members.settings(CHANNEL)?.key_generation ?? -1;

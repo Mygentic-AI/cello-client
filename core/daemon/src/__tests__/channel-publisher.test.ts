@@ -62,6 +62,8 @@ interface Harness {
   channelHex: string;
   relayKeys: Map<string, InMemoryKeyProvider>;
   deposits: Seen[];
+  /** The full deposit FRAME each relay received, so a test can assert what rode along with a post. */
+  depositFrames: Array<{ post_cbor: Uint8Array; fetch_key?: { pubkey: Uint8Array; time_ms: number; signature: Uint8Array } }>;
   logStateAtDeposit: boolean[];
   held: Map<string, Set<number>>;
   /** Relays that refuse, and with what. */
@@ -86,6 +88,7 @@ async function harness(opts: { access?: "public" | "open"; noFetchKey?: boolean 
     [RELAY_B, generateKeypair()],
   ]);
   const deposits: Seen[] = [];
+  const depositFrames: Array<{ post_cbor: Uint8Array; fetch_key?: { pubkey: Uint8Array; time_ms: number; signature: Uint8Array } }> = [];
   /** For each deposit, whether the log already held the post when the relay was called. */
   const logStateAtDeposit: boolean[] = [];
   /** What each relay actually holds, so `relayHead` can answer truthfully. */
@@ -111,6 +114,7 @@ async function harness(opts: { access?: "public" | "open"; noFetchKey?: boolean 
     }
     if (down.has(relay)) throw new Error(`relay ${relay} is unreachable`);
     deposits.push({ relay, postCbor: req.post_cbor });
+    depositFrames.push(req);
     const refusal = refuse.get(relay);
     if (refusal) {
       refuse.delete(relay); // refuse once, so a retry can be observed succeeding
@@ -205,7 +209,7 @@ async function harness(opts: { access?: "public" | "open"; noFetchKey?: boolean 
   const publisher = new ChannelPublisher(options);
 
   return {
-    publisher, options, log, channelKp, adminKp, channelHex, relayKeys, deposits, logStateAtDeposit,
+    publisher, options, log, channelKp, adminKp, channelHex, relayKeys, deposits, depositFrames, logStateAtDeposit,
     held, refuse, down, screen, clock, infoHeld, pruneCalls,
   };
 }
@@ -387,6 +391,29 @@ describe("M16 018-PUBCOLLECT: publishing", () => {
     const pub = await harness({ access: "public", noFetchKey: true });
     const published = await pub.publisher.publish("agent-1", pub.channelHex, "open to all", "body");
     expect(published.ok).toBe(true);
+  });
+
+  it("14. the deposit FRAME carries the fetch key — the thing that locks an ejected member out", async () => {
+    const h = await harness({ access: "open" });
+    await h.publisher.publish("agent-1", h.channelHex, "gated", "body");
+
+    /**
+     * ⚠️ **ASSERTED ON THE FRAME, because that is the only place it matters.** A publisher that
+     * rotated the group key and did not put the derived fetch key on the deposit would pass every
+     * decryption test ever written while leaving an ejected member able to pull the whole queue —
+     * learning the channel's size, cadence and timing. Order test 14.
+     */
+    expect(h.depositFrames).toHaveLength(2);
+    for (const frame of h.depositFrames) {
+      expect(frame.fetch_key, "every deposit carries it, so a re-key reaches the relays at once").toBeDefined();
+      expect(frame.fetch_key?.pubkey.length).toBe(32);
+      expect(frame.fetch_key?.signature.length).toBe(64);
+    }
+
+    // A PUBLIC channel carries none: anyone may read it, so there is nothing to gate on.
+    const pub = await harness({ access: "public" });
+    await pub.publisher.publish("agent-1", pub.channelHex, "open", "body");
+    expect(pub.depositFrames.every((f) => f.fetch_key === undefined)).toBe(true);
   });
 
   it("7b. with NO group key — production today — a non-public channel FAILS CLOSED", async () => {

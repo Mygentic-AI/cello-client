@@ -350,7 +350,7 @@ export default [
     // reasons, and this file's own rule is that a comment carries the constraint the code cannot.
     // Measured cost of one named unit, not headroom. It only ever shrinks from here.
     //
-    // ⚠️ 1377 → 1408 for M16 019-MEMBERSHIP, extraction FIRST again. The join exchange, the eject
+    // ⚠️ 1377 → 1417 for M16 019-MEMBERSHIP, extraction FIRST again. The join exchange, the eject
     // re-key and six operator verbs are ~350 lines and every one of them is in
     // `channel-membership-wiring.ts`. What is left here is the composition a composition root
     // cannot delegate: which agents this daemon holds, which of them is a channel, how a frame
