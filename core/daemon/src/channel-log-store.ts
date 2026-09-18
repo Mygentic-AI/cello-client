@@ -32,6 +32,9 @@ import {
 import type { BroadcastArtifact, RelayPostReceipt } from "@cello-protocol/protocol-types";
 
 export const CHANNEL_LOG_CREATE_SQL = `
+  -- \`post_cbor\` is AUTHORITATIVE: every read path decodes it. \`published_at\` and \`title\` are lifted
+  -- out of the signed bytes so a digest or an index query does not have to decode every row, and a
+  -- reader that needs certainty must still go through \`post_cbor\`.
   CREATE TABLE IF NOT EXISTS channel_log (
     channel_pubkey   TEXT    NOT NULL,
     seq              INTEGER NOT NULL,
@@ -60,6 +63,9 @@ export type ChannelLogErrorCode =
   // recordReceipt: the receipt does not verify against the post this log holds at that number, or
   // there is no such post.
   | "receipt_invalid"
+  // recordReceipt: the post was pruned. The receipt may be perfectly good; this log no longer holds
+  // the bytes to check it against, and that is a different fact from a bad receipt.
+  | "post_pruned"
   // pruneThrough: asked to prune below what has already been pruned.
   | "prune_regression"
   // readRange: a stored row no longer decodes, or no longer carries valid signatures.
@@ -140,6 +146,16 @@ export class ChannelLogStore {
       if (!verdict.ok) {
         throw new ChannelLogError("post_invalid", verdict.reason);
       }
+      // Verification proves the post was signed by the keys it NAMES — it says nothing about which
+      // channel's log it was handed to. Without this, a post signed by channel A files cleanly under
+      // channel B: every check passes, and B's relay is later refilled with A's posts, which every
+      // subscriber of B rejects for a key mismatch with nothing in B's log saying why.
+      if (hexOf(post.channel_pubkey) !== channelPubkeyHex) {
+        throw new ChannelLogError(
+          "post_invalid",
+          `the post is signed by channel ${hexOf(post.channel_pubkey).slice(0, 16)}, not ${channelPubkeyHex.slice(0, 16)}`,
+        );
+      }
       const inserted = this.#db
         .prepare(
           `INSERT OR IGNORE INTO channel_log (channel_pubkey, seq, published_at, title, post_cbor)
@@ -169,28 +185,64 @@ export class ChannelLogStore {
    * Store one relay's receipt for a post this log holds. VERIFIES FIRST, against the stored post —
    * not against whatever the caller passed alongside it — so a receipt for a different post at the
    * same number is refused rather than filed as proof.
+   *
+   * WHAT THIS DOES NOT CHECK: that `relay_pubkey` is one of the relays this channel actually
+   * publishes to. Any keypair can sign a well-formed receipt for a post it has seen. The relay set
+   * lives with the channel's info record, so that check belongs to the publisher — order 018 —
+   * which knows which two relays it deposited on; here it would have nothing to compare against.
    */
   recordReceipt(channelPubkeyHex: string, receipt: RelayPostReceipt, correlationId?: string): void {
-    this.#state(channelPubkeyHex);
+    const state = this.#state(channelPubkeyHex);
+    // Same binding check as `append`: the receipt names its channel inside the relay's signature, and
+    // a receipt for another channel filed here would sit in this log looking like proof.
+    if (hexOf(receipt.channel_pubkey) !== channelPubkeyHex) {
+      throw new ChannelLogError(
+        "receipt_invalid",
+        `the receipt names channel ${hexOf(receipt.channel_pubkey).slice(0, 16)}, not ${channelPubkeyHex.slice(0, 16)}`,
+      );
+    }
     const post = this.#postAt(channelPubkeyHex, receipt.seq);
     if (!post) {
+      // A pruned post is NOT an invalid receipt. Reporting one as the other sends an operator to
+      // debug a relay's signing key when the answer is that this log no longer holds the bytes.
+      if (receipt.seq <= Number(state.pruned_through)) {
+        throw new ChannelLogError(
+          "post_pruned",
+          `post ${receipt.seq} was pruned (pruned_through is ${Number(state.pruned_through)}); the receipt itself was not checked`,
+        );
+      }
       throw new ChannelLogError("receipt_invalid", `no post at seq ${receipt.seq} in this channel's log`);
     }
     if (!verifyRelayPostReceipt(receipt, post)) {
       throw new ChannelLogError("receipt_invalid", `the receipt does not verify against the post at seq ${receipt.seq}`);
     }
-    this.#db
+    const cbor = encodeRelayPostReceipt(receipt);
+    const inserted = this.#db
       .prepare(
         `INSERT OR IGNORE INTO channel_log_receipts (channel_pubkey, seq, relay_pubkey, received_at, receipt_cbor)
          VALUES (?, ?, ?, ?, ?)`,
       )
-      .run(
-        channelPubkeyHex,
-        receipt.seq,
-        hexOf(receipt.relay_pubkey),
-        receipt.received_at,
-        Buffer.from(encodeRelayPostReceipt(receipt)),
+      .run(channelPubkeyHex, receipt.seq, hexOf(receipt.relay_pubkey), receipt.received_at, Buffer.from(cbor));
+    if (Number(inserted.changes) === 0) {
+      // One relay, one post, one stored receipt: the row is keyed on exactly that. A REPEAT of the
+      // same receipt is a no-op and says so. A DIFFERENT one — the same relay re-acking after a
+      // reconnect with a later time — is dropped by the same statement, so reporting it as stored
+      // would put a `received_at` in the log that disagrees with the bytes actually kept.
+      const held = this.receiptsFor(channelPubkeyHex, receipt.seq).find(
+        (r) => hexOf(r.relay_pubkey) === hexOf(receipt.relay_pubkey),
       );
+      const identical = held !== undefined && Buffer.from(encodeRelayPostReceipt(held)).equals(Buffer.from(cbor));
+      this.#logger.info("channel.receipt.duplicate", {
+        ...(correlationId !== undefined ? { correlationId } : {}),
+        channel_pubkey: channelPubkeyHex,
+        seq: receipt.seq,
+        relay_pubkey: hexOf(receipt.relay_pubkey),
+        identical,
+        held_received_at: held?.received_at ?? null,
+        offered_received_at: receipt.received_at,
+      });
+      return;
+    }
     this.#logger.info("channel.receipt.stored", {
       ...(correlationId !== undefined ? { correlationId } : {}),
       channel_pubkey: channelPubkeyHex,

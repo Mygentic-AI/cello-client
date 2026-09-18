@@ -171,7 +171,17 @@ describe("M16 016-CLIENTREWORK: ChannelLogStore", () => {
 
     store.recordReceipt(ch.hex, a);
     store.recordReceipt(ch.hex, b);
-    store.recordReceipt(ch.hex, a); // idempotent: same relay, same post
+    store.recordReceipt(ch.hex, a); // idempotent: same relay, same post, identical bytes
+
+    // A DIFFERENT receipt from the SAME relay — a re-ack after a reconnect, with a later time. The
+    // row is keyed on (channel, seq, relay), so it cannot be stored; what must not happen is the
+    // store reporting it as stored, which would put a received_at in the log that disagrees with
+    // the bytes actually kept.
+    const later = await receipt(post, relayA, 1_789_000_900_000);
+    store.recordReceipt(ch.hex, later);
+    const afterRepeat = store.receiptsFor(ch.hex, post.seq)
+      .find((r) => Buffer.from(r.relay_pubkey).equals(Buffer.from(a.relay_pubkey)));
+    expect(afterRepeat?.received_at).toBe(1_789_000_500_000);
 
     const stored = store.receiptsFor(ch.hex, post.seq);
     expect(stored).toHaveLength(2);
@@ -260,6 +270,33 @@ describe("M16 016-CLIENTREWORK: ChannelLogStore", () => {
     expect(store.head(two.hex)).toEqual({ first_seq: 1, last_seq: 1, pruned_through: 0 });
     expect(store.receiptsFor(two.hex, 1)).toHaveLength(1);
     expect(rowCount("channel_log", two.hex)).toBe(1);
+
+    // A post signed by ONE channel, filed under the OTHER. Every other check passes — the number is
+    // next, it encodes, it decodes, and both signatures verify against the keys the post NAMES — so
+    // only an explicit binding check refuses it. Without it, `two`'s relay is later refilled with
+    // `one`'s posts and every subscriber of `two` rejects them for a key mismatch.
+    const strayPos = store.nextPosition(two.hex);
+    const stray = await signBroadcastArtifact(one.kp, one.agent, {
+      seq: strayPos.seq, published_at: 1_789_000_000_001, title: "signed by the other channel",
+      body: new Uint8Array([7]), supersedes: null, ext: null,
+    });
+    expect(verifyBroadcastArtifact(stray)).toEqual({ ok: true });
+    expectCode(() => store.append(two.hex, stray), "post_invalid");
+    expect(rowCount("channel_log", two.hex)).toBe(1);
+    expect(store.nextPosition(two.hex)).toEqual(strayPos);
+
+    // And the same for a receipt that names another channel.
+    const strayReceipt = await receipt(post);
+    expectCode(
+      () => store.recordReceipt(one.hex, strayReceipt),
+      "receipt_invalid",
+    );
+
+    // A receipt for a PRUNED post is not an invalid receipt — the log simply no longer holds the
+    // bytes, and an operator told "receipt_invalid" would go and debug the relay's signing key.
+    const pruned = await receipt((await store.readRange(two.hex, 1, 1))[0]);
+    store.pruneThrough(two.hex, 1);
+    expectCode(() => store.recordReceipt(two.hex, pruned), "post_pruned");
 
     // An unknown channel is named rather than answered with an empty log.
     expectCode(() => store.head("ab".repeat(32)), "channel_unknown");

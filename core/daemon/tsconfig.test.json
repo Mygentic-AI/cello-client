@@ -42,6 +42,11 @@
     // M16 016-CLIENTREWORK. New and clean on creation, which is this list's admission criterion.
     "src/__tests__/m16-016-epoch-removal-guard.test.ts",
     "src/__tests__/m16-016-log-enforcer.test.ts",
+    // The two enforcer processes run under `tsx`, which strips types without checking them — so
+    // outside this list a type error in the ONLY proof of cross-process durability is invisible to
+    // both the typecheck gate and vitest.
+    "src/__tests__/helpers/m16-016-publish-process.ts",
+    "src/__tests__/helpers/m16-016-verify-process.ts",
     "src/__tests__/m16-channel-refusal-reason.test.ts",
     "src/__tests__/m16-006-noconverse-enforcer.test.ts",
     "src/__tests__/helpers/signed-assignment.ts",
