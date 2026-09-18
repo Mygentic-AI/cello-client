@@ -32,6 +32,7 @@ import {
   verifyBroadcastArtifact,
 } from "@cello-protocol/protocol-types";
 import type { Stream } from "@libp2p/interface";
+import { extractErrorMessage } from "../../error-message.js";
 
 const CHANNEL_PROTOCOL_ID = "/cello/channel/1.0.0";
 const CBOR_ENC = new Encoder({ tagUint8Array: false, useRecords: false });
@@ -65,7 +66,9 @@ async function main(): Promise<void> {
         const answer = await handle(frame);
         stream.send(lp.encode.single(CBOR_ENC.encode(answer)));
       } catch (err: unknown) {
-        process.stderr.write(`${err instanceof Error ? err.message : JSON.stringify(err)}\n`);
+        // extractErrorMessage, not `instanceof Error`: libp2p rejects with plain objects, so the
+        // one case where the text matters is the case `instanceof` loses.
+        process.stderr.write(`${extractErrorMessage(err)}\n`);
       } finally {
         await stream.close().catch(() => { /* going away */ });
       }
