@@ -30,7 +30,7 @@ import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-man
 import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
-import { spawnGatewaySidecar, LocalSidecarGatewayClient, type SpawnedGateway } from "@cello-protocol/gateway";
+import { spawnGatewaySidecar, LocalSidecarGatewayClient, GatewayConfigStore, type SpawnedGateway } from "@cello-protocol/gateway";
 import { seedAgents } from "./helpers/seed-agents.js";
 import { extractErrorMessage } from "../error-message.js";
 import { receivedCount, receivedText } from "./helpers/received-rows.js";
@@ -109,6 +109,14 @@ describe("M9-GATE-1: the park-recovery producer is screened by a REAL gateway pr
     const storeDb = join(tempDir, "gw-store.db");
     const storeKey = join(tempDir, "gw-store.key");
     writeFileSync(storeKey, randomBytes(32), { mode: 0o600 });
+    // Language does not refuse mail by default — it is a preference, and left alone every language
+    // is delivered and screened by the classifier (DOD-M9C-SCREENBASE-1). This suite is about the
+    // terminal-block path surviving park-and-recover, which is unchanged, so it turns the
+    // preference ON rather than relying on a default that no longer exists. Refusing TIGHTENS, so
+    // the governance gate asks for no confirmation.
+    const cfg = new GatewayConfigStore(storeDb, storeKey);
+    expect(cfg.set("language_enforce", true).ok).toBe(true);
+    cfg.close();
     const gw = await spawnGatewaySidecar({
       socketPath: sock,
       env: { CELLO_GATEWAY_STORE_DB: storeDb, CELLO_GATEWAY_STORE_KEY_FILE: storeKey },

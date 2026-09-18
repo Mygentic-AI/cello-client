@@ -48,6 +48,8 @@ export interface InboundScreenerOptions {
   maxBytes?: number;
   /** IN-003 language allowlist options (default: English / Latin script). */
   language?: LanguageOptions;
+  /** Refuse messages outside the allowlist instead of noting them. Default false — see `screen()`. */
+  languageEnforce?: boolean;
   /** IN-002 semantic injection scanner. Default: a null scanner (Layer-2 off — graceful degrade). */
   injectionScanner?: InjectionScanner;
 }
@@ -118,11 +120,13 @@ const TEXT_ENCODER = new TextEncoder();
 export class InboundScreener {
   readonly #maxBytes?: number;
   readonly #language?: LanguageOptions;
+  readonly #languageEnforce: boolean;
   readonly #injection: InjectionScanner;
 
   constructor(opts: InboundScreenerOptions = {}) {
     this.#maxBytes = opts.maxBytes;
     this.#language = opts.language;
+    this.#languageEnforce = opts.languageEnforce ?? false;
     // No scanner injected ⇒ a null-classifier scanner: available()===false, so it never blocks.
     this.#injection = opts.injectionScanner ?? new InjectionScanner(null);
   }
@@ -225,21 +229,49 @@ export class InboundScreener {
     // answers to different questions, and this screen asks the one only the original can answer.
     const lang = screenInboundLanguage(r.scriptScanText, this.#language ?? {});
     if (!lang.allowed) {
-      return {
-        disposition: "block",
-        content,
-        events: [...events, {
-          stage: "language",
+      // DOD-M9C-SCREENBASE-1 — language is a PREFERENCE, not a screen, and only blocks when the
+      // operator has asked it to.
+      //
+      // It used to block by default, and it refused 554 of 5,000 ordinary benign messages —
+      // 11% of real traffic — because it cannot tell a Chinese purchase order from a Chinese
+      // jailbreak. It never could: it counts which alphabet the letters come from. Measured
+      // 2026-09-18, the classifier refuses 5 of those same 554 and caught every non-Latin attack
+      // in the corpus, so the screening did not disappear, it moved to the layer that reads the
+      // message rather than the script.
+      //
+      // The line the old default drew was by ALPHABET, not by risk: French and Spanish jailbreaks
+      // are Latin-script and have always passed this check unscreened. An operator who wants
+      // English-only mail can still have it — `language_enforce` — and it is then a stated
+      // preference rather than something every new user meets before their first message.
+      if (this.#languageEnforce) {
+        return {
           disposition: "block",
-          category: `language:${lang.script}`,
-          reason: lang.reason ?? "non-allowlisted language",
-        }],
-        terminal: true,
-        reason: "inbound_language_blocked",
-        guidance:
-          (lang.reason ?? "This message is in a language outside the allowlist; it was not delivered.") +
-          "\n" + operatorCanRun("language_allow", "<comma-separated languages>"),
-      };
+          content,
+          events: [...events, {
+            stage: "language",
+            disposition: "block",
+            category: `language:${lang.script}`,
+            reason: lang.reason ?? "non-allowlisted language",
+          }],
+          terminal: true,
+          reason: "inbound_language_blocked",
+          guidance:
+            (lang.reason ?? "This message is in a language outside the allowlist.") +
+            " It was not delivered, because this agent is set to accept only the languages in its " +
+            "allowlist.\n" + operatorCanRun("language_allow", "<comma-separated scripts>"),
+        };
+      }
+      // Delivered — but the agent is told it got ONE layer of screening rather than two, because
+      // the deterministic patterns are English and silence here would read as "screened clean".
+      events.push({
+        stage: "language",
+        disposition: "observe",
+        category: `language:${lang.script}`,
+        reason:
+          (lang.reason ?? "non-allowlisted language") +
+          " It was delivered. The deterministic injection patterns are English-only, so this " +
+          "message was screened by the semantic classifier alone.",
+      });
     }
 
     // IN-002: semantic injection scanner (Layer-2). Off when no model is loaded — available()===false,

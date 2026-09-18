@@ -21,6 +21,18 @@ export type Script =
   | "latin" | "cyrillic" | "greek" | "arabic" | "hebrew" | "han" | "kana" | "hangul"
   | "devanagari" | "thai" | "other";
 
+/**
+ * Every script name the allowlist accepts. Exported so the config layer can REJECT a name that
+ * means nothing — `language_allow=klingon` was stored, gated and hash-chained like a real setting
+ * and then matched no script, which is a guard that reads as configured and screens as if it were
+ * not.
+ */
+export const SCRIPTS: readonly Script[] = [
+  "latin", "cyrillic", "greek", "arabic", "hebrew", "han", "kana", "hangul",
+  "devanagari", "thai", "other",
+];
+export const isScript = (v: unknown): v is Script => SCRIPTS.includes(v as Script);
+
 export interface LanguageVerdict {
   /** false → held (confident non-allowlisted language). */
   allowed: boolean;
@@ -105,7 +117,6 @@ export function screenInboundLanguage(text: string, opts: LanguageOptions = {}):
     script: dominant,
     reason:
       `This message is predominantly ${SCRIPT_LABEL[dominant]} script, outside the gateway's ` +
-      `language allowlist (default: English). It was held. To allow this language, add its script ` +
-      `to the gateway language allowlist.`,
+      `language allowlist.`,
   };
 }

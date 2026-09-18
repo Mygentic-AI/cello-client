@@ -61,6 +61,7 @@ export type AdjustableGuard =
   | "pii_whitelist"
   | "autonomous_override"
   | "language_allow"
+  | "language_enforce"
   | "rate_max_per_window"
   | "rate_window_ms";
 

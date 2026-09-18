@@ -15,6 +15,7 @@
  * Encryption-at-rest (DOD-M9B-STORE-1): the store lives in the gateway's SQLCipher file, opened with
  * the daemon's key via a key FILE path — fail-closed, no plaintext fallback (see store/encrypted-db.ts).
  */
+import { isScript } from "../detect/language.js";
 import { openEncryptedStoreDb, type StoreDb, type StoreEventSink } from "../store/encrypted-db.js";
 import { createHash } from "node:crypto";
 
@@ -60,6 +61,8 @@ const CLASSIFIERS: Record<string, Classifier> = {
   pii_whitelist: membershipDirection,
   // More allowed languages = looser.
   language_allow: membershipDirection,
+  // Refusing mail outside the allowlist TIGHTENS; turning the refusal off loosens.
+  language_enforce: (prev, next) => (!prev && next ? "tighten" : prev && !next ? "loosen" : "neutral"),
   // 0 = no cap = loosest; a higher cap = looser. Lowering the cap tightens.
   rate_max_per_window: (prev, next) => {
     const looseness = (v: unknown): number => { const n = Number(v) || 0; return n === 0 ? Infinity : n; };
@@ -84,7 +87,12 @@ const CLASSIFIERS: Record<string, Classifier> = {
 const BASELINE: Record<string, unknown> = {
   autonomous_override: false,      // the agent cannot self-authorize
   pii_whitelist: [] as string[],   // nothing passes silently
-  language_allow: ["latin"],       // English only (the product default; allowing MORE languages loosens)
+  language_allow: ["latin"],       // the allowlist used when language_enforce is ON (more scripts = looser)
+  // The TIGHTEST value is "refuse everything outside the allowlist". It is deliberately NOT the
+  // product default: that default refused 11% of ordinary benign traffic (DOD-M9C-SCREENBASE-1).
+  // The baseline exists to gate CHANGES, so turning enforcement on stays free and turning it back
+  // off asks a human, which is the correct direction for a guard nobody switched on by accident.
+  language_enforce: true,
   rate_max_per_window: 0,          // 0 = no cap is the loosest; SETTING a cap tightens (so it is free)
   rate_window_ms: 60_000,          // a shorter window loosens; first-set of a shorter one is gated
 };
@@ -93,7 +101,11 @@ const BASELINE: Record<string, unknown> = {
 const VALIDATORS: Record<string, (v: unknown) => boolean> = {
   autonomous_override: (v) => typeof v === "boolean",
   pii_whitelist: (v) => Array.isArray(v) && v.every((x) => typeof x === "string"),
-  language_allow: (v) => Array.isArray(v) && v.every((x) => typeof x === "string"),
+  // Every member must be a REAL script name. `language_allow=klingon` used to be stored, gated and
+  // hash-chained like a real setting, then match nothing — a guard that reads as configured and
+  // screens as though it were not.
+  language_allow: (v) => Array.isArray(v) && v.length > 0 && v.every(isScript),
+  language_enforce: (v) => typeof v === "boolean",
   rate_max_per_window: (v) => typeof v === "number" && Number.isFinite(v) && v >= 0,
   rate_window_ms: (v) => typeof v === "number" && Number.isFinite(v) && v > 0,
 };

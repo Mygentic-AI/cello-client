@@ -17,6 +17,7 @@ import { InboundScreener } from "../screen/inbound.js";
 import { initLinearRegex } from "../detect/linear-regex.js";
 import { compileInjectionPatterns } from "../detect/injection-patterns.js";
 import { compileSecretRules } from "../detect/secrets.js";
+import { isScript, type Script } from "../detect/language.js";
 import { GatewayConfigStore } from "../config/config-store.js";
 import { stderrStoreEventSink } from "../store/encrypted-db.js";
 import { GatewayRecordStore, type RecordDisposition } from "../records/record-store.js";
@@ -139,9 +140,19 @@ async function main(): Promise<void> {
   const layer2 = load.classifier ? "active" : `off:${load.reason ?? "unknown"}`;
   // The same four states the CLI prints, on the daemon's own startup line: "is the classifier
   // usable?" must be answerable from the log, not only by running a command.
-  const inbound = new InboundScreener(
-    load.classifier ? { injectionScanner: new InjectionScanner(load.classifier) } : {},
-  );
+  // DOD-M9C-SCREENBASE-1 — `language_allow` was validated, gated, versioned and hash-chained, and
+  // then read by NOTHING. The block message told the operator to run `cello config set
+  // language_allow …` to let their own language through, and running it changed nothing, because
+  // this line never passed the setting to the screener. The escape hatch from the block was fake.
+  //
+  // `language_enforce` defaults OFF: language is a preference, not a screen (see InboundScreener).
+  const languageAllow: Script[] = cfg<string[]>("language_allow", ["latin"]).filter(isScript);
+  const languageEnforce = cfg<boolean>("language_enforce", false);
+  const inbound = new InboundScreener({
+    ...(load.classifier ? { injectionScanner: new InjectionScanner(load.classifier) } : {}),
+    language: { allow: languageAllow.length > 0 ? languageAllow : ["latin"] },
+    languageEnforce,
+  });
 
   // M9-REC-001 (INV-4): the gateway records what it did to EVERY message, hash-chained for
   // tamper-evidence, in the same encrypted store as the config (M9B-D9). The verdict's disposition

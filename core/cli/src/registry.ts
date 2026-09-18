@@ -1453,7 +1453,9 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "Usage: cello config list | cello config get <key> | cello config set <key> <value>\n" +
       "  The security layer's own guards. Per-INSTALL, not per-agent — they apply to every agent here.\n" +
       "  Keys: autonomous_override (true|false), pii_whitelist (comma-separated, empty string clears),\n" +
-      "        language_allow (comma-separated), rate_max_per_window (number, 0 = no cap), rate_window_ms.\n" +
+      "        language_allow (comma-separated scripts), language_enforce (true/false, default false:\n" +
+      "        mail outside your languages is delivered with a note instead of refused),\n" +
+      "        rate_max_per_window (number, 0 = no cap), rate_window_ms.\n" +
       "  TIGHTENING a guard applies immediately. LOOSENING one asks you to confirm at the terminal —\n" +
       "  there is no --yes flag, because a flag a script can pass is not a human. Every change is\n" +
       "  versioned and hash-chained; 'list' shows the version, the direction, and whether a human\n" +

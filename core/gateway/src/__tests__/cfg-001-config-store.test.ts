@@ -94,7 +94,14 @@ describe("M9-CFG-001 GatewayConfigStore — versioned, tighten-free / loosen-con
   it("language allowlist: ADD a script is loosen; REMOVE is tighten", () => {
     store.set("language_allow", ["latin"]); // v1
     expect(store.set("language_allow", ["latin", "cyrillic"]).ok).toBe(false); // add = loosen
-    expect(store.set("language_allow", [] as string[]).ok).toBe(true); // remove all = tighten, free
+    // An EMPTY allowlist is now REJECTED rather than treated as the tightest value. With
+    // language_enforce on it means "refuse every language including my own", which is a setting
+    // that silently stops all mail; with it off it means nothing at all. (DOD-M9C-SCREENBASE-1)
+    expect(() => store.set("language_allow", [] as string[])).toThrow(/invalid value/);
+    // A name that is not a script is rejected too — it used to be stored and hash-chained like a
+    // real setting, then match nothing.
+    expect(() => store.set("language_allow", ["klingon"])).toThrow(/invalid value/);
+    expect(store.set("language_allow", ["latin"]).ok).toBe(true); // unchanged = neutral, free
   });
 
   it("history is APPEND-ONLY and versions increment monotonically", () => {

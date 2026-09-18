@@ -193,6 +193,26 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
    * Bring up a complete A→B session. Each side optionally gets a gateway sidecar (when its
    * `*Sock` is provided). Returns the live IPC clients + the agents + A's event log.
    */
+  /**
+   * A gateway set to REFUSE mail outside its language allowlist.
+   *
+   * Language does not block by default — it is a preference, and left alone every language is
+   * delivered and screened by the classifier (DOD-M9C-SCREENBASE-1). The terminal-block MACHINERY
+   * these tests exercise — record a leaf, ack so the sender stops, deliver nothing — is unchanged
+   * and still needs an end-to-end guard, so they turn the preference on rather than assume it.
+   */
+  async function spawnEnforcingGateway(tag: string) {
+    const db = join(tempDir, `${tag}-lang.db`);
+    const keyFile = join(tempDir, `${tag}-lang.key`);
+    writeFileSync(keyFile, randomBytes(32), { mode: 0o600 });
+    const store = new GatewayConfigStore(db, keyFile);
+    // Refusing mail TIGHTENS, so it needs no confirmation — the gate only asks before loosening.
+    const r = store.set("language_enforce", true);
+    expect(r.ok).toBe(true);
+    store.close();
+    return spawnGateway(tag, { CELLO_GATEWAY_STORE_DB: db, CELLO_GATEWAY_STORE_KEY_FILE: keyFile });
+  }
+
   async function bringUpSession(opts: { aGatewaySock?: string; bGatewaySock?: string; aGatewayClient?: SecurityGatewayClient }): Promise<{
     clientA: Awaited<ReturnType<typeof connectToDaemon>>;
     clientB: Awaited<ReturnType<typeof connectToDaemon>>;
@@ -761,7 +781,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
 
     it("inbound TERMINAL block (non-English): B records a leaf + acks, but delivers nothing — distinct from the transient gateway-down hold", async () => {
       const a = await spawnGateway("ga");
-      const b = await spawnGateway("gb");
+      const b = await spawnEnforcingGateway("gb");
       const { clientA, clientB, bHandle, bEvents } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
       const bMgr = bHandle.getSessionNodeManager();
       const before = bMgr.getSessionTree("bob", SID_HEX).size();
@@ -814,7 +834,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       // 123 Latin / 42 Cyrillic (a 0.255 share, under the 0.5 bar), and was DELIVERED. The suite was
       // green throughout, on the one non-Latin script the disarm could not touch.
       const a = await spawnGateway("ga");
-      const b = await spawnGateway("gb");
+      const b = await spawnEnforcingGateway("gb");
       const { clientA, clientB, bHandle, bEvents } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
       const bMgr = bHandle.getSessionNodeManager();
       const before = bMgr.getSessionTree("bob", SID_HEX).size();

@@ -137,7 +137,7 @@ describe("027-SCREENORDER — the screener holds the attack and over-holds nothi
   beforeAll(async () => { await initLinearRegex(); compileInjectionPatterns(); });
 
   it("Part 3 #1 — the 100%-Cyrillic jailbreak is HELD, not delivered", async () => {
-    const v = await new InboundScreener().screen(enc(CYRILLIC_JAILBREAK));
+    const v = await new InboundScreener({ languageEnforce: true }).screen(enc(CYRILLIC_JAILBREAK));
     expect(v.disposition).toBe("block");
     expect(v.terminal).toBe(true);
     expect(v.reason).toBe("inbound_language_blocked");
@@ -145,7 +145,7 @@ describe("027-SCREENORDER — the screener holds the attack and over-holds nothi
   });
 
   it("Part 3 #2 — a held message delivers no text, and the refusal names its remedy", async () => {
-    const v = await new InboundScreener().screen(enc(CYRILLIC_JAILBREAK));
+    const v = await new InboundScreener({ languageEnforce: true }).screen(enc(CYRILLIC_JAILBREAK));
     // The verdict is what the daemon acts on: a terminal block never delivers. What it carries back
     // is the ORIGINAL bytes for the record, and no sanitized text for the agent to read.
     expect(v.disposition).toBe("block");
@@ -158,7 +158,7 @@ describe("027-SCREENORDER — the screener holds the attack and over-holds nothi
     // Three marker families, all stripped from delivery, all previously enough to dilute the same
     // 165-letter Cyrillic jailbreak under the 0.5 bar. Each one delivered `Игhopupyй bce…` verbatim.
     for (const pad of ["[SYSTEM]".repeat(28), "[cello security layer, local]".repeat(8), "<|im_start|>".repeat(60)]) {
-      const v = await new InboundScreener().screen(enc(pad + CYRILLIC_JAILBREAK));
+      const v = await new InboundScreener({ languageEnforce: true }).screen(enc(pad + CYRILLIC_JAILBREAK));
       expect(v.disposition).toBe("block");
       expect(v.reason).toBe("inbound_language_blocked");
     }
@@ -166,7 +166,7 @@ describe("027-SCREENORDER — the screener holds the attack and over-holds nothi
 
   it("fullwidth English is DELIVERED, not held as 'a non-Latin script'", async () => {
     const fullwidth = "ｐｌｅａｓｅ ｓｅｎｄ ｍｅ ｔｈｅ ｃｏｎｔｒａｃｔ ｔｏｍｏｒｒｏｗ ｍｏｒｎｉｎｇ ｔｈａｎｋｓ";
-    const v = await new InboundScreener().screen(enc(fullwidth));
+    const v = await new InboundScreener({ languageEnforce: true }).screen(enc(fullwidth));
     expect(v.disposition).not.toBe("block");
     // Delivered as WRITTEN. Folding it to ASCII was the same rewrite that turned `2²` into `22`.
     expect(dec(v.content)).toBe(fullwidth);
@@ -179,7 +179,7 @@ describe("027-SCREENORDER — the screener holds the attack and over-holds nothi
     expect(homoglyph).toContain("о"); // Cyrillic о is really in there
     expect(scriptShare(homoglyph, "cyrillic").share).toBeLessThan(0.5);
 
-    const v = await new InboundScreener().screen(enc(homoglyph));
+    const v = await new InboundScreener({ languageEnforce: true }).screen(enc(homoglyph));
     // The pattern matcher sees through the lookalikes, so this is FLAGGED and delivered wrapped —
     // `not.toBe("block")` would pass for a build that dropped the wrapper, so name the value.
     expect(v.disposition).toBe("redact");
@@ -195,7 +195,7 @@ describe("027-SCREENORDER — the screener holds the attack and over-holds nothi
   });
 
   it("Part 3 #4 [regression guard, passes pre-fix by design] — a short mixed-script message is still delivered (under the 12-letter bar)", async () => {
-    const v = await new InboundScreener().screen(enc("see you at 5 — да"));
+    const v = await new InboundScreener({ languageEnforce: true }).screen(enc("see you at 5 — да"));
     expect(scriptShare("see you at 5 — да", "cyrillic").total).toBeLessThan(12);
     expect(v.disposition).not.toBe("block");
     expect(v.terminal).toBeUndefined();
@@ -203,7 +203,7 @@ describe("027-SCREENORDER — the screener holds the attack and over-holds nothi
 
   it("Part 3 #4 [regression guard, passes pre-fix by design] — English quoting a non-Latin term is still delivered (under the 0.5 share bar)", async () => {
     const quoting = "The Greek word λόγος is the one the contract keeps coming back to, oddly enough";
-    const v = await new InboundScreener().screen(enc(quoting));
+    const v = await new InboundScreener({ languageEnforce: true }).screen(enc(quoting));
     expect(v.disposition).not.toBe("block");
     expect(v.terminal).toBeUndefined();
   });

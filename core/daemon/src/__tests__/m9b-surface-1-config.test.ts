@@ -5,6 +5,7 @@
  * and that a refused loosening leaves NO ROW. A refusal that still persisted would be the whole
  * gate gone while looking enforced.
  */
+import { GATEWAY_CONFIG_KEYS } from "../gateway-config-handlers.js";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -159,7 +160,9 @@ describe("DOD-M9B-SURFACE-1 — gateway config surface + the loosen gate", () =>
     await call("cello_config_set", { key: "rate_max_per_window", value: 10 });
     const res = await call("cello_config_list", {});
     const rows = res.config as Array<Record<string, unknown>>;
-    expect(rows).toHaveLength(5);
+    // Asserted against the surface's own list rather than a retyped number: a key added without a
+    // help line, or a help line for a key the gateway does not read, is the defect worth catching.
+    expect(rows).toHaveLength(GATEWAY_CONFIG_KEYS.length);
     const rate = rows.find((r) => r.key === "rate_max_per_window")!;
     expect(rate.value).toBe(10);
     expect(rate.version).toBe(1);

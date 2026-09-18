@@ -60,11 +60,12 @@ import type { Logger } from "./types.js";
 import { dbKeyPathFor } from "./sqlcipher-db.js";
 import { extractErrorMessage } from "./error-message.js";
 
-/** The five keys the gateway reads. Kept here so the surface can list them without a store open. */
+/** The keys the gateway reads. Kept here so the surface can list them without a store open. */
 export const GATEWAY_CONFIG_KEYS = [
   "autonomous_override",
   "pii_whitelist",
   "language_allow",
+  "language_enforce",
   "rate_max_per_window",
   "rate_window_ms",
 ] as const;
@@ -73,7 +74,8 @@ export const GATEWAY_CONFIG_KEYS = [
 const KEY_HELP: Record<string, string> = {
   autonomous_override: "whether the agent may send a flagged value with no human present",
   pii_whitelist: "values (e.g. your own email) that pass outbound without a warning",
-  language_allow: "which languages are accepted inbound",
+  language_allow: "which scripts count as your languages (latin, cyrillic, greek, arabic, hebrew, han, kana, hangul, devanagari, thai) — only used when language_enforce is on",
+  language_enforce: "refuse mail outside your languages instead of delivering it with a note (default: off)",
   rate_max_per_window: "how many outbound messages are allowed per window (0 = no cap)",
   rate_window_ms: "the window the outbound cap applies to, in milliseconds",
 };
@@ -93,7 +95,12 @@ export interface GatewayConfigHandlerDeps {
 
 /** Parse a wire value into the type the store's validator expects for that key. */
 function coerce(key: string, raw: unknown): { ok: true; value: unknown } | { ok: false; reason: string } {
-  if (key === "autonomous_override") {
+  if (key === "autonomous_override" || key === "language_enforce") {
+    if (typeof raw === "boolean") return { ok: true, value: raw };
+    if (raw === "true" || raw === "false") return { ok: true, value: raw === "true" };
+    return { ok: false, reason: `${key} is a boolean — pass true or false.` };
+  }
+  if (key === "__never") {
     if (typeof raw === "boolean") return { ok: true, value: raw };
     if (raw === "true" || raw === "false") return { ok: true, value: raw === "true" };
     return { ok: false, reason: "autonomous_override is a boolean — pass true or false." };
