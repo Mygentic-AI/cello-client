@@ -613,6 +613,35 @@ jobs:
           pnpm run typecheck
           test -d dist && test "$(ls -A dist)" || (echo "ERROR: dist/ is empty after build" && exit 1)
 
+      # ⚠️ THE GUARD BELONGS IN **THIS** JOB, and the first version of it did not run because it was
+      # added to the main-branch publish job instead — which publishes nothing, since tags are how
+      # this repo releases. A guard in the wrong job is indistinguishable from no guard: the tag run
+      # went green past it twice.
+      #
+      # What it catches: `pnpm publish` packs `dist/`, and packing a SYMLINKED directory drops its
+      # contents. v0.0.320 shipped `protocol-types` holding ONE file where the previous version held
+      # 128, all seven packages structurally empty, with every test green.
+      - name: Pack-integrity — the tarball carries what was built
+        run: |
+          FAILED=0
+          for d in core/*/; do
+            pkg="${d%/}"
+            name=$(node -p "require('./$pkg/package.json').name")
+            priv=$(node -p "require('./$pkg/package.json').private === true")
+            [ "$priv" = "true" ] && continue
+            built=$(find "$pkg/dist" -name '*.js' 2>/dev/null | wc -l | tr -d ' ')
+            packed=$( (cd "$pkg" && pnpm pack --pack-destination "$RUNNER_TEMP" 2>/dev/null | tail -1) )
+            shipped=$(tar tzf "$packed" 2>/dev/null | grep -c '^package/dist/.*\.js$' || true)
+            if [ "$built" -gt 0 ] && [ "$shipped" -lt "$built" ]; then
+              echo "FAIL: $name built $built dist/*.js but the tarball carries $shipped."
+              echo "      Packing dropped files — a symlinked dist is the known cause. NOT publishing."
+              FAILED=1
+            else
+              echo "OK: $name — $shipped of $built built files are in the tarball"
+            fi
+          done
+          exit $FAILED
+
       - name: Publish to npm (tags only)
         run: |
           TAG="beta"
