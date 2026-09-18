@@ -227,11 +227,12 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // did before, and the only symptom is a receipt that does not appear — which is
     // indistinguishable from the bug the module was written to remove.
     //
-    // 105 → 104 for M16 016-CLIENTREWORK: `startChannelEpochTick` and `registerChannelSealHandler`
-    // are DELETED along with the rest of the epoch layer. Neither could enforce what it claimed —
-    // the caps lived in the publisher's own daemon — so accountability moved into the post's two
-    // signatures and the relay's receipt, and there is no periodic sealer left to wire.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(104);
+    // 105 → 103 for M16 016-CLIENTREWORK: `startChannelEpochTick` (channel-epoch-tick.ts) and
+    // `registerChannelSealHandler` (channel-seal-request.ts) are DELETED along with the rest of the
+    // epoch layer — TWO factories, not one. Neither could enforce what it claimed: the caps lived in
+    // the publisher's own daemon, so accountability moved into the post's two signatures and the
+    // relay's receipt, and there is no periodic sealer left to wire.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(103);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",
