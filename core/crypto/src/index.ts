@@ -147,3 +147,12 @@ export { makeTestManifest, TEST_DIRECTORY_NODE_KEYPAIR } from "./manifest-test-f
 // M12 DOD-AE-APPEND-1: directory<->directory anti-entropy peer-auth TBS
 export { buildAePeerAuthTbs, verifyAePeerAuth, AE_PEER_AUTH_DOMAIN } from "./ae-peer-auth.js";
 export type { AePeerAuthParams } from "./ae-peer-auth.js";
+
+// M16 019-MEMBERSHIP: a channel's group key, and the fetch key derived from it. Rotating the first
+// rotates the second, which is what makes ejection lock a member out at the relay and not only at
+// the ciphertext.
+export {
+  generateGroupKey, encryptBody, decryptBody,
+  wrapGroupKeyFor, unwrapGroupKey, deriveFetchKey,
+} from "./channel-group-key.js";
+export type { GroupKey, FetchKey, BodyDecryptResult, BodyDecryptFailure, GroupKeyUnwrapResult } from "./channel-group-key.js";
