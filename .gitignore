@@ -4,7 +4,10 @@
 # checkout. That is not cosmetic: `j-canary` asserts `git status --porcelain` is empty in both repos,
 # so the canary could never pass on a normal dev machine.
 node_modules
-dist/
+# Same no-trailing-slash rule, same reason: `scripts/nosync-build-output.sh` makes every
+# `core/*/dist` a SYMLINK to `dist.nosync`, and `dist/` matches directories only.
+dist
+dist.nosync
 *.tsbuildinfo
 .env
 .env.*
@@ -21,3 +24,6 @@ node_modules.nosync/
 # flagged that seven of them sat untracked at the repo root where one `git add -A` would have
 # committed them into a published package.
 gf-*.mjs
+
+# iCloud exclusion twin for build output — see scripts/nosync-build-output.sh
+dist.nosync/
