@@ -13,6 +13,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connectToDaemon } from "../ipc-client.js";
+import { extractErrorMessage } from "../error-message.js";
 import { spawnRealDaemon, makeCelloDir, cleanupCelloDir, type SpawnedDaemon } from "./helpers/spawn-real-daemon.js";
 
 const PKG_ROOT = join(import.meta.dirname, "../..");
@@ -85,7 +86,7 @@ describe("M16 016-CLIENTREWORK enforcer", () => {
       await client.send("cello_channel_seal", { agent: "singleton-test-agent" });
       refusal = "the verb was answered";
     } catch (err) {
-      refusal = err instanceof Error ? err.message : String(err);
+      refusal = extractErrorMessage(err);
     } finally {
       client.close();
     }

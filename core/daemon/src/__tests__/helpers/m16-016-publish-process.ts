@@ -11,6 +11,7 @@
 import { generateKeypair } from "@cello-protocol/crypto";
 import { signBroadcastArtifact, signRelayPostReceipt } from "@cello-protocol/protocol-types";
 import { openTestDb } from "./encrypted-db.js";
+import { extractErrorMessage } from "../../error-message.js";
 import { ChannelLogStore } from "../../channel-log-store.js";
 import type { Logger } from "../../types.js";
 
@@ -60,6 +61,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err: unknown) => {
-  process.stderr.write(`${err instanceof Error ? err.stack : String(err)}\n`);
+  process.stderr.write(`${extractErrorMessage(err)}\n`);
   process.exit(1);
 });
