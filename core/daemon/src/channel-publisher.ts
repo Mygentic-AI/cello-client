@@ -161,7 +161,7 @@ export class ChannelPublisher {
    * the attempt budget ran out and the post would never land.
    */
   async #depositWithRetry(relay: string, post: BroadcastArtifact, channelHex: string, correlationId?: string): Promise<DepositOutcome> {
-    const { logger, log } = this.#opts;
+    const { logger } = this.#opts;
     let attempt = post;
     for (let tries = 0; tries < 2; tries++) {
       let answer: Awaited<ReturnType<RelayDepositSeam>>;
