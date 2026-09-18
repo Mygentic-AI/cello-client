@@ -208,11 +208,21 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
     async onSubscriberFrame(agentId, sessionId, counterpartyHex, content): Promise<SubscriberJoinResult> {
       if (!isChannelJoinFrame(content)) return { ok: false, reason: "not_a_join_frame" };
 
-      const accepted = decodeChannelJoinAccepted(content);
-      const rekey = accepted.ok ? null : decodeChannelRekey(content);
-      if (!accepted.ok && (!rekey || !rekey.ok)) return { ok: false, reason: "malformed" };
+      /**
+       * An acceptance OR a re-key. Narrowed into two locals rather than kept as a pair of results,
+       * so the compiler knows which one carries a frame — a non-null assertion here would be the
+       * kind of "I know better" that survives a later edit changing which branch can be reached.
+       */
+      const acceptedResult = decodeChannelJoinAccepted(content);
+      const acceptedFrame = acceptedResult.ok ? acceptedResult.frame : null;
+      let rekeyFrame: import("@cello-protocol/protocol-types").ChannelRekey | null = null;
+      if (!acceptedFrame) {
+        const rekeyResult = decodeChannelRekey(content);
+        if (rekeyResult.ok) rekeyFrame = rekeyResult.frame;
+      }
+      if (!acceptedFrame && !rekeyFrame) return { ok: false, reason: "malformed" };
 
-      const channelPubkey = accepted.ok ? accepted.frame.channel_pubkey : rekey!.frame.channel_pubkey;
+      const channelPubkey = acceptedFrame ? acceptedFrame.channel_pubkey : rekeyFrame!.channel_pubkey;
       const channelHex = Buffer.from(channelPubkey).toString("hex");
 
       /**
@@ -239,7 +249,7 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
       const myKeys = deps.keyProviderFor(agentId);
       if (!myKeys) return { ok: false, reason: "no_key_provider" };
 
-      const bundle = accepted.ok ? accepted.frame.key_bundle : rekey!.frame.key_bundle;
+      const bundle = acceptedFrame ? acceptedFrame.key_bundle : rekeyFrame!.key_bundle;
       const unwrapped = await unwrapGroupKey(bundle, channelPubkey, myKeys);
       if (!unwrapped.ok) {
         logger.warn("channel.join.refused", { channel_pubkey: channelHex, reason: unwrapped.reason });
@@ -247,13 +257,13 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
       }
 
       // An ACCEPTANCE brings the subscription with it; a RE-KEY only adds a key to one that exists.
-      if (accepted.ok) {
+      if (acceptedFrame) {
         subscriptions.upsert({
           agent_id: agentId,
           channel_pubkey: channelHex,
           admin_pubkey: profileAdmin,
-          access: accepted.frame.access,
-          relays: accepted.frame.relays,
+          access: acceptedFrame.access,
+          relays: acceptedFrame.relays,
           joined_at: now(),
         });
       }
