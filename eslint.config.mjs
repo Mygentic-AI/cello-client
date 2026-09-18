@@ -357,8 +357,13 @@ export default [
     // reaches a session, and the inbound gate's new lookup. Two of those seams were narrowed on the
     // way out — the module gets `loadedAgents` and a list of open sessions, not the session manager
     // — which is what keeps it from reaching back into the rest of the daemon.
+    // ⚠️ 1417 → 1420 for M16 020-CHANADMIN: three lines, one of them code. The subscriber's
+    // directory lookup and the fallback rules around it are in `channel-admin-lookup.ts` and
+    // `channel-membership-wiring.ts`; what lands here is handing the membership wiring the
+    // per-agent signaling accessor this file already holds — a seam, which is the one thing a
+    // composition root cannot delegate.
     files: ["core/daemon/src/daemon.ts"],
-    rules: { "max-lines": ["error", { max: 1417, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 1420, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/daemon-handle.ts"],

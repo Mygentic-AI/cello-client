@@ -57,7 +57,7 @@ export interface ChannelJoinExchangeDeps {
    * The channel's admin AS THE DIRECTORY REPORTS IT. `null` means the lookup could not be resolved,
    * which FAILS CLOSED — an unreachable directory must not become "whoever answered is the admin".
    */
-  profileAdminPubkey: (channelHex: string) => Promise<string | null>;
+  profileAdminPubkey: (channelHex: string, agentId: string) => Promise<string | null>;
   keyProviderFor: (agentId: string) => KeyProvider | null;
   raiseNotice: (event: string, channelHex: string, subscriberHex: string) => void;
   now?: () => number;
@@ -263,7 +263,9 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
        * A lookup that cannot be RESOLVED fails closed. An unreachable directory must never mean
        * "accept whoever this is" — that would make a network problem into an admission.
        */
-      const profileAdmin = await deps.profileAdminPubkey(channelHex);
+      // The asking agent goes with it: the lookup rides THAT agent's own authenticated directory
+      // stream, not some other agent's that happens to be connected.
+      const profileAdmin = await deps.profileAdminPubkey(channelHex, agentId);
       if (profileAdmin === null) {
         logger.warn("channel.join.refused", { channel_pubkey: channelHex, reason: "admin_unresolved" });
         return { ok: false, reason: "admin_unresolved" };

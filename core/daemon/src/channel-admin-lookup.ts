@@ -18,6 +18,7 @@
  * whoever happened to answer.
  */
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /**
  * The part of a `SignalingManager` this needs. Structural rather than the class, so the lookup can
@@ -151,7 +152,7 @@ export function createChannelAdminLookup(
       deps.logger.info("directory.channel.admin.lookup", { channel: channelHex.slice(0, 16), answered: "admin" });
       return { kind: "admin", adminPubkeyHex };
     } catch (err: unknown) {
-      return { kind: "unavailable", reason: err instanceof Error ? err.message : String(err) };
+      return { kind: "unavailable", reason: extractErrorMessage(err) };
     } finally {
       if (timer !== undefined) clearTimeout(timer);
       unregister();

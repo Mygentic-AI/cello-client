@@ -673,6 +673,9 @@ async function startDaemonHoldingLock(
     activeSessionsFor: (agentName) => sessionNodeManager.getSessionsForAgent(agentName)
       .filter((s) => s.status === "active")
       .map((s) => ({ sessionId: s.session_id, counterpartyPubkeyHex: s.counterparty_pubkey })),
+    // M16 020-CHANADMIN: the subscriber asks the directory who administers a channel, on its own
+    // authenticated stream. No stream means the join is refused, not accepted.
+    signalingFor: (agentName) => signalingFor(agentName) ?? null,
   });
 
   const channelWiring = wireChannelPublishing({
