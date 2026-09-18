@@ -397,3 +397,15 @@ export {
   verifyChannelInfo,
 } from "./channel-info.js";
 export type { ChannelInfo, ChannelAccess, ChannelInfoDecodeReason } from "./channel-info.js";
+// The channel frames that carry a signature of their own. ONE definition, imported by the client
+// that signs and the relay that verifies — see the header of channel-auth.ts.
+export {
+  buildChannelFetchAuthTbs,
+  buildChannelPruneTbs,
+  buildChannelReaderCountsTbs,
+  buildChannelFetchKeyTbs,
+  CHANNEL_FETCH_AUTH_DOMAIN,
+  CHANNEL_PRUNE_DOMAIN,
+  CHANNEL_READER_COUNTS_DOMAIN,
+  CHANNEL_FETCH_KEY_DOMAIN,
+} from "./channel-auth.js";

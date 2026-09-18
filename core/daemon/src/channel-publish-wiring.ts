@@ -58,6 +58,13 @@ export function wireChannelPublishing(deps: ChannelPublishWiringDeps): void {
       logger,
       log,
       deposit: (addr, req) => relay.deposit(addr, { post_cbor: req.post_cbor }),
+      depositInfo: (addr, req) => relay.depositInfo(addr, { info_cbor: req.info_cbor }),
+      prune: (addr, req) => relay.prune(addr, {
+        channel_pubkey: Buffer.from(req.channelHex, "hex"),
+        through_seq: req.throughSeq,
+        time_ms: req.timeMs,
+        signature: req.signature,
+      }),
       relayHead: (addr, channelHex) => relay.head(addr, Buffer.from(channelHex, "hex")),
       // The screen has no session to name, so it names what it IS screening. Borrowing a session id
       // would file channel posts in another conversation's governance history.

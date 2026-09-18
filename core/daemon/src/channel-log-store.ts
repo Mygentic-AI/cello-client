@@ -182,6 +182,66 @@ export class ChannelLogStore {
   }
 
   /**
+   * Replace the bytes at a position that NO relay has receipted yet (M16 018-PUBCOLLECT).
+   *
+   * The one caller is the clock-skew correction: a relay refused the post for its timestamp, the
+   * time is inside both signatures, so the corrected post is different bytes at the same number.
+   *
+   * ⚠️ **REFUSES ONCE ANY RECEIPT EXISTS, and that refusal is the point.** A receipt binds the post
+   * BY HASH. Replacing bytes a relay has already acknowledged would leave a receipt that proves
+   * nothing and a subscriber holding the old bytes at the same number as the new ones — which is
+   * indistinguishable from the publisher forking its own channel.
+   *
+   * ⚠️ It does NOT move `next_seq`. This is a correction to an existing position, not an append.
+   */
+  replaceUnreceipted(channelPubkeyHex: string, post: BroadcastArtifact, correlationId?: string): void {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const receipted = this.#db
+        .prepare(`SELECT COUNT(*) AS n FROM channel_log_receipts WHERE channel_pubkey = ? AND seq = ?`)
+        .get(channelPubkeyHex, post.seq) as { n: number | bigint };
+      if (Number(receipted.n) > 0) {
+        throw new ChannelLogError("position_taken", `seq ${post.seq} has already been receipted and cannot be re-signed`);
+      }
+      // The same three checks `append` makes. A correction is still a post, and skipping them here
+      // would make this the one way to get unverifiable bytes into the log.
+      let cbor: Uint8Array;
+      try {
+        cbor = encodeBroadcastArtifact(post);
+      } catch (err) {
+        throw new ChannelLogError("post_invalid", extractErrorMessage(err));
+      }
+      const decoded = decodeBroadcastArtifact(cbor);
+      if (!decoded.ok) throw new ChannelLogError("post_invalid", `${decoded.reason}: ${decoded.detail}`);
+      const verdict = verifyBroadcastArtifact(decoded.artifact);
+      if (!verdict.ok) throw new ChannelLogError("post_invalid", verdict.reason);
+      if (hexOf(post.channel_pubkey) !== channelPubkeyHex) {
+        throw new ChannelLogError(
+          "post_invalid",
+          `the post is signed by channel ${hexOf(post.channel_pubkey).slice(0, 16)}, not ${channelPubkeyHex.slice(0, 16)}`,
+        );
+      }
+      const updated = this.#db
+        .prepare(
+          `UPDATE channel_log SET published_at = ?, title = ?, post_cbor = ?
+           WHERE channel_pubkey = ? AND seq = ?`,
+        )
+        .run(post.published_at, post.title, Buffer.from(cbor), channelPubkeyHex, post.seq);
+      if (Number(updated.changes) === 0) {
+        throw new ChannelLogError("seq_not_next", `seq ${post.seq} is not in this channel's log`);
+      }
+      this.#db.exec("COMMIT");
+    } catch (err) {
+      this.#rollback(channelPubkeyHex, err);
+      throw err;
+    }
+    this.#logger.info("channel.post.resigned", {
+      ...(correlationId !== undefined ? { correlationId } : {}),
+      channel_pubkey: channelPubkeyHex, seq: post.seq, published_at: post.published_at,
+    });
+  }
+
+  /**
    * Store one relay's receipt for a post this log holds. VERIFIES FIRST, against the stored post —
    * not against whatever the caller passed alongside it — so a receipt for a different post at the
    * same number is refused rather than filed as proof.

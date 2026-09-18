@@ -168,6 +168,34 @@ export class ChannelRelayClient {
     };
   }
 
+  /**
+   * Deposit the channel's info record. No receipt: the record carries no post number, so there is
+   * nothing for a relay to order or countersign — it either holds the latest one or it does not.
+   */
+  async depositInfo(relayAddr: string, req: { info_cbor: Uint8Array }): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const answer = await this.request(relayAddr, { type: "channel_info_set", info_record: req.info_cbor });
+    if (answer["type"] === "channel_info_set_ok") return { ok: true };
+    return { ok: false, reason: typeof answer["reason"] === "string" ? answer["reason"] : "unexpected_answer" };
+  }
+
+  /** Ask a relay to drop everything through a post number. Oldest end only — the relay enforces that. */
+  async prune(relayAddr: string, req: { channel_pubkey: Uint8Array; through_seq: number; time_ms: number; signature: Uint8Array }): Promise<
+    { ok: true; dropped?: number } | { ok: false; reason: string }
+  > {
+    const answer = await this.request(relayAddr, {
+      type: "channel_prune",
+      channel_pubkey: req.channel_pubkey,
+      through_seq: req.through_seq,
+      time_ms: req.time_ms,
+      signature: req.signature,
+    });
+    // `pruned` is the relay's own field name for how many it dropped — read it as sent.
+    if (answer["type"] === "channel_prune_ok") {
+      return { ok: true, ...(typeof answer["pruned"] === "number" ? { dropped: answer["pruned"] } : {}) };
+    }
+    return { ok: false, reason: typeof answer["reason"] === "string" ? answer["reason"] : "unexpected_answer" };
+  }
+
   /** The channel's info record as this relay holds it, or null. */
   async info(relayAddr: string, channelPubkey: Uint8Array): Promise<Uint8Array | null> {
     const answer = await this.request(relayAddr, { type: "channel_info", channel_pubkey: channelPubkey });

@@ -22,7 +22,10 @@ import {
   verifyRelayPostReceipt,
 } from "@cello-protocol/protocol-types";
 import { ChannelLogStore } from "../channel-log-store.js";
-import { ChannelPublisher, type RelayDepositSeam } from "../channel-publisher.js";
+import {
+  ChannelPublisher,
+  type RelayDepositSeam, type RelayInfoDepositSeam, type RelayPruneSeam,
+} from "../channel-publisher.js";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import type { DaemonDatabase } from "../sqlcipher-db.js";
 import type { Logger } from "../types.js";
@@ -64,6 +67,10 @@ interface Harness {
   down: Set<string>;
   screen: { block: boolean };
   clock: { now: number };
+  /** The info record each relay currently holds — empty means no relay was ever told. */
+  infoHeld: Map<string, Uint8Array>;
+  /** Every prune request a relay received. An empty list means no relay was asked. */
+  pruneCalls: Array<{ relay: string; throughSeq: number; signature: Uint8Array }>;
 }
 
 async function harness(opts: { access?: "public" | "open" } = {}): Promise<Harness> {
@@ -114,8 +121,38 @@ async function harness(opts: { access?: "public" | "open" } = {}): Promise<Harne
     return { ok: true, receipt_cbor: encodeRelayPostReceipt(receipt) };
   };
 
+  /** Info records each relay holds, so a test can ask whether a deposit actually reached one. */
+  const infoHeld = new Map<string, Uint8Array>();
+  const depositInfo: RelayInfoDepositSeam = (relay, req) => {
+    if (down.has(relay)) throw new Error(`relay ${relay} is unreachable`);
+    const refusal = refuse.get(relay);
+    if (refusal) {
+      refuse.delete(relay);
+      return Promise.resolve({ ok: false, reason: refusal.reason });
+    }
+    infoHeld.set(relay, req.info_cbor);
+    return Promise.resolve({ ok: true });
+  };
+
+  /** Prune requests each relay received, so a test can tell "asked and dropped" from "never asked". */
+  const pruneCalls: Array<{ relay: string; throughSeq: number; signature: Uint8Array }> = [];
+  const prune: RelayPruneSeam = (relay, req) => {
+    if (down.has(relay)) throw new Error(`relay ${relay} is unreachable`);
+    pruneCalls.push({ relay, throughSeq: req.throughSeq, signature: req.signature });
+    const holding = held.get(relay)!;
+    let dropped = 0;
+    for (const seq of [...holding]) {
+      if (seq <= req.throughSeq) { holding.delete(seq); dropped += 1; }
+    }
+    return Promise.resolve({ ok: true, dropped });
+  };
+
   const publisher = new ChannelPublisher({
     db,
+    depositInfo,
+    prune,
+    // No waiting in tests. Production paces refills under the relay's rate limit.
+    resendPaceMs: 0,
     logger: silent,
     log,
     now: () => clock.now,
@@ -132,8 +169,14 @@ async function harness(opts: { access?: "public" | "open" } = {}): Promise<Harne
     // The seam `cello_send` uses. The subscriber's inbound screen is the enforcement; this is the
     // early check that spares an honest publisher the friction.
     screenOutbound: () => Promise.resolve(screen.block ? { disposition: "block", reason: "injection" } : { disposition: "allow" }),
-    getChannelKey: () => channelKp,
-    getAgentKey: () => adminKp,
+    /**
+     * ⚠️ BOTH LOOKUPS ARE NAME-SENSITIVE, and that is not fussiness. They ignored their argument,
+     * so the publisher's skew retry — which asked for the agent key under the EMPTY STRING — passed
+     * every test while being `null` in production, where the real lookup is a map read. A harness
+     * that answers any question with the right key cannot see a caller asking the wrong one.
+     */
+    getChannelKey: (hex) => (hex.toLowerCase() === channelHex.toLowerCase() ? channelKp : null),
+    getAgentKey: (name) => (name === "agent-1" ? adminKp : null),
     /**
      * 019 owns the group key; this stands in for it. It XORs rather than merely prefixing, because a
      * prefix leaves the plaintext readable — and test 7, which asserts the body is not readable,
@@ -148,7 +191,10 @@ async function harness(opts: { access?: "public" | "open" } = {}): Promise<Harne
     }),
   });
 
-  return { publisher, log, channelKp, adminKp, channelHex, relayKeys, deposits, logStateAtDeposit, held, refuse, down, screen, clock };
+  return {
+    publisher, log, channelKp, adminKp, channelHex, relayKeys, deposits, logStateAtDeposit,
+    held, refuse, down, screen, clock, infoHeld, pruneCalls,
+  };
 }
 
 describe("M16 018-PUBCOLLECT: publishing", () => {
@@ -221,28 +267,63 @@ describe("M16 018-PUBCOLLECT: publishing", () => {
     expect(h.log.receiptsFor(h.channelHex, 1)).toHaveLength(1);
   });
 
-  it("5. clock_skew is retried ONCE with a fresh published_at, and the two attempts differ", async () => {
+  it("5. clock_skew re-signs ONCE, at the LARGEST reported skew, and sends the SAME bytes to both relays", async () => {
     const h = await harness();
-    h.refuse.set(RELAY_A, { reason: "clock_skew", skew_ms: 90_000 });
+    // Both relays refuse, by different amounts. Correcting to the smaller one would leave the
+    // stricter relay refusing again with no retry left.
+    h.refuse.set(RELAY_A, { reason: "clock_skew", skew_ms: 60_000 });
+    h.refuse.set(RELAY_B, { reason: "clock_skew", skew_ms: 90_000 });
+    // The harness refuses once per relay, so the corrected attempt is the one they accept.
 
     const result = await h.publisher.publish("agent-1", h.channelHex, "re-signed", "body");
     expect(result.ok).toBe(true);
 
     const toA = h.deposits.filter((d) => d.relay === RELAY_A);
-    expect(toA, "the refused attempt and the retry").toHaveLength(2);
+    const toB = h.deposits.filter((d) => d.relay === RELAY_B);
+    expect(toA, "the refused attempt and the corrected one").toHaveLength(2);
+    expect(toB).toHaveLength(2);
+
     // ⚠️ A NEW SIGNATURE OVER A NEW TIME. The time is inside the signature, so re-sending the same
     // bytes could never satisfy the relay — retrying without re-signing would loop forever.
     expect(Buffer.from(toA[0].postCbor).equals(Buffer.from(toA[1].postCbor))).toBe(false);
+
+    /**
+     * ⚠️ **THE HEART OF THIS TEST: BOTH RELAYS GET IDENTICAL BYTES.** Correcting per relay gives
+     * relay A one body at post 1 and relay B another — and a subscriber taking the union of the two
+     * sees precisely what a fork looks like, manufactured by an honest publisher with a bad clock.
+     */
+    expect(Buffer.from(toA[1].postCbor).equals(Buffer.from(toB[1].postCbor))).toBe(true);
 
     const first = decodeBroadcastArtifact(toA[0].postCbor);
     const second = decodeBroadcastArtifact(toA[1].postCbor);
     expect(first.ok && second.ok).toBe(true);
     if (!first.ok || !second.ok) return;
-    // The retry APPLIES the relay's number rather than guessing: the relay said this publisher was
-    // 90s ahead, so the re-signed time is 90s earlier. Re-signing at the same clock would be refused
-    // identically, for ever.
+    // The LARGEST skew, not the first one heard: 90s, the amount the stricter relay reported.
     expect(second.artifact.published_at).toBe(first.artifact.published_at - 90_000);
-    expect(second.artifact.seq, "a retry is the SAME post, not the next one").toBe(first.artifact.seq);
+    expect(second.artifact.seq, "a correction is the SAME post, not the next one").toBe(first.artifact.seq);
+
+    // And the LOG holds the corrected bytes — the ones the relays took and receipted. Leaving the
+    // original there would mean every receipt named bytes the publisher could not produce again.
+    const stored = h.log.readRange(h.channelHex, 1, 1)[0];
+    expect(stored.published_at).toBe(second.artifact.published_at);
+    expect(h.log.receiptsFor(h.channelHex, 1), "both relays' receipts filed").toHaveLength(2);
+  });
+
+  it("5b. a relay that ALREADY took the post is never re-signed under: the receipt stays valid", async () => {
+    const h = await harness();
+    // A takes it; B refuses for skew. There is now a receipt bound to those bytes by hash.
+    h.refuse.set(RELAY_B, { reason: "clock_skew", skew_ms: 90_000 });
+
+    const result = await h.publisher.publish("agent-1", h.channelHex, "one took it", "body");
+    expect(result.ok).toBe(true);
+
+    // ⚠️ NO CORRECTION HAPPENED. One relay accepting means those bytes ARE the post; re-signing
+    // under A's receipt would strand it, and put two bodies at post 1 across the two relays.
+    expect(h.deposits.filter((d) => d.relay === RELAY_A), "A was asked once").toHaveLength(1);
+    expect(h.deposits.filter((d) => d.relay === RELAY_B), "B was asked once").toHaveLength(1);
+
+    const receipts = h.log.receiptsFor(h.channelHex, 1);
+    expect(receipts, "A's receipt, and it still binds the stored bytes").toHaveLength(1);
   });
 
   it("6. a blocked outbound screen refuses: nothing signed, logged or sent", async () => {
@@ -308,7 +389,40 @@ describe("M16 018-PUBCOLLECT: publishing", () => {
     const pruned = await h.publisher.pruneChannel("agent-1", h.channelHex, 2);
     expect(pruned.pruned).toBe(2);
     expect(h.log.head(h.channelHex)).toEqual({ first_seq: 3, last_seq: 3, pruned_through: 2 });
-    expect(pruned.relays.map((r) => r.relay).sort()).toEqual([RELAY_A, RELAY_B].sort());
+
+    /**
+     * ⚠️ **THE RELAYS WERE ASKED, AND THEY DROPPED.** The earlier version of this test asserted
+     * `pruned.relays.map(r => r.relay)` — which is the channel's CONFIGURED relay list, true of code
+     * that contacts nobody. It passed against exactly that: a `relays.map(r => ({relay: r, ok: true}))`
+     * that told the operator both relays had dropped 500 posts while both still served every one.
+     */
+    expect(h.pruneCalls.map((c) => c.relay).sort()).toEqual([RELAY_A, RELAY_B].sort());
+    for (const call of h.pruneCalls) {
+      expect(call.throughSeq).toBe(2);
+      // Signed by the CHANNEL key: without a signature anyone knowing the public key could delete
+      // the channel's backbone from both relays.
+      expect(call.signature.length).toBe(64);
+    }
+    // What the relays actually still hold — the assertion the operator's belief rests on.
+    expect([...h.held.get(RELAY_A)!].sort()).toEqual([3]);
+    expect([...h.held.get(RELAY_B)!].sort()).toEqual([3]);
+    expect(pruned.relays.every((r) => r.ok)).toBe(true);
+  });
+
+  it("9b. a relay that is DOWN is reported as still holding the posts, never as pruned", async () => {
+    const h = await harness();
+    for (const t of ["a", "b", "c"]) await h.publisher.publish("agent-1", h.channelHex, t, "body");
+    h.down.add(RELAY_B);
+
+    const pruned = await h.publisher.pruneChannel("agent-1", h.channelHex, 2);
+    // The local log is pruned either way: that half cannot fail partway.
+    expect(pruned.pruned).toBe(2);
+    expect(pruned.relays.find((r) => r.relay === RELAY_A)?.ok).toBe(true);
+    // ⚠️ AND B IS NOT `ok`. It never heard the request and is still serving posts 1 and 2. Reporting
+    // it as pruned is the difference between an operator who knows their content is still out there
+    // and one who believes it is gone.
+    expect(pruned.relays.find((r) => r.relay === RELAY_B)?.ok).toBe(false);
+    expect([...h.held.get(RELAY_B)!].sort()).toEqual([1, 2, 3]);
   });
 
   it("10. the info record round-trips and verifies; an ADMIN-key signature is refused", async () => {
@@ -324,6 +438,17 @@ describe("M16 018-PUBCOLLECT: publishing", () => {
     expect(decoded.info.relays).toEqual([RELAY_A, RELAY_B]);
     expect(decoded.info.access).toBe("open");
 
+    /**
+     * ⚠️ **BOTH RELAYS ACTUALLY RECEIVED IT.** Signing the record is not publishing it: this record
+     * is the ONLY way a subscriber learns a channel's relays, access and admin key, so a version
+     * that signed it, logged `channel.info.published` and returned the bytes to the caller left the
+     * operator certain their channel was live while nobody could find it. That version passed this
+     * test, because the test stopped at the signature.
+     */
+    expect([...h.infoHeld.keys()].sort()).toEqual([RELAY_A, RELAY_B].sort());
+    expect(Buffer.from(h.infoHeld.get(RELAY_A)!).equals(Buffer.from(published.info_cbor))).toBe(true);
+    expect(published.relays.every((r) => r.ok)).toBe(true);
+
     // ⚠️ Only the CHANNEL key may say where a channel's subscribers should look. A record signed by
     // the admin agent would let a replaced admin redirect an entire audience.
     const { signChannelInfo } = await import("@cello-protocol/protocol-types");
@@ -334,5 +459,19 @@ describe("M16 018-PUBCOLLECT: publishing", () => {
     // It verifies against the ADMIN key it names, and that is exactly the problem: a subscriber
     // checks against the CHANNEL key, and against that it is not a record at all.
     expect(verifyChannelInfo({ ...byAdmin, channel_pubkey: await h.channelKp.getPublicKey() })).toBe(false);
+  });
+
+  it("10b. no relay takes the info record → the operator is told the channel is undiscoverable", async () => {
+    const h = await harness();
+    h.down.add(RELAY_A);
+    h.down.add(RELAY_B);
+
+    const published = await h.publisher.publishInfo("agent-1", h.channelHex);
+    // ⚠️ NOT `ok`. A signed record nobody holds is a channel no subscriber can find, and reporting
+    // success here is the failure mode this test exists for.
+    expect(published.ok).toBe(false);
+    if (published.ok) return;
+    expect(published.reason).toBe("no_relay_accepted");
+    expect(h.infoHeld.size).toBe(0);
   });
 });

@@ -1542,7 +1542,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "Usage: cello channel publish <channel> <title> <body> [--agent <agent>]\n" +
       "       cello channel info-set <channel> [--agent <agent>]\n" +
       "       cello channel prune <channel> <through_seq> [--agent <agent>]\n" +
-      "       cello channel resend <channel> [--agent <agent>]\n" +
+      "       cello channel resend <channel> [<relay>] [--agent <agent>]\n" +
       "  <channel> is the channel's 64-character hex public key.\n" +
       "  A post is signed by BOTH the channel key and your agent key, so a reader can tell which\n" +
       "  operator published it, not only which channel.\n" +
@@ -1572,7 +1572,11 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
         return legacy(await channelVerb(ctx.celloDir, "cello_channel_prune", withAgent({ channel, through_seq: through })));
       }
       if (sub === "resend" && channel) {
-        return legacy(await channelVerb(ctx.celloDir, "cello_channel_resend", withAgent({ channel })));
+        // A relay is OPTIONAL: with none, the daemon refills every relay the channel publishes to.
+        // Requiring a multiaddr here made the only repair command unrunnable in practice.
+        return legacy(await channelVerb(
+          ctx.celloDir, "cello_channel_resend", withAgent(a !== undefined ? { channel, relay: a } : { channel }),
+        ));
       }
       return { stdout: helpForSpec("channel"), stderr: "", exitCode: 1 };
     },

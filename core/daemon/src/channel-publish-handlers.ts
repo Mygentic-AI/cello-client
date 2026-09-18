@@ -109,7 +109,22 @@ export function registerChannelPublishHandlers(deps: ChannelPublishDeps): void {
     if (!publisher) return { ok: false, reason: "channel_unknown" };
 
     const result = await publisher.publishInfo(agent.agentName, channel.channelHex);
-    return result.ok ? { ok: true, bytes: result.info_cbor.length } : { ok: false, reason: result.reason };
+    if (!result.ok) {
+      return {
+        ok: false, reason: result.reason, detail: result.detail,
+        guidance: result.reason === "no_relay_accepted"
+          ? "No relay took the channel's description, so nobody can discover this channel yet. Check the relays are reachable and run it again."
+          : undefined,
+      };
+    }
+    return {
+      ok: true,
+      bytes: result.info_cbor.length,
+      // WHICH relays hold it, not just that it was signed. A subscriber can only find this channel
+      // through a relay that actually took the record.
+      relays_ok: result.relays.filter((r) => r.ok).map((r) => r.relay),
+      relays_failed: result.relays.filter((r) => !r.ok).map((r) => ({ relay: r.relay, reason: r.reason })),
+    };
   });
 
   handlers.set("cello_channel_prune", async (params, connectionId) => {
@@ -126,7 +141,18 @@ export function registerChannelPublishHandlers(deps: ChannelPublishDeps): void {
     if (!publisher) return { ok: false, reason: "channel_unknown" };
 
     const result = await publisher.pruneChannel(agent.agentName, channel.channelHex, through);
-    return { ok: true, pruned: result.pruned, relays: result.relays };
+    const stillHolding = result.relays.filter((r) => !r.ok);
+    return {
+      ok: true,
+      pruned: result.pruned,
+      relays: result.relays,
+      // The log is pruned either way — that part is local and cannot fail halfway. A relay that did
+      // not drop its copy KEEPS SERVING those posts, and saying so is the difference between an
+      // operator who knows their content is still out there and one who believes it is gone.
+      guidance: stillHolding.length > 0
+        ? `Your own copy is pruned. ${String(stillHolding.length)} relay(s) did not drop theirs and will keep serving those posts until retention expires.`
+        : undefined,
+    };
   });
 
   handlers.set("cello_channel_resend", async (params, connectionId) => {
@@ -135,14 +161,32 @@ export function registerChannelPublishHandlers(deps: ChannelPublishDeps): void {
     const channel = needChannel(params);
     if (!channel.ok) return channel.answer;
 
-    const relay = params?.["relay"];
-    if (typeof relay !== "string" || relay.length === 0) {
-      return { ok: false, reason: "bad_relay", guidance: "Pass `relay`: the multiaddr to refill." };
-    }
     const publisher = deps.getPublisher(agent.agentName);
     if (!publisher) return { ok: false, reason: "channel_unknown" };
 
-    const result = await publisher.resendMissing(agent.agentName, channel.channelHex, relay);
-    return { ok: true, deposited: result.deposited };
+    /**
+     * ⚠️ **NO RELAY NAMED MEANS ALL OF THEM**, and that is the ordinary case. Requiring the operator
+     * to type a multiaddr made this verb impossible to run from the terminal, which left a relay
+     * that lost content with no repair path at all — the one job this verb has. Naming a relay
+     * stays available for the case where only one needs refilling.
+     */
+    const raw = params?.["relay"];
+    if (raw !== undefined && (typeof raw !== "string" || raw.length === 0)) {
+      return { ok: false, reason: "bad_relay", guidance: "Pass `relay` as a multiaddr, or leave it out to refill every relay." };
+    }
+    const targets = typeof raw === "string" ? [raw] : publisher.relaysFor(channel.channelHex);
+    if (targets.length === 0) {
+      return {
+        ok: false, reason: "channel_unknown",
+        guidance: "This daemon has no relays recorded for that channel, so there is nothing to refill.",
+      };
+    }
+
+    const per: Array<{ relay: string; deposited: number }> = [];
+    for (const target of targets) {
+      const result = await publisher.resendMissing(agent.agentName, channel.channelHex, target);
+      per.push({ relay: target, deposited: result.deposited });
+    }
+    return { ok: true, deposited: per.reduce((n, r) => n + r.deposited, 0), relays: per };
   });
 }

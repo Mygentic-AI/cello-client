@@ -32,6 +32,7 @@ import {
   signBroadcastArtifact,
   signChannelInfo,
   verifyRelayPostReceipt,
+  buildChannelPruneTbs,
   type BroadcastArtifact,
   type ChannelAccess,
 } from "@cello-protocol/protocol-types";
@@ -40,19 +41,44 @@ import { ChannelLogStore } from "./channel-log-store.js";
 /** How the publisher reaches a relay. The transport is the caller's; this owns the decisions. */
 export type RelayDepositSeam = (
   relay: string,
-  req: { post_cbor: Uint8Array; info_cbor?: Uint8Array },
+  req: { post_cbor: Uint8Array },
 ) => Promise<
   | { ok: true; receipt_cbor: Uint8Array }
   | { ok: false; reason: string; skew_ms?: number }
 >;
 
+/** Deposit the channel's info record. Separate from a post: it carries no sequence and no receipt. */
+export type RelayInfoDepositSeam = (
+  relay: string,
+  req: { info_cbor: Uint8Array },
+) => Promise<{ ok: true } | { ok: false; reason: string }>;
+
+/** Ask a relay to drop everything through a post number, oldest end only. */
+export type RelayPruneSeam = (
+  relay: string,
+  req: { channelHex: string; throughSeq: number; timeMs: number; signature: Uint8Array },
+) => Promise<{ ok: true; dropped?: number } | { ok: false; reason: string }>;
+
 export type ScreenVerdict = { disposition: "allow" | "block" | "warn" | "redact"; reason?: string };
+
+/**
+ * Gap between deposits during a refill, so a long backlog stays under the relay's per-publisher
+ * rate limit. Only `resendMissing` paces — an ordinary publish is two deposits and pacing it would
+ * add latency to every post to protect against a burst that cannot happen.
+ */
+export const DEFAULT_RESEND_PACE_MS = 50;
 
 export interface ChannelPublisherOptions {
   db: DaemonDatabase;
   logger: Logger;
   log: ChannelLogStore;
   deposit: RelayDepositSeam;
+  depositInfo: RelayInfoDepositSeam;
+  /**
+   * Optional ONLY so a caller that cannot prune says so: an absent seam reports each relay as
+   * `relay_prune_unavailable`, never as a successful prune.
+   */
+  prune?: RelayPruneSeam;
   /**
    * Where a relay's queue begins and ends. Optional: without it `resendMissing` re-sends everything
    * logged, which is correct but chattier. See the note at its use for why a RECEIPT is not the
@@ -64,6 +90,8 @@ export interface ChannelPublisherOptions {
   getAgentKey: (agentName: string) => KeyProvider | null;
   /** 019 owns the group key; the publisher must not be able to tell what this does. */
   encryptBody: (plaintext: Uint8Array, channelHex: string) => Promise<Uint8Array>;
+  /** Overridable so a test can refill without waiting; production takes the default. */
+  resendPaceMs?: number;
   channelInfo: (channelHex: string) => {
     access: ChannelAccess; relays: string[]; guidance: string; retention_seconds: number;
   } | null;
@@ -75,8 +103,17 @@ export type PublishRefusal =
 
 export interface DepositOutcome {
   relay: string;
+  /** Did this relay TAKE the post. Nothing else belongs in this flag — see `receipt_unfiled`. */
   ok: boolean;
   reason?: string;
+  /** What the relay said our clock is off by, carried so the correction can use the largest. */
+  skew_ms?: number;
+  /**
+   * The relay took the post and its receipt could not be filed (unverifiable, or naming bytes this
+   * log does not hold). SEPARATE FROM `ok` on purpose: folding it in reported a post that is safely
+   * on two relays as `no_relay_accepted`, and sent the operator to resend something already there.
+   */
+  receipt_unfiled?: string;
 }
 
 export type PublishResult =
@@ -140,8 +177,27 @@ export class ChannelPublisher {
 
     // 5. Both relays, in parallel — a deposit is independent of the other, and making the second
     //    wait on the first would double the latency of the ordinary case for no gain.
-    const deposited = await Promise.all(info.relays.map((relay) => this.#depositWithRetry(relay, post, channelHex, correlationId)));
-    const ok = deposited.filter((d) => d.ok);
+    let deposited = await Promise.all(info.relays.map((relay) => this.#depositOnce(relay, post, channelHex, correlationId)));
+    let ok = deposited.filter((d) => d.ok);
+
+    /**
+     * ⚠️ **THE CLOCK-SKEW CORRECTION IS ONE POST FOR ALL RELAYS, AND ONLY WHILE NONE HAS TAKEN IT.**
+     *
+     * `published_at` is inside both signatures, so a corrected post is different BYTES at the same
+     * number. Correcting per relay would let relay A hold one body at seq N and relay B another —
+     * and a subscriber taking the union of the two sees exactly what a fork looks like, produced by
+     * an honest publisher with a wrong clock. So the correction happens here, once, and only when
+     * NO relay accepted the original: a relay that already answered holds a receipt bound to those
+     * bytes by hash, and re-signing under it would strand the proof.
+     */
+    if (ok.length === 0 && deposited.some((d) => d.reason === "clock_skew")) {
+      const corrected = await this.#resignForSkew(agentName, channelHex, post, deposited, correlationId);
+      if (corrected) {
+        post = corrected;
+        deposited = await Promise.all(info.relays.map((relay) => this.#depositOnce(relay, post, channelHex, correlationId)));
+        ok = deposited.filter((d) => d.ok);
+      }
+    }
 
     logger.info("channel.post.published", {
       ...(correlationId !== undefined ? { correlationId } : {}),
@@ -160,80 +216,113 @@ export class ChannelPublisher {
   }
 
   /**
-   * Deposit on one relay, retrying ONCE on `clock_skew` with a freshly signed post.
+   * One deposit on one relay. No retry lives here — see the skew note in `publish`, which is where
+   * a correction has to happen if it is to produce the same bytes for every relay.
    *
-   * ⚠️ THE RETRY RE-SIGNS. `published_at` is inside both signatures, so re-sending the same bytes
-   * could never satisfy a relay that just refused them for their time — the retry would loop until
-   * the attempt budget ran out and the post would never land.
+   * A relay that TOOK the post is `ok: true` even when its receipt could not be filed. The two facts
+   * are reported separately because folding them together turned a post that is safely on two relays
+   * into `no_relay_accepted`, and sent the operator to resend something already there.
    */
-  async #depositWithRetry(relay: string, post: BroadcastArtifact, channelHex: string, correlationId?: string): Promise<DepositOutcome> {
+  async #depositOnce(relay: string, post: BroadcastArtifact, channelHex: string, correlationId?: string): Promise<DepositOutcome> {
     const { logger } = this.#opts;
-    let attempt = post;
-    for (let tries = 0; tries < 2; tries++) {
-      let answer: Awaited<ReturnType<RelayDepositSeam>>;
-      try {
-        answer = await this.#opts.deposit(relay, { post_cbor: encodeBroadcastArtifact(attempt) });
-      } catch (err: unknown) {
-        logger.warn("channel.post.deposit_failed", {
-          ...(correlationId !== undefined ? { correlationId } : {}),
-          channel_pubkey: channelHex, seq: post.seq, relay, reason: extract(err),
-        });
-        return { relay, ok: false, reason: extract(err) };
-      }
-
-      if (answer.ok) {
-        const stored = this.#storeReceipt(channelHex, attempt, answer.receipt_cbor, relay, correlationId);
-        return stored ? { relay, ok: true } : { relay, ok: false, reason: "receipt_invalid" };
-      }
-
-      if (answer.reason === "clock_skew" && tries === 0) {
-        const channelKey = this.#opts.getChannelKey(channelHex);
-        const agentKey = this.#opts.getAgentKey("");
-        // Re-sign at OUR clock adjusted by what the relay told us, so an honest publisher with a
-        // wrong clock converges instead of guessing.
-        const corrected = this.#now() - (answer.skew_ms ?? 0);
-        if (channelKey && agentKey) {
-          attempt = await signBroadcastArtifact(channelKey, agentKey, {
-            seq: post.seq, published_at: corrected, title: post.title,
-            body: post.body, supersedes: post.supersedes, ext: null,
-          });
-          // The log holds what was FIRST signed; the relay may hold a differently-timed twin of the
-          // same post. Both are the channel's, and the receipt binds whichever the relay took.
-          continue;
-        }
-      }
-
+    let answer: Awaited<ReturnType<RelayDepositSeam>>;
+    try {
+      answer = await this.#opts.deposit(relay, { post_cbor: encodeBroadcastArtifact(post) });
+    } catch (err: unknown) {
       logger.warn("channel.post.deposit_failed", {
         ...(correlationId !== undefined ? { correlationId } : {}),
-        channel_pubkey: channelHex, seq: post.seq, relay, reason: answer.reason,
+        channel_pubkey: channelHex, seq: post.seq, relay, reason: extract(err),
       });
-      return { relay, ok: false, reason: answer.reason };
+      return { relay, ok: false, reason: extract(err) };
     }
-    return { relay, ok: false, reason: "clock_skew" };
+
+    if (answer.ok) {
+      const filed = this.#storeReceipt(channelHex, post, answer.receipt_cbor, relay, correlationId);
+      return filed.ok ? { relay, ok: true } : { relay, ok: true, receipt_unfiled: filed.reason };
+    }
+
+    logger.warn("channel.post.deposit_failed", {
+      ...(correlationId !== undefined ? { correlationId } : {}),
+      channel_pubkey: channelHex, seq: post.seq, relay, reason: answer.reason,
+    });
+    return {
+      relay, ok: false, reason: answer.reason,
+      ...(answer.skew_ms !== undefined ? { skew_ms: answer.skew_ms } : {}),
+    };
+  }
+
+  /**
+   * Re-sign a post ONCE at a clock the relays will accept, and put the corrected bytes in the log.
+   *
+   * The correction is the LARGEST skew any relay reported: a post the fastest relay will take is one
+   * the others will too, and correcting to the smallest would leave the strictest relay refusing
+   * again with no retry left.
+   *
+   * Returns `null` when the correction cannot be made — the keys are gone, or the log refuses to
+   * replace bytes it has already receipted. `null` leaves the ORIGINAL post standing, which is the
+   * safe direction: the post is in the log at its number and `resendMissing` can carry it later.
+   */
+  async #resignForSkew(
+    agentName: string, channelHex: string, post: BroadcastArtifact,
+    deposited: DepositOutcome[], correlationId?: string,
+  ): Promise<BroadcastArtifact | null> {
+    const { logger } = this.#opts;
+    const channelKey = this.#opts.getChannelKey(channelHex);
+    // BY NAME, from the caller. This read the empty string once, which is no agent, so the lookup
+    // was always null and the correction never ran in production — the test harness ignored the
+    // argument, so nothing said so.
+    const agentKey = this.#opts.getAgentKey(agentName);
+    if (!channelKey || !agentKey) {
+      logger.warn("channel.post.resign_failed", {
+        ...(correlationId !== undefined ? { correlationId } : {}),
+        channel_pubkey: channelHex, seq: post.seq, reason: "key_unavailable",
+      });
+      return null;
+    }
+
+    const skews = deposited.map((d) => d.skew_ms ?? 0);
+    const corrected = this.#now() - Math.max(...skews);
+    let resigned: BroadcastArtifact;
+    try {
+      resigned = await signBroadcastArtifact(channelKey, agentKey, {
+        seq: post.seq, published_at: corrected, title: post.title,
+        body: post.body, supersedes: post.supersedes, ext: null,
+      });
+      this.#opts.log.replaceUnreceipted(channelHex, resigned, correlationId);
+    } catch (err: unknown) {
+      logger.warn("channel.post.resign_failed", {
+        ...(correlationId !== undefined ? { correlationId } : {}),
+        channel_pubkey: channelHex, seq: post.seq, reason: extract(err),
+      });
+      return null;
+    }
+    return resigned;
   }
 
   /** Verify a receipt against the post it names before storing it; an unverified one is worthless. */
-  #storeReceipt(channelHex: string, post: BroadcastArtifact, receiptCbor: Uint8Array, relay: string, correlationId?: string): boolean {
+  #storeReceipt(channelHex: string, post: BroadcastArtifact, receiptCbor: Uint8Array, relay: string, correlationId?: string): { ok: true } | { ok: false; reason: string } {
     const decoded = decodeRelayPostReceipt(receiptCbor);
     if (!decoded.ok || !verifyRelayPostReceipt(decoded.receipt, post)) {
       this.#opts.logger.warn("channel.post.deposit_failed", {
         ...(correlationId !== undefined ? { correlationId } : {}),
         channel_pubkey: channelHex, seq: post.seq, relay, reason: "receipt_invalid",
       });
-      return false;
+      return { ok: false, reason: "receipt_invalid" };
     }
     try {
       this.#opts.log.recordReceipt(channelHex, decoded.receipt, correlationId);
       // Learn which key answers at this address, so `resendMissing` can tell the two relays apart.
       this.#relayKeys.set(relay, Buffer.from(decoded.receipt.relay_pubkey).toString("hex"));
-      return true;
+      return { ok: true };
     } catch (err: unknown) {
-      // A receipt for a post whose bytes the log does not hold — the clock-skew retry's twin, for
-      // instance. The publish still succeeded; the proof simply belongs to bytes we did not keep.
-      this.#opts.logger.warn("channel.post.deposit_failed", {
+      // A receipt naming bytes this log does not hold. The relay DID take the post — the caller
+      // reports that separately, because calling the deposit failed would send the operator to
+      // resend a post the relay already has.
+      this.#opts.logger.warn("channel.post.receipt_unfiled", {
+        ...(correlationId !== undefined ? { correlationId } : {}),
         channel_pubkey: channelHex, seq: post.seq, relay, reason: extract(err),
       });
-      return false;
+      return { ok: false, reason: extract(err) };
     }
   }
 
@@ -283,7 +372,12 @@ export class ChannelPublisher {
     // first gap and refills nothing after it.
     for (const post of log.readRange(channelHex, head.first_seq, head.last_seq)) {
       if (holds !== null && post.seq >= holds.first && post.seq <= holds.last) continue;
-      const outcome = await this.#depositWithRetry(relay, post, channelHex, correlationId);
+      // PACED. A refill of a long backbone is the one path that deposits hundreds of posts in a
+      // row, and the relay rate-limits per publisher — so an unpaced refill trips the limiter part
+      // way through and the rest of the backlog is refused, which looks exactly like a relay that
+      // will not take the channel's posts at all.
+      if (deposited > 0) await this.#pause(this.#opts.resendPaceMs ?? DEFAULT_RESEND_PACE_MS);
+      const outcome = await this.#depositOnce(relay, post, channelHex, correlationId);
       if (outcome.ok) deposited += 1;
     }
     logger.info("channel.resend.completed", {
@@ -293,27 +387,80 @@ export class ChannelPublisher {
     return { deposited };
   }
 
-  /** Prune the log, then tell both relays to drop the same range. */
+  /**
+   * Prune the log, then tell both relays to drop the same range.
+   *
+   * ⚠️ **EACH RELAY'S OUTCOME IS THE ONE IT GAVE.** This used to report `ok: true` for every relay
+   * without contacting any of them, so an operator pruning 500 posts was shown two successful
+   * relays while both still held and served every post. A relay that is down is `ok: false` with its
+   * reason, and its copy survives until its own retention sweeps it — which is what retention is for.
+   */
   async pruneChannel(agentName: string, channelHex: string, throughSeq: number, correlationId?: string): Promise<{
-    pruned: number; relays: Array<{ relay: string; ok: boolean }>;
+    pruned: number; relays: Array<{ relay: string; ok: boolean; reason?: string }>;
   }> {
+    const { logger } = this.#opts;
     const { pruned } = this.#opts.log.pruneThrough(channelHex, throughSeq);
     const info = this.#opts.channelInfo(channelHex);
     const relays = info?.relays ?? [];
-    // The relay half is best-effort: a relay that is down keeps the posts until its own retention
-    // sweeps them, which is what retention is for.
-    const outcomes = relays.map((relay) => ({ relay, ok: true }));
-    this.#opts.logger.info("channel.log.pruned", {
+
+    /**
+     * ⚠️ THE PRUNE IS SIGNED BY THE CHANNEL KEY, and it has to be: the frame is not a post, so
+     * nothing else proves the caller owns the channel. An unsigned prune would let anyone who knows
+     * a channel's public key delete its backbone from both relays.
+     */
+    const channelKey = this.#opts.getChannelKey(channelHex);
+    const timeMs = this.#now();
+    const signature = channelKey
+      ? await channelKey.sign(buildChannelPruneTbs(Buffer.from(channelHex, "hex"), throughSeq, timeMs))
+      : null;
+
+    const outcomes = await Promise.all(relays.map(async (relay) => {
+      if (!this.#opts.prune || signature === null) {
+        // No seam wired, or no key to sign with, is not a successful prune. Say which it was.
+        return { relay, ok: false, reason: signature === null ? "key_unavailable" : "relay_prune_unavailable" };
+      }
+      try {
+        const answer = await this.#opts.prune(relay, { channelHex, throughSeq, timeMs, signature });
+        if (!answer.ok) {
+          logger.warn("channel.prune.relay_refused", {
+            ...(correlationId !== undefined ? { correlationId } : {}),
+            channel_pubkey: channelHex, relay, through_seq: throughSeq, reason: answer.reason,
+          });
+          return { relay, ok: false, reason: answer.reason };
+        }
+        return { relay, ok: true };
+      } catch (err: unknown) {
+        logger.warn("channel.prune.relay_unreachable", {
+          ...(correlationId !== undefined ? { correlationId } : {}),
+          channel_pubkey: channelHex, relay, through_seq: throughSeq, reason: extract(err),
+        });
+        return { relay, ok: false, reason: extract(err) };
+      }
+    }));
+
+    logger.info("channel.log.pruned", {
       ...(correlationId !== undefined ? { correlationId } : {}),
       channel_pubkey: channelHex, through_seq: throughSeq, pruned,
+      relays_pruned: outcomes.filter((o) => o.ok).map((o) => o.relay),
+      relays_still_holding: outcomes.filter((o) => !o.ok).map((o) => o.relay),
     });
     return { pruned, relays: outcomes };
   }
 
-  /** Sign and deposit the channel's info record. Only the CHANNEL key signs it. */
+  /**
+   * Sign and deposit the channel's info record. Only the CHANNEL key signs it.
+   *
+   * ⚠️ **THE DEPOSIT IS THE POINT, NOT THE SIGNATURE.** The record is the only way a subscriber
+   * learns a channel's relays, access and admin key. This used to sign it, log
+   * `channel.info.published` and return the bytes to the caller without contacting a relay — so an
+   * operator was told their channel was published while no one could find it. The event now names
+   * only the relays that actually took it.
+   */
   async publishInfo(agentName: string, channelHex: string, correlationId?: string): Promise<
-    { ok: true; info_cbor: Uint8Array } | { ok: false; reason: PublishRefusal }
+    | { ok: true; info_cbor: Uint8Array; relays: Array<{ relay: string; ok: boolean; reason?: string }> }
+    | { ok: false; reason: PublishRefusal; detail?: string }
   > {
+    const { logger } = this.#opts;
     const info = this.#opts.channelInfo(channelHex);
     const channelKey = this.#opts.getChannelKey(channelHex);
     const agentKey = this.#opts.getAgentKey(agentName);
@@ -330,11 +477,33 @@ export class ChannelPublisher {
       ext: null,
     });
     const info_cbor = encodeChannelInfo(record);
-    this.#opts.logger.info("channel.info.published", {
+
+    const outcomes = await Promise.all(info.relays.map(async (relay) => {
+      try {
+        const answer = await this.#opts.depositInfo(relay, { info_cbor });
+        if (!answer.ok) return { relay, ok: false, reason: answer.reason };
+        return { relay, ok: true };
+      } catch (err: unknown) {
+        return { relay, ok: false, reason: extract(err) };
+      }
+    }));
+
+    const took = outcomes.filter((o) => o.ok);
+    if (took.length === 0) {
+      logger.warn("channel.info.deposit_failed", {
+        ...(correlationId !== undefined ? { correlationId } : {}),
+        channel_pubkey: channelHex,
+        reasons: outcomes.map((o) => o.reason ?? "unknown"),
+      });
+      return { ok: false, reason: "no_relay_accepted", detail: outcomes.map((o) => `${o.relay}: ${o.reason ?? "unknown"}`).join("; ") };
+    }
+    logger.info("channel.info.published", {
       ...(correlationId !== undefined ? { correlationId } : {}),
-      channel_pubkey: channelHex, relays: info.relays, access: info.access,
+      channel_pubkey: channelHex, access: info.access,
+      relays_ok: took.map((o) => o.relay),
+      relays_failed: outcomes.filter((o) => !o.ok).map((o) => o.relay),
     });
-    return { ok: true, info_cbor };
+    return { ok: true, info_cbor, relays: outcomes };
   }
 
   /**
@@ -359,6 +528,17 @@ export class ChannelPublisher {
    * post once, not that it still holds it.
    */
   readonly #relayKeys = new Map<string, string>();
+
+  /** The relays this channel publishes to, so a caller can refill all of them without naming one. */
+  relaysFor(channelHex: string): string[] {
+    return this.#opts.channelInfo(channelHex)?.relays ?? [];
+  }
+
+  /** The pacing gap between refill deposits. Its own method so a test can drive it to zero. */
+  #pause(ms: number): Promise<void> {
+    if (ms <= 0) return Promise.resolve();
+    return new Promise((resolve) => { setTimeout(resolve, ms); });
+  }
 
   /** The relay key observed at an address, or null if this process has not seen one answer yet. */
   relayKeyAt(relay: string): string | null {
