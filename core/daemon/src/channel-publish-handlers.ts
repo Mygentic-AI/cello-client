@@ -16,6 +16,7 @@
  */
 import type { Logger } from "./types.js";
 import type { ChannelPublisher } from "./channel-publisher.js";
+import { DEFAULT_RETENTION_SECONDS, type ChannelConfig } from "./channel-config-store.js";
 
 type Handler = (params: Record<string, unknown> | undefined, connectionId: string) => Promise<unknown>;
 
@@ -23,6 +24,13 @@ export interface ChannelPublishDeps {
   handlers: Map<string, Handler>;
   logger: Logger;
   getPublisher: (agentName: string) => ChannelPublisher | null;
+  /**
+   * Record the publisher's decisions for a channel it holds the key to. REFUSES when this daemon
+   * does not hold that channel's key — otherwise an operator could record relays for somebody
+   * else's channel and every later verb would fail with a key error instead of the real reason.
+   */
+  setChannelConfig: (agentName: string, channelHex: string, config: ChannelConfig) =>
+    { ok: true } | { ok: false; reason: string; guidance?: string };
   /** The daemon's single agent-selection rule, injected rather than re-implemented here. */
   resolveCurrentAgent: (connectionId: string, explicitAgent?: string) => string | null;
 }
@@ -97,6 +105,59 @@ export function registerChannelPublishHandlers(deps: ChannelPublishDeps): void {
         // they can reach.
         ? "No relay took the post. It is in your log — retry with 'cello channel resend' rather than publishing it again."
         : undefined,
+    };
+  });
+
+  /**
+   * Record what this publisher has decided about its own channel: which relays it publishes to,
+   * whether it is public, what it is for, how long posts are kept.
+   *
+   * ⚠️ **NOTHING ELSE WRITES THIS, AND WITHOUT IT NO CHANNEL CAN PUBLISH AT ALL.** The publisher
+   * reads the relay pair from here; with no row, every verb answers `channel_unknown` for ever. The
+   * first version of this unit shipped the four verbs with no way to create the row they all read.
+   *
+   * It does NOT deposit anything. `cello_channel_info_set` signs and publishes the description to
+   * the relays; this is the local decision it is signed from. Keeping them apart means a publisher
+   * can change its mind and re-publish, rather than the relays' copy being the only record.
+   */
+  handlers.set("cello_channel_config", async (params, connectionId) => {
+    const agent = needAgent(deps, params, connectionId);
+    if (!agent.ok) return agent.answer;
+    const channel = needChannel(params);
+    if (!channel.ok) return channel.answer;
+
+    const rawRelays = params?.["relays"];
+    const relays = Array.isArray(rawRelays) ? rawRelays.filter((r): r is string => typeof r === "string") : [];
+    if (relays.length === 0 || relays.length !== (rawRelays as unknown[]).length) {
+      return {
+        ok: false, reason: "bad_relays",
+        guidance: "Pass `relays`: the multiaddrs this channel publishes to. Two is the design — one is a single point of failure, and the subscriber takes the union of both.",
+      };
+    }
+    const access = params?.["access"];
+    if (access !== "public" && access !== "open" && access !== "invite_only") {
+      return {
+        ok: false, reason: "bad_access",
+        guidance: "Pass `access`: public (anyone can read), open (anyone may ask to join) or invite_only.",
+      };
+    }
+    const guidance = typeof params?.["guidance"] === "string" ? params["guidance"] : "";
+    const retention = params?.["retention_seconds"];
+    const retention_seconds = typeof retention === "number" && Number.isSafeInteger(retention) && retention > 0
+      ? retention
+      : DEFAULT_RETENTION_SECONDS;
+
+    const saved = deps.setChannelConfig(agent.agentName, channel.channelHex, {
+      access, relays, guidance, retention_seconds,
+    });
+    if (!saved.ok) return { ok: false, reason: saved.reason, guidance: saved.guidance };
+
+    logger.info("channel.config.recorded", {
+      channel_pubkey: channel.channelHex, access, relays: relays.length,
+    });
+    return {
+      ok: true, channel: channel.channelHex, access, relays, retention_seconds,
+      guidance: "Recorded locally. Run 'cello channel info-set' to publish the description so subscribers can find the channel.",
     };
   });
 

@@ -1223,9 +1223,12 @@ export async function trustSignals(
  * anything that can drive an agent's tools, and a channel's posts are the publisher's own name on
  * the record. The caller here is a person at a terminal, deliberately.
  *
- * ⚠️ The daemon ANSWERS refusals rather than throwing them, so a `{ ok: false }` is printed with its
- * guidance and exits non-zero. A thrown error means the daemon could not be reached at all, which is
- * a different thing and says so.
+ * ⚠️ **A REFUSAL THAT ARRIVED IS NOT AN UNREACHABLE DAEMON, and the two must not print the same.**
+ * Most refusals come back as `{ ok: false, reason }`, but a handler that THROWS becomes an IPC
+ * error response — which still travelled over a working socket. Printing that as
+ * `{"daemon":"unreachable"}` sends the operator to check the socket, the lock file and the process,
+ * none of which is the problem: the daemon answered, and what it said was `channel_group_key_unavailable`.
+ * Only a failure to connect is reported as unreachable.
  */
 export async function channelVerb(
   celloDir: string,
@@ -1237,15 +1240,27 @@ export async function channelVerb(
   if (!lock) {
     return { exitCode: 1, output: JSON.stringify({ daemon: "stopped" }, null, 2) };
   }
+  // Connecting is the ONLY step whose failure means "unreachable". Split from the call itself so a
+  // refusal that arrived over a working socket can never be labelled as a dead daemon.
+  let client;
   try {
-    const result = (await withIpc(lock.socketPath, async (client) => {
-      await client.send("ipc.connect", { clientType: "cli" });
-      return client.send(verb, params);
-    })) as { ok?: boolean };
-    return { exitCode: result?.ok === true ? 0 : 1, output: JSON.stringify(result, null, 2) };
+    client = await connectToDaemon(lock.socketPath);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     return { exitCode: 1, output: JSON.stringify({ daemon: "unreachable", error: message }, null, 2) };
+  }
+
+  try {
+    await client.send("ipc.connect", { clientType: "cli" });
+    const result = (await client.send(verb, params)) as { ok?: boolean };
+    return { exitCode: result?.ok === true ? 0 : 1, output: JSON.stringify(result, null, 2) };
+  } catch (err: unknown) {
+    // The daemon ANSWERED and what it said was an error. Report its words, not a guess about the
+    // socket: `channel_group_key_unavailable` is a decision the daemon made, not a connection fault.
+    const message = err instanceof Error ? err.message : String(err);
+    return { exitCode: 1, output: JSON.stringify({ ok: false, reason: message }, null, 2) };
+  } finally {
+    client.close();
   }
 }
 

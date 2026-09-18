@@ -1539,11 +1539,15 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
     group: "Other",
     summary: "Publish to a broadcast channel you hold the key to.",
     help:
-      "Usage: cello channel publish <channel> <title> <body> [--agent <agent>]\n" +
+      "Usage: cello channel setup <channel> <access> <relay> <relay> [--agent <agent>]\n" +
+      "       cello channel publish <channel> <title> <body> [--agent <agent>]\n" +
       "       cello channel info-set <channel> [--agent <agent>]\n" +
       "       cello channel prune <channel> <through_seq> [--agent <agent>]\n" +
       "       cello channel resend <channel> [<relay>] [--agent <agent>]\n" +
       "  <channel> is the channel's 64-character hex public key.\n" +
+      "  'setup' comes FIRST and is what makes a channel publishable at all: it records the two\n" +
+      "  relays and whether the channel is public. Without it every other command says the channel\n" +
+      "  is unknown. <access> is public (anyone reads), open (anyone may ask to join) or invite_only.\n" +
       "  A post is signed by BOTH the channel key and your agent key, so a reader can tell which\n" +
       "  operator published it, not only which channel.\n" +
       "  It goes to the channel's two relays. ONE relay refusing is not a failed publish — the post\n" +
@@ -1554,8 +1558,15 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
     jsonOut: true,
     async run(ctx, args) {
       const { agent, positional } = parityOpts(args);
-      const [sub, channel, a, b] = positional;
+      const [sub, channel, a, b, ...rest] = positional;
       const withAgent = (p: Record<string, unknown>) => (agent ? { ...p, agent } : p);
+      if (sub === "setup" && channel && a !== undefined && b !== undefined) {
+        // Every positional after the access word is a relay, so two (the design) is the ordinary
+        // call and more is possible without a second syntax.
+        return legacy(await channelVerb(ctx.celloDir, "cello_channel_config", withAgent({
+          channel, access: a, relays: [b, ...rest],
+        })));
+      }
       if (sub === "publish" && channel && a !== undefined && b !== undefined) {
         return legacy(await channelVerb(ctx.celloDir, "cello_channel_publish", withAgent({ channel, title: a, body: b })));
       }

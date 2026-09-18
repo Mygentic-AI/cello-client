@@ -93,5 +93,21 @@ export function wireChannelPublishing(deps: ChannelPublishWiringDeps): void {
     logger,
     resolveCurrentAgent: deps.resolveCurrentAgent,
     getPublisher: buildPublisher,
+    setChannelConfig: (agentName, channelHex, cfg) => {
+      // The channel key must be one this daemon HOLDS. Recording relays for a channel we cannot
+      // sign for would leave every later verb failing on a key lookup, which describes neither the
+      // mistake nor how to correct it.
+      if (channelKeyByPubkey(channelHex) === null) {
+        return {
+          ok: false, reason: "channel_key_not_held",
+          guidance: "This daemon does not hold that channel's key. A channel is an agent — create it with 'cello create-agent' and use its public key here.",
+        };
+      }
+      if (!keyProviders.has(agentName)) {
+        return { ok: false, reason: "no_such_agent", guidance: `${agentName} is not an agent this daemon holds.` };
+      }
+      config.set(channelHex, cfg, Date.now());
+      return { ok: true };
+    },
   });
 }

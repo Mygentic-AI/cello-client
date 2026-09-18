@@ -50,6 +50,7 @@ const EXEMPT = new Map<string, string>([
    * every subscriber keeps, so the caller is a person at a terminal; an MCP tool would put it in
    * reach of anything that can drive the agent's tools. Order 018 defers the MCP surface to Tier 5.
    */
+  ["cello_channel_config", "terminal-only: records which relays a channel publishes to, the decision every other channel verb reads. MCP surface deferred to Tier 5"],
   ["cello_channel_publish", "terminal-only: a post carries the operator's signature to every subscriber, so it is not a tool an agent may reach for. MCP surface deferred to Tier 5"],
   ["cello_channel_info_set", "terminal-only: signs the channel's public description under the channel key. MCP surface deferred to Tier 5"],
   ["cello_channel_prune", "terminal-only and destructive — dropped posts cannot be re-signed at their old numbers. MCP surface deferred to Tier 5"],
