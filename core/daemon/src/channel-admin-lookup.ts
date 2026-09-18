@@ -87,8 +87,14 @@ export function createChannelAdminLookup(
      */
     const unregister = signaling.registerInboundHandler((frame) => {
       const t = frame["type"];
-      if (t === "channel_admin_error") { resolveFrame(frame); return; }
-      if (t !== "channel_admin_result") return;
+      if (t !== "channel_admin_result" && t !== "channel_admin_error") return;
+      /**
+       * ⚠️ **THE ERROR IS MATCHED THE SAME WAY, and it was not at first.** An unmatched error
+       * resolved whichever lookup happened to be waiting: two joins in flight, a database fault on
+       * the first channel, and the second was refused although the directory had answered it
+       * perfectly. It fails closed, so nothing unsafe — it just turns one channel's outage into
+       * every concurrent join's refusal, which is a bad trade for a field.
+       */
       if (echoedChannelHex(frame) !== channelHex) return;
       resolveFrame(frame);
     });
@@ -140,13 +146,18 @@ export function createChannelAdminLookup(
       const adminPubkeyHex = adminPubkeyOf(frame);
       if (adminPubkeyHex === null) {
         /**
-         * A channel whose answer carries no usable admin key. Reading a missing or malformed field
-         * as `""` would put an empty key into the comparison against whoever answered — which either
-         * matches nothing forever or, worse, matches an empty counterparty. This is a directory that
-         * replied with something we cannot use, which is not knowing.
+         * A registered channel whose answer carries no usable admin key. Reading a missing or
+         * malformed field as `""` would put an empty key into the comparison against whoever
+         * answered — which either matches nothing for ever or, worse, matches an empty counterparty.
+         * So it is `unavailable`: there is no admin to check against, and that is not knowing.
+         *
+         * ⚠️ **NAMED FOR THE REGISTRATION, NOT THE WIRE.** Calling this `malformed_reply` sent the
+         * operator to debug the protocol, when the directory answered exactly as designed about a
+         * channel that was registered without an administrator. The reason has to point at the
+         * thing that is actually wrong.
          */
-        deps.logger.warn("directory.channel.admin.lookup.failed", { channel: channelHex.slice(0, 16), reason: "malformed_admin_pubkey" });
-        return { kind: "unavailable", reason: "malformed_reply" };
+        deps.logger.warn("directory.channel.admin.lookup.failed", { channel: channelHex.slice(0, 16), reason: "channel_without_admin" });
+        return { kind: "unavailable", reason: "channel_without_admin" };
       }
 
       deps.logger.info("directory.channel.admin.lookup", { channel: channelHex.slice(0, 16), answered: "admin" });

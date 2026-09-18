@@ -102,13 +102,44 @@ describe("M16 020 — the channel admin lookup", () => {
     if (out.kind === "unavailable") expect(out.reason).toBe("timeout");
   });
 
+  it("9b. an ERROR about a different channel does not settle this lookup either", async () => {
+    /**
+     * ⚠️ **ONE CHANNEL'S FAULT MUST NOT REFUSE EVERY OTHER JOIN IN FLIGHT.** The error frame first
+     * shipped with no channel on it, and was taken by whichever lookup was waiting — so a database
+     * fault on channel A refused a join to channel B that the directory had answered correctly. It
+     * fails closed, which is why nothing caught it; it just spreads one outage across everything
+     * the agent is doing.
+     */
+    const sig = fakeSignaling(() => ({
+      type: "channel_admin_error",
+      channel_pubkey: new Uint8Array(Buffer.from(OTHER_CHANNEL, "hex")),
+      reason: "lookup_failed",
+    }));
+    const out = await lookupWith(sig)(AGENT, CHANNEL);
+    expect(out.kind).toBe("unavailable");
+    if (out.kind === "unavailable") expect(out.reason, "timed out rather than taking the other channel's fault").toBe("timeout");
+  });
+
+  it("9c. a channel with no administrator names the REGISTRATION, not the wire", async () => {
+    // The directory answered exactly as designed, about a channel registered without an admin.
+    // Calling this `malformed_reply` sent the operator to debug the protocol.
+    const sig = fakeSignaling(() => resultFor(CHANNEL, { admin_pubkey: "" }));
+    const out = await lookupWith(sig)(AGENT, CHANNEL);
+    expect(out.kind).toBe("unavailable");
+    if (out.kind === "unavailable") expect(out.reason).toBe("channel_without_admin");
+  });
+
   it("10. a directory fault is UNAVAILABLE and never 'not a channel'", async () => {
     /**
      * ⚠️ **THE SECURITY-CARRYING CASE.** `lookup_failed` means the directory could not look. Read as
      * a negative it says "that is not a channel" about a channel that plainly is — and the
      * subscriber's next move after a clean negative is nothing like its next move after not knowing.
      */
-    const sig = fakeSignaling(() => ({ type: "channel_admin_error", reason: "lookup_failed" }));
+    const sig = fakeSignaling(() => ({
+      type: "channel_admin_error",
+      channel_pubkey: new Uint8Array(Buffer.from(CHANNEL, "hex")),
+      reason: "lookup_failed",
+    }));
     const out = await lookupWith(sig)(AGENT, CHANNEL);
     expect(out.kind).toBe("unavailable");
     if (out.kind === "unavailable") expect(out.reason).toBe("lookup_failed");
@@ -146,6 +177,8 @@ describe("M16 020 — the channel admin lookup", () => {
     const sig = fakeSignaling(() => ({ type: "channel_admin_result", channel_pubkey: new Uint8Array(Buffer.from(CHANNEL, "hex")) }));
     const out = await lookupWith(sig)(AGENT, CHANNEL);
     expect(out.kind).toBe("unavailable");
+    // Named, or this assertion would also pass against a valid reply being called unavailable.
+    if (out.kind === "unavailable") expect(out.reason).toBe("malformed_reply");
   });
 
   it("12c. the inbound handler is unregistered once the lookup settles", async () => {

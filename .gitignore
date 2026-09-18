@@ -27,3 +27,14 @@ gf-*.mjs
 
 # iCloud exclusion twin for build output — see scripts/nosync-build-output.sh
 dist.nosync/
+
+# Compiled output that lands NEXT TO the source it was built from. The sibling repo had four of
+# these committed for one file, and they were a live landmine rather than clutter: every import is
+# written `./thing.js`, so once a `.js` exists beside `thing.ts` the test runner resolves to the
+# COMPILED copy and the TypeScript is ignored. It matched when committed, so nothing went red — and
+# then the first edit to that source silently did nothing at all. Nothing like this is tracked here
+# today; the rule is so it stays that way. Build output belongs in dist/.
+core/*/src/**/*.js
+core/*/src/**/*.js.map
+core/*/src/**/*.d.ts
+core/*/src/**/*.d.ts.map
