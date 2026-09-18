@@ -127,6 +127,36 @@ export class InboundScreener {
     this.#injection = opts.injectionScanner ?? new InjectionScanner(null);
   }
 
+  /**
+   * The classifier's verdict over EVERY copy of the message, worst one wins.
+   *
+   * Handing it only the scrubbed copy hid the attacks it is best at. Measured 2026-09-18 against
+   * the Mindgard disguise set: a tag-smuggled payload scores 100 on the hidden text and 84 on the
+   * bytes as received, but 0 on the scan copy — because our own invisible-strip had already deleted
+   * the instruction before the model could read it. Diacritic-stuffed attacks scored 100 raw and 2
+   * folded. Sanitizing before classifying destroys the evidence.
+   *
+   * All three copies are still needed. The scan copy is the only one that reads a homoglyph word as
+   * the Latin it imitates; the raw copy is the only one that still holds the disguise; the hidden
+   * copy is the only one that holds a smuggled instruction at all.
+   *
+   * Cost is bounded: duplicates are scanned once, so an ordinary message with nothing hidden and
+   * nothing folded is a SINGLE pass, exactly as before — and a copy scoring at or above the block
+   * bar ends the loop, because no later copy can make the verdict worse.
+   */
+  async #scanHighest(content: Uint8Array, scanText: string, hiddenText: string) {
+    const raw = new TextDecoder().decode(content);
+    let worst = await this.#injection.scan(scanText);
+    if (!worst.available) return worst;
+    for (const copy of [raw, hiddenText]) {
+      if (worst.verdict === "block") return worst;
+      if (copy === "" || copy === scanText) continue;
+      const next = await this.#injection.scan(copy);
+      if (next.available && (next.score ?? 0) > (worst.score ?? 0)) worst = next;
+    }
+    return worst;
+  }
+
   async screen(content: Uint8Array): Promise<InboundVerdict> {
     const r = sanitizeInbound(content, this.#maxBytes !== undefined ? { maxBytes: this.#maxBytes } : {});
 
@@ -196,7 +226,7 @@ export class InboundScreener {
     // IN-002: semantic injection scanner (Layer-2). Off when no model is loaded — available()===false,
     // so the call short-circuits and inbound behaviour is unchanged until the model is installed.
     if (this.#injection.available()) {
-      const scan = await this.#injection.scan(scanText);
+      const scan = await this.#scanHighest(content, scanText, r.hiddenText);
       if (scan.verdict === "block") {
         return {
           disposition: "block",
