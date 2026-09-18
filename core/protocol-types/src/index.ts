@@ -397,6 +397,22 @@ export {
   verifyChannelInfo,
 } from "./channel-info.js";
 export type { ChannelInfo, ChannelAccess, ChannelInfoDecodeReason } from "./channel-info.js";
+// M16 019-MEMBERSHIP: the join exchange. These travel inside an ordinary sealed session with the
+// channel's ADMIN — a channel never converses itself.
+export {
+  encodeChannelJoinRequest, decodeChannelJoinRequest,
+  encodeChannelJoinAccepted, decodeChannelJoinAccepted,
+  encodeChannelJoinRefused, decodeChannelJoinRefused,
+  encodeChannelRekey, decodeChannelRekey,
+  isChannelJoinFrame,
+  MAX_JOIN_NOTE_CHARS, MAX_JOIN_GUIDANCE_CHARS, MAX_JOIN_RELAYS,
+  JOIN_REQUEST_TYPE, JOIN_ACCEPTED_TYPE, JOIN_REFUSED_TYPE, REKEY_TYPE,
+} from "./channel-join.js";
+export type {
+  ChannelJoinRequest, ChannelJoinAccepted, ChannelJoinRefused, ChannelRekey,
+  ChannelJoinAccess, ChannelJoinRefusedReason, JoinDecodeReason, JoinDecodeResult,
+} from "./channel-join.js";
+
 // The channel frames that carry a signature of their own. ONE definition, imported by the client
 // that signs and the relay that verifies — see the header of channel-auth.ts.
 export {
