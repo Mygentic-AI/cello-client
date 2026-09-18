@@ -638,15 +638,15 @@ async function startDaemonHoldingLock(
 
   // M16 018-PUBCOLLECT: the channel publishing verbs, their log, their relay client and the
   // per-channel publisher → channel-publish-wiring.ts. What stays here is the wiring.
-  wireChannelPublishing({
+  const channelWiring = wireChannelPublishing({
     handlers, logger,
     getDb: () => sessionNodeManager.getDb(),
     getNode: () => sessionNodeManager.getStandingReceiverNode() ?? null,
     screenOutbound: (content, ctx) => securityGateway.screenOutbound(content, ctx),
-    loadedAgents,
-    keyProviders,
+    loadedAgents, keyProviders,
     resolveCurrentAgent: (connectionId, explicitAgent) =>
       resolveCurrentAgent(perConnectionState.get(connectionId), explicitAgent),
+    isAgentOnline: (agentId) => onlineAgents.has(agentId) && !explicitlyOfflineAgents.has(agentId),
   });
 
   // ─── Trust-signal wallet (operator-facing, no agent scope required) ───
@@ -1194,7 +1194,7 @@ async function startDaemonHoldingLock(
       // stopAllSignaling() stops the shared manager AND every per-agent manager (best-effort). Do
       // not add a separate per-agent stop loop beside it: it would be redundant, and an unguarded
       // second stop() that throws would abort the rest of shutdown.
-      trustSignalSweepTicker.stopAll(); await stopAllSignaling();
+      trustSignalSweepTicker.stopAll(); channelWiring.stop(); await stopAllSignaling();
       // Gracefully mark active sessions interrupted (AC-009) before stopping IPC
       await sessionNodeManager.gracefulShutdown();
       await ipcServer.stop();

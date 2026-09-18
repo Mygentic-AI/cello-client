@@ -241,7 +241,12 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // 104 → 105 for the extraction that followed: `wireChannelPublishing`
     // (channel-publish-wiring.ts) holds the publisher's construction, so daemon.ts keeps only the
     // call. TWO factories for one subsystem is the same shape every other subsystem here has.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(105);
+    //
+    // 105 → 106 for `createChannelCollectTicker` (channel-collect-tick.ts), the schedule that RUNS
+    // the collector. There is no inbound event for a channel post — the relay holds a queue and
+    // waits to be asked — so the collector shipped unwired meant a subscriber who received nothing
+    // while every component reported healthy. Same hole as the publishing verbs, other half.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(106);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",

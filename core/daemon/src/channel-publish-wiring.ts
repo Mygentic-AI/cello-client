@@ -19,6 +19,10 @@ import { ChannelPublisher } from "./channel-publisher.js";
 import { ChannelLogStore } from "./channel-log-store.js";
 import { ChannelConfigStore } from "./channel-config-store.js";
 import { ChannelRelayClient } from "./channel-relay-client.js";
+import { ChannelCollector } from "./channel-collector.js";
+import { ChannelSubscriptionStore } from "./channel-subscription-store.js";
+import { ChannelInboxStore } from "./channel-inbox-store.js";
+import { createChannelCollectTicker } from "./channel-collect-tick.js";
 
 type Handler = (params: Record<string, unknown> | undefined, connectionId: string) => Promise<unknown>;
 
@@ -32,9 +36,14 @@ export interface ChannelPublishWiringDeps {
   loadedAgents: ReadonlyArray<{ pubkey: string; keyProvider: KeyProvider }>;
   keyProviders: Map<string, KeyProvider>;
   resolveCurrentAgent: (connectionId: string, explicitAgent?: string) => string | null;
+  /**
+   * Online AND not explicitly switched off — the same pair every other background loop here reads.
+   * Collecting for an agent the operator switched off is the kill switch failing to switch off.
+   */
+  isAgentOnline: (agentId: string) => boolean;
 }
 
-export function wireChannelPublishing(deps: ChannelPublishWiringDeps): void {
+export function wireChannelPublishing(deps: ChannelPublishWiringDeps): { stop: () => void } {
   const { logger, keyProviders } = deps;
 
   const log = new ChannelLogStore(deps.getDb(), logger);
@@ -110,4 +119,50 @@ export function wireChannelPublishing(deps: ChannelPublishWiringDeps): void {
       return { ok: true };
     },
   });
+
+  /**
+   * ⚠️ THE SUBSCRIBER HALF, AND IT NEEDS A SCHEDULE TO EXIST AT ALL. There is no inbound event for a
+   * channel post — the relay holds a queue and waits to be asked — so a collector nobody calls is a
+   * subscriber who receives nothing while every component reports healthy.
+   */
+  const subscriptions = new ChannelSubscriptionStore(deps.getDb(), logger);
+  const inbox = new ChannelInboxStore(deps.getDb(), logger);
+  const collector = new ChannelCollector({
+    db: deps.getDb(),
+    logger,
+    subscriptions,
+    inbox,
+    fetch: (addr, req) => relay.fetch(addr, req),
+    /**
+     * ⚠️ **PUBLIC CHANNELS ONLY, UNTIL 019.** `undefined` means "send no auth", which is correct for
+     * a public channel and correct nowhere else: 019 owns the fetch key. A non-public channel is
+     * refused by the RELAY rather than silently fetched — the failure is visible and belongs to the
+     * side that can check it.
+     */
+    fetchAuth: () => Promise.resolve(undefined),
+    // The reader count is best-effort and never affects delivery, so declaring nothing costs only
+    // the publisher's view of how many read a post. 019 records the membership this reads from.
+    localAgentKeys: () => [],
+    /**
+     * ⚠️ NOT IMPLEMENTED, AND IT SAYS SO. Asking the publisher to re-deposit needs a session to the
+     * publishing agent, which is 019's join path. Until then the OTHER RELAY is the whole repair —
+     * `repairGaps` tries that first and usually closes the gap there. A silent no-op would let a
+     * permanent gap look like one still being worked on.
+     */
+    requestRepair: (_agentId, channelHex, from, to) => {
+      logger.warn("channel.repair.unavailable", {
+        channel_pubkey: channelHex, from, to,
+        impact: "neither relay holds these posts; asking the publisher directly needs the join path (019)",
+      });
+      return Promise.resolve();
+    },
+  });
+
+  const ticker = createChannelCollectTicker({
+    logger, collector, subscriptions,
+    isAgentOnline: deps.isAgentOnline,
+  });
+  ticker.start();
+
+  return { stop: () => { ticker.stop(); } };
 }
