@@ -27,7 +27,6 @@
  * reported with both hashes, and the position stops below it. Nothing is resolved automatically:
  * picking one would make whichever relay answered first the arbiter of what the channel said.
  */
-import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
 import {
   broadcastPostHash,
@@ -58,7 +57,6 @@ export type RelayFetchSeam = (
 >;
 
 export interface ChannelCollectorOptions {
-  db: DaemonDatabase;
   logger: Logger;
   subscriptions: ChannelSubscriptionStore;
   inbox: ChannelInboxStore;

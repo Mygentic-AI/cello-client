@@ -63,7 +63,6 @@ export function wireChannelPublishing(deps: ChannelPublishWiringDeps): { stop: (
   const buildPublisher = (agentName: string): ChannelPublisher | null => {
     if (!keyProviders.has(agentName)) return null;
     return new ChannelPublisher({
-      db: deps.getDb(),
       logger,
       log,
       deposit: (addr, req) => relay.deposit(addr, { post_cbor: req.post_cbor }),
@@ -128,7 +127,6 @@ export function wireChannelPublishing(deps: ChannelPublishWiringDeps): { stop: (
   const subscriptions = new ChannelSubscriptionStore(deps.getDb(), logger);
   const inbox = new ChannelInboxStore(deps.getDb(), logger);
   const collector = new ChannelCollector({
-    db: deps.getDb(),
     logger,
     subscriptions,
     inbox,

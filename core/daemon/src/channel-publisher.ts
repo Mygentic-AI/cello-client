@@ -22,7 +22,6 @@
  * Both failing gives `no_relay_accepted` — and the post STAYS in the log, because the next attempt
  * has to send the same signed bytes rather than a new post at a new number.
  */
-import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import {
@@ -69,7 +68,6 @@ export type ScreenVerdict = { disposition: "allow" | "block" | "warn" | "redact"
 export const DEFAULT_RESEND_PACE_MS = 50;
 
 export interface ChannelPublisherOptions {
-  db: DaemonDatabase;
   logger: Logger;
   log: ChannelLogStore;
   deposit: RelayDepositSeam;
@@ -311,8 +309,6 @@ export class ChannelPublisher {
     }
     try {
       this.#opts.log.recordReceipt(channelHex, decoded.receipt, correlationId);
-      // Learn which key answers at this address, so `resendMissing` can tell the two relays apart.
-      this.#relayKeys.set(relay, Buffer.from(decoded.receipt.relay_pubkey).toString("hex"));
       return { ok: true };
     } catch (err: unknown) {
       // A receipt naming bytes this log does not hold. The relay DID take the post — the caller
@@ -382,6 +378,9 @@ export class ChannelPublisher {
     }
     logger.info("channel.resend.completed", {
       ...(correlationId !== undefined ? { correlationId } : {}),
+      // WHO ran it. A refill and a prune are the two verbs that change what the world can read, and
+      // an operator asking "why did the backbone change" needs the acting agent in the line.
+      agent: agentName,
       channel_pubkey: channelHex, relay, deposited,
     });
     return { deposited };
@@ -440,6 +439,7 @@ export class ChannelPublisher {
 
     logger.info("channel.log.pruned", {
       ...(correlationId !== undefined ? { correlationId } : {}),
+      agent: agentName,
       channel_pubkey: channelHex, through_seq: throughSeq, pruned,
       relays_pruned: outcomes.filter((o) => o.ok).map((o) => o.relay),
       relays_still_holding: outcomes.filter((o) => !o.ok).map((o) => o.relay),
@@ -506,29 +506,6 @@ export class ChannelPublisher {
     return { ok: true, info_cbor, relays: outcomes };
   }
 
-  /**
-   * Has this RELAY receipted this post?
-   *
-   * ⚠️ A receipt names the relay's KEY; a relay list names ADDRESSES. Nothing in the stored receipt
-   * says which address it came from, so the two are joined by what this process has observed: every
-   * accepted deposit teaches it that address → key. Until that is learned, a post is treated as NOT
-   * delivered there — the conservative direction, because a redundant re-deposit is a no-op the
-   * relay answers with the receipt it already signed, while wrongly skipping one leaves a relay
-   * permanently missing a post.
-   *
-   * The mapping is in memory and does not survive a restart; the RECEIPTS do, and the first
-   * successful deposit after a restart relearns the key. 019, which records the relay set properly,
-   * is where this stops being inferred.
-   */
-  /**
-   * address → relay pubkey, learned from the receipts this process has accepted.
-   *
-   * Kept because it is what lets an operator surface say WHICH relay signed a post's receipt; the
-   * resend no longer consults it, for the reason recorded there — a receipt says a relay took a
-   * post once, not that it still holds it.
-   */
-  readonly #relayKeys = new Map<string, string>();
-
   /** The relays this channel publishes to, so a caller can refill all of them without naming one. */
   relaysFor(channelHex: string): string[] {
     return this.#opts.channelInfo(channelHex)?.relays ?? [];
@@ -538,11 +515,6 @@ export class ChannelPublisher {
   #pause(ms: number): Promise<void> {
     if (ms <= 0) return Promise.resolve();
     return new Promise((resolve) => { setTimeout(resolve, ms); });
-  }
-
-  /** The relay key observed at an address, or null if this process has not seen one answer yet. */
-  relayKeyAt(relay: string): string | null {
-    return this.#relayKeys.get(relay) ?? null;
   }
 }
 

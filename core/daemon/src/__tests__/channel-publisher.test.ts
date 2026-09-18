@@ -25,6 +25,7 @@ import { ChannelLogStore } from "../channel-log-store.js";
 import {
   ChannelPublisher,
   type RelayDepositSeam, type RelayInfoDepositSeam, type RelayPruneSeam,
+  type ChannelPublisherOptions,
 } from "../channel-publisher.js";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import type { DaemonDatabase } from "../sqlcipher-db.js";
@@ -53,6 +54,8 @@ interface Seen {
 
 interface Harness {
   publisher: ChannelPublisher;
+  /** The seams this publisher was built from, so a test can swap exactly one. */
+  options: ChannelPublisherOptions;
   log: ChannelLogStore;
   channelKp: InMemoryKeyProvider;
   adminKp: InMemoryKeyProvider;
@@ -147,8 +150,8 @@ async function harness(opts: { access?: "public" | "open" } = {}): Promise<Harne
     return Promise.resolve({ ok: true, dropped });
   };
 
-  const publisher = new ChannelPublisher({
-    db,
+  // Captured so a test can rebuild the publisher with ONE seam swapped for the production one.
+  const options: ChannelPublisherOptions = {
     depositInfo,
     prune,
     // No waiting in tests. Production paces refills under the relay's rate limit.
@@ -189,10 +192,11 @@ async function harness(opts: { access?: "public" | "open" } = {}): Promise<Harne
       guidance: "what this channel is for",
       retention_seconds: 7 * 24 * 3600,
     }),
-  });
+  };
+  const publisher = new ChannelPublisher(options);
 
   return {
-    publisher, log, channelKp, adminKp, channelHex, relayKeys, deposits, logStateAtDeposit,
+    publisher, options, log, channelKp, adminKp, channelHex, relayKeys, deposits, logStateAtDeposit,
     held, refuse, down, screen, clock, infoHeld, pruneCalls,
   };
 }
@@ -355,6 +359,32 @@ describe("M16 018-PUBCOLLECT: publishing", () => {
     // A public channel is readable by anyone, so encrypting it would be theatre — and would stop a
     // subscriber who has no key from reading what the channel exists to publish.
     expect(Buffer.from(pubPost.body).toString("utf-8")).toBe("public words");
+  });
+
+  it("7b. with NO group key — production today — a non-public channel FAILS CLOSED", async () => {
+    /**
+     * ⚠️ **THE SEAM THE DAEMON ACTUALLY WIRES, not the test's stand-in.** 019 owns the group key, so
+     * the real `encryptBody` rejects. Test 7 proves the publisher encrypts when it CAN; this proves
+     * what happens when it cannot, which is the case in production right now.
+     *
+     * The failure direction is the whole point: a publisher that fell back to plaintext would put
+     * the operator's content on two public relays under an `access` promising members-only. Nothing
+     * is signed, numbered, logged or deposited.
+     */
+    const h = await harness({ access: "open" });
+    const failClosed = new ChannelPublisher({
+      ...h.options,
+      encryptBody: () => Promise.reject(new Error("channel_group_key_unavailable")),
+    });
+
+    await expect(failClosed.publish("agent-1", h.channelHex, "members only", "secret words")).rejects.toThrow(
+      "channel_group_key_unavailable",
+    );
+    expect(h.deposits, "nothing reached a relay").toEqual([]);
+    // The channel was never even opened in the log: the refusal happens before a number is taken.
+    let thrown: unknown;
+    try { h.log.head(h.channelHex); } catch (err) { thrown = err; }
+    expect(thrown, "no position was burned on a post that was never made").toBeDefined();
   });
 
   it("8. resendMissing deposits only what a relay has NOT receipted, oldest first", async () => {
