@@ -21,6 +21,9 @@ import { generateGroupKey, wrapGroupKeyFor, deriveFetchKey } from "@cello-protoc
 import { ChannelMembershipStore } from "./channel-membership-store.js";
 import { ChannelSubscriptionStore } from "./channel-subscription-store.js";
 import { createChannelJoinExchange, type LocalChannelAdmin } from "./channel-join-exchange.js";
+import {
+  createChannelAdminLookup, type ChannelAdminOutcome, type SignalingLike,
+} from "./channel-admin-lookup.js";
 import { extractErrorMessage } from "./error-message.js";
 
 type Handler = (params: Record<string, unknown> | undefined, connectionId: string) => Promise<unknown>;
@@ -42,6 +45,62 @@ export interface ChannelMembershipWiringDeps {
   resolveCurrentAgent: (connectionId: string, explicitAgent?: string) => string | null;
   /** Open sessions for an agent, so a re-key can ride one this daemon already holds. */
   activeSessionsFor: (agentName: string) => Array<{ sessionId: string; counterpartyPubkeyHex: string }>;
+  /**
+   * M16 020-CHANADMIN: an agent's directory connection, by NAME (the daemon's own key for it), or
+   * null when it has none. The subscriber asks on ITS OWN authenticated stream — the directory
+   * answers a client that has proved its agent key, which is the difference between this frame and
+   * the relay's copy of it.
+   */
+  signalingFor: (agentName: string) => SignalingLike | null;
+}
+
+/**
+ * M16 020-CHANADMIN — where the subscriber's admin key comes from.
+ *
+ * The join exchange compares the agent that answered against this. It is deliberately the ONLY
+ * source: the session proves who the counterparty is and says nothing about their authority over a
+ * channel, so "whoever answered" is exactly the hole the check exists to close.
+ *
+ * Two sources, in order:
+ *  1. **This daemon's own settings**, when we publish the channel. No round trip, and no directory
+ *     outage in the path of a join to a channel running on this very machine.
+ *  2. **The directory**, for everything else. Before 020 there was no step 2 and this returned null
+ *     for every channel not published here — so nobody could join anybody else's channel, or their
+ *     own from a second device.
+ *
+ * ⚠️ **`null` MEANS REFUSE, AND EVERY UNKNOWN STILL ENDS HERE.** A directory that cannot be reached,
+ * one that faults, a pubkey that is not a channel, and a lookup that throws all answer `null`, which
+ * the exchange refuses as `admin_unresolved`. 020 removes a refusal that was firing on every
+ * channel; it must not weaken the one that remains.
+ */
+export function createProfileAdminPubkey(deps: {
+  members: ChannelMembershipStore;
+  lookup: (agentId: string, channelHex: string) => Promise<ChannelAdminOutcome>;
+  logger: Logger;
+}): (channelHex: string, agentId: string) => Promise<string | null> {
+  return async function profileAdminPubkey(channelHex: string, agentId: string): Promise<string | null> {
+    // The ADMIN this daemon recorded, not the channel's own key — the two are different agents, and
+    // comparing a key with itself is what the first version of this did.
+    const settings = deps.members.settings(channelHex);
+    if (settings && settings.admin_pubkey.length > 0) return settings.admin_pubkey;
+
+    try {
+      const outcome = await deps.lookup(agentId, channelHex);
+      if (outcome.kind === "admin") return outcome.adminPubkeyHex;
+      deps.logger.info("channel.join.admin_unresolved", {
+        channel_pubkey: channelHex,
+        reason: outcome.kind === "not_a_channel" ? "not_a_channel" : outcome.reason,
+      });
+      return null;
+    } catch (err: unknown) {
+      // This runs inside the inbound content path. An exception escaping would surface as a broken
+      // session rather than a refused join, which is a worse answer to the same question.
+      deps.logger.warn("channel.join.admin_unresolved", {
+        channel_pubkey: channelHex, reason: extractErrorMessage(err),
+      });
+      return null;
+    }
+  };
 }
 
 function needAgent(deps: ChannelMembershipWiringDeps, params: Record<string, unknown> | undefined, connectionId: string):
@@ -119,19 +178,20 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
   };
 
   /**
-   * ⚠️ **NOT WIRED TO A DIRECTORY YET, AND IT FAILS CLOSED RATHER THAN PRETENDING.** The subscriber's
-   * admin check compares the answering agent against THIS. Returning "whoever answered" would be
-   * precisely the hole that check exists to close, so until the profile read lands, a join from a
-   * channel this daemon does not itself administer is refused as `admin_unresolved` — which is
-   * visible in the log and safe, where a permissive default would be neither.
+   * The join path carries an agent ID; `signalingFor` is keyed by the daemon's agent NAME. Resolved
+   * the same way `keyProviderFor` does it just below — by walking the loaded agents, because the ID
+   * is the stable key and the name is a mutable label.
    */
-  const profileAdminPubkey = (channelHex: string): Promise<string | null> => {
-    // The ADMIN this daemon recorded, not the channel's own key — the two are different agents, and
-    // comparing a key with itself is what the first version of this did.
-    const settings = members.settings(channelHex);
-    if (!settings || settings.admin_pubkey.length === 0) return Promise.resolve(null);
-    return Promise.resolve(settings.admin_pubkey);
+  const signalingForAgentId = (agentId: string): SignalingLike | null => {
+    const agent = deps.loadedAgents.find((a) => deps.resolveAgentId(a.name) === agentId);
+    return agent ? deps.signalingFor(agent.name) : null;
   };
+
+  const profileAdminPubkey = createProfileAdminPubkey({
+    members,
+    logger,
+    lookup: createChannelAdminLookup({ signalingFor: signalingForAgentId, logger }),
+  });
 
   const keyProviderFor = (agentId: string): KeyProvider | null => {
     const agent = deps.loadedAgents.find((a) => deps.resolveAgentId(a.name) === agentId);

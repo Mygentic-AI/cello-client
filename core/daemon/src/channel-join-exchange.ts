@@ -57,7 +57,7 @@ export interface ChannelJoinExchangeDeps {
    * The channel's admin AS THE DIRECTORY REPORTS IT. `null` means the lookup could not be resolved,
    * which FAILS CLOSED — an unreachable directory must not become "whoever answered is the admin".
    */
-  profileAdminPubkey: (channelHex: string) => Promise<string | null>;
+  profileAdminPubkey: (channelHex: string, agentId: string) => Promise<string | null>;
   keyProviderFor: (agentId: string) => KeyProvider | null;
   raiseNotice: (event: string, channelHex: string, subscriberHex: string) => void;
   now?: () => number;
@@ -263,7 +263,19 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
        * A lookup that cannot be RESOLVED fails closed. An unreachable directory must never mean
        * "accept whoever this is" — that would make a network problem into an admission.
        */
-      const profileAdmin = await deps.profileAdminPubkey(channelHex);
+      /**
+       * ⚠️ **A RE-KEY ASKS NOBODY: the admin was checked when the subscription was made, and is
+       * stored on it.** Going back to the directory for one would put a network round trip, and a
+       * directory outage, in the path of every re-key — and a re-key is how an EJECTION reaches the
+       * remaining members, so losing one is the thing with a cost. It is also what closed the
+       * exposure this check opened: an unsolicited re-key naming any pubkey would otherwise have
+       * bought a stranger a directory lookup, on a handler the session layer is waiting for.
+       *
+       * The asking agent goes with the acceptance case, because the lookup rides THAT agent's own
+       * authenticated directory stream rather than any connection that happens to be open.
+       */
+      const storedAdmin = rekeyFrame ? (subscriptions.get(agentId, channelHex)?.admin_pubkey ?? null) : null;
+      const profileAdmin = storedAdmin ?? await deps.profileAdminPubkey(channelHex, agentId);
       if (profileAdmin === null) {
         logger.warn("channel.join.refused", { channel_pubkey: channelHex, reason: "admin_unresolved" });
         return { ok: false, reason: "admin_unresolved" };
