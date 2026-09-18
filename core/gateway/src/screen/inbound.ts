@@ -27,7 +27,7 @@ import { sanitizeInbound } from "../detect/sanitize.js";
 import { injectionPatternsReady, scanInjectionPatterns } from "../detect/injection-patterns.js";
 import { scanVariants } from "../detect/scan-variants.js";
 import { screenInboundLanguage, type LanguageOptions } from "../detect/language.js";
-import { InjectionScanner } from "../detect/injection-scanner.js";
+import { InjectionScanner, type ScanResult } from "../detect/injection-scanner.js";
 import type { GovernanceEvent } from "./outbound.js";
 
 export interface InboundVerdict {
@@ -140,21 +140,40 @@ export class InboundScreener {
    * the Latin it imitates; the raw copy is the only one that still holds the disguise; the hidden
    * copy is the only one that holds a smuggled instruction at all.
    *
-   * Cost is bounded: duplicates are scanned once, so an ordinary message with nothing hidden and
-   * nothing folded is a SINGLE pass, exactly as before — and a copy scoring at or above the block
-   * bar ends the loop, because no later copy can make the verdict worse.
+   * A FAILING copy never ends the scan, and that distinction is the whole point of the loop.
+   * `ScanResult.available:false` means two different things: the model is absent (handled by the
+   * caller's `available()` guard, Layer 2 simply off) or THIS TEXT made the classifier throw. The
+   * second is attacker-reachable — the classifier throws on an unrecognised label set, which is
+   * input-dependent — so returning early on it would let a message that breaks the model on its
+   * scan copy skip the raw and hidden copies, exactly the two that carry the attack.
+   *
+   * When every copy fails, the result is `available:false` and the caller says so out loud rather
+   * than delivering a message that merely looks clean. When SOME copy failed, `degraded` is set and
+   * the caller notes which, because "scored clean" and "could not be scored" must not look alike.
+   *
+   * Cost is bounded: duplicate copies are scanned once, so a plain message with nothing to decode,
+   * fold or unhide is a SINGLE pass — and a copy at or above the block bar ends the loop, because
+   * no later copy can make the verdict worse.
    */
-  async #scanHighest(content: Uint8Array, scanText: string, hiddenText: string) {
+  async #scanHighest(
+    content: Uint8Array,
+    scanText: string,
+    hiddenText: string,
+  ): Promise<ScanResult & { degraded?: number; scanned?: number }> {
     const raw = new TextDecoder().decode(content);
-    let worst = await this.#injection.scan(scanText);
-    if (!worst.available) return worst;
-    for (const copy of [raw, hiddenText]) {
-      if (worst.verdict === "block") return worst;
-      if (copy === "" || copy === scanText) continue;
+    const copies = [scanText, raw, hiddenText].filter(
+      (c, i, all) => c !== "" && all.indexOf(c) === i,
+    );
+    let worst: ScanResult | null = null;
+    let degraded = 0;
+    for (const copy of copies) {
+      if (worst?.verdict === "block") break;
       const next = await this.#injection.scan(copy);
-      if (next.available && (next.score ?? 0) > (worst.score ?? 0)) worst = next;
+      if (!next.available) { degraded++; continue; }
+      if (worst === null || (next.score ?? 0) > (worst.score ?? 0)) worst = next;
     }
-    return worst;
+    if (worst === null) return { available: false, degraded };
+    return { ...worst, ...(degraded > 0 ? { degraded, scanned: copies.length } : {}) };
   }
 
   async screen(content: Uint8Array): Promise<InboundVerdict> {
@@ -227,6 +246,23 @@ export class InboundScreener {
     // so the call short-circuits and inbound behaviour is unchanged until the model is installed.
     if (this.#injection.available()) {
       const scan = await this.#scanHighest(content, scanText, r.hiddenText);
+      // The model is installed and loaded, so "unavailable" here means the message itself broke
+      // every copy's scan. Silence would be indistinguishable from a clean score.
+      if (!scan.available) {
+        events.push({
+          stage: "injection_scan",
+          disposition: "observe",
+          category: "injection:scan_failed",
+          reason: "the semantic classifier failed on every copy of this message — no Layer-2 screening ran on it",
+        });
+      } else if (scan.degraded !== undefined) {
+        events.push({
+          stage: "injection_scan",
+          disposition: "observe",
+          category: "injection:scan_degraded",
+          reason: `the semantic classifier failed on ${scan.degraded} of ${scan.scanned} copies of this message — the score below is from the copies that did scan`,
+        });
+      }
       if (scan.verdict === "block") {
         return {
           disposition: "block",
