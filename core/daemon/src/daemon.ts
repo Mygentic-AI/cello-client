@@ -51,6 +51,8 @@ import { registerContactHandlers } from "./contact-handlers.js";
 import { registerSignalHandlers } from "./signal-handlers.js";
 import { registerTestHandlers } from "./test-handlers.js";
 import { registerAgentAdminHandlers } from "./agent-admin-handlers.js";
+// M16 018-PUBCOLLECT — the channel publishing half.
+import { wireChannelPublishing } from "./channel-publish-wiring.js";
 import { registerStatusHandler } from "./status-handler.js";
 import { registerBackupRestoreHandlers } from "./backup-restore-handlers.js";
 import { wireDocumentGate } from "./document-gate-wiring.js";
@@ -634,6 +636,19 @@ async function startDaemonHoldingLock(
     resolveConsortiumRoster, getFailoverEndpoint, sealFailures,
   });
 
+  // M16 018-PUBCOLLECT: the channel publishing verbs, their log, their relay client and the
+  // per-channel publisher → channel-publish-wiring.ts. What stays here is the wiring.
+  const channelWiring = wireChannelPublishing({
+    handlers, logger,
+    getDb: () => sessionNodeManager.getDb(),
+    getNode: () => sessionNodeManager.getStandingReceiverNode() ?? null,
+    screenOutbound: (content, ctx) => securityGateway.screenOutbound(content, ctx),
+    loadedAgents, keyProviders,
+    resolveCurrentAgent: (connectionId, explicitAgent) =>
+      resolveCurrentAgent(perConnectionState.get(connectionId), explicitAgent),
+    isAgentOnline: (agentId) => onlineAgents.has(agentId) && !explicitlyOfflineAgents.has(agentId),
+  });
+
   // ─── Trust-signal wallet (operator-facing, no agent scope required) ───
   // 040-DAEMONROOT unit 1: the trust-signal, attestation and consent handlers moved to
   // signal-handlers.ts, with the two helpers only they used. What stays here is the wiring.
@@ -1179,7 +1194,7 @@ async function startDaemonHoldingLock(
       // stopAllSignaling() stops the shared manager AND every per-agent manager (best-effort). Do
       // not add a separate per-agent stop loop beside it: it would be redundant, and an unguarded
       // second stop() that throws would abort the rest of shutdown.
-      trustSignalSweepTicker.stopAll(); await stopAllSignaling();
+      trustSignalSweepTicker.stopAll(); channelWiring.stop(); await stopAllSignaling();
       // Gracefully mark active sessions interrupted (AC-009) before stopping IPC
       await sessionNodeManager.gracefulShutdown();
       await ipcServer.stop();

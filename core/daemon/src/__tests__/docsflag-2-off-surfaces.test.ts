@@ -159,10 +159,17 @@ describe("074-DOCSFLAG clauses 2/5/6/9 — the daemon's three document surfaces,
   // 62/76 → 61/75 for M16 016-CLIENTREWORK: `cello_channel_seal` is deleted with the epoch layer,
   // so the socket answers one verb fewer in both flag positions. The 14-verb gap is unchanged —
   // that is the assertion this test is really about.
-  it("OFF: the operator's socket answers 61 verbs, exactly 14 fewer than ON, and no doc verb", async () => {
+  //
+  // 61/75 → 65/79 for M16 018-PUBCOLLECT: the four channel publishing verbs. They are registered
+  // unconditionally, so both flag positions move by the same four and the gap is again unchanged.
+  //
+  // 65/79 → 66/80 for the fifth channel verb, `cello_channel_config`: the publisher's record of
+  // which relays a channel publishes to. Without it the other four answer `channel_unknown` for
+  // ever, which is how the first version of that unit shipped.
+  it("OFF: the operator's socket answers 66 verbs, exactly 14 fewer than ON, and no doc verb", async () => {
     const off = await start("off");
     const offKeys = productionVerbs(off);
-    expect(offKeys).toHaveLength(61);
+    expect(offKeys).toHaveLength(66);
     expect(offKeys.filter((k) => k.startsWith("cello_doc_"))).toEqual([]);
     for (const verb of DOC_VERBS) expect(offKeys).not.toContain(verb);
 
@@ -171,7 +178,7 @@ describe("074-DOCSFLAG clauses 2/5/6/9 — the daemon's three document surfaces,
 
     const on = await start("on");
     const onKeys = productionVerbs(on);
-    expect(onKeys).toHaveLength(75);
+    expect(onKeys).toHaveLength(80);
     // The three assertions that survive any unrelated verb being added or removed.
     expect(onKeys.length - offKeys.length).toBe(14);
     expect(onKeys.filter((k) => k.startsWith("cello_doc_")).sort()).toEqual([...DOC_VERBS].sort());

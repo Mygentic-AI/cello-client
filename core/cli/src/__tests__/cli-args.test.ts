@@ -61,6 +61,9 @@ describe("F1: usage string lists every command", () => {
         "contacts", "contact",
         // Trust & endorsements
         "attestations", "trust-signals", "attestation-consent",
+        // Broadcast channels (M16). Terminal-only on purpose: a post carries the operator's own
+        // signature to every subscriber, so it is not a tool an agent may reach for.
+        "channel",
         // Other
         "settings", "moniker", "telegram", "bridge", "config", "policy",
       ].sort(),

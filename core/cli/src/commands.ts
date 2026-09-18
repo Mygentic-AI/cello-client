@@ -1216,6 +1216,54 @@ export async function trustSignals(
   };
 }
 
+/**
+ * M16 018-PUBCOLLECT — the terminal side of the four channel publishing verbs.
+ *
+ * These are IPC-only by order 018: an MCP tool would put "publish to every subscriber" in reach of
+ * anything that can drive an agent's tools, and a channel's posts are the publisher's own name on
+ * the record. The caller here is a person at a terminal, deliberately.
+ *
+ * ⚠️ **A REFUSAL THAT ARRIVED IS NOT AN UNREACHABLE DAEMON, and the two must not print the same.**
+ * Most refusals come back as `{ ok: false, reason }`, but a handler that THROWS becomes an IPC
+ * error response — which still travelled over a working socket. Printing that as
+ * `{"daemon":"unreachable"}` sends the operator to check the socket, the lock file and the process,
+ * none of which is the problem: the daemon answered, and what it said was `channel_group_key_unavailable`.
+ * Only a failure to connect is reported as unreachable.
+ */
+export async function channelVerb(
+  celloDir: string,
+  verb: string,
+  params: Record<string, unknown>,
+): Promise<CommandResult> {
+  const lockFilePath = join(celloDir, "daemon.lock");
+  const lock = await readLock(lockFilePath);
+  if (!lock) {
+    return { exitCode: 1, output: JSON.stringify({ daemon: "stopped" }, null, 2) };
+  }
+  // Connecting is the ONLY step whose failure means "unreachable". Split from the call itself so a
+  // refusal that arrived over a working socket can never be labelled as a dead daemon.
+  let client;
+  try {
+    client = await connectToDaemon(lock.socketPath);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { exitCode: 1, output: JSON.stringify({ daemon: "unreachable", error: message }, null, 2) };
+  }
+
+  try {
+    await client.send("ipc.connect", { clientType: "cli" });
+    const result = (await client.send(verb, params)) as { ok?: boolean };
+    return { exitCode: result?.ok === true ? 0 : 1, output: JSON.stringify(result, null, 2) };
+  } catch (err: unknown) {
+    // The daemon ANSWERED and what it said was an error. Report its words, not a guess about the
+    // socket: `channel_group_key_unavailable` is a decision the daemon made, not a connection fault.
+    const message = err instanceof Error ? err.message : String(err);
+    return { exitCode: 1, output: JSON.stringify({ ok: false, reason: message }, null, 2) };
+  } finally {
+    client.close();
+  }
+}
+
 export async function telegramSetToken(celloDir: string, botToken: string, chatId: string): Promise<CommandResult> {
   const lockFilePath = join(celloDir, "daemon.lock");
   const lock = await readLock(lockFilePath);
