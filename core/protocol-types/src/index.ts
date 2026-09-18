@@ -31,7 +31,7 @@ export {
 } from "./submission.js";
 export type { SubmissionBody, SubmissionOp, SignedSubmission } from "./submission.js";
 
-// M16 / DOD-M16-ARTIFACT-1 — the signed broadcast artifact wire format.
+// M16 / DOD-M16-ARTIFACT-1 — the doubly-signed broadcast post wire format.
 export {
   BROADCAST_ARTIFACT_DOMAIN,
   MAX_BROADCAST_TITLE_CHARS,
@@ -42,22 +42,25 @@ export {
   encodeBroadcastArtifact,
   decodeBroadcastArtifact,
   verifyBroadcastArtifact,
-  broadcastArtifactLeafHash,
 } from "./broadcast-artifact.js";
-export type { BroadcastArtifact, BroadcastDecodeReason } from "./broadcast-artifact.js";
+export type {
+  BroadcastArtifact,
+  BroadcastDecodeReason,
+  BroadcastVerifyReason,
+  BroadcastVerifyResult,
+} from "./broadcast-artifact.js";
 
-// M16 / DOD-M16-SEAL-TYPE-1 — the one-party channel-epoch-seal receipt.
+// M16 / DOD-M16-ARTIFACT-1 — the relay's signed receipt: the post's hash and the relay's own time.
 export {
-  CHANNEL_EPOCH_SEAL_DOMAIN,
-  CHANNEL_EPOCH_SEAL_ATTESTS,
-  buildChannelEpochSealTbs,
-  signChannelEpochSeal,
-  encodeChannelEpochSeal,
-  decodeChannelEpochSeal,
-  verifyChannelEpochSealSignature,
-  checkEpochChainLink,
-} from "./channel-epoch-seal.js";
-export type { ChannelEpochSeal, EpochSealDecodeReason, EpochChainReason } from "./channel-epoch-seal.js";
+  RELAY_POST_RECEIPT_DOMAIN,
+  broadcastPostHash,
+  buildRelayPostReceiptTbs,
+  signRelayPostReceipt,
+  encodeRelayPostReceipt,
+  decodeRelayPostReceipt,
+  verifyRelayPostReceipt,
+} from "./relay-post-receipt.js";
+export type { RelayPostReceipt, RelayPostReceiptDecodeReason } from "./relay-post-receipt.js";
 
 export type {
   MessageEnvelope,

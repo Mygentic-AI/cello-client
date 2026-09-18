@@ -156,10 +156,13 @@ describe("074-DOCSFLAG clauses 2/5/6/9 — the daemon's three document surfaces,
 
   // ── Clause 2: the IPC verb count, and no doc verb among them ────────────────────────────────
 
-  it("OFF: the operator's socket answers 62 verbs, exactly 14 fewer than ON, and no doc verb", async () => {
+  // 62/76 → 61/75 for M16 016-CLIENTREWORK: `cello_channel_seal` is deleted with the epoch layer,
+  // so the socket answers one verb fewer in both flag positions. The 14-verb gap is unchanged —
+  // that is the assertion this test is really about.
+  it("OFF: the operator's socket answers 61 verbs, exactly 14 fewer than ON, and no doc verb", async () => {
     const off = await start("off");
     const offKeys = productionVerbs(off);
-    expect(offKeys).toHaveLength(62);
+    expect(offKeys).toHaveLength(61);
     expect(offKeys.filter((k) => k.startsWith("cello_doc_"))).toEqual([]);
     for (const verb of DOC_VERBS) expect(offKeys).not.toContain(verb);
 
@@ -168,7 +171,7 @@ describe("074-DOCSFLAG clauses 2/5/6/9 — the daemon's three document surfaces,
 
     const on = await start("on");
     const onKeys = productionVerbs(on);
-    expect(onKeys).toHaveLength(76);
+    expect(onKeys).toHaveLength(75);
     // The three assertions that survive any unrelated verb being added or removed.
     expect(onKeys.length - offKeys.length).toBe(14);
     expect(onKeys.filter((k) => k.startsWith("cello_doc_")).sort()).toEqual([...DOC_VERBS].sort());
