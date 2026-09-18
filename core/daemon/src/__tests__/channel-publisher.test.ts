@@ -56,6 +56,8 @@ interface Harness {
   channelHex: string;
   relayKeys: Map<string, InMemoryKeyProvider>;
   deposits: Seen[];
+  logStateAtDeposit: boolean[];
+  held: Map<string, Set<number>>;
   /** Relays that refuse, and with what. */
   refuse: Map<string, { reason: string; skew_ms?: number }>;
   /** Relays that throw outright — a relay that is simply down. */
@@ -65,6 +67,7 @@ interface Harness {
 }
 
 async function harness(opts: { access?: "public" | "open" } = {}): Promise<Harness> {
+  const log = new ChannelLogStore(db, silent);
   const channelKp = generateKeypair();
   const adminKp = generateKeypair();
   const channelHex = Buffer.from(await channelKp.getPublicKey()).toString("hex");
@@ -73,12 +76,29 @@ async function harness(opts: { access?: "public" | "open" } = {}): Promise<Harne
     [RELAY_B, generateKeypair()],
   ]);
   const deposits: Seen[] = [];
+  /** For each deposit, whether the log already held the post when the relay was called. */
+  const logStateAtDeposit: boolean[] = [];
+  /** What each relay actually holds, so `relayHead` can answer truthfully. */
+  const held = new Map<string, Set<number>>([[RELAY_A, new Set()], [RELAY_B, new Set()]]);
   const refuse = new Map<string, { reason: string; skew_ms?: number }>();
   const down = new Set<string>();
   const screen = { block: false };
   const clock = { now: 1_800_000_000_000 };
 
   const deposit: RelayDepositSeam = async (relay, req) => {
+    // ⚠️ WHAT THE LOG HELD AT THE MOMENT THIS WAS CALLED. Asserting only that the post is logged
+    // AFTERWARDS proves nothing about order — it is logged either way. The first version of test 2
+    // did exactly that and passed against a publisher that deposited first.
+    const decodedNow = decodeBroadcastArtifact(req.post_cbor);
+    if (decodedNow.ok) {
+      let loggedAtDepositTime = false;
+      try {
+        loggedAtDepositTime = log.readRange(channelHex, decodedNow.artifact.seq, decodedNow.artifact.seq).length > 0;
+      } catch {
+        loggedAtDepositTime = false; // the channel is not even open in the log yet
+      }
+      logStateAtDeposit.push(loggedAtDepositTime);
+    }
     if (down.has(relay)) throw new Error(`relay ${relay} is unreachable`);
     deposits.push({ relay, postCbor: req.post_cbor });
     const refusal = refuse.get(relay);
@@ -88,18 +108,27 @@ async function harness(opts: { access?: "public" | "open" } = {}): Promise<Harne
     }
     const decoded = decodeBroadcastArtifact(req.post_cbor);
     if (!decoded.ok) return { ok: false, reason: "bad_post" };
+    held.get(relay)!.add(decoded.artifact.seq);
     const receipt = await signRelayPostReceipt(relayKeys.get(relay)!, decoded.artifact, clock.now);
     const { encodeRelayPostReceipt } = await import("@cello-protocol/protocol-types");
     return { ok: true, receipt_cbor: encodeRelayPostReceipt(receipt) };
   };
 
-  const log = new ChannelLogStore(db, silent);
   const publisher = new ChannelPublisher({
     db,
     logger: silent,
     log,
     now: () => clock.now,
     deposit,
+    // What the relay HOLDS, which is the question a refill has to ask — a receipt says it took the
+    // post once, not that it still has it.
+    relayHead: (relay) => {
+      const seqs = [...held.get(relay)!].sort((a, b) => a - b);
+      return Promise.resolve({
+        first_held_seq: seqs.length > 0 ? seqs[0] : null,
+        last_seq: seqs.length > 0 ? seqs[seqs.length - 1] : null,
+      });
+    },
     // The seam `cello_send` uses. The subscriber's inbound screen is the enforcement; this is the
     // early check that spares an honest publisher the friction.
     screenOutbound: () => Promise.resolve(screen.block ? { disposition: "block", reason: "injection" } : { disposition: "allow" }),
@@ -119,7 +148,7 @@ async function harness(opts: { access?: "public" | "open" } = {}): Promise<Harne
     }),
   });
 
-  return { publisher, log, channelKp, adminKp, channelHex, relayKeys, deposits, refuse, down, screen, clock };
+  return { publisher, log, channelKp, adminKp, channelHex, relayKeys, deposits, logStateAtDeposit, held, refuse, down, screen, clock };
 }
 
 describe("M16 018-PUBCOLLECT: publishing", () => {
@@ -156,6 +185,14 @@ describe("M16 018-PUBCOLLECT: publishing", () => {
     // Logged anyway, with both relays reported failed.
     expect(h.log.head(h.channelHex)).toEqual({ first_seq: 1, last_seq: 1, pruned_through: 0 });
     expect(h.log.receiptsFor(h.channelHex, 1)).toEqual([]);
+
+    // ⚠️ AND THE ORDER ITSELF, which "it is logged afterwards" does not prove — it is logged either
+    // way. Every relay call saw the post ALREADY in the log.
+    expect(h.logStateAtDeposit.length, "both relays were attempted").toBe(2);
+    expect(
+      h.logStateAtDeposit.every((seen) => seen),
+      "a relay was called before the post was durable — reverse the order and this is what catches it",
+    ).toBe(true);
   });
 
   it("3. one relay down is still a SUCCESSFUL publish, with one receipt", async () => {
