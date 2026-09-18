@@ -191,6 +191,28 @@ describe("M16 018-PUBCOLLECT: collecting", () => {
     expect(h.subs.get(AGENT, h.channelHex)?.delivered_through).toBe(6);
   });
 
+  it("14b. the FLOOR POST ITSELF failing verification still does not open a gap below the floor", async () => {
+    const h = await harness();
+    // The relay pruned 1-4 and serves 5, 6, 7 — and post 5 is the one that fails verification.
+    const impostor = generateKeypair();
+    await h.place(RELAY_A, await h.post(5, { agentKp: impostor }));
+    for (const s of [6, 7]) await h.place(RELAY_A, await h.post(s));
+
+    await h.collector.collectOnce(AGENT, h.channelHex);
+    const gaps = h.collector.gapsFor(AGENT, h.channelHex);
+
+    /**
+     * ⚠️ **THE RELAY'S REPORTED FLOOR IS THE FLOOR, whatever the local state says.** Nothing is held
+     * below 6 and the position is still 0, so a floor taken as the minimum of the relay's floor, the
+     * lowest post held and `delivered_through + 1` comes out as 1 — and the subscriber then demands
+     * posts 1 to 5 from a publisher that pruned four of them months ago, every tick, for ever.
+     * Test 14 could not catch this: with a valid floor post, the minimum is the floor either way.
+     */
+    expect(gaps.first_held_seq).toBe(5);
+    // Post 5 IS missing and is above the floor, so it is a real gap. 1-4 are not.
+    expect(gaps.missing).toEqual([5]);
+  });
+
   it("15. an INVALID post is dropped, named, and advances nothing", async () => {
     const h = await harness();
     await h.place(RELAY_A, await h.post(1));
@@ -260,6 +282,35 @@ describe("M16 018-PUBCOLLECT: collecting", () => {
     await h2.collector.repairGaps(AGENT, h2.channelHex);
     expect(h2.repairs, "a gap that survives both is reported once, not every tick").toHaveLength(1);
     expect(h2.repairs[0]).toEqual({ from: 2, to: 2 });
+  });
+
+  it("18b. TWO agents on the same channel each get their own repair request", async () => {
+    const h = await harness();
+    // A second agent on this daemon subscribed to the SAME channel.
+    const SECOND = "agent-2";
+    h.subs.upsert({
+      agent_id: SECOND,
+      channel_pubkey: h.channelHex,
+      admin_pubkey: Buffer.from(await h.adminKp.getPublicKey()).toString("hex"),
+      access: "public",
+      relays: [RELAY_A, RELAY_B],
+    });
+    // Post 2 exists nowhere, so both agents have the same genuine gap.
+    for (const s of [1, 3]) await h.place(RELAY_A, await h.post(s));
+
+    await h.collector.collectOnce(AGENT, h.channelHex);
+    await h.collector.repairGaps(AGENT, h.channelHex);
+    await h.collector.collectOnce(SECOND, h.channelHex);
+    await h.collector.repairGaps(SECOND, h.channelHex);
+
+    /**
+     * ⚠️ **TWO REQUESTS, ONE PER AGENT.** The "asked already" memory used to be keyed on the channel
+     * alone, so the second agent's gap was suppressed by the first agent's request — its posts
+     * simply never arrived, and nothing was logged to say why. Same shape as joining on a mutable
+     * attribute: the key has to name the thing whose state it tracks.
+     */
+    expect(h.repairs).toHaveLength(2);
+    expect(h.repairs.every((r) => r.from === 2 && r.to === 2)).toBe(true);
   });
 
   it("19. a public channel fetches with NO auth; a non-public one signs with the fetch key", async () => {

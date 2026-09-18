@@ -83,8 +83,19 @@ export class ChannelCollector {
   readonly #now: () => number;
   /** Relay-reported `first_held_seq` per channel — the floor below which absence is not a gap. */
   readonly #firstHeld = new Map<string, number>();
-  /** Gaps already reported to the publisher, so a survivor is not re-requested every tick. */
+  /**
+   * Gaps already reported to the publisher, so a survivor is not re-requested every tick.
+   *
+   * ⚠️ KEYED ON `agentId:channel`, NOT on the channel. Two agents on this daemon can subscribe to
+   * the same channel, and one key per channel means the second agent's genuine gap is silently never
+   * requested once the first has asked — its posts simply never arrive, with nothing logged.
+   */
   readonly #repairRequested = new Map<string, Set<number>>();
+
+  /** The one place the repair key is built, so the two halves cannot drift apart. */
+  static #repairKey(agentId: string, channelHex: string): string {
+    return `${agentId}:${channelHex}`;
+  }
 
   constructor(opts: ChannelCollectorOptions) {
     this.#opts = opts;
@@ -147,7 +158,10 @@ export class ChannelCollector {
       }
       logger.info("channel.fetch.completed", {
         ...(correlationId !== undefined ? { correlationId } : {}),
-        channel_pubkey: channelHex, relay, count: stored, delivered_through: sub.delivered_through,
+        // `sub` was read BEFORE the fetch, so its position is the one we started from. Naming it
+        // `delivered_through` made the log say the position had not moved on every successful
+        // collection — the advance happens below, after every relay has been read.
+        channel_pubkey: channelHex, relay, count: stored, delivered_through_before: sub.delivered_through,
       });
     }
 
@@ -236,9 +250,23 @@ export class ChannelCollector {
     const { subscriptions, inbox } = this.#opts;
     const sub = subscriptions.get(agentId, channelHex);
     const held = inbox.heldSeqs(agentId, channelHex);
-    const floorCandidates = [this.#firstHeld.get(channelHex), held[0], (sub?.delivered_through ?? 0) + 1]
+    /**
+     * ⚠️ **THE RELAY'S REPORTED FLOOR WINS OUTRIGHT, and is never lowered by anything local.**
+     *
+     * The floor used to be the minimum of the relay's floor, the lowest post held, and
+     * `delivered_through + 1`. Take a relay that pruned 1–4 and serves 5, 6, 7, where post 5 fails
+     * verification: nothing is held below 6, `delivered_through` stays 0, and the minimum is 1 — so
+     * the subscriber demands posts 1 to 5 from a publisher that pruned four of them months ago, and
+     * keeps demanding them for ever. That is precisely what "below the floor is never a gap" forbids.
+     *
+     * Only when NO relay has reported a floor do the local positions stand in for one.
+     */
+    const reported = this.#firstHeld.get(channelHex);
+    const localCandidates = [held[0], (sub?.delivered_through ?? 0) + 1]
       .filter((n): n is number => typeof n === "number" && n > 0);
-    const first_held_seq = floorCandidates.length > 0 ? Math.min(...floorCandidates) : 1;
+    const first_held_seq = reported !== undefined && reported > 0
+      ? reported
+      : (localCandidates.length > 0 ? Math.min(...localCandidates) : 1);
     if (held.length === 0) return { missing: [], first_held_seq };
 
     const highest = held[held.length - 1];
@@ -278,10 +306,11 @@ export class ChannelCollector {
     const { missing } = this.gapsFor(agentId, channelHex);
     if (missing.length === 0) return;
 
-    let asked = this.#repairRequested.get(channelHex);
+    const repairKey = ChannelCollector.#repairKey(agentId, channelHex);
+    let asked = this.#repairRequested.get(repairKey);
     if (!asked) {
       asked = new Set<number>();
-      this.#repairRequested.set(channelHex, asked);
+      this.#repairRequested.set(repairKey, asked);
     }
     const fresh = missing.filter((seq) => !asked.has(seq));
     if (fresh.length === 0) return;
