@@ -57,6 +57,7 @@ import { randomUUID } from "node:crypto";
 import { GatewayConfigStore, GatewayRecordStore, type ConfigDirection } from "@cello-protocol/gateway";
 import type { IpcHandler } from "./ipc-server.js";
 import type { Logger } from "./types.js";
+import { SCRIPTS, isScript } from "@cello-protocol/gateway";
 import { dbKeyPathFor } from "./sqlcipher-db.js";
 import { extractErrorMessage } from "./error-message.js";
 
@@ -100,20 +101,40 @@ function coerce(key: string, raw: unknown): { ok: true; value: unknown } | { ok:
     if (raw === "true" || raw === "false") return { ok: true, value: raw === "true" };
     return { ok: false, reason: `${key} is a boolean — pass true or false.` };
   }
-  if (key === "__never") {
-    if (typeof raw === "boolean") return { ok: true, value: raw };
-    if (raw === "true" || raw === "false") return { ok: true, value: raw === "true" };
-    return { ok: false, reason: "autonomous_override is a boolean — pass true or false." };
-  }
   if (key === "pii_whitelist" || key === "language_allow") {
-    if (Array.isArray(raw) && raw.every((v) => typeof v === "string")) return { ok: true, value: raw };
-    // A comma-separated string is what a CLI argument looks like. An EMPTY string means the empty
-    // list (the tightest value), not [""] — a stray empty member would whitelist nothing but would
-    // read as a loosening in the version history.
-    if (typeof raw === "string") {
-      return { ok: true, value: raw.split(",").map((s) => s.trim()).filter(Boolean) };
+    const asList = Array.isArray(raw) && raw.every((v) => typeof v === "string")
+      ? raw as string[]
+      // A comma-separated string is what a CLI argument looks like. An EMPTY string means the empty
+      // list (the tightest value), not [""] — a stray empty member would whitelist nothing but would
+      // read as a loosening in the version history.
+      : typeof raw === "string" ? raw.split(",").map((v) => v.trim()).filter(Boolean) : null;
+    if (asList === null) {
+      return { ok: false, reason: `${key} is a list — pass comma-separated values, or an empty string to clear it.` };
     }
-    return { ok: false, reason: `${key} is a list — pass comma-separated values, or an empty string to clear it.` };
+    // This branch must mirror the STORE's validator (review F6). It stopped doing so when
+    // language_allow gained real validation, and the operator got the store's raw JSON dump
+    // instead of a sentence naming the valid scripts.
+    if (key === "language_allow") {
+      if (asList.length === 0) {
+        return {
+          ok: false,
+          reason:
+            "language_allow cannot be empty. An empty list is not 'accept nothing suspicious' — with " +
+            "language_enforce on it refuses every language including your own, which silently stops " +
+            `all mail. Pass the scripts you read, e.g. "latin,greek". Valid: ${SCRIPTS.join(", ")}.`,
+        };
+      }
+      const unknown = asList.filter((v) => !isScript(v));
+      if (unknown.length > 0) {
+        return {
+          ok: false,
+          reason:
+            `not a script: ${unknown.join(", ")}. language_allow takes SCRIPTS, not language names — ` +
+            `Greek is "greek", Japanese is "kana", Chinese is "han". Valid: ${SCRIPTS.join(", ")}.`,
+        };
+      }
+    }
+    return { ok: true, value: asList };
   }
   const n = typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw) : NaN;
   if (!Number.isFinite(n)) return { ok: false, reason: `${key} is a number.` };

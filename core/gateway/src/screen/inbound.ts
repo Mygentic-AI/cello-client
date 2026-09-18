@@ -227,6 +227,7 @@ export class InboundScreener {
     // lookalike, so the live 2026-09-04 jailbreak arrived 165/165 Cyrillic, reached this line as 123
     // Latin / 42 Cyrillic, and cleared the 0.5 bar it should have failed at. Both texts are correct
     // answers to different questions, and this screen asks the one only the original can answer.
+    let languageNote: string | null = null;
     const lang = screenInboundLanguage(r.scriptScanText, this.#language ?? {});
     if (!lang.allowed) {
       // DOD-M9C-SCREENBASE-1 — language is a PREFERENCE, not a screen, and only blocks when the
@@ -258,19 +259,24 @@ export class InboundScreener {
           guidance:
             (lang.reason ?? "This message is in a language outside the allowlist.") +
             " It was not delivered, because this agent is set to accept only the languages in its " +
-            "allowlist.\n" + operatorCanRun("language_allow", "<comma-separated scripts>"),
+            "allowlist. Adding a script ACCEPTS that language; turning the refusal off accepts every " +
+            "language and screens them with the classifier instead.\n" +
+            operatorCanRun("language_allow", "<comma-separated scripts — this REPLACES the list, so include the ones you already read>") +
+            "\n" + operatorCanRun("language_enforce", "false"),
         };
       }
-      // Delivered — but the agent is told it got ONE layer of screening rather than two, because
-      // the deterministic patterns are English and silence here would read as "screened clean".
+      // Delivered — and the agent is TOLD what did and did not screen it. The deterministic
+      // patterns are English by construction, so they match nothing here. Whether anything read
+      // this message for meaning depends entirely on whether the classifier is installed, and
+      // saying "screened by the classifier" when it is off would be the false half of the pair.
+      languageNote = this.#injection.available()
+        ? `noted=non_english (${lang.script}) — the deterministic patterns are English-only, so this message was screened by the semantic classifier alone.`
+        : `noted=non_english (${lang.script}) — NO semantic screening ran on this message: the deterministic patterns are English-only and the classifier is not installed.`;
       events.push({
         stage: "language",
         disposition: "observe",
         category: `language:${lang.script}`,
-        reason:
-          (lang.reason ?? "non-allowlisted language") +
-          " It was delivered. The deterministic injection patterns are English-only, so this " +
-          "message was screened by the semantic classifier alone.",
+        reason: (lang.reason ?? "non-allowlisted language") + " It was delivered. " + languageNote,
       });
     }
 
@@ -429,14 +435,19 @@ export class InboundScreener {
         ? `noted=encoded_blob (${n.count ?? 0} high-entropy segment(s))`
         : `noted=encoded_content (${n.count ?? 0} escape(s) decoded for scanning)`));
 
+    // The language note travels WITH the message. Built and then dropped, it was the exact defect
+    // this layer keeps producing: the screener does the work and the agent never learns of it, so a
+    // message nothing read for meaning arrives looking identical to one that was cleared.
+    const language = languageNote !== null ? [languageNote] : [];
+
     const outage = patternsDown
       ? [`${AFFORDANCE_PREFIX} Pattern screening did not run on this message: the rules are not compiled in this gateway.`]
       : [];
-    const wrapped = flagged || mutated || patternsDown || observations.length > 0
-      ? `${screeningWarning(findings, [...removals, ...observations, ...outage])}\n\n${deliveredText}`
+    const wrapped = flagged || mutated || patternsDown || observations.length > 0 || language.length > 0
+      ? `${screeningWarning(findings, [...removals, ...observations, ...language, ...outage])}\n\n${deliveredText}`
       : deliveredText;
 
-    const annotated = mutated || flagged || patternsDown || observations.length > 0;
+    const annotated = mutated || flagged || patternsDown || observations.length > 0 || language.length > 0;
     return {
       disposition: annotated ? "redact" : "allow",
       content: annotated ? TEXT_ENCODER.encode(wrapped) : content,

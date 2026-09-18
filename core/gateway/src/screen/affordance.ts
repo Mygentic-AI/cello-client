@@ -56,7 +56,7 @@ export function withProvenance(text: string): string {
   return text.includes(AFFORDANCE_PREFIX) ? text : `${AFFORDANCE_PREFIX} ${text}`;
 }
 
-/** The five keys `cello config` exposes. Anything not here has no operator knob — say so instead. */
+/** The keys `cello config` exposes. Anything not here has no operator knob — say so instead. */
 export type AdjustableGuard =
   | "pii_whitelist"
   | "autonomous_override"

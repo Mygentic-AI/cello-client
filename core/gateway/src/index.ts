@@ -31,7 +31,7 @@ export type { SecretFinding, SecretScanResult } from "./detect/secrets.js";
 // Shared with the document content rule — the message path strips these, the document path refuses
 // them, and neither may own a private copy of the list (DOD-DOC-SCREEN-CONTENT-1).
 export { PRIVILEGED_TURN_MARKERS, PIPE_TURN_MARKER_SOURCE, pipeTurnMarkerRegex, sanitizeInbound } from "./detect/sanitize.js";
-export { screenInboundLanguage } from "./detect/language.js";
+export { screenInboundLanguage, SCRIPTS, isScript } from "./detect/language.js";
 export type { LanguageVerdict, LanguageOptions, Script } from "./detect/language.js";
 export { InjectionScanner, scoreToVerdict, BLOCK_THRESHOLD, FLAG_THRESHOLD } from "./detect/injection-scanner.js";
 export type { InjectionClassifier, InjectionVerdict, ScanResult } from "./detect/injection-scanner.js";

@@ -17,7 +17,7 @@ import { InboundScreener } from "../screen/inbound.js";
 import { initLinearRegex } from "../detect/linear-regex.js";
 import { compileInjectionPatterns } from "../detect/injection-patterns.js";
 import { compileSecretRules } from "../detect/secrets.js";
-import { isScript, type Script } from "../detect/language.js";
+import { type Script } from "../detect/language.js";
 import { GatewayConfigStore } from "../config/config-store.js";
 import { stderrStoreEventSink } from "../store/encrypted-db.js";
 import { GatewayRecordStore, type RecordDisposition } from "../records/record-store.js";
@@ -88,8 +88,12 @@ async function main(): Promise<void> {
   // with a published bypass is not a gate. They are gone; `cello config set` is the way in, and it
   // asks a human before it weakens anything.
   //
-  // Each key still falls back to its TIGHTEST value when the store has not set it (empty whitelist,
-  // override off, no rate cap), so an absent or empty config never silently loosens.
+  // Each key falls back to its TIGHTEST value when the store has not set it (empty whitelist,
+  // override off, no rate cap), so an absent or empty config never silently loosens — with ONE
+  // deliberate exception, `language_enforce`. Its store BASELINE is `true` so that turning the
+  // refusal off is gated like any other loosening, but its RUNTIME default is `false`: refusing
+  // mail for being in a language blocked 11% of ordinary traffic and is a preference, not a
+  // screen (DOD-M9C-SCREENBASE-1). Baseline gates CHANGES here; it does not describe the default.
   const config = storeDbPath && storeKeyFile ? new GatewayConfigStore(storeDbPath, storeKeyFile, stderrStoreEventSink) : undefined;
   const cfg = <T>(key: string, tightestDefault: T): T => {
     const v = config?.get(key);
@@ -146,11 +150,16 @@ async function main(): Promise<void> {
   // this line never passed the setting to the screener. The escape hatch from the block was fake.
   //
   // `language_enforce` defaults OFF: language is a preference, not a screen (see InboundScreener).
-  const languageAllow: Script[] = cfg<string[]>("language_allow", ["latin"]).filter(isScript);
+  // The store validates every member against the real script list, so a value it accepted is
+  // already a Script. Filtering-and-substituting here would paper over a corrupt stored value and
+  // screen against a silently different allowlist than the one `cello config get` reports.
+  const languageAllow = cfg<string[]>("language_allow", ["latin"]) as Script[];
+  // NOT the tightest value — see the note on `cfg` above. Language is a preference: refusing mail
+  // for being in a language is off unless the operator turns it on.
   const languageEnforce = cfg<boolean>("language_enforce", false);
   const inbound = new InboundScreener({
     ...(load.classifier ? { injectionScanner: new InjectionScanner(load.classifier) } : {}),
-    language: { allow: languageAllow.length > 0 ? languageAllow : ["latin"] },
+    language: { allow: languageAllow },
     languageEnforce,
   });
 

@@ -160,9 +160,13 @@ describe("DOD-M9B-SURFACE-1 — gateway config surface + the loosen gate", () =>
     await call("cello_config_set", { key: "rate_max_per_window", value: 10 });
     const res = await call("cello_config_list", {});
     const rows = res.config as Array<Record<string, unknown>>;
-    // Asserted against the surface's own list rather than a retyped number: a key added without a
-    // help line, or a help line for a key the gateway does not read, is the defect worth catching.
-    expect(rows).toHaveLength(GATEWAY_CONFIG_KEYS.length);
+    // A retyped count goes red on every key added, which is noise; comparing the list to itself is
+    // worse, because it goes GREEN on the defects worth catching. What matters is that every key the
+    // surface lists is one an operator can actually understand and set, so assert THAT.
+    expect(rows.map((r) => r.key).sort()).toEqual([...GATEWAY_CONFIG_KEYS].sort());
+    for (const row of rows) {
+      expect(String(row.describes ?? ""), `${String(row.key)} has no help line`).not.toBe("");
+    }
     const rate = rows.find((r) => r.key === "rate_max_per_window")!;
     expect(rate.value).toBe(10);
     expect(rate.version).toBe(1);
