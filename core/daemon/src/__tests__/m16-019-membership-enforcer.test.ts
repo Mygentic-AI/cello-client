@@ -23,17 +23,10 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { InMemoryKeyProvider, generateGroupKey, encryptBody, deriveFetchKey } from "@cello-protocol/crypto";
-import {
-  signBroadcastArtifact, encodeBroadcastArtifact, buildChannelFetchKeyTbs,
-} from "@cello-protocol/protocol-types";
-import { createNode } from "@cello-protocol/transport";
-import { ChannelRelayClient } from "../channel-relay-client.js";
-import type { Logger } from "../types.js";
+import { InMemoryKeyProvider } from "@cello-protocol/crypto";
 
 const PKG_ROOT = join(import.meta.dirname, "..", "..");
 const HELPERS = join(PKG_ROOT, "src/__tests__/helpers");
-const silent: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 
 const seedHex = (byte: number): string => Buffer.alloc(32, byte).toString("hex");
 const hex = (b: Uint8Array): string => Buffer.from(b).toString("hex");
@@ -57,6 +50,33 @@ function startRelay(seed: string): Promise<{ child: ChildProcess; multiaddr: str
     setTimeout(() => { reject(new Error("relay did not announce in time")); }, 30_000);
   });
 }
+
+interface AdminResult {
+  channelHex: string; adminHex: string;
+  gen1BundleA: string; gen1BundleB: string; gen2BundleA: string;
+  ejectGeneration: number; remaining: string[];
+}
+
+function runHelper<T>(script: string, args: string[]): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["--import", "tsx", join(HELPERS, script), ...args], {
+      cwd: PKG_ROOT, env: { ...process.env }, stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    let err = "";
+    child.stdout.on("data", (c: Buffer) => { out += c.toString("utf-8"); });
+    child.stderr.on("data", (c: Buffer) => { err += c.toString("utf-8"); });
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      const line = out.split("\n").find((l) => l.trim().startsWith("{"));
+      if (!line) { reject(new Error(`${script} exited ${String(code)} with no result: ${err}`)); return; }
+      resolve(JSON.parse(line) as T);
+    });
+  });
+}
+
+const runAdmin = (args: string[]): Promise<AdminResult> =>
+  runHelper<AdminResult>("m16-019-admin-process.ts", args);
 
 function runMember(args: string[]): Promise<{ fetched: number[]; decrypted: number[]; refusals: string[] }> {
   return new Promise((resolve, reject) => {
@@ -92,68 +112,47 @@ describe("M16 019-MEMBERSHIP enforcer", () => {
     const relayB = await startRelay(seedHex(0x52));
     children.push(relayA.child, relayB.child);
 
-    const channelKp = new InMemoryKeyProvider(new Uint8Array(Buffer.from(seedHex(0x61), "hex")));
-    const adminKp = new InMemoryKeyProvider(new Uint8Array(Buffer.from(seedHex(0x62), "hex")));
-    const channelPubkey = await channelKp.getPublicKey();
-    const channelHex = hex(channelPubkey);
-    const adminHex = hex(await adminKp.getPublicKey());
-
     const memberASeed = seedHex(0x71);
     const memberBSeed = seedHex(0x72);
+    const memberAHex = hex(await new InMemoryKeyProvider(new Uint8Array(Buffer.from(memberASeed, "hex"))).getPublicKey());
+    const memberBHex = hex(await new InMemoryKeyProvider(new Uint8Array(Buffer.from(memberBSeed, "hex"))).getPublicKey());
 
-    // The publisher's own transport, in this process — it is the one role the enforcer drives
-    // directly, because what is being proven is what the MEMBERS can and cannot do.
-    const node = await createNode({
-      listenAddresses: [], keyProvider: adminKp,
-      relayServer: { enabled: false }, autonatResponder: { enabled: false },
-    });
-    await node.start();
-    const client = new ChannelRelayClient({ getNode: () => node, logger: silent });
+    /**
+     * ⚠️ **THE ADMIN RUNS THE REAL CODE, IN ITS OWN PROCESS.** Both members join through
+     * `ChannelJoinExchange.onAdminFrame` and the admin's explicit approval; the ejection is
+     * `ChannelMembershipStore.eject`; both posts go through `ChannelPublisher` with the fetch key
+     * derived from the group key the join stored. The first version of this test built keys by hand
+     * and deposited directly, so reverting this entire unit left it green.
+     */
+    const adminArgs = (ph: string): string[] => [
+      join(dir, "admin.db"), seedHex(0x61), seedHex(0x62),
+      memberAHex, memberBHex, relayA.multiaddr, relayB.multiaddr, ph,
+    ];
+    const setup = await runAdmin(adminArgs("setup"));
+    const channelHex = setup.channelHex;
 
-    /** Publish one post under a generation, carrying that generation's fetch key to both relays. */
-    async function publish(seq: number, gk: { generation: number; key: Uint8Array }, title: string): Promise<void> {
-      const body = encryptBody(gk, channelPubkey, seq, new TextEncoder().encode(`${title} body`));
-      const post = await signBroadcastArtifact(channelKp, adminKp, {
-        seq, published_at: Date.now(), title, body, supersedes: null, ext: null,
-      });
-      const fetchKey = await deriveFetchKey(gk, channelPubkey);
-      const timeMs = Date.now();
-      const signature = await channelKp.sign(buildChannelFetchKeyTbs(channelPubkey, fetchKey.publicKey, timeMs));
-      for (const relay of [relayA.multiaddr, relayB.multiaddr]) {
-        const answer = await client.deposit(relay, {
-          post_cbor: encodeBroadcastArtifact(post),
-          fetch_key: { pubkey: fetchKey.publicKey, time_ms: timeMs, signature },
-        });
-        expect(answer.ok, answer.ok ? "" : answer.reason).toBe(true);
-      }
-    }
+    const argsFor = (seed: string, id: string, bundles: string[]): string[] =>
+      [join(dir, `${id}.db`), id, channelHex, setup.adminHex, seed, relayA.multiaddr, relayB.multiaddr,
+        JSON.stringify(bundles)];
 
-    // ── 1. Generation 1: both members hold it, and both read post 1 ────────────────────────────
-    const gen1 = generateGroupKey(1);
-    await publish(1, gen1, "before the ejection");
-
-    const gen1Json = JSON.stringify([{ generation: 1, keyHex: hex(gen1.key) }]);
-    const argsFor = (seed: string, id: string, keysJson: string): string[] =>
-      [join(dir, `${id}.db`), id, channelHex, adminHex, seed, relayA.multiaddr, relayB.multiaddr, keysJson];
-
-    const aBefore = await runMember(argsFor(memberASeed, "member-a", gen1Json));
-    const bBefore = await runMember(argsFor(memberBSeed, "member-b", gen1Json));
+    // ── 1. Both members joined and both read the first post ───────────────────────────────────
+    const aBefore = await runMember(argsFor(memberASeed, "member-a", [setup.gen1BundleA]));
+    const bBefore = await runMember(argsFor(memberBSeed, "member-b", [setup.gen1BundleB]));
     expect(aBefore.decrypted, "A reads post 1").toEqual([1]);
     expect(bBefore.decrypted, "B reads post 1 — both are members at this point").toEqual([1]);
 
-    // ── 2 & 3. B is ejected: a NEW generation, and the next post carries its fetch key ─────────
-    const gen2 = generateGroupKey(2);
-    await publish(2, gen2, "after the ejection");
+    // ── 2 & 3. A SECOND admin process ejects B and publishes again ─────────────────────────────
+    // A fresh process on the same database: the admin's group key and settings have to survive a
+    // restart, which is the property that broke when the key lived only in memory.
+    const ejected = await runAdmin(adminArgs("eject"));
+    expect(ejected.ejectGeneration, "the store advanced the generation").toBe(2);
+    expect(ejected.remaining, "only A remains a member").toEqual([memberAHex]);
 
-    // ── 4. A holds the new key. B holds only the old one. ──────────────────────────────────────
-    const bothGens = JSON.stringify([
-      { generation: 1, keyHex: hex(gen1.key) },
-      { generation: 2, keyHex: hex(gen2.key) },
-    ]);
-    const aAfter = await runMember(argsFor(memberASeed, "member-a2", bothGens));
+    // ── 4. A holds the re-key bundle; B was never sent one ────────────────────────────────────
+    const aAfter = await runMember(argsFor(memberASeed, "member-a2", [setup.gen1BundleA, ejected.gen2BundleA]));
     expect(aAfter.decrypted, "A reads both posts").toEqual([1, 2]);
 
-    const bAfter = await runMember(argsFor(memberBSeed, "member-b2", gen1Json));
+    const bAfter = await runMember(argsFor(memberBSeed, "member-b2", [setup.gen1BundleB]));
     /**
      * ⚠️ **NOTHING FETCHED AT ALL — not "fetched but unreadable".** B's newest key is generation 1,
      * so the fetch signature it can produce no longer matches what the relays were told to require.
@@ -165,6 +164,5 @@ describe("M16 019-MEMBERSHIP enforcer", () => {
     expect(bAfter.decrypted).toEqual([]);
     expect(bAfter.refusals, "and both relays said why").toEqual(["not_a_member", "not_a_member"]);
 
-    await node.stop();
   }, 180_000);
 });

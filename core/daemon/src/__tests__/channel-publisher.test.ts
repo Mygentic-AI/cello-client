@@ -409,10 +409,15 @@ describe("M16 018-PUBCOLLECT: publishing", () => {
       "channel_group_key_unavailable",
     );
     expect(h.deposits, "nothing reached a relay").toEqual([]);
-    // The channel was never even opened in the log: the refusal happens before a number is taken.
-    let thrown: unknown;
-    try { h.log.head(h.channelHex); } catch (err) { thrown = err; }
-    expect(thrown, "no position was burned on a post that was never made").toBeDefined();
+    /**
+     * ⚠️ NO POST NUMBER WAS CONSUMED. The channel's row now exists — the position is taken before
+     * encryption, because the body's associated data binds the position — but `nextPosition` still
+     * answers 1, so the next real post takes the number this one did not. Burning a number here
+     * would leave a permanent hole that every subscriber reads as a missing post and tries to
+     * repair, for ever.
+     */
+    expect(h.log.nextPosition(h.channelHex).seq, "the number is still there to be used").toBe(1);
+    expect(h.log.head(h.channelHex)).toEqual({ first_seq: null, last_seq: null, pruned_through: 0 });
   });
 
   it("8. resendMissing deposits only what a relay has NOT receipted, oldest first", async () => {

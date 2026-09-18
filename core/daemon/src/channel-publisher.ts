@@ -100,8 +100,14 @@ export interface ChannelPublisherOptions {
   screenOutbound: (bytes: Uint8Array, ctx: { agentName: string; correlationId?: string }) => Promise<ScreenVerdict>;
   getChannelKey: (channelHex: string) => KeyProvider | null;
   getAgentKey: (agentName: string) => KeyProvider | null;
-  /** 019 owns the group key; the publisher must not be able to tell what this does. */
-  encryptBody: (plaintext: Uint8Array, channelHex: string) => Promise<Uint8Array>;
+  /**
+   * 019 owns the group key; the publisher must not be able to tell what this does.
+   *
+   * ⚠️ TAKES THE POST NUMBER, because the body's associated data binds it. Without seq here the
+   * encryption cannot bind the position, and a hostile relay can serve one post's body at another's
+   * number with every signature still verifying.
+   */
+  encryptBody: (plaintext: Uint8Array, channelHex: string, seq: number) => Promise<Uint8Array>;
   /** Overridable so a test can refill without waiting; production takes the default. */
   resendPaceMs?: number;
   /**
@@ -173,14 +179,23 @@ export class ChannelPublisher {
       return { ok: false, reason: "blocked_by_screen", detail: verdict.reason ?? verdict.disposition };
     }
 
-    // 2. A public channel is readable by anyone, so encrypting it would be theatre — and would lock
-    //    out the subscribers it exists for, who hold no key.
-    const plaintext = new TextEncoder().encode(body);
-    const wire = info.access === "public" ? plaintext : await this.#opts.encryptBody(plaintext, channelHex);
-
-    // 3. Position and signatures.
+    /**
+     * 2. THE POSITION COMES FIRST, because the encryption binds it.
+     *
+     * ⚠️ The order's step list says encrypt then take the number, and that cannot be implemented:
+     * the body's associated data is (channel, seq, generation), so encrypting before the number
+     * exists means binding the wrong one — or not binding it, which is what lets a hostile relay
+     * serve post 7's body at position 3 with every signature still checking out. Taking the number
+     * first changes nothing else: the LOG is still written after signing and before any deposit,
+     * which is the part of that order that carries weight.
+     */
     log.ensureChannel(channelHex);
     const { seq } = log.nextPosition(channelHex);
+
+    // 3. A public channel is readable by anyone, so encrypting it would be theatre — and would lock
+    //    out the subscribers it exists for, who hold no key.
+    const plaintext = new TextEncoder().encode(body);
+    const wire = info.access === "public" ? plaintext : await this.#opts.encryptBody(plaintext, channelHex, seq);
     let post: BroadcastArtifact;
     try {
       post = await signBroadcastArtifact(channelKey, agentKey, {

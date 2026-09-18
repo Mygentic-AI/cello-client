@@ -10,8 +10,10 @@
  *   node --import tsx m16-019-member-process.ts <dbPath> <agentId> <channelHex> <adminHex>
  *                                               <memberSeedHex> <relayA> <relayB> <keysJson>
  *
- * `keysJson` is `[{ generation, keyHex }]` — the generations this member holds. An ejected member
- * is simply run with the OLD list, which is exactly its real position.
+ * `keysJson` is `[bundleHex]` — the WRAPPED key bundles this member was actually sent by the admin,
+ * unwrapped here with its own identity key. Handing over raw keys instead would have skipped the
+ * wrapping the join exists to perform. An ejected member is simply run with the bundles it received
+ * BEFORE the ejection, which is exactly its real position.
  *
  * Prints one JSON line: { fetched, decrypted, refusals } where
  *   fetched    post numbers the relays were willing to hand over
@@ -20,7 +22,7 @@
  */
 import { InMemoryKeyProvider } from "@cello-protocol/crypto";
 import { decodeBroadcastArtifact, buildChannelFetchAuthTbs } from "@cello-protocol/protocol-types";
-import { decryptBody, deriveFetchKey, type GroupKey } from "@cello-protocol/crypto";
+import { decryptBody, deriveFetchKey, unwrapGroupKey, type GroupKey } from "@cello-protocol/crypto";
 import { createNode } from "@cello-protocol/transport";
 import { ChannelRelayClient } from "../../channel-relay-client.js";
 import { extractErrorMessage } from "../../error-message.js";
@@ -34,10 +36,20 @@ async function main(): Promise<void> {
     throw new Error("usage: m16-019-member-process.ts <dbPath> <agentId> <channelHex> <adminHex> <memberSeedHex> <relayA> <relayB> <keysJson>");
   }
 
-  const keys: GroupKey[] = (JSON.parse(keysJson) as Array<{ generation: number; keyHex: string }>)
-    .map((k) => ({ generation: k.generation, key: new Uint8Array(Buffer.from(k.keyHex, "hex")) }));
-
   const member = new InMemoryKeyProvider(new Uint8Array(Buffer.from(memberSeedHex, "hex")));
+  const channelPubkeyForUnwrap = new Uint8Array(Buffer.from(channelHex, "hex"));
+
+  /**
+   * ⚠️ UNWRAPPED HERE, with this member's OWN key. The bundles came from the admin's real join
+   * path; handing this process raw group keys would have skipped the wrapping entirely, which is
+   * most of what a join does.
+   */
+  const keys: GroupKey[] = [];
+  for (const bundleHex of JSON.parse(keysJson) as string[]) {
+    const opened = await unwrapGroupKey(new Uint8Array(Buffer.from(bundleHex, "hex")), channelPubkeyForUnwrap, member);
+    if (!opened.ok) throw new Error(`could not unwrap a bundle addressed to this member: ${opened.reason}`);
+    keys.push(opened.gk);
+  }
   const node = await createNode({
     listenAddresses: [], keyProvider: member,
     relayServer: { enabled: false }, autonatResponder: { enabled: false },
