@@ -53,6 +53,7 @@ import { registerTestHandlers } from "./test-handlers.js";
 import { registerAgentAdminHandlers } from "./agent-admin-handlers.js";
 // M16 018-PUBCOLLECT — the channel publishing half.
 import { wireChannelPublishing } from "./channel-publish-wiring.js";
+import { ChannelSubscriptionStore } from "./channel-subscription-store.js";
 import { registerStatusHandler } from "./status-handler.js";
 import { registerBackupRestoreHandlers } from "./backup-restore-handlers.js";
 import { wireDocumentGate } from "./document-gate-wiring.js";
@@ -509,6 +510,11 @@ async function startDaemonHoldingLock(
     dispatchSessionStateChangedWithTelegram,
     sendTelegramDoorbell,
     isDeliveryOpenToAgent, isChannelAgent: channelAgentLookup(sessionNodeManager, logger), // M16
+    // M16 019: the mirror — a session FROM a channel this agent subscribes to. Constructed per call
+    // rather than held, so a channel joined after boot is recognised without a restart.
+    isSubscribedChannel: (agentName, counterpartyPubkeyHex) =>
+      new ChannelSubscriptionStore(sessionNodeManager.getDb(), logger)
+        .isSubscribedChannel(agentName, counterpartyPubkeyHex),
   });
 
   if (!sharedSignaling) {
