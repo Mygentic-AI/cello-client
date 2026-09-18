@@ -33,9 +33,15 @@ export interface ChannelPublishWiringDeps {
   getNode: () => CelloNode | null;
   screenOutbound: (content: Uint8Array, ctx: ScreenContext) => Promise<ScreenVerdict>;
   /** Every agent this daemon loaded, read per lookup so one added after boot is publishable. */
-  loadedAgents: ReadonlyArray<{ pubkey: string; keyProvider: KeyProvider }>;
+  loadedAgents: ReadonlyArray<{ name: string; pubkey: string; keyProvider: KeyProvider }>;
   keyProviders: Map<string, KeyProvider>;
   resolveCurrentAgent: (connectionId: string, explicitAgent?: string) => string | null;
+  /**
+   * M16 019: the channel's current fetch key, signed, or undefined when this daemon holds no group
+   * key for it. Injected rather than derived here so the membership half owns the group key and
+   * this half never has to hold one.
+   */
+  currentFetchKey?: (channelHex: string) => Promise<{ pubkey: Uint8Array; time_ms: number; signature: Uint8Array } | undefined>;
   /**
    * Online AND not explicitly switched off — the same pair every other background loop here reads.
    * Collecting for an agent the operator switched off is the kill switch failing to switch off.
@@ -65,7 +71,18 @@ export function wireChannelPublishing(deps: ChannelPublishWiringDeps): { stop: (
     return new ChannelPublisher({
       logger,
       log,
-      deposit: (addr, req) => relay.deposit(addr, { post_cbor: req.post_cbor }),
+      deposit: (addr, req) => relay.deposit(addr, {
+        post_cbor: req.post_cbor,
+        ...(req.fetch_key ? { fetch_key: req.fetch_key } : {}),
+      }),
+      /**
+       * ⚠️ **THE KEY THAT MAKES AN EJECTION BITE AT THE RELAY.** Derived from the channel's current
+       * group key, signed with the CHANNEL key because the post's signature does not cover it, and
+       * sent with each deposit so a re-key reaches the relays on the very next post. `undefined`
+       * means this daemon holds no group key for that channel — a public one, or one it does not
+       * administer — and the relay then serves it to anyone, which for a public channel is correct.
+       */
+      currentFetchKey: deps.currentFetchKey,
       depositInfo: (addr, req) => relay.depositInfo(addr, { info_cbor: req.info_cbor }),
       prune: (addr, req) => relay.prune(addr, {
         channel_pubkey: Buffer.from(req.channelHex, "hex"),
@@ -114,7 +131,15 @@ export function wireChannelPublishing(deps: ChannelPublishWiringDeps): { stop: (
       if (!keyProviders.has(agentName)) {
         return { ok: false, reason: "no_such_agent", guidance: `${agentName} is not an agent this daemon holds.` };
       }
-      config.set(channelHex, cfg, Date.now());
+      /**
+       * ⚠️ **THE ADMIN AGENT IS RECORDED HERE, and it is what makes the channel joinable at all.**
+       * `agentName` is the agent running the setup, and in this release the publisher and the admin
+       * are the same operator — so that agent's key is the one a subscriber will check the answering
+       * party against. Leaving it empty was how 019's first cut produced a channel that refused
+       * every join with `not_admin_of_channel` on a channel it demonstrably administered.
+       */
+      const adminAgent = deps.loadedAgents.find((a) => a.name === agentName);
+      config.set(channelHex, { ...cfg, admin_pubkey: adminAgent?.pubkey ?? "" }, Date.now());
       return { ok: true };
     },
   });

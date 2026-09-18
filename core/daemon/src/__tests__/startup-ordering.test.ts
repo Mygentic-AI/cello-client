@@ -246,7 +246,13 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // the collector. There is no inbound event for a channel post — the relay holds a queue and
     // waits to be asked — so the collector shipped unwired meant a subscriber who received nothing
     // while every component reported healthy. Same hole as the publishing verbs, other half.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(106);
+    //
+    // 106 → 108 for M16 019-MEMBERSHIP, and it is TWO factories rather than one:
+    // `wireChannelMembership` (the join exchange, the eject re-key, the six operator verbs) and
+    // `createChannelJoinExchange`, which it builds. Unwired, this would be the same hole as its two
+    // predecessors — a join frame would fall through to the transcript as something a person said,
+    // and no membership verb would answer.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(108);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",

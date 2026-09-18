@@ -53,6 +53,9 @@ import { registerTestHandlers } from "./test-handlers.js";
 import { registerAgentAdminHandlers } from "./agent-admin-handlers.js";
 // M16 018-PUBCOLLECT — the channel publishing half.
 import { wireChannelPublishing } from "./channel-publish-wiring.js";
+import { ChannelSubscriptionStore } from "./channel-subscription-store.js";
+import { wireChannelMembership } from "./channel-membership-wiring.js";
+import { LEAF_KIND_MSG } from "./session-relay-client.js";
 import { registerStatusHandler } from "./status-handler.js";
 import { registerBackupRestoreHandlers } from "./backup-restore-handlers.js";
 import { wireDocumentGate } from "./document-gate-wiring.js";
@@ -509,6 +512,17 @@ async function startDaemonHoldingLock(
     dispatchSessionStateChangedWithTelegram,
     sendTelegramDoorbell,
     isDeliveryOpenToAgent, isChannelAgent: channelAgentLookup(sessionNodeManager, logger), // M16
+    // M16 019: the mirror — a session FROM a channel this agent subscribes to. Constructed per call
+    // rather than held, so a channel joined after boot is recognised without a restart.
+    /**
+     * ⚠️ **`resolveAgentId`, NOT THE NAME.** The store queries `agent_id`; the inbound path hands
+     * over `localAgent.name`. Passing the name matched no row, a missing row reads as "not a
+     * channel", and "not a channel" is ALLOW — so the refusal never fired and nothing said so. Test
+     * 21 could not see it because the harness replaced this lookup with a name-keyed stub.
+     */
+    isSubscribedChannel: (agentName, counterpartyPubkeyHex) =>
+      new ChannelSubscriptionStore(sessionNodeManager.getDb(), logger)
+        .isSubscribedChannel(sessionNodeManager.resolveAgentId(agentName), counterpartyPubkeyHex),
   });
 
   if (!sharedSignaling) {
@@ -638,6 +652,29 @@ async function startDaemonHoldingLock(
 
   // M16 018-PUBCOLLECT: the channel publishing verbs, their log, their relay client and the
   // per-channel publisher → channel-publish-wiring.ts. What stays here is the wiring.
+  // M16 019-MEMBERSHIP: joining, the group key, the eject re-key and the operator's channel verbs
+  // → channel-membership-wiring.ts. What stays here is the wiring.
+  const channelMembership = wireChannelMembership({
+    handlers, logger,
+    getDb: () => sessionNodeManager.getDb(),
+    sendInSession: async (agentName, sessionId, content) => {
+      // The hash comes from the SESSION, because a salted session hashes differently — computing it
+      // here would produce a leaf the counterparty's chain cannot match. Leaf kind `msg`: a join
+      // frame is not conversation, but a leaf kind is what a VERIFIER renders a leaf by, and a
+      // third kind would make every existing verifier unable to read a transcript carrying a join.
+      const { hash, alg } = await sessionNodeManager.contentHashForSession(agentName, sessionId, content);
+      await sessionNodeManager.sendContent(agentName, sessionId, content, new Uint8Array(hash), undefined, LEAF_KIND_MSG, alg);
+    },
+    setOnChannelJoinFrame: (cb) => { sessionNodeManager.setOnChannelJoinFrame(cb); },
+    loadedAgents, keyProviders,
+    resolveAgentId: (agentName) => sessionNodeManager.resolveAgentId(agentName),
+    resolveCurrentAgent: (connectionId, explicitAgent) =>
+      resolveCurrentAgent(perConnectionState.get(connectionId), explicitAgent),
+    activeSessionsFor: (agentName) => sessionNodeManager.getSessionsForAgent(agentName)
+      .filter((s) => s.status === "active")
+      .map((s) => ({ sessionId: s.session_id, counterpartyPubkeyHex: s.counterparty_pubkey })),
+  });
+
   const channelWiring = wireChannelPublishing({
     handlers, logger,
     getDb: () => sessionNodeManager.getDb(),
@@ -647,6 +684,9 @@ async function startDaemonHoldingLock(
     resolveCurrentAgent: (connectionId, explicitAgent) =>
       resolveCurrentAgent(perConnectionState.get(connectionId), explicitAgent),
     isAgentOnline: (agentId) => onlineAgents.has(agentId) && !explicitlyOfflineAgents.has(agentId),
+    // From the membership half, which owns the group key. This is what carries a re-key to the
+    // relays on the next post, and so what makes an ejection lock a member out AT the relay.
+    currentFetchKey: channelMembership.currentFetchKey,
   });
 
   // ─── Trust-signal wallet (operator-facing, no agent scope required) ───

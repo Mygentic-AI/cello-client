@@ -163,6 +163,12 @@ export interface InboundSessionDeps {
    * nothing here can know whether a REMOTE counterparty is a channel.
    */
   isChannelAgent: (agentName: string) => boolean;
+  /**
+   * M16 019: is this REMOTE pubkey a channel the given local agent subscribes to? The mirror of
+   * `isChannelAgent`, and it answers a question that one cannot: this daemon knows a remote identity
+   * is a channel only because it subscribed to it.
+   */
+  isSubscribedChannel: (agentName: string, counterpartyPubkeyHex: string) => boolean;
 }
 
 /**
@@ -552,7 +558,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     NO_CURRENT_AGENT_RESPONSE, getKeyProvider, sharedSignaling,
     handleInboundSealInterruptedRequest, reapDeadHalfOpenSessions,
     sendAwayResponse, dispatchSessionStateChangedWithTelegram, sendTelegramDoorbell,
-    isDeliveryOpenToAgent, isChannelAgent,
+    isDeliveryOpenToAgent, isChannelAgent, isSubscribedChannel,
   } = deps;
 
   // ─── Seam 2: inbound session establishment (counterparty side) ─────────────
@@ -1662,6 +1668,34 @@ export function createInboundSessions(deps: InboundSessionDeps) {
           "They refused this session: the identity you tried to reach is a broadcast channel. Channels " +
           "publish and never hold sessions. To reach the operator behind it, open a session with the " +
           "channel's admin agent instead.",
+        correlationId,
+      });
+      return;
+    }
+
+    /**
+     * M16 019: THE MIRROR — a session FROM a channel this agent subscribes to.
+     *
+     * The check above holds the line when somebody dials one of OUR channels. This one catches what
+     * it cannot see: a channel that dials US. A channel does not converse, so this is either its key
+     * in somebody else's hands, or someone who has learned a channel's pubkey and is trading on the
+     * trust the operator already places in it — which is exactly the shape a subscriber is least
+     * equipped to doubt, because they already read and believe that identity.
+     *
+     * Same slot and same path as its sibling: after verification, through `refuseInboundSession`,
+     * so the refusal is durable and the dialer is revoked.
+     */
+    if (isSubscribedChannel(localAgent.name, parsed.participantAPubkeyHex)) {
+      refuseInboundSession({
+        agentName: localAgent.name,
+        sessionIdHex: parsed.sessionIdHex,
+        counterpartyPubkeyHex: parsed.participantAPubkeyHex,
+        reason: REFUSAL_REASONS.SESSION_FROM_SUBSCRIBED_CHANNEL,
+        offeredDialer: offered,
+        counterpartyGuidance:
+          "They refused this session: the identity you dialled from is a broadcast channel they " +
+          "subscribe to, and channels publish rather than hold sessions. If you are the operator " +
+          "behind it, open the session from your admin agent instead.",
         correlationId,
       });
       return;

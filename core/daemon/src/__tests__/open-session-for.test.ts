@@ -65,6 +65,8 @@ function newOpener() {
     buildRelayConnectParams: async () => undefined,
     getRelayCircuitAddress: () => "",
     isChannelAgent: () => false,
+    // M16 019: this harness is not testing channel subscriptions — nobody here subscribes to one.
+    isSubscribedChannel: () => false,
   });
   return { openSessionFor, openSessionAs, seen };
 }

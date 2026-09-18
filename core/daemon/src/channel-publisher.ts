@@ -40,7 +40,21 @@ import { ChannelLogStore } from "./channel-log-store.js";
 /** How the publisher reaches a relay. The transport is the caller's; this owns the decisions. */
 export type RelayDepositSeam = (
   relay: string,
-  req: { post_cbor: Uint8Array },
+  req: {
+    post_cbor: Uint8Array;
+    /**
+     * ⚠️ **THIS IS WHAT MAKES AN EJECTION BITE AT THE RELAY.** The relay serves a non-public
+     * channel's queue only to a caller who can sign with the channel's current fetch key, and that
+     * key is DERIVED from the group key — so rotating the group key on an ejection rotates this
+     * too. Sent with the first deposit of each generation: until the relay has it, the ejected
+     * member can still FETCH (they just cannot decrypt), and "cannot read" is a weaker property
+     * than the one the order asks for.
+     *
+     * It carries its own channel signature because the post's does not cover it — see 017's note
+     * on the takeover this closes.
+     */
+    fetch_key?: { pubkey: Uint8Array; time_ms: number; signature: Uint8Array };
+  },
 ) => Promise<
   | { ok: true; receipt_cbor: Uint8Array }
   | { ok: false; reason: string; skew_ms?: number }
@@ -86,10 +100,22 @@ export interface ChannelPublisherOptions {
   screenOutbound: (bytes: Uint8Array, ctx: { agentName: string; correlationId?: string }) => Promise<ScreenVerdict>;
   getChannelKey: (channelHex: string) => KeyProvider | null;
   getAgentKey: (agentName: string) => KeyProvider | null;
-  /** 019 owns the group key; the publisher must not be able to tell what this does. */
-  encryptBody: (plaintext: Uint8Array, channelHex: string) => Promise<Uint8Array>;
+  /**
+   * 019 owns the group key; the publisher must not be able to tell what this does.
+   *
+   * ⚠️ TAKES THE POST NUMBER, because the body's associated data binds it. Without seq here the
+   * encryption cannot bind the position, and a hostile relay can serve one post's body at another's
+   * number with every signature still verifying.
+   */
+  encryptBody: (plaintext: Uint8Array, channelHex: string, seq: number) => Promise<Uint8Array>;
   /** Overridable so a test can refill without waiting; production takes the default. */
   resendPaceMs?: number;
+  /**
+   * The channel's CURRENT fetch key, or undefined for a public channel (which has none — anyone may
+   * read it). Asked per publish so a re-key reaches the relays on the very next post rather than
+   * waiting for a restart.
+   */
+  currentFetchKey?: (channelHex: string) => Promise<{ pubkey: Uint8Array; time_ms: number; signature: Uint8Array } | undefined>;
   channelInfo: (channelHex: string) => {
     access: ChannelAccess; relays: string[]; guidance: string; retention_seconds: number;
   } | null;
@@ -153,14 +179,23 @@ export class ChannelPublisher {
       return { ok: false, reason: "blocked_by_screen", detail: verdict.reason ?? verdict.disposition };
     }
 
-    // 2. A public channel is readable by anyone, so encrypting it would be theatre — and would lock
-    //    out the subscribers it exists for, who hold no key.
-    const plaintext = new TextEncoder().encode(body);
-    const wire = info.access === "public" ? plaintext : await this.#opts.encryptBody(plaintext, channelHex);
-
-    // 3. Position and signatures.
+    /**
+     * 2. THE POSITION COMES FIRST, because the encryption binds it.
+     *
+     * ⚠️ The order's step list says encrypt then take the number, and that cannot be implemented:
+     * the body's associated data is (channel, seq, generation), so encrypting before the number
+     * exists means binding the wrong one — or not binding it, which is what lets a hostile relay
+     * serve post 7's body at position 3 with every signature still checking out. Taking the number
+     * first changes nothing else: the LOG is still written after signing and before any deposit,
+     * which is the part of that order that carries weight.
+     */
     log.ensureChannel(channelHex);
     const { seq } = log.nextPosition(channelHex);
+
+    // 3. A public channel is readable by anyone, so encrypting it would be theatre — and would lock
+    //    out the subscribers it exists for, who hold no key.
+    const plaintext = new TextEncoder().encode(body);
+    const wire = info.access === "public" ? plaintext : await this.#opts.encryptBody(plaintext, channelHex, seq);
     let post: BroadcastArtifact;
     try {
       post = await signBroadcastArtifact(channelKey, agentKey, {
@@ -173,9 +208,33 @@ export class ChannelPublisher {
     // 4. THE LOG, BEFORE THE NETWORK.
     log.append(channelHex, post, correlationId);
 
-    // 5. Both relays, in parallel — a deposit is independent of the other, and making the second
-    //    wait on the first would double the latency of the ordinary case for no gain.
-    let deposited = await Promise.all(info.relays.map((relay) => this.#depositOnce(relay, post, channelHex, correlationId)));
+    /**
+     * 5. Both relays, in parallel — a deposit is independent of the other, and making the second
+     *    wait on the first would double the latency of the ordinary case for no gain.
+     *
+     * ⚠️ THE FETCH KEY RIDES ALONG. A public channel has none. For every other channel this is what
+     * makes an ejection bite AT THE RELAY rather than only at the ciphertext: until the relay holds
+     * the new generation's key, an ejected member can still pull the queue.
+     */
+    const fetchKey = info.access === "public" ? undefined : await this.#opts.currentFetchKey?.(channelHex);
+    /**
+     * ⚠️ **A NON-PUBLIC CHANNEL WITH NO FETCH KEY REFUSES TO PUBLISH.** Depositing without one tells
+     * the relay nothing about who may read, so it serves the queue to ANY caller — an `access` of
+     * invite_only with a queue open to the world, which is worse than not publishing. The absent key
+     * means no group key has been minted (nobody has joined yet, or this daemon does not administer
+     * the channel), and both are states to name rather than paper over.
+     */
+    if (info.access !== "public" && !fetchKey) {
+      logger.warn("channel.publish.refused", {
+        ...(correlationId !== undefined ? { correlationId } : {}),
+        channel_pubkey: channelHex, reason: "no_fetch_key",
+      });
+      return {
+        ok: false, reason: "key_unavailable", seq,
+        detail: "this channel has no group key yet, so the relays cannot be told who may read it; admit a member first",
+      };
+    }
+    let deposited = await Promise.all(info.relays.map((relay) => this.#depositOnce(relay, post, channelHex, correlationId, fetchKey)));
     let ok = deposited.filter((d) => d.ok);
 
     /**
@@ -221,11 +280,17 @@ export class ChannelPublisher {
    * are reported separately because folding them together turned a post that is safely on two relays
    * into `no_relay_accepted`, and sent the operator to resend something already there.
    */
-  async #depositOnce(relay: string, post: BroadcastArtifact, channelHex: string, correlationId?: string): Promise<DepositOutcome> {
+  async #depositOnce(
+    relay: string, post: BroadcastArtifact, channelHex: string, correlationId?: string,
+    fetchKey?: { pubkey: Uint8Array; time_ms: number; signature: Uint8Array },
+  ): Promise<DepositOutcome> {
     const { logger } = this.#opts;
     let answer: Awaited<ReturnType<RelayDepositSeam>>;
     try {
-      answer = await this.#opts.deposit(relay, { post_cbor: encodeBroadcastArtifact(post) });
+      answer = await this.#opts.deposit(relay, {
+        post_cbor: encodeBroadcastArtifact(post),
+        ...(fetchKey ? { fetch_key: fetchKey } : {}),
+      });
     } catch (err: unknown) {
       logger.warn("channel.post.deposit_failed", {
         ...(correlationId !== undefined ? { correlationId } : {}),

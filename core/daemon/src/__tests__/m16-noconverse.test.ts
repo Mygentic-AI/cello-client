@@ -101,6 +101,8 @@ function inboundHarness(opts: { tier?: number } = {}) {
   const revoked: Array<{ agent: string; session: string; dialer: string | null }> = [];
   /** Frames sent back to the counterparty — the `session_refused` notice a KNOWN+ caller earns. */
   const sentFrames: Array<Record<string, unknown>> = [];
+  /** M16 019: whether alice subscribes to the dialling counterparty. Off unless a test says so. */
+  let aliceSubscribes = false;
 
   const sessionNodeManager = {
     getOfferedDialer: () => DIALER,
@@ -134,6 +136,13 @@ function inboundHarness(opts: { tier?: number } = {}) {
     sessionNodeManager,
     agents: [{ name: CHAN, pubkey: CHAN_PUBKEY }, { name: ALICE, pubkey: ALICE_PUBKEY }],
     isChannelAgent: (name: string) => name === CHAN,
+    /**
+     * M16 019: alice SUBSCRIBES to the counterparty, which is therefore a channel as far as she is
+     * concerned. Nothing else in this harness changes — the point is that the same verified
+     * assignment she would otherwise accept is refused because of who it is FROM.
+     */
+    isSubscribedChannel: (name: string, counterpartyHex: string) =>
+      name === ALICE && counterpartyHex.toLowerCase() === COUNTERPARTY.toLowerCase() && aliceSubscribes,
     sharedSignaling: {
       registerInboundHandler(h: (frame: Record<string, unknown>) => void) {
         inbound = h;
@@ -189,6 +198,8 @@ function inboundHarness(opts: { tier?: number } = {}) {
     sentFrames,
     operatorSees: (agent: string) => (api.refusedSessionRequests.get(agent) ?? []) as Array<{ reason: string }>,
     enqueued: (agent: string) => api.inboundSessionQueues.get(agent) ?? [],
+    /** M16 019: make alice a subscriber of the dialling counterparty. */
+    subscribeAliceToCaller: () => { aliceSubscribes = true; },
   };
 }
 
@@ -236,6 +247,39 @@ describe("M16 006-NOCONVERSE: a channel refuses an inbound session", () => {
     await settle();
     expect(h.durable).toEqual([]);
     expect(h.enqueued(ALICE), "the session must actually reach the agent's queue").toHaveLength(1);
+  });
+
+  it("21. a session FROM a channel this agent SUBSCRIBES to is refused with its own reason", async () => {
+    const h = inboundHarness();
+    h.subscribeAliceToCaller();
+
+    // The identical assignment that the test above proves alice ACCEPTS.
+    await h.inject(ALICE_PUBKEY, new Uint8Array(16).fill(9));
+    await settle();
+
+    /**
+     * ⚠️ **THE MIRROR OF THE CHECK ABOVE, AND IT CATCHES WHAT THAT ONE CANNOT.** That one holds when
+     * somebody dials OUR channel. This one is a channel dialling US — either its key is in somebody
+     * else's hands, or someone has learned a channel's pubkey and is trading on the trust the
+     * operator already places in it. A subscriber is the least equipped person to doubt that
+     * identity, because they already read and believe it.
+     */
+    expect(h.durable.map((d) => d.reason)).toEqual([REFUSAL_REASONS.SESSION_FROM_SUBSCRIBED_CHANNEL]);
+    expect(h.enqueued(ALICE), "nothing reaches the agent").toHaveLength(0);
+    // Durable and revoked, like every other refusal on this path — not a silent drop.
+    expect(h.revoked).toHaveLength(1);
+    expect(h.operatorSees(ALICE).map((r) => r.reason))
+      .toContain(REFUSAL_REASONS.SESSION_FROM_SUBSCRIBED_CHANNEL);
+  });
+
+  it("21b. its guidance tells the operator to be SUSPICIOUS, not that something is broken", () => {
+    const guidance = REFUSAL_GUIDANCE[REFUSAL_REASONS.SESSION_FROM_SUBSCRIBED_CHANNEL];
+    expect(typeof guidance).toBe("string");
+    // The sibling refusal says "there is nothing wrong and nothing to retry" — correct there, and
+    // exactly wrong here. This one is a signal about the counterparty, and must read as one.
+    expect(guidance.toLowerCase()).toContain("suspicious");
+    // It must point somewhere the operator can actually go, and that is the channel's ADMIN agent.
+    expect(guidance.toLowerCase()).toContain("admin");
   });
 
   it("the refusal fires AFTER signature verification", async () => {

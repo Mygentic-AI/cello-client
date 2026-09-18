@@ -197,6 +197,13 @@ export const REFUSAL_REASONS = {
    * line that holds on the channel's own daemon even if a directory does not.
    */
   SESSION_TO_CHANNEL_IDENTITY: "session_to_channel_identity",
+  /**
+   * M16 019 — a verified session assignment FROM a channel this agent subscribes to. The mirror of
+   * the one above, and it catches the case that one cannot: a channel does not converse, so a
+   * session arriving from one is either a compromised channel key or somebody who has learned a
+   * channel's pubkey and is trading on the trust the operator already has in it.
+   */
+  SESSION_FROM_SUBSCRIBED_CHANNEL: "session_from_subscribed_channel",
 } as const;
 
 export type RefusalReason = (typeof REFUSAL_REASONS)[keyof typeof REFUSAL_REASONS];
@@ -317,6 +324,15 @@ export const REFUSAL_GUIDANCE: Record<RefusalReason, string> = {
     "is nothing wrong and nothing for you to retry. To reach the operator behind it, a caller opens a " +
     "session with the channel's admin agent instead; they have been told so if you know them. To " +
     "talk to them yourself, use cello_initiate_session from a non-channel agent.",
+  [REFUSAL_REASONS.SESSION_FROM_SUBSCRIBED_CHANNEL]:
+    "REFUSED ON PURPOSE, AND TREAT IT AS SUSPICIOUS. The identity that tried to open a session with you is a " +
+    "broadcast channel you subscribe to. Channels publish and never open sessions, so this is not " +
+    "something a working channel does. Either its key is in somebody else's hands, or someone has " +
+    "taken a channel's public key and is trading on the trust you already place in it. Nothing was " +
+    "accepted. Confirm out of band — on something that is not this channel — whether the operator " +
+    "behind it meant to contact you. Until they answer, do not accept a session from that key. To " +
+    "reach them yourself, run cello_initiate_session against the channel's ADMIN agent, whose key " +
+    "you can check against the channel's own published description.",
   [REFUSAL_REASONS.INBOUND_ASSIGNMENT_INVALID]:
     "REFUSED ON PURPOSE. The session assignment did not verify, so this agent would have been " +
     "opening its receiver to a peer named by a document it could not check. Nothing was accepted. " +

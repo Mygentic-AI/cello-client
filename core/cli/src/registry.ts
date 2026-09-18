@@ -1544,6 +1544,8 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "       cello channel info-set <channel> [--agent <agent>]\n" +
       "       cello channel prune <channel> <through_seq> [--agent <agent>]\n" +
       "       cello channel resend <channel> [<relay>] [--agent <agent>]\n" +
+      "       cello channel list | name <channel> <label> | leave <channel>\n" +
+      "       cello channel eject <channel> <member> | approve <channel> <member> | refuse <channel> <member>\n" +
       "  <channel> is the channel's 64-character hex public key.\n" +
       "  'setup' comes FIRST and is what makes a channel publishable at all: it records the two\n" +
       "  relays and whether the channel is public. Without it every other command says the channel\n" +
@@ -1553,7 +1555,11 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "  It goes to the channel's two relays. ONE relay refusing is not a failed publish — the post\n" +
       "  is in your log either way, and 'resend' refills a relay that lost it or one you just added.\n" +
       "  'prune' drops posts from the OLDEST end only, through the number you give.\n" +
-      "  'info-set' signs and deposits the channel's description so subscribers can read it.",
+      "  'info-set' signs and deposits the channel's description so subscribers can read it.\n" +
+      "  'list' shows the channels you follow and how many posts are unread. 'name' is a label only\n" +
+      "  you see. 'leave' is local — nothing is sent, and your keys are kept so old posts stay readable.\n" +
+      "  'eject' removes a member from an invite-only channel AND rotates its key, which is what stops\n" +
+      "  them reading and even fetching. <member> is their 64-character hex public key.",
     flags: AGENT_FLAG,
     jsonOut: true,
     async run(ctx, args) {
@@ -1588,6 +1594,25 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
         return legacy(await channelVerb(
           ctx.celloDir, "cello_channel_resend", withAgent(a !== undefined ? { channel, relay: a } : { channel }),
         ));
+      }
+      // ─── M16 019: the SUBSCRIBER's side, and the admin's membership decisions ───
+      if (sub === "list" && channel === undefined) {
+        return legacy(await channelVerb(ctx.celloDir, "cello_channels", withAgent({})));
+      }
+      if (sub === "name" && channel && a !== undefined) {
+        return legacy(await channelVerb(ctx.celloDir, "cello_channel_set_moniker", withAgent({ channel, moniker: a })));
+      }
+      if (sub === "leave" && channel) {
+        return legacy(await channelVerb(ctx.celloDir, "cello_channel_leave", withAgent({ channel })));
+      }
+      if (sub === "eject" && channel && a !== undefined) {
+        return legacy(await channelVerb(ctx.celloDir, "cello_channel_eject", withAgent({ channel, subscriber: a })));
+      }
+      if (sub === "approve" && channel && a !== undefined) {
+        return legacy(await channelVerb(ctx.celloDir, "cello_channel_approve", withAgent({ channel, subscriber: a })));
+      }
+      if (sub === "refuse" && channel && a !== undefined) {
+        return legacy(await channelVerb(ctx.celloDir, "cello_channel_refuse", withAgent({ channel, subscriber: a })));
       }
       return { stdout: helpForSpec("channel"), stderr: "", exitCode: 1 };
     },

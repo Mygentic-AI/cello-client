@@ -46,12 +46,39 @@ export const CHANNEL_SUBSCRIPTION_CREATE_SQL = `
   );
 `;
 
+/**
+ * The group keys a subscriber holds, one row per generation.
+ *
+ * ⚠️ **A SEPARATE TABLE BECAUSE THERE ARE MANY PER SUBSCRIPTION, and every one is kept.** A re-key
+ * does not make old posts unreadable — they are still in the relay's queue under the old key — so a
+ * single `key` column on the subscription would make the channel's own history undecryptable to its
+ * own members the moment anyone was ejected.
+ *
+ * The key bytes live only here, inside the SQLCipher database, and are never logged.
+ */
+export const CHANNEL_SUBSCRIPTION_KEYS_CREATE_SQL = `
+  CREATE TABLE IF NOT EXISTS channel_subscription_keys (
+    agent_id        TEXT    NOT NULL,
+    channel_pubkey  TEXT    NOT NULL,
+    generation      INTEGER NOT NULL,
+    key             BLOB    NOT NULL,
+    received_at     INTEGER NOT NULL,
+    PRIMARY KEY (agent_id, channel_pubkey, generation)
+  );
+`;
+
 export interface ChannelSubscription {
   agent_id: string;
   channel_pubkey: string;
   admin_pubkey: string;
   access: ChannelAccess;
   relays: string[];
+  /** A local display label. The pubkey is the identity; this is what an operator calls it. */
+  moniker: string;
+  /** What the channel is for, in the publisher's words — and how long its posts last. Both arrive
+   * on the acceptance and have no other source, so a subscriber that drops them cannot recover them. */
+  guidance: string;
+  retention_seconds: number;
   delivered_through: number;
   processed_through: number;
   status: "active" | "left" | "ejected";
@@ -74,6 +101,9 @@ interface Row {
   admin_pubkey: string;
   access: string;
   relays: string;
+  moniker: string;
+  guidance: string;
+  retention_seconds: number | bigint;
   delivered_through: number | bigint;
   processed_through: number | bigint;
   status: string;
@@ -87,33 +117,51 @@ export class ChannelSubscriptionStore {
     this.#db = db;
     this.#logger = logger;
     this.#db.exec(CHANNEL_SUBSCRIPTION_CREATE_SQL);
+    this.#db.exec(CHANNEL_SUBSCRIPTION_KEYS_CREATE_SQL);
   }
 
   /** Record (or refresh) a subscription. 019's join calls this; 018's tests use it directly. */
   upsert(sub: {
     agent_id: string; channel_pubkey: string; admin_pubkey: string; access: ChannelAccess;
-    relays: string[]; joined_at?: number;
+    relays: string[]; joined_at?: number; guidance?: string; retention_seconds?: number;
   }): void {
     this.#db
       .prepare(
+        /**
+         * ⚠️ TWO THINGS THIS USED TO GET WRONG, both silent.
+         *
+         * `guidance` and `retention_seconds` arrive on the acceptance frame, are validated, and were
+         * then DROPPED — the columns existed and nothing ever wrote them. The order says to store
+         * them; a subscriber that does not has no idea what the channel is for or how long its posts
+         * last.
+         *
+         * And `status` was not in the update list, so a subscriber who LEFT and later rejoined got a
+         * fresh key, an `ok`, and a row still marked `left`. `active()` excludes it, so the collector
+         * never fetched: a channel they had just rejoined that produced nothing, for ever.
+         */
         `INSERT INTO channel_subscriptions
-           (agent_id, channel_pubkey, admin_pubkey, access, relays, joined_at, status)
-         VALUES (?, ?, ?, ?, ?, ?, 'active')
+           (agent_id, channel_pubkey, admin_pubkey, access, relays, guidance, retention_seconds, joined_at, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')
          ON CONFLICT (agent_id, channel_pubkey) DO UPDATE SET
-           admin_pubkey = excluded.admin_pubkey,
-           access       = excluded.access,
-           relays       = excluded.relays`,
+           admin_pubkey      = excluded.admin_pubkey,
+           access            = excluded.access,
+           relays            = excluded.relays,
+           guidance          = excluded.guidance,
+           retention_seconds = excluded.retention_seconds,
+           status            = 'active'`,
       )
       .run(
         sub.agent_id, sub.channel_pubkey.toLowerCase(), sub.admin_pubkey.toLowerCase(),
-        sub.access, JSON.stringify(sub.relays), sub.joined_at ?? Date.now(),
+        sub.access, JSON.stringify(sub.relays),
+        sub.guidance ?? "", sub.retention_seconds ?? 7 * 24 * 60 * 60,
+        sub.joined_at ?? Date.now(),
       );
   }
 
   get(agentId: string, channelPubkeyHex: string): ChannelSubscription | null {
     const row = this.#db
       .prepare(
-        `SELECT agent_id, channel_pubkey, admin_pubkey, access, relays, delivered_through, processed_through, status
+        `SELECT agent_id, channel_pubkey, admin_pubkey, access, relays, moniker, guidance, retention_seconds, delivered_through, processed_through, status
            FROM channel_subscriptions WHERE agent_id = ? AND channel_pubkey = ?`,
       )
       .get(agentId, channelPubkeyHex.toLowerCase()) as Row | undefined;
@@ -124,7 +172,7 @@ export class ChannelSubscriptionStore {
   active(): ChannelSubscription[] {
     const rows = this.#db
       .prepare(
-        `SELECT agent_id, channel_pubkey, admin_pubkey, access, relays, delivered_through, processed_through, status
+        `SELECT agent_id, channel_pubkey, admin_pubkey, access, relays, moniker, guidance, retention_seconds, delivered_through, processed_through, status
            FROM channel_subscriptions WHERE status = 'active' ORDER BY channel_pubkey ASC, agent_id ASC`,
       )
       .all() as Row[];
@@ -156,6 +204,121 @@ export class ChannelSubscriptionStore {
     });
   }
 
+  /**
+   * Move the AGENT's position — how far it has actually READ.
+   *
+   * ⚠️ **A LOWER VALUE THROWS RATHER THAN BEING IGNORED.** Silently refusing would leave a caller
+   * that computed a wrong position believing it had been applied, and this number is not
+   * recoverable from anywhere else: moving it back re-delivers messages the operator already saw,
+   * and moving it forward by mistake skips messages they never did. Equal is a no-op, not an error.
+   */
+  advanceProcessed(agentId: string, channelPubkeyHex: string, seq: number): void {
+    const current = this.get(agentId, channelPubkeyHex);
+    if (!current) {
+      throw new ChannelSubscriptionError("subscription_unknown", `no subscription for ${channelPubkeyHex.slice(0, 16)}`);
+    }
+    if (seq < current.processed_through) {
+      throw new ChannelSubscriptionError(
+        "position_regression",
+        `processed_through is ${String(current.processed_through)}; refusing to move it back to ${String(seq)}`,
+      );
+    }
+    if (seq === current.processed_through) return;
+    // ⚠️ TOUCHES ONE COLUMN. A read must never move `delivered_through`, or the collector's next
+    // pass would start past posts it has not fetched and they would never arrive.
+    this.#db
+      .prepare(`UPDATE channel_subscriptions SET processed_through = ? WHERE agent_id = ? AND channel_pubkey = ?`)
+      .run(seq, agentId, channelPubkeyHex.toLowerCase());
+  }
+
+  /**
+   * Store a group key for one generation.
+   *
+   * ⚠️ **IDEMPOTENT, because a re-key can be delivered twice** — the admin retries an undelivered
+   * one, and a member that already has it must not end up with two rows or a replaced key.
+   */
+  addKey(agentId: string, channelPubkeyHex: string, gk: { generation: number; key: Uint8Array }, receivedAt: number): void {
+    this.#db
+      .prepare(
+        `INSERT INTO channel_subscription_keys (agent_id, channel_pubkey, generation, key, received_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (agent_id, channel_pubkey, generation) DO NOTHING`,
+      )
+      .run(agentId, channelPubkeyHex.toLowerCase(), gk.generation, Buffer.from(gk.key), receivedAt);
+    // The GENERATION may be logged; the key may not, ever.
+    this.#logger.info("channel.key.stored", {
+      agent_id: agentId, channel_pubkey: channelPubkeyHex, generation: gk.generation,
+    });
+  }
+
+  /**
+   * Every group key this subscriber holds, newest generation first.
+   *
+   * ⚠️ **OLD GENERATIONS ARE NEVER DELETED.** A re-key does not make yesterday's posts unreadable —
+   * they are still encrypted under the old key and still in the relay's queue — so dropping it
+   * would turn the channel's own history into `unknown_generation` for its own members.
+   */
+  keysFor(agentId: string, channelPubkeyHex: string): Array<{ generation: number; key: Uint8Array }> {
+    const rows = this.#db
+      .prepare(
+        `SELECT generation, key FROM channel_subscription_keys
+          WHERE agent_id = ? AND channel_pubkey = ? ORDER BY generation DESC`,
+      )
+      .all(agentId, channelPubkeyHex.toLowerCase()) as Array<{ generation: number | bigint; key: Uint8Array }>;
+    return rows.map((r) => ({ generation: Number(r.generation), key: new Uint8Array(r.key) }));
+  }
+
+  /**
+   * The subscriber's OWN decision to stop following. Purely local: nothing is sent, nothing is asked
+   * of the publisher, and `active()` stops returning it so the collector stops fetching.
+   */
+  markLeft(agentId: string, channelPubkeyHex: string): void {
+    this.#setStatus(agentId, channelPubkeyHex, "left");
+  }
+
+  /**
+   * The PUBLISHER's decision. Distinct from `left` on purpose: one the subscriber chose and can undo
+   * by rejoining, the other they cannot, and an operator asking why a channel went quiet needs to
+   * see which of the two happened.
+   */
+  markEjected(agentId: string, channelPubkeyHex: string): void {
+    this.#setStatus(agentId, channelPubkeyHex, "ejected");
+  }
+
+  #setStatus(agentId: string, channelPubkeyHex: string, status: "active" | "left" | "ejected"): void {
+    const changed = this.#db
+      .prepare(`UPDATE channel_subscriptions SET status = ? WHERE agent_id = ? AND channel_pubkey = ?`)
+      .run(status, agentId, channelPubkeyHex.toLowerCase());
+    if (Number(changed.changes) === 0) {
+      throw new ChannelSubscriptionError("subscription_unknown", `no subscription for ${channelPubkeyHex.slice(0, 16)}`);
+    }
+    this.#logger.info("channel.subscription.status_changed", {
+      agent_id: agentId, channel_pubkey: channelPubkeyHex, status,
+    });
+  }
+
+  /** A local display label. The pubkey is the identity and naming it changes nothing. */
+  setMoniker(agentId: string, channelPubkeyHex: string, moniker: string): void {
+    this.#db
+      .prepare(`UPDATE channel_subscriptions SET moniker = ? WHERE agent_id = ? AND channel_pubkey = ?`)
+      .run(moniker, agentId, channelPubkeyHex.toLowerCase());
+  }
+
+  /**
+   * Is this pubkey a channel this agent subscribes to?
+   *
+   * ⚠️ **TRUE FOR `left` AND `ejected` TOO, and that is deliberate.** The one caller is the
+   * inbound-session gate: a channel never opens a session, so one arriving from a pubkey we know to
+   * be a channel is worth refusing on. Unsubscribing does not stop it being a channel, and
+   * answering false here would reopen the hole the moment somebody left.
+   */
+  isSubscribedChannel(agentId: string, pubkeyHex: string): boolean {
+    const row = this.#db
+      .prepare(`SELECT 1 AS hit FROM channel_subscriptions WHERE agent_id = ? AND channel_pubkey = ?`)
+      .get(agentId, pubkeyHex.toLowerCase()) as { hit: number } | undefined;
+    return row !== undefined;
+  }
+
   #toSubscription(row: Row): ChannelSubscription {
     let relays: string[] = [];
     try {
@@ -172,6 +335,9 @@ export class ChannelSubscriptionStore {
       admin_pubkey: row.admin_pubkey,
       access: row.access as ChannelAccess,
       relays,
+      moniker: row.moniker,
+      guidance: row.guidance,
+      retention_seconds: Number(row.retention_seconds),
       delivered_through: Number(row.delivered_through),
       processed_through: Number(row.processed_through),
       status: row.status as "active" | "left" | "ejected",

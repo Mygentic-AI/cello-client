@@ -23,13 +23,15 @@
  */
 import { Encoder, decode } from "cbor-x";
 import * as lp from "it-length-prefixed";
-import { InMemoryKeyProvider } from "@cello-protocol/crypto";
+import { InMemoryKeyProvider, verify } from "@cello-protocol/crypto";
 import { createNode } from "@cello-protocol/transport";
 import {
   decodeBroadcastArtifact,
   encodeRelayPostReceipt,
   signRelayPostReceipt,
   verifyBroadcastArtifact,
+  buildChannelFetchKeyTbs,
+  buildChannelFetchAuthTbs,
 } from "@cello-protocol/protocol-types";
 import type { Stream } from "@libp2p/interface";
 import { extractErrorMessage } from "../../error-message.js";
@@ -52,6 +54,12 @@ async function main(): Promise<void> {
 
   /** channelHex → seq → { post, receipt } */
   const queues = new Map<string, Map<number, { post: Uint8Array; receipt: Uint8Array }>>();
+  /**
+   * M16 019 — channelHex → the fetch PUBLIC key this relay will serve that channel's queue to.
+   * Absent means the channel is public and anyone may read it; present means only a caller who can
+   * sign with it may, which is what an ejection's re-key takes away.
+   */
+  const fetchKeys = new Map<string, Uint8Array>();
 
   const node = await createNode({ listenAddresses: ["/ip4/127.0.0.1/tcp/0"], keyProvider: relayKey });
   await node.start();
@@ -98,6 +106,28 @@ async function main(): Promise<void> {
         // A re-deposit is a no-op answered with the receipt already signed — what a refill runs on.
         return { type: "channel_deposit_ok", receipt_cbor: held.receipt, seq: post.seq };
       }
+      /**
+       * M16 019 — THE FETCH KEY RIDES THE DEPOSIT, and accepting it is what lets this fixture prove
+       * an ejected member is refused AT THE RELAY rather than merely unable to decrypt.
+       *
+       * ⚠️ Verified against the CHANNEL key, exactly as the real relay does. The post's signature
+       * does not cover this field, so an unverified rotation would let anyone who had read one post
+       * replay it with their own key attached and take the channel over.
+       */
+      const rawKey = frame["fetch_key"];
+      if (rawKey !== undefined && rawKey !== null) {
+        const k = rawKey as Record<string, unknown>;
+        const pubkey = k["pubkey"];
+        const signature = k["signature"];
+        const timeMs = k["time_ms"];
+        if (!(pubkey instanceof Uint8Array) || !(signature instanceof Uint8Array) || typeof timeMs !== "number") {
+          return { type: "channel_deposit_rejected", reason: "bad_post" };
+        }
+        const ok = verify(post.channel_pubkey, buildChannelFetchKeyTbs(post.channel_pubkey, pubkey, timeMs), signature);
+        if (!ok) return { type: "channel_deposit_rejected", reason: "signature_invalid" };
+        fetchKeys.set(channelHex, pubkey);
+      }
+
       const receipt = encodeRelayPostReceipt(await signRelayPostReceipt(relayKey, post, Date.now()));
       queue.set(post.seq, { post: postCbor, receipt });
       return { type: "channel_deposit_ok", receipt_cbor: receipt, seq: post.seq };
@@ -109,6 +139,25 @@ async function main(): Promise<void> {
       if (!(channelPubkey instanceof Uint8Array) || typeof sinceSeq !== "number") {
         return { type: "channel_fetch_rejected", reason: "bad_frame" };
       }
+      /**
+       * ⚠️ **THE GATE AN EJECTION RELIES ON.** Once a channel has a fetch key, this relay serves its
+       * queue only to a caller who can sign with it. An ejected member holds the OLD generation's
+       * key, so their signature no longer verifies and they are turned away here — before any
+       * ciphertext leaves, which is the difference between "cannot read it" and "cannot have it".
+       */
+      const channelHexForFetch = Buffer.from(channelPubkey).toString("hex");
+      const required = fetchKeys.get(channelHexForFetch);
+      if (required) {
+        const auth = frame["auth"] as Record<string, unknown> | undefined;
+        const sig = auth?.["signature"];
+        const authTime = auth?.["time_ms"];
+        if (!(sig instanceof Uint8Array) || typeof authTime !== "number") {
+          return { type: "channel_fetch_rejected", reason: "not_a_member" };
+        }
+        const ok = verify(required, buildChannelFetchAuthTbs(channelPubkey, sinceSeq, authTime), sig);
+        if (!ok) return { type: "channel_fetch_rejected", reason: "not_a_member" };
+      }
+
       const queue = queues.get(Buffer.from(channelPubkey).toString("hex")) ?? new Map();
       const seqs = [...queue.keys()].sort((a, b) => a - b);
       const posts = seqs.filter((s) => s >= sinceSeq).map((s) => ({

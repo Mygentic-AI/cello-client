@@ -909,6 +909,20 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       ) => { consumed: boolean; kind?: string })
     | null = null;
   /**
+   * M16 019 — the channel join exchange's hook. Null until `setOnChannelJoinFrame` is called, and a
+   * daemon without it behaves exactly as before: join frames would fall through to conversation,
+   * which is visible in a transcript rather than silent.
+   */
+  #onChannelJoinFrame:
+    | ((
+        agentName: string,
+        sessionId: string,
+        content: Uint8Array,
+        senderPubkey: string,
+        correlationId?: string,
+      ) => { consumed: boolean })
+    | null = null;
+  /**
    * DOD-DOC-SCREEN-CLASSIFY-1: the classify-only half of the hook above — is this a document
    * frame, deciding nothing else. Injected together with it so the two cannot disagree about what
    * a document frame is. Null means every frame takes the full inbound screen, exactly as before
@@ -1268,6 +1282,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       get onParkFailed() { return mgr.#onParkFailed; },
       get onContentArrived() { return mgr.#onContentArrived; },
       get onDocumentFrame() { return mgr.#onDocumentFrame; },
+      get onChannelJoinFrame() { return mgr.#onChannelJoinFrame; },
       get isDocumentFrame() { return mgr.#isDocumentFrame; },
       get onAwaitingPersisted() { return mgr.#onAwaitingPersisted; },
       get inboundFrameObserver() { return mgr.#inboundFrameObserver; },
@@ -1752,6 +1767,19 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
   ): void {
     this.#onDocumentFrame = cb;
     this.#isDocumentFrame = classifyOnly ?? null;
+  }
+
+  /** M16 019: route channel join frames. Its own hook — see the field's note. */
+  setOnChannelJoinFrame(
+    cb: (
+      agentName: string,
+      sessionId: string,
+      content: Uint8Array,
+      senderPubkey: string,
+      correlationId?: string,
+    ) => { consumed: boolean },
+  ): void {
+    this.#onChannelJoinFrame = cb;
   }
 
   /**

@@ -62,6 +62,8 @@ interface Harness {
   channelHex: string;
   relayKeys: Map<string, InMemoryKeyProvider>;
   deposits: Seen[];
+  /** The full deposit FRAME each relay received, so a test can assert what rode along with a post. */
+  depositFrames: Array<{ post_cbor: Uint8Array; fetch_key?: { pubkey: Uint8Array; time_ms: number; signature: Uint8Array } }>;
   logStateAtDeposit: boolean[];
   held: Map<string, Set<number>>;
   /** Relays that refuse, and with what. */
@@ -76,7 +78,7 @@ interface Harness {
   pruneCalls: Array<{ relay: string; throughSeq: number; signature: Uint8Array }>;
 }
 
-async function harness(opts: { access?: "public" | "open" } = {}): Promise<Harness> {
+async function harness(opts: { access?: "public" | "open"; noFetchKey?: boolean } = {}): Promise<Harness> {
   const log = new ChannelLogStore(db, silent);
   const channelKp = generateKeypair();
   const adminKp = generateKeypair();
@@ -86,6 +88,7 @@ async function harness(opts: { access?: "public" | "open" } = {}): Promise<Harne
     [RELAY_B, generateKeypair()],
   ]);
   const deposits: Seen[] = [];
+  const depositFrames: Array<{ post_cbor: Uint8Array; fetch_key?: { pubkey: Uint8Array; time_ms: number; signature: Uint8Array } }> = [];
   /** For each deposit, whether the log already held the post when the relay was called. */
   const logStateAtDeposit: boolean[] = [];
   /** What each relay actually holds, so `relayHead` can answer truthfully. */
@@ -111,6 +114,7 @@ async function harness(opts: { access?: "public" | "open" } = {}): Promise<Harne
     }
     if (down.has(relay)) throw new Error(`relay ${relay} is unreachable`);
     deposits.push({ relay, postCbor: req.post_cbor });
+    depositFrames.push(req);
     const refusal = refuse.get(relay);
     if (refusal) {
       refuse.delete(relay); // refuse once, so a retry can be observed succeeding
@@ -156,6 +160,15 @@ async function harness(opts: { access?: "public" | "open" } = {}): Promise<Harne
     prune,
     // No waiting in tests. Production paces refills under the relay's rate limit.
     resendPaceMs: 0,
+    /**
+     * M16 019: a non-public channel refuses to publish without one, because a deposit with no fetch
+     * key leaves the relay serving the queue to anyone. `opts.noFetchKey` drives that refusal.
+     */
+    currentFetchKey: () => Promise.resolve(opts.noFetchKey === true ? undefined : {
+      pubkey: new Uint8Array(Buffer.alloc(32, 0x5f)),
+      time_ms: clock.now,
+      signature: new Uint8Array(Buffer.alloc(64, 0x60)),
+    }),
     logger: silent,
     log,
     now: () => clock.now,
@@ -196,7 +209,7 @@ async function harness(opts: { access?: "public" | "open" } = {}): Promise<Harne
   const publisher = new ChannelPublisher(options);
 
   return {
-    publisher, options, log, channelKp, adminKp, channelHex, relayKeys, deposits, logStateAtDeposit,
+    publisher, options, log, channelKp, adminKp, channelHex, relayKeys, deposits, depositFrames, logStateAtDeposit,
     held, refuse, down, screen, clock, infoHeld, pruneCalls,
   };
 }
@@ -361,6 +374,48 @@ describe("M16 018-PUBCOLLECT: publishing", () => {
     expect(Buffer.from(pubPost.body).toString("utf-8")).toBe("public words");
   });
 
+  it("7c. a non-public channel with NO FETCH KEY refuses to publish rather than depositing ungated", async () => {
+    const h = await harness({ access: "open", noFetchKey: true });
+
+    const result = await h.publisher.publish("agent-1", h.channelHex, "nobody may read this", "body");
+    /**
+     * ⚠️ **A DEPOSIT WITHOUT A FETCH KEY LEAVES THE RELAY SERVING THE QUEUE TO ANYONE.** An `access`
+     * of open or invite_only with a world-readable queue is worse than not publishing: the operator
+     * believes the channel is gated and it is not. The absent key means no group key has been minted
+     * — nobody has joined yet — which is a state to name, not to paper over.
+     */
+    expect(result.ok ? "published" : result.reason).toBe("key_unavailable");
+    expect(h.deposits, "nothing reached a relay").toEqual([]);
+
+    // A PUBLIC channel is unaffected: it has no fetch key by design and anyone may read it.
+    const pub = await harness({ access: "public", noFetchKey: true });
+    const published = await pub.publisher.publish("agent-1", pub.channelHex, "open to all", "body");
+    expect(published.ok).toBe(true);
+  });
+
+  it("14. the deposit FRAME carries the fetch key — the thing that locks an ejected member out", async () => {
+    const h = await harness({ access: "open" });
+    await h.publisher.publish("agent-1", h.channelHex, "gated", "body");
+
+    /**
+     * ⚠️ **ASSERTED ON THE FRAME, because that is the only place it matters.** A publisher that
+     * rotated the group key and did not put the derived fetch key on the deposit would pass every
+     * decryption test ever written while leaving an ejected member able to pull the whole queue —
+     * learning the channel's size, cadence and timing. Order test 14.
+     */
+    expect(h.depositFrames).toHaveLength(2);
+    for (const frame of h.depositFrames) {
+      expect(frame.fetch_key, "every deposit carries it, so a re-key reaches the relays at once").toBeDefined();
+      expect(frame.fetch_key?.pubkey.length).toBe(32);
+      expect(frame.fetch_key?.signature.length).toBe(64);
+    }
+
+    // A PUBLIC channel carries none: anyone may read it, so there is nothing to gate on.
+    const pub = await harness({ access: "public" });
+    await pub.publisher.publish("agent-1", pub.channelHex, "open", "body");
+    expect(pub.depositFrames.every((f) => f.fetch_key === undefined)).toBe(true);
+  });
+
   it("7b. with NO group key — production today — a non-public channel FAILS CLOSED", async () => {
     /**
      * ⚠️ **THE SEAM THE DAEMON ACTUALLY WIRES, not the test's stand-in.** 019 owns the group key, so
@@ -381,10 +436,15 @@ describe("M16 018-PUBCOLLECT: publishing", () => {
       "channel_group_key_unavailable",
     );
     expect(h.deposits, "nothing reached a relay").toEqual([]);
-    // The channel was never even opened in the log: the refusal happens before a number is taken.
-    let thrown: unknown;
-    try { h.log.head(h.channelHex); } catch (err) { thrown = err; }
-    expect(thrown, "no position was burned on a post that was never made").toBeDefined();
+    /**
+     * ⚠️ NO POST NUMBER WAS CONSUMED. The channel's row now exists — the position is taken before
+     * encryption, because the body's associated data binds the position — but `nextPosition` still
+     * answers 1, so the next real post takes the number this one did not. Burning a number here
+     * would leave a permanent hole that every subscriber reads as a missing post and tries to
+     * repair, for ever.
+     */
+    expect(h.log.nextPosition(h.channelHex).seq, "the number is still there to be used").toBe(1);
+    expect(h.log.head(h.channelHex)).toEqual({ first_seq: null, last_seq: null, pruned_through: 0 });
   });
 
   it("8. resendMissing deposits only what a relay has NOT receipted, oldest first", async () => {

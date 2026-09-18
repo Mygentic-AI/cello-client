@@ -28,6 +28,21 @@ export const CHANNEL_CONFIG_CREATE_SQL = `
     relays             TEXT    NOT NULL,
     guidance           TEXT    NOT NULL DEFAULT '',
     retention_seconds  INTEGER NOT NULL DEFAULT ${String(DEFAULT_RETENTION_SECONDS)},
+    -- ─── M16 019-MEMBERSHIP: one table, not two ───────────────────────────────────────────────
+    -- 019 first added a channel_settings table duplicating four of these columns, and wired NO
+    -- writer to it — so every membership read came back empty and every join was refused on a
+    -- channel the daemon genuinely administered. Two tables for one fact, with the live path
+    -- reading the empty one. Collapsed here while the database is still empty, which makes it a
+    -- schema edit rather than a migration.
+    --
+    -- Whether members can see each other. A publisher's decision about its own channel.
+    members_visible    INTEGER NOT NULL DEFAULT 0,
+    -- 0 means NO KEY HAS EVER BEEN ISSUED. The first join mints generation 1; each ejection
+    -- advances it, and that number is what every body and every fetch key is bound to.
+    key_generation     INTEGER NOT NULL DEFAULT 0,
+    -- The AGENT that admits members and answers join requests. Distinct from the channel key: the
+    -- channel signs posts and never converses, the admin holds the sessions. Empty until set.
+    admin_pubkey       TEXT    NOT NULL DEFAULT '',
     updated_at         INTEGER NOT NULL
   );
 `;
@@ -37,6 +52,9 @@ export interface ChannelConfig {
   relays: string[];
   guidance: string;
   retention_seconds: number;
+  members_visible?: boolean;
+  /** The agent that answers join requests. NOT the channel key — see the column comment. */
+  admin_pubkey?: string;
 }
 
 export class ChannelConfigStore {
@@ -51,9 +69,15 @@ export class ChannelConfigStore {
 
   get(channelHex: string): ChannelConfig | null {
     const row = this.#db
-      .prepare(`SELECT access, relays, guidance, retention_seconds FROM channel_config WHERE channel_pubkey = ?`)
+      .prepare(
+        `SELECT access, relays, guidance, retention_seconds, members_visible, admin_pubkey
+           FROM channel_config WHERE channel_pubkey = ?`,
+      )
       .get(channelHex.toLowerCase()) as
-      | { access: string; relays: string; guidance: string; retention_seconds: number | bigint }
+      | {
+          access: string; relays: string; guidance: string; retention_seconds: number | bigint;
+          members_visible: number | bigint; admin_pubkey: string;
+        }
       | undefined;
     if (!row) return null;
 
@@ -72,21 +96,28 @@ export class ChannelConfigStore {
       relays,
       guidance: row.guidance,
       retention_seconds: Number(row.retention_seconds),
+      members_visible: Number(row.members_visible) === 1,
+      admin_pubkey: row.admin_pubkey,
     };
   }
 
   set(channelHex: string, config: ChannelConfig, now: number): void {
     this.#db
       .prepare(
-        `INSERT INTO channel_config (channel_pubkey, access, relays, guidance, retention_seconds, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)
+        // ⚠️ `key_generation` is NOT in the update list, and must never be: it is advanced only by an
+        // ejection, and letting a settings edit touch it would silently re-key or un-re-key a channel.
+        `INSERT INTO channel_config
+           (channel_pubkey, access, relays, guidance, retention_seconds, members_visible, admin_pubkey, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (channel_pubkey) DO UPDATE SET
            access = excluded.access, relays = excluded.relays, guidance = excluded.guidance,
-           retention_seconds = excluded.retention_seconds, updated_at = excluded.updated_at`,
+           retention_seconds = excluded.retention_seconds, members_visible = excluded.members_visible,
+           admin_pubkey = excluded.admin_pubkey, updated_at = excluded.updated_at`,
       )
       .run(
         channelHex.toLowerCase(), config.access, JSON.stringify(config.relays),
-        config.guidance, config.retention_seconds, now,
+        config.guidance, config.retention_seconds,
+        config.members_visible === true ? 1 : 0, config.admin_pubkey ?? "", now,
       );
     this.#logger.info("channel.config.set", {
       channel_pubkey: channelHex, access: config.access, relays: config.relays.length,
