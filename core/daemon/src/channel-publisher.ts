@@ -53,6 +53,12 @@ export interface ChannelPublisherOptions {
   logger: Logger;
   log: ChannelLogStore;
   deposit: RelayDepositSeam;
+  /**
+   * Where a relay's queue begins and ends. Optional: without it `resendMissing` re-sends everything
+   * logged, which is correct but chattier. See the note at its use for why a RECEIPT is not the
+   * right question to ask.
+   */
+  relayHead?: (relay: string, channelHex: string) => Promise<{ first_held_seq: number | null; last_seq: number | null }>;
   screenOutbound: (bytes: Uint8Array, ctx: { agentName: string; correlationId?: string }) => Promise<ScreenVerdict>;
   getChannelKey: (channelHex: string) => KeyProvider | null;
   getAgentKey: (agentName: string) => KeyProvider | null;
@@ -242,11 +248,41 @@ export class ChannelPublisher {
     const head = log.head(channelHex);
     if (head.first_seq === null || head.last_seq === null) return { deposited: 0 };
 
+    /**
+     * ⚠️ WHAT THE RELAY HOLDS NOW, NOT WHAT IT ONCE RECEIPTED — and this is a deviation from the
+     * order, raised there.
+     *
+     * The order says to deposit "every logged post that relay has not receipted". But a receipt
+     * proves the relay TOOK the post once, not that it still has it — and the case the same sentence
+     * names, "refills a relay that lost content", is precisely a relay whose receipts are all in the
+     * log and whose queue is empty. Skipping on receipts refills nothing, which the enforcer caught:
+     * a restarted relay got 3 posts back out of 6.
+     *
+     * So the relay is asked where its queue begins and ends, and anything outside that is sent. When
+     * it cannot be asked, every logged post is sent — a repeat is a no-op the relay answers with the
+     * receipt it already signed, so the cost of over-sending is bandwidth and the cost of
+     * under-sending is a relay permanently missing posts.
+     */
+    let holds: { first: number; last: number } | null = null;
+    if (this.#opts.relayHead) {
+      try {
+        const reported = await this.#opts.relayHead(relay, channelHex);
+        if (reported.first_held_seq !== null && reported.last_seq !== null) {
+          holds = { first: reported.first_held_seq, last: reported.last_seq };
+        }
+      } catch (err: unknown) {
+        logger.warn("channel.resend.head_unavailable", {
+          channel_pubkey: channelHex, relay, reason: extract(err),
+          impact: "every logged post is re-sent; a repeat is a no-op at the relay",
+        });
+      }
+    }
+
     let deposited = 0;
     // Oldest first: a relay's queue only accepts the next number, so any other order stalls at the
     // first gap and refills nothing after it.
     for (const post of log.readRange(channelHex, head.first_seq, head.last_seq)) {
-      if (this.#hasReceiptFrom(channelHex, post.seq, relay)) continue;
+      if (holds !== null && post.seq >= holds.first && post.seq <= holds.last) continue;
       const outcome = await this.#depositWithRetry(relay, post, channelHex, correlationId);
       if (outcome.ok) deposited += 1;
     }
@@ -315,16 +351,19 @@ export class ChannelPublisher {
    * successful deposit after a restart relearns the key. 019, which records the relay set properly,
    * is where this stops being inferred.
    */
-  #hasReceiptFrom(channelHex: string, seq: number, relay: string): boolean {
-    const relayPubkeyHex = this.#relayKeys.get(relay);
-    if (relayPubkeyHex === undefined) return false;
-    return this.#opts.log
-      .receiptsFor(channelHex, seq)
-      .some((r) => Buffer.from(r.relay_pubkey).toString("hex") === relayPubkeyHex);
-  }
-
-  /** address → relay pubkey, learned from the receipts this process has accepted. */
+  /**
+   * address → relay pubkey, learned from the receipts this process has accepted.
+   *
+   * Kept because it is what lets an operator surface say WHICH relay signed a post's receipt; the
+   * resend no longer consults it, for the reason recorded there — a receipt says a relay took a
+   * post once, not that it still holds it.
+   */
   readonly #relayKeys = new Map<string, string>();
+
+  /** The relay key observed at an address, or null if this process has not seen one answer yet. */
+  relayKeyAt(relay: string): string | null {
+    return this.#relayKeys.get(relay) ?? null;
+  }
 }
 
 function extract(err: unknown): string {
