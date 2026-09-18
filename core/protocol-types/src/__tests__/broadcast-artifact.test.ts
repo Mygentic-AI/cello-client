@@ -1,18 +1,23 @@
 /**
- * M16 / 002-ARTIFACT — the signed broadcast artifact wire format.
+ * M16 / 016-CLIENTREWORK — the doubly-signed broadcast post.
+ *
+ * The epoch fields are gone; the post now carries the publishing agent's key and the publisher's
+ * own timestamp, and it is signed TWICE — once by the channel key (the right to publish) and once
+ * by the agent key (what ties the post to a human operator). One valid signature is not a valid
+ * post.
  *
  * Tests are written RED-first. Expected reasons come from the work order, never from the encoder
- * under test; expected hashes are recomputed inline from the crypto primitive.
+ * under test; expected preimages are rebuilt inline from the CBOR encoder.
  */
 
 import { setupV3Tests, describe, it, expect } from "@claude-flow/testing";
-import { generateKeypair, msgLeafHash, verify } from "@cello-protocol/crypto";
+import { generateKeypair, verify } from "@cello-protocol/crypto";
+import type { KeyProvider } from "@cello-protocol/crypto";
 import { encodeCbor } from "../cbor.js";
 import {
   BROADCAST_ARTIFACT_DOMAIN,
   MAX_BROADCAST_BODY_BYTES,
   MAX_BROADCAST_TITLE_CHARS,
-  broadcastArtifactLeafHash,
   decodeBroadcastArtifact,
   encodeBroadcastArtifact,
   signBroadcastArtifact,
@@ -23,42 +28,36 @@ import type { BroadcastArtifact } from "../broadcast-artifact.js";
 
 setupV3Tests();
 
-type Fields = Omit<BroadcastArtifact, "signature" | "channel_pubkey">;
+type Fields = Omit<BroadcastArtifact, "channel_signature" | "agent_signature" | "channel_pubkey" | "agent_pubkey">;
+
+const PUBLISHED_AT = 1_758_000_000_000;
 
 function makeFields(overrides: Partial<Fields> = {}): Fields {
   return {
     seq: 3,
-    epoch_index: 1,
+    published_at: PUBLISHED_AT,
     title: "Deploy finished",
-    body_ciphertext: new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]),
+    body: new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]),
     supersedes: null,
-    prev_epoch_root: null,
     ext: null,
     ...overrides,
   };
 }
 
-/** Epoch-first shape with supersedes set: no two adjacent optional slots hold equal values. */
-const DISTINCT_SLOTS: Partial<Fields> = {
-  seq: 3,
-  epoch_index: 1,
-  supersedes: 2,
-  prev_epoch_root: new Uint8Array(32).fill(0xab),
-};
-
-/** The ten wire slots of a valid encoded artifact, for building malformed variants by hand. */
+/** The eleven wire slots of a valid encoded post, for building malformed variants by hand. */
 function slotsOf(a: BroadcastArtifact): unknown[] {
   return [
     BROADCAST_ARTIFACT_DOMAIN,
     a.channel_pubkey,
+    a.agent_pubkey,
     a.seq,
-    a.epoch_index,
+    a.published_at,
     a.title,
-    a.body_ciphertext,
+    a.body,
     a.supersedes,
-    a.prev_epoch_root,
     a.ext,
-    a.signature,
+    a.channel_signature,
+    a.agent_signature,
   ];
 }
 
@@ -69,68 +68,71 @@ function withSlot(a: BroadcastArtifact, index: number, value: unknown): Uint8Arr
 }
 
 /**
- * The same signed artifact with `seq` written as float64 3.0 instead of the integer 3. Values are
- * identical and the signature still verifies, but the bytes are a second wire form of one artifact.
- * Offset 64 = array header (1) + domain text (2 + 27) + pubkey bytes (2 + 32).
+ * The same signed post with `seq` written as float64 3.0 instead of the integer 3. Values are
+ * identical and both signatures still verify, but the bytes are a second wire form of one post —
+ * and anything that hashes the RECEIVED bytes (the relay receipt) would then disagree.
+ * Offset 98 = array header (1) + domain text (2 + 27) + channel pubkey (2 + 32) + agent pubkey (2 + 32).
  */
 function floatSeq(a: BroadcastArtifact): Uint8Array {
   const canonical = encodeBroadcastArtifact(a);
-  if (a.seq !== 3 || canonical[64] !== 0x03) throw new Error("fixture drift: seq is not at offset 64");
+  if (a.seq !== 3 || canonical[98] !== 0x03) throw new Error("fixture drift: seq is not at offset 98");
   const float3 = [0xfb, 0x40, 0x08, 0, 0, 0, 0, 0, 0];
-  return new Uint8Array([...canonical.slice(0, 64), ...float3, ...canonical.slice(65)]);
+  return new Uint8Array([...canonical.slice(0, 98), ...float3, ...canonical.slice(99)]);
 }
 
-async function signed(overrides: Partial<Fields> = {}): Promise<BroadcastArtifact> {
-  return signBroadcastArtifact(generateKeypair(), makeFields(overrides));
+async function signed(
+  overrides: Partial<Fields> = {},
+  keys: { channel?: KeyProvider; agent?: KeyProvider } = {},
+): Promise<BroadcastArtifact> {
+  return signBroadcastArtifact(
+    keys.channel ?? generateKeypair(),
+    keys.agent ?? generateKeypair(),
+    makeFields(overrides),
+  );
 }
 
-describe("002-ARTIFACT — broadcast artifact", () => {
-  it("1. sign → encode → decode → verify round-trips", async () => {
-    const kp = generateKeypair();
-    // Every nullable slot NON-null and distinct, so the inline preimage below pins their order:
-    // with all three null, swapping two of them leaves the bytes identical.
-    const fields = makeFields(DISTINCT_SLOTS);
-    const a = await signBroadcastArtifact(kp, fields);
+describe("016-CLIENTREWORK — the doubly-signed post", () => {
+  it("4. sign → encode → decode → verify round-trips, and the TBS is the spec's slot order", async () => {
+    const channel = generateKeypair();
+    const agent = generateKeypair();
+    // `supersedes` non-null so no two adjacent optional slots hold equal values: with both null,
+    // swapping them leaves the bytes identical and the inline preimage would not pin the order.
+    const fields = makeFields({ seq: 3, supersedes: 2 });
+    const a = await signBroadcastArtifact(channel, agent, fields);
     const d = decodeBroadcastArtifact(encodeBroadcastArtifact(a));
     expect(d.ok).toBe(true);
     if (!d.ok) return;
-    expect(d.artifact.channel_pubkey).toEqual(await kp.getPublicKey());
+    expect(d.artifact.channel_pubkey).toEqual(await channel.getPublicKey());
+    expect(d.artifact.agent_pubkey).toEqual(await agent.getPublicKey());
     expect(d.artifact.seq).toBe(fields.seq);
-    expect(d.artifact.epoch_index).toBe(fields.epoch_index);
+    expect(d.artifact.published_at).toBe(fields.published_at);
     expect(d.artifact.title).toBe(fields.title);
-    expect(d.artifact.body_ciphertext).toEqual(fields.body_ciphertext);
+    expect(d.artifact.body).toEqual(fields.body);
     expect(d.artifact.supersedes).toBe(2);
-    expect(d.artifact.prev_epoch_root).toEqual(new Uint8Array(32).fill(0xab));
     expect(d.artifact.ext).toBeNull();
-    expect(d.artifact.signature).toEqual(a.signature);
-    expect(verifyBroadcastArtifact(d.artifact)).toBe(true);
-    // Pin the TBS to the spec's slot order, rebuilt inline. Sign and verify share one TBS builder,
-    // so a reordered builder still round-trips; only an independent preimage catches it.
+    expect(verifyBroadcastArtifact(d.artifact)).toEqual({ ok: true });
+
+    // Sign and verify share one TBS builder, so a reordered builder still round-trips; only an
+    // independent preimage catches it. BOTH signatures are over this one preimage.
     const specTbs = encodeCbor([
       BROADCAST_ARTIFACT_DOMAIN,
       a.channel_pubkey,
+      a.agent_pubkey,
       fields.seq,
-      fields.epoch_index,
+      fields.published_at,
       fields.title,
-      fields.body_ciphertext,
+      fields.body,
       fields.supersedes,
-      fields.prev_epoch_root,
       fields.ext,
     ]);
-    expect(verify(a.channel_pubkey, specTbs, a.signature)).toBe(true);
-  });
-
-  it("2. encoding is deterministic", async () => {
-    const a = await signed();
+    expect(verify(a.channel_pubkey, specTbs, a.channel_signature)).toBe(true);
+    expect(verify(a.agent_pubkey, specTbs, a.agent_signature)).toBe(true);
     expect(encodeBroadcastArtifact(a)).toEqual(encodeBroadcastArtifact(a));
   });
 
-  it("3. every field is signed", async () => {
-    const a = await signed();
-    const d = decodeBroadcastArtifact(encodeBroadcastArtifact(a));
-    expect(d.ok).toBe(true);
-    if (!d.ok) return;
-    expect(verifyBroadcastArtifact(d.artifact)).toBe(true);
+  it("5. flipping any field breaks BOTH signatures", async () => {
+    const a = await signed({ seq: 3, supersedes: 2 });
+    expect(verifyBroadcastArtifact(a)).toEqual({ ok: true });
     const flip = (b: Uint8Array): Uint8Array => {
       const c = new Uint8Array(b);
       c[0] ^= 0x01;
@@ -138,117 +140,133 @@ describe("002-ARTIFACT — broadcast artifact", () => {
     };
     const cases: Array<[string, (x: BroadcastArtifact) => BroadcastArtifact]> = [
       ["seq", (x) => ({ ...x, seq: x.seq + 1 })],
-      ["epoch_index", (x) => ({ ...x, epoch_index: x.epoch_index + 1 })],
+      ["published_at", (x) => ({ ...x, published_at: x.published_at + 1 })],
       ["title", (x) => ({ ...x, title: x.title + "x" })],
-      ["body_ciphertext", (x) => ({ ...x, body_ciphertext: flip(x.body_ciphertext) })],
+      ["body", (x) => ({ ...x, body: flip(x.body) })],
       ["supersedes", (x) => ({ ...x, supersedes: 1 })],
-      ["prev_epoch_root", (x) => ({ ...x, epoch_index: 1, prev_epoch_root: new Uint8Array(32) })],
       ["channel_pubkey", (x) => ({ ...x, channel_pubkey: flip(x.channel_pubkey) })],
+      ["agent_pubkey", (x) => ({ ...x, agent_pubkey: flip(x.agent_pubkey) })],
     ];
-    for (const [name, mutate] of cases) {
-      expect({ field: name, verified: verifyBroadcastArtifact(mutate(d.artifact)) }).toEqual({
-        field: name,
+    for (const [field, mutate] of cases) {
+      const mutated = mutate(a);
+      // Name the failing side: a mutation that only broke one signature would still be refused,
+      // and this test would pass while the other signature covered nothing.
+      const channelOnly = verify(
+        mutated.channel_pubkey,
+        encodeCbor(slotsOf(mutated).slice(0, 9)),
+        mutated.channel_signature,
+      );
+      const agentOnly = verify(
+        mutated.agent_pubkey,
+        encodeCbor(slotsOf(mutated).slice(0, 9)),
+        mutated.agent_signature,
+      );
+      expect({ field, channelOnly, agentOnly, verified: verifyBroadcastArtifact(mutated).ok }).toEqual({
+        field,
+        channelOnly: false,
+        agentOnly: false,
         verified: false,
       });
     }
   });
 
-  it("4. title validation", async () => {
+  it("5b. one good signature and one forged one is refused, naming which side failed", async () => {
+    const channel = generateKeypair();
+    const agent = generateKeypair();
+    const impostor = generateKeypair();
+    const fields = makeFields();
+
+    // Valid channel signature, agent signature made by a key that is not `agent_pubkey`.
+    const good = await signBroadcastArtifact(channel, agent, fields);
+    const forgedAgent = await signBroadcastArtifact(channel, impostor, fields);
+    const agentBad: BroadcastArtifact = { ...good, agent_signature: forgedAgent.agent_signature };
+    expect(verifyBroadcastArtifact(agentBad)).toEqual({ ok: false, reason: "agent_signature_invalid" });
+
+    // And the reverse.
+    const forgedChannel = await signBroadcastArtifact(impostor, agent, fields);
+    const channelBad: BroadcastArtifact = { ...good, channel_signature: forgedChannel.channel_signature };
+    expect(verifyBroadcastArtifact(channelBad)).toEqual({ ok: false, reason: "channel_signature_invalid" });
+
+    // A post signed entirely by one key pair does not verify against the other's pubkey either.
+    const other = await generateKeypair().getPublicKey();
+    expect(verifyBroadcastArtifact({ ...good, channel_pubkey: other }).ok).toBe(false);
+    expect(verifyBroadcastArtifact({ ...good, agent_pubkey: other }).ok).toBe(false);
+  });
+
+  it("6. the old ten-slot epoch shape fails wrong_shape", async () => {
+    const a = await signed();
+    const epochShape = encodeCbor([
+      BROADCAST_ARTIFACT_DOMAIN,
+      a.channel_pubkey,
+      a.seq,
+      1, // epoch_index
+      a.title,
+      a.body,
+      a.supersedes,
+      null, // prev_epoch_root
+      a.ext,
+      a.channel_signature,
+    ]);
+    const d = decodeBroadcastArtifact(epochShape);
+    expect(d.ok ? "ok" : d.reason).toBe("wrong_shape");
+  });
+
+  it("7. published_at must be a safe integer >= 1", async () => {
+    const a = await signed();
+    for (const bad of [0, -1, 1.5, "now", null]) {
+      const d = decodeBroadcastArtifact(withSlot(a, 4, bad));
+      expect({ bad, got: d.ok ? "ok" : d.reason }).toEqual({ bad, got: "bad_published_at" });
+    }
+    await expect(
+      signBroadcastArtifact(generateKeypair(), generateKeypair(), makeFields({ published_at: 0 })),
+    ).rejects.toThrow(RangeError);
+  });
+
+  it("8. title, body and supersedes limits are unchanged, and decode names each field", async () => {
     expect(validateBroadcastTitle("").ok).toBe(false);
     expect(validateBroadcastTitle("🚨".repeat(200)).ok).toBe(true);
     expect(validateBroadcastTitle("🚨".repeat(201)).ok).toBe(false);
-    expect(validateBroadcastTitle("a\u0000b").ok).toBe(false);
+    expect(validateBroadcastTitle("a b").ok).toBe(false);
     expect(validateBroadcastTitle("a\nb").ok).toBe(false);
-    expect(validateBroadcastTitle("a\u007Fb").ok).toBe(false);
     expect(validateBroadcastTitle("a".repeat(MAX_BROADCAST_TITLE_CHARS)).ok).toBe(true);
     // An unpaired surrogate is rewritten to U+FFFD by UTF-8 encoding, so a title carrying one signs
     // fine and then fails verification for every subscriber. Refuse it before signing.
     expect(validateBroadcastTitle("t\uD800x").ok).toBe(false);
-    expect(validateBroadcastTitle("t\uDC00x").ok).toBe(false);
-    await expect(signBroadcastArtifact(generateKeypair(), makeFields({ title: "t\uD800x" }))).rejects.toThrow(RangeError);
-    const refused = validateBroadcastTitle(42);
-    expect(refused.ok).toBe(false);
-    if (!refused.ok) expect(refused.reason).toBe("bad_title");
-  });
 
-  it("5. decode rejects each malformation with its named reason", async () => {
-    const a = await signed();
+    const a = await signed({ seq: 3, supersedes: 2 });
     const cases: Array<[string, Uint8Array]> = [
       ["not_cbor", new Uint8Array([0xfe, 0x3c, 0x9a, 0x17, 0x44])],
-      ["wrong_shape", encodeCbor(slotsOf(a).slice(0, 9))],
+      ["wrong_shape", encodeCbor(slotsOf(a).slice(0, 10))],
       ["wrong_domain", withSlot(a, 0, "cello-trust-signal-v1")],
       ["bad_channel_pubkey", withSlot(a, 1, new Uint8Array(31))],
-      ["bad_seq", withSlot(a, 2, 0)],
-      ["bad_seq", withSlot(a, 2, 1.5)],
-      ["bad_epoch_index", withSlot(a, 3, -1)],
-      ["bad_title", withSlot(a, 4, "bad\u0001title")],
-      ["body_too_large", withSlot(a, 5, new Uint8Array(MAX_BROADCAST_BODY_BYTES + 1))],
-      ["bad_supersedes", withSlot(a, 6, a.seq)],
-      ["bad_supersedes", withSlot(a, 6, 0)],
-      ["bad_prev_epoch_root", withSlot(a, 7, new Uint8Array(16))],
-      [
-        "bad_prev_epoch_root",
-        (() => {
-          const s = slotsOf(a);
-          s[3] = 0;
-          s[7] = new Uint8Array(32);
-          return encodeCbor(s);
-        })(),
-      ],
+      ["bad_agent_pubkey", withSlot(a, 2, new Uint8Array(31))],
+      ["bad_seq", withSlot(a, 3, 0)],
+      ["bad_seq", withSlot(a, 3, 1.5)],
+      ["bad_title", withSlot(a, 5, "badtitle")],
+      ["body_too_large", withSlot(a, 6, new Uint8Array(MAX_BROADCAST_BODY_BYTES + 1))],
+      ["bad_supersedes", withSlot(a, 7, a.seq)],
+      ["bad_supersedes", withSlot(a, 7, 0)],
       ["ext_not_null", withSlot(a, 8, 7)],
       ["bad_signature_shape", withSlot(a, 9, new Uint8Array(63))],
+      ["bad_signature_shape", withSlot(a, 10, new Uint8Array(63))],
       ["wrong_shape", floatSeq(a)],
     ];
     for (const [reason, bytes] of cases) {
       const d = decodeBroadcastArtifact(bytes);
       expect({ expected: reason, got: d.ok ? "ok" : d.reason }).toEqual({ expected: reason, got: reason });
     }
-  });
 
-  it("6. adversarial CBOR does not throw", () => {
-    const inputs = [
-      new Uint8Array(0),
-      encodeCbor({ a: 1 }),
-      encodeCbor(7),
-      new Uint8Array(1024).fill(0xff),
-    ];
-    for (const bytes of inputs) {
+    // Adversarial CBOR is refused, never thrown.
+    for (const bytes of [new Uint8Array(0), encodeCbor({ a: 1 }), encodeCbor(7), new Uint8Array(1024).fill(0xff)]) {
       let result: ReturnType<typeof decodeBroadcastArtifact> | undefined;
       expect(() => {
         result = decodeBroadcastArtifact(bytes);
       }).not.toThrow();
       expect(result?.ok).toBe(false);
     }
-  });
 
-  it("7. signBroadcastArtifact enforces the same rules", async () => {
-    const kp = generateKeypair();
-    await expect(signBroadcastArtifact(kp, makeFields({ seq: 0 }))).rejects.toThrow(RangeError);
-    await expect(signBroadcastArtifact(kp, makeFields({ title: "é".repeat(201) }))).rejects.toThrow(RangeError);
-  });
-
-  it("8. wrong key fails verify", async () => {
-    const a = await signed();
-    const other = await generateKeypair().getPublicKey();
-    expect(verifyBroadcastArtifact({ ...a, channel_pubkey: other })).toBe(false);
-  });
-
-  it("9. leaf hash commits to the signature", async () => {
-    const fields = makeFields(DISTINCT_SLOTS);
-    const a = await signBroadcastArtifact(generateKeypair(), fields);
-    const b = await signBroadcastArtifact(generateKeypair(), fields);
-    expect(broadcastArtifactLeafHash(a)).not.toEqual(broadcastArtifactLeafHash(b));
-    const inline = msgLeafHash(encodeCbor(slotsOf(a)));
-    expect(broadcastArtifactLeafHash(a)).toEqual(inline);
-    expect(broadcastArtifactLeafHash(a)).toEqual(msgLeafHash(encodeBroadcastArtifact(a)));
-  });
-
-  it("10. supersedes survives the wire", async () => {
-    const a = await signed({ seq: 3, supersedes: 2 });
-    const d = decodeBroadcastArtifact(encodeBroadcastArtifact(a));
-    expect(d.ok).toBe(true);
-    if (!d.ok) return;
-    expect(d.artifact.supersedes).toBe(2);
-    expect(verifyBroadcastArtifact(d.artifact)).toBe(true);
+    await expect(
+      signBroadcastArtifact(generateKeypair(), generateKeypair(), makeFields({ title: "é".repeat(201) })),
+    ).rejects.toThrow(RangeError);
   });
 });

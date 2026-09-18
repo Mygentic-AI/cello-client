@@ -1,74 +1,74 @@
 /**
- * ChannelLogStore — M16 007-PUBLOG.
+ * ChannelLogStore — M16 016-CLIENTREWORK.
  *
- * A broadcast channel publishes a signed artifact once and it is delivered many times. The publisher
+ * A broadcast channel publishes a signed post once and it is delivered many times. The publisher
  * keeps ONE append-only log of everything it published, not one per subscriber, and that log is the
- * durable copy: when a relay loses content, subscribers repair from it. So:
+ * durable copy: when a relay loses content, it is refilled from here. Beside each post sit the
+ * relays' signed receipts — the publisher's proof of what it sent and when each relay took it. So:
  *
- *   - ROWS ARE IMMUTABLE. INSERT OR IGNORE at (channel_pubkey, seq); nothing rewrites a published
- *     artifact. A log that could be edited would make a consistency proof over it worthless.
- *   - THE STORE NEVER DECIDES A POSITION. The seq and epoch are inside the artifact's signature, so
- *     `nextPosition` reports what the next append must carry, the publisher signs that, and `append`
- *     checks it. A wrong position throws its own code; nothing is auto-corrected.
- *   - THE LOG ROW AND THE EPOCH STATE CHANGE IN ONE TRANSACTION, or `next_seq` could drift from the
- *     rows forever after a crash.
+ *   - ROWS ARE IMMUTABLE. Nothing rewrites a published post. The only deletion is `pruneThrough`,
+ *     and it only ever removes from the OLDEST end, because a hole in the middle is indistinguishable
+ *     to a subscriber from a post it has not received yet.
+ *   - THE STORE NEVER DECIDES A POSITION. The number is inside both signatures, so `nextPosition`
+ *     reports what the next append must carry, the publisher signs that, and `append` checks it. A
+ *     wrong position throws its own code; nothing is auto-corrected.
+ *   - A RECEIPT IS VERIFIED BEFORE IT IS STORED, against the post it names as this log holds it. An
+ *     unverified receipt is worthless as proof, and storing one would only be discovered at the
+ *     moment it was needed.
  *
  * Keyed on the channel's pubkey — the daemon's own channel identity — never on an agent name.
  */
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
 import { extractErrorMessage } from "./error-message.js";
-import { buildMerkleTree, merkleRoot } from "@cello-protocol/crypto";
-import { encodeBroadcastArtifact, decodeBroadcastArtifact, broadcastArtifactLeafHash } from "@cello-protocol/protocol-types";
-import type { BroadcastArtifact } from "@cello-protocol/protocol-types";
-
-/** Protocol maximum leaves per epoch (008-EPOCH). Lives here because `append` enforces it. */
-export const EPOCH_MAX_LEAVES = 1000;
+import {
+  encodeBroadcastArtifact,
+  decodeBroadcastArtifact,
+  verifyBroadcastArtifact,
+  encodeRelayPostReceipt,
+  decodeRelayPostReceipt,
+  verifyRelayPostReceipt,
+} from "@cello-protocol/protocol-types";
+import type { BroadcastArtifact, RelayPostReceipt } from "@cello-protocol/protocol-types";
 
 export const CHANNEL_LOG_CREATE_SQL = `
+  -- \`post_cbor\` is AUTHORITATIVE: every read path decodes it. \`published_at\` and \`title\` are lifted
+  -- out of the signed bytes so a digest or an index query does not have to decode every row, and a
+  -- reader that needs certainty must still go through \`post_cbor\`.
   CREATE TABLE IF NOT EXISTS channel_log (
     channel_pubkey   TEXT    NOT NULL,
     seq              INTEGER NOT NULL,
-    epoch_index      INTEGER NOT NULL,
-    leaf_hash        BLOB    NOT NULL,
-    artifact_cbor    BLOB    NOT NULL,
-    title            TEXT    NOT NULL,
     published_at     INTEGER NOT NULL,
+    title            TEXT    NOT NULL,
+    post_cbor        BLOB    NOT NULL,
     PRIMARY KEY (channel_pubkey, seq)
   );
-  CREATE TABLE IF NOT EXISTS channel_epoch_state (
-    channel_pubkey        TEXT    NOT NULL PRIMARY KEY,
-    open_epoch_index      INTEGER NOT NULL,
-    open_epoch_first_seq  INTEGER NOT NULL,
-    open_epoch_opened_at  INTEGER NOT NULL,
-    prev_epoch_root       BLOB,
-    next_seq              INTEGER NOT NULL,
-    -- M16 008-EPOCH: this channel's epoch cap. Defaults are the protocol maxima (24h, 1,000 leaves);
-    -- a channel may only shorten them, which the sealer enforces.
-    max_age_ms            INTEGER NOT NULL DEFAULT 86400000,
-    max_leaves            INTEGER NOT NULL DEFAULT 1000
+  CREATE TABLE IF NOT EXISTS channel_log_receipts (
+    channel_pubkey   TEXT    NOT NULL,
+    seq              INTEGER NOT NULL,
+    relay_pubkey     TEXT    NOT NULL,
+    received_at      INTEGER NOT NULL,
+    receipt_cbor     BLOB    NOT NULL,
+    PRIMARY KEY (channel_pubkey, seq, relay_pubkey)
+  );
+  CREATE TABLE IF NOT EXISTS channel_state (
+    channel_pubkey   TEXT    NOT NULL PRIMARY KEY,
+    next_seq         INTEGER NOT NULL,
+    pruned_through   INTEGER NOT NULL DEFAULT 0
   );
 `;
 
-export interface AppendResult {
-  seq: number;
-  epoch_index: number;
-  leaf_index: number;
-  epoch_root: Uint8Array;
-  leaf_count: number;
-}
-
 export type ChannelLogErrorCode =
-  | "channel_unknown" | "seq_not_next" | "epoch_mismatch" | "prev_root_mismatch"
-  | "position_taken" | "artifact_invalid"
-  // append: the open epoch already holds its leaf cap; it must be sealed before the next publish.
-  | "epoch_full"
-  // closeEpoch: the root being sealed is not the open epoch's current root (a publish landed while
-  // the seal was being signed, the epoch was already closed, or it is empty).
-  | "epoch_changed"
-  // closeEpoch: the sealed root is not 32 bytes, which would wedge every later append.
-  | "sealed_root_invalid"
-  // readRange: a stored row no longer decodes, or no longer matches its own leaf hash.
+  | "channel_unknown" | "seq_not_next" | "position_taken" | "post_invalid"
+  // recordReceipt: the receipt does not verify against the post this log holds at that number, or
+  // there is no such post.
+  | "receipt_invalid"
+  // recordReceipt: the post was pruned. The receipt may be perfectly good; this log no longer holds
+  // the bytes to check it against, and that is a different fact from a bad receipt.
+  | "post_pruned"
+  // pruneThrough: asked to prune below what has already been pruned.
+  | "prune_regression"
+  // readRange: a stored row no longer decodes, or no longer carries valid signatures.
   | "log_row_corrupt";
 
 export class ChannelLogError extends Error {
@@ -81,23 +81,20 @@ export class ChannelLogError extends Error {
 }
 
 interface StateRow {
-  open_epoch_index: number | bigint;
-  open_epoch_first_seq: number | bigint;
-  open_epoch_opened_at: number | bigint;
-  prev_epoch_root: Uint8Array | null;
   next_seq: number | bigint;
-  max_leaves: number | bigint;
+  pruned_through: number | bigint;
 }
 
-const toBytes = (v: unknown): Uint8Array | null =>
-  v === null || v === undefined ? null : new Uint8Array(v as Uint8Array);
-
-function bytesEqual(a: Uint8Array | null, b: Uint8Array | null): boolean {
-  if (a === null || b === null) return a === b;
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-  return true;
+export interface ChannelHead {
+  /** Oldest post still held, or null when the log holds none. */
+  first_seq: number | null;
+  /** Newest post held, or null when the log holds none. */
+  last_seq: number | null;
+  /** Everything at or below this number was pruned. NOT the same as `first_seq`. */
+  pruned_through: number;
 }
+
+const hexOf = (b: Uint8Array): string => Buffer.from(b).toString("hex");
 
 export class ChannelLogStore {
   readonly #db: DaemonDatabase;
@@ -109,204 +106,274 @@ export class ChannelLogStore {
     this.#db.exec(CHANNEL_LOG_CREATE_SQL);
   }
 
-  /** M16 008-EPOCH: the channel's declared epoch cap, as stored. The sealer validates it against the maxima. */
-  epochPolicy(channelPubkeyHex: string): { maxAgeMs: number; maxLeaves: number } {
-    this.#state(channelPubkeyHex);
-    const row = this.#db
-      .prepare(`SELECT max_age_ms, max_leaves FROM channel_epoch_state WHERE channel_pubkey = ?`)
-      .get(channelPubkeyHex) as { max_age_ms: number | bigint; max_leaves: number | bigint };
-    return { maxAgeMs: Number(row.max_age_ms), maxLeaves: Number(row.max_leaves) };
-  }
-
-  /** Idempotent: creates the state row {epoch 0, first_seq 0, opened_at 0, prev NULL, next_seq 1}. */
+  /** Idempotent: creates the state row {next_seq 1, pruned_through 0}. */
   ensureChannel(channelPubkeyHex: string): void {
     this.#db
-      .prepare(
-        `INSERT OR IGNORE INTO channel_epoch_state
-           (channel_pubkey, open_epoch_index, open_epoch_first_seq, open_epoch_opened_at, prev_epoch_root, next_seq)
-         VALUES (?, 0, 0, 0, NULL, 1)`,
-      )
+      .prepare(`INSERT OR IGNORE INTO channel_state (channel_pubkey, next_seq, pruned_through) VALUES (?, 1, 0)`)
       .run(channelPubkeyHex);
   }
 
-  /** What the NEXT append will be assigned — the publisher signs with these before appending. */
-  nextPosition(channelPubkeyHex: string): {
-    seq: number; epoch_index: number; prev_epoch_root: Uint8Array | null; first_in_epoch: boolean;
-  } {
-    const s = this.#state(channelPubkeyHex);
-    return {
-      seq: Number(s.next_seq),
-      epoch_index: Number(s.open_epoch_index),
-      prev_epoch_root: toBytes(s.prev_epoch_root),
-      first_in_epoch: Number(s.open_epoch_first_seq) === 0,
-    };
+  /** What the NEXT append will be assigned — the publisher signs with this before appending. */
+  nextPosition(channelPubkeyHex: string): { seq: number } {
+    return { seq: Number(this.#state(channelPubkeyHex).next_seq) };
   }
 
-  /** Append an already-signed artifact. Throws ChannelLogError — never silently skips. */
-  append(channelPubkeyHex: string, artifact: BroadcastArtifact, publishedAtMs: number, correlationId?: string): AppendResult {
+  /** Append an already-signed post. Throws ChannelLogError — never silently skips. */
+  append(channelPubkeyHex: string, post: BroadcastArtifact, correlationId?: string): { seq: number } {
     this.#state(channelPubkeyHex);
 
     this.#db.exec("BEGIN IMMEDIATE");
     try {
-      // The position checks run UNDER the write lock: a second daemon on this DB could otherwise
-      // close the epoch between the read and the insert, filing this row in an epoch already sealed.
-      const s = this.#state(channelPubkeyHex);
-      const nextSeq = Number(s.next_seq);
-      const openEpoch = Number(s.open_epoch_index);
-      const firstInEpoch = Number(s.open_epoch_first_seq) === 0;
-      if (artifact.seq !== nextSeq) {
-        throw new ChannelLogError("seq_not_next", `artifact seq ${artifact.seq}, next is ${nextSeq}`);
+      // The position check runs UNDER the write lock: a second daemon on this DB could otherwise
+      // append between the read and the insert, and both posts would claim one number.
+      const nextSeq = Number(this.#state(channelPubkeyHex).next_seq);
+      if (post.seq !== nextSeq) {
+        throw new ChannelLogError("seq_not_next", `post seq ${post.seq}, next is ${nextSeq}`);
       }
-      if (artifact.epoch_index !== openEpoch) {
-        throw new ChannelLogError("epoch_mismatch", `artifact epoch ${artifact.epoch_index}, open epoch is ${openEpoch}`);
-      }
-      // The leaf cap holds HERE, not only at the once-a-minute tick, or a burst inside one minute
-      // seals as one oversized epoch. A stored cap never lifts the protocol maximum.
-      const storedCap = Number(s.max_leaves);
-      const leafCap = Number.isSafeInteger(storedCap) && storedCap >= 1 && storedCap <= EPOCH_MAX_LEAVES ? storedCap : EPOCH_MAX_LEAVES;
-      const openLeaves = firstInEpoch ? 0 : nextSeq - Number(s.open_epoch_first_seq);
-      if (openLeaves >= leafCap) {
-        throw new ChannelLogError("epoch_full", `the open epoch holds ${openLeaves} leaves (cap ${leafCap}); seal it before publishing again`);
-      }
-      if (firstInEpoch) {
-        if (!bytesEqual(artifact.prev_epoch_root, toBytes(s.prev_epoch_root))) {
-          throw new ChannelLogError("prev_root_mismatch", "the first artifact of an epoch must carry the previous epoch's sealed root");
-        }
-      } else if (artifact.prev_epoch_root !== null) {
-        throw new ChannelLogError("prev_root_mismatch", "only the first artifact of an epoch carries prev_epoch_root");
-      }
-      // Never trust the in-memory object: it must survive its own wire encoding.
+      // Never trust the in-memory object: it must survive its own wire encoding, and it must carry
+      // both valid signatures — an unsigned post in the log is one a subscriber would reject.
       let cbor: Uint8Array;
       try {
-        cbor = encodeBroadcastArtifact(artifact);
+        cbor = encodeBroadcastArtifact(post);
       } catch (err) {
-        throw new ChannelLogError("artifact_invalid", extractErrorMessage(err));
+        throw new ChannelLogError("post_invalid", extractErrorMessage(err));
       }
       const decoded = decodeBroadcastArtifact(cbor);
       if (!decoded.ok) {
-        throw new ChannelLogError("artifact_invalid", `${decoded.reason}: ${decoded.detail}`);
+        throw new ChannelLogError("post_invalid", `${decoded.reason}: ${decoded.detail}`);
       }
-      const leafHash = broadcastArtifactLeafHash(decoded.artifact);
+      const verdict = verifyBroadcastArtifact(decoded.artifact);
+      if (!verdict.ok) {
+        throw new ChannelLogError("post_invalid", verdict.reason);
+      }
+      // Verification proves the post was signed by the keys it NAMES — it says nothing about which
+      // channel's log it was handed to. Without this, a post signed by channel A files cleanly under
+      // channel B: every check passes, and B's relay is later refilled with A's posts, which every
+      // subscriber of B rejects for a key mismatch with nothing in B's log saying why.
+      if (hexOf(post.channel_pubkey) !== channelPubkeyHex) {
+        throw new ChannelLogError(
+          "post_invalid",
+          `the post is signed by channel ${hexOf(post.channel_pubkey).slice(0, 16)}, not ${channelPubkeyHex.slice(0, 16)}`,
+        );
+      }
       const inserted = this.#db
         .prepare(
-          `INSERT OR IGNORE INTO channel_log
-             (channel_pubkey, seq, epoch_index, leaf_hash, artifact_cbor, title, published_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT OR IGNORE INTO channel_log (channel_pubkey, seq, published_at, title, post_cbor)
+           VALUES (?, ?, ?, ?, ?)`,
         )
-        .run(channelPubkeyHex, artifact.seq, artifact.epoch_index, Buffer.from(leafHash), Buffer.from(cbor), artifact.title, publishedAtMs);
+        .run(channelPubkeyHex, post.seq, post.published_at, post.title, Buffer.from(cbor));
       if (Number(inserted.changes) === 0) {
-        throw new ChannelLogError("position_taken", `seq ${artifact.seq} is already in this channel's log`);
+        throw new ChannelLogError("position_taken", `seq ${post.seq} is already in this channel's log`);
       }
-      this.#db
-        .prepare(
-          firstInEpoch
-            ? `UPDATE channel_epoch_state SET next_seq = ?, open_epoch_first_seq = ?, open_epoch_opened_at = ? WHERE channel_pubkey = ?`
-            : `UPDATE channel_epoch_state SET next_seq = ? WHERE channel_pubkey = ?`,
-        )
-        .run(...(firstInEpoch
-          ? [nextSeq + 1, artifact.seq, publishedAtMs, channelPubkeyHex]
-          : [nextSeq + 1, channelPubkeyHex]));
+      this.#db.prepare(`UPDATE channel_state SET next_seq = ? WHERE channel_pubkey = ?`).run(nextSeq + 1, channelPubkeyHex);
       this.#db.exec("COMMIT");
     } catch (err) {
-      try {
-        this.#db.exec("ROLLBACK");
-      } catch (rollbackErr) {
-        // Usually harmless: the failing statement already ended the transaction. If it did not, the
-        // handle is still inside one, and the next append fails naming the wrong cause — so say so.
-        this.#logger.warn("channel.log.rollback_failed", {
-          channel_pubkey: channelPubkeyHex,
-          error: extractErrorMessage(rollbackErr),
-          original_error: extractErrorMessage(err),
-        });
-      }
+      this.#rollback(channelPubkeyHex, err);
       throw err;
     }
 
-    const { root, leaf_count } = this.openEpochRoot(channelPubkeyHex);
-    this.#logger.info("channel.artifact.appended", {
+    this.#logger.info("channel.post.appended", {
       ...(correlationId !== undefined ? { correlationId } : {}),
       channel_pubkey: channelPubkeyHex,
-      seq: artifact.seq,
-      epoch_index: artifact.epoch_index,
-      leaf_count,
+      seq: post.seq,
+      published_at: post.published_at,
     });
-    return { seq: artifact.seq, epoch_index: artifact.epoch_index, leaf_index: leaf_count - 1, epoch_root: root, leaf_count };
-  }
-
-  /** Leaf hashes of the open epoch in seq order; [] when the epoch has no leaves. */
-  openEpochLeafHashes(channelPubkeyHex: string): Uint8Array[] {
-    const s = this.#state(channelPubkeyHex);
-    const rows = this.#db
-      .prepare(`SELECT leaf_hash FROM channel_log WHERE channel_pubkey = ? AND epoch_index = ? ORDER BY seq ASC`)
-      .all(channelPubkeyHex, Number(s.open_epoch_index)) as Array<{ leaf_hash: Uint8Array }>;
-    return rows.map((r) => new Uint8Array(r.leaf_hash));
-  }
-
-  /** Merkle root over openEpochLeafHashes. `leaf_count` 0 means an empty epoch — never seal it. */
-  openEpochRoot(channelPubkeyHex: string): { root: Uint8Array; leaf_count: number; first_seq: number; opened_at: number } {
-    const s = this.#state(channelPubkeyHex);
-    const leaves = this.openEpochLeafHashes(channelPubkeyHex);
-    return {
-      root: merkleRoot(buildMerkleTree(leaves.map((data) => ({ kind: "hash" as const, data })))),
-      leaf_count: leaves.length,
-      first_seq: Number(s.open_epoch_first_seq),
-      opened_at: Number(s.open_epoch_opened_at),
-    };
-  }
-
-  /** Range read for repair and for verification. Inclusive, seq order. */
-  readRange(channelPubkeyHex: string, fromSeq: number, toSeq: number): BroadcastArtifact[] {
-    this.#state(channelPubkeyHex);
-    const rows = this.#db
-      .prepare(`SELECT seq, leaf_hash, artifact_cbor FROM channel_log WHERE channel_pubkey = ? AND seq BETWEEN ? AND ? ORDER BY seq ASC`)
-      .all(channelPubkeyHex, fromSeq, toSeq) as Array<{ seq: number | bigint; leaf_hash: Uint8Array; artifact_cbor: Uint8Array }>;
-    return rows.map((r) => {
-      // A stored row that no longer decodes, or no longer matches the leaf hash the epoch root was
-      // built over, is corruption — never something to skip past or hand to a repairing subscriber.
-      const d = decodeBroadcastArtifact(new Uint8Array(r.artifact_cbor));
-      if (!d.ok) {
-        throw new ChannelLogError("log_row_corrupt", `stored seq ${Number(r.seq)} does not decode: ${d.reason}`);
-      }
-      if (!bytesEqual(broadcastArtifactLeafHash(d.artifact), new Uint8Array(r.leaf_hash))) {
-        throw new ChannelLogError("log_row_corrupt", `stored seq ${Number(r.seq)} does not match its leaf hash`);
-      }
-      return d.artifact;
-    });
+    return { seq: post.seq };
   }
 
   /**
-   * Called by the epoch sealer after a seal: advances to epoch+1 with prev_epoch_root = sealedRoot.
+   * Store one relay's receipt for a post this log holds. VERIFIES FIRST, against the stored post —
+   * not against whatever the caller passed alongside it — so a receipt for a different post at the
+   * same number is refused rather than filed as proof.
    *
-   * ⚠️ A COMPARE-AND-SET, not a blind advance. The seal is signed over a root read earlier; if a
-   * publish landed in between, the open epoch now holds a leaf that root does not cover, and
-   * advancing anyway would leave that artifact in an epoch no seal includes. So the close is refused
-   * unless `sealedRoot` IS the open epoch's current root over at least one leaf — which also refuses
-   * a repeated close (the next epoch is empty) and an empty one. Opens no transaction of its own,
-   * so the sealer can run it inside the transaction that records the seal.
+   * WHAT THIS DOES NOT CHECK: that `relay_pubkey` is one of the relays this channel actually
+   * publishes to. Any keypair can sign a well-formed receipt for a post it has seen. The relay set
+   * lives with the channel's info record, so that check belongs to the publisher — order 018 —
+   * which knows which two relays it deposited on; here it would have nothing to compare against.
    */
-  closeEpoch(channelPubkeyHex: string, sealedRoot: Uint8Array): void {
-    if (!(sealedRoot instanceof Uint8Array) || sealedRoot.length !== 32) {
-      throw new ChannelLogError("sealed_root_invalid", "a sealed epoch root must be 32 bytes");
+  recordReceipt(channelPubkeyHex: string, receipt: RelayPostReceipt, correlationId?: string): void {
+    const state = this.#state(channelPubkeyHex);
+    // Same binding check as `append`: the receipt names its channel inside the relay's signature, and
+    // a receipt for another channel filed here would sit in this log looking like proof.
+    if (hexOf(receipt.channel_pubkey) !== channelPubkeyHex) {
+      throw new ChannelLogError(
+        "receipt_invalid",
+        `the receipt names channel ${hexOf(receipt.channel_pubkey).slice(0, 16)}, not ${channelPubkeyHex.slice(0, 16)}`,
+      );
     }
-    const open = this.openEpochRoot(channelPubkeyHex);
-    if (open.leaf_count === 0) {
-      throw new ChannelLogError("epoch_changed", "the open epoch has no leaves: nothing was sealed over it, or it was already closed");
+    const post = this.#postAt(channelPubkeyHex, receipt.seq);
+    if (!post) {
+      // A pruned post is NOT an invalid receipt. Reporting one as the other sends an operator to
+      // debug a relay's signing key when the answer is that this log no longer holds the bytes.
+      if (receipt.seq <= Number(state.pruned_through)) {
+        throw new ChannelLogError(
+          "post_pruned",
+          `post ${receipt.seq} was pruned (pruned_through is ${Number(state.pruned_through)}); the receipt itself was not checked`,
+        );
+      }
+      throw new ChannelLogError("receipt_invalid", `no post at seq ${receipt.seq} in this channel's log`);
     }
-    if (!bytesEqual(open.root, sealedRoot)) {
-      throw new ChannelLogError("epoch_changed", `the open epoch's root no longer matches the sealed root (it now holds ${open.leaf_count} leaves)`);
+    if (!verifyRelayPostReceipt(receipt, post)) {
+      throw new ChannelLogError("receipt_invalid", `the receipt does not verify against the post at seq ${receipt.seq}`);
     }
-    this.#db
+    const cbor = encodeRelayPostReceipt(receipt);
+    const inserted = this.#db
       .prepare(
-        `UPDATE channel_epoch_state
-            SET open_epoch_index = open_epoch_index + 1, open_epoch_first_seq = 0, open_epoch_opened_at = 0, prev_epoch_root = ?
-          WHERE channel_pubkey = ?`,
+        `INSERT OR IGNORE INTO channel_log_receipts (channel_pubkey, seq, relay_pubkey, received_at, receipt_cbor)
+         VALUES (?, ?, ?, ?, ?)`,
       )
-      .run(Buffer.from(sealedRoot), channelPubkeyHex);
+      .run(channelPubkeyHex, receipt.seq, hexOf(receipt.relay_pubkey), receipt.received_at, Buffer.from(cbor));
+    if (Number(inserted.changes) === 0) {
+      // One relay, one post, one stored receipt: the row is keyed on exactly that. A REPEAT of the
+      // same receipt is a no-op and says so. A DIFFERENT one — the same relay re-acking after a
+      // reconnect with a later time — is dropped by the same statement, so reporting it as stored
+      // would put a `received_at` in the log that disagrees with the bytes actually kept.
+      const held = this.receiptsFor(channelPubkeyHex, receipt.seq).find(
+        (r) => hexOf(r.relay_pubkey) === hexOf(receipt.relay_pubkey),
+      );
+      const identical = held !== undefined && Buffer.from(encodeRelayPostReceipt(held)).equals(Buffer.from(cbor));
+      this.#logger.info("channel.receipt.duplicate", {
+        ...(correlationId !== undefined ? { correlationId } : {}),
+        channel_pubkey: channelPubkeyHex,
+        seq: receipt.seq,
+        relay_pubkey: hexOf(receipt.relay_pubkey),
+        identical,
+        held_received_at: held?.received_at ?? null,
+        offered_received_at: receipt.received_at,
+      });
+      return;
+    }
+    this.#logger.info("channel.receipt.stored", {
+      ...(correlationId !== undefined ? { correlationId } : {}),
+      channel_pubkey: channelPubkeyHex,
+      seq: receipt.seq,
+      relay_pubkey: hexOf(receipt.relay_pubkey),
+      received_at: receipt.received_at,
+    });
+  }
+
+  /** Every relay's receipt for one post, in relay order. Empty when none were stored. */
+  receiptsFor(channelPubkeyHex: string, seq: number): RelayPostReceipt[] {
+    this.#state(channelPubkeyHex);
+    const rows = this.#db
+      .prepare(`SELECT receipt_cbor FROM channel_log_receipts WHERE channel_pubkey = ? AND seq = ? ORDER BY relay_pubkey ASC`)
+      .all(channelPubkeyHex, seq) as Array<{ receipt_cbor: Uint8Array }>;
+    return rows.map((r) => {
+      const d = decodeRelayPostReceipt(new Uint8Array(r.receipt_cbor));
+      if (!d.ok) {
+        throw new ChannelLogError("log_row_corrupt", `a stored receipt for seq ${seq} does not decode: ${d.reason}`);
+      }
+      return d.receipt;
+    });
+  }
+
+  /** Range read, for refilling a relay and for verification. Inclusive, seq order. */
+  readRange(channelPubkeyHex: string, fromSeq: number, toSeq: number): BroadcastArtifact[] {
+    this.#state(channelPubkeyHex);
+    const rows = this.#db
+      .prepare(`SELECT seq, post_cbor FROM channel_log WHERE channel_pubkey = ? AND seq BETWEEN ? AND ? ORDER BY seq ASC`)
+      .all(channelPubkeyHex, fromSeq, toSeq) as Array<{ seq: number | bigint; post_cbor: Uint8Array }>;
+    return rows.map((r) => this.#decodeRow(Number(r.seq), new Uint8Array(r.post_cbor)));
+  }
+
+  /**
+   * Delete every post at or below `throughSeq`, with its receipts. The OLDEST END ONLY: a prune
+   * below what is already pruned is refused rather than silently ignored, because a caller that
+   * believes it pruned something it did not would keep re-sending it.
+   */
+  pruneThrough(channelPubkeyHex: string, throughSeq: number): { pruned: number } {
+    const state = this.#state(channelPubkeyHex);
+    const prunedThrough = Number(state.pruned_through);
+    if (!Number.isSafeInteger(throughSeq) || throughSeq < 0) {
+      throw new ChannelLogError("prune_regression", "throughSeq must be a safe integer >= 0");
+    }
+    if (throughSeq < prunedThrough) {
+      throw new ChannelLogError(
+        "prune_regression",
+        `asked to prune through ${throughSeq}, but ${prunedThrough} is already pruned`,
+      );
+    }
+
+    this.#db.exec("BEGIN IMMEDIATE");
+    let pruned: number;
+    try {
+      pruned = Number(
+        this.#db.prepare(`DELETE FROM channel_log WHERE channel_pubkey = ? AND seq <= ?`).run(channelPubkeyHex, throughSeq).changes,
+      );
+      // The receipts go with the posts: they are proof about bytes that no longer exist here.
+      this.#db.prepare(`DELETE FROM channel_log_receipts WHERE channel_pubkey = ? AND seq <= ?`).run(channelPubkeyHex, throughSeq);
+      this.#db.prepare(`UPDATE channel_state SET pruned_through = ? WHERE channel_pubkey = ?`).run(throughSeq, channelPubkeyHex);
+      this.#db.exec("COMMIT");
+    } catch (err) {
+      this.#rollback(channelPubkeyHex, err);
+      throw err;
+    }
+
+    this.#logger.info("channel.log.pruned", {
+      channel_pubkey: channelPubkeyHex,
+      pruned_through: throughSeq,
+      posts_removed: pruned,
+    });
+    return { pruned };
+  }
+
+  /**
+   * What this log holds. `pruned_through` is NOT `first_seq`: posts can also be absent because the
+   * log is empty, and a caller that conflated them would report gaps that are not gaps.
+   */
+  head(channelPubkeyHex: string): ChannelHead {
+    const state = this.#state(channelPubkeyHex);
+    const row = this.#db
+      .prepare(`SELECT MIN(seq) AS first_seq, MAX(seq) AS last_seq FROM channel_log WHERE channel_pubkey = ?`)
+      .get(channelPubkeyHex) as { first_seq: number | bigint | null; last_seq: number | bigint | null };
+    return {
+      first_seq: row.first_seq === null ? null : Number(row.first_seq),
+      last_seq: row.last_seq === null ? null : Number(row.last_seq),
+      pruned_through: Number(state.pruned_through),
+    };
+  }
+
+  #postAt(channelPubkeyHex: string, seq: number): BroadcastArtifact | null {
+    const row = this.#db
+      .prepare(`SELECT post_cbor FROM channel_log WHERE channel_pubkey = ? AND seq = ?`)
+      .get(channelPubkeyHex, seq) as { post_cbor: Uint8Array } | undefined;
+    if (!row) return null;
+    return this.#decodeRow(seq, new Uint8Array(row.post_cbor));
+  }
+
+  /**
+   * A stored row that no longer decodes, or no longer carries both valid signatures, is corruption —
+   * never something to skip past or hand to a relay being refilled.
+   */
+  #decodeRow(seq: number, cbor: Uint8Array): BroadcastArtifact {
+    const d = decodeBroadcastArtifact(cbor);
+    if (!d.ok) {
+      throw new ChannelLogError("log_row_corrupt", `stored seq ${seq} does not decode: ${d.reason}`);
+    }
+    const verdict = verifyBroadcastArtifact(d.artifact);
+    if (!verdict.ok) {
+      throw new ChannelLogError("log_row_corrupt", `stored seq ${seq} no longer verifies: ${verdict.reason}`);
+    }
+    return d.artifact;
+  }
+
+  #rollback(channelPubkeyHex: string, original: unknown): void {
+    try {
+      this.#db.exec("ROLLBACK");
+    } catch (rollbackErr) {
+      // Usually harmless: the failing statement already ended the transaction. If it did not, the
+      // handle is still inside one, and the next write fails naming the wrong cause — so say so.
+      this.#logger.warn("channel.log.rollback_failed", {
+        channel_pubkey: channelPubkeyHex,
+        error: extractErrorMessage(rollbackErr),
+        original_error: extractErrorMessage(original),
+      });
+    }
   }
 
   #state(channelPubkeyHex: string): StateRow {
     const row = this.#db
-      .prepare(`SELECT open_epoch_index, open_epoch_first_seq, open_epoch_opened_at, prev_epoch_root, next_seq, max_leaves FROM channel_epoch_state WHERE channel_pubkey = ?`)
+      .prepare(`SELECT next_seq, pruned_through FROM channel_state WHERE channel_pubkey = ?`)
       .get(channelPubkeyHex) as StateRow | undefined;
     if (!row) throw new ChannelLogError("channel_unknown", `no channel log for ${channelPubkeyHex.slice(0, 16)}; call ensureChannel first`);
     return row;

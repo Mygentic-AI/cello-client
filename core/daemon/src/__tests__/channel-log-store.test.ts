@@ -1,22 +1,29 @@
 /**
- * M16 007-PUBLOG — the publisher-side channel log.
+ * M16 016-CLIENTREWORK — the publisher-side channel log, reworked for the post-epoch design.
  *
- * A channel keeps ONE append-only log of every artifact it published. It is the durable copy
- * subscribers repair from, so its rows are immutable and every position check throws its own code.
- * Real SQLCipher DB, real signatures; expected roots are recomputed inline from the crypto
- * primitives, never read back from the store.
+ * A channel keeps ONE append-only log of every post it published. It is the durable copy a relay is
+ * refilled from, so its rows are immutable: only `pruneThrough` deletes, only from the oldest end.
+ * Beside each post sit the relays' signed receipts — the publisher's proof of what it sent and when
+ * each relay took it — and a receipt is VERIFIED before it is stored, because an unverified receipt
+ * is worthless as proof.
+ *
+ * Real SQLCipher DB, real signatures. Expected values are recomputed inline from the primitives,
+ * never read back from the store.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildMerkleTree, generateKeypair, merkleRoot } from "@cello-protocol/crypto";
+import { generateKeypair } from "@cello-protocol/crypto";
 import type { InMemoryKeyProvider } from "@cello-protocol/crypto";
 import {
-  broadcastArtifactLeafHash,
+  encodeBroadcastArtifact,
   signBroadcastArtifact,
+  signRelayPostReceipt,
   verifyBroadcastArtifact,
+  verifyRelayPostReceipt,
   type BroadcastArtifact,
+  type RelayPostReceipt,
 } from "@cello-protocol/protocol-types";
 import { ChannelLogStore, ChannelLogError } from "../channel-log-store.js";
 import { openTestDb } from "./helpers/encrypted-db.js";
@@ -39,39 +46,45 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-async function channel(): Promise<{ kp: InMemoryKeyProvider; hex: string }> {
+interface Channel {
+  kp: InMemoryKeyProvider;
+  agent: InMemoryKeyProvider;
+  hex: string;
+}
+
+async function channel(): Promise<Channel> {
   const kp = generateKeypair();
+  const agent = generateKeypair();
   const hex = Buffer.from(await kp.getPublicKey()).toString("hex");
   store.ensureChannel(hex);
-  return { kp, hex };
+  return { kp, agent, hex };
 }
 
 /** Sign at exactly what nextPosition reports, with optional overrides, WITHOUT appending. */
 async function signAt(
-  kp: InMemoryKeyProvider,
-  hex: string,
-  overrides: Partial<Omit<BroadcastArtifact, "signature" | "channel_pubkey">> = {},
+  ch: Channel,
+  overrides: Partial<Omit<BroadcastArtifact, "channel_signature" | "agent_signature" | "channel_pubkey" | "agent_pubkey">> = {},
 ): Promise<BroadcastArtifact> {
-  const pos = store.nextPosition(hex);
-  return signBroadcastArtifact(kp, {
+  const pos = store.nextPosition(ch.hex);
+  return signBroadcastArtifact(ch.kp, ch.agent, {
     seq: pos.seq,
-    epoch_index: pos.epoch_index,
+    published_at: 1_789_000_000_000 + pos.seq,
     title: `post ${pos.seq}`,
-    body_ciphertext: new Uint8Array([pos.seq, 1, 2, 3]),
+    body: new Uint8Array([pos.seq, 1, 2, 3]),
     supersedes: null,
-    prev_epoch_root: pos.first_in_epoch ? pos.prev_epoch_root : null,
     ext: null,
     ...overrides,
   });
 }
 
-async function publish(kp: InMemoryKeyProvider, hex: string) {
-  const a = await signAt(kp, hex);
-  return { artifact: a, result: store.append(hex, a, 1_789_000_000_000 + a.seq) };
+async function publish(ch: Channel): Promise<BroadcastArtifact> {
+  const post = await signAt(ch);
+  store.append(ch.hex, post);
+  return post;
 }
 
-function rootOver(artifacts: BroadcastArtifact[]): Uint8Array {
-  return merkleRoot(buildMerkleTree(artifacts.map((a) => ({ kind: "hash" as const, data: broadcastArtifactLeafHash(a) }))));
+async function receipt(post: BroadcastArtifact, relay = generateKeypair(), at = 1_789_000_500_000): Promise<RelayPostReceipt> {
+  return signRelayPostReceipt(relay, post, at);
 }
 
 function expectCode(fn: () => unknown, code: string): void {
@@ -81,226 +94,212 @@ function expectCode(fn: () => unknown, code: string): void {
   expect((thrown as ChannelLogError).code).toBe(code);
 }
 
-const hex32 = (b: Uint8Array) => Buffer.from(b).toString("hex");
+const rowCount = (table: string, hex: string): number =>
+  Number((db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE channel_pubkey = ?`).get(hex) as { n: number | bigint }).n);
 
-describe("M16 007-PUBLOG: ChannelLogStore", () => {
-  it("ensureChannel is idempotent", async () => {
-    const { hex } = await channel();
-    store.ensureChannel(hex);
-    const rows = db.prepare("SELECT COUNT(*) AS n FROM channel_epoch_state WHERE channel_pubkey = ?").get(hex) as { n: number };
-    expect(Number(rows.n)).toBe(1);
-    expect(store.nextPosition(hex).seq).toBe(1);
+describe("M16 016-CLIENTREWORK: ChannelLogStore", () => {
+  it("13. the first append lands at seq 1 and reads back byte-identical", async () => {
+    const ch = await channel();
+    expect(store.nextPosition(ch.hex)).toEqual({ seq: 1 });
+    const post = await publish(ch);
+    expect(post.seq).toBe(1);
+
+    const read = store.readRange(ch.hex, 1, 10);
+    expect(read).toHaveLength(1);
+    expect(encodeBroadcastArtifact(read[0])).toEqual(encodeBroadcastArtifact(post));
+    expect(verifyBroadcastArtifact(read[0])).toEqual({ ok: true });
+    expect(store.head(ch.hex)).toEqual({ first_seq: 1, last_seq: 1, pruned_through: 0 });
+    expect(store.nextPosition(ch.hex)).toEqual({ seq: 2 });
   });
 
-  it("first append lands at seq 1 epoch 0 with a real root", async () => {
-    const { kp, hex } = await channel();
-    const { artifact, result } = await publish(kp, hex);
-    expect(result.seq).toBe(1);
-    expect(result.epoch_index).toBe(0);
-    expect(result.leaf_count).toBe(1);
-    expect(hex32(result.epoch_root)).toBe(hex32(rootOver([artifact])));
+  it("14. seq_not_next and position_taken refuse and write nothing", async () => {
+    const ch = await channel();
+    await publish(ch);
+
+    const skipped = await signAt(ch, { seq: 5 });
+    expectCode(() => store.append(ch.hex, skipped), "seq_not_next");
+
+    // A post re-signed at a position already taken: the store never overwrites a published row.
+    const taken = await signAt(ch, { seq: 1, title: "rewritten" });
+    expectCode(() => store.append(ch.hex, taken), "seq_not_next");
+
+    expect(rowCount("channel_log", ch.hex)).toBe(1);
+    expect(store.readRange(ch.hex, 1, 10)[0].title).toBe("post 1");
+
+    // And the direct collision: the position is next by state, but the row is already there.
+    db.prepare("UPDATE channel_state SET next_seq = 1 WHERE channel_pubkey = ?").run(ch.hex);
+    expectCode(() => store.append(ch.hex, taken), "position_taken");
+    expect(rowCount("channel_log", ch.hex)).toBe(1);
+
+    // An unknown channel is named, never auto-created.
+    expectCode(() => store.append("ff".repeat(32), taken), "channel_unknown");
   });
 
-  it("three appends: root equals independent recomputation over all three leaf hashes", async () => {
-    const { kp, hex } = await channel();
-    const a1 = (await publish(kp, hex)).artifact;
-    const a2 = (await publish(kp, hex)).artifact;
-    const { artifact: a3, result } = await publish(kp, hex);
-    expect(result.leaf_count).toBe(3);
-    expect(hex32(result.epoch_root)).toBe(hex32(rootOver([a1, a2, a3])));
-    expect(hex32(store.openEpochRoot(hex).root)).toBe(hex32(rootOver([a1, a2, a3])));
-  });
+  it("15. a receipt for another post is refused receipt_invalid and written nowhere", async () => {
+    const ch = await channel();
+    const first = await publish(ch);
+    const second = await publish(ch);
 
-  it("seq_not_next", async () => {
-    const { kp, hex } = await channel();
-    await publish(kp, hex);
-    const wrong = await signAt(kp, hex, { seq: 5 });
-    expectCode(() => store.append(hex, wrong, 1), "seq_not_next");
-    expect(store.nextPosition(hex).seq).toBe(2);
-    expect(store.readRange(hex, 2, 10)).toEqual([]);
-  });
+    // Signed over `second`, filed against `first`: only the hash tells them apart.
+    const wrong = await receipt(second);
+    expectCode(() => store.recordReceipt(ch.hex, { ...wrong, seq: first.seq }), "receipt_invalid");
+    expect(rowCount("channel_log_receipts", ch.hex)).toBe(0);
 
-  it("epoch_mismatch", async () => {
-    const { kp, hex } = await channel();
-    const wrong = await signAt(kp, hex, { epoch_index: 1, prev_epoch_root: new Uint8Array(32).fill(9) });
-    expectCode(() => store.append(hex, wrong, 1), "epoch_mismatch");
-  });
+    // A receipt whose own signature does not verify is refused too.
+    const good = await receipt(first);
+    const forged: RelayPostReceipt = { ...good, received_at: good.received_at + 1 };
+    expect(verifyRelayPostReceipt(forged, first)).toBe(false);
+    expectCode(() => store.recordReceipt(ch.hex, forged), "receipt_invalid");
+    expect(rowCount("channel_log_receipts", ch.hex)).toBe(0);
 
-  it("prev_root_mismatch, both directions", async () => {
-    const { kp, hex } = await channel();
-    // Built by hand: signBroadcastArtifact refuses to sign an epoch-0 artifact carrying a root, so
-    // this shape can only reach the store from a caller that skipped the signer. Check (4) runs first.
-    const carrying: BroadcastArtifact = { ...(await signAt(kp, hex)), prev_epoch_root: new Uint8Array(32).fill(7) };
-    expectCode(() => store.append(hex, carrying, 1), "prev_root_mismatch");
-
-    const root0 = (await publish(kp, hex)).result.epoch_root;
-    store.closeEpoch(hex, root0);
-    const missing = await signAt(kp, hex, { prev_epoch_root: null });
-    expectCode(() => store.append(hex, missing, 2), "prev_root_mismatch");
-    const wrongRoot = Uint8Array.from(root0);
-    wrongRoot[0] ^= 1;
-    const wrong = await signAt(kp, hex, { prev_epoch_root: wrongRoot });
-    expectCode(() => store.append(hex, wrong, 2), "prev_root_mismatch");
-    const right = await signAt(kp, hex, { prev_epoch_root: root0 });
-    expect(store.append(hex, right, 2).epoch_index).toBe(1);
-  });
-
-  it("position_taken", async () => {
-    const { kp, hex } = await channel();
-    const { artifact } = await publish(kp, hex);
-    // Rewind next_seq by hand so the only guard left is the row itself.
-    db.prepare("UPDATE channel_epoch_state SET next_seq = 1 WHERE channel_pubkey = ?").run(hex);
-    expectCode(() => store.append(hex, artifact, 2), "position_taken");
-    const n = db.prepare("SELECT COUNT(*) AS n FROM channel_log WHERE channel_pubkey = ?").get(hex) as { n: number };
-    expect(Number(n.n)).toBe(1);
-    expect(hex32(store.readRange(hex, 1, 1)[0]!.signature)).toBe(hex32(artifact.signature));
-  });
-
-  it("artifact_invalid", async () => {
-    const { kp, hex } = await channel();
-    const signed = await signAt(kp, hex);
-    const handBuilt: BroadcastArtifact = { ...signed, title: "badtitle" };
-    expectCode(() => store.append(hex, handBuilt, 1), "artifact_invalid");
-    const n = db.prepare("SELECT COUNT(*) AS n FROM channel_log").get() as { n: number };
-    expect(Number(n.n)).toBe(0);
-  });
-
-  it("closeEpoch advances state", async () => {
-    const { kp, hex } = await channel();
-    await publish(kp, hex);
-    await publish(kp, hex);
-    const { result } = await publish(kp, hex);
-    store.closeEpoch(hex, result.epoch_root);
-    const pos = store.nextPosition(hex);
-    expect(pos.epoch_index).toBe(1);
-    expect(pos.first_in_epoch).toBe(true);
-    expect(hex32(pos.prev_epoch_root!)).toBe(hex32(result.epoch_root));
-    expect(store.openEpochLeafHashes(hex)).toEqual([]);
-    expect(store.openEpochRoot(hex).leaf_count).toBe(0);
-    expect(store.readRange(hex, 1, 3).map((a) => a.seq)).toEqual([1, 2, 3]);
-  });
-
-  it("readRange returns decoded artifacts in seq order and verifies", async () => {
-    const { kp, hex } = await channel();
-    for (let i = 0; i < 4; i++) await publish(kp, hex);
-    const got = store.readRange(hex, 1, 4);
-    expect(got.map((a) => a.seq)).toEqual([1, 2, 3, 4]);
-    for (const a of got) expect(verifyBroadcastArtifact(a)).toBe(true);
-  });
-
-  it("two channels do not interfere", async () => {
-    const A = await channel();
-    const B = await channel();
-    await publish(A.kp, A.hex);
-    await publish(A.kp, A.hex);
-    expect(store.nextPosition(A.hex).seq).toBe(3);
-    expect(store.nextPosition(B.hex).seq).toBe(1);
-  });
-
-  it("an unknown channel is refused", async () => {
-    const kp = generateKeypair();
-    const hex = Buffer.from(await kp.getPublicKey()).toString("hex");
-    store.ensureChannel(hex);
-    const a = await signAt(kp, hex);
-    const other = "ab".repeat(32);
-    expectCode(() => store.append(other, a, 1), "channel_unknown");
-    expectCode(() => store.readRange(other, 1, 10), "channel_unknown");
-  });
-
-  it("first-in-epoch bookkeeping: first_seq, opened_at, and only the first leaf carries a root", async () => {
-    // Review: never updating first_seq/opened_at, or dropping the "later leaves carry no root"
-    // branch, left every other test green.
-    const { kp, hex } = await channel();
-    const root0 = (await publish(kp, hex)).result.epoch_root;
-    store.closeEpoch(hex, root0);
-    const first = await signAt(kp, hex, { prev_epoch_root: root0 });
-    store.append(hex, first, 5_000);
-    const second = await signAt(kp, hex, { prev_epoch_root: null });
-    const r2 = store.append(hex, second, 6_000);
-    expect(r2.leaf_index).toBe(1);
-    const open = store.openEpochRoot(hex);
-    expect(open.first_seq).toBe(2);
-    expect(open.opened_at).toBe(5_000);
-    // Built by hand: a later leaf carrying a root cannot be signed, but the store must refuse it.
-    const third: BroadcastArtifact = { ...(await signAt(kp, hex, { prev_epoch_root: null })), prev_epoch_root: root0 };
-    expectCode(() => store.append(hex, third, 7_000), "prev_root_mismatch");
-  });
-
-  it("the log row and the state change in one transaction", async () => {
-    // Review: removing BEGIN/COMMIT left every other test green. A state update that fails after
-    // the row is written must leave no row behind.
-    const { kp, hex } = await channel();
-    db.exec(`CREATE TRIGGER fail_state_update BEFORE UPDATE ON channel_epoch_state BEGIN SELECT RAISE(ABORT, 'simulated state write failure'); END;`);
-    const a = await signAt(kp, hex);
-    expect(() => store.append(hex, a, 1)).toThrow(/simulated state write failure/);
-    const n = db.prepare("SELECT COUNT(*) AS n FROM channel_log").get() as { n: number };
-    expect(Number(n.n)).toBe(0);
-    db.exec("DROP TRIGGER fail_state_update");
-    expect(store.append(hex, a, 1).seq, "the store is usable afterwards").toBe(1);
-  });
-
-  it("append stores title and published_at, and logs channel.artifact.appended", async () => {
-    const events: Array<{ event: string; ctx: Record<string, unknown> }> = [];
-    const recording: Logger = { debug() {}, warn() {}, error() {}, info(event, ctx) { events.push({ event, ctx: ctx ?? {} }); } };
-    const s = new ChannelLogStore(db, recording);
-    const kp = generateKeypair();
-    const hex = Buffer.from(await kp.getPublicKey()).toString("hex");
-    s.ensureChannel(hex);
-    const pos = s.nextPosition(hex);
-    const a = await signBroadcastArtifact(kp, {
-      seq: pos.seq, epoch_index: pos.epoch_index, title: "hello channel", body_ciphertext: new Uint8Array([1]),
-      supersedes: null, prev_epoch_root: null, ext: null,
+    // A receipt for a post this log does not hold names the missing post, not the signature.
+    const absent = await signBroadcastArtifact(ch.kp, ch.agent, {
+      seq: 99, published_at: 1, title: "not in the log", body: new Uint8Array([1]), supersedes: null, ext: null,
     });
-    s.append(hex, a, 42_000, "corr-1");
-    const row = db.prepare("SELECT title, published_at FROM channel_log WHERE channel_pubkey = ? AND seq = 1").get(hex) as { title: string; published_at: number };
-    expect(row.title).toBe("hello channel");
-    expect(Number(row.published_at)).toBe(42_000);
-    const ev = events.find((e) => e.event === "channel.artifact.appended");
-    expect(ev?.ctx).toMatchObject({ correlationId: "corr-1", channel_pubkey: hex, seq: 1, epoch_index: 0, leaf_count: 1 });
+    const forAbsent = await receipt(absent);
+    expectCode(() => store.recordReceipt(ch.hex, forAbsent), "receipt_invalid");
+    expect(rowCount("channel_log_receipts", ch.hex)).toBe(0);
   });
 
-  it("closeEpoch refuses a stale, repeated, empty, or malformed close", async () => {
-    // Review HIGH: a close whose root no longer matches the open epoch orphaned a published artifact
-    // in an epoch no seal covers; a repeated close skipped an epoch; an empty one sealed nothing.
-    const { kp, hex } = await channel();
-    const rootAtSigning = (await publish(kp, hex)).result.epoch_root;
-    await publish(kp, hex); // a publish lands while the seal over one leaf is being signed
-    expectCode(() => store.closeEpoch(hex, rootAtSigning), "epoch_changed");
-    expect(store.nextPosition(hex).epoch_index, "a refused close leaves the epoch open").toBe(0);
+  it("16. two relays' receipts for one post are both kept, and a repeat is a no-op", async () => {
+    const ch = await channel();
+    const post = await publish(ch);
+    const relayA = generateKeypair();
+    const relayB = generateKeypair();
+    const a = await receipt(post, relayA, 1_789_000_500_000);
+    const b = await receipt(post, relayB, 1_789_000_600_000);
 
-    expectCode(() => store.closeEpoch(hex, new Uint8Array(31)), "sealed_root_invalid");
+    store.recordReceipt(ch.hex, a);
+    store.recordReceipt(ch.hex, b);
+    store.recordReceipt(ch.hex, a); // idempotent: same relay, same post, identical bytes
 
-    const current = store.openEpochRoot(hex).root;
-    store.closeEpoch(hex, current);
-    expectCode(() => store.closeEpoch(hex, current), "epoch_changed");
-    expect(store.nextPosition(hex).epoch_index, "a repeated close does not skip an epoch").toBe(1);
+    // A DIFFERENT receipt from the SAME relay — a re-ack after a reconnect, with a later time. The
+    // row is keyed on (channel, seq, relay), so it cannot be stored; what must not happen is the
+    // store reporting it as stored, which would put a received_at in the log that disagrees with
+    // the bytes actually kept.
+    const later = await receipt(post, relayA, 1_789_000_900_000);
+    store.recordReceipt(ch.hex, later);
+    const afterRepeat = store.receiptsFor(ch.hex, post.seq)
+      .find((r) => Buffer.from(r.relay_pubkey).equals(Buffer.from(a.relay_pubkey)));
+    expect(afterRepeat?.received_at).toBe(1_789_000_500_000);
+
+    const stored = store.receiptsFor(ch.hex, post.seq);
+    expect(stored).toHaveLength(2);
+    for (const r of stored) expect(verifyRelayPostReceipt(r, post)).toBe(true);
+    expect(stored.map((r) => r.received_at).sort()).toEqual([1_789_000_500_000, 1_789_000_600_000]);
+    expect(
+      stored.map((r) => Buffer.from(r.relay_pubkey).toString("hex")).sort(),
+    ).toEqual([
+      Buffer.from(await relayA.getPublicKey()).toString("hex"),
+      Buffer.from(await relayB.getPublicKey()).toString("hex"),
+    ].sort());
   });
 
-  it("a full open epoch refuses the next append until it is sealed (epoch_full)", async () => {
-    // 008 review: the leaf cap was only checked by the once-a-minute tick, so a burst of 5,000
-    // publishes inside one minute sealed as ONE epoch. The cap has to hold at the append.
-    const { kp, hex } = await channel();
-    db.prepare("UPDATE channel_epoch_state SET max_leaves = 2 WHERE channel_pubkey = ?").run(hex);
-    await publish(kp, hex);
-    await publish(kp, hex);
-    const third = await signAt(kp, hex);
-    expectCode(() => store.append(hex, third, 1), "epoch_full");
-    expect(store.openEpochRoot(hex).leaf_count, "nothing was filed").toBe(2);
-    store.closeEpoch(hex, store.openEpochRoot(hex).root);
-    await publish(kp, hex); // the next epoch accepts again
+  it("17. readRange refuses a tampered row with log_row_corrupt", async () => {
+    const ch = await channel();
+    await publish(ch);
+    const post2 = await publish(ch);
 
-    // A stored cap above the protocol maximum does not lift the maximum.
-    const other = await channel();
-    db.prepare("UPDATE channel_epoch_state SET max_leaves = 5000 WHERE channel_pubkey = ?").run(other.hex);
-    db.prepare("UPDATE channel_epoch_state SET next_seq = 1001, open_epoch_first_seq = 1 WHERE channel_pubkey = ?").run(other.hex);
-    const over = await signAt(other.kp, other.hex);
-    expectCode(() => store.append(other.hex, over, 1), "epoch_full");
+    // Rewrite the stored bytes behind the store's back: a row that no longer decodes, or no longer
+    // carries valid signatures, is corruption — never something to skip past or hand to a relay.
+    const broken = new Uint8Array(encodeBroadcastArtifact(post2));
+    broken[broken.length - 1] ^= 0x01; // breaks the agent signature, not the CBOR shape
+    db.prepare("UPDATE channel_log SET post_cbor = ? WHERE channel_pubkey = ? AND seq = ?")
+      .run(Buffer.from(broken), ch.hex, post2.seq);
+    expectCode(() => store.readRange(ch.hex, 1, 10), "log_row_corrupt");
+
+    db.prepare("UPDATE channel_log SET post_cbor = ? WHERE channel_pubkey = ? AND seq = ?")
+      .run(Buffer.from(new Uint8Array([0xfe, 0x01])), ch.hex, post2.seq);
+    expectCode(() => store.readRange(ch.hex, 1, 10), "log_row_corrupt");
   });
 
-  it("readRange refuses a stored row that no longer matches its leaf hash", async () => {
-    const { kp, hex } = await channel();
-    await publish(kp, hex);
-    db.prepare("UPDATE channel_log SET leaf_hash = ? WHERE channel_pubkey = ? AND seq = 1").run(Buffer.alloc(32, 1), hex);
-    expectCode(() => store.readRange(hex, 1, 1), "log_row_corrupt");
+  it("18. pruneThrough deletes posts AND their receipts, and head reports the new first_seq", async () => {
+    const ch = await channel();
+    const posts: BroadcastArtifact[] = [];
+    for (let i = 0; i < 5; i++) posts.push(await publish(ch));
+    for (const p of posts) store.recordReceipt(ch.hex, await receipt(p));
+    expect(rowCount("channel_log_receipts", ch.hex)).toBe(5);
+
+    expect(store.pruneThrough(ch.hex, 3)).toEqual({ pruned: 3 });
+    expect(store.head(ch.hex)).toEqual({ first_seq: 4, last_seq: 5, pruned_through: 3 });
+    expect(store.readRange(ch.hex, 1, 10).map((p) => p.seq)).toEqual([4, 5]);
+    // The receipts of pruned posts go with them — they are proof about bytes that no longer exist.
+    expect(rowCount("channel_log_receipts", ch.hex)).toBe(2);
+    expect(store.receiptsFor(ch.hex, 1)).toEqual([]);
+    expect(store.receiptsFor(ch.hex, 4)).toHaveLength(1);
+  });
+
+  it("19. a prune below pruned_through is refused, and a repeat is a no-op", async () => {
+    const ch = await channel();
+    for (let i = 0; i < 4; i++) await publish(ch);
+    store.pruneThrough(ch.hex, 2);
+
+    expectCode(() => store.pruneThrough(ch.hex, 1), "prune_regression");
+    expect(store.head(ch.hex)).toEqual({ first_seq: 3, last_seq: 4, pruned_through: 2 });
+
+    expect(store.pruneThrough(ch.hex, 2)).toEqual({ pruned: 0 });
+    expect(store.head(ch.hex)).toEqual({ first_seq: 3, last_seq: 4, pruned_through: 2 });
+    expect(store.readRange(ch.hex, 1, 10).map((p) => p.seq)).toEqual([3, 4]);
+  });
+
+  it("20. appending continues from the same numbers after a prune", async () => {
+    const ch = await channel();
+    for (let i = 0; i < 3; i++) await publish(ch);
+    store.pruneThrough(ch.hex, 3);
+
+    // Everything is pruned, so the log is empty — but the numbering never restarts, or a later
+    // post would collide with one a subscriber already holds.
+    expect(store.head(ch.hex)).toEqual({ first_seq: null, last_seq: null, pruned_through: 3 });
+    expect(store.nextPosition(ch.hex)).toEqual({ seq: 4 });
+    const fourth = await publish(ch);
+    expect(fourth.seq).toBe(4);
+    expect(store.head(ch.hex)).toEqual({ first_seq: 4, last_seq: 4, pruned_through: 3 });
+  });
+
+  it("21. two channels do not interfere", async () => {
+    const one = await channel();
+    const two = await channel();
+    await publish(one);
+    await publish(one);
+    const post = await publish(two);
+    store.recordReceipt(two.hex, await receipt(post));
+
+    expect(store.head(one.hex)).toEqual({ first_seq: 1, last_seq: 2, pruned_through: 0 });
+    expect(store.head(two.hex)).toEqual({ first_seq: 1, last_seq: 1, pruned_through: 0 });
+    store.pruneThrough(one.hex, 2);
+    expect(store.head(two.hex)).toEqual({ first_seq: 1, last_seq: 1, pruned_through: 0 });
+    expect(store.receiptsFor(two.hex, 1)).toHaveLength(1);
+    expect(rowCount("channel_log", two.hex)).toBe(1);
+
+    // A post signed by ONE channel, filed under the OTHER. Every other check passes — the number is
+    // next, it encodes, it decodes, and both signatures verify against the keys the post NAMES — so
+    // only an explicit binding check refuses it. Without it, `two`'s relay is later refilled with
+    // `one`'s posts and every subscriber of `two` rejects them for a key mismatch.
+    const strayPos = store.nextPosition(two.hex);
+    const stray = await signBroadcastArtifact(one.kp, one.agent, {
+      seq: strayPos.seq, published_at: 1_789_000_000_001, title: "signed by the other channel",
+      body: new Uint8Array([7]), supersedes: null, ext: null,
+    });
+    expect(verifyBroadcastArtifact(stray)).toEqual({ ok: true });
+    expectCode(() => store.append(two.hex, stray), "post_invalid");
+    expect(rowCount("channel_log", two.hex)).toBe(1);
+    expect(store.nextPosition(two.hex)).toEqual(strayPos);
+
+    // And the same for a receipt that names another channel.
+    const strayReceipt = await receipt(post);
+    expectCode(
+      () => store.recordReceipt(one.hex, strayReceipt),
+      "receipt_invalid",
+    );
+
+    // A receipt for a PRUNED post is not an invalid receipt — the log simply no longer holds the
+    // bytes, and an operator told "receipt_invalid" would go and debug the relay's signing key.
+    const pruned = await receipt((await store.readRange(two.hex, 1, 1))[0]);
+    store.pruneThrough(two.hex, 1);
+    expectCode(() => store.recordReceipt(two.hex, pruned), "post_pruned");
+
+    // An unknown channel is named rather than answered with an empty log.
+    expectCode(() => store.head("ab".repeat(32)), "channel_unknown");
+    expectCode(() => store.readRange("ab".repeat(32), 1, 5), "channel_unknown");
   });
 });

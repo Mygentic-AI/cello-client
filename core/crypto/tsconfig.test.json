@@ -15,7 +15,6 @@
   "files": [
     "src/__tests__/ae-peer-auth.test.ts",
     "src/__tests__/checkpoint.test.ts",
-    "src/__tests__/consistency.test.ts",
     "src/__tests__/content-seal.test.ts",
     "src/__tests__/ed25519.test.ts",
     "src/__tests__/frost-resharing.test.ts",
