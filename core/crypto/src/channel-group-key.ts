@@ -97,7 +97,7 @@ export type BodyDecryptResult =
 
 export type GroupKeyUnwrapResult =
   | { ok: true; gk: GroupKey }
-  | { ok: false; reason: "not_for_me" | "malformed" | "wrong_channel" };
+  | { ok: false; reason: "not_for_me" | "malformed" | "wrong_channel" | "provider_failed" };
 
 /** An Ed25519 keypair derived from a group key, for authenticating fetches to the relay. */
 export interface FetchKey {
@@ -199,7 +199,13 @@ export async function unwrapGroupKey(
   try {
     opened = await myKeys.openContentSeal(bundle);
   } catch {
-    return { ok: false, reason: "not_for_me" };
+    /**
+     * ⚠️ THE PROVIDER THREW, which is not the same as "this bundle is not addressed to me". One is
+     * a defect in the key provider — a caller should look at it — and the other is the routine
+     * outcome of being handed somebody else's bundle. Collapsing them hid the first inside the
+     * second, where nothing would ever investigate it.
+     */
+    return { ok: false, reason: "provider_failed" };
   }
   if (!opened) return { ok: false, reason: "not_for_me" };
 

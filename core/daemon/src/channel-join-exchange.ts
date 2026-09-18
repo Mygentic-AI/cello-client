@@ -165,7 +165,15 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
       const channelPubkey = decoded.frame.channel_pubkey;
       const channelHex = Buffer.from(channelPubkey).toString("hex");
       const namedSubscriber = Buffer.from(decoded.frame.subscriber_pubkey).toString("hex");
-      logger.info("channel.join.requested", { channel_pubkey: channelHex, subscriber_pubkey: namedSubscriber });
+      /**
+       * ⚠️ THE COUNTERPARTY, NOT THE FRAME'S CLAIM. `namedSubscriber` is whatever the caller wrote;
+       * logging it before the check below let a prober put an arbitrary pubkey in an operator's log
+       * and make it look like that party had asked to join. The session's counterparty is the only
+       * identity here that anything has proven.
+       */
+      logger.info("channel.join.requested", {
+        channel_pubkey: channelHex, counterparty_pubkey: counterpartyHex,
+      });
 
       /**
        * ⚠️ **THE COUNTERPARTY MUST BE THE SUBSCRIBER THE FRAME NAMES.** Otherwise anyone can enrol a
