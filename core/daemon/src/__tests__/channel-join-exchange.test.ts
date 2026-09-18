@@ -21,7 +21,8 @@ import {
 } from "@cello-protocol/crypto";
 import {
   encodeChannelJoinRequest, decodeChannelJoinAccepted, decodeChannelJoinRefused,
-  encodeChannelJoinAccepted, isChannelJoinFrame,
+  encodeChannelJoinAccepted, isChannelJoinFrame, channelJoinFrameType,
+  JOIN_ACCEPTED_TYPE, JOIN_REQUEST_TYPE,
 } from "@cello-protocol/protocol-types";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import type { DaemonDatabase } from "../sqlcipher-db.js";
@@ -66,7 +67,7 @@ async function fixture(access: "open" | "invite_only" | "public" = "open"): Prom
   const members = new ChannelMembershipStore(db, silent);
   members.putSettings(channelHex, {
     access, members_visible: false, guidance: "release notes",
-    retention_seconds: 7 * 24 * 3600, relays: [RELAY_A, RELAY_B],
+    retention_seconds: 7 * 24 * 3600, relays: [RELAY_A, RELAY_B], admin_pubkey: adminHex,
   });
   const subs = new ChannelSubscriptionStore(db, silent);
 
@@ -256,6 +257,87 @@ describe("M16 019 Part B — the join exchange", () => {
     const second = decodeChannelJoinRefused(f.sent[1].content);
     expect(second.ok && second.frame.reason).toBe("ejected");
     expect(f.members.statusOf(f.channelHex, f.subscriberHex)).toBe("ejected");
+  });
+
+  it("6b. an ACCEPTANCE is routed to the subscriber, not swallowed by the admin half", async () => {
+    const f = await fixture("open");
+
+    /**
+     * ⚠️ **THE BUG THIS PINS MADE JOINING IMPOSSIBLE, and every unit test above missed it** because
+     * they call the two halves by hand. The wiring tried the admin half first and fell through on
+     * `consumed: false` — but `onAdminFrame` answers `consumed: true` for ANY join frame it cannot
+     * read as a request. So an acceptance arriving at a subscriber was absorbed there: the daemon
+     * appended a leaf, logged it as received, and discarded it. No subscription, no key, and not one
+     * line saying anything had gone wrong. Every re-key after an ejection went the same way.
+     *
+     * The classifier is what a caller must route on, so the assertion is on IT.
+     */
+    const accepted = encodeChannelJoinAccepted({
+      channel_pubkey: await f.channelKp.getPublicKey(),
+      key_bundle: new Uint8Array(Buffer.alloc(120, 0x33)),
+      guidance: "g", retention_seconds: 3600, access: "open",
+      relays: [RELAY_A], members_visible: false,
+    });
+    expect(channelJoinFrameType(accepted)).toBe(JOIN_ACCEPTED_TYPE);
+    expect(channelJoinFrameType(accepted)).not.toBe(JOIN_REQUEST_TYPE);
+
+    // And the admin half still claims it, which is exactly why routing cannot be "try admin first".
+    const swallowed = await f.exchange.onAdminFrame("s1", f.subscriberHex, accepted);
+    expect(swallowed.consumed, "the admin half consumes what it cannot read — hence route by type").toBe(true);
+  });
+
+  it("6c. guidance and retention are STORED, not just decoded off the frame", async () => {
+    const f = await fixture("open");
+    const request = encodeChannelJoinRequest({
+      channel_pubkey: await f.channelKp.getPublicKey(),
+      subscriber_pubkey: await f.subscriberKp.getPublicKey(),
+      note: "",
+    });
+    await f.exchange.onAdminFrame("s1", f.subscriberHex, request);
+    await f.exchange.onSubscriberFrame("agent-2", "s1", f.adminHex, f.sent[0].content);
+
+    // ⚠️ Both were validated on the frame and then dropped. A subscriber that does not keep them has
+    // no idea what the channel is for or how long its posts last — and no other way to learn either.
+    const row = f.subs.get("agent-2", f.channelHex);
+    expect(row?.guidance).toBe("release notes");
+    expect(row?.retention_seconds).toBe(7 * 24 * 3600);
+  });
+
+  it("6d. rejoining after LEAVING makes the subscription active again", async () => {
+    const f = await fixture("open");
+    const request = encodeChannelJoinRequest({
+      channel_pubkey: await f.channelKp.getPublicKey(),
+      subscriber_pubkey: await f.subscriberKp.getPublicKey(),
+      note: "",
+    });
+    await f.exchange.onAdminFrame("s1", f.subscriberHex, request);
+    await f.exchange.onSubscriberFrame("agent-2", "s1", f.adminHex, f.sent[0].content);
+    f.subs.markLeft("agent-2", f.channelHex);
+    expect(f.subs.active()).toEqual([]);
+
+    // ⚠️ `status` was missing from the upsert's update list, so a rejoin stored a fresh key, answered
+    // ok, and left the row `left` — the collector never fetched, and the operator saw a channel they
+    // had just rejoined produce nothing, for ever.
+    await f.exchange.onSubscriberFrame("agent-2", "s1", f.adminHex, f.sent[0].content);
+    expect(f.subs.get("agent-2", f.channelHex)?.status).toBe("active");
+    expect(f.subs.active().map((s) => s.channel_pubkey)).toEqual([f.channelHex]);
+  });
+
+  it("11b. REFUSING is not ejecting: it cannot remove an existing member", async () => {
+    const f = await fixture("invite_only");
+    f.members.admit(f.channelHex, f.subscriberHex, "active", 1000);
+
+    const result = await f.exchange.refuse(f.channelHex, f.subscriberHex, "s1");
+    /**
+     * ⚠️ This used to answer `ok: true`, mark the member `ejected`, and change nothing else — so
+     * they kept the current group key AND the current fetch key and read on indefinitely while the
+     * table said they were gone. An eject re-keys the channel; a refusal has nothing to re-key,
+     * because a refused party was never in.
+     */
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toContain("not_a_pending_request");
+    expect(f.members.statusOf(f.channelHex, f.subscriberHex), "still a member").toBe("active");
   });
 
   it("a frame that is not a join frame is NOT consumed — it is somebody talking", async () => {

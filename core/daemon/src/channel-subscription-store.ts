@@ -75,6 +75,10 @@ export interface ChannelSubscription {
   relays: string[];
   /** A local display label. The pubkey is the identity; this is what an operator calls it. */
   moniker: string;
+  /** What the channel is for, in the publisher's words — and how long its posts last. Both arrive
+   * on the acceptance and have no other source, so a subscriber that drops them cannot recover them. */
+  guidance: string;
+  retention_seconds: number;
   delivered_through: number;
   processed_through: number;
   status: "active" | "left" | "ejected";
@@ -98,6 +102,8 @@ interface Row {
   access: string;
   relays: string;
   moniker: string;
+  guidance: string;
+  retention_seconds: number | bigint;
   delivered_through: number | bigint;
   processed_through: number | bigint;
   status: string;
@@ -117,28 +123,45 @@ export class ChannelSubscriptionStore {
   /** Record (or refresh) a subscription. 019's join calls this; 018's tests use it directly. */
   upsert(sub: {
     agent_id: string; channel_pubkey: string; admin_pubkey: string; access: ChannelAccess;
-    relays: string[]; joined_at?: number;
+    relays: string[]; joined_at?: number; guidance?: string; retention_seconds?: number;
   }): void {
     this.#db
       .prepare(
+        /**
+         * ⚠️ TWO THINGS THIS USED TO GET WRONG, both silent.
+         *
+         * `guidance` and `retention_seconds` arrive on the acceptance frame, are validated, and were
+         * then DROPPED — the columns existed and nothing ever wrote them. The order says to store
+         * them; a subscriber that does not has no idea what the channel is for or how long its posts
+         * last.
+         *
+         * And `status` was not in the update list, so a subscriber who LEFT and later rejoined got a
+         * fresh key, an `ok`, and a row still marked `left`. `active()` excludes it, so the collector
+         * never fetched: a channel they had just rejoined that produced nothing, for ever.
+         */
         `INSERT INTO channel_subscriptions
-           (agent_id, channel_pubkey, admin_pubkey, access, relays, joined_at, status)
-         VALUES (?, ?, ?, ?, ?, ?, 'active')
+           (agent_id, channel_pubkey, admin_pubkey, access, relays, guidance, retention_seconds, joined_at, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')
          ON CONFLICT (agent_id, channel_pubkey) DO UPDATE SET
-           admin_pubkey = excluded.admin_pubkey,
-           access       = excluded.access,
-           relays       = excluded.relays`,
+           admin_pubkey      = excluded.admin_pubkey,
+           access            = excluded.access,
+           relays            = excluded.relays,
+           guidance          = excluded.guidance,
+           retention_seconds = excluded.retention_seconds,
+           status            = 'active'`,
       )
       .run(
         sub.agent_id, sub.channel_pubkey.toLowerCase(), sub.admin_pubkey.toLowerCase(),
-        sub.access, JSON.stringify(sub.relays), sub.joined_at ?? Date.now(),
+        sub.access, JSON.stringify(sub.relays),
+        sub.guidance ?? "", sub.retention_seconds ?? 7 * 24 * 60 * 60,
+        sub.joined_at ?? Date.now(),
       );
   }
 
   get(agentId: string, channelPubkeyHex: string): ChannelSubscription | null {
     const row = this.#db
       .prepare(
-        `SELECT agent_id, channel_pubkey, admin_pubkey, access, relays, moniker, delivered_through, processed_through, status
+        `SELECT agent_id, channel_pubkey, admin_pubkey, access, relays, moniker, guidance, retention_seconds, delivered_through, processed_through, status
            FROM channel_subscriptions WHERE agent_id = ? AND channel_pubkey = ?`,
       )
       .get(agentId, channelPubkeyHex.toLowerCase()) as Row | undefined;
@@ -149,7 +172,7 @@ export class ChannelSubscriptionStore {
   active(): ChannelSubscription[] {
     const rows = this.#db
       .prepare(
-        `SELECT agent_id, channel_pubkey, admin_pubkey, access, relays, moniker, delivered_through, processed_through, status
+        `SELECT agent_id, channel_pubkey, admin_pubkey, access, relays, moniker, guidance, retention_seconds, delivered_through, processed_through, status
            FROM channel_subscriptions WHERE status = 'active' ORDER BY channel_pubkey ASC, agent_id ASC`,
       )
       .all() as Row[];
@@ -313,6 +336,8 @@ export class ChannelSubscriptionStore {
       access: row.access as ChannelAccess,
       relays,
       moniker: row.moniker,
+      guidance: row.guidance,
+      retention_seconds: Number(row.retention_seconds),
       delivered_through: Number(row.delivered_through),
       processed_through: Number(row.processed_through),
       status: row.status as "active" | "left" | "ejected",

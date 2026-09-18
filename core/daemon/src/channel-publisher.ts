@@ -202,6 +202,23 @@ export class ChannelPublisher {
      * the new generation's key, an ejected member can still pull the queue.
      */
     const fetchKey = info.access === "public" ? undefined : await this.#opts.currentFetchKey?.(channelHex);
+    /**
+     * ⚠️ **A NON-PUBLIC CHANNEL WITH NO FETCH KEY REFUSES TO PUBLISH.** Depositing without one tells
+     * the relay nothing about who may read, so it serves the queue to ANY caller — an `access` of
+     * invite_only with a queue open to the world, which is worse than not publishing. The absent key
+     * means no group key has been minted (nobody has joined yet, or this daemon does not administer
+     * the channel), and both are states to name rather than paper over.
+     */
+    if (info.access !== "public" && !fetchKey) {
+      logger.warn("channel.publish.refused", {
+        ...(correlationId !== undefined ? { correlationId } : {}),
+        channel_pubkey: channelHex, reason: "no_fetch_key",
+      });
+      return {
+        ok: false, reason: "key_unavailable", seq,
+        detail: "this channel has no group key yet, so the relays cannot be told who may read it; admit a member first",
+      };
+    }
     let deposited = await Promise.all(info.relays.map((relay) => this.#depositOnce(relay, post, channelHex, correlationId, fetchKey)));
     let ok = deposited.filter((d) => d.ok);
 

@@ -14,7 +14,9 @@
 import type { Logger } from "./types.js";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { KeyProvider } from "@cello-protocol/crypto";
-import { isChannelJoinFrame, encodeChannelRekey, buildChannelFetchKeyTbs } from "@cello-protocol/protocol-types";
+import {
+  channelJoinFrameType, encodeChannelRekey, buildChannelFetchKeyTbs, JOIN_REQUEST_TYPE,
+} from "@cello-protocol/protocol-types";
 import { generateGroupKey, wrapGroupKeyFor, deriveFetchKey } from "@cello-protocol/crypto";
 import { ChannelMembershipStore } from "./channel-membership-store.js";
 import { ChannelSubscriptionStore } from "./channel-subscription-store.js";
@@ -90,11 +92,27 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
   const localChannelAdmin = (channelHex: string): LocalChannelAdmin | null => {
     const channel = deps.loadedAgents.find((a) => a.pubkey.toLowerCase() === channelHex.toLowerCase());
     if (!channel) return null;
-    const adminKp = deps.keyProviders.get(channel.name);
+
+    /**
+     * ⚠️ **THE ADMIN IS A DIFFERENT AGENT FROM THE CHANNEL, and reading the channel's own key here
+     * was a defect.** The channel signs posts and never converses; the ADMIN holds the sessions and
+     * answers join requests. A subscriber compares the agent that answered against the admin key, so
+     * returning the channel's key made that comparison a key against itself — it could never
+     * succeed, in either direction, and the check was safe only by never passing.
+     *
+     * The admin is whichever agent ran the channel's setup, recorded then. No row, or an agent this
+     * daemon no longer holds, means this daemon cannot answer for the channel — which is the truth.
+     */
+    const settings = members.settings(channelHex);
+    if (!settings || settings.admin_pubkey.length === 0) return null;
+    const adminAgent = deps.loadedAgents.find((a) => a.pubkey.toLowerCase() === settings.admin_pubkey.toLowerCase());
+    if (!adminAgent) return null;
+    const adminKp = deps.keyProviders.get(adminAgent.name);
     if (!adminKp) return null;
+
     return {
-      agentId: deps.resolveAgentId(channel.name),
-      adminPubkeyHex: channel.pubkey,
+      agentId: deps.resolveAgentId(adminAgent.name),
+      adminPubkeyHex: adminAgent.pubkey,
       channelKeyProvider: channel.keyProvider,
       adminKeyProvider: adminKp,
     };
@@ -108,8 +126,11 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
    * visible in the log and safe, where a permissive default would be neither.
    */
   const profileAdminPubkey = (channelHex: string): Promise<string | null> => {
-    const local = deps.loadedAgents.find((a) => a.pubkey.toLowerCase() === channelHex.toLowerCase());
-    return Promise.resolve(local ? local.pubkey : null);
+    // The ADMIN this daemon recorded, not the channel's own key — the two are different agents, and
+    // comparing a key with itself is what the first version of this did.
+    const settings = members.settings(channelHex);
+    if (!settings || settings.admin_pubkey.length === 0) return Promise.resolve(null);
+    return Promise.resolve(settings.admin_pubkey);
   };
 
   const keyProviderFor = (agentId: string): KeyProvider | null => {
@@ -145,20 +166,31 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
    * a directory lookup — cannot be done in that window.
    */
   deps.setOnChannelJoinFrame((agentName, sessionId, content, senderPubkey, correlationId) => {
-    if (!isChannelJoinFrame(content)) return { consumed: false };
+    /**
+     * ⚠️ **ROUTED BY FRAME TYPE, ONCE — trying the admin half first and falling through was a bug
+     * that made joining impossible.** `onAdminFrame` answers `consumed: true` for any join frame it
+     * cannot read as a REQUEST, so an acceptance or a re-key arriving at a SUBSCRIBER was absorbed
+     * there and the subscriber half was never called. A member sent a request, the admin admitted
+     * them and replied with the key, and their daemon appended a leaf and discarded it: no
+     * subscription, no key, and not one line saying anything had gone wrong. Every re-key after an
+     * ejection went the same way. The unit tests missed it because they call the two halves by hand.
+     */
+    const kind = channelJoinFrameType(content);
+    if (kind === null) return { consumed: false };
 
     const exchange = exchangeFor(agentName);
     const agentId = deps.resolveAgentId(agentName);
     void (async () => {
-      // BOTH sides are tried, because a daemon can be the admin of one channel and a subscriber to
-      // another in the same breath, and the frame itself says which this is.
-      const asAdmin = await exchange.onAdminFrame(sessionId, senderPubkey, content);
-      if (asAdmin.consumed) return;
+      if (kind === JOIN_REQUEST_TYPE) {
+        await exchange.onAdminFrame(sessionId, senderPubkey, content);
+        return;
+      }
+      // An acceptance, a refusal or a re-key: all answers TO us, all the subscriber's business.
       const asSubscriber = await exchange.onSubscriberFrame(agentId, sessionId, senderPubkey, content);
       if (!asSubscriber.ok) {
         logger.warn("channel.join.refused", {
           ...(correlationId !== undefined ? { correlationId } : {}),
-          reason: asSubscriber.reason, sender: senderPubkey,
+          reason: asSubscriber.reason, sender: senderPubkey, frame_type: kind,
         });
       }
     })().catch((err: unknown) => {

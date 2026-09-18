@@ -108,9 +108,14 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
 
   async function acceptInto(
     sessionId: string, channelHex: string, subscriberHex: string, admin: LocalChannelAdmin,
-  ): Promise<void> {
+  ): Promise<{ ok: true } | { ok: false; reason: string }> {
     const settings = members.settings(channelHex);
-    if (!settings) return;
+    /**
+     * ⚠️ RETURNS A REASON RATHER THAN NOTHING. This used to return silently, and `approve` reported
+     * `ok: true` on top of it — so an admin believed they had admitted somebody who received no key
+     * and no relays, and the member's daemon heard nothing at all.
+     */
+    if (!settings) return { ok: false, reason: "channel_not_configured_for_membership" };
 
     let generation = settings.key_generation;
     if (generation === 0) generation = members.startGeneration(channelHex);
@@ -133,6 +138,7 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
     logger.info("channel.member.joined", {
       channel_pubkey: channelHex, subscriber_pubkey: subscriberHex, generation,
     });
+    return { ok: true };
   }
 
   return {
@@ -142,9 +148,19 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
       if (!isChannelJoinFrame(content)) return { consumed: false };
 
       const decoded = decodeChannelJoinRequest(content);
-      // A join frame of another type (an acceptance, a re-key) arriving at an admin is not a
-      // request. It is consumed — it is structured traffic, not conversation — and ignored.
-      if (!decoded.ok) return { consumed: true };
+      if (!decoded.ok) {
+        /**
+         * ⚠️ LOGGED, because this frame is now GONE. It is consumed — structured traffic, not
+         * conversation — so it never reaches the operator's transcript. Returning silently meant any
+         * counterparty could send a CBOR array whose first element was one of the four type strings
+         * and have it disappear with nothing recorded anywhere. The decoder already produces a
+         * reason and a detail; there is no excuse for discarding them.
+         */
+        logger.warn("channel.join.frame_undecodable", {
+          reason: decoded.reason, detail: decoded.detail, sender: counterpartyHex,
+        });
+        return { consumed: true };
+      }
 
       const channelPubkey = decoded.frame.channel_pubkey;
       const channelHex = Buffer.from(channelPubkey).toString("hex");
@@ -270,6 +286,10 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
           admin_pubkey: profileAdmin,
           access: acceptedFrame.access,
           relays: acceptedFrame.relays,
+          // STORED, not just decoded. What the channel is for and how long its posts last are the
+          // two things a subscriber has no other way to learn.
+          guidance: acceptedFrame.guidance,
+          retention_seconds: acceptedFrame.retention_seconds,
           joined_at: now(),
         });
       }
@@ -285,16 +305,27 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
       } catch (err: unknown) {
         return { ok: false, reason: extractErrorMessage(err) };
       }
-      await acceptInto(sessionId, channelHex, subscriberHex, admin);
-      return { ok: true };
+      // The delivery's verdict is the ANSWER. Reporting `ok` regardless told an admin they had
+      // admitted somebody who in fact received nothing.
+      return acceptInto(sessionId, channelHex, subscriberHex, admin);
     },
 
     async refuse(channelHex, subscriberHex, sessionId): Promise<{ ok: true } | { ok: false; reason: string }> {
       const admin = deps.localChannelAdmin(channelHex);
       if (!admin) return { ok: false, reason: "channel_not_local" };
       const channelPubkey = await admin.channelKeyProvider.getPublicKey();
-      // The row stays, as `ejected`: a refused request that left no trace would be re-asked for ever.
-      members.admit(channelHex, subscriberHex, "ejected", now());
+      /**
+       * ⚠️ **CONDITIONAL ON `pending`, AND THAT CONDITION IS THE POINT.** This used to upsert
+       * `ejected` unconditionally, so a refusal typed against an existing MEMBER answered `ok`,
+       * marked them ejected, and left them holding the current group key and fetch key — reading
+       * indefinitely while the table said otherwise. Refusing is not ejecting: an eject re-keys the
+       * channel, and a refusal has nothing to re-key because they were never in.
+       */
+      try {
+        members.refusePending(channelHex, subscriberHex);
+      } catch (err: unknown) {
+        return { ok: false, reason: extractErrorMessage(err) };
+      }
       await refuseTo(sessionId, channelPubkey, "refused_by_admin");
       return { ok: true };
     },

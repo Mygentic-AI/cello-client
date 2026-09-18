@@ -33,7 +33,7 @@ export interface ChannelPublishWiringDeps {
   getNode: () => CelloNode | null;
   screenOutbound: (content: Uint8Array, ctx: ScreenContext) => Promise<ScreenVerdict>;
   /** Every agent this daemon loaded, read per lookup so one added after boot is publishable. */
-  loadedAgents: ReadonlyArray<{ pubkey: string; keyProvider: KeyProvider }>;
+  loadedAgents: ReadonlyArray<{ name: string; pubkey: string; keyProvider: KeyProvider }>;
   keyProviders: Map<string, KeyProvider>;
   resolveCurrentAgent: (connectionId: string, explicitAgent?: string) => string | null;
   /**
@@ -131,7 +131,15 @@ export function wireChannelPublishing(deps: ChannelPublishWiringDeps): { stop: (
       if (!keyProviders.has(agentName)) {
         return { ok: false, reason: "no_such_agent", guidance: `${agentName} is not an agent this daemon holds.` };
       }
-      config.set(channelHex, cfg, Date.now());
+      /**
+       * ⚠️ **THE ADMIN AGENT IS RECORDED HERE, and it is what makes the channel joinable at all.**
+       * `agentName` is the agent running the setup, and in this release the publisher and the admin
+       * are the same operator — so that agent's key is the one a subscriber will check the answering
+       * party against. Leaving it empty was how 019's first cut produced a channel that refused
+       * every join with `not_admin_of_channel` on a channel it demonstrably administered.
+       */
+      const adminAgent = deps.loadedAgents.find((a) => a.name === agentName);
+      config.set(channelHex, { ...cfg, admin_pubkey: adminAgent?.pubkey ?? "" }, Date.now());
       return { ok: true };
     },
   });

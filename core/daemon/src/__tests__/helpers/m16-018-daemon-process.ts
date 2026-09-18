@@ -12,7 +12,8 @@
  *
  * Prints one JSON line describing the outcome.
  */
-import { InMemoryKeyProvider } from "@cello-protocol/crypto";
+import { InMemoryKeyProvider, deriveFetchKey, type GroupKey } from "@cello-protocol/crypto";
+import { buildChannelFetchKeyTbs, buildChannelFetchAuthTbs } from "@cello-protocol/protocol-types";
 import { createNode } from "@cello-protocol/transport";
 import { ChannelLogStore } from "../../channel-log-store.js";
 import { ChannelPublisher } from "../../channel-publisher.js";
@@ -24,6 +25,13 @@ import { openTestDb } from "./encrypted-db.js";
 import type { Logger } from "../../types.js";
 
 const AGENT = "enforcer-agent";
+
+/**
+ * A FIXED group key, shared by the publisher and subscriber halves of this fixture so both derive
+ * the same fetch key. 018 is not about membership — 019's enforcer covers that — but an `open`
+ * channel is still gated at the relay, so this fixture has to hold a key to exercise the path at all.
+ */
+const ENFORCER_GROUP_KEY: GroupKey = { generation: 1, key: new Uint8Array(Buffer.alloc(32, 0x4b)) };
 
 /** Structured to stderr, so stdout carries exactly one JSON line for the test to parse. */
 const logger: Logger = {
@@ -67,6 +75,23 @@ async function main(): Promise<void> {
           access: "open" as const, relays: [relayA, relayB],
           guidance: "enforcer channel", retention_seconds: 7 * 24 * 3600,
         }),
+        /**
+         * M16 019: an `open` channel is not public, so the publisher refuses to deposit without a
+         * fetch key — a deposit with none leaves the relay serving the queue to anyone. Derived from
+         * a FIXED group key so the subscriber half below derives the identical one and can sign its
+         * fetches, which is what the relay now checks.
+         */
+        currentFetchKey: async () => {
+          const fetchKey = await deriveFetchKey(ENFORCER_GROUP_KEY, await channelKp.getPublicKey());
+          const timeMs = Date.now();
+          return {
+            pubkey: fetchKey.publicKey,
+            time_ms: timeMs,
+            signature: await channelKp.sign(
+              buildChannelFetchKeyTbs(await channelKp.getPublicKey(), fetchKey.publicKey, timeMs),
+            ),
+          };
+        },
       });
 
       if (mode === "resend") {
@@ -104,7 +129,17 @@ async function main(): Promise<void> {
       const collector = new ChannelCollector({
         db, logger, subscriptions: subs, inbox,
         fetch: (relay, req) => relayClient.fetch(relay, req),
-        fetchAuth: () => Promise.resolve(undefined),
+        // The same fixed group key the publisher used, so the derived fetch key matches what the
+        // relays were told to require. A subscriber that could not sign would be turned away.
+        fetchAuth: async (_access, chHex, sinceSeq) => {
+          const channelPubkey = new Uint8Array(Buffer.from(chHex, "hex"));
+          const fetchKey = await deriveFetchKey(ENFORCER_GROUP_KEY, channelPubkey);
+          const timeMs = Date.now();
+          return {
+            signature: await fetchKey.sign(buildChannelFetchAuthTbs(channelPubkey, sinceSeq, timeMs)),
+            time_ms: timeMs,
+          };
+        },
         localAgentKeys: () => [],
         requestRepair: () => Promise.resolve(),
       });

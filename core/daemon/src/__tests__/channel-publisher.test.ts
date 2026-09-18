@@ -76,7 +76,7 @@ interface Harness {
   pruneCalls: Array<{ relay: string; throughSeq: number; signature: Uint8Array }>;
 }
 
-async function harness(opts: { access?: "public" | "open" } = {}): Promise<Harness> {
+async function harness(opts: { access?: "public" | "open"; noFetchKey?: boolean } = {}): Promise<Harness> {
   const log = new ChannelLogStore(db, silent);
   const channelKp = generateKeypair();
   const adminKp = generateKeypair();
@@ -156,6 +156,15 @@ async function harness(opts: { access?: "public" | "open" } = {}): Promise<Harne
     prune,
     // No waiting in tests. Production paces refills under the relay's rate limit.
     resendPaceMs: 0,
+    /**
+     * M16 019: a non-public channel refuses to publish without one, because a deposit with no fetch
+     * key leaves the relay serving the queue to anyone. `opts.noFetchKey` drives that refusal.
+     */
+    currentFetchKey: () => Promise.resolve(opts.noFetchKey === true ? undefined : {
+      pubkey: new Uint8Array(Buffer.alloc(32, 0x5f)),
+      time_ms: clock.now,
+      signature: new Uint8Array(Buffer.alloc(64, 0x60)),
+    }),
     logger: silent,
     log,
     now: () => clock.now,
@@ -359,6 +368,25 @@ describe("M16 018-PUBCOLLECT: publishing", () => {
     // A public channel is readable by anyone, so encrypting it would be theatre — and would stop a
     // subscriber who has no key from reading what the channel exists to publish.
     expect(Buffer.from(pubPost.body).toString("utf-8")).toBe("public words");
+  });
+
+  it("7c. a non-public channel with NO FETCH KEY refuses to publish rather than depositing ungated", async () => {
+    const h = await harness({ access: "open", noFetchKey: true });
+
+    const result = await h.publisher.publish("agent-1", h.channelHex, "nobody may read this", "body");
+    /**
+     * ⚠️ **A DEPOSIT WITHOUT A FETCH KEY LEAVES THE RELAY SERVING THE QUEUE TO ANYONE.** An `access`
+     * of open or invite_only with a world-readable queue is worse than not publishing: the operator
+     * believes the channel is gated and it is not. The absent key means no group key has been minted
+     * — nobody has joined yet — which is a state to name, not to paper over.
+     */
+    expect(result.ok ? "published" : result.reason).toBe("key_unavailable");
+    expect(h.deposits, "nothing reached a relay").toEqual([]);
+
+    // A PUBLIC channel is unaffected: it has no fetch key by design and anyone may read it.
+    const pub = await harness({ access: "public", noFetchKey: true });
+    const published = await pub.publisher.publish("agent-1", pub.channelHex, "open to all", "body");
+    expect(published.ok).toBe(true);
   });
 
   it("7b. with NO group key — production today — a non-public channel FAILS CLOSED", async () => {

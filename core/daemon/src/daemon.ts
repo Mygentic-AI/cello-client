@@ -514,9 +514,15 @@ async function startDaemonHoldingLock(
     isDeliveryOpenToAgent, isChannelAgent: channelAgentLookup(sessionNodeManager, logger), // M16
     // M16 019: the mirror — a session FROM a channel this agent subscribes to. Constructed per call
     // rather than held, so a channel joined after boot is recognised without a restart.
+    /**
+     * ⚠️ **`resolveAgentId`, NOT THE NAME.** The store queries `agent_id`; the inbound path hands
+     * over `localAgent.name`. Passing the name matched no row, a missing row reads as "not a
+     * channel", and "not a channel" is ALLOW — so the refusal never fired and nothing said so. Test
+     * 21 could not see it because the harness replaced this lookup with a name-keyed stub.
+     */
     isSubscribedChannel: (agentName, counterpartyPubkeyHex) =>
       new ChannelSubscriptionStore(sessionNodeManager.getDb(), logger)
-        .isSubscribedChannel(agentName, counterpartyPubkeyHex),
+        .isSubscribedChannel(sessionNodeManager.resolveAgentId(agentName), counterpartyPubkeyHex),
   });
 
   if (!sharedSignaling) {
