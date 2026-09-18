@@ -382,3 +382,18 @@ export {
   decodeDocumentRejection,
 } from "./document-rejection-envelope.js";
 export type { DocumentRejectionEnvelope } from "./document-rejection-envelope.js";
+
+// M16 / 018-PUBCOLLECT — the channel info record: how a subscriber finds a channel without a
+// directory lookup, and the only thing a PUBLIC channel has to learn from. Signed by the CHANNEL
+// key alone; an admin-signed record would let a replaced admin redirect a channel's subscribers.
+export {
+  CHANNEL_INFO_DOMAIN,
+  MAX_CHANNEL_GUIDANCE_CHARS,
+  MAX_CHANNEL_RELAYS,
+  buildChannelInfoTbs,
+  signChannelInfo,
+  encodeChannelInfo,
+  decodeChannelInfo,
+  verifyChannelInfo,
+} from "./channel-info.js";
+export type { ChannelInfo, ChannelAccess, ChannelInfoDecodeReason } from "./channel-info.js";
