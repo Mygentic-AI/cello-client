@@ -149,6 +149,8 @@ function harness(opts: {
     sendTelegramDoorbell: async () => {},
     isDeliveryOpenToAgent: () => false,
     isChannelAgent: () => false,
+    // M16 019: this harness is not testing channel subscriptions — nobody here subscribes to one.
+    isSubscribedChannel: () => false,
   } as unknown as InboundSessionDeps;
 
   // The RETURN VALUE, not discarded. `refusedSessionRequests` is the in-memory list `cello_inbox`

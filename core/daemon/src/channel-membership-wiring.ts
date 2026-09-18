@@ -1,0 +1,327 @@
+/**
+ * M16 019-MEMBERSHIP — the join exchange, the eject re-key, and the operator's channel verbs.
+ *
+ * The publishing half is wired next door in `channel-publish-wiring.ts`; this is membership. Both
+ * exist because a module registered into nothing is a feature that does not exist — the mistake 017
+ * shipped and 018 repeated on its other half.
+ *
+ * ⚠️ **THE JOIN FRAME HOOK IS SYNCHRONOUS AND THE HANDLING IS NOT.** `setOnChannelJoinFrame` must
+ * answer "is this mine" immediately, because the ingest path is deciding whether to write the frame
+ * into a transcript as something a person said. The decision is made by CLASSIFYING (a cheap decode)
+ * and the work is then queued, exactly as the document layer does. A rejected promise here must not
+ * take down the content path, so it is caught and logged.
+ */
+import type { Logger } from "./types.js";
+import type { DaemonDatabase } from "./sqlcipher-db.js";
+import type { KeyProvider } from "@cello-protocol/crypto";
+import { isChannelJoinFrame, encodeChannelRekey } from "@cello-protocol/protocol-types";
+import { generateGroupKey, wrapGroupKeyFor } from "@cello-protocol/crypto";
+import { ChannelMembershipStore } from "./channel-membership-store.js";
+import { ChannelSubscriptionStore } from "./channel-subscription-store.js";
+import { createChannelJoinExchange, type LocalChannelAdmin } from "./channel-join-exchange.js";
+import { extractErrorMessage } from "./error-message.js";
+
+type Handler = (params: Record<string, unknown> | undefined, connectionId: string) => Promise<unknown>;
+
+export interface ChannelMembershipWiringDeps {
+  handlers: Map<string, Handler>;
+  logger: Logger;
+  getDb: () => DaemonDatabase;
+  /** Route a frame into an open session. The session layer owns delivery. */
+  sendInSession: (agentName: string, sessionId: string, content: Uint8Array) => Promise<void>;
+  /** Register the inbound hook. Separate from the document one — see that field's note. */
+  setOnChannelJoinFrame: (
+    cb: (agentName: string, sessionId: string, content: Uint8Array, senderPubkey: string, correlationId?: string) => { consumed: boolean },
+  ) => void;
+  /** Every agent this daemon loaded. A channel IS one of them — looked up by pubkey, never by name. */
+  loadedAgents: ReadonlyArray<{ name: string; pubkey: string; keyProvider: KeyProvider }>;
+  keyProviders: Map<string, KeyProvider>;
+  resolveAgentId: (agentName: string) => string;
+  resolveCurrentAgent: (connectionId: string, explicitAgent?: string) => string | null;
+  /** Open sessions for an agent, so a re-key can ride one this daemon already holds. */
+  activeSessionsFor: (agentName: string) => Array<{ sessionId: string; counterpartyPubkeyHex: string }>;
+}
+
+function needAgent(deps: ChannelMembershipWiringDeps, params: Record<string, unknown> | undefined, connectionId: string):
+  { ok: true; agentName: string } | { ok: false; answer: Record<string, unknown> } {
+  const agentName = deps.resolveCurrentAgent(connectionId, params?.["agent"] as string | undefined);
+  if (agentName === null) {
+    return {
+      ok: false,
+      answer: { ok: false, reason: "no_current_agent", guidance: "Name the agent, or select one with cello_use_agent." },
+    };
+  }
+  return { ok: true, agentName };
+}
+
+function needChannel(params: Record<string, unknown> | undefined):
+  { ok: true; channelHex: string } | { ok: false; answer: Record<string, unknown> } {
+  const raw = params?.["channel"];
+  if (typeof raw !== "string" || !/^[0-9a-fA-F]{64}$/.test(raw)) {
+    return {
+      ok: false,
+      answer: { ok: false, reason: "bad_channel", guidance: "Pass the channel's 64-character hex public key as `channel`." },
+    };
+  }
+  return { ok: true, channelHex: raw.toLowerCase() };
+}
+
+export function wireChannelMembership(deps: ChannelMembershipWiringDeps): void {
+  const { handlers, logger } = deps;
+
+  const members = new ChannelMembershipStore(deps.getDb(), logger);
+  const subscriptions = new ChannelSubscriptionStore(deps.getDb(), logger);
+
+  /**
+   * ⚠️ A CHANNEL IS AN AGENT THIS DAEMON HOLDS, looked up BY PUBKEY — the same rule the publisher
+   * follows, because the pubkey is the identity and the name is a mutable label. In this release the
+   * publisher and the admin are the SAME daemon; that is ASSERTED by returning null when the key is
+   * not here, rather than assumed anywhere downstream.
+   */
+  const localChannelAdmin = (channelHex: string): LocalChannelAdmin | null => {
+    const channel = deps.loadedAgents.find((a) => a.pubkey.toLowerCase() === channelHex.toLowerCase());
+    if (!channel) return null;
+    const adminKp = deps.keyProviders.get(channel.name);
+    if (!adminKp) return null;
+    return {
+      agentId: deps.resolveAgentId(channel.name),
+      adminPubkeyHex: channel.pubkey,
+      channelKeyProvider: channel.keyProvider,
+      adminKeyProvider: adminKp,
+    };
+  };
+
+  /**
+   * ⚠️ **NOT WIRED TO A DIRECTORY YET, AND IT FAILS CLOSED RATHER THAN PRETENDING.** The subscriber's
+   * admin check compares the answering agent against THIS. Returning "whoever answered" would be
+   * precisely the hole that check exists to close, so until the profile read lands, a join from a
+   * channel this daemon does not itself administer is refused as `admin_unresolved` — which is
+   * visible in the log and safe, where a permissive default would be neither.
+   */
+  const profileAdminPubkey = (channelHex: string): Promise<string | null> => {
+    const local = deps.loadedAgents.find((a) => a.pubkey.toLowerCase() === channelHex.toLowerCase());
+    return Promise.resolve(local ? local.pubkey : null);
+  };
+
+  const keyProviderFor = (agentId: string): KeyProvider | null => {
+    const agent = deps.loadedAgents.find((a) => deps.resolveAgentId(a.name) === agentId);
+    return agent ? (deps.keyProviders.get(agent.name) ?? null) : null;
+  };
+
+  const openSessionWith = (agentName: string, memberPubkeyHex: string): string | null => {
+    const open = deps.activeSessionsFor(agentName)
+      .find((s) => s.counterpartyPubkeyHex.toLowerCase() === memberPubkeyHex.toLowerCase());
+    return open ? open.sessionId : null;
+  };
+
+  const raiseNotice = (event: string, channelHex: string, subscriberHex: string): void => {
+    logger.info(event, { channel_pubkey: channelHex, subscriber_pubkey: subscriberHex });
+  };
+
+  /** Which agent a session belongs to, so the hook's answers go back down the right one. */
+  const exchangeFor = (agentName: string) => createChannelJoinExchange({
+    logger,
+    members,
+    subscriptions,
+    sendInSession: (sessionId, content) => deps.sendInSession(agentName, sessionId, content),
+    localChannelAdmin,
+    profileAdminPubkey,
+    keyProviderFor,
+    raiseNotice,
+  });
+
+  /**
+   * ⚠️ CLASSIFY SYNCHRONOUSLY, HANDLE ASYNCHRONOUSLY. The ingest path needs an immediate answer to
+   * decide whether these bytes are conversation; the admin and subscriber work — key wrapping,
+   * a directory lookup — cannot be done in that window.
+   */
+  deps.setOnChannelJoinFrame((agentName, sessionId, content, senderPubkey, correlationId) => {
+    if (!isChannelJoinFrame(content)) return { consumed: false };
+
+    const exchange = exchangeFor(agentName);
+    const agentId = deps.resolveAgentId(agentName);
+    void (async () => {
+      // BOTH sides are tried, because a daemon can be the admin of one channel and a subscriber to
+      // another in the same breath, and the frame itself says which this is.
+      const asAdmin = await exchange.onAdminFrame(sessionId, senderPubkey, content);
+      if (asAdmin.consumed) return;
+      const asSubscriber = await exchange.onSubscriberFrame(agentId, sessionId, senderPubkey, content);
+      if (!asSubscriber.ok) {
+        logger.warn("channel.join.refused", {
+          ...(correlationId !== undefined ? { correlationId } : {}),
+          reason: asSubscriber.reason, sender: senderPubkey,
+        });
+      }
+    })().catch((err: unknown) => {
+      // A rejected promise here must not take down the content path for every other session.
+      logger.error("channel.join.handling_failed", {
+        ...(correlationId !== undefined ? { correlationId } : {}),
+        reason: extractErrorMessage(err),
+      });
+    });
+    return { consumed: true };
+  });
+
+  // ─── Operator verbs ───────────────────────────────────────────────────────────────────────────
+
+  handlers.set("cello_channels", async (params, connectionId) => {
+    const agent = needAgent(deps, params, connectionId);
+    if (!agent.ok) return agent.answer;
+    const agentId = deps.resolveAgentId(agent.agentName);
+    const rows = subscriptions.active().filter((s) => s.agent_id === agentId);
+    return Promise.resolve({
+      ok: true,
+      channels: rows.map((s) => ({
+        channel: s.channel_pubkey,
+        moniker: s.moniker,
+        access: s.access,
+        delivered_through: s.delivered_through,
+        processed_through: s.processed_through,
+        // What the operator actually wants to know: how much is waiting.
+        unread: Math.max(0, s.delivered_through - s.processed_through),
+      })),
+    });
+  });
+
+  handlers.set("cello_channel_set_moniker", async (params, connectionId) => {
+    const agent = needAgent(deps, params, connectionId);
+    if (!agent.ok) return agent.answer;
+    const channel = needChannel(params);
+    if (!channel.ok) return channel.answer;
+    const moniker = params?.["moniker"];
+    if (typeof moniker !== "string" || moniker.length === 0) {
+      return { ok: false, reason: "bad_moniker", guidance: "Pass a `moniker`: what you want to call this channel." };
+    }
+    subscriptions.setMoniker(deps.resolveAgentId(agent.agentName), channel.channelHex, moniker);
+    return Promise.resolve({ ok: true, channel: channel.channelHex, moniker });
+  });
+
+  handlers.set("cello_channel_leave", async (params, connectionId) => {
+    const agent = needAgent(deps, params, connectionId);
+    if (!agent.ok) return agent.answer;
+    const channel = needChannel(params);
+    if (!channel.ok) return channel.answer;
+    try {
+      subscriptions.markLeft(deps.resolveAgentId(agent.agentName), channel.channelHex);
+    } catch (err: unknown) {
+      return { ok: false, reason: extractErrorMessage(err) };
+    }
+    return Promise.resolve({
+      ok: true,
+      channel: channel.channelHex,
+      // ⚠️ LEAVING IS LOCAL, and saying so matters: an operator who thinks the publisher was told
+      // may expect to be removed from a member list they are still on.
+      guidance: "You have stopped collecting this channel. Nothing was sent — the publisher does not know, and your keys are kept so old posts stay readable.",
+    });
+  });
+
+  /**
+   * Eject a member and re-key the channel.
+   *
+   * ⚠️ **THE GENERATION BUMP AND THE STATUS FLIP ARE ONE TRANSACTION** (in the store). What happens
+   * HERE is the delivery, and a delivery that fails does NOT undo the ejection: the member is out at
+   * the relay the moment the next deposit carries the new fetch key, whether or not every remaining
+   * member has collected their new key yet. A member left behind hits `unknown_generation` and asks.
+   */
+  handlers.set("cello_channel_eject", async (params, connectionId) => {
+    const agent = needAgent(deps, params, connectionId);
+    if (!agent.ok) return agent.answer;
+    const channel = needChannel(params);
+    if (!channel.ok) return channel.answer;
+    const subscriber = params?.["subscriber"];
+    if (typeof subscriber !== "string" || !/^[0-9a-fA-F]{64}$/.test(subscriber)) {
+      return { ok: false, reason: "bad_subscriber", guidance: "Pass the member's 64-character hex public key as `subscriber`." };
+    }
+
+    const admin = localChannelAdmin(channel.channelHex);
+    if (!admin) {
+      return {
+        ok: false, reason: "channel_not_local",
+        guidance: "This daemon does not hold that channel's key, and ejecting is the admin's own act. Cross-daemon admin is not in this release.",
+      };
+    }
+
+    let outcome: { generation: number; remaining: string[] };
+    try {
+      outcome = members.eject(channel.channelHex, subscriber.toLowerCase());
+    } catch (err: unknown) {
+      return { ok: false, reason: extractErrorMessage(err) };
+    }
+
+    // The new key, wrapped once per REMAINING member. The ejected one is simply not in this list.
+    const gk = generateGroupKey(outcome.generation);
+    const channelPubkey = await admin.channelKeyProvider.getPublicKey();
+    let delivered = 0;
+    const unreached: string[] = [];
+    for (const member of outcome.remaining) {
+      const sessionId = openSessionWith(agent.agentName, member);
+      if (sessionId === null) {
+        // Not a failure of the ejection. Recorded by name so an operator can see who is behind.
+        logger.warn("channel.rekey.member_unreached", {
+          channel_pubkey: channel.channelHex, member_pubkey: member, generation: outcome.generation,
+        });
+        unreached.push(member);
+        continue;
+      }
+      const bundle = await wrapGroupKeyFor(
+        gk, channelPubkey, new Uint8Array(Buffer.from(member, "hex")), admin.adminKeyProvider,
+      );
+      await deps.sendInSession(agent.agentName, sessionId, encodeChannelRekey({
+        channel_pubkey: channelPubkey, key_bundle: bundle, generation: outcome.generation,
+      }));
+      delivered += 1;
+    }
+
+    logger.info("channel.rekey.completed", {
+      channel_pubkey: channel.channelHex,
+      generation: outcome.generation,
+      member_count: outcome.remaining.length,
+      delivered_count: delivered,
+      failed_count: unreached.length,
+    });
+    return {
+      ok: true,
+      channel: channel.channelHex,
+      generation: outcome.generation,
+      delivered,
+      unreached,
+      guidance: unreached.length > 0
+        ? `${String(unreached.length)} member(s) were not reachable and still hold the old key. They will ask for the new one when they next read; the ejection itself is done.`
+        : undefined,
+    };
+  });
+
+  handlers.set("cello_channel_approve", async (params, connectionId) => {
+    const agent = needAgent(deps, params, connectionId);
+    if (!agent.ok) return agent.answer;
+    const channel = needChannel(params);
+    if (!channel.ok) return channel.answer;
+    const subscriber = params?.["subscriber"];
+    if (typeof subscriber !== "string" || !/^[0-9a-fA-F]{64}$/.test(subscriber)) {
+      return { ok: false, reason: "bad_subscriber" };
+    }
+    const sessionId = openSessionWith(agent.agentName, subscriber.toLowerCase());
+    if (sessionId === null) {
+      // The approval is recorded either way: the next request from an approved member is accepted
+      // immediately, so an admin approving somebody who has gone offline is not wasted work.
+      return { ok: false, reason: "no_open_session", guidance: "They are not currently reachable. Approve again when they next ask, or the approval applies to their next request." };
+    }
+    const result = await exchangeFor(agent.agentName).approve(channel.channelHex, subscriber.toLowerCase(), sessionId);
+    return result.ok ? { ok: true, channel: channel.channelHex } : { ok: false, reason: result.reason };
+  });
+
+  handlers.set("cello_channel_refuse", async (params, connectionId) => {
+    const agent = needAgent(deps, params, connectionId);
+    if (!agent.ok) return agent.answer;
+    const channel = needChannel(params);
+    if (!channel.ok) return channel.answer;
+    const subscriber = params?.["subscriber"];
+    if (typeof subscriber !== "string" || !/^[0-9a-fA-F]{64}$/.test(subscriber)) {
+      return { ok: false, reason: "bad_subscriber" };
+    }
+    const sessionId = openSessionWith(agent.agentName, subscriber.toLowerCase());
+    if (sessionId === null) return { ok: false, reason: "no_open_session" };
+    const result = await exchangeFor(agent.agentName).refuse(channel.channelHex, subscriber.toLowerCase(), sessionId);
+    return result.ok ? { ok: true, channel: channel.channelHex } : { ok: false, reason: result.reason };
+  });
+}

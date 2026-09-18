@@ -1372,6 +1372,40 @@ export class SessionContentIngest {
       return { leafIndex };
     }
 
+    /**
+     * M16 019 — CHANNEL JOIN FRAMES, the sibling of the document branch above and deliberately its
+     * own hook rather than a second job for that one.
+     *
+     * They take the same three-way split for the same reasons: a LEAF is appended (the exchange is
+     * inside the sealed transcript, which is what makes "you admitted me" provable), no TRANSCRIPT
+     * entry (a key bundle is not something a person said, and `cello_receive` would hand it to an
+     * agent as if it were), and no DOORBELL (a join needs no agent's attention at the moment it
+     * arrives; the admin is raised a notice instead).
+     *
+     * ⚠️ The leaf kind is `msg`, not a new one. A leaf kind is what a VERIFIER renders a leaf by,
+     * and inventing a third would make every existing verifier unable to read a transcript that
+     * carries a join — for a distinction no verifier needs to draw.
+     */
+    const joinRouted = this.#ctx.onChannelJoinFrame?.(
+      agentName,
+      sessionId,
+      // THE PEER'S BYTES, not the sanitized ones — same reason as the document branch.
+      originalContent ?? content,
+      senderPubkey,
+      correlationId,
+    );
+    if (joinRouted?.consumed === true) {
+      const { leafIndex } = this.#ctx.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, correlationId);
+      // Drop the witness, exactly as both other branches do once their leaf is committed. The
+      // document branch records what leaving it behind cost: a session that carried structured
+      // traffic could never seal again.
+      this.#ctx.witnessedSeq.get(this.#ctx.sessionKey(agentName, sessionId))?.delete(contentHashHex);
+      this.#ctx.logger.info("session.channel_join.received", {
+        sessionId, senderPubkey, sequenceNumber: leafIndex, dispatch: "queued", correlationId,
+      });
+      return { leafIndex };
+    }
+
     const { leafIndex } = this.#ctx.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, correlationId);
     // DOD-LOG-1: persist the readable RECEIVED plaintext to the durable transcript, keyed by the
     // canonical leaf sequence so it joins the committed hash chain (survives restart; INV-3 — the

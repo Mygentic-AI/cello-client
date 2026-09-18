@@ -50,6 +50,18 @@ const EXEMPT = new Map<string, string>([
    * every subscriber keeps, so the caller is a person at a terminal; an MCP tool would put it in
    * reach of anything that can drive the agent's tools. Order 018 defers the MCP surface to Tier 5.
    */
+  /**
+   * M16 019-MEMBERSHIP. All six ARE reachable — `cello channel list|name|leave|eject|approve|refuse`
+   * — and deliberately absent from MCP for the same reason as the publishing verbs: ejecting a
+   * member, approving a stranger and leaving a channel are the operator's own decisions about who
+   * they deal with, not tools an agent should reach for mid-conversation.
+   */
+  ["cello_channels", "terminal-only: the operator's own list of what they follow. MCP surface deferred to Tier 5"],
+  ["cello_channel_set_moniker", "terminal-only: a local label on a channel the operator follows. MCP surface deferred to Tier 5"],
+  ["cello_channel_leave", "terminal-only: stops collecting a channel, which is the operator's decision about their own attention. MCP surface deferred to Tier 5"],
+  ["cello_channel_eject", "terminal-only and irreversible for the ejected member — it rotates the channel key, so every remaining member is re-keyed. Never an agent's call. MCP surface deferred to Tier 5"],
+  ["cello_channel_approve", "terminal-only: admitting a stranger to a private channel is the admin's judgement, and the order forbids any auto-approve. MCP surface deferred to Tier 5"],
+  ["cello_channel_refuse", "terminal-only: the other half of the admin's judgement on a join request. MCP surface deferred to Tier 5"],
   ["cello_channel_config", "terminal-only: records which relays a channel publishes to, the decision every other channel verb reads. MCP surface deferred to Tier 5"],
   ["cello_channel_publish", "terminal-only: a post carries the operator's signature to every subscriber, so it is not a tool an agent may reach for. MCP surface deferred to Tier 5"],
   ["cello_channel_info_set", "terminal-only: signs the channel's public description under the channel key. MCP surface deferred to Tier 5"],

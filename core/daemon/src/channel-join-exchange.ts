@@ -36,6 +36,7 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import type { Logger } from "./types.js";
 import type { ChannelMembershipStore } from "./channel-membership-store.js";
 import type { ChannelSubscriptionStore } from "./channel-subscription-store.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /** What this daemon knows about a channel it administers. `null` means it does not administer one. */
 export interface LocalChannelAdmin {
@@ -277,7 +278,7 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
       try {
         members.approve(channelHex, subscriberHex);
       } catch (err: unknown) {
-        return { ok: false, reason: err instanceof Error ? err.message : "approve_failed" };
+        return { ok: false, reason: extractErrorMessage(err) };
       }
       await acceptInto(sessionId, channelHex, subscriberHex, admin);
       return { ok: true };

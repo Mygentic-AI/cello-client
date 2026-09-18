@@ -325,13 +325,14 @@ export const REFUSAL_GUIDANCE: Record<RefusalReason, string> = {
     "session with the channel's admin agent instead; they have been told so if you know them. To " +
     "talk to them yourself, use cello_initiate_session from a non-channel agent.",
   [REFUSAL_REASONS.SESSION_FROM_SUBSCRIBED_CHANNEL]:
-    "REFUSED, AND TREAT THIS AS SUSPICIOUS. The identity that tried to open a session with you is a " +
+    "REFUSED ON PURPOSE, AND TREAT IT AS SUSPICIOUS. The identity that tried to open a session with you is a " +
     "broadcast channel you subscribe to. Channels publish and never open sessions, so this is not " +
     "something a working channel does. Either its key is in somebody else's hands, or someone has " +
     "taken a channel's public key and is trading on the trust you already place in it. Nothing was " +
-    "accepted. Read the channel's posts as usual; if you need to reach the operator behind it, open " +
-    "a session with the channel's admin agent, whose key you can check against the channel's own " +
-    "published description.",
+    "accepted. Confirm out of band — on something that is not this channel — whether the operator " +
+    "behind it meant to contact you. Until they answer, do not accept a session from that key. To " +
+    "reach them yourself, run cello_initiate_session against the channel's ADMIN agent, whose key " +
+    "you can check against the channel's own published description.",
   [REFUSAL_REASONS.INBOUND_ASSIGNMENT_INVALID]:
     "REFUSED ON PURPOSE. The session assignment did not verify, so this agent would have been " +
     "opening its receiver to a peer named by a document it could not check. Nothing was accepted. " +

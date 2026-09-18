@@ -54,6 +54,8 @@ import { registerAgentAdminHandlers } from "./agent-admin-handlers.js";
 // M16 018-PUBCOLLECT — the channel publishing half.
 import { wireChannelPublishing } from "./channel-publish-wiring.js";
 import { ChannelSubscriptionStore } from "./channel-subscription-store.js";
+import { wireChannelMembership } from "./channel-membership-wiring.js";
+import { LEAF_KIND_MSG } from "./session-relay-client.js";
 import { registerStatusHandler } from "./status-handler.js";
 import { registerBackupRestoreHandlers } from "./backup-restore-handlers.js";
 import { wireDocumentGate } from "./document-gate-wiring.js";
@@ -644,6 +646,29 @@ async function startDaemonHoldingLock(
 
   // M16 018-PUBCOLLECT: the channel publishing verbs, their log, their relay client and the
   // per-channel publisher → channel-publish-wiring.ts. What stays here is the wiring.
+  // M16 019-MEMBERSHIP: joining, the group key, the eject re-key and the operator's channel verbs
+  // → channel-membership-wiring.ts. What stays here is the wiring.
+  wireChannelMembership({
+    handlers, logger,
+    getDb: () => sessionNodeManager.getDb(),
+    sendInSession: async (agentName, sessionId, content) => {
+      // The hash comes from the SESSION, because a salted session hashes differently — computing it
+      // here would produce a leaf the counterparty's chain cannot match. Leaf kind `msg`: a join
+      // frame is not conversation, but a leaf kind is what a VERIFIER renders a leaf by, and a
+      // third kind would make every existing verifier unable to read a transcript carrying a join.
+      const { hash, alg } = await sessionNodeManager.contentHashForSession(agentName, sessionId, content);
+      await sessionNodeManager.sendContent(agentName, sessionId, content, new Uint8Array(hash), undefined, LEAF_KIND_MSG, alg);
+    },
+    setOnChannelJoinFrame: (cb) => { sessionNodeManager.setOnChannelJoinFrame(cb); },
+    loadedAgents, keyProviders,
+    resolveAgentId: (agentName) => sessionNodeManager.resolveAgentId(agentName),
+    resolveCurrentAgent: (connectionId, explicitAgent) =>
+      resolveCurrentAgent(perConnectionState.get(connectionId), explicitAgent),
+    activeSessionsFor: (agentName) => sessionNodeManager.getSessionsForAgent(agentName)
+      .filter((s) => s.status === "active")
+      .map((s) => ({ sessionId: s.session_id, counterpartyPubkeyHex: s.counterparty_pubkey })),
+  });
+
   const channelWiring = wireChannelPublishing({
     handlers, logger,
     getDb: () => sessionNodeManager.getDb(),

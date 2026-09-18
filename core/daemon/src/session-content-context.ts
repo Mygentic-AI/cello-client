@@ -144,6 +144,20 @@ export interface SessionContentPipelineContext {
       ) => { consumed: boolean; kind?: string })
     | null;
   readonly isDocumentFrame: ((content: Uint8Array) => boolean) | null;
+  /**
+   * M16 019 — the channel join exchange's hook. Its own, not a second job for `onDocumentFrame`:
+   * both consume a frame and append a leaf, and one callback doing two unrelated jobs is how the
+   * second one ends up silently skipped when the first is rewired.
+   */
+  readonly onChannelJoinFrame:
+    | ((
+        agentName: string,
+        sessionId: string,
+        content: Uint8Array,
+        senderPubkey: string,
+        correlationId?: string,
+      ) => { consumed: boolean })
+    | null;
   readonly onAwaitingPersisted: ((agentName: string, sessionId: string, contentHashHex: string) => void) | null;
   readonly inboundFrameObserver: ((frame: Record<string, unknown>) => void) | null;
 

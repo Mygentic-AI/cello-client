@@ -278,7 +278,8 @@ describe("M16 006-NOCONVERSE: a channel refuses an inbound session", () => {
     // The sibling refusal says "there is nothing wrong and nothing to retry" — correct there, and
     // exactly wrong here. This one is a signal about the counterparty, and must read as one.
     expect(guidance.toLowerCase()).toContain("suspicious");
-    expect(guidance).toContain("admin");
+    // It must point somewhere the operator can actually go, and that is the channel's ADMIN agent.
+    expect(guidance.toLowerCase()).toContain("admin");
   });
 
   it("the refusal fires AFTER signature verification", async () => {

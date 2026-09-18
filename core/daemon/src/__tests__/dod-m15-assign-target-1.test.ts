@@ -185,6 +185,8 @@ async function makeHarness(opts: {
     autoNatService: { getDialability: () => ({ dialable: false, publicAddr: null }) },
     buildRelayConnectParams: async () => undefined,
     isChannelAgent: () => false,
+    // M16 019: this harness is not testing channel subscriptions — nobody here subscribes to one.
+    isSubscribedChannel: () => false,
   } as unknown as InitiateSessionDeps);
 
   return { openSessionAs, events, dials, sessionNodesCreated, counterpartyConnects, counterpartyPrimaries };
