@@ -42,6 +42,12 @@ const withLayer2 = process.argv.includes("--layer2");
 // same number whether the rules contribute everything or nothing.
 const layer2Only = process.argv.includes("--layer2-only");
 
+/** Every benign classifier score, so the block bar is set from a distribution and not a guess. */
+const benignScores = [];
+/** Set in both classifier modes; scores a benign message exactly as the shipped path would. */
+let benignScorer = null;
+
+
 const { initLinearRegex } = await import(join(GATEWAY, "detect/linear-regex.js"));
 const { compileInjectionPatterns } = await import(join(GATEWAY, "detect/injection-patterns.js"));
 const { InboundScreener } = await import(join(GATEWAY, "screen/inbound.js"));
@@ -72,6 +78,22 @@ if (withLayer2 || layer2Only) {
   const scanner = new InjectionScanner(load.classifier);
   screener = new InboundScreener({ injectionScanner: scanner });
   if (layer2Only) scanOnly = scanner;
+  // Worst-of-the-copies, the same rule inbound.ts applies — not the scan copy alone.
+  const { sanitizeInbound } = await import(join(GATEWAY, "detect/sanitize.js"));
+  benignScorer = async (text) => {
+    const bytes = enc.encode(text);
+    const r = sanitizeInbound(bytes);
+    if (r.blocked) return 0;
+    const copies = layer2Only
+      ? [text]
+      : [r.decodedForScan, text, r.hiddenText].filter((c, i, all) => c !== "" && all.indexOf(c) === i);
+    let worst = 0;
+    for (const c of copies) {
+      const s = await scanner.scan(c);
+      if (s.available && (s.score ?? 0) > worst) worst = s.score ?? 0;
+    }
+    return worst;
+  };
   layer2Note = `${layer2Only ? "Layer 2 ONLY (rules out of the path)" : "BOTH layers"} (${state.revision.slice(0, 8)}, loaded in ${((Date.now() - t0) / 1000).toFixed(1)}s)`;
 }
 console.log(layer2Note);
@@ -81,11 +103,14 @@ let totalMs = 0;
 let totalScreened = 0;
 let slowest = { ms: 0, bytes: 0 };
 
-/** Every benign classifier score, so the block bar is set from a distribution and not a guess. */
-const benignScores = [];
 
 /** BLOCKED / FLAGGED / PASSES — "caught" is either of the first two. */
 async function verdict(text, isBenign = false) {
+  // The block bar is set from this distribution, so it has to be measured in the configuration we
+  // SHIP. Collecting it only in --layer2-only measured the rules-out-of-the-path, single-copy,
+  // pre-fix path; worst-of-three-copies can only move benign scores UP, so that run understated the
+  // refusals the shipped screener would make.
+  if (isBenign && benignScorer) benignScores.push(await benignScorer(text));
   const started = Date.now();
   if (scanOnly) {
     const r = await scanOnly.scan(text);
@@ -94,7 +119,6 @@ async function verdict(text, isBenign = false) {
     totalScreened++;
     if (took > slowest.ms) slowest = { ms: took, bytes: text.length };
     if (!r.available) return "PASSES";
-    if (isBenign) benignScores.push(r.score);
     if (r.verdict === "block") return "BLOCKED:inbound_injection_blocked";
     return r.verdict === "flag" ? "FLAGGED" : "PASSES";
   }
