@@ -252,7 +252,14 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // `createChannelJoinExchange`, which it builds. Unwired, this would be the same hole as its two
     // predecessors — a join frame would fall through to the transcript as something a person said,
     // and no membership verb would answer.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(108);
+    //
+    // 108 → 110 for M16 020-CHANADMIN, TWO factories again: `createChannelAdminLookup`
+    // (channel-admin-lookup.ts), which asks a directory who administers a channel, and
+    // `createProfileAdminPubkey`, which decides between this daemon's own settings and that lookup.
+    // Unwired they would be silent in this corpus's own way — the subscriber's admin check would go
+    // on refusing every channel not published on this machine, which is EXACTLY how the code behaved
+    // before the order and so looks like nothing changed rather than like something broke.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(110);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",
