@@ -92,7 +92,10 @@ export function registerChannelPublishHandlers(deps: ChannelPublishDeps): void {
       // `no_relay_accepted` is the one refusal where the post SURVIVES, and a caller that did not
       // know that would publish it again and burn a second post number on the same content.
       guidance: result.reason === "no_relay_accepted"
-        ? "No relay took the post. It is in your log — retry with cello_channel_resend rather than publishing it again."
+        // `cello channel resend`, NOT the handler's own name: these verbs are terminal-only, so a
+        // `cello_*` token here would hand the operator a command that does not exist on any surface
+        // they can reach.
+        ? "No relay took the post. It is in your log — retry with 'cello channel resend' rather than publishing it again."
         : undefined,
     };
   });

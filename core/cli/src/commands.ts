@@ -1216,6 +1216,39 @@ export async function trustSignals(
   };
 }
 
+/**
+ * M16 018-PUBCOLLECT — the terminal side of the four channel publishing verbs.
+ *
+ * These are IPC-only by order 018: an MCP tool would put "publish to every subscriber" in reach of
+ * anything that can drive an agent's tools, and a channel's posts are the publisher's own name on
+ * the record. The caller here is a person at a terminal, deliberately.
+ *
+ * ⚠️ The daemon ANSWERS refusals rather than throwing them, so a `{ ok: false }` is printed with its
+ * guidance and exits non-zero. A thrown error means the daemon could not be reached at all, which is
+ * a different thing and says so.
+ */
+export async function channelVerb(
+  celloDir: string,
+  verb: string,
+  params: Record<string, unknown>,
+): Promise<CommandResult> {
+  const lockFilePath = join(celloDir, "daemon.lock");
+  const lock = await readLock(lockFilePath);
+  if (!lock) {
+    return { exitCode: 1, output: JSON.stringify({ daemon: "stopped" }, null, 2) };
+  }
+  try {
+    const result = (await withIpc(lock.socketPath, async (client) => {
+      await client.send("ipc.connect", { clientType: "cli" });
+      return client.send(verb, params);
+    })) as { ok?: boolean };
+    return { exitCode: result?.ok === true ? 0 : 1, output: JSON.stringify(result, null, 2) };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { exitCode: 1, output: JSON.stringify({ daemon: "unreachable", error: message }, null, 2) };
+  }
+}
+
 export async function telegramSetToken(celloDir: string, botToken: string, chatId: string): Promise<CommandResult> {
   const lockFilePath = join(celloDir, "daemon.lock");
   const lock = await readLock(lockFilePath);

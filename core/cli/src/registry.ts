@@ -27,6 +27,7 @@ import {
   sessions,
   type SessionFilter,
   telegramSetToken,
+  channelVerb,
   attestations,
   trustSignals,
   type CommandResult,
@@ -1531,6 +1532,49 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       if (sub === "set" && name) return monikerSet(ctx.celloDir, name, opts);
       if (sub === "clear" && !name) return monikerSet(ctx.celloDir, null, opts);
       return { stdout: helpForSpec("moniker"), stderr: "", exitCode: 1 };
+    },
+  },
+  {
+    name: "channel",
+    group: "Other",
+    summary: "Publish to a broadcast channel you hold the key to.",
+    help:
+      "Usage: cello channel publish <channel> <title> <body> [--agent <agent>]\n" +
+      "       cello channel info-set <channel> [--agent <agent>]\n" +
+      "       cello channel prune <channel> <through_seq> [--agent <agent>]\n" +
+      "       cello channel resend <channel> [--agent <agent>]\n" +
+      "  <channel> is the channel's 64-character hex public key.\n" +
+      "  A post is signed by BOTH the channel key and your agent key, so a reader can tell which\n" +
+      "  operator published it, not only which channel.\n" +
+      "  It goes to the channel's two relays. ONE relay refusing is not a failed publish — the post\n" +
+      "  is in your log either way, and 'resend' refills a relay that lost it or one you just added.\n" +
+      "  'prune' drops posts from the OLDEST end only, through the number you give.\n" +
+      "  'info-set' signs and deposits the channel's description so subscribers can read it.",
+    flags: AGENT_FLAG,
+    jsonOut: true,
+    async run(ctx, args) {
+      const { agent, positional } = parityOpts(args);
+      const [sub, channel, a, b] = positional;
+      const withAgent = (p: Record<string, unknown>) => (agent ? { ...p, agent } : p);
+      if (sub === "publish" && channel && a !== undefined && b !== undefined) {
+        return legacy(await channelVerb(ctx.celloDir, "cello_channel_publish", withAgent({ channel, title: a, body: b })));
+      }
+      if (sub === "info-set" && channel) {
+        return legacy(await channelVerb(ctx.celloDir, "cello_channel_info_set", withAgent({ channel })));
+      }
+      if (sub === "prune" && channel && a !== undefined) {
+        // Parsed here so a non-numeric argument is a usage error in the terminal rather than a
+        // `bad_seq` round-trip through the daemon.
+        const through = Number(a);
+        if (!Number.isSafeInteger(through) || through < 1) {
+          return { stdout: "through_seq must be a whole number of 1 or more", stderr: "", exitCode: 1 };
+        }
+        return legacy(await channelVerb(ctx.celloDir, "cello_channel_prune", withAgent({ channel, through_seq: through })));
+      }
+      if (sub === "resend" && channel) {
+        return legacy(await channelVerb(ctx.celloDir, "cello_channel_resend", withAgent({ channel })));
+      }
+      return { stdout: helpForSpec("channel"), stderr: "", exitCode: 1 };
     },
   },
   {

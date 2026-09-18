@@ -51,6 +51,13 @@ import { registerContactHandlers } from "./contact-handlers.js";
 import { registerSignalHandlers } from "./signal-handlers.js";
 import { registerTestHandlers } from "./test-handlers.js";
 import { registerAgentAdminHandlers } from "./agent-admin-handlers.js";
+// M16 018-PUBCOLLECT — the channel publishing half.
+import { registerChannelPublishHandlers } from "./channel-publish-handlers.js";
+import { ChannelPublisher } from "./channel-publisher.js";
+import { ChannelLogStore } from "./channel-log-store.js";
+import { ChannelConfigStore } from "./channel-config-store.js";
+import { ChannelRelayClient } from "./channel-relay-client.js";
+import type { KeyProvider } from "@cello-protocol/crypto";
 import { registerStatusHandler } from "./status-handler.js";
 import { registerBackupRestoreHandlers } from "./backup-restore-handlers.js";
 import { wireDocumentGate } from "./document-gate-wiring.js";
@@ -632,6 +639,70 @@ async function startDaemonHoldingLock(
     getConnState: (connectionId) => perConnectionState.get(connectionId),
     resolveCurrentAgent, getPersistence, getAgentSignaling, waitForSignalingConnected,
     resolveConsortiumRoster, getFailoverEndpoint, sealFailures,
+  });
+
+  /**
+   * M16 018-PUBCOLLECT: the channel publishing verbs.
+   *
+   * ⚠️ The publisher is built PER CHANNEL AGENT and only when its key is loaded — a channel is an
+   * agent whose key this daemon holds, and a publisher without one could sign nothing. `null` makes
+   * the verb answer `channel_unknown`, which is the truth: this daemon does not publish for it.
+   *
+   * Order 017's own wiring gap is why this line exists at all in the same commit as the handlers:
+   * a registered module nothing calls is a feature that does not exist, and `startup-ordering.test`
+   * is what caught it here.
+   */
+  const channelLogStore = new ChannelLogStore(sessionNodeManager.getDb(), logger);
+  const channelConfigStore = new ChannelConfigStore(sessionNodeManager.getDb(), logger);
+  const channelRelayClient = new ChannelRelayClient({
+    getNode: () => sessionNodeManager.getStandingReceiverNode() ?? null,
+    logger,
+  });
+
+  /**
+   * The channel key is looked up BY PUBKEY, because that is what a post is signed with and what a
+   * subscriber verifies against. A channel is an agent this daemon holds; the map is rebuilt per
+   * lookup rather than cached, so an agent added after boot is publishable without a restart.
+   */
+  const channelKeyByPubkey = (channelHex: string): KeyProvider | null => {
+    const match = loadedAgents.find((a) => a.pubkey.toLowerCase() === channelHex.toLowerCase());
+    return match ? match.keyProvider : null;
+  };
+
+  const buildChannelPublisher = (agentName: string): ChannelPublisher | null => {
+    if (!keyProviders.has(agentName)) return null;
+    return new ChannelPublisher({
+      db: sessionNodeManager.getDb(),
+      logger,
+      log: channelLogStore,
+      deposit: (relay, req) => channelRelayClient.deposit(relay, { post_cbor: req.post_cbor }),
+      relayHead: (relay, channelHex) =>
+        channelRelayClient.head(relay, Buffer.from(channelHex, "hex")),
+      // The screen has no session to name, so it says what it IS screening. A borrowed session id
+      // would put channel posts in another conversation's governance history.
+      screenOutbound: (bytes, ctx) =>
+        securityGateway.screenOutbound(bytes, {
+          direction: "outbound", agentName: ctx.agentName, sessionId: `channel:${agentName}`,
+          ...(ctx.correlationId !== undefined ? { correlationId: ctx.correlationId } : {}),
+        }),
+      getChannelKey: channelKeyByPubkey,
+      getAgentKey: (name) => keyProviders.get(name) ?? null,
+      /**
+       * ⚠️ **THERE IS NO GROUP KEY UNTIL 019**, so a private channel REFUSES to publish rather than
+       * depositing a body that looks encrypted and is not. Publishing plaintext under an `access`
+       * that promises members-only would put the operator's content on two relays under a claim
+       * this code cannot keep — the one failure the whole encrypt step exists to prevent.
+       */
+      encryptBody: () => Promise.reject(new Error("channel_group_key_unavailable")),
+      channelInfo: (channelHex) => channelConfigStore.get(channelHex),
+    });
+  };
+
+  registerChannelPublishHandlers({
+    handlers, logger,
+    resolveCurrentAgent: (connectionId, explicitAgent) =>
+      resolveCurrentAgent(perConnectionState.get(connectionId), explicitAgent),
+    getPublisher: (agentName) => buildChannelPublisher(agentName),
   });
 
   // ─── Trust-signal wallet (operator-facing, no agent scope required) ───

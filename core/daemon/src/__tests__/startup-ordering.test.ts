@@ -232,7 +232,12 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // epoch layer — TWO factories, not one. Neither could enforce what it claimed: the caps lived in
     // the publisher's own daemon, so accountability moved into the post's two signatures and the
     // relay's receipt, and there is no periodic sealer left to wire.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(103);
+    //
+    // 103 → 104 for M16 018-PUBCOLLECT's `registerChannelPublishHandlers`
+    // (channel-publish-handlers.ts). This guard caught it unwired, which is exactly the hole order
+    // 017 shipped through: the four publishing verbs existed, compiled and tested, and no IPC call
+    // could reach any of them.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(104);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",

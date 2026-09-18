@@ -44,6 +44,16 @@ const EXEMPT = new Map<string, string>([
   ["cello_refresh_shares", "recovery plumbing invoked by the restore flow, never an operator verb"],
   ["cello_get_relay_receipts", "diagnostic read used by support tooling, not surfaced to operators"],
   ["cello_telegram_set_token", "credential entry — deliberately terminal-only, never over MCP"],
+  /**
+   * M16 018-PUBCOLLECT. All four ARE reachable — `cello channel publish|info-set|prune|resend` —
+   * and are deliberately absent from MCP. Publishing puts the operator's own name on a post that
+   * every subscriber keeps, so the caller is a person at a terminal; an MCP tool would put it in
+   * reach of anything that can drive the agent's tools. Order 018 defers the MCP surface to Tier 5.
+   */
+  ["cello_channel_publish", "terminal-only: a post carries the operator's signature to every subscriber, so it is not a tool an agent may reach for. MCP surface deferred to Tier 5"],
+  ["cello_channel_info_set", "terminal-only: signs the channel's public description under the channel key. MCP surface deferred to Tier 5"],
+  ["cello_channel_prune", "terminal-only and destructive — dropped posts cannot be re-signed at their old numbers. MCP surface deferred to Tier 5"],
+  ["cello_channel_resend", "terminal-only: repair of a relay that lost content, run by the publisher deliberately. MCP surface deferred to Tier 5"],
   ["cello_create_agent", "onboarding runs in the terminal; the MCP shim has no agent to act as yet"],
   ["cello_register", "onboarding runs in the terminal; needs a token pasted from another channel"],
   ["cello_remove_agent", "destructive and irreversible — deliberately requires the terminal"],

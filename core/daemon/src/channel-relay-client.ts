@@ -15,17 +15,21 @@
  * on one prints "[object Object]". Its own reason is preserved rather than overwritten with a
  * generic one; `content-park-client.ts` records what discarding it cost.
  */
-import { Encoder, decode } from "cbor-x";
 import * as lp from "it-length-prefixed";
 import type { Stream } from "@libp2p/interface";
 import type { CelloNode } from "@cello-protocol/transport";
+import { encodeCbor, decodeCbor } from "@cello-protocol/protocol-types";
 import type { Logger } from "./types.js";
 
 export const CHANNEL_PROTOCOL_ID = "/cello/channel/1.0.0";
 
-// ⚠️ `useRecords: false` is load-bearing: cbor-x otherwise writes its own tag instead of a CBOR map,
-// which the relay's decoder — and every other CBOR reader — does not speak.
-const CBOR_ENC = new Encoder({ tagUint8Array: false, useRecords: false });
+/**
+ * ⚠️ THE SHARED ENCODER, NOT A LOCAL ONE. `no-multiple-cbor-encoders.test.ts` exists because
+ * `new Encoder({ tagUint8Array: false })` was copy-pasted into fourteen files and two of them used
+ * cbor-x's bare `encode` instead — writing tag-64 typed arrays into the same columns the others
+ * wrote as raw bytes. cbor-x reads both, so the corruption was invisible until a non-cbor-x reader
+ * touched it. I wrote a local encoder here anyway; the guard caught it.
+ */
 
 function toU8(chunk: unknown): Uint8Array {
   if (chunk instanceof Uint8Array) return chunk;
@@ -79,11 +83,11 @@ export class ChannelRelayClient {
     }
 
     try {
-      stream.send(lp.encode.single(CBOR_ENC.encode(frame)));
+      stream.send(lp.encode.single(encodeCbor(frame)));
       const iter = (lp.decode(stream) as AsyncIterable<unknown>)[Symbol.asyncIterator]();
       const res = await iter.next();
       if (res.done || res.value === undefined) throw new Error("relay_closed_without_answering");
-      const answer = decode(toU8(res.value)) as unknown;
+      const answer = decodeCbor(toU8(res.value)) as unknown;
       if (typeof answer !== "object" || answer === null || Array.isArray(answer)) {
         throw new Error("relay_answer_malformed");
       }
