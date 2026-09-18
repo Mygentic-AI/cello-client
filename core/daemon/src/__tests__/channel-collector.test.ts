@@ -202,7 +202,10 @@ describe("M16 018-PUBCOLLECT: collecting", () => {
     await h.place(RELAY_A, await h.post(3));
 
     await h.collector.collectOnce(AGENT, h.channelHex);
-    expect(h.inbox.range(AGENT, h.channelHex, 1, 10).map((p) => p.seq)).toEqual([1]);
+    // The INVALID one is absent; a later valid post is still stored, because storage and delivery
+    // are different questions — when 2 is repaired, 3 is already here and the run closes at once.
+    expect(h.inbox.range(AGENT, h.channelHex, 1, 10).map((p) => p.seq)).toEqual([1, 3]);
+    // ⚠️ But the POSITION stops at 1: post 2 was never delivered, so nothing past it may be.
     expect(h.subs.get(AGENT, h.channelHex)?.delivered_through).toBe(1);
     const invalid = h.events.find((e) => e.name === "channel.post.invalid");
     expect(invalid, "the drop must say WHICH check failed").toBeDefined();

@@ -105,9 +105,12 @@ async function harness(opts: { access?: "public" | "open" } = {}): Promise<Harne
     screenOutbound: () => Promise.resolve(screen.block ? { disposition: "block", reason: "injection" } : { disposition: "allow" }),
     getChannelKey: () => channelKp,
     getAgentKey: () => adminKp,
-    // 019 owns the group key. Until then a non-public channel's body is sealed by this seam, and the
-    // publisher must not be able to tell the difference.
-    encryptBody: (plaintext) => Promise.resolve(new Uint8Array([0xe1, ...plaintext])),
+    /**
+     * 019 owns the group key; this stands in for it. It XORs rather than merely prefixing, because a
+     * prefix leaves the plaintext readable — and test 7, which asserts the body is not readable,
+     * would then pass against a publisher that never encrypted anything at all.
+     */
+    encryptBody: (plaintext) => Promise.resolve(new Uint8Array([0xe1, ...plaintext.map((b) => b ^ 0x5a)])),
     channelInfo: () => ({
       access: opts.access ?? "open",
       relays: [RELAY_A, RELAY_B],
@@ -198,7 +201,10 @@ describe("M16 018-PUBCOLLECT: publishing", () => {
     const second = decodeBroadcastArtifact(toA[1].postCbor);
     expect(first.ok && second.ok).toBe(true);
     if (!first.ok || !second.ok) return;
-    expect(second.artifact.published_at).toBeGreaterThanOrEqual(first.artifact.published_at);
+    // The retry APPLIES the relay's number rather than guessing: the relay said this publisher was
+    // 90s ahead, so the re-signed time is 90s earlier. Re-signing at the same clock would be refused
+    // identically, for ever.
+    expect(second.artifact.published_at).toBe(first.artifact.published_at - 90_000);
     expect(second.artifact.seq, "a retry is the SAME post, not the next one").toBe(first.artifact.seq);
   });
 
@@ -211,7 +217,11 @@ describe("M16 018-PUBCOLLECT: publishing", () => {
     // ⚠️ REFUSES, never warns-and-publishes. The screen is the publisher's own early check, and a
     // check that proceeds anyway is decoration.
     expect(h.deposits, "nothing reached a relay").toEqual([]);
-    expect(h.log.head(h.channelHex).last_seq, "nothing reached the log").toBeNull();
+    // Nothing reached the log either — and the channel was never even opened in it, so `head`
+    // refuses rather than reporting an empty channel that a refused publish had created.
+    let thrown: unknown;
+    try { h.log.head(h.channelHex); } catch (err) { thrown = err; }
+    expect((thrown as { code?: string } | undefined)?.code, "nothing reached the log").toBe("channel_unknown");
   });
 
   it("7. a PUBLIC channel's body is plaintext; an open channel's is ciphertext", async () => {
