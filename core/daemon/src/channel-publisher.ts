@@ -330,6 +330,10 @@ export class ChannelPublisher {
    */
   async resendMissing(agentName: string, channelHex: string, relay: string, correlationId?: string): Promise<{ deposited: number }> {
     const { log, logger } = this.#opts;
+    // A channel that has been set up but never published has no log row yet, and `head` THROWS on
+    // one. Nothing to resend is an ANSWER — `deposited: 0` — not an error: a freshly created channel
+    // is the most likely thing an operator runs this against, and it came back looking broken.
+    log.ensureChannel(channelHex);
     const head = log.head(channelHex);
     if (head.first_seq === null || head.last_seq === null) return { deposited: 0 };
 
@@ -398,6 +402,8 @@ export class ChannelPublisher {
     pruned: number; relays: Array<{ relay: string; ok: boolean; reason?: string }>;
   }> {
     const { logger } = this.#opts;
+    // Same as `resendMissing`: pruning a channel with nothing in it yet is "pruned 0", not an error.
+    this.#opts.log.ensureChannel(channelHex);
     const { pruned } = this.#opts.log.pruneThrough(channelHex, throughSeq);
     const info = this.#opts.channelInfo(channelHex);
     const relays = info?.relays ?? [];
