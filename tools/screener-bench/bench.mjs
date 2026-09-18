@@ -37,6 +37,10 @@ const labels = JSON.parse(readFileSync(join(HERE, "labels.json"), "utf8"));
 const showMisses = process.argv.includes("--misses");
 
 const withLayer2 = process.argv.includes("--layer2");
+// Layer 2 ALONE: the classifier scored directly, with the rules out of the path entirely. Without
+// it the two-layer run cannot answer "do the rules still earn their place" — a combined 92% is the
+// same number whether the rules contribute everything or nothing.
+const layer2Only = process.argv.includes("--layer2-only");
 
 const { initLinearRegex } = await import(join(GATEWAY, "detect/linear-regex.js"));
 const { compileInjectionPatterns } = await import(join(GATEWAY, "detect/injection-patterns.js"));
@@ -48,7 +52,8 @@ compileInjectionPatterns();
 // test this milestone was warned to expect right here.
 let layer2Note = "Layer 2 OFF (rules only)";
 let screener = new InboundScreener();
-if (withLayer2) {
+let scanOnly = null;
+if (withLayer2 || layer2Only) {
   const { loadInjectionClassifier } = await import(join(GATEWAY, "detect/injection-classifier-onnx.js"));
   const { InjectionScanner } = await import(join(GATEWAY, "detect/injection-scanner.js"));
   const { screenerModelDir, screenerState, runtimeAvailable, classifierLoadable } = await import(join(GATEWAY, "detect/screener-state.js"));
@@ -64,8 +69,10 @@ if (withLayer2) {
     console.error(`--layer2 asked for, but the model did not load: ${load.reason}`);
     process.exit(1);
   }
-  screener = new InboundScreener({ injectionScanner: new InjectionScanner(load.classifier) });
-  layer2Note = `Layer 2 ON (${state.revision.slice(0, 8)}, loaded in ${((Date.now() - t0) / 1000).toFixed(1)}s)`;
+  const scanner = new InjectionScanner(load.classifier);
+  screener = new InboundScreener({ injectionScanner: scanner });
+  if (layer2Only) scanOnly = scanner;
+  layer2Note = `${layer2Only ? "Layer 2 ONLY (rules out of the path)" : "BOTH layers"} (${state.revision.slice(0, 8)}, loaded in ${((Date.now() - t0) / 1000).toFixed(1)}s)`;
 }
 console.log(layer2Note);
 const enc = new TextEncoder();
@@ -74,9 +81,23 @@ let totalMs = 0;
 let totalScreened = 0;
 let slowest = { ms: 0, bytes: 0 };
 
+/** Every benign classifier score, so the block bar is set from a distribution and not a guess. */
+const benignScores = [];
+
 /** BLOCKED / FLAGGED / PASSES — "caught" is either of the first two. */
-async function verdict(text) {
+async function verdict(text, isBenign = false) {
   const started = Date.now();
+  if (scanOnly) {
+    const r = await scanOnly.scan(text);
+    const took = Date.now() - started;
+    totalMs += took;
+    totalScreened++;
+    if (took > slowest.ms) slowest = { ms: took, bytes: text.length };
+    if (!r.available) return "PASSES";
+    if (isBenign) benignScores.push(r.score);
+    if (r.verdict === "block") return "BLOCKED:inbound_injection_blocked";
+    return r.verdict === "flag" ? "FLAGGED" : "PASSES";
+  }
   const v = await screener.screen(enc.encode(text));
   const took = Date.now() - started;
   totalMs += took;
@@ -103,7 +124,7 @@ async function bordair() {
   const byTemplate = new Map();
   const benign = { n: 0, flagged: 0, blocked: 0 };
   for (const row of sample) {
-    const v = await verdict(row.text);
+    const v = await verdict(row.text, row.kind === "benign");
     if (row.kind === "benign") {
       benign.n++;
       if (v === "FLAGGED") benign.flagged++;
@@ -123,11 +144,18 @@ async function bordair() {
       byTemplate.set(k, t);
     }
   }
-  console.log(`bordair  LAYER 1 (ours):   ${score.layer1.c}/${score.layer1.n}  ${pct(score.layer1.c, score.layer1.n)}`);
+  console.log(`bordair  OUR-GROUND:       ${score.layer1.c}/${score.layer1.n}  ${pct(score.layer1.c, score.layer1.n)}`);
   const tCaught = [...byTemplate.values()].filter((t) => t.c > 0).length;
-  console.log(`bordair  LAYER 1 per template: ${tCaught}/${byTemplate.size}  ${pct(tCaught, byTemplate.size)}  ← the one to trust`);
+  console.log(`bordair  OUR-GROUND per template: ${tCaught}/${byTemplate.size}  ${pct(tCaught, byTemplate.size)}  ← the one to trust`);
   console.log(`bordair  classifier's:     ${score.classifier.c}/${score.classifier.n}  ${pct(score.classifier.c, score.classifier.n)}  (informational)`);
-  console.log(`bordair  benign:           ${benign.flagged}/${benign.n} flagged by a pattern, ${benign.blocked} blocked by the language rule`);
+  console.log(`bordair  benign:           ${benign.flagged}/${benign.n} flagged, ${benign.blocked} blocked`);
+  if (benignScores.length > 0) {
+    const sorted = [...benignScores].sort((a, b) => a - b);
+    const at = (q) => sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
+    const over = (bar) => sorted.filter((s) => s >= bar).length;
+    console.log(`bordair  benign classifier scores: p50 ${at(0.5)} p90 ${at(0.9)} p99 ${at(0.99)} max ${sorted[sorted.length - 1]}`);
+    console.log(`bordair  benign at or above bar:   70→${over(70)}  90→${over(90)}  95→${over(95)}  99→${over(99)}  (of ${sorted.length})`);
+  }
   if (score.unlabelled.length > 0) console.log(`  ⚠ UNLABELLED categories (add to labels.json): ${score.unlabelled.join(", ")}`);
   if (showMisses) {
     const byGroup = {};
@@ -155,7 +183,7 @@ async function mindgard() {
   }
   const sum = (cls) => Object.values(per).filter((p) => p.cls === cls).reduce((a, p) => ({ n: a.n + p.n, kept: a.kept + p.kept }), { n: 0, kept: 0 });
   const l1 = sum("layer1"), cl = sum("classifier");
-  console.log(`mindgard LAYER 1 (ours):   ${l1.kept}/${l1.n}  ${pct(l1.kept, l1.n)} of attacks we catch plain survive the disguise`);
+  console.log(`mindgard OUR-GROUND:       ${l1.kept}/${l1.n}  ${pct(l1.kept, l1.n)} of attacks we catch plain survive the disguise`);
   console.log(`mindgard classifier's:     ${cl.kept}/${cl.n}  ${pct(cl.kept, cl.n)}  (word-swap attacks — informational)`);
   for (const [k, p] of Object.entries(per).filter(([, p]) => p.cls === "layer1").sort((a, b) => a[1].kept / a[1].n - b[1].kept / b[1].n))
     if (p.kept < p.n) console.log(`   weak ${k}: ${p.kept}/${p.n}`);
@@ -176,7 +204,7 @@ async function p4rs() {
   }
   const rows = [...per.entries()];
   const ok = rows.filter(([, p]) => p.caught).length;
-  console.log(`p4rs     LAYER 1 (ours):   ${ok}/${rows.length}  ${pct(ok, rows.length)} of model-readable transforms seen through`);
+  console.log(`p4rs     OUR-GROUND:       ${ok}/${rows.length}  ${pct(ok, rows.length)} of model-readable transforms seen through`);
   if (showMisses) for (const [n, p] of rows.filter(([, p]) => !p.caught)) console.log(`   miss ${n}: ${JSON.stringify(p.example.slice(0, 90))}`);
 }
 
