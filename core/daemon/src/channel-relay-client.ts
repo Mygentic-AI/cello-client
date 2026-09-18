@@ -24,11 +24,14 @@ import type { Logger } from "./types.js";
 export const CHANNEL_PROTOCOL_ID = "/cello/channel/1.0.0";
 
 /**
- * ⚠️ THE SHARED ENCODER, NOT A LOCAL ONE. `no-multiple-cbor-encoders.test.ts` exists because
- * `new Encoder({ tagUint8Array: false })` was copy-pasted into fourteen files and two of them used
+ * ⚠️ THE SHARED ENCODER, NOT A LOCAL ONE. `no-multiple-cbor-encoders.test.ts` exists because a
+ * locally-constructed cbor-x encoder was copy-pasted into fourteen files and two of them used
  * cbor-x's bare `encode` instead — writing tag-64 typed arrays into the same columns the others
  * wrote as raw bytes. cbor-x reads both, so the corruption was invisible until a non-cbor-x reader
- * touched it. I wrote a local encoder here anyway; the guard caught it.
+ * touched it. This file built its own anyway; the guard caught it.
+ *
+ * (The guard is a text scan, so it fires on a comment that spells the forbidden call out too. That
+ * is the right trade — a scanner that skipped comments would miss a commented-out one.)
  */
 
 function toU8(chunk: unknown): Uint8Array {

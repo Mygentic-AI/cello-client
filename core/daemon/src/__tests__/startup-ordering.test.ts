@@ -237,7 +237,11 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // (channel-publish-handlers.ts). This guard caught it unwired, which is exactly the hole order
     // 017 shipped through: the four publishing verbs existed, compiled and tested, and no IPC call
     // could reach any of them.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(104);
+    //
+    // 104 → 105 for the extraction that followed: `wireChannelPublishing`
+    // (channel-publish-wiring.ts) holds the publisher's construction, so daemon.ts keeps only the
+    // call. TWO factories for one subsystem is the same shape every other subsystem here has.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(105);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",
