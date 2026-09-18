@@ -14,8 +14,8 @@
 import type { Logger } from "./types.js";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { KeyProvider } from "@cello-protocol/crypto";
-import { isChannelJoinFrame, encodeChannelRekey } from "@cello-protocol/protocol-types";
-import { generateGroupKey, wrapGroupKeyFor } from "@cello-protocol/crypto";
+import { isChannelJoinFrame, encodeChannelRekey, buildChannelFetchKeyTbs } from "@cello-protocol/protocol-types";
+import { generateGroupKey, wrapGroupKeyFor, deriveFetchKey } from "@cello-protocol/crypto";
 import { ChannelMembershipStore } from "./channel-membership-store.js";
 import { ChannelSubscriptionStore } from "./channel-subscription-store.js";
 import { createChannelJoinExchange, type LocalChannelAdmin } from "./channel-join-exchange.js";
@@ -66,7 +66,16 @@ function needChannel(params: Record<string, unknown> | undefined):
   return { ok: true, channelHex: raw.toLowerCase() };
 }
 
-export function wireChannelMembership(deps: ChannelMembershipWiringDeps): void {
+export interface ChannelMembershipWiring {
+  /**
+   * The channel's CURRENT fetch key, signed, or undefined when this daemon holds no group key for
+   * it. Handed to the publishing half so a re-key reaches the relays on the very next post — which
+   * is what makes an ejection lock the member out at the relay and not only at the ciphertext.
+   */
+  currentFetchKey: (channelHex: string) => Promise<{ pubkey: Uint8Array; time_ms: number; signature: Uint8Array } | undefined>;
+}
+
+export function wireChannelMembership(deps: ChannelMembershipWiringDeps): ChannelMembershipWiring {
   const { handlers, logger } = deps;
 
   const members = new ChannelMembershipStore(deps.getDb(), logger);
@@ -248,8 +257,16 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): void {
       return { ok: false, reason: extractErrorMessage(err) };
     }
 
-    // The new key, wrapped once per REMAINING member. The ejected one is simply not in this list.
+    /**
+     * The new key, wrapped once per REMAINING member — the ejected one is simply not in this list.
+     *
+     * ⚠️ STORED FIRST, against the admin's own agent id. If the process died between minting and
+     * storing, the channel's settings would say generation N while no key for N existed anywhere:
+     * every subsequent publish would encrypt under a key no member was ever given, and the channel
+     * would go permanently silent for everyone rather than for the one person ejected.
+     */
     const gk = generateGroupKey(outcome.generation);
+    subscriptions.addKey(admin.agentId, channel.channelHex, gk, Date.now());
     const channelPubkey = await admin.channelKeyProvider.getPublicKey();
     let delivered = 0;
     const unreached: string[] = [];
@@ -324,4 +341,27 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): void {
     const result = await exchangeFor(agent.agentName).refuse(channel.channelHex, subscriber.toLowerCase(), sessionId);
     return result.ok ? { ok: true, channel: channel.channelHex } : { ok: false, reason: result.reason };
   });
+
+  return {
+    currentFetchKey: async (channelHex) => {
+      const admin = localChannelAdmin(channelHex);
+      if (!admin) return undefined;
+      // The NEWEST generation this daemon holds for its own channel. `keysFor` returns them newest
+      // first, so a re-key is picked up by the next publish without anything else being told.
+      const newest = subscriptions.keysFor(admin.agentId, channelHex)[0];
+      if (!newest) return undefined;
+
+      const fetchKey = await deriveFetchKey(newest, new Uint8Array(Buffer.from(channelHex, "hex")));
+      const timeMs = Date.now();
+      /**
+       * ⚠️ SIGNED WITH THE CHANNEL KEY, and it must be: the post's signature does not cover the
+       * fetch key, so without one of its own anyone who could read a post could replay its bytes
+       * inside the clock window, attach their own key and take the channel over.
+       */
+      const signature = await admin.channelKeyProvider.sign(
+        buildChannelFetchKeyTbs(new Uint8Array(Buffer.from(channelHex, "hex")), fetchKey.publicKey, timeMs),
+      );
+      return { pubkey: fetchKey.publicKey, time_ms: timeMs, signature };
+    },
+  };
 }

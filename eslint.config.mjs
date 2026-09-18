@@ -358,7 +358,7 @@ export default [
     // way out — the module gets `loadedAgents` and a list of open sessions, not the session manager
     // — which is what keeps it from reaching back into the rest of the daemon.
     files: ["core/daemon/src/daemon.ts"],
-    rules: { "max-lines": ["error", { max: 1408, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 1411, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/daemon-handle.ts"],

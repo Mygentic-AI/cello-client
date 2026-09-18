@@ -648,7 +648,7 @@ async function startDaemonHoldingLock(
   // per-channel publisher → channel-publish-wiring.ts. What stays here is the wiring.
   // M16 019-MEMBERSHIP: joining, the group key, the eject re-key and the operator's channel verbs
   // → channel-membership-wiring.ts. What stays here is the wiring.
-  wireChannelMembership({
+  const channelMembership = wireChannelMembership({
     handlers, logger,
     getDb: () => sessionNodeManager.getDb(),
     sendInSession: async (agentName, sessionId, content) => {
@@ -678,6 +678,9 @@ async function startDaemonHoldingLock(
     resolveCurrentAgent: (connectionId, explicitAgent) =>
       resolveCurrentAgent(perConnectionState.get(connectionId), explicitAgent),
     isAgentOnline: (agentId) => onlineAgents.has(agentId) && !explicitlyOfflineAgents.has(agentId),
+    // From the membership half, which owns the group key. This is what carries a re-key to the
+    // relays on the next post, and so what makes an ejection lock a member out AT the relay.
+    currentFetchKey: channelMembership.currentFetchKey,
   });
 
   // ─── Trust-signal wallet (operator-facing, no agent scope required) ───

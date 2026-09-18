@@ -40,7 +40,21 @@ import { ChannelLogStore } from "./channel-log-store.js";
 /** How the publisher reaches a relay. The transport is the caller's; this owns the decisions. */
 export type RelayDepositSeam = (
   relay: string,
-  req: { post_cbor: Uint8Array },
+  req: {
+    post_cbor: Uint8Array;
+    /**
+     * ⚠️ **THIS IS WHAT MAKES AN EJECTION BITE AT THE RELAY.** The relay serves a non-public
+     * channel's queue only to a caller who can sign with the channel's current fetch key, and that
+     * key is DERIVED from the group key — so rotating the group key on an ejection rotates this
+     * too. Sent with the first deposit of each generation: until the relay has it, the ejected
+     * member can still FETCH (they just cannot decrypt), and "cannot read" is a weaker property
+     * than the one the order asks for.
+     *
+     * It carries its own channel signature because the post's does not cover it — see 017's note
+     * on the takeover this closes.
+     */
+    fetch_key?: { pubkey: Uint8Array; time_ms: number; signature: Uint8Array };
+  },
 ) => Promise<
   | { ok: true; receipt_cbor: Uint8Array }
   | { ok: false; reason: string; skew_ms?: number }
@@ -90,6 +104,12 @@ export interface ChannelPublisherOptions {
   encryptBody: (plaintext: Uint8Array, channelHex: string) => Promise<Uint8Array>;
   /** Overridable so a test can refill without waiting; production takes the default. */
   resendPaceMs?: number;
+  /**
+   * The channel's CURRENT fetch key, or undefined for a public channel (which has none — anyone may
+   * read it). Asked per publish so a re-key reaches the relays on the very next post rather than
+   * waiting for a restart.
+   */
+  currentFetchKey?: (channelHex: string) => Promise<{ pubkey: Uint8Array; time_ms: number; signature: Uint8Array } | undefined>;
   channelInfo: (channelHex: string) => {
     access: ChannelAccess; relays: string[]; guidance: string; retention_seconds: number;
   } | null;
@@ -173,9 +193,16 @@ export class ChannelPublisher {
     // 4. THE LOG, BEFORE THE NETWORK.
     log.append(channelHex, post, correlationId);
 
-    // 5. Both relays, in parallel — a deposit is independent of the other, and making the second
-    //    wait on the first would double the latency of the ordinary case for no gain.
-    let deposited = await Promise.all(info.relays.map((relay) => this.#depositOnce(relay, post, channelHex, correlationId)));
+    /**
+     * 5. Both relays, in parallel — a deposit is independent of the other, and making the second
+     *    wait on the first would double the latency of the ordinary case for no gain.
+     *
+     * ⚠️ THE FETCH KEY RIDES ALONG. A public channel has none. For every other channel this is what
+     * makes an ejection bite AT THE RELAY rather than only at the ciphertext: until the relay holds
+     * the new generation's key, an ejected member can still pull the queue.
+     */
+    const fetchKey = info.access === "public" ? undefined : await this.#opts.currentFetchKey?.(channelHex);
+    let deposited = await Promise.all(info.relays.map((relay) => this.#depositOnce(relay, post, channelHex, correlationId, fetchKey)));
     let ok = deposited.filter((d) => d.ok);
 
     /**
@@ -221,11 +248,17 @@ export class ChannelPublisher {
    * are reported separately because folding them together turned a post that is safely on two relays
    * into `no_relay_accepted`, and sent the operator to resend something already there.
    */
-  async #depositOnce(relay: string, post: BroadcastArtifact, channelHex: string, correlationId?: string): Promise<DepositOutcome> {
+  async #depositOnce(
+    relay: string, post: BroadcastArtifact, channelHex: string, correlationId?: string,
+    fetchKey?: { pubkey: Uint8Array; time_ms: number; signature: Uint8Array },
+  ): Promise<DepositOutcome> {
     const { logger } = this.#opts;
     let answer: Awaited<ReturnType<RelayDepositSeam>>;
     try {
-      answer = await this.#opts.deposit(relay, { post_cbor: encodeBroadcastArtifact(post) });
+      answer = await this.#opts.deposit(relay, {
+        post_cbor: encodeBroadcastArtifact(post),
+        ...(fetchKey ? { fetch_key: fetchKey } : {}),
+      });
     } catch (err: unknown) {
       logger.warn("channel.post.deposit_failed", {
         ...(correlationId !== undefined ? { correlationId } : {}),

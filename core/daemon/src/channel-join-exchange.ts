@@ -92,10 +92,19 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
   /**
    * Mint or reuse this channel's current group key, wrap it for one member, and send the acceptance.
    *
-   * The key for a generation must be the SAME key for every member — they all decrypt the same
-   * bodies — so it is held per channel for the life of the process and re-wrapped per recipient.
+   * ⚠️ **THE ADMIN STORES ITS OWN CHANNEL'S GROUP KEY IN THE SAME TABLE ITS SUBSCRIBERS USE**, under
+   * its own agent id. A key held only in this process is lost on restart — and then the second
+   * member admitted after a restart gets a DIFFERENT key at the same generation, so the two decrypt
+   * different halves of the channel and neither can tell why. The admin is a reader of its own
+   * channel; storing the key where readers keep keys is the honest place for it.
    */
-  const currentKeys = new Map<string, GroupKey>();
+  function currentGroupKey(adminAgentId: string, channelHex: string, generation: number): GroupKey {
+    const held = subscriptions.keysFor(adminAgentId, channelHex).find((k) => k.generation === generation);
+    if (held) return held;
+    const minted = generateGroupKey(generation);
+    subscriptions.addKey(adminAgentId, channelHex, minted, now());
+    return minted;
+  }
 
   async function acceptInto(
     sessionId: string, channelHex: string, subscriberHex: string, admin: LocalChannelAdmin,
@@ -105,11 +114,7 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
 
     let generation = settings.key_generation;
     if (generation === 0) generation = members.startGeneration(channelHex);
-    let gk = currentKeys.get(`${channelHex}:${String(generation)}`);
-    if (!gk) {
-      gk = generateGroupKey(generation);
-      currentKeys.set(`${channelHex}:${String(generation)}`, gk);
-    }
+    const gk = currentGroupKey(admin.agentId, channelHex, generation);
 
     const channelPubkey = await admin.channelKeyProvider.getPublicKey();
     const bundle = await wrapGroupKeyFor(

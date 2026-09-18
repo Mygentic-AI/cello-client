@@ -37,6 +37,12 @@ export interface ChannelPublishWiringDeps {
   keyProviders: Map<string, KeyProvider>;
   resolveCurrentAgent: (connectionId: string, explicitAgent?: string) => string | null;
   /**
+   * M16 019: the channel's current fetch key, signed, or undefined when this daemon holds no group
+   * key for it. Injected rather than derived here so the membership half owns the group key and
+   * this half never has to hold one.
+   */
+  currentFetchKey?: (channelHex: string) => Promise<{ pubkey: Uint8Array; time_ms: number; signature: Uint8Array } | undefined>;
+  /**
    * Online AND not explicitly switched off — the same pair every other background loop here reads.
    * Collecting for an agent the operator switched off is the kill switch failing to switch off.
    */
@@ -65,7 +71,18 @@ export function wireChannelPublishing(deps: ChannelPublishWiringDeps): { stop: (
     return new ChannelPublisher({
       logger,
       log,
-      deposit: (addr, req) => relay.deposit(addr, { post_cbor: req.post_cbor }),
+      deposit: (addr, req) => relay.deposit(addr, {
+        post_cbor: req.post_cbor,
+        ...(req.fetch_key ? { fetch_key: req.fetch_key } : {}),
+      }),
+      /**
+       * ⚠️ **THE KEY THAT MAKES AN EJECTION BITE AT THE RELAY.** Derived from the channel's current
+       * group key, signed with the CHANNEL key because the post's signature does not cover it, and
+       * sent with each deposit so a re-key reaches the relays on the very next post. `undefined`
+       * means this daemon holds no group key for that channel — a public one, or one it does not
+       * administer — and the relay then serves it to anyone, which for a public channel is correct.
+       */
+      currentFetchKey: deps.currentFetchKey,
       depositInfo: (addr, req) => relay.depositInfo(addr, { info_cbor: req.info_cbor }),
       prune: (addr, req) => relay.prune(addr, {
         channel_pubkey: Buffer.from(req.channelHex, "hex"),
