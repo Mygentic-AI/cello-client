@@ -85,7 +85,13 @@ async function fixture(access: "open" | "invite_only" | "public" = "open"): Prom
       ? { agentId: "admin-1", adminPubkeyHex: adminHex, channelKeyProvider: channelKp, adminKeyProvider: adminKp }
       : null),
     // The channel's admin AS THE DIRECTORY REPORTS IT — the subscriber's only trustworthy source.
-    profileAdminPubkey: (chHex) => Promise.resolve(profileAdmin.get(chHex) ?? null),
+    profileAdminPubkey: (chHex) => {
+      const found = profileAdmin.get(chHex);
+      // M16 021 item 21: the seam carries WHY there is no admin, not just that there is none.
+      return Promise.resolve(found !== undefined
+        ? { ok: true as const, adminPubkeyHex: found }
+        : { ok: false as const, reason: "not_a_channel" });
+    },
     keyProviderFor: () => subscriberKp,
     raiseNotice: (event, channel, subscriber) => { notices.push({ event, channel, subscriber }); },
     now: () => 1_800_000_000_000,

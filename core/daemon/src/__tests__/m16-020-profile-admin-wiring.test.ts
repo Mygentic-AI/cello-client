@@ -60,7 +60,7 @@ describe("M16 020 — where the subscriber's admin key comes from", () => {
      * channel — including their own, from a second device.
      */
     const lookup = vi.fn(async () => ({ kind: "admin", adminPubkeyHex: THEIR_ADMIN }) as ChannelAdminOutcome);
-    expect(await build(lookup)(THEIRS, AGENT)).toBe(THEIR_ADMIN);
+    expect(await build(lookup)(THEIRS, AGENT)).toEqual({ ok: true, adminPubkeyHex: THEIR_ADMIN });
     expect(lookup).toHaveBeenCalledWith(AGENT, THEIRS);
   });
 
@@ -70,17 +70,23 @@ describe("M16 020 — where the subscriber's admin key comes from", () => {
      * answering with anything at all here — least of all "whoever answered" — would turn a network
      * problem into an admission.
      */
+    /**
+     * ⚠️ M16 021 item 21: the REASON now travels with the refusal. Both of these still refuse —
+     * that is the property this test exists for — but `admin_unresolved` alone could not tell a
+     * timeout against an unrolled directory from a database fault, and an operator got one word.
+     */
     const unreachable = build(async () => ({ kind: "unavailable", reason: "timeout" }));
-    expect(await unreachable(THEIRS, AGENT)).toBeNull();
+    expect(await unreachable(THEIRS, AGENT)).toEqual({ ok: false, reason: "timeout" });
 
     const faulted = build(async () => ({ kind: "unavailable", reason: "lookup_failed" }));
-    expect(await faulted(THEIRS, AGENT)).toBeNull();
+    expect(await faulted(THEIRS, AGENT)).toEqual({ ok: false, reason: "lookup_failed" });
   });
 
   it("14b. a pubkey the directory says is NOT a channel is refused too", async () => {
     // A settled answer, and it still gives the comparison nothing to run against. There is no admin
     // because there is no channel.
-    expect(await build(async () => ({ kind: "not_a_channel" }))(THEIRS, AGENT)).toBeNull();
+    expect(await build(async () => ({ kind: "not_a_channel" }))(THEIRS, AGENT))
+      .toEqual({ ok: false, reason: "not_a_channel" });
   });
 
   it("15. a channel this daemon administers is answered LOCALLY — the directory is not asked", async () => {
@@ -90,13 +96,15 @@ describe("M16 020 — where the subscriber's admin key comes from", () => {
      * running on this very machine.
      */
     const lookup = vi.fn(async () => ({ kind: "unavailable", reason: "timeout" }) as ChannelAdminOutcome);
-    expect(await build(lookup)(OURS, AGENT)).toBe(OUR_ADMIN);
+    expect(await build(lookup)(OURS, AGENT)).toEqual({ ok: true, adminPubkeyHex: OUR_ADMIN });
     expect(lookup, "the directory was never asked").not.toHaveBeenCalled();
   });
 
   it("15b. a lookup that THROWS is refused, and does not escape into the join path", async () => {
     // The join handler runs this inside the inbound content path. An exception here would surface as
     // a broken session rather than a refused join.
-    expect(await build(async () => { throw new Error("boom"); })(THEIRS, AGENT)).toBeNull();
+    // Refused, and the thrown message is what the operator sees rather than a bare word.
+    expect(await build(async () => { throw new Error("boom"); })(THEIRS, AGENT))
+      .toEqual({ ok: false, reason: "boom" });
   });
 });

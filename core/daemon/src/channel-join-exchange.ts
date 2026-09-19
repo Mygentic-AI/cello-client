@@ -46,6 +46,17 @@ export interface LocalChannelAdmin {
   adminKeyProvider: KeyProvider;
 }
 
+/**
+ * M16 021-WAKE item 21: the admin, or WHY there isn't one.
+ *
+ * ⚠️ The refusal is unchanged — anything other than `ok` leaves the join refused, exactly as the
+ * bare `null` did. What is new is that the cause travels with it, so `admin_unresolved` stops being
+ * a word an operator can do nothing with.
+ */
+export type AdminLookupOutcome =
+  | { ok: true; adminPubkeyHex: string }
+  | { ok: false; reason: string };
+
 export interface ChannelJoinExchangeDeps {
   logger: Logger;
   members: ChannelMembershipStore;
@@ -57,7 +68,7 @@ export interface ChannelJoinExchangeDeps {
    * The channel's admin AS THE DIRECTORY REPORTS IT. `null` means the lookup could not be resolved,
    * which FAILS CLOSED — an unreachable directory must not become "whoever answered is the admin".
    */
-  profileAdminPubkey: (channelHex: string, agentId: string) => Promise<string | null>;
+  profileAdminPubkey: (channelHex: string, agentId: string) => Promise<AdminLookupOutcome>;
   keyProviderFor: (agentId: string) => KeyProvider | null;
   raiseNotice: (event: string, channelHex: string, subscriberHex: string) => void;
   now?: () => number;
@@ -65,7 +76,20 @@ export interface ChannelJoinExchangeDeps {
 
 export type SubscriberJoinResult =
   | { ok: true; channelHex: string; generation: number }
-  | { ok: false; reason: "not_a_join_frame" | "malformed" | "not_admin_of_channel" | "admin_unresolved" | "key_unwrap_failed" | "no_key_provider" };
+  | {
+      ok: false;
+      reason: "not_a_join_frame" | "malformed" | "not_admin_of_channel" | "admin_unresolved" | "key_unwrap_failed" | "no_key_provider";
+      /**
+       * M16 021-WAKE item 21: WHY, when the reason alone cannot say.
+       *
+       * ⚠️ `admin_unresolved` is an exit-point label. A dead signaling stream, a ten-second timeout
+       * against a directory that has not been rolled, a channel the directory has never heard of
+       * and a database fault all arrive at that one word, and the operator cannot tell which. The
+       * cause survived only in a log line one step upstream, which is not where anyone looks when a
+       * join is refused.
+       */
+      detail?: string;
+    };
 
 export interface ChannelJoinExchange {
   /** An inbound frame on the ADMIN's daemon. `consumed: false` means it was not a join frame. */
@@ -275,11 +299,18 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
        * authenticated directory stream rather than any connection that happens to be open.
        */
       const storedAdmin = rekeyFrame ? (subscriptions.get(agentId, channelHex)?.admin_pubkey ?? null) : null;
-      const profileAdmin = storedAdmin ?? await deps.profileAdminPubkey(channelHex, agentId);
-      if (profileAdmin === null) {
-        logger.warn("channel.join.refused", { channel_pubkey: channelHex, reason: "admin_unresolved" });
-        return { ok: false, reason: "admin_unresolved" };
+      const looked: AdminLookupOutcome = storedAdmin !== null
+        ? { ok: true, adminPubkeyHex: storedAdmin }
+        : await deps.profileAdminPubkey(channelHex, agentId);
+      if (!looked.ok) {
+        // The cause travels with the refusal now. It used to live only in a log line one step
+        // upstream, which is not where anyone looks when a join is refused.
+        logger.warn("channel.join.refused", {
+          channel_pubkey: channelHex, reason: "admin_unresolved", detail: looked.reason,
+        });
+        return { ok: false, reason: "admin_unresolved", detail: looked.reason };
       }
+      const profileAdmin = looked.adminPubkeyHex;
       if (profileAdmin.toLowerCase() !== counterpartyHex.toLowerCase()) {
         logger.warn("channel.join.refused", {
           channel_pubkey: channelHex, reason: "not_admin_of_channel",

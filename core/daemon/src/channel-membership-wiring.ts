@@ -20,7 +20,9 @@ import {
 import { generateGroupKey, wrapGroupKeyFor, deriveFetchKey } from "@cello-protocol/crypto";
 import { ChannelMembershipStore } from "./channel-membership-store.js";
 import { ChannelSubscriptionStore } from "./channel-subscription-store.js";
-import { createChannelJoinExchange, type LocalChannelAdmin } from "./channel-join-exchange.js";
+import {
+  createChannelJoinExchange, type LocalChannelAdmin, type AdminLookupOutcome,
+} from "./channel-join-exchange.js";
 import {
   createChannelAdminLookup, type ChannelAdminOutcome, type SignalingLike,
 } from "./channel-admin-lookup.js";
@@ -77,28 +79,29 @@ export function createProfileAdminPubkey(deps: {
   members: ChannelMembershipStore;
   lookup: (agentId: string, channelHex: string) => Promise<ChannelAdminOutcome>;
   logger: Logger;
-}): (channelHex: string, agentId: string) => Promise<string | null> {
-  return async function profileAdminPubkey(channelHex: string, agentId: string): Promise<string | null> {
+}): (channelHex: string, agentId: string) => Promise<AdminLookupOutcome> {
+  return async function profileAdminPubkey(channelHex: string, agentId: string): Promise<AdminLookupOutcome> {
     // The ADMIN this daemon recorded, not the channel's own key — the two are different agents, and
     // comparing a key with itself is what the first version of this did.
     const settings = deps.members.settings(channelHex);
-    if (settings && settings.admin_pubkey.length > 0) return settings.admin_pubkey;
+    if (settings && settings.admin_pubkey.length > 0) {
+      return { ok: true, adminPubkeyHex: settings.admin_pubkey };
+    }
 
     try {
       const outcome = await deps.lookup(agentId, channelHex);
-      if (outcome.kind === "admin") return outcome.adminPubkeyHex;
-      deps.logger.info("channel.join.admin_unresolved", {
-        channel_pubkey: channelHex,
-        reason: outcome.kind === "not_a_channel" ? "not_a_channel" : outcome.reason,
-      });
-      return null;
+      if (outcome.kind === "admin") return { ok: true, adminPubkeyHex: outcome.adminPubkeyHex };
+      // M16 021-WAKE item 21: the reason goes BACK, not just into a log. `admin_unresolved` alone
+      // cannot tell a dead stream from an unrolled directory from a channel that does not exist.
+      const reason = outcome.kind === "not_a_channel" ? "not_a_channel" : outcome.reason;
+      deps.logger.info("channel.join.admin_unresolved", { channel_pubkey: channelHex, reason });
+      return { ok: false, reason };
     } catch (err: unknown) {
       // This runs inside the inbound content path. An exception escaping would surface as a broken
       // session rather than a refused join, which is a worse answer to the same question.
-      deps.logger.warn("channel.join.admin_unresolved", {
-        channel_pubkey: channelHex, reason: extractErrorMessage(err),
-      });
-      return null;
+      const reason = extractErrorMessage(err);
+      deps.logger.warn("channel.join.admin_unresolved", { channel_pubkey: channelHex, reason });
+      return { ok: false, reason };
     }
   };
 }
