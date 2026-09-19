@@ -63,6 +63,9 @@ describe("F1: usage string lists every command", () => {
         "attestations", "trust-signals", "attestation-consent",
         // Broadcast channels (M16). Terminal-only on purpose: a post carries the operator's own
         // signature to every subscriber, so it is not a tool an agent may reach for.
+        // M16 022: the plural LIST, beside the singular that acts on one — the shape `contacts` /
+        // `contact` and `agents` already use. It replaces `cello channel list`.
+        "channels",
         "channel",
         // Other
         "settings", "moniker", "telegram", "bridge", "config", "policy",

@@ -131,6 +131,12 @@ export const GROUP_ORDER = [
   // finds it only if they already know it exists.
   "Documents",
   "Contacts",
+  // ITS OWN GROUP, AFTER THE ONE-TO-ONE SURFACES. Broadcast is the other half of what CELLO does —
+  // fifteen orders of it — and it surfaced as ONE LINE under "Other", between telegram and bridge,
+  // summarised as "publish to a channel you hold the key to". An operator reading that had no way
+  // to learn the feature had a subscriber side at all, which is exactly what happened: the verbs to
+  // find, join and read a channel did not exist and nobody noticed for five orders.
+  "Channels",
   // TWO GROUPS, NOT ONE. On the wire an attestation is a trust signal, and they sat together for
   // exactly that reason — which made the person-to-person primitive read as a wallet chore. What the
   // NETWORK verifies about you and what a PERSON says about a person are different affordances, and
@@ -157,6 +163,11 @@ export interface CommandSpec {
   group: CommandGroup;
   /** One line. Rendered as this command's row in the `cello --help` Commands: table. */
   summary: string;
+  /**
+   * M16 022: subcommands to list individually in `cello -h`, for a command whose subcommands ARE
+   * the feature. Absent means the command is one line, as before.
+   */
+  verbs?: ReadonlyArray<{ name: string; summary: string }>;
   /** Full per-command help, printed by `cello <cmd> --help`. */
   help: string;
   flags?: readonly FlagSpec[];
@@ -1535,16 +1546,51 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
     },
   },
   {
-    name: "channel",
-    group: "Other",
-    summary: "Publish to a broadcast channel you hold the key to.",
+    name: "channels",
+    group: "Channels",
+    summary: "List channels you follow or publish, with unread counts.",
     help:
-      "Usage: cello channel setup <channel> <access> <relay> <relay> [--agent <agent>]\n" +
+      "Usage: cello channels [--agent <agent>]\n" +
+      "  Every channel this agent follows or publishes, with how many posts are waiting.\n" +
+      "  'unread' is the gap between what the daemon has FETCHED and what you have READ —\n" +
+      "  'cello channel read <channel>' closes it.",
+    jsonOut: true,
+    async run(ctx, args) {
+      const { agent } = parityOpts(args);
+      return legacy(await channelVerb(ctx.celloDir, "cello_channels", agent ? { agent } : {}));
+    },
+  },
+  {
+    name: "channel",
+    group: "Channels",
+    summary: "Follow a channel, or run one you hold the key to.",
+    // Subscriber verbs first: following a channel is the common case, publishing is the rare one,
+    // and the order on this page is what tells an operator which of the two the feature is for.
+    verbs: [
+      { name: "info", summary: "Look up a channel: whether it exists and who runs it." },
+      { name: "join", summary: "Ask to join a channel and start receiving its posts." },
+      { name: "read", summary: "Read new posts on a channel you follow." },
+      { name: "name", summary: "Label a channel so you can tell it apart. Only you see it." },
+      { name: "leave", summary: "Stop receiving a channel's posts. Local — nothing is sent." },
+      { name: "setup", summary: "Make a channel you hold the key to publishable. Do this first." },
+      { name: "publish", summary: "Publish a post to your channel." },
+      { name: "info-set", summary: "Publish your channel's description so others can find it." },
+      { name: "approve", summary: "Admit someone who asked to join an invite-only channel." },
+      { name: "refuse", summary: "Turn down a request to join." },
+      { name: "eject", summary: "Remove a member and rotate the key, so they stop receiving posts." },
+      { name: "prune", summary: "Drop the oldest posts from the relays." },
+      { name: "resend", summary: "Refill a relay that lost posts, or one you just added." },
+    ],
+    help:
+      "Usage: cello channel info <channel> [--agent <agent>]\n" +
+      "       cello channel join <channel> [<note>] [--agent <agent>]\n" +
+      "       cello channel read <channel> [--all] [--agent <agent>]\n" +
+      "       cello channel name <channel> <label> | leave <channel>\n" +
+      "       cello channel setup <channel> <access> <relay> <relay> [--agent <agent>]\n" +
       "       cello channel publish <channel> <title> <body> [--agent <agent>]\n" +
       "       cello channel info-set <channel> [--agent <agent>]\n" +
       "       cello channel prune <channel> <through_seq> [--agent <agent>]\n" +
       "       cello channel resend <channel> [<relay>] [--agent <agent>]\n" +
-      "       cello channel list | name <channel> <label> | leave <channel>\n" +
       "       cello channel eject <channel> <member> | approve <channel> <member> | refuse <channel> <member>\n" +
       "  <channel> is the channel's 64-character hex public key.\n" +
       "  'setup' comes FIRST and is what makes a channel publishable at all: it records the two\n" +
@@ -1559,7 +1605,14 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "  'list' shows the channels you follow and how many posts are unread. 'name' is a label only\n" +
       "  you see. 'leave' is local — nothing is sent, and your keys are kept so old posts stay readable.\n" +
       "  'eject' removes a member from an invite-only channel AND rotates its key, which is what stops\n" +
-      "  them reading and even fetching. <member> is their 64-character hex public key.",
+      "  them reading and even fetching. <member> is their 64-character hex public key.\n" +
+      "\n" +
+      "  FOLLOWING A CHANNEL takes its public key and nothing else. 'info' asks the directory who\n" +
+      "  administers it. 'join' opens a session with that admin and asks; the answer comes back on\n" +
+      "  its own and brings the relays, so you do not type one. 'read' prints new posts and moves\n" +
+      "  your read position; --all re-reads from the start without moving it. A post whose body\n" +
+      "  will not open is listed by number rather than skipped — that usually means a key change\n" +
+      "  you did not receive.",
     flags: AGENT_FLAG,
     jsonOut: true,
     async run(ctx, args) {
@@ -1593,6 +1646,22 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
         // Requiring a multiaddr here made the only repair command unrunnable in practice.
         return legacy(await channelVerb(
           ctx.celloDir, "cello_channel_resend", withAgent(a !== undefined ? { channel, relay: a } : { channel }),
+        ));
+      }
+      // ─── M16 022: the three verbs that make the other eleven mean anything ───
+      if (sub === "info" && channel) {
+        return legacy(await channelVerb(ctx.celloDir, "cello_channel_info", withAgent({ channel })));
+      }
+      if (sub === "join" && channel) {
+        // A NOTE is optional and a relay is not a thing you pass: relays are the publisher's choice
+        // and arrive on the acceptance.
+        return legacy(await channelVerb(
+          ctx.celloDir, "cello_channel_join", withAgent(a !== undefined ? { channel, note: a } : { channel }),
+        ));
+      }
+      if (sub === "read" && channel) {
+        return legacy(await channelVerb(
+          ctx.celloDir, "cello_channel_read", withAgent(a === "--all" ? { channel, all: true } : { channel }),
         ));
       }
       // ─── M16 019: the SUBSCRIBER's side, and the admin's membership decisions ───
@@ -1787,11 +1856,20 @@ export function flagsFor(name: string): ReadonlyMap<string, FlagSpec> {
  * summaries line up as one column down the page.
  */
 export function renderCommandsTable(): string {
-  const width = Math.max(...COMMANDS.map((c) => c.name.length));
+  /**
+   * ⚠️ **A COMMAND WITH `verbs` LISTS THEM HERE, and that is not decoration.** `channel` carried a
+   * whole half of CELLO behind one line reading "publish to a channel you hold the key to" — so
+   * nothing on this page said the feature had a subscriber side, and for five orders it did not.
+   * A command whose subcommands are the feature has to show them where people look.
+   */
+  const names = COMMANDS.flatMap((c) => [c.name, ...(c.verbs ?? []).map((v) => `${c.name} ${v.name}`)]);
+  const width = Math.max(...names.map((n) => n.length));
   const sections = GROUP_ORDER.map((group) => {
-    const rows = COMMANDS.filter((c) => c.group === group).map(
-      (c) => `  ${c.name.padEnd(width)}  ${c.summary}`,
-    );
+    const rows = COMMANDS.filter((c) => c.group === group).flatMap((c) => (
+      c.verbs === undefined
+        ? [`  ${c.name.padEnd(width)}  ${c.summary}`]
+        : c.verbs.map((v) => `  ${`${c.name} ${v.name}`.padEnd(width)}  ${v.summary}`)
+    ));
     return rows.length === 0 ? null : `${group}:\n${rows.join("\n")}`;
   }).filter((s): s is string => s !== null);
   return sections.join("\n\n");

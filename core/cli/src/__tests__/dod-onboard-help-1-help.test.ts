@@ -57,8 +57,14 @@ describe("§1 — the help is grouped and logically ordered", () => {
   it("every command appears in the rendered table exactly once", () => {
     const table = renderCommandsTable();
     for (const name of commandNames()) {
+      const spec = COMMANDS.find((c) => c.name === name);
+      // A verb-listed command contributes ONE ROW PER VERB, on purpose: `channel` hid a whole half
+      // of CELLO behind a single line, and nothing on the page said the feature had a subscriber
+      // side. The clause is "no command is missing and none is duplicated" — for these, the unit
+      // being counted is the verb.
+      const expected = spec?.verbs?.length ?? 1;
       const rows = table.split("\n").filter((l) => l.startsWith(`  ${name} `) || l.trim() === name);
-      expect(rows.length, `${name} should appear once as a row`).toBe(1);
+      expect(rows.length, `${name} should appear ${String(expected)} time(s) as a row`).toBe(expected);
     }
   });
 });

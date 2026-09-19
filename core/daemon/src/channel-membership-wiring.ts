@@ -17,7 +17,7 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import {
   channelJoinFrameType, encodeChannelRekey, buildChannelFetchKeyTbs, JOIN_REQUEST_TYPE,
 } from "@cello-protocol/protocol-types";
-import { generateGroupKey, wrapGroupKeyFor, deriveFetchKey } from "@cello-protocol/crypto";
+import { generateGroupKey, wrapGroupKeyFor, deriveFetchKey, decryptBody } from "@cello-protocol/crypto";
 import { ChannelMembershipStore } from "./channel-membership-store.js";
 import { ChannelSubscriptionStore } from "./channel-subscription-store.js";
 import {
@@ -26,6 +26,8 @@ import {
 import {
   createChannelAdminLookup, type ChannelAdminOutcome, type SignalingLike,
 } from "./channel-admin-lookup.js";
+import { createChannelSubscribe } from "./channel-subscribe.js";
+import { ChannelInboxStore } from "./channel-inbox-store.js";
 import { extractErrorMessage } from "./error-message.js";
 
 type Handler = (params: Record<string, unknown> | undefined, connectionId: string) => Promise<unknown>;
@@ -279,6 +281,72 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
   });
 
   // ─── Operator verbs ───────────────────────────────────────────────────────────────────────────
+
+  /**
+   * M16 022-SUBSCRIBE — the three verbs that make the other eleven mean anything. Until this, no
+   * production code sent a join request and nothing read a post back out.
+   */
+  const subscribe = createChannelSubscribe({
+    logger,
+    subscriptions,
+    inbox: new ChannelInboxStore(deps.getDb(), logger),
+    lookupAdmin: (agentId, channelHex) => createChannelAdminLookup({
+      signalingFor: signalingForAgentId, logger,
+    })(agentId, channelHex),
+    /**
+     * An existing session with the admin, or a new one.
+     *
+     * ⚠️ **IT OPENS ONE IF THERE IS NONE, and that is what makes `join` a single command.** A
+     * subscriber has no reason to already hold a session with a channel's administrator — they have
+     * never spoken. Requiring `cello initiate-session` first would make the verb a two-step dance
+     * whose first step nothing tells you to take.
+     *
+     * It calls the daemon's OWN initiate handler rather than a second path to the same thing: the
+     * brokering, key-binding checks and refusals all belong to that handler and must not be
+     * reimplemented here.
+     */
+    sessionWith: async (agentName, counterpartyHex) => {
+      const existing = openSessionWith(agentName, counterpartyHex);
+      if (existing !== null) return existing;
+      const initiate = handlers.get("cello_initiate_session");
+      if (!initiate) return null;
+      const answer = await initiate({ agent: agentName, target: counterpartyHex }, "channel-join") as
+        { ok?: boolean; session_id?: string };
+      return answer.ok === true && typeof answer.session_id === "string" ? answer.session_id : null;
+    },
+    sendInSession: (agentName, sessionId, content) => deps.sendInSession(agentName, sessionId, content),
+    agentPubkey: (agentName) => deps.loadedAgents.find((a) => a.name === agentName)?.pubkey ?? null,
+    decrypt: (agentId, channelHex, seq, body) => {
+      const keys = subscriptions.keysFor(agentId, channelHex);
+      const out = decryptBody(keys, new Uint8Array(Buffer.from(channelHex, "hex")), seq, body);
+      return Promise.resolve(out.ok ? out.plaintext : null);
+    },
+  });
+
+  handlers.set("cello_channel_info", async (params, connectionId) => {
+    const agent = needAgent(deps, params, connectionId);
+    if (!agent.ok) return agent.answer;
+    const channel = needChannel(params);
+    if (!channel.ok) return channel.answer;
+    return subscribe.info(deps.resolveAgentId(agent.agentName), channel.channelHex);
+  });
+
+  handlers.set("cello_channel_join", async (params, connectionId) => {
+    const agent = needAgent(deps, params, connectionId);
+    if (!agent.ok) return agent.answer;
+    const channel = needChannel(params);
+    if (!channel.ok) return channel.answer;
+    const note = typeof params?.["note"] === "string" ? (params["note"]) : undefined;
+    return subscribe.join(agent.agentName, deps.resolveAgentId(agent.agentName), channel.channelHex, note);
+  });
+
+  handlers.set("cello_channel_read", async (params, connectionId) => {
+    const agent = needAgent(deps, params, connectionId);
+    if (!agent.ok) return agent.answer;
+    const channel = needChannel(params);
+    if (!channel.ok) return channel.answer;
+    return subscribe.read(deps.resolveAgentId(agent.agentName), channel.channelHex, params?.["all"] === true);
+  });
 
   handlers.set("cello_channels", async (params, connectionId) => {
     const agent = needAgent(deps, params, connectionId);
