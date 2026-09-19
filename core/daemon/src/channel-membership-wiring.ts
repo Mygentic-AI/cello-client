@@ -134,6 +134,13 @@ export interface ChannelMembershipWiring {
    * is what makes an ejection lock the member out at the relay and not only at the ciphertext.
    */
   currentFetchKey: (channelHex: string) => Promise<{ pubkey: Uint8Array; time_ms: number; signature: Uint8Array } | undefined>;
+  /**
+   * M16 021-WAKE: the channel's ACTIVE members, which is who a post's doorbell is rung for. Pending
+   * and ejected rows are excluded by the store — waking a pending request would tell somebody who
+   * has not been admitted that a post exists, and waking an ejected member is the thing the
+   * ejection undid.
+   */
+  activeMembers: (channelHex: string) => string[];
 }
 
 export function wireChannelMembership(deps: ChannelMembershipWiringDeps): ChannelMembershipWiring {
@@ -435,6 +442,7 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
   });
 
   return {
+    activeMembers: (channelHex: string) => members.activeMembers(channelHex),
     currentFetchKey: async (channelHex) => {
       const admin = localChannelAdmin(channelHex);
       if (!admin) return undefined;

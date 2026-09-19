@@ -33,6 +33,14 @@ export interface ChannelPublishDeps {
     { ok: true } | { ok: false; reason: string; guidance?: string };
   /** The daemon's single agent-selection rule, injected rather than re-implemented here. */
   resolveCurrentAgent: (connectionId: string, explicitAgent?: string) => string | null;
+  /**
+   * M16 021-WAKE: ring the doorbell for this channel's members after a post lands.
+   *
+   * ⚠️ **IT CANNOT FAIL A PUBLISH.** The post is deposited and durable before this is called, and
+   * every failure inside it is logged and dropped — an unreachable directory means subscribers
+   * collect on their backstop poll, which is what the poll is for.
+   */
+  wakeMembers?: (agentName: string, channelHex: string) => Promise<void>;
 }
 
 function needAgent(deps: ChannelPublishDeps, params: Record<string, unknown> | undefined, connectionId: string):
@@ -88,6 +96,9 @@ export function registerChannelPublishHandlers(deps: ChannelPublishDeps): void {
 
     const result = await publisher.publish(agent.agentName, channel.channelHex, title, body);
     if (result.ok) {
+      // The doorbell, after the post is durable and never before: a wake for a post that failed to
+      // deposit would send every member to fetch something that is not there.
+      await deps.wakeMembers?.(agent.agentName, channel.channelHex);
       return {
         ok: true, seq: result.seq,
         relays_ok: result.deposited.filter((d) => d.ok).map((d) => d.relay),

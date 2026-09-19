@@ -368,7 +368,9 @@ export default [
     // collector (built ~400 lines below), so the root holds the late-bound handle between them.
     // Null until the collector exists means an early wake is ignored rather than crashing, and an
     // ignored wake costs nothing because the backstop poll is the guarantee.
-    rules: { "max-lines": ["error", { max: 1441, skipBlankLines: false, skipComments: false }] },
+    // 1,441 → 1,445 (+4): the publisher's half of the same doorbell — the member list and the
+    // stream to ask on, both read from halves that already exist here.
+    rules: { "max-lines": ["error", { max: 1445, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/daemon-handle.ts"],
