@@ -81,6 +81,19 @@ export interface RegisterRequest {
   /** Hex-encoded 32-byte pubkey of the administering agent. REQUIRED when channel is set;
    *  must be absent otherwise. Immutable after registration. */
   admin_pubkey?: string;
+  /**
+   * How this channel admits readers. Only meaningful with `channel`, and must be absent otherwise.
+   *
+   * ⚠️ **WITHOUT THIS A PUBLIC CHANNEL COULD NOT EXIST.** The relay decides whether a fetch needs
+   * the group key, and the only thing it can ask is the directory's channel identity. With no
+   * `access` there, it fell back to the least privileged reading — `open`, meaning a key is
+   * required — so the `public` branch was reachable only from a test fixture. 017 raised this in a
+   * code comment naming order 019; it was never written into 019's text, so it fell between orders
+   * and was still missing after 020.
+   *
+   * Absent means `open`, which is what every channel registered before this shipped already is.
+   */
+  access?: "public" | "open" | "invite_only";
 }
 
 /**
@@ -224,6 +237,15 @@ export interface AgentProfile {
   channel: boolean;
   /** Hex admin pubkey when channel === true; "" otherwise. Immutable. */
   admin_pubkey: string;
+  /**
+   * M16 021-WAKE: how this channel admits readers, when `channel === true`. Immutable.
+   *
+   * ⚠️ **OPTIONAL ON THE TYPE, AND ABSENT MEANS `open`.** `open` still requires the group key to
+   * fetch; `public` does not. So a profile written before this field existed keeps the MORE private
+   * reading, which is also exactly how the relay has been treating every channel — with no access
+   * on the identity answer it fell back to `open`, and a public channel could not exist at all.
+   */
+  channel_access?: "public" | "open" | "invite_only";
 }
 
 // ─── RegistrationState (stored locally by client) ────────────────────────────
