@@ -1055,6 +1055,126 @@ server.tool(
   },
 );
 
+// ─── Channel tools (M16 / 023-MCPCHAN) ──────────────────────────────────────
+//
+// A channel is one-to-many and one-way: a publisher posts, subscribers read. It is NOT a session —
+// there is no back-and-forth, no seal, and no transcript. Posts are encrypted under a group key
+// every member holds, deposited at two relays, and collected by this daemon on a timer or when the
+// publisher rings the doorbell.
+//
+// ⚠️ A SUBSCRIBER NEVER HANDLES A RELAY. Every verb below takes the channel's public key and
+// nothing else; the relay pair arrives as part of being admitted. Relays are the publisher's choice
+// and the publisher's problem.
+//
+// ⚠️ THE DAEMON METHOD IS NOT ALWAYS THE TOOL NAME. `cello_channel_setup` calls
+// `cello_channel_config` and `cello_channel_name` calls `cello_channel_set_moniker`: the tool name
+// follows the CLI command, the wire name is frozen so a new daemon keeps serving an old shim.
+
+const channelKey = () =>
+  z.string().describe("The channel's 64-character hex public key");
+const channelAgent = () =>
+  z.string().optional().describe("Agent acting here (defaults to the current agent)");
+
+server.tool("cello_channels", "List the channels this agent follows or publishes, with how many posts are waiting to be read on each. Local — it reads what this daemon has already collected and asks no relay.", {
+  agent: channelAgent(),
+}, async ({ agent }) => jsonText(await proxy.call("cello_channels", { ...(agent ? { agent } : {}) })));
+
+server.tool("cello_channel_info", "Look up a channel by its public key: whether it is a channel the directory knows, and which agent administers it. Asks the directory only — it does not join, does not contact the administrator, and returns nothing about the channel's posts.", {
+  channel: channelKey(),
+  agent: channelAgent(),
+}, async ({ channel, agent }) => jsonText(await proxy.call("cello_channel_info", { channel, ...(agent ? { agent } : {}) })));
+
+server.tool("cello_channel_join", "Ask a channel's administrator to let this agent in. Opens a session with the administrator and sends the request; the answer may be admitted, pending (an invite-only channel, awaiting a human), refused, or that the channel is public and has no join. Being admitted is what delivers the group key and the relay pair, so posts start arriving after it.", {
+  channel: channelKey(),
+  note: z.string().optional().describe("A line for the administrator saying who you are and why"),
+  agent: channelAgent(),
+}, async ({ channel, note, agent }) =>
+  jsonText(await proxy.call("cello_channel_join", { channel, ...(note ? { note } : {}), ...(agent ? { agent } : {}) })));
+
+server.tool("cello_channel_read", "Read the posts collected on a channel since the last read, oldest first, and move the read position past them. Only posts this daemon has already fetched are returned. A post whose key this agent does not hold is reported rather than skipped, and the read position stops there — so a key that arrives later makes it readable instead of lost. Pass all:true to re-read from the beginning WITHOUT moving the position.", {
+  channel: channelKey(),
+  all: z.boolean().optional().describe("Re-read every post from the start; leaves the read position alone"),
+  agent: channelAgent(),
+}, async ({ channel, all, agent }) =>
+  jsonText(await proxy.call("cello_channel_read", { channel, ...(all === undefined ? {} : { all }), ...(agent ? { agent } : {}) })));
+
+server.tool("cello_channel_name", "Give a channel a label so it can be told apart from its public key. The label is stored on this machine and goes nowhere — the publisher and the other members do not see it.", {
+  channel: channelKey(),
+  moniker: z.string().describe("What to call this channel locally"),
+  agent: channelAgent(),
+}, async ({ channel, moniker, agent }) =>
+  jsonText(await proxy.call("cello_channel_set_moniker", { channel, moniker, ...(agent ? { agent } : {}) })));
+
+server.tool("cello_channel_leave", "Stop collecting a channel's posts. LOCAL ONLY: nothing is sent, the publisher is not told, and this agent stays on the member list it was admitted to. The keys already held are kept, so posts collected before now stay readable.", {
+  channel: channelKey(),
+  agent: channelAgent(),
+}, async ({ channel, agent }) => jsonText(await proxy.call("cello_channel_leave", { channel, ...(agent ? { agent } : {}) })));
+
+// ─── Publisher side ─────────────────────────────────────────────────────────
+
+server.tool("cello_channel_setup", "Record what this publisher has decided about a channel it holds the key to: which relays it posts to, who may join, what the channel is for, and how long posts are kept. DO THIS FIRST — nothing else can publish until the row exists. It writes locally and deposits nothing; cello_channel_info_set is what publishes the description.", {
+  channel: channelKey(),
+  relays: z.array(z.string()).describe("Relay multiaddrs to publish to. Two is the design — one is a single point of failure, and a subscriber takes the union of both"),
+  access: z.enum(["public", "open", "invite_only"]).describe("public = anyone reads; open = anyone may ask and is admitted; invite_only = the administrator decides each request"),
+  guidance: z.string().optional().describe("What the channel is for, shown to someone looking it up"),
+  retention_seconds: z.number().optional().describe("How long relays keep a post before dropping it"),
+  agent: channelAgent(),
+}, async ({ channel, relays, access, guidance, retention_seconds, agent }) =>
+  jsonText(await proxy.call("cello_channel_config", {
+    channel, relays, access,
+    ...(guidance === undefined ? {} : { guidance }),
+    ...(retention_seconds === undefined ? {} : { retention_seconds }),
+    ...(agent ? { agent } : {}),
+  })));
+
+server.tool("cello_channel_publish", "Publish a post to a channel this agent holds the key to. The post is encrypted under the current group key, deposited at every relay configured for the channel, and the members are then rung so they collect it without waiting for their timer. The answer names which relays took it and which did not. If NO relay took it the post still exists locally — use cello_channel_resend rather than publishing it again, which would spend a second post number on the same content.", {
+  channel: channelKey(),
+  title: z.string().describe("The post's title"),
+  body: z.string().describe("The post's body"),
+  agent: channelAgent(),
+}, async ({ channel, title, body, agent }) =>
+  jsonText(await proxy.call("cello_channel_publish", { channel, title, body, ...(agent ? { agent } : {}) })));
+
+server.tool("cello_channel_info_set", "Publish the channel's description — what cello_channel_setup recorded locally — signed, to the relays, so somebody who has the channel's key can find out what it is. Deposits; the answer names which relays took the record.", {
+  channel: channelKey(),
+  agent: channelAgent(),
+}, async ({ channel, agent }) => jsonText(await proxy.call("cello_channel_info_set", { channel, ...(agent ? { agent } : {}) })));
+
+server.tool("cello_channel_approve", "Admit somebody who asked to join an invite-only channel. Sends them the group key and the relay pair over an open session, so they can collect posts from here on. Needs them to be reachable right now; if they are not, the approval still stands for their next request.", {
+  channel: channelKey(),
+  subscriber: z.string().describe("The asking agent's 64-character hex public key"),
+  agent: channelAgent(),
+}, async ({ channel, subscriber, agent }) =>
+  jsonText(await proxy.call("cello_channel_approve", { channel, subscriber, ...(agent ? { agent } : {}) })));
+
+server.tool("cello_channel_refuse", "Turn down a request to join. They are told; no key is sent.", {
+  channel: channelKey(),
+  subscriber: z.string().describe("The asking agent's 64-character hex public key"),
+  agent: channelAgent(),
+}, async ({ channel, subscriber, agent }) =>
+  jsonText(await proxy.call("cello_channel_refuse", { channel, subscriber, ...(agent ? { agent } : {}) })));
+
+server.tool("cello_channel_eject", "Remove a member and rotate the channel's key, so the posts published from now on are ones they cannot open — and the relays stop serving them the channel at all. CANNOT BE UNDONE except by admitting them again. The new key is delivered to each remaining member, and any member who was unreachable is named in the answer: the ejection is done either way, and those members ask for the new key when they next read. Posts published BEFORE this still open under the old key they already hold.", {
+  channel: channelKey(),
+  subscriber: z.string().describe("The member's 64-character hex public key"),
+  agent: channelAgent(),
+}, async ({ channel, subscriber, agent }) =>
+  jsonText(await proxy.call("cello_channel_eject", { channel, subscriber, ...(agent ? { agent } : {}) })));
+
+server.tool("cello_channel_prune", "Drop a channel's oldest posts, up to and including a post number, from this publisher's log and ask each relay to drop its copy. The local half always happens; a relay that declines KEEPS SERVING those posts until its retention expires, and the answer names it.", {
+  channel: channelKey(),
+  through_seq: z.number().describe("The last post number to drop"),
+  agent: channelAgent(),
+}, async ({ channel, through_seq, agent }) =>
+  jsonText(await proxy.call("cello_channel_prune", { channel, through_seq, ...(agent ? { agent } : {}) })));
+
+server.tool("cello_channel_resend", "Re-deposit the posts a relay is missing — after it lost content, or when a relay has just been added to the channel. Leave `relay` out to refill every relay the channel publishes to, which is the ordinary case.", {
+  channel: channelKey(),
+  relay: z.string().optional().describe("One relay multiaddr; omit to refill all of them"),
+  agent: channelAgent(),
+}, async ({ channel, relay, agent }) =>
+  jsonText(await proxy.call("cello_channel_resend", { channel, ...(relay ? { relay } : {}), ...(agent ? { agent } : {}) })));
+
 // ─── Connect stdio transport ─────────────────────────────────────────────────
 const transport = new StdioServerTransport();
 await server.connect(transport);

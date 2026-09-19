@@ -90,6 +90,31 @@ const ALWAYS_ON_VERBS: readonly DualSurfaceVerb[] = [
   { mcp: "cello_attestation_consent_list", cli: "cello attestation-consent list" },
   { mcp: "cello_attestation_consent_accept", cli: "cello attestation-consent accept" },
   { mcp: "cello_attestation_consent_refuse", cli: "cello attestation-consent refuse" },
+  /**
+   * Channels (M16 / 023-MCPCHAN). Subscriber verbs first, matching the `Channels:` section of
+   * `cello -h` — following a channel is the common case and publishing is the rare one.
+   *
+   * ⚠️ TWO OF THESE NAME A DIFFERENT DAEMON METHOD THAN THEY DO A TOOL, and that is correct.
+   * `cello channel setup` is the tool `cello_channel_setup` proxying to `cello_channel_config`, and
+   * `cello channel name` is `cello_channel_name` proxying to `cello_channel_set_moniker`. The tool
+   * name follows the CLI command (this table's rule, enforced by dod-onboard-help-1-vocabulary);
+   * the WIRE name is never renamed, because `connect` has no daemon dependency and a new daemon
+   * must keep serving an old shim. `cello_agents` → `cello_list_agents` is the same pairing.
+   */
+  { mcp: "cello_channels", cli: "cello channels" },
+  { mcp: "cello_channel_info", cli: "cello channel info" },
+  { mcp: "cello_channel_join", cli: "cello channel join" },
+  { mcp: "cello_channel_read", cli: "cello channel read" },
+  { mcp: "cello_channel_name", cli: "cello channel name" },
+  { mcp: "cello_channel_leave", cli: "cello channel leave" },
+  { mcp: "cello_channel_setup", cli: "cello channel setup" },
+  { mcp: "cello_channel_publish", cli: "cello channel publish" },
+  { mcp: "cello_channel_info_set", cli: "cello channel info-set" },
+  { mcp: "cello_channel_approve", cli: "cello channel approve" },
+  { mcp: "cello_channel_refuse", cli: "cello channel refuse" },
+  { mcp: "cello_channel_eject", cli: "cello channel eject" },
+  { mcp: "cello_channel_prune", cli: "cello channel prune" },
+  { mcp: "cello_channel_resend", cli: "cello channel resend" },
   // Other
   { mcp: "cello_moniker", cli: "cello moniker" },
   { mcp: "cello_settings_get", cli: "cello settings get" },
