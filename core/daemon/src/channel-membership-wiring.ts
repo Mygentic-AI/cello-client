@@ -261,6 +261,11 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
         logger.warn("channel.join.refused", {
           ...(correlationId !== undefined ? { correlationId } : {}),
           reason: asSubscriber.reason, sender: senderPubkey, frame_type: kind,
+          // ⚠️ THE LINE THE OPERATOR ACTUALLY READS — this is the one carrying correlationId, and
+          // the join path is fire-and-forget so there is no response to inspect either. Dropping
+          // `detail` here left `admin_unresolved` as bare as it was before item 21 fixed it, with
+          // the cause visible only on a second line that shares this event name.
+          ...(asSubscriber.detail !== undefined ? { detail: asSubscriber.detail } : {}),
         });
       }
     })().catch((err: unknown) => {
