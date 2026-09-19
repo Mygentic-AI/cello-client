@@ -52,7 +52,7 @@ function build(over: Partial<Parameters<typeof createChannelSubscribe>[0]> = {})
     subscriptions: subs,
     inbox,
     lookupAdmin: () => Promise.resolve({ kind: "admin" as const, adminPubkeyHex: ADMIN }),
-    sessionWith: () => Promise.resolve("session-1"),
+    sessionWith: () => Promise.resolve({ ok: true as const, sessionId: "session-1" }),
     sendInSession: (_a, sessionId, content) => { sent.push({ sessionId, content }); return Promise.resolve(); },
     agentPubkey: () => AGENT_PUBKEY,
     decrypt: (_a, _c, _s, body) => Promise.resolve(body),
@@ -126,13 +126,15 @@ describe("M16 022 — join", () => {
      * or a refused one — look like membership, and would hand the operator a channel they cannot
      * read.
      */
-    const { api } = build();
+    const { api, sent } = build();
     await api.join(AGENT_NAME, AGENT, CHANNEL);
+    // Paired with the send, so this cannot pass for an implementation that simply failed earlier.
+    expect(sent, "the request really went out").toHaveLength(1);
     expect(subs.get(AGENT, CHANNEL)).toBeNull();
   });
 
   it("6. a channel the directory does not know is refused before any session is opened", async () => {
-    const sessionWith = vi.fn(() => Promise.resolve("session-1"));
+    const sessionWith = vi.fn(() => Promise.resolve({ ok: true as const, sessionId: "session-1" }));
     const { api } = build({ lookupAdmin: () => Promise.resolve({ kind: "not_a_channel" as const }), sessionWith });
     const r = await api.join(AGENT_NAME, AGENT, CHANNEL);
     expect(r.ok).toBe(false);
@@ -140,10 +142,21 @@ describe("M16 022 — join", () => {
   });
 
   it("7. no session with the admin is a named refusal, not a throw", async () => {
-    const { api } = build({ sessionWith: () => Promise.resolve(null) });
+    const { api } = build({
+      sessionWith: () => Promise.resolve({ ok: false as const, reason: "invalid_target_pubkey" }),
+    });
     const r = await api.join(AGENT_NAME, AGENT, CHANNEL);
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.reason).toBe("no_session");
+    if (!r.ok) {
+      expect(r.reason).toBe("no_session");
+      /**
+       * ⚠️ **THE REAL CAUSE TRAVELS, and the first version threw it away.** It said "could not open
+       * a session with the admin" for everything — including a field name wrong in the caller,
+       * which is what actually shipped. That message points an operator at the counterparty and the
+       * network for a bug in their own daemon.
+       */
+      expect(r.detail).toBe("invalid_target_pubkey");
+    }
   });
 });
 
@@ -189,16 +202,21 @@ describe("M16 022 — read", () => {
   });
 
   it("11. --all re-reads from the start WITHOUT moving the position", async () => {
+    /**
+     * ⚠️ The position must be BEHIND the collector's edge for this to prove anything. With both at
+     * the same number, an implementation that advanced on `--all` would set it to the value it
+     * already had and the test would pass regardless.
+     */
     subscribe(2);
     await storePost(1, "first", "one");
     await storePost(2, "second", "two");
-    const { api } = build();
-    await api.read(AGENT, CHANNEL);
+    subs.advanceProcessed(AGENT, CHANNEL, 1);
 
+    const { api } = build();
     const all = await api.read(AGENT, CHANNEL, true);
     expect(all.ok && all.posts).toHaveLength(2);
     // Reviewing history is not seeing something new.
-    expect(subs.get(AGENT, CHANNEL)?.processed_through).toBe(2);
+    expect(subs.get(AGENT, CHANNEL)?.processed_through, "unchanged, and still behind").toBe(1);
   });
 
   it("12. A POST THAT WILL NOT DECRYPT IS NAMED, NOT SKIPPED", async () => {
@@ -220,6 +238,12 @@ describe("M16 022 — read", () => {
       expect(r.posts.map((p) => p.seq)).toEqual([1]);
       expect(r.undecryptable, "the operator is told which posts could not be opened").toEqual([2]);
     }
+    /**
+     * ⚠️ **AND THE POSITION STOPS BELOW IT.** Naming the post and then advancing past it is
+     * "announced once, then skipped for ever": receive the missing key later and those posts are
+     * behind the read position, never to be shown. The next read must retry them.
+     */
+    expect(subs.get(AGENT, CHANNEL)?.processed_through, "stops below the sealed post").toBe(1);
   });
 
   it("13. reading a channel this agent does not follow is a named refusal", async () => {

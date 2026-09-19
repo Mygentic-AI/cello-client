@@ -56,6 +56,12 @@ export interface ChannelMembershipWiringDeps {
    * the relay's copy of it.
    */
   signalingFor: (agentName: string) => SignalingLike | null;
+  /**
+   * M16 022: open a session as this agent, without an IPC connection. The same path
+   * `cello_initiate_session` takes — `join` needs it because a subscriber has never spoken to the
+   * channel's administrator.
+   */
+  openSessionFor: (agentName: string, opts: { targetPubkey: string }) => Promise<unknown>;
 }
 
 /**
@@ -307,12 +313,23 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
      */
     sessionWith: async (agentName, counterpartyHex) => {
       const existing = openSessionWith(agentName, counterpartyHex);
-      if (existing !== null) return existing;
-      const initiate = handlers.get("cello_initiate_session");
-      if (!initiate) return null;
-      const answer = await initiate({ agent: agentName, target: counterpartyHex }, "channel-join") as
-        { ok?: boolean; session_id?: string };
-      return answer.ok === true && typeof answer.session_id === "string" ? answer.session_id : null;
+      if (existing !== null) return { ok: true, sessionId: existing };
+      /**
+       * ⚠️ **`openSessionFor`, NOT the handlers map — and the first version got BOTH field names
+       * wrong.** It passed `target` where the negotiator reads `target_pubkey`, and read back
+       * `session_id` where the handler returns `sessionId`. So every join refused with
+       * `no_session`, pointing the operator at the counterparty and the network for a bug that was
+       * a field name in this file. The handler's own header names this exact trap.
+       *
+       * `openSessionFor` is the seam built for callers with no IPC connection, and the document
+       * layer already uses it. Going through the handler map also meant inventing a fake
+       * connectionId, which was a seam that proved nothing.
+       */
+      const res = await deps.openSessionFor(agentName, { targetPubkey: counterpartyHex }) as
+        { ok?: boolean; sessionId?: string; reason?: string; guidance?: string };
+      if (res.ok === true && typeof res.sessionId === "string") return { ok: true, sessionId: res.sessionId };
+      // The real refusal travels. Discarding it is what made a payload bug read as a network fault.
+      return { ok: false, reason: res.reason ?? "session_open_failed", guidance: res.guidance };
     },
     sendInSession: (agentName, sessionId, content) => deps.sendInSession(agentName, sessionId, content),
     agentPubkey: (agentName) => deps.loadedAgents.find((a) => a.name === agentName)?.pubkey ?? null,

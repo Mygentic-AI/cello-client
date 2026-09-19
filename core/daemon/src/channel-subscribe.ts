@@ -23,7 +23,7 @@ export type ChannelInfoResult =
 
 export type ChannelJoinResult =
   | { ok: true; channelHex: string; state: "requested" }
-  | { ok: false; reason: "not_a_channel" | "unavailable" | "no_session" | "send_failed"; detail?: string };
+  | { ok: false; reason: "not_a_channel" | "unavailable" | "no_session" | "send_failed" | "channel_is_public"; detail?: string };
 
 export interface ReadPost {
   seq: number;
@@ -43,10 +43,14 @@ export interface ChannelSubscribeDeps {
   inbox: ChannelInboxStore;
   /** Who the DIRECTORY says administers a channel. 020's lookup, unchanged. */
   lookupAdmin: (agentId: string, channelHex: string) => Promise<
-    { kind: "admin"; adminPubkeyHex: string } | { kind: "not_a_channel" } | { kind: "unavailable"; reason: string }
+    { kind: "admin"; adminPubkeyHex: string }
+    | { kind: "not_a_channel" }
+    | { kind: "unavailable"; reason: string }
   >;
   /** An open session with that agent, opening one if needed. Null when it cannot be reached. */
-  sessionWith: (agentName: string, counterpartyHex: string) => Promise<string | null>;
+  sessionWith: (agentName: string, counterpartyHex: string) => Promise<
+    { ok: true; sessionId: string } | { ok: false; reason: string; guidance?: string }
+  >;
   sendInSession: (agentName: string, sessionId: string, content: Uint8Array) => Promise<void>;
   /** This agent's own public key — the subscriber identity the request names. */
   agentPubkey: (agentName: string) => string | null;
@@ -76,11 +80,27 @@ export function createChannelSubscribe(deps: ChannelSubscribeDeps) {
     if (found.kind === "not_a_channel") return { ok: false, reason: "not_a_channel" };
     if (found.kind === "unavailable") return { ok: false, reason: "unavailable", detail: found.reason };
 
+    /**
+     * ⚠️ **A PUBLIC CHANNEL'S `channel_is_public` COMES FROM THE ADMIN, NOT FROM HERE, AND THAT IS
+     * NOT A CHOICE.** The directory's answer carries `registered`, `channel` and `admin_pubkey` and
+     * says nothing about access, so this side cannot know. 019's admin half already refuses a join
+     * to a public channel by that name and the refusal arrives on the session.
+     *
+     * A pre-check here would have been dead code that looked like a guard. Recorded in the order
+     * instead: subscribing to a public channel has no path at all yet, because there is no
+     * acceptance to carry its relays.
+     */
     const subscriberHex = deps.agentPubkey(agentName);
     if (subscriberHex === null) return { ok: false, reason: "no_session", detail: "agent_unknown" };
 
-    const sessionId = await deps.sessionWith(agentName, found.adminPubkeyHex);
-    if (sessionId === null) return { ok: false, reason: "no_session", detail: "could not open a session with the admin" };
+    const opened = await deps.sessionWith(agentName, found.adminPubkeyHex);
+    if (!opened.ok) {
+      // ⚠️ THE REAL REFUSAL TRAVELS. The first version discarded it and said "could not open a
+      // session with the admin", which pointed at the counterparty and the network for what was a
+      // field name in the caller.
+      return { ok: false, reason: "no_session", detail: opened.reason };
+    }
+    const sessionId = opened.sessionId;
 
     try {
       const frame = encodeChannelJoinRequest({
@@ -124,7 +144,14 @@ export function createChannelSubscribe(deps: ChannelSubscribeDeps) {
       for (const entry of stored) {
         const plain = await deps.decrypt(agentId, channelHex, entry.seq, entry.body);
         if (plain === null) {
+          /**
+           * ⚠️ **THE READ POSITION STOPS HERE.** Naming the post and then advancing past it is
+           * "announced once, then skipped for ever": a subscriber who missed a re-key sees
+           * `undecryptable: [7,8,9]`, later receives the key, and those three are now behind the
+           * position and will never be shown. Stopping means the next read retries them.
+           */
           undecryptable.push(entry.seq);
+          break;
         } else {
           // The TITLE travels in clear on the artifact; only the body is sealed. So a post whose
           // body will not open still has a name, which is what makes `undecryptable` actionable.

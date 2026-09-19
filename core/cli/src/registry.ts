@@ -1655,19 +1655,28 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       if (sub === "join" && channel) {
         // A NOTE is optional and a relay is not a thing you pass: relays are the publisher's choice
         // and arrive on the acceptance.
+        //
+        // ⚠️ A stray flag must NOT become the note. The note is free text delivered to the channel's
+        // administrator, so `cello channel join <ch> --all` would have sent them "--all".
+        if (a !== undefined && a.startsWith("--")) {
+          return { stdout: helpForSpec("channel"), stderr: "", exitCode: 1 };
+        }
         return legacy(await channelVerb(
           ctx.celloDir, "cello_channel_join", withAgent(a !== undefined ? { channel, note: a } : { channel }),
         ));
       }
       if (sub === "read" && channel) {
+        // `--all` is matched EXACTLY and anything else beginning with `--` is refused. Matching it
+        // loosely meant a typo silently changed the command: `--al` was ignored and the position
+        // moved anyway, which is the opposite of what the operator asked for.
+        if (a !== undefined && a !== "--all") {
+          return { stdout: helpForSpec("channel"), stderr: "", exitCode: 1 };
+        }
         return legacy(await channelVerb(
           ctx.celloDir, "cello_channel_read", withAgent(a === "--all" ? { channel, all: true } : { channel }),
         ));
       }
       // ─── M16 019: the SUBSCRIBER's side, and the admin's membership decisions ───
-      if (sub === "list" && channel === undefined) {
-        return legacy(await channelVerb(ctx.celloDir, "cello_channels", withAgent({})));
-      }
       if (sub === "name" && channel && a !== undefined) {
         return legacy(await channelVerb(ctx.celloDir, "cello_channel_set_moniker", withAgent({ channel, moniker: a })));
       }

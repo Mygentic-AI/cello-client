@@ -373,7 +373,10 @@ export default [
     // 1,445 → 1,457 (+12, review F6): collect on signaling RECONNECT, not only on the timer. It
     // belongs here because the reconnect hook and the collector are wired at opposite ends of this
     // file, which is the same reason the doorbell's handle is late-bound a few lines above.
-    rules: { "max-lines": ["error", { max: 1457, skipBlankLines: false, skipComments: false }] },
+    // 1,457 → 1,460 (+3, M16 022-SUBSCRIBE): `openSessionFor` reaches the membership wiring, so
+    // `join` can open a session with a channel's admin — a subscriber has never spoken to them.
+    // Three lines, and they are a seam the root is the only place to pass.
+    rules: { "max-lines": ["error", { max: 1460, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/daemon-handle.ts"],

@@ -700,6 +700,9 @@ async function startDaemonHoldingLock(
     // M16 020-CHANADMIN: the subscriber asks the directory who administers a channel, on its own
     // authenticated stream. No stream means the join is refused, not accepted.
     signalingFor: (agentName) => signalingFor(agentName) ?? null,
+    // M16 022: `join` opens a session with the channel's admin — a subscriber has never spoken to
+    // them. The same path cello_initiate_session takes, callable without an IPC connection.
+    openSessionFor: (agentName, opts) => openSessionFor(agentName, opts),
   });
 
   const channelWiring = wireChannelPublishing({
