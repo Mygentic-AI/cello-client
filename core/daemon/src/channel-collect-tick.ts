@@ -36,12 +36,49 @@ import type { ChannelCollector } from "./channel-collector.js";
 import type { ChannelSubscriptionStore } from "./channel-subscription-store.js";
 import { extractErrorMessage } from "./error-message.js";
 
-/** See the header: bounded by the shortest retention any channel may configure. */
-export const COLLECT_TICK_INTERVAL_MS = 5 * 60_000;
-/** The widest the pubkey-derived offset can push a channel's tick. */
-export const COLLECT_JITTER_MS = 60_000;
-/** A failing channel is backed off to at most this, then stays there until it succeeds. */
-export const COLLECT_MAX_BACKOFF_MS = 30 * 60_000;
+/**
+ * ⚠️ **THIS IS A BACKSTOP, NOT THE DELIVERY MECHANISM — 021-WAKE changed what it is FOR.**
+ *
+ * At five minutes this timer WAS how a post reached anyone, and the feature was email with a
+ * five-minute inbox check. Delivery is now the wake (021): the publisher asks a directory to poke
+ * the members and they fetch at once.
+ *
+ * The timer keeps a job because push is best-effort, and it is the only thing that covers a post
+ * sitting on a relay with nobody told: the publisher's daemon never sent the wake, the frame was
+ * lost while the signaling stream rotated, or the peer forward never reached this subscriber's
+ * node. It does not go to zero, because the case it cannot otherwise repair is a channel that goes
+ * QUIET right after the message you missed — which is exactly the "relays going down now" post.
+ */
+export const COLLECT_TICK_INTERVAL_MS = 60 * 60_000;
+/**
+ * The widest the pubkey-derived offset can push a channel's tick — **a proportion of the interval,
+ * which is why it is written as one.** A fixed 60 seconds was right for a 5-minute tick and is a
+ * narrow band inside an hour: the fleet would clump into the same minute every hour, which is the
+ * thundering herd this exists to prevent, arriving less often and so harder to notice.
+ */
+export const COLLECT_JITTER_MS = COLLECT_TICK_INTERVAL_MS / 2;
+/**
+ * A failing channel is backed off to at most this, then stays there until it succeeds.
+ *
+ * ⚠️ **IT HAS TO EXCEED THE INTERVAL OR IT IS NOT A BACKOFF.** At 30 minutes against an hourly
+ * poll, a FAILING channel became due sooner than a healthy one — the first failure computed
+ * `min(30min, 60min×2)` = 30 minutes, and every subsequent one stayed there. This number was sized
+ * for a five-minute interval and not re-derived when the interval moved, which is the whole
+ * mistake: a constant that only makes sense relative to another constant should be written
+ * relative to it.
+ */
+export const COLLECT_MAX_BACKOFF_MS = 4 * COLLECT_TICK_INTERVAL_MS;
+
+/**
+ * Randomness added to a RETRY, on top of the stable per-channel jitter.
+ *
+ * ⚠️ **THE STEADY-STATE TIMER IS NOT THE STAMPEDE RISK — RECOVERY IS.** When a relay returns after
+ * an outage, every daemon that has been failing is on the retry path, not the timer, and
+ * `jitterForChannel` is stable per (agent, channel) so it does not stagger the returning WAVE: all
+ * of them back off to the same ceiling and come due on the same pass. This is the one place a
+ * re-rolled random belongs, because the thing being spread is a moment rather than a schedule.
+ */
+export const COLLECT_RETRY_SPREAD_MS = 10 * 60_000;
 
 export interface ChannelCollectTickDeps {
   logger: Logger;
@@ -55,6 +92,8 @@ export interface ChannelCollectTickDeps {
   intervalMs?: number;
   jitterMs?: number;
   maxBackoffMs?: number;
+  /** M16 021-WAKE: random spread on the RETRY path only. Set to 0 in a test that needs determinism. */
+  retrySpreadMs?: number;
 }
 
 export interface ChannelCollectTicker {
@@ -62,6 +101,14 @@ export interface ChannelCollectTicker {
   start: () => void;
   /** One pass over every active subscription. Exposed so a test drives it without a clock. */
   collectAllDue: (now: number) => Promise<void>;
+  /**
+   * M16 021-WAKE: the doorbell rang — collect this agent's channels NOW.
+   *
+   * ⚠️ **EVERY channel this agent follows, because the wake names none.** The frame is deliberately
+   * empty so that channel→member never travels a second wire; the daemon already knows what it
+   * subscribes to, and fetching all of them is what makes the empty frame sufficient.
+   */
+  collectNow: (agentId: string) => Promise<void>;
   stop: () => void;
 }
 
@@ -80,6 +127,7 @@ export function createChannelCollectTicker(deps: ChannelCollectTickDeps): Channe
   const intervalMs = deps.intervalMs ?? COLLECT_TICK_INTERVAL_MS;
   const jitterMs = deps.jitterMs ?? COLLECT_JITTER_MS;
   const maxBackoffMs = deps.maxBackoffMs ?? COLLECT_MAX_BACKOFF_MS;
+  const retrySpreadMs = deps.retrySpreadMs ?? COLLECT_RETRY_SPREAD_MS;
 
   /** When each subscription is next due, and how far it has been backed off. */
   const nextDue = new Map<string, number>();
@@ -123,7 +171,12 @@ export function createChannelCollectTicker(deps: ChannelCollectTickDeps): Channe
         // and one channel's bad relay must not stop every other channel on this daemon.
         const next = Math.min(maxBackoffMs, (backoff.get(key) ?? intervalMs) * 2);
         backoff.set(key, next);
-        nextDue.set(key, now + next + jitterForChannel(sub.channel_pubkey, sub.agent_id, jitterMs));
+        // Stable jitter spreads channels across subscribers; the RANDOM part spreads the moment a
+        // whole fleet returns after an outage, which stable jitter cannot do because every failing
+        // channel lands on the same ceiling.
+        nextDue.set(key, now + next
+          + jitterForChannel(sub.channel_pubkey, sub.agent_id, jitterMs)
+          + Math.floor(Math.random() * retrySpreadMs));
         logger.warn("channel.collect.tick_failed", {
           channel_pubkey: sub.channel_pubkey,
           reason: extractErrorMessage(err),
@@ -135,9 +188,60 @@ export function createChannelCollectTicker(deps: ChannelCollectTickDeps): Channe
     }
   }
 
+  /**
+   * M16 021-WAKE — a doorbell arrived for this agent. Fetch its channels at once.
+   *
+   * ⚠️ **IT DOES NOT TOUCH `nextDue`, and that is deliberate.** A wake that reset the schedule would
+   * let a chatty channel keep pushing the backstop out for every OTHER channel on this agent — and
+   * the backstop is the only thing that repairs a wake that never arrived.
+   *
+   * ⚠️ The online check is repeated here. The kill switch has to hold on this path too: collecting
+   * for an agent the operator switched off is the switch failing to switch something off, and a
+   * doorbell must not become the way around it.
+   */
+  async function collectNow(agentId: string): Promise<void> {
+    if (!isAgentOnline(agentId)) {
+      logger.debug("channel.collect.wake_ignored", { reason: "agent_offline" });
+      return;
+    }
+    for (const sub of subscriptions.active()) {
+      if (sub.agent_id !== agentId) continue;
+      const key = keyOf(sub.agent_id, sub.channel_pubkey);
+      if (inFlight.has(key)) continue;
+      inFlight.add(key);
+      try {
+        await collector.collectOnce(sub.agent_id, sub.channel_pubkey);
+        await collector.repairGaps(sub.agent_id, sub.channel_pubkey);
+        backoff.delete(key);
+      } catch (err: unknown) {
+        // One channel's bad relay must not stop the rest of this agent's channels collecting. The
+        // timer's own backoff is untouched: this pass is extra, not a replacement for it.
+        logger.warn("channel.collect.wake_failed", {
+          channel_pubkey: sub.channel_pubkey, reason: extractErrorMessage(err),
+        });
+      } finally {
+        inFlight.delete(key);
+      }
+    }
+  }
+
   return {
+    collectNow,
     start(): void {
       if (timer !== null) return;
+      /**
+       * ⚠️ **ONE PASS NOW, BEFORE THE TIMER — and leaving this out made the order's own worst case
+       * twelve times worse.** At a five-minute interval a daemon that had just started waited five
+       * minutes for its first collection; at sixty it waits an hour. Your laptop was shut
+       * overnight, you open it, the daemon reconnects — and nothing is fetched until the next hour.
+       * The offline subscriber is exactly the case the backstop exists for.
+       *
+       * It is also what makes a NEW subscription arrive promptly: `collectAllDue` treats first
+       * sight as due immediately, but only a pass can notice it.
+       */
+      void collectAllDue(Date.now()).catch((err: unknown) => {
+        logger.warn("channel.collect.pass_failed", { reason: extractErrorMessage(err) });
+      });
       // The pass runs every interval and decides per subscription what is due; the jitter lives in
       // the due times rather than in the timer, so one slow channel cannot drag the others.
       timer = setInterval(() => {

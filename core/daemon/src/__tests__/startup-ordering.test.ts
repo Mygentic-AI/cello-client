@@ -259,7 +259,13 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // Unwired they would be silent in this corpus's own way — the subscriber's admin check would go
     // on refusing every channel not published on this machine, which is EXACTLY how the code behaved
     // before the order and so looks like nothing changed rather than like something broke.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(110);
+    //
+    // 110 → 111 for M16 021-WAKE's `createChannelWakeSender` (channel-wake-sender.ts). Unwired it
+    // is silent in this corpus's own way: every publish still succeeds, every relay still takes the
+    // post, and subscribers just go on hearing about it when their backstop timer fires — which is
+    // exactly the behaviour the order exists to replace. Nothing would look broken; the feature
+    // would simply not be there.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(111);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",

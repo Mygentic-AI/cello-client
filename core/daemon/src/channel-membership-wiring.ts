@@ -20,7 +20,9 @@ import {
 import { generateGroupKey, wrapGroupKeyFor, deriveFetchKey } from "@cello-protocol/crypto";
 import { ChannelMembershipStore } from "./channel-membership-store.js";
 import { ChannelSubscriptionStore } from "./channel-subscription-store.js";
-import { createChannelJoinExchange, type LocalChannelAdmin } from "./channel-join-exchange.js";
+import {
+  createChannelJoinExchange, type LocalChannelAdmin, type AdminLookupOutcome,
+} from "./channel-join-exchange.js";
 import {
   createChannelAdminLookup, type ChannelAdminOutcome, type SignalingLike,
 } from "./channel-admin-lookup.js";
@@ -77,28 +79,29 @@ export function createProfileAdminPubkey(deps: {
   members: ChannelMembershipStore;
   lookup: (agentId: string, channelHex: string) => Promise<ChannelAdminOutcome>;
   logger: Logger;
-}): (channelHex: string, agentId: string) => Promise<string | null> {
-  return async function profileAdminPubkey(channelHex: string, agentId: string): Promise<string | null> {
+}): (channelHex: string, agentId: string) => Promise<AdminLookupOutcome> {
+  return async function profileAdminPubkey(channelHex: string, agentId: string): Promise<AdminLookupOutcome> {
     // The ADMIN this daemon recorded, not the channel's own key — the two are different agents, and
     // comparing a key with itself is what the first version of this did.
     const settings = deps.members.settings(channelHex);
-    if (settings && settings.admin_pubkey.length > 0) return settings.admin_pubkey;
+    if (settings && settings.admin_pubkey.length > 0) {
+      return { ok: true, adminPubkeyHex: settings.admin_pubkey };
+    }
 
     try {
       const outcome = await deps.lookup(agentId, channelHex);
-      if (outcome.kind === "admin") return outcome.adminPubkeyHex;
-      deps.logger.info("channel.join.admin_unresolved", {
-        channel_pubkey: channelHex,
-        reason: outcome.kind === "not_a_channel" ? "not_a_channel" : outcome.reason,
-      });
-      return null;
+      if (outcome.kind === "admin") return { ok: true, adminPubkeyHex: outcome.adminPubkeyHex };
+      // M16 021-WAKE item 21: the reason goes BACK, not just into a log. `admin_unresolved` alone
+      // cannot tell a dead stream from an unrolled directory from a channel that does not exist.
+      const reason = outcome.kind === "not_a_channel" ? "not_a_channel" : outcome.reason;
+      deps.logger.info("channel.join.admin_unresolved", { channel_pubkey: channelHex, reason });
+      return { ok: false, reason };
     } catch (err: unknown) {
       // This runs inside the inbound content path. An exception escaping would surface as a broken
       // session rather than a refused join, which is a worse answer to the same question.
-      deps.logger.warn("channel.join.admin_unresolved", {
-        channel_pubkey: channelHex, reason: extractErrorMessage(err),
-      });
-      return null;
+      const reason = extractErrorMessage(err);
+      deps.logger.warn("channel.join.admin_unresolved", { channel_pubkey: channelHex, reason });
+      return { ok: false, reason };
     }
   };
 }
@@ -134,6 +137,13 @@ export interface ChannelMembershipWiring {
    * is what makes an ejection lock the member out at the relay and not only at the ciphertext.
    */
   currentFetchKey: (channelHex: string) => Promise<{ pubkey: Uint8Array; time_ms: number; signature: Uint8Array } | undefined>;
+  /**
+   * M16 021-WAKE: the channel's ACTIVE members, which is who a post's doorbell is rung for. Pending
+   * and ejected rows are excluded by the store — waking a pending request would tell somebody who
+   * has not been admitted that a post exists, and waking an ejected member is the thing the
+   * ejection undid.
+   */
+  activeMembers: (channelHex: string) => string[];
 }
 
 export function wireChannelMembership(deps: ChannelMembershipWiringDeps): ChannelMembershipWiring {
@@ -251,6 +261,11 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
         logger.warn("channel.join.refused", {
           ...(correlationId !== undefined ? { correlationId } : {}),
           reason: asSubscriber.reason, sender: senderPubkey, frame_type: kind,
+          // ⚠️ THE LINE THE OPERATOR ACTUALLY READS — this is the one carrying correlationId, and
+          // the join path is fire-and-forget so there is no response to inspect either. Dropping
+          // `detail` here left `admin_unresolved` as bare as it was before item 21 fixed it, with
+          // the cause visible only on a second line that shares this event name.
+          ...(asSubscriber.detail !== undefined ? { detail: asSubscriber.detail } : {}),
         });
       }
     })().catch((err: unknown) => {
@@ -435,6 +450,7 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
   });
 
   return {
+    activeMembers: (channelHex: string) => members.activeMembers(channelHex),
     currentFetchKey: async (channelHex) => {
       const admin = localChannelAdmin(channelHex);
       if (!admin) return undefined;

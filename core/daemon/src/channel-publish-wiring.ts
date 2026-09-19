@@ -23,6 +23,7 @@ import { ChannelCollector } from "./channel-collector.js";
 import { ChannelSubscriptionStore } from "./channel-subscription-store.js";
 import { ChannelInboxStore } from "./channel-inbox-store.js";
 import { createChannelCollectTicker } from "./channel-collect-tick.js";
+import { createChannelWakeSender } from "./channel-wake-sender.js";
 
 type Handler = (params: Record<string, unknown> | undefined, connectionId: string) => Promise<unknown>;
 
@@ -30,6 +31,10 @@ export interface ChannelPublishWiringDeps {
   handlers: Map<string, Handler>;
   logger: Logger;
   getDb: () => DaemonDatabase;
+  /** M16 021-WAKE: who a post's doorbell is rung for. From the membership half, which owns the list. */
+  activeMembers: (channelHex: string) => string[];
+  /** M16 021-WAKE: the publishing agent's own directory connection, by agent NAME. */
+  signalingFor: (agentName: string) => { sendRaw(frame: unknown): Promise<{ ok: boolean; reason?: string }> } | null;
   getNode: () => CelloNode | null;
   screenOutbound: (content: Uint8Array, ctx: ScreenContext) => Promise<ScreenVerdict>;
   /** Every agent this daemon loaded, read per lookup so one added after boot is publishable. */
@@ -49,7 +54,9 @@ export interface ChannelPublishWiringDeps {
   isAgentOnline: (agentId: string) => boolean;
 }
 
-export function wireChannelPublishing(deps: ChannelPublishWiringDeps): { stop: () => void } {
+export function wireChannelPublishing(
+  deps: ChannelPublishWiringDeps,
+): { stop: () => void; collectNow: (agentId: string) => Promise<void> } {
   const { logger, keyProviders } = deps;
 
   const log = new ChannelLogStore(deps.getDb(), logger);
@@ -113,11 +120,23 @@ export function wireChannelPublishing(deps: ChannelPublishWiringDeps): { stop: (
     });
   };
 
+  /**
+   * M16 021-WAKE. The publishing agent asks on ITS OWN directory stream — the directory checks the
+   * caller is the channel's admin, so it has to be that agent's connection and not any that happens
+   * to be open.
+   */
+  const sendWake = createChannelWakeSender({
+    logger,
+    activeMembers: (channelHex) => deps.activeMembers(channelHex),
+    signalingFor: (agentId) => deps.signalingFor(agentId),
+  });
+
   registerChannelPublishHandlers({
     handlers: deps.handlers,
     logger,
     resolveCurrentAgent: deps.resolveCurrentAgent,
     getPublisher: buildPublisher,
+    wakeMembers: (agentName, channelHex) => sendWake(agentName, channelHex),
     setChannelConfig: (agentName, channelHex, cfg) => {
       // The channel key must be one this daemon HOLDS. Recording relays for a channel we cannot
       // sign for would leave every later verb failing on a key lookup, which describes neither the
@@ -187,5 +206,10 @@ export function wireChannelPublishing(deps: ChannelPublishWiringDeps): { stop: (
   });
   ticker.start();
 
-  return { stop: () => { ticker.stop(); } };
+  return {
+    stop: () => { ticker.stop(); },
+    // M16 021-WAKE: what the doorbell calls. Exposed rather than wired here because the frame
+    // arrives on the agent's signaling stream, which this module does not own.
+    collectNow: (agentId: string) => ticker.collectNow(agentId),
+  };
 }

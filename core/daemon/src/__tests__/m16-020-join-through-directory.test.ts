@@ -195,6 +195,39 @@ describe("M16 020 — joining a channel this daemon does not administer", () => 
     expect(h2.subs.keysFor(SUB_ID, h2.channelHex), "and no key was kept").toEqual([]);
   });
 
+  it("21. the refusal NAMES the cause, so admin_unresolved is not a dead end", async () => {
+    /**
+     * ⚠️ **`admin_unresolved` IS AN EXIT-POINT LABEL.** A dead signaling stream, a ten-second
+     * timeout against a directory that has not been rolled, a channel nobody has registered and a
+     * database fault all arrive at that one word. The cause used to survive only in a log line one
+     * step upstream — which is not where anyone looks when a join is refused.
+     *
+     * This drives the exchange directly, because the refusal is what carries the detail and the
+     * wiring test above can only see that nothing was stored.
+     */
+    const { createChannelJoinExchange } = await import("../channel-join-exchange.js");
+    const h2 = await harness({ registered: false });
+    const frame = await h2.acceptanceFrame();
+
+    const exchange = createChannelJoinExchange({
+      logger: silent,
+      members: new (await import("../channel-membership-store.js")).ChannelMembershipStore(db, silent),
+      subscriptions: h2.subs,
+      sendInSession: () => Promise.resolve(),
+      localChannelAdmin: () => null,
+      profileAdminPubkey: () => Promise.resolve({ ok: false as const, reason: "signaling_unavailable" }),
+      keyProviderFor: () => null,
+      raiseNotice: () => {},
+    });
+
+    const result = await exchange.onSubscriberFrame(SUB_ID, "session-1", h2.adminHex, frame);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("admin_unresolved");
+      expect(result.detail, "the cause travels with the refusal").toBe("signaling_unavailable");
+    }
+  });
+
   it("14b. a directory that answers 'not a channel' refuses the join too", async () => {
     // Nothing to check the answerer against, so there is no admission to make.
     const h2 = await harness({ registered: false });

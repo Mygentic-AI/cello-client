@@ -363,7 +363,17 @@ export default [
     // per-agent signaling accessor this file already holds — a seam, which is the one thing a
     // composition root cannot delegate.
     files: ["core/daemon/src/daemon.ts"],
-    rules: { "max-lines": ["error", { max: 1420, skipBlankLines: false, skipComments: false }] },
+    // ⚠️ 1420 → 1441 for M16 021-WAKE: the doorbell's two ends meet here and nowhere else. The
+    // frame arrives on a signaling stream (wired near the top of this file) and is answered by the
+    // collector (built ~400 lines below), so the root holds the late-bound handle between them.
+    // Null until the collector exists means an early wake is ignored rather than crashing, and an
+    // ignored wake costs nothing because the backstop poll is the guarantee.
+    // 1,441 → 1,445 (+4): the publisher's half of the same doorbell — the member list and the
+    // stream to ask on, both read from halves that already exist here.
+    // 1,445 → 1,457 (+12, review F6): collect on signaling RECONNECT, not only on the timer. It
+    // belongs here because the reconnect hook and the collector are wired at opposite ends of this
+    // file, which is the same reason the doorbell's handle is late-bound a few lines above.
+    rules: { "max-lines": ["error", { max: 1457, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/daemon-handle.ts"],
@@ -482,7 +492,11 @@ export default [
   },
   {
     files: ["core/daemon/src/signaling-wiring.ts"],
-    rules: { "max-lines": ["error", { max: 458, skipBlankLines: false, skipComments: false }] },
+    // ⚠️ 458 → 477 for M16 021-WAKE: one inbound handler for the channel doorbell, on the agent's
+    // OWN stream. It belongs here because this is where a per-agent manager is built; the work it
+    // triggers is entirely in the collector, and the handler is four lines plus the reason it is
+    // safe to act on a frame that carries nothing.
+    rules: { "max-lines": ["error", { max: 477, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/document-wiring.ts"],

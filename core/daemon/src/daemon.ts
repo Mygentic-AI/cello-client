@@ -284,13 +284,33 @@ async function startDaemonHoldingLock(
       logger, keyProviders, signalingConnect, directoryEndpointResolver,
     });
 
+  /**
+   * M16 021-WAKE. Late-bound on purpose: the doorbell arrives on a signaling stream, which is wired
+   * HERE, and it is answered by the collector, which is built two hundred lines below. Null until
+   * then means an early wake is ignored rather than crashing — and an ignored wake costs a
+   * subscriber nothing, because the backstop poll is what guarantees delivery.
+   */
+  let channelCollectNow: ((agentId: string) => void) | null = null;
+
   // 040-DAEMONROOT unit 5: per-agent directory signaling → signaling-wiring.ts.
   const {
     perAgentSignaling, getAgentSignaling, waitForSignalingConnected, dropAgentSignaling,
     signalingFor, sendOver, directorySignalingStatus, stopAllSignaling, registerPickupListener,
   } = createSignalingWiring({
     logger, sessionNodeManager, loadedAgents, keyProviders, sharedSignaling, noSharedDirectoryNode,
-    verifiedManifestVersion, getPersistence, onSignalingConnected, resolveConsortiumRoster,
+    verifiedManifestVersion, getPersistence, resolveConsortiumRoster,
+    /**
+     * M16 021-WAKE item 15: collect on RECONNECT, not just on the timer.
+     *
+     * ⚠️ Without this the order made its own worst case twelve times worse. A daemon that was
+     * offline — the laptop shut overnight, the exact case the backstop exists for — reconnects and
+     * then waits a full hour, where before it waited five minutes. The wake only reaches agents
+     * that were already online, so reconnect is the ONLY event that covers the ones that were not.
+     */
+    onSignalingConnected: async (agentName: string) => {
+      await onSignalingConnected(agentName);
+      channelCollectNow?.(sessionNodeManager.resolveAgentId(agentName));
+    },
     failoverEndpointResolver, getFailoverEndpoint, sealFailures, submissionRetries,
     registerSealListeners, challengeVerifier, directoryEndpointResolver,
     // Built ~1,200 lines BELOW this call, and only ever READ when a manager is constructed, which
@@ -300,6 +320,10 @@ async function startDaemonHoldingLock(
     // is not it.)
     getWirePerAgentSessionInbound: () => wirePerAgentSessionInbound,
     getHandleTrustSignalPickup: () => handleTrustSignalPickup, getSweepTrustSignals: () => sweepTrustSignalsAndTick,
+    // M16 021-WAKE: the doorbell, resolved to the stable agent id the subscriptions are keyed by.
+    onChannelWake: (agentName: string) => {
+      channelCollectNow?.(sessionNodeManager.resolveAgentId(agentName));
+    },
   });
 
   // CELLO-M7-CONN-001 (DOD-CONN-1, code-review HIGH): in PRODUCTION, bring up EACH loaded agent's OWN
@@ -690,7 +714,20 @@ async function startDaemonHoldingLock(
     // From the membership half, which owns the group key. This is what carries a re-key to the
     // relays on the next post, and so what makes an ejection lock a member out AT the relay.
     currentFetchKey: channelMembership.currentFetchKey,
+    // M16 021-WAKE: who to wake after a post, and the stream to ask on. The member list comes from
+    // the membership half, which is the only place it lives.
+    activeMembers: channelMembership.activeMembers,
+    signalingFor: (agentName) => signalingFor(agentName) ?? null,
   });
+
+  // M16 021-WAKE: now the collector exists, the doorbell has somewhere to ring.
+  channelCollectNow = (agentId: string): void => {
+    void channelWiring.collectNow(agentId).catch((err: unknown) => {
+      // A failed wake collection is not fatal and must not surface as an unhandled rejection: the
+      // backstop poll retries the same channels, which is what it is for.
+      logger.warn("channel.collect.wake_failed", { reason: extractErrorMessage(err) });
+    });
+  };
 
   // ─── Trust-signal wallet (operator-facing, no agent scope required) ───
   // 040-DAEMONROOT unit 1: the trust-signal, attestation and consent handlers moved to

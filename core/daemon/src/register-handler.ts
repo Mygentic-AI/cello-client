@@ -88,8 +88,25 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
     if (channelParam === undefined && adminPubkeyParam !== undefined) {
       return { ok: false, reason: "invalid_channel_registration", guidance: "'adminPubkeyHex' only applies to a channel registration. Pass 'channel: true' with it, or omit both for an ordinary agent." };
     }
+    /**
+     * M16 021-WAKE: `access` travels with the channel registration, and without it a PUBLIC channel
+     * could not exist — the relay asks the directory what a channel is, got no access back, and
+     * fell to the least privileged reading (a fetch needs the key).
+     */
+    const accessParam = params?.access;
+    if (accessParam !== undefined && channelParam !== true) {
+      return { ok: false, reason: "invalid_channel_registration", guidance: "'access' only applies to a channel registration. Pass 'channel: true' with it." };
+    }
+    if (accessParam !== undefined && accessParam !== "public" && accessParam !== "open" && accessParam !== "invite_only") {
+      return { ok: false, reason: "invalid_channel_registration", guidance: "'access' must be one of: public, open, invite_only." };
+    }
     const channelOpts = channelParam === true
-      ? { channel: true as const, adminPubkeyHex: adminPubkeyParam as string }
+      ? {
+          channel: true as const,
+          adminPubkeyHex: adminPubkeyParam as string,
+          // Omitted means `open`, which is what every channel registered before this already is.
+          ...(accessParam !== undefined ? { access: accessParam as "public" | "open" | "invite_only" } : {}),
+        }
       : undefined;
     const keyProvider = keyProviders.get(name);
     if (!keyProvider) {

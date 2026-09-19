@@ -81,6 +81,12 @@ export interface ChannelRegistrationOpts {
   channel: true;
   /** 64 lowercase hex chars: the pubkey of the agent that administers the channel. */
   adminPubkeyHex: string;
+  /**
+   * M16 021-WAKE. Absent means `open`. Carried to the directory because the RELAY asks the
+   * directory what a channel is, and with no access in that answer it falls to the least
+   * privileged reading — which is why a public channel could not exist in production at all.
+   */
+  access?: "public" | "open" | "invite_only";
 }
 
 const ADMIN_PUBKEY_HEX_RE = /^[0-9a-f]{64}$/;
@@ -358,7 +364,15 @@ export class RegistrationManager {
       ...(reachableNodeIds ? { reachable_node_ids: reachableNodeIds } : {}),
       // M16: present only for a channel. An ordinary registration carries neither key — absent
       // means not a channel, and there is no `channel: false` on the wire.
-      ...(channelOpts ? { channel: true, admin_pubkey: channelOpts.adminPubkeyHex } : {}),
+      ...(channelOpts
+        ? {
+            channel: true,
+            admin_pubkey: channelOpts.adminPubkeyHex,
+            // Omitted when the caller did not ask for one: a directory that predates this reads an
+            // absent access as `open`, which is exactly what every channel already registered is.
+            ...(channelOpts.access !== undefined ? { access: channelOpts.access } : {}),
+          }
+        : {}),
     });
     if (!regSent.ok) {
       return { error: regSent.reason ?? "directory_unreachable" };
