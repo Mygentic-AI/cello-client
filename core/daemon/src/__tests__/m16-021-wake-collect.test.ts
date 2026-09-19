@@ -6,7 +6,7 @@
  * never arrives — the publisher crashed, the frame was lost in stream churn, or the forward did not
  * reach this subscriber's node. Each of those leaves a post on a relay with nobody told.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
