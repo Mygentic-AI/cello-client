@@ -85,9 +85,61 @@ describe("M16 018-PUBCOLLECT: the channel verbs on a live daemon", () => {
     for (const verb of [
       "cello_channel_config", "cello_channel_publish",
       "cello_channel_info_set", "cello_channel_prune", "cello_channel_resend",
+      // M16 022: the SUBSCRIBER's three. Their absence is what made channels a feature you could
+      // publish to and nobody could subscribe to, for five orders.
+      "cello_channel_info", "cello_channel_join", "cello_channel_read",
     ]) {
       expect(verbs, `${verb} is not registered — the module is wired to nothing`).toContain(verb);
     }
+  });
+
+  it("33. M16 022 — join REACHES the session layer, and a failure to open one says what happened", async () => {
+    /**
+     * ⚠️ **THE TEST THAT WOULD HAVE CAUGHT THE FIRST CUT OF THIS VERB, and did not exist.** Every
+     * unit test stubbed the daemon seam, so all thirteen were green while `join` could never
+     * succeed: it passed `target` where the negotiator reads `target_pubkey` and read back
+     * `session_id` where the handler returns `sessionId`. Both were invisible from either side
+     * alone and obvious the moment a real daemon was asked to do the thing.
+     *
+     * There is no directory here, so the join cannot complete — that is fine and is the point. What
+     * this asserts is that the verb runs through the REAL socket, reaches the REAL session path,
+     * and comes back with a reason that names what actually stopped it. A field-name bug produced
+     * `no_session` with a detail about "the admin", which pointed at the counterparty for a fault
+     * in the caller.
+     */
+    /**
+     * ⚠️ **SET UP FIRST, AND THAT IS WHAT GIVES THIS TEETH.** With no channel recorded, the admin
+     * lookup fails before the session path is ever reached, and the test passes whatever the
+     * session code does — which is exactly how the first version of this test failed to catch the
+     * bug it was written for. A channel this daemon holds resolves its admin LOCALLY, so `join`
+     * runs all the way to opening a session.
+     */
+    await call("cello_channel_config", {
+      agent: "alice", channel: alicePubkeyHex, access: "open", relays: [RELAY_A, RELAY_B],
+    });
+
+    const answer = await call("cello_channel_join", {
+      agent: "alice", channel: alicePubkeyHex,
+    }) as { ok: boolean; reason?: string; detail?: string };
+
+    expect(answer.ok, "there is no counterparty to admit it in this harness").toBe(false);
+    // It reached the SESSION path — not the lookup, and not a caller that never got that far.
+    expect(answer.reason, `unexpected refusal ${String(answer.reason)}`).toBe("no_session");
+    /**
+     * ⚠️ And the detail is the SESSION LAYER'S OWN reason. The bug this catches passed `target`
+     * where the negotiator reads `target_pubkey`, so it came back `invalid_target_pubkey` — a
+     * fault in the caller, reported as though the counterparty were unreachable.
+     */
+    expect(answer.detail, "the session layer's real reason, not a summary").toBeDefined();
+    expect(answer.detail).not.toBe("invalid_target_pubkey");
+  });
+
+  it("34. M16 022 — read on a channel this agent does not follow is refused by name", async () => {
+    const answer = await call("cello_channel_read", {
+      agent: "alice", channel: alicePubkeyHex,
+    }) as { ok: boolean; reason?: string };
+    expect(answer.ok).toBe(false);
+    expect(answer.reason, "the operator is told they follow nothing, not given an empty list").toBe("not_subscribed");
   });
 
   it("28. a channel must be SET UP before it can publish, and the refusal says so", async () => {

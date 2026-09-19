@@ -296,9 +296,19 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     logger,
     subscriptions,
     inbox: new ChannelInboxStore(deps.getDb(), logger),
-    lookupAdmin: (agentId, channelHex) => createChannelAdminLookup({
-      signalingFor: signalingForAgentId, logger,
-    })(agentId, channelHex),
+    /**
+     * ⚠️ **THE SAME SOURCE THE ADMIN CHECK USES, and the first version used a different one.** It
+     * went straight to the directory, so joining a channel THIS daemon administers answered
+     * `unavailable` — while the check that runs on the answer resolves it locally. Two sources for
+     * one fact is how they drift.
+     */
+    lookupAdmin: async (agentId, channelHex) => {
+      const found = await profileAdminPubkey(channelHex, agentId);
+      if (found.ok) return { kind: "admin" as const, adminPubkeyHex: found.adminPubkeyHex };
+      return found.reason === "not_a_channel"
+        ? { kind: "not_a_channel" as const }
+        : { kind: "unavailable" as const, reason: found.reason };
+    },
     /**
      * An existing session with the admin, or a new one.
      *
