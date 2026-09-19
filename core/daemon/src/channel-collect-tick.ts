@@ -57,8 +57,28 @@ export const COLLECT_TICK_INTERVAL_MS = 60 * 60_000;
  * thundering herd this exists to prevent, arriving less often and so harder to notice.
  */
 export const COLLECT_JITTER_MS = COLLECT_TICK_INTERVAL_MS / 2;
-/** A failing channel is backed off to at most this, then stays there until it succeeds. */
-export const COLLECT_MAX_BACKOFF_MS = 30 * 60_000;
+/**
+ * A failing channel is backed off to at most this, then stays there until it succeeds.
+ *
+ * ⚠️ **IT HAS TO EXCEED THE INTERVAL OR IT IS NOT A BACKOFF.** At 30 minutes against an hourly
+ * poll, a FAILING channel became due sooner than a healthy one — the first failure computed
+ * `min(30min, 60min×2)` = 30 minutes, and every subsequent one stayed there. This number was sized
+ * for a five-minute interval and not re-derived when the interval moved, which is the whole
+ * mistake: a constant that only makes sense relative to another constant should be written
+ * relative to it.
+ */
+export const COLLECT_MAX_BACKOFF_MS = 4 * COLLECT_TICK_INTERVAL_MS;
+
+/**
+ * Randomness added to a RETRY, on top of the stable per-channel jitter.
+ *
+ * ⚠️ **THE STEADY-STATE TIMER IS NOT THE STAMPEDE RISK — RECOVERY IS.** When a relay returns after
+ * an outage, every daemon that has been failing is on the retry path, not the timer, and
+ * `jitterForChannel` is stable per (agent, channel) so it does not stagger the returning WAVE: all
+ * of them back off to the same ceiling and come due on the same pass. This is the one place a
+ * re-rolled random belongs, because the thing being spread is a moment rather than a schedule.
+ */
+export const COLLECT_RETRY_SPREAD_MS = 10 * 60_000;
 
 export interface ChannelCollectTickDeps {
   logger: Logger;
@@ -72,6 +92,8 @@ export interface ChannelCollectTickDeps {
   intervalMs?: number;
   jitterMs?: number;
   maxBackoffMs?: number;
+  /** M16 021-WAKE: random spread on the RETRY path only. Set to 0 in a test that needs determinism. */
+  retrySpreadMs?: number;
 }
 
 export interface ChannelCollectTicker {
@@ -105,6 +127,7 @@ export function createChannelCollectTicker(deps: ChannelCollectTickDeps): Channe
   const intervalMs = deps.intervalMs ?? COLLECT_TICK_INTERVAL_MS;
   const jitterMs = deps.jitterMs ?? COLLECT_JITTER_MS;
   const maxBackoffMs = deps.maxBackoffMs ?? COLLECT_MAX_BACKOFF_MS;
+  const retrySpreadMs = deps.retrySpreadMs ?? COLLECT_RETRY_SPREAD_MS;
 
   /** When each subscription is next due, and how far it has been backed off. */
   const nextDue = new Map<string, number>();
@@ -148,7 +171,12 @@ export function createChannelCollectTicker(deps: ChannelCollectTickDeps): Channe
         // and one channel's bad relay must not stop every other channel on this daemon.
         const next = Math.min(maxBackoffMs, (backoff.get(key) ?? intervalMs) * 2);
         backoff.set(key, next);
-        nextDue.set(key, now + next + jitterForChannel(sub.channel_pubkey, sub.agent_id, jitterMs));
+        // Stable jitter spreads channels across subscribers; the RANDOM part spreads the moment a
+        // whole fleet returns after an outage, which stable jitter cannot do because every failing
+        // channel lands on the same ceiling.
+        nextDue.set(key, now + next
+          + jitterForChannel(sub.channel_pubkey, sub.agent_id, jitterMs)
+          + Math.floor(Math.random() * retrySpreadMs));
         logger.warn("channel.collect.tick_failed", {
           channel_pubkey: sub.channel_pubkey,
           reason: extractErrorMessage(err),
@@ -201,6 +229,19 @@ export function createChannelCollectTicker(deps: ChannelCollectTickDeps): Channe
     collectNow,
     start(): void {
       if (timer !== null) return;
+      /**
+       * ⚠️ **ONE PASS NOW, BEFORE THE TIMER — and leaving this out made the order's own worst case
+       * twelve times worse.** At a five-minute interval a daemon that had just started waited five
+       * minutes for its first collection; at sixty it waits an hour. Your laptop was shut
+       * overnight, you open it, the daemon reconnects — and nothing is fetched until the next hour.
+       * The offline subscriber is exactly the case the backstop exists for.
+       *
+       * It is also what makes a NEW subscription arrive promptly: `collectAllDue` treats first
+       * sight as due immediately, but only a pass can notice it.
+       */
+      void collectAllDue(Date.now()).catch((err: unknown) => {
+        logger.warn("channel.collect.pass_failed", { reason: extractErrorMessage(err) });
+      });
       // The pass runs every interval and decides per subscription what is due; the jitter lives in
       // the due times rather than in the timer, so one slow channel cannot drag the others.
       timer = setInterval(() => {

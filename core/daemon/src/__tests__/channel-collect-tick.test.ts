@@ -144,7 +144,10 @@ describe("M16 018-PUBCOLLECT: the collection schedule", () => {
     fake.failOn.add(CHANNEL_A);
     const ticker = createChannelCollectTicker({
       logger, collector: fake.collector, subscriptions: subs, isAgentOnline: () => true,
-      intervalMs: 1_000, jitterMs: 0, maxBackoffMs: 8_000,
+      // M16 021-WAKE added a RANDOM spread on the retry path, to stagger the wave of daemons that
+      // return together after a relay outage. This test pins an exact schedule, so it pins that to
+      // zero as well — the knob exists for precisely this.
+      intervalMs: 1_000, jitterMs: 0, maxBackoffMs: 8_000, retrySpreadMs: 0,
     });
 
     // Fail at t=0 → next attempt is 2 intervals out, not 1.

@@ -16,7 +16,7 @@ import type { Logger } from "../types.js";
 import { ChannelSubscriptionStore } from "../channel-subscription-store.js";
 import {
   createChannelCollectTicker, jitterForChannel,
-  COLLECT_TICK_INTERVAL_MS, COLLECT_JITTER_MS,
+  COLLECT_TICK_INTERVAL_MS, COLLECT_JITTER_MS, COLLECT_MAX_BACKOFF_MS, COLLECT_RETRY_SPREAD_MS,
 } from "../channel-collect-tick.js";
 
 const silent: Logger = { debug() {}, info() {}, warn() {}, error() {} };
@@ -134,7 +134,37 @@ describe("M16 021 — the doorbell, and the timer as a backstop", () => {
     expect(after?.processed_through).toBe(before?.processed_through);
   });
 
-  it("15. a collect failure on one channel does not stop the others", async () => {
+  it("15. start() collects IMMEDIATELY, it does not wait out the first interval", async () => {
+    /**
+     * ⚠️ **WITHOUT THIS THE ORDER MADE ITS OWN WORST CASE TWELVE TIMES WORSE.** A daemon that has
+     * just started — your laptop opened after a night shut — used to wait five minutes for its
+     * first collection. At an hourly interval it waited an hour. The wake only reaches agents that
+     * are ALREADY online, so start and reconnect are the only events covering the ones that were
+     * not, which is the precise case the backstop exists for.
+     */
+    const { t, collected } = ticker();
+    t.start();
+    await new Promise((r) => setTimeout(r, 30));
+    t.stop();
+    expect(collected.sort()).toEqual([CHANNEL, CHANNEL_B].sort());
+  });
+
+  it("17. the backoff ceiling EXCEEDS the interval, or a broken channel is retried sooner than a healthy one", () => {
+    /**
+     * ⚠️ **THE CEILING WAS 30 MINUTES AGAINST AN HOURLY POLL, so the backoff did not back off.**
+     * First failure computed min(30min, 60min×2) = 30 minutes, and every one after stayed there: a
+     * FAILING channel became due at +30 while a healthy one went to +60. The constant was sized for
+     * a five-minute interval and not re-derived when the interval moved — which is why it is now
+     * written as a multiple of the interval rather than as a number that has to be remembered.
+     */
+    expect(COLLECT_MAX_BACKOFF_MS).toBeGreaterThan(COLLECT_TICK_INTERVAL_MS);
+    // And the retry path carries its own randomness: the stable per-channel jitter spreads channels
+    // across subscribers but cannot stagger the WAVE of daemons returning after a relay outage,
+    // because every failing channel lands on the same ceiling.
+    expect(COLLECT_RETRY_SPREAD_MS).toBeGreaterThan(0);
+  });
+
+  it("15b. a collect failure on one channel does not stop the others", async () => {
     const collected: string[] = [];
     const t = createChannelCollectTicker({
       logger: silent,

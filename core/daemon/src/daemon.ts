@@ -298,7 +298,19 @@ async function startDaemonHoldingLock(
     signalingFor, sendOver, directorySignalingStatus, stopAllSignaling, registerPickupListener,
   } = createSignalingWiring({
     logger, sessionNodeManager, loadedAgents, keyProviders, sharedSignaling, noSharedDirectoryNode,
-    verifiedManifestVersion, getPersistence, onSignalingConnected, resolveConsortiumRoster,
+    verifiedManifestVersion, getPersistence, resolveConsortiumRoster,
+    /**
+     * M16 021-WAKE item 15: collect on RECONNECT, not just on the timer.
+     *
+     * ⚠️ Without this the order made its own worst case twelve times worse. A daemon that was
+     * offline — the laptop shut overnight, the exact case the backstop exists for — reconnects and
+     * then waits a full hour, where before it waited five minutes. The wake only reaches agents
+     * that were already online, so reconnect is the ONLY event that covers the ones that were not.
+     */
+    onSignalingConnected: async (agentName: string) => {
+      await onSignalingConnected(agentName);
+      channelCollectNow?.(sessionNodeManager.resolveAgentId(agentName));
+    },
     failoverEndpointResolver, getFailoverEndpoint, sealFailures, submissionRetries,
     registerSealListeners, challengeVerifier, directoryEndpointResolver,
     // Built ~1,200 lines BELOW this call, and only ever READ when a manager is constructed, which

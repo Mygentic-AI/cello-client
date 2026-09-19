@@ -370,7 +370,10 @@ export default [
     // ignored wake costs nothing because the backstop poll is the guarantee.
     // 1,441 → 1,445 (+4): the publisher's half of the same doorbell — the member list and the
     // stream to ask on, both read from halves that already exist here.
-    rules: { "max-lines": ["error", { max: 1445, skipBlankLines: false, skipComments: false }] },
+    // 1,445 → 1,457 (+12, review F6): collect on signaling RECONNECT, not only on the timer. It
+    // belongs here because the reconnect hook and the collector are wired at opposite ends of this
+    // file, which is the same reason the doorbell's handle is late-bound a few lines above.
+    rules: { "max-lines": ["error", { max: 1457, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/daemon-handle.ts"],
