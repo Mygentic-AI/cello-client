@@ -69,6 +69,20 @@ describe("DOD-ONBOARD-HELP-1: `cello --help` renders a DESCRIBED Commands: table
   it("renders one line per command, each with its summary (git / `claude --help` style)", () => {
     const table = renderCommandsTable();
     for (const spec of COMMANDS) {
+      /**
+       * ⚠️ A command with `verbs` is listed BY VERB, each with its own summary — the parent's
+       * summary never appears, on purpose. `channel` carried a whole half of CELLO behind one line,
+       * and nothing on this page said the feature had a subscriber side. The clause is "every
+       * command is described"; for these, the described thing is the verb.
+       */
+      if (spec.verbs !== undefined) {
+        for (const verb of spec.verbs) {
+          const verbLine = table.split("\n").find((l) => l.trim().startsWith(`${spec.name} ${verb.name} `));
+          expect(verbLine, `table must have a row for '${spec.name} ${verb.name}'`).toBeDefined();
+          expect(verbLine, `'${spec.name} ${verb.name}' row must carry its summary`).toContain(verb.summary);
+        }
+        continue;
+      }
       const line = table.split("\n").find((l) => l.trim().startsWith(spec.name + " "));
       expect(line, `table must have a row for '${spec.name}'`).toBeDefined();
       expect(line, `'${spec.name}' row must carry its summary`).toContain(spec.summary);
@@ -83,6 +97,13 @@ describe("DOD-ONBOARD-HELP-1: `cello --help` renders a DESCRIBED Commands: table
     expect(USAGE).toContain("Messaging:");
     for (const spec of COMMANDS) {
       expect(USAGE, `usage must list '${spec.name}'`).toContain(spec.name);
+      // A verb-listed command is described one verb at a time — see the note above.
+      if (spec.verbs !== undefined) {
+        for (const verb of spec.verbs) {
+          expect(USAGE, `usage must describe '${spec.name} ${verb.name}'`).toContain(verb.summary);
+        }
+        continue;
+      }
       expect(USAGE, `usage must describe '${spec.name}'`).toContain(spec.summary);
     }
   });

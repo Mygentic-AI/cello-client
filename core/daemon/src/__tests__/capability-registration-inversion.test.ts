@@ -57,6 +57,12 @@ const EXEMPT = new Map<string, string>([
    * they deal with, not tools an agent should reach for mid-conversation.
    */
   ["cello_channels", "terminal-only: the operator's own list of what they follow. MCP surface deferred to Tier 5"],
+  // M16 022: the subscriber's three verbs, terminal-only on the same Tier 5 deferral as the rest of
+  // the channel surface. `join` in particular OPENS A SESSION and asks to be admitted somewhere —
+  // an agent doing that unprompted is the operator's decision to delegate, not a default.
+  ["cello_channel_info", "terminal-only: a directory lookup the operator runs. MCP surface deferred to Tier 5"],
+  ["cello_channel_join", "terminal-only: asking to be admitted to somebody's channel is the operator's call. MCP surface deferred to Tier 5"],
+  ["cello_channel_read", "terminal-only: reading what the operator follows. MCP surface deferred to Tier 5"],
   ["cello_channel_set_moniker", "terminal-only: a local label on a channel the operator follows. MCP surface deferred to Tier 5"],
   ["cello_channel_leave", "terminal-only: stops collecting a channel, which is the operator's decision about their own attention. MCP surface deferred to Tier 5"],
   ["cello_channel_eject", "terminal-only and irreversible for the ejected member — it rotates the channel key, so every remaining member is re-keyed. Never an agent's call. MCP surface deferred to Tier 5"],

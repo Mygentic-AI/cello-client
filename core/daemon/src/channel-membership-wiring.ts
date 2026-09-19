@@ -17,7 +17,7 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import {
   channelJoinFrameType, encodeChannelRekey, buildChannelFetchKeyTbs, JOIN_REQUEST_TYPE,
 } from "@cello-protocol/protocol-types";
-import { generateGroupKey, wrapGroupKeyFor, deriveFetchKey } from "@cello-protocol/crypto";
+import { generateGroupKey, wrapGroupKeyFor, deriveFetchKey, decryptBody } from "@cello-protocol/crypto";
 import { ChannelMembershipStore } from "./channel-membership-store.js";
 import { ChannelSubscriptionStore } from "./channel-subscription-store.js";
 import {
@@ -26,6 +26,8 @@ import {
 import {
   createChannelAdminLookup, type ChannelAdminOutcome, type SignalingLike,
 } from "./channel-admin-lookup.js";
+import { createChannelSubscribe } from "./channel-subscribe.js";
+import { ChannelInboxStore } from "./channel-inbox-store.js";
 import { extractErrorMessage } from "./error-message.js";
 
 type Handler = (params: Record<string, unknown> | undefined, connectionId: string) => Promise<unknown>;
@@ -54,6 +56,12 @@ export interface ChannelMembershipWiringDeps {
    * the relay's copy of it.
    */
   signalingFor: (agentName: string) => SignalingLike | null;
+  /**
+   * M16 022: open a session as this agent, without an IPC connection. The same path
+   * `cello_initiate_session` takes — `join` needs it because a subscriber has never spoken to the
+   * channel's administrator.
+   */
+  openSessionFor: (agentName: string, opts: { targetPubkey: string }) => Promise<unknown>;
 }
 
 /**
@@ -279,6 +287,93 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
   });
 
   // ─── Operator verbs ───────────────────────────────────────────────────────────────────────────
+
+  /**
+   * M16 022-SUBSCRIBE — the three verbs that make the other eleven mean anything. Until this, no
+   * production code sent a join request and nothing read a post back out.
+   */
+  const subscribe = createChannelSubscribe({
+    logger,
+    subscriptions,
+    inbox: new ChannelInboxStore(deps.getDb(), logger),
+    /**
+     * ⚠️ **THE SAME SOURCE THE ADMIN CHECK USES, and the first version used a different one.** It
+     * went straight to the directory, so joining a channel THIS daemon administers answered
+     * `unavailable` — while the check that runs on the answer resolves it locally. Two sources for
+     * one fact is how they drift.
+     */
+    lookupAdmin: async (agentId, channelHex) => {
+      const found = await profileAdminPubkey(channelHex, agentId);
+      if (found.ok) return { kind: "admin" as const, adminPubkeyHex: found.adminPubkeyHex };
+      return found.reason === "not_a_channel"
+        ? { kind: "not_a_channel" as const }
+        : { kind: "unavailable" as const, reason: found.reason };
+    },
+    /**
+     * An existing session with the admin, or a new one.
+     *
+     * ⚠️ **IT OPENS ONE IF THERE IS NONE, and that is what makes `join` a single command.** A
+     * subscriber has no reason to already hold a session with a channel's administrator — they have
+     * never spoken. Requiring `cello initiate-session` first would make the verb a two-step dance
+     * whose first step nothing tells you to take.
+     *
+     * It calls the daemon's OWN initiate handler rather than a second path to the same thing: the
+     * brokering, key-binding checks and refusals all belong to that handler and must not be
+     * reimplemented here.
+     */
+    sessionWith: async (agentName, counterpartyHex) => {
+      const existing = openSessionWith(agentName, counterpartyHex);
+      if (existing !== null) return { ok: true, sessionId: existing };
+      /**
+       * ⚠️ **`openSessionFor`, NOT the handlers map — and the first version got BOTH field names
+       * wrong.** It passed `target` where the negotiator reads `target_pubkey`, and read back
+       * `session_id` where the handler returns `sessionId`. So every join refused with
+       * `no_session`, pointing the operator at the counterparty and the network for a bug that was
+       * a field name in this file. The handler's own header names this exact trap.
+       *
+       * `openSessionFor` is the seam built for callers with no IPC connection, and the document
+       * layer already uses it. Going through the handler map also meant inventing a fake
+       * connectionId, which was a seam that proved nothing.
+       */
+      const res = await deps.openSessionFor(agentName, { targetPubkey: counterpartyHex }) as
+        { ok?: boolean; sessionId?: string; reason?: string; guidance?: string };
+      if (res.ok === true && typeof res.sessionId === "string") return { ok: true, sessionId: res.sessionId };
+      // The real refusal travels. Discarding it is what made a payload bug read as a network fault.
+      return { ok: false, reason: res.reason ?? "session_open_failed", guidance: res.guidance };
+    },
+    sendInSession: (agentName, sessionId, content) => deps.sendInSession(agentName, sessionId, content),
+    agentPubkey: (agentName) => deps.loadedAgents.find((a) => a.name === agentName)?.pubkey ?? null,
+    decrypt: (agentId, channelHex, seq, body) => {
+      const keys = subscriptions.keysFor(agentId, channelHex);
+      const out = decryptBody(keys, new Uint8Array(Buffer.from(channelHex, "hex")), seq, body);
+      return Promise.resolve(out.ok ? out.plaintext : null);
+    },
+  });
+
+  handlers.set("cello_channel_info", async (params, connectionId) => {
+    const agent = needAgent(deps, params, connectionId);
+    if (!agent.ok) return agent.answer;
+    const channel = needChannel(params);
+    if (!channel.ok) return channel.answer;
+    return subscribe.info(deps.resolveAgentId(agent.agentName), channel.channelHex);
+  });
+
+  handlers.set("cello_channel_join", async (params, connectionId) => {
+    const agent = needAgent(deps, params, connectionId);
+    if (!agent.ok) return agent.answer;
+    const channel = needChannel(params);
+    if (!channel.ok) return channel.answer;
+    const note = typeof params?.["note"] === "string" ? (params["note"]) : undefined;
+    return subscribe.join(agent.agentName, deps.resolveAgentId(agent.agentName), channel.channelHex, note);
+  });
+
+  handlers.set("cello_channel_read", async (params, connectionId) => {
+    const agent = needAgent(deps, params, connectionId);
+    if (!agent.ok) return agent.answer;
+    const channel = needChannel(params);
+    if (!channel.ok) return channel.answer;
+    return subscribe.read(deps.resolveAgentId(agent.agentName), channel.channelHex, params?.["all"] === true);
+  });
 
   handlers.set("cello_channels", async (params, connectionId) => {
     const agent = needAgent(deps, params, connectionId);

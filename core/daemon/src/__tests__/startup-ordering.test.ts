@@ -265,7 +265,12 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // post, and subscribers just go on hearing about it when their backstop timer fires — which is
     // exactly the behaviour the order exists to replace. Nothing would look broken; the feature
     // would simply not be there.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(111);
+    //
+    // 111 → 112 for M16 022-SUBSCRIBE's `createChannelSubscribe` (channel-subscribe.ts). Unwired it
+    // is the exact hole this order exists to close: nothing in production sent a join request and
+    // nothing read a post back out, so a person could publish to a channel nobody could subscribe
+    // to — for five orders, with every suite green.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(112);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",
