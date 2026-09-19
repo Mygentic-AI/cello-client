@@ -49,7 +49,9 @@ export interface ChannelPublishWiringDeps {
   isAgentOnline: (agentId: string) => boolean;
 }
 
-export function wireChannelPublishing(deps: ChannelPublishWiringDeps): { stop: () => void } {
+export function wireChannelPublishing(
+  deps: ChannelPublishWiringDeps,
+): { stop: () => void; collectNow: (agentId: string) => Promise<void> } {
   const { logger, keyProviders } = deps;
 
   const log = new ChannelLogStore(deps.getDb(), logger);
@@ -187,5 +189,10 @@ export function wireChannelPublishing(deps: ChannelPublishWiringDeps): { stop: (
   });
   ticker.start();
 
-  return { stop: () => { ticker.stop(); } };
+  return {
+    stop: () => { ticker.stop(); },
+    // M16 021-WAKE: what the doorbell calls. Exposed rather than wired here because the frame
+    // arrives on the agent's signaling stream, which this module does not own.
+    collectNow: (agentId: string) => ticker.collectNow(agentId),
+  };
 }

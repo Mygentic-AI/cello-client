@@ -68,6 +68,11 @@ export interface SignalingWiringDeps {
   verifiedManifestVersion: number;
   getPersistence: (agentName: string) => DbRegistrationPersistence;
   onSignalingConnected: (agentName: string) => void | Promise<void>;
+  /**
+   * M16 021-WAKE: the channel doorbell arrived on THIS agent's stream. Late-bound because the
+   * collector is built in the channel wiring, which is constructed after this one.
+   */
+  onChannelWake?: (agentName: string) => void;
   /** C2, late-bound; built in outbound-sessions. See trust-signal-sweep.ts. */
   getSweepTrustSignals: () => ((n: string, k: KeyProvider, p: string) => Promise<unknown>) | undefined;
   resolveConsortiumRoster: () => Promise<ConsortiumEndpoint[] | null>;
@@ -288,6 +293,20 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
      * would turn one directory's minting failure into a reachability outage the operator cannot
      * explain. The absence is already reported by the directory's own `online_token.failed`.
      */
+    /**
+     * M16 021-WAKE — the channel doorbell. A publisher asked a directory to poke this agent, so its
+     * channels are fetched now instead of at the next backstop tick.
+     *
+     * ⚠️ **THE FRAME CARRIES NOTHING AND IS NOT TRUSTED TO.** It names no channel and no sequence,
+     * so there is nothing here to forge: the worst a hostile directory can do with it is make this
+     * daemon fetch, which it was going to do anyway. Everything about WHAT was published is decided
+     * by the fetch — signatures, positions, gaps — exactly as it was before this existed.
+     */
+    mgr.registerInboundHandler((frame) => {
+      if (frame["type"] !== "channel_wake") return;
+      deps.onChannelWake?.(agentName);
+    });
+
     mgr.registerInboundHandler((frame) => {
       if (frame["type"] !== "register_success") return;
       const raw = frame["online_token"];

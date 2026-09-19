@@ -284,6 +284,14 @@ async function startDaemonHoldingLock(
       logger, keyProviders, signalingConnect, directoryEndpointResolver,
     });
 
+  /**
+   * M16 021-WAKE. Late-bound on purpose: the doorbell arrives on a signaling stream, which is wired
+   * HERE, and it is answered by the collector, which is built two hundred lines below. Null until
+   * then means an early wake is ignored rather than crashing — and an ignored wake costs a
+   * subscriber nothing, because the backstop poll is what guarantees delivery.
+   */
+  let channelCollectNow: ((agentId: string) => void) | null = null;
+
   // 040-DAEMONROOT unit 5: per-agent directory signaling → signaling-wiring.ts.
   const {
     perAgentSignaling, getAgentSignaling, waitForSignalingConnected, dropAgentSignaling,
@@ -300,6 +308,10 @@ async function startDaemonHoldingLock(
     // is not it.)
     getWirePerAgentSessionInbound: () => wirePerAgentSessionInbound,
     getHandleTrustSignalPickup: () => handleTrustSignalPickup, getSweepTrustSignals: () => sweepTrustSignalsAndTick,
+    // M16 021-WAKE: the doorbell, resolved to the stable agent id the subscriptions are keyed by.
+    onChannelWake: (agentName: string) => {
+      channelCollectNow?.(sessionNodeManager.resolveAgentId(agentName));
+    },
   });
 
   // CELLO-M7-CONN-001 (DOD-CONN-1, code-review HIGH): in PRODUCTION, bring up EACH loaded agent's OWN
@@ -691,6 +703,15 @@ async function startDaemonHoldingLock(
     // relays on the next post, and so what makes an ejection lock a member out AT the relay.
     currentFetchKey: channelMembership.currentFetchKey,
   });
+
+  // M16 021-WAKE: now the collector exists, the doorbell has somewhere to ring.
+  channelCollectNow = (agentId: string): void => {
+    void channelWiring.collectNow(agentId).catch((err: unknown) => {
+      // A failed wake collection is not fatal and must not surface as an unhandled rejection: the
+      // backstop poll retries the same channels, which is what it is for.
+      logger.warn("channel.collect.wake_failed", { reason: extractErrorMessage(err) });
+    });
+  };
 
   // ─── Trust-signal wallet (operator-facing, no agent scope required) ───
   // 040-DAEMONROOT unit 1: the trust-signal, attestation and consent handlers moved to
