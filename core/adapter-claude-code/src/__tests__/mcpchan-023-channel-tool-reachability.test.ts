@@ -29,18 +29,68 @@ const here = dirname(fileURLToPath(import.meta.url));
 const SHIM_SRC = readFileSync(join(here, "..", "bin", "cello-mcp.ts"), "utf8");
 const DAEMON_SRC = join(here, "..", "..", "..", "daemon", "src");
 
+/**
+ * Every `.ts` under the daemon's source, RECURSIVELY.
+ *
+ * ⚠️ It was a flat `readdirSync` filtered to `isFile()`. Verb fifteen landing in
+ * `core/daemon/src/channels/` would have been invisible to the scan, the `>= 14` guard would still
+ * have passed on the fourteen at the top level, and the reachability assertion would have passed
+ * with it — an audit reporting success about a file it never opened. The parity audit next door
+ * learned the same lesson twice; this one is not going to learn it a third time.
+ */
+function daemonSources(dir: string = DAEMON_SRC): string[] {
+  return readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
+    if (e.name === "__tests__" || e.name === "node_modules") return [];
+    const full = join(dir, e.name);
+    return e.isDirectory() ? daemonSources(full) : e.name.endsWith(".ts") ? [full] : [];
+  });
+}
+
 /** Every `cello_channel*` IPC method the daemon registers a handler for. */
 function daemonChannelMethods(): string[] {
-  const files = readdirSync(DAEMON_SRC, { withFileTypes: true })
-    .filter((e) => e.isFile() && e.name.endsWith(".ts"))
-    .map((e) => join(DAEMON_SRC, e.name));
   const found = new Set<string>();
-  for (const f of files) {
+  for (const f of daemonSources()) {
     for (const m of readFileSync(f, "utf8").matchAll(/handlers\.set\(\s*"(cello_channels?[a-z_]*)"/g)) {
       found.add(m[1]!);
     }
   }
   return [...found].sort();
+}
+
+/**
+ * The parameter names a daemon handler actually READS, per method.
+ *
+ * Handlers read their arguments as `params?.["name"]`, and the two shared helpers `needAgent` and
+ * `needChannel` read `agent` and `channel` on every one of them — so those two are added rather
+ * than scanned for, since they are read in a different function from the handler body.
+ */
+function handlerParams(): Map<string, Set<string>> {
+  const out = new Map<string, Set<string>>();
+  for (const f of daemonSources()) {
+    const text = readFileSync(f, "utf8");
+    // Each handler body runs to the start of the next `handlers.set(` — good enough to attribute a
+    // `params?.["x"]` to the verb it belongs to, and it is checked below by a negative control.
+    const starts = [...text.matchAll(/handlers\.set\(\s*"(cello_channels?[a-z_]*)"/g)];
+    starts.forEach((m, i) => {
+      const body = text.slice(m.index!, starts[i + 1]?.index ?? text.length);
+      const names = new Set(["agent", "channel"]);
+      for (const p of body.matchAll(/params\??\.\[\s*"([a-z_]+)"\s*\]/g)) names.add(p[1]!);
+      out.set(m[1]!, names);
+    });
+  }
+  return out;
+}
+
+/** What the shim SENDS to each daemon method: the keys of the object literal it passes. */
+function shimPayloads(): Map<string, Set<string>> {
+  const out = new Map<string, Set<string>>();
+  for (const m of SHIM_SRC.matchAll(/proxy\.call\(\s*"(cello_channels?[a-z_]*)"\s*,\s*\{([\s\S]*?)\}\s*\)\s*\)/g)) {
+    const keys = new Set<string>();
+    // `channel,` and `title,` (shorthand) and `...(x ? { relay } : {})` (spread) both land here.
+    for (const k of m[2]!.matchAll(/(?:^|[\s,{])([a-z_]+)\s*(?:,|:|\})/g)) keys.add(k[1]!);
+    out.set(m[1]!, keys);
+  }
+  return out;
 }
 
 /** Every daemon method the shim proxies to, whatever the tool it sits behind is called. */
@@ -64,5 +114,45 @@ describe("023-MCPCHAN — the channel verbs are on the MCP surface", () => {
         `cannot use them at all — only a person at a terminal can. Register a tool for each and ` +
         `add its row to ALWAYS_ON_VERBS in vocabulary.ts.\n  ${unreachable.join("\n  ")}`,
     ).toEqual([]);
+  });
+
+  /**
+   * ⚠️ THE ASSERTION ABOVE IS NOT ENOUGH, AND ORDER 022 IS THE PROOF.
+   *
+   * There, `join` passed `target` where the negotiator read `target_pubkey` and read back
+   * `session_id` where the handler returned `sessionId`. Thirteen unit tests were green because
+   * every one of them stubbed that seam, and the operator saw a network error for a caller bug.
+   * "The shim calls this method" would have been just as green. So this asks the harder question:
+   * does it call it with names the handler reads?
+   */
+  it("every key the shim sends is one the handler reads", () => {
+    const reads = handlerParams();
+    const sends = shimPayloads();
+    expect(sends.size, "no proxy payloads parsed — this audit would be vacuous").toBeGreaterThanOrEqual(14);
+
+    const unread: string[] = [];
+    for (const [method, keys] of sends) {
+      const known = reads.get(method);
+      if (!known) {
+        unread.push(`${method}: the shim calls it and no daemon handler registers it`);
+        continue;
+      }
+      for (const k of keys) if (!known.has(k)) unread.push(`${method}: sends '${k}', handler never reads it`);
+    }
+    expect(
+      unread,
+      `The shim proxies to a real handler and hands it a name the handler does not read, so the ` +
+        `field arrives as undefined and the caller is answered with a refusal that points at the ` +
+        `counterparty for a bug in this file.\n  ${unread.join("\n  ")}`,
+    ).toEqual([]);
+  });
+
+  it("the payload scan can actually see a wrong name (negative control)", () => {
+    // A parser that matched nothing would make the test above pass for every possible defect. This
+    // proves it reads real keys out of a real call, and that a stray one would not be in the set.
+    const publish = shimPayloads().get("cello_channel_publish");
+    expect(publish).toBeDefined();
+    expect([...publish!].sort()).toEqual(["agent", "body", "channel", "title"]);
+    expect(handlerParams().get("cello_channel_publish")?.has("target_pubkey")).toBe(false);
   });
 });

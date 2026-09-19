@@ -1445,6 +1445,30 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
       "prints the prompt and exits 1 having fetched nothing, and a declined answer returns " +
       "\"Nothing was downloaded\". No daemon or gateway path calls it. Adjudicated 2026-09-17.",
   },
+  {
+    surface: "core/adapter-claude-code/SKILL.md",
+    claim: "A channel's posts are encrypted under the group key — EXCEPT on a public channel, where they are not",
+    /**
+     * The exception is quoted with the claim on purpose. The first draft of this sentence said
+     * posts are encrypted, full stop, which is false for a public channel and would have told an
+     * agent its public posts were protected. A row that quoted only the true half would have
+     * adjudicated the wrong sentence.
+     */
+    excerpts: [
+      "invite-only channel they are encrypted under a group key every member holds, and on a public",
+      "channel they go in the clear, which is what public means. This daemon collects them on a timer, or",
+    ],
+    verdict: "true",
+    enforcedBy: "daemon-local",
+    evidence:
+      "`ChannelPublisher.publish` (core/daemon/src/channel-publisher.ts:198) branches on the " +
+      "channel's recorded access: `info.access === \"public\" ? plaintext : await encryptBody(...)`. " +
+      "The group key comes from `generateGroupKey` and reaches a member only through the join " +
+      "acceptance or a re-key, both wrapped to that member's public key. DAEMON-LOCAL, not " +
+      "structural: it is the publisher's own daemon that encrypts, so this is a statement about " +
+      "what YOUR machine does before it deposits, not something a relay enforces. Adjudicated " +
+      "2026-09-19 (023-MCPCHAN).",
+  },
 ];
 /**
  * DELIBERATELY NOT ADJUDICATED, and worth saying why rather than leaving a silent gap.

@@ -1058,9 +1058,10 @@ server.tool(
 // ─── Channel tools (M16 / 023-MCPCHAN) ──────────────────────────────────────
 //
 // A channel is one-to-many and one-way: a publisher posts, subscribers read. It is NOT a session —
-// there is no back-and-forth, no seal, and no transcript. Posts are encrypted under a group key
-// every member holds, deposited at two relays, and collected by this daemon on a timer or when the
-// publisher rings the doorbell.
+// there is no back-and-forth, no seal, and no transcript. Posts are deposited at two relays and
+// collected by this daemon on a timer or when the publisher rings the doorbell. On an open or
+// invite-only channel a post is encrypted under a group key every member holds; on a PUBLIC channel
+// it is deposited in the clear (`channel-publisher.ts`: the group key is skipped for `public`).
 //
 // ⚠️ A SUBSCRIBER NEVER HANDLES A RELAY. Every verb below takes the channel's public key and
 // nothing else; the relay pair arrives as part of being admitted. Relays are the publisher's choice
@@ -1072,10 +1073,24 @@ server.tool(
 
 const channelKey = () =>
   z.string().describe("The channel's 64-character hex public key");
+/**
+ * ⚠️ `agent` MEANS THREE DIFFERENT THINGS ACROSS THESE FOURTEEN, so it gets three descriptions.
+ *
+ * Every handler resolves it the same way — `resolveCurrentAgent(connectionId, params.agent)`, so
+ * omitting it uses the attended agent — but WHICH agent has to be named differs by verb, and a
+ * single sentence saying "defaults to the current agent" reads as "you can leave this out". For the
+ * publisher verbs you usually cannot: the daemon looks the channel's publisher up BY AGENT NAME
+ * (`getPublisher(agentName)`), so an agent that omits it publishes as whatever it is attending and
+ * is answered `channel_unknown` — a refusal that sounds like the channel does not exist.
+ */
 const channelAgent = () =>
-  z.string().optional().describe("Agent acting here (defaults to the current agent)");
+  z.string().optional().describe("The subscribed agent (defaults to the agent you are attending)");
+const publisherAgent = () =>
+  z.string().optional().describe("THE CHANNEL'S OWN AGENT NAME — the publisher is looked up by it, so `channel_unknown` usually means this is missing or is the wrong agent. Defaults to the agent you are attending");
+const adminAgent = () =>
+  z.string().optional().describe("The administrating agent, the one that holds the channel's key (defaults to the agent you are attending)");
 
-server.tool("cello_channels", "List the channels this agent follows or publishes, with how many posts are waiting to be read on each. Local — it reads what this daemon has already collected and asks no relay.", {
+server.tool("cello_channels", "List the channels this agent FOLLOWS, with how many posts are waiting to be read on each. Local — it reads what this daemon has already collected and asks no relay. A channel this agent PUBLISHES does not appear: the list is built from subscriptions, and setting a channel up does not create one.", {
   agent: channelAgent(),
 }, async ({ agent }) => jsonText(await proxy.call("cello_channels", { ...(agent ? { agent } : {}) })));
 
@@ -1084,12 +1099,14 @@ server.tool("cello_channel_info", "Look up a channel by its public key: whether 
   agent: channelAgent(),
 }, async ({ channel, agent }) => jsonText(await proxy.call("cello_channel_info", { channel, ...(agent ? { agent } : {}) })));
 
-server.tool("cello_channel_join", "Ask a channel's administrator to let this agent in. Opens a session with the administrator and sends the request; the answer may be admitted, pending (an invite-only channel, awaiting a human), refused, or that the channel is public and has no join. Being admitted is what delivers the group key and the relay pair, so posts start arriving after it.", {
+server.tool("cello_channel_join", "Ask a channel's administrator to let this agent in. THIS CALL ONLY ASKS: it opens a session with the administrator, sends the request, and returns that the request went out. The verdict — admitted, pending a human on an invite-only channel, refused, or that the channel is public and has no join — arrives afterwards on that session, and being admitted is what delivers the group key and the relay pair. So calling read straight after join is expected to show nothing yet.", {
   channel: channelKey(),
   note: z.string().optional().describe("A line for the administrator saying who you are and why"),
   agent: channelAgent(),
 }, async ({ channel, note, agent }) =>
-  jsonText(await proxy.call("cello_channel_join", { channel, ...(note ? { note } : {}), ...(agent ? { agent } : {}) })));
+  jsonText(await proxy.call("cello_channel_join", {
+    channel, ...(note === undefined ? {} : { note }), ...(agent ? { agent } : {}),
+  })));
 
 server.tool("cello_channel_read", "Read the posts collected on a channel since the last read, oldest first, and move the read position past them. Only posts this daemon has already fetched are returned. A post whose key this agent does not hold is reported rather than skipped, and the read position stops there — so a key that arrives later makes it readable instead of lost. Pass all:true to re-read from the beginning WITHOUT moving the position.", {
   channel: channelKey(),
@@ -1118,7 +1135,7 @@ server.tool("cello_channel_setup", "Record what this publisher has decided about
   access: z.enum(["public", "open", "invite_only"]).describe("public = anyone reads; open = anyone may ask and is admitted; invite_only = the administrator decides each request"),
   guidance: z.string().optional().describe("What the channel is for, shown to someone looking it up"),
   retention_seconds: z.number().optional().describe("How long relays keep a post before dropping it"),
-  agent: channelAgent(),
+  agent: publisherAgent(),
 }, async ({ channel, relays, access, guidance, retention_seconds, agent }) =>
   jsonText(await proxy.call("cello_channel_config", {
     channel, relays, access,
@@ -1127,53 +1144,59 @@ server.tool("cello_channel_setup", "Record what this publisher has decided about
     ...(agent ? { agent } : {}),
   })));
 
-server.tool("cello_channel_publish", "Publish a post to a channel this agent holds the key to. The post is encrypted under the current group key, deposited at every relay configured for the channel, and the members are then rung so they collect it without waiting for their timer. The answer names which relays took it and which did not. If NO relay took it the post still exists locally — use cello_channel_resend rather than publishing it again, which would spend a second post number on the same content.", {
+server.tool("cello_channel_publish", "Publish a post to a channel this agent holds the key to. The post goes under the channel's current group key — unless the channel is public, where it is deposited as it stands — then to every relay configured for the channel. The members are then rung so they collect it without waiting for their own timer; if the doorbell is not wired on this daemon they still get it on that timer, which is hourly. The answer names which relays took it and which did not. If NO relay took it the post still exists locally — use cello_channel_resend rather than publishing it again, which would spend a second post number on the same content.", {
   channel: channelKey(),
   title: z.string().describe("The post's title"),
   body: z.string().describe("The post's body"),
-  agent: channelAgent(),
+  agent: publisherAgent(),
 }, async ({ channel, title, body, agent }) =>
   jsonText(await proxy.call("cello_channel_publish", { channel, title, body, ...(agent ? { agent } : {}) })));
 
 server.tool("cello_channel_info_set", "Publish the channel's description — what cello_channel_setup recorded locally — signed, to the relays, so somebody who has the channel's key can find out what it is. Deposits; the answer names which relays took the record.", {
   channel: channelKey(),
-  agent: channelAgent(),
+  agent: publisherAgent(),
 }, async ({ channel, agent }) => jsonText(await proxy.call("cello_channel_info_set", { channel, ...(agent ? { agent } : {}) })));
 
-server.tool("cello_channel_approve", "Admit somebody who asked to join an invite-only channel. Sends them the group key and the relay pair over an open session, so they can collect posts from here on. Needs them to be reachable right now; if they are not, the approval still stands for their next request.", {
+server.tool("cello_channel_approve", "Admit somebody who asked to join an invite-only channel. Sends them the group key and the relay pair over an open session, so they can collect posts from here on. THEY MUST BE REACHABLE RIGHT NOW: if they are not, the answer is `no_open_session` and NOTHING WAS RECORDED — run approve again when they are back. Their own request cannot restart this; asking again while pending is refused.", {
   channel: channelKey(),
   subscriber: z.string().describe("The asking agent's 64-character hex public key"),
-  agent: channelAgent(),
+  agent: adminAgent(),
 }, async ({ channel, subscriber, agent }) =>
   jsonText(await proxy.call("cello_channel_approve", { channel, subscriber, ...(agent ? { agent } : {}) })));
 
-server.tool("cello_channel_refuse", "Turn down a request to join. They are told; no key is sent.", {
+server.tool("cello_channel_refuse", "Turn down a request to join. They are told; no key is sent. They must be reachable right now — if they are not, the answer is `no_open_session` and they stay pending.", {
   channel: channelKey(),
   subscriber: z.string().describe("The asking agent's 64-character hex public key"),
-  agent: channelAgent(),
+  agent: adminAgent(),
 }, async ({ channel, subscriber, agent }) =>
   jsonText(await proxy.call("cello_channel_refuse", { channel, subscriber, ...(agent ? { agent } : {}) })));
 
-server.tool("cello_channel_eject", "Remove a member and rotate the channel's key, so the posts published from now on are ones they cannot open — and the relays stop serving them the channel at all. CANNOT BE UNDONE except by admitting them again. The new key is delivered to each remaining member, and any member who was unreachable is named in the answer: the ejection is done either way, and those members ask for the new key when they next read. Posts published BEFORE this still open under the old key they already hold.", {
+server.tool("cello_channel_eject", "Remove a member and rotate the channel's key, so posts published from now on are ones they cannot open. The relays stop serving them FROM THE NEXT POST ONWARDS — the rotated fetch key travels with a deposit, so a channel that ejects and then goes quiet leaves them still able to fetch what is already there. CANNOT BE UNDONE except by admitting them again. The new key is pushed to each remaining member; any member who was unreachable is named in the answer and is STUCK on the old key until you eject or re-admit again, because nothing asks for a missed key. Posts published BEFORE this still open under the key they already hold.", {
   channel: channelKey(),
   subscriber: z.string().describe("The member's 64-character hex public key"),
-  agent: channelAgent(),
+  agent: adminAgent(),
 }, async ({ channel, subscriber, agent }) =>
   jsonText(await proxy.call("cello_channel_eject", { channel, subscriber, ...(agent ? { agent } : {}) })));
 
 server.tool("cello_channel_prune", "Drop a channel's oldest posts, up to and including a post number, from this publisher's log and ask each relay to drop its copy. The local half always happens; a relay that declines KEEPS SERVING those posts until its retention expires, and the answer names it.", {
   channel: channelKey(),
   through_seq: z.number().describe("The last post number to drop"),
-  agent: channelAgent(),
+  agent: publisherAgent(),
 }, async ({ channel, through_seq, agent }) =>
   jsonText(await proxy.call("cello_channel_prune", { channel, through_seq, ...(agent ? { agent } : {}) })));
 
 server.tool("cello_channel_resend", "Re-deposit the posts a relay is missing — after it lost content, or when a relay has just been added to the channel. Leave `relay` out to refill every relay the channel publishes to, which is the ordinary case.", {
   channel: channelKey(),
   relay: z.string().optional().describe("One relay multiaddr; omit to refill all of them"),
-  agent: channelAgent(),
+  agent: publisherAgent(),
+  // `!== undefined`, never a truthiness test: an EMPTY relay string would be dropped by `relay ? …`
+  // and silently become "refill every relay", when the handler's own answer for it is `bad_relay`.
+  // A shim that swallows a malformed argument turns a refusal the caller could act on into a
+  // different operation succeeding.
 }, async ({ channel, relay, agent }) =>
-  jsonText(await proxy.call("cello_channel_resend", { channel, ...(relay ? { relay } : {}), ...(agent ? { agent } : {}) })));
+  jsonText(await proxy.call("cello_channel_resend", {
+    channel, ...(relay === undefined ? {} : { relay }), ...(agent ? { agent } : {}),
+  })));
 
 // ─── Connect stdio transport ─────────────────────────────────────────────────
 const transport = new StdioServerTransport();

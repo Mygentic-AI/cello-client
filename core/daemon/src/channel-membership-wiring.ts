@@ -432,7 +432,13 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
    * ⚠️ **THE GENERATION BUMP AND THE STATUS FLIP ARE ONE TRANSACTION** (in the store). What happens
    * HERE is the delivery, and a delivery that fails does NOT undo the ejection: the member is out at
    * the relay the moment the next deposit carries the new fetch key, whether or not every remaining
-   * member has collected their new key yet. A member left behind hits `unknown_generation` and asks.
+   * member has collected their new key yet.
+   *
+   * ⚠️ THIS LINE USED TO END *"A member left behind hits `unknown_generation` and asks."* THEY
+   * CANNOT ASK. There is a rekey RECEIVER (`channel-join-exchange.ts`) and no requester anywhere:
+   * `read` reports `unknown_generation` and stops the read position, and sends nothing. A member
+   * who was unreachable during a re-key stays stuck until the admin ejects or re-admits somebody,
+   * which is what pushes keys again. The answer names them for exactly that reason.
    */
   handlers.set("cello_channel_eject", async (params, connectionId) => {
     const agent = needAgent(deps, params, connectionId);
@@ -521,9 +527,23 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     }
     const sessionId = openSessionWith(agent.agentName, subscriber.toLowerCase());
     if (sessionId === null) {
-      // The approval is recorded either way: the next request from an approved member is accepted
-      // immediately, so an admin approving somebody who has gone offline is not wasted work.
-      return { ok: false, reason: "no_open_session", guidance: "They are not currently reachable. Approve again when they next ask, or the approval applies to their next request." };
+      /**
+       * ⚠️ THIS COMMENT USED TO READ *"The approval is recorded either way: the next request from an
+       * approved member is accepted immediately, so an admin approving somebody who has gone offline
+       * is not wasted work."* — AND THE GUIDANCE BELOW SAID THE SAME THING TO THE OPERATOR. Neither
+       * was true, in either half.
+       *
+       * Nothing is recorded: `members.approve` runs inside `exchange.approve`, BELOW this early
+       * return, so an approval that cannot be delivered leaves the row `pending`. And the member
+       * cannot restart it — a request from a `pending` member is refused `pending_approval`
+       * (channel-join-exchange.ts), and one from an `active` member is refused `already_member`
+       * without re-sending the key. So "approve again when they next ask" was the only true clause,
+       * and the sentence after it sent an admin away believing the work was done.
+       *
+       * Rewritten rather than deleted: this is a comment that asserted a property the code did not
+       * have, sitting directly above the guidance that repeated it to the person relying on it.
+       */
+      return { ok: false, reason: "no_open_session", guidance: "They are not reachable right now and nothing was recorded — they are still pending. Run approve again once they are back online; their own retry cannot restart it." };
     }
     const result = await exchangeFor(agent.agentName).approve(channel.channelHex, subscriber.toLowerCase(), sessionId);
     return result.ok ? { ok: true, channel: channel.channelHex } : { ok: false, reason: result.reason };

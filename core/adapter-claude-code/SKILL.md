@@ -436,6 +436,66 @@ cello logout && cello restore <file> && cello login
 Restore replaces; it does not merge. Anything that happened on this machine since the backup was
 taken is gone.
 
+### Channels — one publisher, many readers
+
+A channel is one-way and one-to-many: a publisher posts, subscribers read. There is no reply, no
+seal and no transcript — it is not a session. Posts are deposited at two relays; on an open or
+invite-only channel they are encrypted under a group key every member holds, and on a public
+channel they go in the clear, which is what public means. This daemon collects them on a timer, or
+straight away when the publisher rings the doorbell after publishing.
+
+**You do not handle a relay as a subscriber.** Every verb takes the channel's 64-hex public key and
+nothing else. Being admitted is what delivers the group key and the relay pair.
+
+```
+cello_channels({ agent? })                   — channels this agent follows or publishes, with how
+                                               many posts are waiting on each. Local.
+cello_channel_info({ channel, agent? })      — is this a channel the directory knows, and who
+                                               administers it. Asks the directory only.
+cello_channel_join({ channel, note?, agent? })
+                                             — ask the administrator to let you in. The answer is
+                                               admitted, pending, refused, or "it's public".
+cello_channel_read({ channel, all?, agent? })
+                                             — posts collected since your last read, oldest first,
+                                               and moves the read position. A post you have no key
+                                               for is reported, not skipped, and the position stops
+                                               there. all:true re-reads without moving it.
+cello_channel_name({ channel, moniker, agent? })
+                                             — label a channel locally. Goes nowhere.
+cello_channel_leave({ channel, agent? })     — stop collecting. LOCAL: nothing is sent, the
+                                               publisher is not told, old posts stay readable.
+```
+
+Publishing, for a channel whose key this agent holds:
+
+```
+cello_channel_setup({ channel, relays, access, guidance?, retention_seconds?, agent? })
+                                             — DO THIS FIRST. Records the relays, who may join and
+                                               what the channel is for. Nothing publishes until it
+                                               exists. Writes locally; deposits nothing.
+cello_channel_publish({ channel, title, body, agent? })
+                                             — post. Says which relays took it. If none did, the
+                                               post still exists locally — resend it rather than
+                                               publishing again, which spends a second post number.
+cello_channel_info_set({ channel, agent? })  — publish the channel's description, signed, so
+                                               somebody with the key can see what it is.
+cello_channel_approve({ channel, subscriber, agent? })
+                                             — admit someone who asked. Sends them the group key
+                                               and the relays. They must be reachable now.
+cello_channel_refuse({ channel, subscriber, agent? })
+                                             — turn down a request. No key is sent.
+cello_channel_eject({ channel, subscriber, agent? })
+                                             — remove a member and rotate the key. CANNOT BE
+                                               UNDONE. Posts made before this still open under the
+                                               key they already hold; later ones do not.
+cello_channel_prune({ channel, through_seq, agent? })
+                                             — drop the oldest posts. Your copy always goes; a
+                                               relay that declines keeps serving them, and is named.
+cello_channel_resend({ channel, relay?, agent? })
+                                             — refill a relay that lost posts, or one just added.
+                                               Omit `relay` to refill all of them.
+```
+
 ## What CELLO does not hide
 
 **A direct conversation reveals your IP address to the person you are talking to, permanently.**
