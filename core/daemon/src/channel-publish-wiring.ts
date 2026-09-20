@@ -17,6 +17,7 @@ import type { ScreenContext, ScreenVerdict } from "@cello-protocol/gateway";
 import { Buffer } from "node:buffer";
 import { registerChannelPublishHandlers, recordChannelConfig, depositChannelInfo } from "./channel-publish-handlers.js";
 import { registerChannelCreateHandler } from "./channel-create-handler.js";
+import { extractErrorMessage } from "./error-message.js";
 import { DbIdentityStore } from "./db-identity-store.js";
 import { ChannelPublisher } from "./channel-publisher.js";
 import { ChannelLogStore } from "./channel-log-store.js";
@@ -206,9 +207,7 @@ export function wireChannelPublishing(
           // leaving a half-made channel identity behind with NO trace of why cleanup did not run. Log
           // it with the name and error so the operator can remove it by hand; the create still fails.
           await removeAgent({ name }, "internal:channel-create").catch((err) => {
-            logger.warn("channel.create.rollback_failed", {
-              name, error: err instanceof Error ? err.message : String(err),
-            });
+            logger.warn("channel.create.rollback_failed", { name, error: extractErrorMessage(err) });
           });
         }
       };
