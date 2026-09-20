@@ -238,7 +238,15 @@ export function wireChannelPublishing(
         await rollbackMint(mintedHere);
         return { ok: false, reason: "no_current_agent", guidance: `Agent '${adminName}' has no key on this daemon, so it cannot sign as the channel's admin.` };
       }
-      const adminSignature = Buffer.from(await adminKp.sign(Buffer.from(channelPubkeyHex, "hex"))).toString("hex");
+      // 024-CREATE item 3 — DOMAIN SEPARATION. Sign "cello.channel.admin.v1" || channelPubkey, never
+      // the bare pubkey. The admin's K_local key also signs FROST auth and more; the tag binds this
+      // signature to "authorize this channel" so one made for another purpose cannot be replayed here.
+      // The directory verifies these exact bytes (channelAdminSigMessage) — the two change together.
+      const adminSigMessage = Buffer.concat([
+        Buffer.from("cello.channel.admin.v1", "utf8"),
+        Buffer.from(channelPubkeyHex, "hex"),
+      ]);
+      const adminSignature = Buffer.from(await adminKp.sign(new Uint8Array(adminSigMessage))).toString("hex");
 
       const reg = (await register(
         { agent: name, channel: true, adminPubkeyHex, adminSignature, access, correlationId },

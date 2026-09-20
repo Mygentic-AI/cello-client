@@ -35,7 +35,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
-import { generateKeypair, type InMemoryKeyProvider, type KeyProvider } from "@cello-protocol/crypto";
+import { generateKeypair, verify, type InMemoryKeyProvider, type KeyProvider } from "@cello-protocol/crypto";
 import { registerChannelCreateHandler, type ChannelCreateDeps } from "../channel-create-handler.js";
 import { wireChannelPublishing } from "../channel-publish-wiring.js";
 import { ChannelConfigStore } from "../channel-config-store.js";
@@ -337,5 +337,41 @@ describe("M16 024-CREATE Section C: the config create records is real, and publi
     // NOTHING PERSISTED: no channel_config row was written, so a channel with one relay never exists.
     const row = new ChannelConfigStore(db, silent).get(channelPubkeyHex);
     expect(row, "a one-relay echo must not write a channel_config row").toBeNull();
+  });
+
+  it("item 3: the admin signs the DOMAIN-SEPARATED message, not the bare channel pubkey", async () => {
+    // Capture what the register step is handed, so we can check the exact bytes the admin signed.
+    const captured: { adminSignature?: string; adminPubkeyHex?: string } = {};
+    const handlers = new Map<string, Handler>();
+    handlers.set("cello_register", async (params) => {
+      captured.adminSignature = params?.["adminSignature"] as string;
+      captured.adminPubkeyHex = params?.["adminPubkeyHex"] as string;
+      return { ok: true, agent_id: "a1", primary_pubkey: channelPubkeyHex, relays: [RELAY_A, RELAY_B] };
+    });
+    wireChannelPublishing({
+      handlers, logger: silent, getDb: () => db, getNode: () => null,
+      screenOutbound: (content, ctx) => new PassthroughGatewayClient().screenOutbound(content, ctx),
+      loadedAgents: [
+        { name: "admin", pubkey: adminPubkeyHex, keyProvider: adminKp as KeyProvider },
+        { name: "channel", pubkey: channelPubkeyHex, keyProvider: channelKp as KeyProvider },
+      ],
+      keyProviders: new Map<string, KeyProvider>([["admin", adminKp], ["channel", channelKp]]),
+      resolveCurrentAgent: (_c, explicit) => explicit ?? "admin",
+      isAgentOnline: () => true, activeMembers: () => [], signalingFor: () => null,
+    });
+
+    await handlers.get("cello_channel_create")!({ agent: "admin", name: "channel", access: "public" }, "conn1");
+
+    expect(captured.adminSignature, "register must receive an admin signature").toBeDefined();
+    expect(captured.adminPubkeyHex).toBe(adminPubkeyHex);
+    const sig = new Uint8Array(Buffer.from(captured.adminSignature!, "hex"));
+    const adminPubkey = new Uint8Array(Buffer.from(adminPubkeyHex, "hex"));
+    const channelPubkeyBytes = new Uint8Array(Buffer.from(channelPubkeyHex, "hex"));
+    const taggedMsg = new Uint8Array(Buffer.concat([Buffer.from("cello.channel.admin.v1", "utf8"), channelPubkeyBytes]));
+
+    // The signature verifies over the TAGGED message the directory checks, and NOT over the bare
+    // pubkey — a K_local signature made for another purpose cannot be replayed as this authorization.
+    expect(verify(adminPubkey, taggedMsg, sig)).toBe(true);
+    expect(verify(adminPubkey, channelPubkeyBytes, sig)).toBe(false);
   });
 });
