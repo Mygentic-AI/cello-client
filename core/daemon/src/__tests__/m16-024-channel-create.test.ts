@@ -375,3 +375,66 @@ describe("M16 024-CREATE Section C: the config create records is real, and publi
     expect(verify(adminPubkey, channelPubkeyBytes, sig)).toBe(false);
   });
 });
+
+describe("M16 024-CREATE item 6: a failed rollback is logged, not swallowed", () => {
+  let dir: string;
+  let db: DaemonDatabase;
+
+  beforeEach(() => {
+    process.env["CELLO_ENV"] = "test";
+    dir = mkdtempSync(join(tmpdir(), "cello-m16-024-rb-"));
+    db = openTestDb(join(dir, "sessions.db"));
+  });
+  afterEach(() => {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+    delete process.env["CELLO_ENV"];
+  });
+
+  it("when the mint rollback's removeAgent throws, channel.create.rollback_failed is logged with the name and error", async () => {
+    const logs: Array<{ event: string; ctx: Record<string, unknown> }> = [];
+    const capturing: Logger = {
+      debug() {}, info() {},
+      warn(event: string, ctx?: Record<string, unknown>) { logs.push({ event, ctx: ctx ?? {} }); },
+      error() {},
+    };
+
+    const adminKp = generateKeypair();
+    const channelKp = generateKeypair();
+    const adminPubkeyHex = Buffer.from(await adminKp.getPublicKey()).toString("hex");
+    const channelPubkeyHex = Buffer.from(await channelKp.getPublicKey()).toString("hex");
+
+    const handlers = new Map<string, Handler>();
+    // The channel name is NOT pre-loaded, so create mints it (mintedHere = true). The mint stub adds
+    // the key so the pubkey resolves; registration then FAILS, triggering the rollback.
+    const loadedAgents = [{ name: "admin", pubkey: adminPubkeyHex, keyProvider: adminKp as KeyProvider }];
+    const keyProviders = new Map<string, KeyProvider>([["admin", adminKp]]);
+    handlers.set("cello_create_agent", async () => {
+      keyProviders.set("channel", channelKp);
+      loadedAgents.push({ name: "channel", pubkey: channelPubkeyHex, keyProvider: channelKp as KeyProvider });
+      return { ok: true };
+    });
+    handlers.set("cello_register", async () => ({ ok: false, reason: "register_failed" }));
+    // The rollback's removeAgent throws — before item 6 this was swallowed by .catch(() => undefined).
+    handlers.set("cello_remove_agent", async () => { throw new Error("db locked"); });
+
+    wireChannelPublishing({
+      handlers, logger: capturing, getDb: () => db, getNode: () => null,
+      screenOutbound: (content, ctx) => new PassthroughGatewayClient().screenOutbound(content, ctx),
+      loadedAgents, keyProviders,
+      resolveCurrentAgent: (_c, explicit) => explicit ?? "admin",
+      isAgentOnline: () => true, activeMembers: () => [], signalingFor: () => null,
+    });
+
+    const created = (await handlers.get("cello_channel_create")!(
+      { agent: "admin", name: "channel", access: "public" }, "conn1",
+    )) as Record<string, unknown>;
+    // The create still fails at the register step (the rollback is best-effort cleanup).
+    expect(created.step).toBe("register");
+
+    const rb = logs.find((l) => l.event === "channel.create.rollback_failed");
+    expect(rb, "a failed rollback must be logged, not swallowed").toBeDefined();
+    expect(rb!.ctx["name"]).toBe("channel");
+    expect(String(rb!.ctx["error"])).toContain("db locked");
+  });
+});

@@ -201,7 +201,16 @@ export function wireChannelPublishing(
       const rollbackMint = async (mintedHere: boolean): Promise<void> => {
         if (!mintedHere) return;
         const removeAgent = deps.handlers.get("cello_remove_agent");
-        if (removeAgent) await removeAgent({ name }, "internal:channel-create").catch(() => undefined);
+        if (removeAgent) {
+          // 024-CREATE item 6: a failed rollback used to be swallowed (.catch(() => undefined)),
+          // leaving a half-made channel identity behind with NO trace of why cleanup did not run. Log
+          // it with the name and error so the operator can remove it by hand; the create still fails.
+          await removeAgent({ name }, "internal:channel-create").catch((err) => {
+            logger.warn("channel.create.rollback_failed", {
+              name, error: err instanceof Error ? err.message : String(err),
+            });
+          });
+        }
       };
 
       // Fold the mint in: over MCP there is no cello_create_agent tool, so an agent could never
