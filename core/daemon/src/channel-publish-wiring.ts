@@ -180,7 +180,7 @@ export function wireChannelPublishing(
     logger,
     resolveCurrentAgent: deps.resolveCurrentAgent,
     agentPubkey: (agentName) => deps.loadedAgents.find((a) => a.name === agentName)?.pubkey ?? null,
-    registerChannel: async ({ name, preAuthToken, adminPubkeyHex, access, correlationId }) => {
+    registerChannel: async ({ name, adminName, adminPubkeyHex, access, correlationId }) => {
       const register = deps.handlers.get("cello_register");
       if (!register) {
         // Unreachable in production — registered at boot. A miss here is a WIRING bug, not an
@@ -189,7 +189,7 @@ export function wireChannelPublishing(
       }
 
       // Refuse a name that is ALREADY a registered identity before anything runs. Re-registering it
-      // would either clobber it or spend the token on a DKG for an identity that already exists.
+      // would either clobber it or run a DKG for an identity that already exists.
       const existing = new DbIdentityStore(deps.getDb(), logger).getAgentForRevocation(name);
       if (existing && existing.state === "registered") {
         return {
@@ -197,6 +197,12 @@ export function wireChannelPublishing(
           guidance: `'${name}' is already a registered identity, so it cannot be created as a channel. Choose a different name.`,
         };
       }
+
+      const rollbackMint = async (mintedHere: boolean): Promise<void> => {
+        if (!mintedHere) return;
+        const removeAgent = deps.handlers.get("cello_remove_agent");
+        if (removeAgent) await removeAgent({ name }, "internal:channel-create").catch(() => undefined);
+      };
 
       // Fold the mint in: over MCP there is no cello_create_agent tool, so an agent could never
       // satisfy a "create the identity first" precondition. When the name has no local key, mint it
@@ -212,33 +218,54 @@ export function wireChannelPublishing(
         mintedHere = true;
       }
 
+      // The channel's own pubkey is its loaded K_local key — what a post is signed with and what
+      // config/info-set are addressed by (the agent NAME is a mutable display label). Resolve it now,
+      // BEFORE registration, because the admin signs over these very bytes.
+      const kp = keyProviders.get(name);
+      const channelPubkeyHex = deps.loadedAgents.find((a) => a.name === name)?.pubkey
+        ?? (kp ? Buffer.from(await kp.getPublicKey()).toString("hex") : undefined);
+      if (channelPubkeyHex === undefined) {
+        await rollbackMint(mintedHere);
+        throw new Error("channel_create_wiring: channel key not loaded after mint");
+      }
+
+      // ⚠️ THE WHOLE BASIS OF THE RIGHT: the admin — an already-registered agent — signs the channel's
+      // K_local pubkey with its own K_local (Ed25519, RFC 8032). No token. The directory verifies this
+      // against `admin_pubkey` and that the admin is a registered non-channel agent, then skips the
+      // token gate. Signed here, where the admin's key provider is held.
+      const adminKp = keyProviders.get(adminName);
+      if (!adminKp) {
+        await rollbackMint(mintedHere);
+        return { ok: false, reason: "no_current_agent", guidance: `Agent '${adminName}' has no key on this daemon, so it cannot sign as the channel's admin.` };
+      }
+      const adminSignature = Buffer.from(await adminKp.sign(Buffer.from(channelPubkeyHex, "hex"))).toString("hex");
+
       const reg = (await register(
-        { agent: name, preAuthToken, channel: true, adminPubkeyHex, access, correlationId },
+        { agent: name, channel: true, adminPubkeyHex, adminSignature, access, correlationId },
         "internal:channel-create",
-      )) as { ok?: boolean; reason?: string };
+      )) as { ok?: boolean; reason?: string; relays?: unknown };
       if (reg?.ok !== true) {
         // Roll back an identity WE minted so a failed create leaves nothing behind — "nothing exists
         // yet" is the register step's contract. `reason` is passed up; the guidance is deliberately
         // NOT (the create handler writes its own, which names `cello channel create`, never
-        // `register-agent` — that would spend the next token on an ordinary agent that can never
-        // become a channel).
-        if (mintedHere) {
-          const removeAgent = deps.handlers.get("cello_remove_agent");
-          if (removeAgent) await removeAgent({ name }, "internal:channel-create").catch(() => undefined);
-        }
+        // `register-agent` — an ordinary agent that can never become a channel).
+        await rollbackMint(mintedHere);
         return { ok: false, reason: reg?.reason ?? "register_failed" };
       }
 
-      // The channel's own pubkey is its loaded K_local key — what a post is signed with and what
-      // config/info-set are addressed by (the agent NAME is a mutable display label). Resolve it the
-      // way register-handler does, from the loaded key material that a successful register guarantees.
-      const loaded = deps.loadedAgents.find((a) => a.name === name);
-      const kp = keyProviders.get(name);
-      const channelPubkeyHex = loaded?.pubkey ?? (kp ? Buffer.from(await kp.getPublicKey()).toString("hex") : undefined);
-      if (channelPubkeyHex === undefined) {
-        throw new Error("channel_create_wiring: registered channel key not loaded");
+      // The directory picks the channel's two relays from its pool and echoes them here. Fewer than
+      // two DISTINCT relays is a registration we cannot honour — a channel with one relay is a single
+      // point of failure — so it is treated as failed and the mint is rolled back, leaving nothing.
+      const echoed = Array.isArray(reg.relays) ? reg.relays.filter((r): r is string => typeof r === "string") : [];
+      const distinct = [...new Set(echoed)];
+      if (distinct.length < 2) {
+        await rollbackMint(mintedHere);
+        return {
+          ok: false, reason: "directory_returned_no_relays",
+          guidance: "The directory did not return two distinct relays for this channel, so it was not created. Retry; if it persists, the directory's relay pool is short of relays.",
+        };
       }
-      return { ok: true, channelPubkeyHex };
+      return { ok: true, channelPubkeyHex, relays: distinct };
     },
     applyChannelConfig: (agentName, channelHex, cfg) =>
       recordChannelConfig({ logger, setChannelConfig }, agentName, channelHex, cfg),

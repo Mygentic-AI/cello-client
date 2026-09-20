@@ -377,6 +377,10 @@ describe("038-KEYBIND: the binding this daemon MINTS", () => {
 describe("M16 004-IDENTITY-WIRE: channel registration (client side)", () => {
   const GROUP = "cc".repeat(32);
   const ADMIN = generateKeypair().toJSON()["publicKey"]!;
+  // M16 024-CREATE: a channel presents no token — the admin's Ed25519 signature over the channel's
+  // pubkey rides the round-1 DKG frame instead. The manager forwards it verbatim (the DIRECTORY
+  // verifies it), so any well-formed hex stands in here.
+  const ADMIN_SIG = "ab".repeat(64);
 
   function makeCapturingCtx(persistence: DaemonRegistrationPersistence | null = null) {
     const frames: Array<Record<string, unknown>> = [];
@@ -420,7 +424,7 @@ describe("M16 004-IDENTITY-WIRE: channel registration (client side)", () => {
   it("channel registration sends channel and admin_pubkey in register_request", async () => {
     const h = makeCapturingCtx();
     const mgr = new RegistrationManager(h.ctx);
-    void mgr.register("", "token", { channel: true, adminPubkeyHex: ADMIN });
+    void mgr.register("", "token", { channel: true, adminPubkeyHex: ADMIN, adminSignature: ADMIN_SIG });
     await vi.waitFor(() => expect(h.frames.length).toBeGreaterThan(0));
     const frame = h.frames[0]!;
     expect(frame["type"]).toBe("register_request");
@@ -442,7 +446,7 @@ describe("M16 004-IDENTITY-WIRE: channel registration (client side)", () => {
   it("self-administered channel is refused before sending", async () => {
     const h = makeCapturingCtx();
     const mgr = new RegistrationManager(h.ctx);
-    const result = await mgr.register("", "token", { channel: true, adminPubkeyHex: stubKeyProviderPubkeyHex });
+    const result = await mgr.register("", "token", { channel: true, adminPubkeyHex: stubKeyProviderPubkeyHex, adminSignature: ADMIN_SIG });
     expect(result).toMatchObject({ error: "invalid_channel_registration" });
     expect(h.frames).toHaveLength(0);
   });
@@ -451,7 +455,7 @@ describe("M16 004-IDENTITY-WIRE: channel registration (client side)", () => {
     for (const bad of [ADMIN.slice(0, 63), "A" + ADMIN.slice(1)]) {
       const h = makeCapturingCtx();
       const mgr = new RegistrationManager(h.ctx);
-      const result = await mgr.register("", "token", { channel: true, adminPubkeyHex: bad });
+      const result = await mgr.register("", "token", { channel: true, adminPubkeyHex: bad, adminSignature: ADMIN_SIG });
       expect(result, bad).toMatchObject({ error: "invalid_channel_registration" });
       expect(h.frames, bad).toHaveLength(0);
     }
@@ -461,18 +465,31 @@ describe("M16 004-IDENTITY-WIRE: channel registration (client side)", () => {
     const { persistence, calls } = makeRecordingPersistence(GROUP);
     const h = makeCapturingCtx(persistence);
     const mgr = new RegistrationManager(h.ctx);
-    const promise = mgr.register("", "token", { channel: true, adminPubkeyHex: ADMIN });
+    const promise = mgr.register("", "token", { channel: true, adminPubkeyHex: ADMIN, adminSignature: ADMIN_SIG });
     const result = await driveToRegisterSuccess(h, promise, { channel: true });
     expect(result).toMatchObject({ agent_id: "agent-ch", status: "active" });
     expect(calls.reg).toHaveLength(1);
     expect(calls.reg[0]).toMatchObject({ agentId: "agent-ch", channel: true, adminPubkey: ADMIN });
   });
 
+  it("register_success carries the directory's two relays back to the caller (M16 024-CREATE)", async () => {
+    // Nobody typed a relay: the directory picks two from its pool and echoes them here. register()
+    // returns exactly those so cello_channel_create can record them.
+    const RELAY_A = "/dns4/relay-a.example/tcp/443/tls/ws";
+    const RELAY_B = "/dns4/relay-b.example/tcp/443/tls/ws";
+    const { persistence } = makeRecordingPersistence(GROUP);
+    const h = makeCapturingCtx(persistence);
+    const mgr = new RegistrationManager(h.ctx);
+    const promise = mgr.register("", "token", { channel: true, adminPubkeyHex: ADMIN, adminSignature: ADMIN_SIG });
+    const result = await driveToRegisterSuccess(h, promise, { channel: true, relays: [RELAY_A, RELAY_B] });
+    expect(result).toMatchObject({ agent_id: "agent-ch", relays: [RELAY_A, RELAY_B] });
+  });
+
   it("register_success WITHOUT the echo fails the registration", async () => {
     const { persistence, calls } = makeRecordingPersistence(GROUP);
     const h = makeCapturingCtx(persistence);
     const mgr = new RegistrationManager(h.ctx);
-    const promise = mgr.register("", "token", { channel: true, adminPubkeyHex: ADMIN });
+    const promise = mgr.register("", "token", { channel: true, adminPubkeyHex: ADMIN, adminSignature: ADMIN_SIG });
     const result = await driveToRegisterSuccess(h, promise, {});
     expect(result).toMatchObject({ error: "directory_missing_channel_support" });
     expect(calls.reg, "a channel the directory did not record must not be persisted as registered").toHaveLength(0);
@@ -490,7 +507,7 @@ describe("M16 004-IDENTITY-WIRE: channel registration (client side)", () => {
     const { persistence, calls } = makeRecordingPersistence(GROUP);
     const h = makeCapturingCtx(persistence);
     const mgr = new RegistrationManager(h.ctx);
-    const promise = mgr.register("", "token", { channel: true, adminPubkeyHex: ADMIN });
+    const promise = mgr.register("", "token", { channel: true, adminPubkeyHex: ADMIN, adminSignature: ADMIN_SIG });
     await vi.waitFor(() => expect(h.getPendingDkg()).not.toBeNull());
     h.deliverDkg({
       type: "register_error", reason: "already_registered",
@@ -505,7 +522,7 @@ describe("M16 004-IDENTITY-WIRE: channel registration (client side)", () => {
     const { persistence, calls } = makeRecordingPersistence(GROUP);
     const h = makeCapturingCtx(persistence);
     const mgr = new RegistrationManager(h.ctx);
-    const promise = mgr.register("", "token", { channel: true, adminPubkeyHex: ADMIN });
+    const promise = mgr.register("", "token", { channel: true, adminPubkeyHex: ADMIN, adminSignature: ADMIN_SIG });
     const result = await driveToRegisterSuccess(h, promise, {
       type: "register_error", reason: "already_registered", ml_dsa_pubkey: "dd".repeat(32),
     });
@@ -517,7 +534,7 @@ describe("M16 004-IDENTITY-WIRE: channel registration (client side)", () => {
     const { persistence, calls } = makeRecordingPersistence(GROUP);
     const h = makeCapturingCtx(persistence);
     const mgr = new RegistrationManager(h.ctx);
-    const promise = mgr.register("", "token", { channel: true, adminPubkeyHex: ADMIN });
+    const promise = mgr.register("", "token", { channel: true, adminPubkeyHex: ADMIN, adminSignature: ADMIN_SIG });
     const result = await driveToRegisterSuccess(h, promise, { channel: "true" });
     expect(result).toMatchObject({ error: "directory_missing_channel_support" });
     expect(calls.reg).toHaveLength(0);
@@ -528,7 +545,7 @@ describe("M16 004-IDENTITY-WIRE: channel registration (client side)", () => {
     // retry gets already_registered with no echo, forever, so "retry" is advice that cannot work.
     const h = makeCapturingCtx(makeRecordingPersistence(GROUP).persistence);
     const mgr = new RegistrationManager(h.ctx);
-    const promise = mgr.register("", "token", { channel: true, adminPubkeyHex: ADMIN });
+    const promise = mgr.register("", "token", { channel: true, adminPubkeyHex: ADMIN, adminSignature: ADMIN_SIG });
     const result = (await driveToRegisterSuccess(h, promise, {})) as { error: string; detail?: string };
     expect(result.error).toBe("directory_missing_channel_support");
     expect(result.detail).toMatch(/ordinary agent/);

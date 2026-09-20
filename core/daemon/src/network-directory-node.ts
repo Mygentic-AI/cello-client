@@ -389,14 +389,19 @@ async function dkgRound1WithNode(
   epochId: string,
   signers: { min: number; max: number },
   preAuthToken?: string,
+  channelAuth?: { adminPubkeyHex: string; adminSignatureHex: string },
 ): Promise<DkgRound1Broadcast> {
   const frame = encodeCbor({
     type: "frost_dkg_round1_request",
     agentPubkey: agentPubkeyHex,
     epochId,
     signers,
-    // Include preAuthToken when present.
-    ...(preAuthToken !== undefined ? { preAuthToken } : {}),
+    // M16 024-CREATE: a channel carries its admin's authorization to EACH node here (where a token
+    // would ride), and no token. Every node verifies the signature and skips the token gate itself,
+    // so a channel cannot be minted past one node claiming `channel: true` without a valid admin sig.
+    ...(channelAuth
+      ? { channel: true as const, admin_pubkey: channelAuth.adminPubkeyHex, admin_signature: channelAuth.adminSignatureHex }
+      : preAuthToken !== undefined ? { preAuthToken } : {}),
   });
   const stream = await node.openStream();
   try {
@@ -670,8 +675,14 @@ export async function runNetworkDkg(
     threshold: number;
     participants: number;
     directoryNodes: NetworkDirectoryNode[];
-    /** Pre-authorization token to present in the Round 1 frame. */
+    /** Pre-authorization token to present in the Round 1 frame. Absent for a channel. */
     preAuthToken?: string;
+    /** M16 024-CREATE: true when registering a broadcast channel — no token, admin signature instead. */
+    channel?: true;
+    /** M16 024-CREATE: hex K_local pubkey of the administering agent (required with `channel`). */
+    adminPubkeyHex?: string;
+    /** M16 024-CREATE: hex Ed25519 signature by the admin's K_local over this channel's pubkey. */
+    adminSignatureHex?: string;
     /** K_local signer for the DKG-time commit/sign requests' auth. */
     signAuth?: FrostAuthSigner;
   },
@@ -708,9 +719,12 @@ export async function runNetworkDkg(
   };
 
   // Directory nodes run round1 in parallel
+  const channelAuth = opts.channel && opts.adminPubkeyHex && opts.adminSignatureHex
+    ? { adminPubkeyHex: opts.adminPubkeyHex, adminSignatureHex: opts.adminSignatureHex }
+    : undefined;
   const nodeRound1Broadcasts = await Promise.all(
     opts.directoryNodes.map((node) =>
-      dkgRound1WithNode(node, agentPubkeyHex, epochId, signers, opts.preAuthToken)
+      dkgRound1WithNode(node, agentPubkeyHex, epochId, signers, opts.preAuthToken, channelAuth)
     )
   );
 

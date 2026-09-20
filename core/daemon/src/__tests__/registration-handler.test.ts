@@ -185,6 +185,7 @@ describe("DOD-M15-EXPIRY-CONSUMER-POLICY-1: a lapsed manifest is reported, and d
  */
 describe("M16 004-IDENTITY-WIRE: cello_register channel params", () => {
   const ADMIN = "ab".repeat(32);
+  const ADMIN_SIG = "cd".repeat(64);
 
   function makeHandler() {
     const handlers = new Map<string, (p: Record<string, unknown> | undefined, c: string) => Promise<unknown>>();
@@ -229,14 +230,29 @@ describe("M16 004-IDENTITY-WIRE: cello_register channel params", () => {
     expect(spy).not.toHaveBeenCalled();
   });
 
-  it("well-formed channel params reach the manager", async () => {
+  it("a channel is refused without adminSignature", async () => {
+    // M16 024-CREATE: a channel presents no token, but it MUST present the admin's signature — the
+    // basis of its right. Missing it is refused before the manager is touched.
+    const spy = vi.spyOn(RegistrationManager.prototype, "register");
+    const result = (await makeHandler()({ agent: "alice", channel: true, adminPubkeyHex: ADMIN }, "c")) as {
+      ok: boolean; reason?: string;
+    };
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("invalid_channel_registration");
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("well-formed channel params reach the manager WITH the admin signature and NO token", async () => {
     let received: unknown[] | undefined;
     vi.spyOn(RegistrationManager.prototype, "register").mockImplementation(async (...args: unknown[]) => {
       received = args;
       return { error: "stopped_here_by_test" };
     });
-    await makeHandler()({ agent: "alice", preAuthToken: "t", channel: true, adminPubkeyHex: ADMIN }, "c");
+    // A channel presents no preAuthToken — its admin signature is the authorization.
+    await makeHandler()({ agent: "alice", channel: true, adminPubkeyHex: ADMIN, adminSignature: ADMIN_SIG }, "c");
     expect(received, "the manager must have been invoked").toBeDefined();
-    expect(received![2]).toEqual({ channel: true, adminPubkeyHex: ADMIN });
+    // The token argument is undefined for a channel; the channel opts carry the signature.
+    expect(received![1]).toBeUndefined();
+    expect(received![2]).toEqual({ channel: true, adminPubkeyHex: ADMIN, adminSignature: ADMIN_SIG });
   });
 });

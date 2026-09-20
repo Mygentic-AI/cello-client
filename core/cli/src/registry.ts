@@ -1572,7 +1572,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       { name: "read", summary: "Read new posts on a channel you follow." },
       { name: "name", summary: "Label a channel so you can tell it apart. Only you see it." },
       { name: "leave", summary: "Stop receiving a channel's posts. Local — nothing is sent." },
-      { name: "create", summary: "Make a new channel you run — register it, record its relays, describe it. Do this first." },
+      { name: "create", summary: "Make a new channel you run — one command registers it, the directory picks its relays, and it is described. Do this first." },
       { name: "setup", summary: "Change the relays or access on a channel you already run." },
       { name: "publish", summary: "Publish a post to your channel." },
       { name: "info-set", summary: "Publish your channel's description so others can find it." },
@@ -1587,7 +1587,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "       cello channel join <channel> [<note>] [--agent <agent>]\n" +
       "       cello channel read <channel> [--all] [--agent <agent>]\n" +
       "       cello channel name <channel> <label> | leave <channel>\n" +
-      "       cello channel create <name> <access> <relay> <relay> [preAuthToken] [--guidance <text>] [--agent <agent>]\n" +
+      "       cello channel create <name> <access> [--guidance <text>] [--agent <agent>]\n" +
       "       cello channel setup <channel> <access> <relay> <relay> [--agent <agent>]\n" +
       "       cello channel publish <channel> <title> <body> [--agent <agent>]\n" +
       "       cello channel info-set <channel> [--agent <agent>]\n" +
@@ -1595,11 +1595,12 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "       cello channel resend <channel> [<relay>] [--agent <agent>]\n" +
       "       cello channel eject <channel> <member> | approve <channel> <member> | refuse <channel> <member>\n" +
       "  <channel> is the channel's 64-character hex public key.\n" +
-      "  'create' comes FIRST for a channel you run: it registers the channel identity <name> (a\n" +
-      "  channel costs a full registration, same as an agent, so it takes a pre-auth token too),\n" +
-      "  records its two relays and access, and publishes its description — in one step. 'setup'\n" +
-      "  CHANGES the relays or access on a channel that already exists. <access> is public (anyone\n" +
-      "  reads), open (anyone may ask to join) or invite_only.\n" +
+      "  'create' comes FIRST for a channel you run: it registers the channel identity <name>,\n" +
+      "  the DIRECTORY picks its two relays for you, and it publishes the description — in one step.\n" +
+      "  A channel takes NO pre-auth token and NO relay: the agent you are running is already\n" +
+      "  registered, and that identity is the whole basis of the channel's right. 'setup' CHANGES\n" +
+      "  the relays or access on a channel that already exists. <access> is public (anyone reads),\n" +
+      "  open (anyone may ask to join) or invite_only.\n" +
       "  A post is signed by BOTH the channel key and your agent key, so a reader can tell which\n" +
       "  operator published it, not only which channel.\n" +
       "  It goes to the channel's two relays. ONE relay refusing is not a failed publish — the post\n" +
@@ -1628,27 +1629,20 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       const withAgent = (p: Record<string, unknown>) => (agent ? { ...p, agent } : p);
       const ACCESS = ["public", "open", "invite_only"];
       const usage = (msg: string): CliOutput => ({ stdout: msg, stderr: "", exitCode: 1 });
-      if (sub === "create" && channel && a !== undefined && b !== undefined) {
-        // `channel` is the new channel's <name>, `a` its access, then two relay multiaddrs and an
-        // optional pre-auth token: `create <name> <access> <relay> <relay> [preAuthToken]`. The
-        // token falls back to CELLO_PREAUTH_TOKEN, exactly as register-agent does.
-        //
-        // A relay is a multiaddr (starts with '/'); the token is not. Splitting the tail on that —
-        // rather than by position — is what stops `create c public rA TOK` (with $CELLO_PREAUTH_TOKEN
-        // ALSO set) from recording TOK as the second relay. The non-relay tail arg is the token.
+      if (sub === "create" && channel && a !== undefined) {
+        // `channel` is the new channel's <name>, `a` its access. A channel takes NO relay and NO
+        // token — the directory picks the relays, and the running agent's registration is the right.
         if (!ACCESS.includes(a)) {
           return usage("<access> must be public (anyone reads), open (anyone may ask to join) or invite_only.");
         }
-        const tail = [b, ...rest];
-        const relays = tail.filter((x) => x.startsWith("/"));
-        const preAuthToken = tail.find((x) => !x.startsWith("/")) ?? process.env.CELLO_PREAUTH_TOKEN;
-        if (relays.length < 2) {
-          return usage("cello channel create needs two relay multiaddrs, e.g. /dns4/relay.example/tcp/443/tls/ws — one is a single point of failure.");
-        }
+        // Catch the OLD habit — trailing positionals were relays or a pre-auth token. Route them
+        // through as `relays` so the daemon answers with the one canonical `channel_needs_no_token`,
+        // rather than the CLI inventing a second message that could drift from it.
+        const strays = [b, ...rest].filter((x) => x !== undefined);
         return legacy(await channelVerb(ctx.celloDir, "cello_channel_create", withAgent({
-          name: channel, access: a, relays,
+          name: channel, access: a,
           ...(guidanceFlag !== undefined ? { guidance: guidanceFlag } : {}),
-          ...(preAuthToken !== undefined ? { preAuthToken } : {}),
+          ...(strays.length > 0 ? { relays: strays } : {}),
         })));
       }
       if (sub === "setup" && channel && a !== undefined && b !== undefined) {

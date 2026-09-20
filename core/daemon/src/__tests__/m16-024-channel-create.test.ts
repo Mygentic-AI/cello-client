@@ -3,9 +3,10 @@
  *
  * Sixteen orders built everything a channel does and none built the step that brings one into
  * existence. This unit proves the single composing handler: it mints the channel identity when
- * needed, registers it, records its relays/access and deposits its info record — reporting WHICH
- * step failed and how to finish by hand, and never leaving a registered channel the daemon does not
- * know is a channel.
+ * needed, registers it WITH NO TOKEN (the admin's signature over the channel's pubkey is the basis
+ * of the right), records the two relays the DIRECTORY picked, and deposits its info record —
+ * reporting WHICH step failed and how to finish by hand, never leaving a registered channel the
+ * daemon does not know is a channel.
  *
  * ─── What is proven where, and why ────────────────────────────────────────────────────────────
  *
@@ -19,13 +20,15 @@
  *    real-persistence proof: an implementation that minted and did not roll back would leave an
  *    active agent row, and this test would catch it.
  *  • The happy composition (Section C) writes to a REAL `ChannelConfigStore` through the REAL
- *    wiring and publisher, with a SEPARATE admin identity. Only the registration step is stubbed —
- *    the one step that needs a directory this repo does not have — and that is stated at the test.
- *    It asserts the persisted config row, not a spy, and that publish works with nothing in between.
+ *    wiring and publisher, with a SEPARATE admin identity that actually signs. Only the registration
+ *    step is stubbed — the one step that needs a directory this repo does not have — and that is
+ *    stated at the test. It asserts the persisted config row (the directory's relays), not a spy,
+ *    and that publish works with nothing in between. It also proves that a directory echoing fewer
+ *    than two distinct relays is treated as a failed registration with nothing persisted.
  *
  * The identity-table channel FLAG is set only by a directory-echoed registration (004's own note:
- * "a directory cannot echo the channel flag until 005 ships"), so it is proven by 005's enforcer and
- * the live smoke in trustless-cello, not here.
+ * "a directory cannot echo the channel flag until 005 ships"), and the directory's admin-signature
+ * gate + relay pick are proven by the directory's own tests and the live smoke in trustless-cello.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -52,7 +55,7 @@ const RELAY_B = "/dns4/relay-b.example/tcp/443/tls/ws";
 type Handler = (params: Record<string, unknown> | undefined, connectionId: string) => Promise<unknown>;
 
 interface Spies {
-  register: Array<{ name: string; preAuthToken: string; adminPubkeyHex: string; access: string }>;
+  register: Array<{ name: string; adminName: string; adminPubkeyHex: string; access: string }>;
   config: Array<{ agentName: string; channelHex: string; relays: string[]; access: string; guidance: string; retention_seconds: number }>;
   info: Array<{ agentName: string; channelHex: string }>;
 }
@@ -67,8 +70,9 @@ function makeHandler(overrides: Partial<ChannelCreateDeps> = {}): { fn: Handler;
     resolveCurrentAgent: () => "admin",
     agentPubkey: (name) => (name === "admin" ? ADMIN_HEX : null),
     registerChannel: async (opts) => {
-      spies.register.push({ name: opts.name, preAuthToken: opts.preAuthToken, adminPubkeyHex: opts.adminPubkeyHex, access: opts.access });
-      return { ok: true, channelPubkeyHex: CHANNEL_HEX };
+      spies.register.push({ name: opts.name, adminName: opts.adminName, adminPubkeyHex: opts.adminPubkeyHex, access: opts.access });
+      // The directory picks the two relays — the handler records exactly what comes back.
+      return { ok: true, channelPubkeyHex: CHANNEL_HEX, relays: [RELAY_A, RELAY_B] };
     },
     applyChannelConfig: (agentName, channelHex, cfg) => {
       spies.config.push({ agentName, channelHex, relays: cfg.relays, access: cfg.access, guidance: cfg.guidance, retention_seconds: cfg.retention_seconds });
@@ -87,10 +91,10 @@ function makeHandler(overrides: Partial<ChannelCreateDeps> = {}): { fn: Handler;
 }
 
 describe("M16 024-CREATE Section A: the composing handler's control flow", () => {
-  it("1. happy composition — returns ok and runs register → config → info-set, in order, with the given values", async () => {
+  it("1. happy composition — returns ok, records the DIRECTORY's relays, and runs register → config → info-set in order", async () => {
     const { fn, spies } = makeHandler();
     const result = (await fn(
-      { name: "newschan", access: "public", relays: [RELAY_A, RELAY_B], preAuthToken: "CELLO-tok", guidance: "The morning bulletin" },
+      { name: "newschan", access: "public", guidance: "The morning bulletin" },
       "conn1",
     )) as Record<string, unknown>;
 
@@ -98,27 +102,29 @@ describe("M16 024-CREATE Section A: the composing handler's control flow", () =>
     expect(result.channel_pubkey).toBe(CHANNEL_HEX);
     expect(result.name).toBe("newschan");
     expect(result.access).toBe("public");
+    // The relays are the directory's, echoed back to the operator — not anything they typed.
     expect(result.relays).toEqual([RELAY_A, RELAY_B]);
     expect(result.admin_pubkey).toBe(ADMIN_HEX);
 
-    expect(spies.register).toEqual([{ name: "newschan", preAuthToken: "CELLO-tok", adminPubkeyHex: ADMIN_HEX, access: "public" }]);
-    // Both relays, the access, AND the description all reach the config step.
+    // No token, no relays travel to the register step — just name/admin/access.
+    expect(spies.register).toEqual([{ name: "newschan", adminName: "admin", adminPubkeyHex: ADMIN_HEX, access: "public" }]);
+    // The directory's relays, the access, AND the description all reach the config step.
     expect(spies.config).toEqual([{ agentName: "admin", channelHex: CHANNEL_HEX, relays: [RELAY_A, RELAY_B], access: "public", guidance: "The morning bulletin", retention_seconds: DEFAULT_RETENTION_SECONDS }]);
     expect(spies.info).toEqual([{ agentName: "admin", channelHex: CHANNEL_HEX }]);
   });
 
-  it("2. register refused — step 'register', and config/info-set never run", async () => {
+  it("2. register refused (bad admin signature) — step 'register', and config/info-set never run", async () => {
     const { fn, spies } = makeHandler({
-      registerChannel: async () => ({ ok: false, reason: "directory_unreachable" }),
+      registerChannel: async () => ({ ok: false, reason: "invalid_channel_registration" }),
     });
     const result = (await fn(
-      { name: "newschan", access: "public", relays: [RELAY_A, RELAY_B], preAuthToken: "CELLO-tok" },
+      { name: "newschan", access: "public" },
       "conn1",
     )) as Record<string, unknown>;
 
     expect(result.ok).toBe(false);
     expect(result.step).toBe("register");
-    expect(result.reason).toBe("directory_unreachable");
+    expect(result.reason).toBe("invalid_channel_registration");
     // The step guidance names `cello channel create`, never `register-agent`.
     expect(String(result.guidance)).toContain("cello channel create");
     expect(String(result.guidance)).not.toContain("register-agent");
@@ -126,37 +132,40 @@ describe("M16 024-CREATE Section A: the composing handler's control flow", () =>
     expect(spies.info).toEqual([]);
   });
 
-  it("3. a relays list of length one is refused BEFORE step 1 runs", async () => {
-    const { fn, spies } = makeHandler();
+  it("3. the directory returned fewer than two relays — step 'register', reason directory_returned_no_relays, nothing else runs", async () => {
+    const { fn, spies } = makeHandler({
+      registerChannel: async () => ({ ok: false, reason: "directory_returned_no_relays" }),
+    });
     const result = (await fn(
-      { name: "newschan", access: "public", relays: [RELAY_A], preAuthToken: "CELLO-tok" },
+      { name: "newschan", access: "public" },
       "conn1",
     )) as Record<string, unknown>;
     expect(result.ok).toBe(false);
-    expect(result.reason).toBe("bad_relays");
-    expect(spies.register).toEqual([]);
+    expect(result.step).toBe("register");
+    expect(result.reason).toBe("directory_returned_no_relays");
+    expect(spies.config).toEqual([]);
+    expect(spies.info).toEqual([]);
   });
 
-  it("4. a relay that is not a multiaddr (a token mis-parsed as a relay) is refused BEFORE step 1", async () => {
+  it("4. a pre-auth token is refused with channel_needs_no_token, BEFORE the register step runs", async () => {
     const { fn, spies } = makeHandler();
     const result = (await fn(
-      { name: "newschan", access: "public", relays: [RELAY_A, "CELLO-a-token-not-a-relay"], preAuthToken: "CELLO-tok" },
+      { name: "newschan", access: "public", preAuthToken: "CELLO-a-token" },
       "conn1",
     )) as Record<string, unknown>;
     expect(result.ok).toBe(false);
-    expect(result.reason).toBe("bad_relays");
-    expect(String(result.guidance)).toContain("multiaddr");
+    expect(result.reason).toBe("channel_needs_no_token");
     expect(spies.register).toEqual([]);
   });
 
-  it("a missing pre-auth token is refused with missing_preauth_token, before step 1", async () => {
+  it("4b. a relay argument (the old habit) is refused with channel_needs_no_token, BEFORE the register step runs", async () => {
     const { fn, spies } = makeHandler();
     const result = (await fn(
       { name: "newschan", access: "public", relays: [RELAY_A, RELAY_B] },
       "conn1",
     )) as Record<string, unknown>;
     expect(result.ok).toBe(false);
-    expect(result.reason).toBe("missing_preauth_token");
+    expect(result.reason).toBe("channel_needs_no_token");
     expect(spies.register).toEqual([]);
   });
 
@@ -165,7 +174,7 @@ describe("M16 024-CREATE Section A: the composing handler's control flow", () =>
       depositChannelInfo: async () => ({ ok: false, reason: "no_relay_accepted" }),
     });
     const result = (await fn(
-      { name: "newschan", access: "public", relays: [RELAY_A, RELAY_B], preAuthToken: "CELLO-tok" },
+      { name: "newschan", access: "public" },
       "conn1",
     )) as Record<string, unknown>;
     expect(result.ok).toBe(false);
@@ -188,7 +197,7 @@ describe("M16 024-CREATE Section B: register failure leaves NO active identity (
     celloDir = undefined;
   });
 
-  it("create mints the identity, the real registration fails with no directory, and the mint is rolled back", async () => {
+  it("create mints the identity, signs with the admin key, the real registration fails with no directory, and the mint is rolled back", async () => {
     celloDir = await makeCelloDir("cello-m16-024-");
     daemon = spawnRealDaemon(celloDir);
     await daemon.waitForEvent("daemon.started");
@@ -197,12 +206,11 @@ describe("M16 024-CREATE Section B: register failure leaves NO active identity (
     try {
       await client.send("ipc.connect", { clientType: "cli" });
       const result = (await client.send("cello_channel_create", {
-        // singleton-test-agent is the pre-created agent this fixture boots with — the admin.
+        // singleton-test-agent is the pre-created agent this fixture boots with — the admin. It signs
+        // the new channel's pubkey; no token is presented.
         agent: "singleton-test-agent",
         name: "brand-new-channel",
         access: "public",
-        relays: [RELAY_A, RELAY_B],
-        preAuthToken: "DEV-enforcer-token",
       })) as { ok: boolean; step?: string };
 
       // No directory here, so the real cello_register cannot complete.
@@ -246,14 +254,16 @@ describe("M16 024-CREATE Section C: the config create records is real, and publi
     delete process.env["CELLO_ENV"];
   });
 
-  it("create (separate admin) writes the real channel_config row; publish is not channel_unknown afterwards", async () => {
+  /** Wire the real publishing stack with a `cello_register` stub that echoes the given relays. */
+  function wire(registerRelays: string[]): Map<string, Handler> {
     const handlers = new Map<string, Handler>();
     // The registration step needs a directory this repo has no harness for, so it is the ONE step
     // stubbed here (Section B exercises the real, failing registration). The channel identity's key
-    // is pre-loaded, so registerChannel resolves its pubkey without minting.
-    handlers.set("cello_register", async () => ({ ok: true, agent_id: "a1", primary_pubkey: channelPubkeyHex }));
+    // is pre-loaded, so registerChannel resolves its pubkey without minting. The stub echoes the
+    // relays the directory would have picked.
+    handlers.set("cello_register", async () => ({ ok: true, agent_id: "a1", primary_pubkey: channelPubkeyHex, relays: registerRelays }));
 
-    // Two DISTINCT identities: `admin` administers, `channel` is the channel. Admin is NOT the channel.
+    // Two DISTINCT identities: `admin` administers and SIGNS, `channel` is the channel. Admin != channel.
     const loadedAgents = [
       { name: "admin", pubkey: adminPubkeyHex, keyProvider: adminKp as KeyProvider },
       { name: "channel", pubkey: channelPubkeyHex, keyProvider: channelKp as KeyProvider },
@@ -273,12 +283,16 @@ describe("M16 024-CREATE Section C: the config create records is real, and publi
       activeMembers: () => [],
       signalingFor: () => null,
     });
+    return handlers;
+  }
 
+  it("create (separate admin) writes the real channel_config row with the directory's relays; publish is not channel_unknown afterwards", async () => {
+    const handlers = wire([RELAY_A, RELAY_B]);
     const create = handlers.get("cello_channel_create");
     expect(create, "wireChannelPublishing must register cello_channel_create").toBeDefined();
 
     const created = (await create!(
-      { agent: "admin", name: "channel", access: "public", relays: [RELAY_A, RELAY_B], guidance: "Release notes", preAuthToken: "DEV-tok" },
+      { agent: "admin", name: "channel", access: "public", guidance: "Release notes" },
       "conn1",
     )) as Record<string, unknown>;
 
@@ -287,8 +301,8 @@ describe("M16 024-CREATE Section C: the config create records is real, and publi
     expect(created.ok).toBe(false);
     expect(created.step).toBe("info_set");
 
-    // REAL PERSISTENCE: the channel_config row holds both relays, the access, the description, and
-    // the SEPARATE admin's pubkey (proving admin != channel, and that the admin identity was recorded).
+    // REAL PERSISTENCE: the channel_config row holds the DIRECTORY's two relays, the access, the
+    // description, and the SEPARATE admin's pubkey (proving admin != channel, and the admin was recorded).
     const row = new ChannelConfigStore(db, silent).get(channelPubkeyHex);
     expect(row, "create must have written the channel_config row").not.toBeNull();
     expect(row!.relays).toEqual([RELAY_A, RELAY_B]);
@@ -306,5 +320,22 @@ describe("M16 024-CREATE Section C: the config create records is real, and publi
     )) as Record<string, unknown>;
     expect(pub.reason).not.toBe("channel_unknown");
     expect(pub.reason).toBe("no_relay_accepted");
+  });
+
+  it("a directory echo of fewer than two distinct relays is a failed registration — step 'register', directory_returned_no_relays, and nothing is persisted", async () => {
+    const handlers = wire([RELAY_A]); // one relay: not enough
+    const create = handlers.get("cello_channel_create")!;
+    const created = (await create(
+      { agent: "admin", name: "channel", access: "public" },
+      "conn1",
+    )) as Record<string, unknown>;
+
+    expect(created.ok).toBe(false);
+    expect(created.step).toBe("register");
+    expect(created.reason).toBe("directory_returned_no_relays");
+
+    // NOTHING PERSISTED: no channel_config row was written, so a channel with one relay never exists.
+    const row = new ChannelConfigStore(db, silent).get(channelPubkeyHex);
+    expect(row, "a one-relay echo must not write a channel_config row").toBeNull();
   });
 });

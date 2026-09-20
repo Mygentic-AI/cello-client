@@ -77,8 +77,33 @@ export interface FrostDkgRound1Request {
    * Must be present for all new registrations after M6. The directory consumes
    * the token atomically before any crypto computation.
    * Local/test: use any 'DEV-' prefixed token (accepted by DevTokenValidator).
+   *
+   * M16 024-CREATE: ABSENT for a channel registration. A channel presents no token —
+   * `channel: true` with a valid `admin_signature` is the basis of its right, so its round-1
+   * frame carries no `preAuthToken`. A channel frame that ALSO carries one is refused by the
+   * directory ("channels take no token"): one path, no ambiguity.
    */
   preAuthToken?: string;
+  /**
+   * M16 024-CREATE: true when this round-1 frame registers a broadcast CHANNEL. The token gate
+   * runs per directory node in round 1, so a channel's authorization travels here to EACH node —
+   * each verifies `admin_signature` and skips the token gate independently, so no single node's
+   * gate can be bypassed by merely claiming `channel: true`. Absent for an ordinary agent.
+   */
+  channel?: true;
+  /**
+   * M16 024-CREATE: hex-encoded 32-byte K_local pubkey of the administering agent. REQUIRED with
+   * `channel`, absent otherwise. The directory looks it up — it must be a registered, non-channel
+   * agent — and verifies `admin_signature` against it.
+   */
+  admin_pubkey?: string;
+  /**
+   * M16 024-CREATE: hex-encoded 64-byte Ed25519 signature (RFC 8032) by the admin's K_local over
+   * the CHANNEL's `agentPubkey` bytes (its K_local pubkey). This is what makes a registered agent's
+   * identity the whole basis of the channel's right to register with no token. REQUIRED with
+   * `channel`, absent otherwise.
+   */
+  admin_signature?: string;
 }
 
 export interface FrostDkgRound1ResponseOk {

@@ -82,6 +82,14 @@ export interface ChannelRegistrationOpts {
   /** 64 lowercase hex chars: the pubkey of the agent that administers the channel. */
   adminPubkeyHex: string;
   /**
+   * M16 024-CREATE. Hex-encoded 64-byte Ed25519 signature (RFC 8032) by the admin's K_local over
+   * this channel's K_local pubkey bytes. A channel presents NO token — this signature by an
+   * already-registered agent is the whole basis of its right to register. It travels in the round-1
+   * DKG frame (where a token would), so every directory node verifies it and skips the token gate
+   * independently.
+   */
+  adminSignature: string;
+  /**
    * M16 021-WAKE. Absent means `open`. Carried to the directory because the RELAY asks the
    * directory what a channel is, and with no access in that answer it falls to the least
    * privileged reading — which is why a public channel could not exist in production at all.
@@ -298,7 +306,7 @@ export class RegistrationManager {
     phoneStub: string = "",
     preAuthToken?: string,
     channelOpts?: ChannelRegistrationOpts,
-  ): Promise<RegistrationState | { error: string; detail?: string }> {
+  ): Promise<(RegistrationState & { relays?: string[] }) | { error: string; detail?: string }> {
     // Step 1: already registered
     if (this.#registrationState) {
       return { error: "already_registered" };
@@ -521,7 +529,12 @@ export class RegistrationManager {
         threshold,
         participants,
         directoryNodes,
-        preAuthToken,
+        // M16 024-CREATE: a channel presents NO token — the admin's signature over this channel's
+        // K_local is its round-1 authorization, verified by every node. An ordinary agent presents
+        // its pre-auth token. One or the other, never both.
+        ...(channelOpts
+          ? { channel: true as const, adminPubkeyHex: channelOpts.adminPubkeyHex, adminSignatureHex: channelOpts.adminSignature }
+          : { preAuthToken }),
         signAuth: (h) => this.#ctx.keyProvider.sign(h), // SEC-2
       });
       dkgPrimaryPubkeyHex = Buffer.from(dkgResult.primaryPubkey).toString("hex");
@@ -708,6 +721,12 @@ export class RegistrationManager {
     }
     this.#registrationState = state;
     this.#mlDsaProvider = mlDsaProvider;
-    return state;
+    // M16 024-CREATE: a channel registration comes back with the two relays the directory picked
+    // from its pool. Nobody typed them; the client records exactly these. Filtered to strings so a
+    // malformed echo cannot smuggle a non-multiaddr into the channel's relay list.
+    const relays = Array.isArray(responseWithTimeout["relays"])
+      ? (responseWithTimeout["relays"] as unknown[]).filter((r): r is string => typeof r === "string")
+      : undefined;
+    return relays !== undefined ? { ...state, relays } : state;
   }
 }

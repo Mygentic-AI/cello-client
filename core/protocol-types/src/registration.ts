@@ -169,6 +169,14 @@ export interface RegisterSuccess {
   /** Echoed by the directory when the profile was stored with channel = true. A client
    *  registering a channel MUST refuse success without this echo. */
   channel?: true;
+  /**
+   * M16 024-CREATE: the two relay multiaddrs the directory picked for this CHANNEL from its own
+   * relay pool. Nobody types a relay — the directory chooses two DISTINCT relays at registration
+   * and returns them here, and the client records them as the channel's relays. Present only for a
+   * channel registration; a pool with fewer than two relays refuses the registration rather than
+   * returning one.
+   */
+  relays?: string[];
 }
 
 /**

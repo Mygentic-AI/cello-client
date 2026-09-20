@@ -76,18 +76,25 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
     if (!name) {
       return { ok: false, reason: "missing_params", guidance: "Provide 'agent' (the agent name to register) and 'preAuthToken' (the pre-authorization ticket from the CELLO Operations Agent)." };
     }
-    if (!preAuthToken) {
-      return { ok: false, reason: "missing_preauth_token", guidance: "Registration requires a 'preAuthToken' issued by the CELLO Operations Agent (Telegram). Obtain one, then retry 'cello register-agent'." };
-    }
     // M16: a broadcast channel is registered with `channel: true` AND the administering agent's
     // pubkey. The two travel together or not at all. The manager checks the pubkey's shape.
     const channelParam = params?.channel;
     const adminPubkeyParam = params?.adminPubkeyHex;
+    const adminSignatureParam = params?.adminSignature as string | undefined;
+    // M16 024-CREATE: an ordinary agent registers against a pre-auth token; a CHANNEL presents no
+    // token — the admin's signature is its authorization. So the token is required only when this is
+    // NOT a channel registration.
+    if (channelParam !== true && !preAuthToken) {
+      return { ok: false, reason: "missing_preauth_token", guidance: "Registration requires a 'preAuthToken' issued by the CELLO Operations Agent (Telegram). Obtain one, then retry 'cello register-agent'." };
+    }
     if (channelParam !== undefined && channelParam !== true) {
       return { ok: false, reason: "invalid_channel_registration", guidance: "'channel' must be true to register a broadcast channel, or omitted for an ordinary agent." };
     }
     if (channelParam === true && typeof adminPubkeyParam !== "string") {
       return { ok: false, reason: "invalid_channel_registration", guidance: "Registering a channel requires 'adminPubkeyHex': the public key of the agent that will administer it." };
+    }
+    if (channelParam === true && typeof adminSignatureParam !== "string") {
+      return { ok: false, reason: "invalid_channel_registration", guidance: "Registering a channel requires 'adminSignature': the admin agent's Ed25519 signature over the channel's public key." };
     }
     if (channelParam === undefined && adminPubkeyParam !== undefined) {
       return { ok: false, reason: "invalid_channel_registration", guidance: "'adminPubkeyHex' only applies to a channel registration. Pass 'channel: true' with it, or omit both for an ordinary agent." };
@@ -108,6 +115,7 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
       ? {
           channel: true as const,
           adminPubkeyHex: adminPubkeyParam as string,
+          adminSignature: adminSignatureParam as string,
           // Omitted means `open`, which is what every channel registered before this already is.
           ...(accessParam !== undefined ? { access: accessParam as "public" | "open" | "invite_only" } : {}),
         }
@@ -314,10 +322,20 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
         // a link-write failure must NOT be reported as a registration failure.
         // Surface it as a non-fatal warning so the operator knows the link wasn't
         // captured (re-registering with the same token re-attempts it).
+        // M16 024-CREATE: a channel registration comes back with the two relays the directory picked
+        // from its pool. Pass them up so cello_channel_create records exactly these — nobody typed one.
+        const relays = (result as { relays?: string[] }).relays;
+        const relaysOut = relays !== undefined ? { relays } : {};
+        // M16 024-CREATE: a channel presents no token, so there is no agent→user link to capture —
+        // the link is keyed on the pre-auth token. Skip it and report success with the relays.
+        if (preAuthToken === undefined) {
+          logger.info("registration.succeeded", { ...cid, agentName: name, agentId: result.agent_id, primaryPubkey: result.primary_pubkey });
+          return { ok: true, agent_id: result.agent_id, primary_pubkey: result.primary_pubkey, ...relaysOut };
+        }
         try {
           await persistence.persistAgentUserLink({ agentId: result.agent_id, preAuthToken, linkedAt: Date.now() });
           logger.info("registration.succeeded", { ...cid, agentName: name, agentId: result.agent_id, primaryPubkey: result.primary_pubkey });
-          return { ok: true, agent_id: result.agent_id, primary_pubkey: result.primary_pubkey };
+          return { ok: true, agent_id: result.agent_id, primary_pubkey: result.primary_pubkey, ...relaysOut };
         } catch (linkErr: unknown) {
           logger.warn("registration.user_link.capture_failed", {
             ...cid,
@@ -331,6 +349,7 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
             agent_id: result.agent_id,
             primary_pubkey: result.primary_pubkey,
             warning: "agent_user_link_not_captured",
+            ...relaysOut,
           };
         }
       } finally {

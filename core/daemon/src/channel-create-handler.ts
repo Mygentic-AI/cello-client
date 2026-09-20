@@ -34,17 +34,19 @@ export interface ChannelCreateDeps {
   /** The K_local pubkey of a local agent this daemon holds, or null. Used for the admin's pubkey. */
   agentPubkey: (agentName: string) => string | null;
   /**
-   * Step 1: register `<name>` as a channel administered by `adminPubkeyHex`, through the existing
-   * registration path. Returns the channel's own pubkey — the key a subscriber verifies posts
-   * against and the key `config`/`info-set` are addressed by.
+   * Step 1: register `<name>` as a channel administered by `adminName`/`adminPubkeyHex`, through the
+   * existing registration path. NO token — the admin's Ed25519 signature over the channel's pubkey
+   * is signed inside this step and is the whole basis of the right. Returns the channel's own pubkey
+   * (the key a subscriber verifies posts against, addressed by `config`/`info-set`) AND the two
+   * relays the directory picked from its pool — nobody types a relay.
    */
   registerChannel: (opts: {
     name: string;
-    preAuthToken: string;
+    adminName: string;
     adminPubkeyHex: string;
     access: ChannelAccess;
     correlationId: string;
-  }) => Promise<{ ok: true; channelPubkeyHex: string } | { ok: false; reason: string; guidance?: string }>;
+  }) => Promise<{ ok: true; channelPubkeyHex: string; relays: string[] } | { ok: false; reason: string; guidance?: string }>;
   /** Step 2: the SAME code `cello_channel_config` runs. */
   applyChannelConfig: (
     agentName: string,
@@ -70,7 +72,7 @@ export function registerChannelCreateHandler(deps: ChannelCreateDeps): void {
     }
 
     // Everything is validated up front, BEFORE the registration is attempted — a bad argument must
-    // never spend a registration.
+    // never run a registration.
     const name = params?.["name"];
     if (typeof name !== "string" || name.length === 0) {
       return { ok: false, reason: "missing_params", guidance: "Provide 'name': the channel's local identity label, the same thing register-agent takes." };
@@ -79,22 +81,15 @@ export function registerChannelCreateHandler(deps: ChannelCreateDeps): void {
     if (access !== "public" && access !== "open" && access !== "invite_only") {
       return { ok: false, reason: "bad_access", guidance: "Pass 'access': public (anyone can read), open (anyone may ask to join) or invite_only." };
     }
-    const rawRelays = params?.["relays"];
-    const relays = Array.isArray(rawRelays) ? rawRelays.filter((r): r is string => typeof r === "string") : [];
-    if (relays.length < 2 || !Array.isArray(rawRelays) || relays.length !== rawRelays.length) {
-      return { ok: false, reason: "bad_relays", guidance: "Pass 'relays': two relay multiaddrs this channel publishes to. Two is the design — one is a single point of failure, and the subscriber takes the union of both." };
-    }
-    // Every relay must be a multiaddr (they start with '/'). This is what stops a pre-auth token
-    // being recorded as a relay when it is mis-parsed as a positional — a token starts with
-    // 'CELLO-'/'DEV-' or is a base64url blob, never '/'.
-    if (!relays.every((r) => r.startsWith("/"))) {
-      return { ok: false, reason: "bad_relays", guidance: "Each relay must be a multiaddr, for example /dns4/relay.example/tcp/443/tls/ws. A pre-auth token is not a relay." };
-    }
-    // The token falls back to CELLO_PREAUTH_TOKEN on the CLI, exactly as register-agent does; by the
-    // time it reaches here it is an explicit field.
-    const preAuthToken = params?.["preAuthToken"];
-    if (typeof preAuthToken !== "string" || preAuthToken.length === 0) {
-      return { ok: false, reason: "missing_preauth_token", guidance: "Creating a channel requires a 'preAuthToken' issued by the CELLO Operations Agent, the same kind register-agent takes." };
+    // ⚠️ A CHANNEL TAKES NO TOKEN, AND CARRIES NO RELAY. Its right to register is the admin's
+    // signature — the admin is already a registered agent, which paid the identity cost. Refuse a
+    // token loudly so nobody carries the old habit forward (the first cut demanded one; that was the
+    // planner's invention, not decision 31). The relays are the directory's to pick, not the caller's.
+    if (params?.["preAuthToken"] !== undefined || params?.["relays"] !== undefined) {
+      return {
+        ok: false, reason: "channel_needs_no_token",
+        guidance: "A channel takes NO pre-auth token and NO relay argument. The admin agent's identity is the basis of the right, and the directory picks the two relays. Run: cello channel create <name> <access> [--guidance <text>].",
+      };
     }
     const adminPubkeyHex = deps.agentPubkey(adminName);
     if (adminPubkeyHex === null) {
@@ -105,7 +100,9 @@ export function registerChannelCreateHandler(deps: ChannelCreateDeps): void {
     logger.info("channel.create.started", { correlationId, name, admin_pubkey: adminPubkeyHex, access });
 
     // ─── Step 1: register the channel identity ───
-    const registered = await deps.registerChannel({ name, preAuthToken, adminPubkeyHex, access, correlationId });
+    // No token: the admin signs the channel's pubkey (inside registerChannel), and the directory
+    // returns the two relays it picked from its pool.
+    const registered = await deps.registerChannel({ name, adminName, adminPubkeyHex, access, correlationId });
     if (!registered.ok) {
       logger.warn("channel.create.failed", { correlationId, step: "register", reason: registered.reason });
       return {
@@ -115,8 +112,9 @@ export function registerChannelCreateHandler(deps: ChannelCreateDeps): void {
       };
     }
     const channelHex = registered.channelPubkeyHex;
+    const relays = registered.relays;
 
-    // ─── Step 2: record relays + access locally ───
+    // ─── Step 2: record the directory's relays + access locally ───
     // The channel's description travels with the info record (step 3) — an empty one would deposit a
     // channel nobody looking it up can tell apart, so it is a real parameter, not a placeholder.
     const guidanceText = typeof params?.["guidance"] === "string" ? (params["guidance"] as string) : "";
