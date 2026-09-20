@@ -14,8 +14,10 @@ import type { Logger } from "./types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { ScreenContext, ScreenVerdict } from "@cello-protocol/gateway";
+import { Buffer } from "node:buffer";
 import { registerChannelPublishHandlers, recordChannelConfig, depositChannelInfo } from "./channel-publish-handlers.js";
 import { registerChannelCreateHandler } from "./channel-create-handler.js";
+import { DbIdentityStore } from "./db-identity-store.js";
 import { ChannelPublisher } from "./channel-publisher.js";
 import { ChannelLogStore } from "./channel-log-store.js";
 import { ChannelConfigStore, type ChannelConfig } from "./channel-config-store.js";
@@ -181,27 +183,67 @@ export function wireChannelPublishing(
     registerChannel: async ({ name, preAuthToken, adminPubkeyHex, access, correlationId }) => {
       const register = deps.handlers.get("cello_register");
       if (!register) {
-        return { ok: false, reason: "register_unavailable", guidance: "The daemon has no registration handler wired." };
+        // Unreachable in production — registered at boot. A miss here is a WIRING bug, not an
+        // operator error, so it throws rather than mislabelling itself as a failed create step.
+        throw new Error("channel_create_wiring: the register handler is not wired");
       }
+
+      // Refuse a name that is ALREADY a registered identity before anything runs. Re-registering it
+      // would either clobber it or spend the token on a DKG for an identity that already exists.
+      const existing = new DbIdentityStore(deps.getDb(), logger).getAgentForRevocation(name);
+      if (existing && existing.state === "registered") {
+        return {
+          ok: false, reason: "channel_name_registered",
+          guidance: `'${name}' is already a registered identity, so it cannot be created as a channel. Choose a different name.`,
+        };
+      }
+
+      // Fold the mint in: over MCP there is no cello_create_agent tool, so an agent could never
+      // satisfy a "create the identity first" precondition. When the name has no local key, mint it
+      // here through the existing handler; if the mint fails, nothing was created.
+      let mintedHere = false;
+      if (!keyProviders.has(name)) {
+        const createAgent = deps.handlers.get("cello_create_agent");
+        if (!createAgent) throw new Error("channel_create_wiring: the create-agent handler is not wired");
+        const made = (await createAgent({ name }, "internal:channel-create")) as { ok?: boolean; reason?: string; guidance?: string };
+        if (made?.ok !== true) {
+          return { ok: false, reason: made?.reason ?? "agent_create_failed", guidance: made?.guidance };
+        }
+        mintedHere = true;
+      }
+
       const reg = (await register(
         { agent: name, preAuthToken, channel: true, adminPubkeyHex, access, correlationId },
         "internal:channel-create",
-      )) as { ok?: boolean; reason?: string; guidance?: string };
+      )) as { ok?: boolean; reason?: string };
       if (reg?.ok !== true) {
-        return { ok: false, reason: reg?.reason ?? "register_failed", guidance: reg?.guidance };
+        // Roll back an identity WE minted so a failed create leaves nothing behind — "nothing exists
+        // yet" is the register step's contract. `reason` is passed up; the guidance is deliberately
+        // NOT (the create handler writes its own, which names `cello channel create`, never
+        // `register-agent` — that would spend the next token on an ordinary agent that can never
+        // become a channel).
+        if (mintedHere) {
+          const removeAgent = deps.handlers.get("cello_remove_agent");
+          if (removeAgent) await removeAgent({ name }, "internal:channel-create").catch(() => undefined);
+        }
+        return { ok: false, reason: reg?.reason ?? "register_failed" };
       }
+
       // The channel's own pubkey is its loaded K_local key — what a post is signed with and what
-      // config/info-set are addressed by (agent NAME is a mutable display label).
-      const channel = deps.loadedAgents.find((a) => a.name === name);
-      if (!channel) {
-        return { ok: false, reason: "channel_key_not_held", guidance: "The channel registered but its key is not loaded on this daemon." };
+      // config/info-set are addressed by (the agent NAME is a mutable display label). Resolve it the
+      // way register-handler does, from the loaded key material that a successful register guarantees.
+      const loaded = deps.loadedAgents.find((a) => a.name === name);
+      const kp = keyProviders.get(name);
+      const channelPubkeyHex = loaded?.pubkey ?? (kp ? Buffer.from(await kp.getPublicKey()).toString("hex") : undefined);
+      if (channelPubkeyHex === undefined) {
+        throw new Error("channel_create_wiring: registered channel key not loaded");
       }
-      return { ok: true, channelPubkeyHex: channel.pubkey };
+      return { ok: true, channelPubkeyHex };
     },
     applyChannelConfig: (agentName, channelHex, cfg) =>
       recordChannelConfig({ logger, setChannelConfig }, agentName, channelHex, cfg),
-    depositChannelInfo: (agentName, channelHex) =>
-      depositChannelInfo({ getPublisher: buildPublisher }, agentName, channelHex),
+    depositChannelInfo: (agentName, channelHex, correlationId) =>
+      depositChannelInfo({ getPublisher: buildPublisher }, agentName, channelHex, correlationId),
   });
 
   /**

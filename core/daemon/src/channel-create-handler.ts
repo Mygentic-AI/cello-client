@@ -55,6 +55,7 @@ export interface ChannelCreateDeps {
   depositChannelInfo: (
     agentName: string,
     channelHex: string,
+    correlationId?: string,
   ) => Promise<{ ok: true } | { ok: false; reason: string; guidance?: string }>;
 }
 
@@ -83,6 +84,12 @@ export function registerChannelCreateHandler(deps: ChannelCreateDeps): void {
     if (relays.length < 2 || !Array.isArray(rawRelays) || relays.length !== rawRelays.length) {
       return { ok: false, reason: "bad_relays", guidance: "Pass 'relays': two relay multiaddrs this channel publishes to. Two is the design — one is a single point of failure, and the subscriber takes the union of both." };
     }
+    // Every relay must be a multiaddr (they start with '/'). This is what stops a pre-auth token
+    // being recorded as a relay when it is mis-parsed as a positional — a token starts with
+    // 'CELLO-'/'DEV-' or is a base64url blob, never '/'.
+    if (!relays.every((r) => r.startsWith("/"))) {
+      return { ok: false, reason: "bad_relays", guidance: "Each relay must be a multiaddr, for example /dns4/relay.example/tcp/443/tls/ws. A pre-auth token is not a relay." };
+    }
     // The token falls back to CELLO_PREAUTH_TOKEN on the CLI, exactly as register-agent does; by the
     // time it reaches here it is an explicit field.
     const preAuthToken = params?.["preAuthToken"];
@@ -110,8 +117,11 @@ export function registerChannelCreateHandler(deps: ChannelCreateDeps): void {
     const channelHex = registered.channelPubkeyHex;
 
     // ─── Step 2: record relays + access locally ───
+    // The channel's description travels with the info record (step 3) — an empty one would deposit a
+    // channel nobody looking it up can tell apart, so it is a real parameter, not a placeholder.
+    const guidanceText = typeof params?.["guidance"] === "string" ? (params["guidance"] as string) : "";
     const configured = deps.applyChannelConfig(adminName, channelHex, {
-      access, relays, guidance: "", retention_seconds: DEFAULT_RETENTION_SECONDS,
+      access, relays, guidance: guidanceText, retention_seconds: DEFAULT_RETENTION_SECONDS,
     });
     if (!configured.ok) {
       logger.warn("channel.create.failed", { correlationId, step: "config", reason: configured.reason });
@@ -122,7 +132,7 @@ export function registerChannelCreateHandler(deps: ChannelCreateDeps): void {
     }
 
     // ─── Step 3: deposit the info record ───
-    const deposited = await deps.depositChannelInfo(adminName, channelHex);
+    const deposited = await deps.depositChannelInfo(adminName, channelHex, correlationId);
     if (!deposited.ok) {
       logger.warn("channel.create.failed", { correlationId, step: "info_set", reason: deposited.reason });
       return {

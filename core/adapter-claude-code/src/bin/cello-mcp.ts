@@ -1133,11 +1133,13 @@ server.tool("cello_channel_create", "Bring a NEW channel into existence in one s
   name: z.string().describe("The channel's local identity label, the same thing register-agent takes"),
   access: z.enum(["public", "open", "invite_only"]).describe("public = anyone reads; open = anyone may ask and is admitted; invite_only = the administrator decides each request"),
   relays: z.array(z.string()).describe("Two relay multiaddrs the channel publishes to — one is a single point of failure, and a subscriber takes the union of both"),
+  guidance: z.string().optional().describe("What the channel is for, published in its description so someone looking it up can tell what it is"),
   preAuthToken: z.string().optional().describe("The single-use pre-auth token from the CELLO Operations Agent; falls back to the CELLO_PREAUTH_TOKEN environment variable"),
   agent: adminAgent(),
-}, async ({ name, access, relays, preAuthToken, agent }) =>
+}, async ({ name, access, relays, guidance, preAuthToken, agent }) =>
   jsonText(await proxy.call("cello_channel_create", {
     name, access, relays,
+    ...(guidance === undefined ? {} : { guidance }),
     ...(preAuthToken === undefined ? {} : { preAuthToken }),
     ...(agent ? { agent } : {}),
   })));

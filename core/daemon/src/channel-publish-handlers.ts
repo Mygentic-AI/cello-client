@@ -102,6 +102,7 @@ export async function depositChannelInfo(
   deps: Pick<ChannelPublishDeps, "getPublisher">,
   agentName: string,
   channelHex: string,
+  correlationId?: string,
 ): Promise<
   | { ok: true; bytes: number; relays_ok: string[]; relays_failed: Array<{ relay: string; reason?: string }> }
   | { ok: false; reason: string; detail?: string; guidance?: string }
@@ -109,7 +110,7 @@ export async function depositChannelInfo(
   const publisher = deps.getPublisher(agentName);
   if (!publisher) return { ok: false, reason: "channel_unknown" };
 
-  const result = await publisher.publishInfo(agentName, channelHex);
+  const result = await publisher.publishInfo(agentName, channelHex, correlationId);
   if (!result.ok) {
     return {
       ok: false, reason: result.reason, detail: result.detail,

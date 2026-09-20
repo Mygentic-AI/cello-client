@@ -1587,7 +1587,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "       cello channel join <channel> [<note>] [--agent <agent>]\n" +
       "       cello channel read <channel> [--all] [--agent <agent>]\n" +
       "       cello channel name <channel> <label> | leave <channel>\n" +
-      "       cello channel create <name> <access> <relay> <relay> [preAuthToken] [--agent <agent>]\n" +
+      "       cello channel create <name> <access> <relay> <relay> [preAuthToken] [--guidance <text>] [--agent <agent>]\n" +
       "       cello channel setup <channel> <access> <relay> <relay> [--agent <agent>]\n" +
       "       cello channel publish <channel> <title> <body> [--agent <agent>]\n" +
       "       cello channel info-set <channel> [--agent <agent>]\n" +
@@ -1617,21 +1617,37 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "  your read position; --all re-reads from the start without moving it. A post whose body\n" +
       "  will not open is listed by number rather than skipped — that usually means a key change\n" +
       "  you did not receive.",
-    flags: AGENT_FLAG,
+    flags: [{ name: "--agent", consumesValue: false }, { name: "--guidance", consumesValue: true }],
     jsonOut: true,
     async run(ctx, args) {
       const { agent, positional } = parityOpts(args);
-      const [sub, channel, a, b, ...rest] = positional;
+      // `--guidance <text>` is the channel's description (create/setup). A value flag rather than a
+      // positional so it cannot be confused with a relay or the pre-auth token.
+      const { value: guidanceFlag, rest: afterGuidance } = takeValueFlag(positional, "--guidance");
+      const [sub, channel, a, b, ...rest] = afterGuidance;
       const withAgent = (p: Record<string, unknown>) => (agent ? { ...p, agent } : p);
+      const ACCESS = ["public", "open", "invite_only"];
+      const usage = (msg: string): CliOutput => ({ stdout: msg, stderr: "", exitCode: 1 });
       if (sub === "create" && channel && a !== undefined && b !== undefined) {
-        // `channel` is the new channel's <name>, `a` its access, then EXACTLY two relays and an
+        // `channel` is the new channel's <name>, `a` its access, then two relay multiaddrs and an
         // optional pre-auth token: `create <name> <access> <relay> <relay> [preAuthToken]`. The
-        // token falls back to CELLO_PREAUTH_TOKEN, exactly as register-agent does, so it need not
-        // appear in shell history. The daemon validates the relay count and refuses one relay.
-        const relays = [b, ...(rest[0] !== undefined ? [rest[0]] : [])];
-        const preAuthToken = rest[1] ?? process.env.CELLO_PREAUTH_TOKEN;
+        // token falls back to CELLO_PREAUTH_TOKEN, exactly as register-agent does.
+        //
+        // A relay is a multiaddr (starts with '/'); the token is not. Splitting the tail on that —
+        // rather than by position — is what stops `create c public rA TOK` (with $CELLO_PREAUTH_TOKEN
+        // ALSO set) from recording TOK as the second relay. The non-relay tail arg is the token.
+        if (!ACCESS.includes(a)) {
+          return usage("<access> must be public (anyone reads), open (anyone may ask to join) or invite_only.");
+        }
+        const tail = [b, ...rest];
+        const relays = tail.filter((x) => x.startsWith("/"));
+        const preAuthToken = tail.find((x) => !x.startsWith("/")) ?? process.env.CELLO_PREAUTH_TOKEN;
+        if (relays.length < 2) {
+          return usage("cello channel create needs two relay multiaddrs, e.g. /dns4/relay.example/tcp/443/tls/ws — one is a single point of failure.");
+        }
         return legacy(await channelVerb(ctx.celloDir, "cello_channel_create", withAgent({
           name: channel, access: a, relays,
+          ...(guidanceFlag !== undefined ? { guidance: guidanceFlag } : {}),
           ...(preAuthToken !== undefined ? { preAuthToken } : {}),
         })));
       }
@@ -1640,6 +1656,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
         // call and more is possible without a second syntax.
         return legacy(await channelVerb(ctx.celloDir, "cello_channel_config", withAgent({
           channel, access: a, relays: [b, ...rest],
+          ...(guidanceFlag !== undefined ? { guidance: guidanceFlag } : {}),
         })));
       }
       if (sub === "publish" && channel && a !== undefined && b !== undefined) {

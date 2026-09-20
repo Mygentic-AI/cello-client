@@ -69,6 +69,10 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
     const name = params?.agent as string | undefined;
     const preAuthToken = params?.preAuthToken as string | undefined;
     const phoneStub = (params?.phoneStub as string | undefined) ?? "";
+    // M16 024-CREATE: a channel create passes its own correlationId so one id spans create.started,
+    // the registration events under it, and create.completed. Absent for an ordinary register-agent.
+    const correlationId = params?.correlationId as string | undefined;
+    const cid = correlationId !== undefined ? { correlationId } : {};
     if (!name) {
       return { ok: false, reason: "missing_params", guidance: "Provide 'agent' (the agent name to register) and 'preAuthToken' (the pre-authorization ticket from the CELLO Operations Agent)." };
     }
@@ -216,6 +220,7 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
         || manifestValidity.state === "not_yet_valid";
       if (lapsed) {
         logger.warn("registration.manifest.lapsed", {
+          ...cid,
           agent: name,
           state: manifestValidity.state,
           window: manifestValidity.state === "expired" ? manifestValidity.expires : manifestValidity.notBefore,
@@ -272,7 +277,7 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
       try {
         const result = await new RegistrationManager(ctx).register(phoneStub, preAuthToken, channelOpts);
         if ("error" in result) {
-          logger.warn("registration.failed", { agentName: name, reason: result.error });
+          logger.warn("registration.failed", { ...cid, agentName: name, reason: result.error });
           // Terminal failure for THIS agent — drop its dedicated signaling manager so it
           // does not reconnect forever for an unregistered agent (re-created on retry).
           await dropAgentSignaling(name);
@@ -287,7 +292,7 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
         // PERSIST-002 (AC-013): the identity row (K_local + share + ML-DSA + registration) is durably
         // committed at this point (RegistrationManager awaits the persist before returning success).
         // SI-001: never log a secret — only the agent name + PUBLIC key.
-        logger.info("persist.identity.persisted", { agentName: name, agentPubkey: agentPubkeyHex });
+        logger.info("persist.identity.persisted", { ...cid, agentName: name, agentPubkey: agentPubkeyHex });
         // CC-2 (2026-07-07): registration succeeded — arm this agent's standing receiver NOW so a
         // brand-new agent can receive inbound immediately. Without this the agent reports
         // standing_receiver_ready:false and cannot receive until the operator restarts (logout/login),
@@ -297,12 +302,12 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
         // registration — surface it as a warning and let the operator recover via login.
         const armResult = startAgentInternal(name);
         if (!armResult.ok) {
-          logger.warn("registration.standing_receiver.arm_failed", { agentName: name, reason: armResult.reason });
+          logger.warn("registration.standing_receiver.arm_failed", { ...cid, agentName: name, reason: armResult.reason });
         } else {
           // arm_INITIATED, not armed: startAgentInternal returns ok once the agent is online + signaling
           // is up, but ensureStandingReceiverForAgent runs fire-and-forget (its own failure emits
           // session.standing_receiver.ensure.failed) — so this event marks the start, not readiness.
-          logger.info("registration.standing_receiver.arm_initiated", { agentName: name });
+          logger.info("registration.standing_receiver.arm_initiated", { ...cid, agentName: name });
         }
         // Capture-now-or-lose-it: persist the agent→user link (using it is future
         // trust-layer work). L1: the agent is already registered at this point —
@@ -311,15 +316,16 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
         // captured (re-registering with the same token re-attempts it).
         try {
           await persistence.persistAgentUserLink({ agentId: result.agent_id, preAuthToken, linkedAt: Date.now() });
-          logger.info("registration.succeeded", { agentName: name, agentId: result.agent_id, primaryPubkey: result.primary_pubkey });
+          logger.info("registration.succeeded", { ...cid, agentName: name, agentId: result.agent_id, primaryPubkey: result.primary_pubkey });
           return { ok: true, agent_id: result.agent_id, primary_pubkey: result.primary_pubkey };
         } catch (linkErr: unknown) {
           logger.warn("registration.user_link.capture_failed", {
+            ...cid,
             agentName: name,
             agentId: result.agent_id,
             error: extractErrorMessage(linkErr),
           });
-          logger.info("registration.succeeded", { agentName: name, agentId: result.agent_id, primaryPubkey: result.primary_pubkey });
+          logger.info("registration.succeeded", { ...cid, agentName: name, agentId: result.agent_id, primaryPubkey: result.primary_pubkey });
           return {
             ok: true,
             agent_id: result.agent_id,
