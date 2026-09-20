@@ -260,14 +260,16 @@ export function wireChannelPublishing(
       const reg = (await register(
         { agent: name, channel: true, adminPubkeyHex, adminSignature, access, correlationId },
         "internal:channel-create",
-      )) as { ok?: boolean; reason?: string; relays?: unknown };
+      )) as { ok?: boolean; reason?: string; guidance?: string; relays?: unknown };
       if (reg?.ok !== true) {
         // Roll back an identity WE minted so a failed create leaves nothing behind — "nothing exists
-        // yet" is the register step's contract. `reason` is passed up; the guidance is deliberately
-        // NOT (the create handler writes its own, which names `cello channel create`, never
-        // `register-agent` — an ordinary agent that can never become a channel).
+        // yet" is the register step's contract.
         await rollbackMint(mintedHere);
-        return { ok: false, reason: reg?.reason ?? "register_failed" };
+        // 024-CREATE item 4: pass the register step's guidance up. It carries the directory's own
+        // refusal detail (e.g. "admin signature does not verify" via registrationGuidance), so the
+        // create step surfaces WHY the registration was refused instead of a generic register failure.
+        // The create handler still supplies a fallback when the register step gave none.
+        return { ok: false, reason: reg?.reason ?? "register_failed", guidance: reg?.guidance };
       }
 
       // The directory picks the channel's two relays from its pool and echoes them here. Fewer than

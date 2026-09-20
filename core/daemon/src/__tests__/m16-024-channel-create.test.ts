@@ -438,3 +438,65 @@ describe("M16 024-CREATE item 6: a failed rollback is logged, not swallowed", ()
     expect(String(rb!.ctx["error"])).toContain("db locked");
   });
 });
+
+describe("M16 024-CREATE item 4: the directory's refusal detail reaches the operator", () => {
+  let dir: string;
+  let db: DaemonDatabase;
+
+  beforeEach(() => {
+    process.env["CELLO_ENV"] = "test";
+    dir = mkdtempSync(join(tmpdir(), "cello-m16-024-d-"));
+    db = openTestDb(join(dir, "sessions.db"));
+  });
+  afterEach(() => {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+    delete process.env["CELLO_ENV"];
+  });
+
+  it("a register refusal carrying the directory detail surfaces in channel.create.failed AND the returned guidance, not a generic register failure", async () => {
+    const logs: Array<{ event: string; ctx: Record<string, unknown> }> = [];
+    const capturing: Logger = {
+      debug() {}, info() {},
+      warn(event: string, ctx?: Record<string, unknown>) { logs.push({ event, ctx: ctx ?? {} }); },
+      error() {},
+    };
+
+    const adminKp = generateKeypair();
+    const channelKp = generateKeypair();
+    const adminPubkeyHex = Buffer.from(await adminKp.getPublicKey()).toString("hex");
+    const channelPubkeyHex = Buffer.from(await channelKp.getPublicKey()).toString("hex");
+
+    // The register step returns exactly what the real chain produces for a channel refused at the
+    // directory's admin-signature gate: registrationGuidance("dkg_failed", <detail carrying "admin
+    // signature does not verify">). Item 4 proves the create surfaces this, not a generic fallback.
+    const directoryGuidance =
+      "The FROST DKG ceremony with the directory failed: dkgRound1 rejected: CHANNEL_REGISTRATION_INVALID: admin signature does not verify";
+    const handlers = new Map<string, Handler>();
+    handlers.set("cello_register", async () => ({ ok: false, reason: "dkg_failed", guidance: directoryGuidance }));
+
+    wireChannelPublishing({
+      handlers, logger: capturing, getDb: () => db, getNode: () => null,
+      screenOutbound: (content, ctx) => new PassthroughGatewayClient().screenOutbound(content, ctx),
+      loadedAgents: [
+        { name: "admin", pubkey: adminPubkeyHex, keyProvider: adminKp as KeyProvider },
+        { name: "channel", pubkey: channelPubkeyHex, keyProvider: channelKp as KeyProvider },
+      ],
+      keyProviders: new Map<string, KeyProvider>([["admin", adminKp], ["channel", channelKp]]),
+      resolveCurrentAgent: (_c, explicit) => explicit ?? "admin",
+      isAgentOnline: () => true, activeMembers: () => [], signalingFor: () => null,
+    });
+
+    const created = (await handlers.get("cello_channel_create")!(
+      { agent: "admin", name: "channel", access: "public" }, "conn1",
+    )) as Record<string, unknown>;
+
+    expect(created.step).toBe("register");
+    // The returned guidance is the directory's, not the generic "nothing was created" fallback.
+    expect(String(created.guidance)).toContain("admin signature does not verify");
+
+    const failed = logs.find((l) => l.event === "channel.create.failed");
+    expect(failed, "channel.create.failed must be logged").toBeDefined();
+    expect(String(failed!.ctx["guidance"])).toContain("admin signature does not verify");
+  });
+});

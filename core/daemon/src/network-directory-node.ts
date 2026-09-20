@@ -410,7 +410,7 @@ async function dkgRound1WithNode(
       const bytes = chunk instanceof Uint8Array ? chunk : (chunk as unknown as { slice(): Uint8Array }).slice();
       const parsed = parseDkgRound1Response(bytes);
       if (parsed.kind === "invalid") throw new Error("dkgRound1: invalid response");
-      if (parsed.kind === "preauth_error") throw new Error(`dkgRound1 rejected: ${parsed.reason}`);
+      if (parsed.kind === "preauth_error") throw new Error(`dkgRound1 rejected: ${parsed.reason}${parsed.detail ? `: ${parsed.detail}` : ""}`);
       const resp = parsed.response;
       if (!resp.ok) throw new Error(`dkgRound1 failed: ${resp.reason}`);
       return resp.broadcast;
@@ -504,7 +504,7 @@ async function dkgRound3WithNode(
 /** Structured result for parseDkgRound1Response — distinguishes normal responses from preauth rejections */
 type DkgRound1ParseResult =
   | { kind: "response"; response: FrostDkgRound1Response }
-  | { kind: "preauth_error"; reason: string }
+  | { kind: "preauth_error"; reason: string; detail?: string }
   | { kind: "invalid" };
 
 function parseDkgRound1Response(bytes: Uint8Array): DkgRound1ParseResult {
@@ -517,7 +517,10 @@ function parseDkgRound1Response(bytes: Uint8Array): DkgRound1ParseResult {
   // discarded rejection reads to the caller as a malformed frame instead of a refused authorization.
   if (o["type"] === "preauth_error") {
     const reason = typeof o["reason"] === "string" ? o["reason"] : "PRE_AUTH_TOKEN_MISSING";
-    return { kind: "preauth_error", reason };
+    // 024-CREATE item 4: carry the directory's `detail` (e.g. "admin signature does not verify") so
+    // the operator sees WHY a channel registration was refused, not just the generic reason label.
+    const detail = typeof o["detail"] === "string" ? o["detail"] : undefined;
+    return { kind: "preauth_error", reason, ...(detail !== undefined ? { detail } : {}) };
   }
 
   if (o["type"] !== "frost_dkg_round1_response") return { kind: "invalid" };

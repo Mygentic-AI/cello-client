@@ -104,7 +104,10 @@ export function registerChannelCreateHandler(deps: ChannelCreateDeps): void {
     // returns the two relays it picked from its pool.
     const registered = await deps.registerChannel({ name, adminName, adminPubkeyHex, access, correlationId });
     if (!registered.ok) {
-      logger.warn("channel.create.failed", { correlationId, step: "register", reason: registered.reason });
+      // 024-CREATE item 4: log the register step's guidance too — it carries the directory's own
+      // refusal detail (e.g. "admin signature does not verify"), so the failure event says WHY, not
+      // just a generic reason label.
+      logger.warn("channel.create.failed", { correlationId, step: "register", reason: registered.reason, guidance: registered.guidance });
       return {
         ok: false, step: "register", reason: registered.reason,
         // Step 1 failing means nothing exists yet — there is no channel to finish by hand.
