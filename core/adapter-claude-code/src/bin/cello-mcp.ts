@@ -1129,7 +1129,20 @@ server.tool("cello_channel_leave", "Stop collecting a channel's posts. LOCAL ONL
 
 // ─── Publisher side ─────────────────────────────────────────────────────────
 
-server.tool("cello_channel_setup", "Record what this publisher has decided about a channel it holds the key to: which relays it posts to, who may join, what the channel is for, and how long posts are kept. DO THIS FIRST — nothing else can publish until the row exists. It writes locally and deposits nothing; cello_channel_info_set is what publishes the description.", {
+server.tool("cello_channel_create", "Bring a NEW channel into existence in one step: register the channel identity `name` with the directory (a channel costs a full registration, same as an agent — pass the same kind of pre-auth token register-agent takes), record its two relays and access, and publish its description. The agent you are attending becomes its administrator. There is NO partial success — if a step fails the answer names which (`register`, `config`, or `info_set`) and the command that finishes the job by hand; a `register` failure means nothing was created. Do this FIRST for a channel you run; `cello_channel_setup` afterwards only CHANGES the relays or access on a channel that already exists.", {
+  name: z.string().describe("The channel's local identity label, the same thing register-agent takes"),
+  access: z.enum(["public", "open", "invite_only"]).describe("public = anyone reads; open = anyone may ask and is admitted; invite_only = the administrator decides each request"),
+  relays: z.array(z.string()).describe("Two relay multiaddrs the channel publishes to — one is a single point of failure, and a subscriber takes the union of both"),
+  preAuthToken: z.string().optional().describe("The single-use pre-auth token from the CELLO Operations Agent; falls back to the CELLO_PREAUTH_TOKEN environment variable"),
+  agent: adminAgent(),
+}, async ({ name, access, relays, preAuthToken, agent }) =>
+  jsonText(await proxy.call("cello_channel_create", {
+    name, access, relays,
+    ...(preAuthToken === undefined ? {} : { preAuthToken }),
+    ...(agent ? { agent } : {}),
+  })));
+
+server.tool("cello_channel_setup", "Record what this publisher has decided about a channel it holds the key to: which relays it posts to, who may join, what the channel is for, and how long posts are kept. Use cello_channel_create to make a NEW channel; this only CHANGES the relays or access on one that already exists. It writes locally and deposits nothing; cello_channel_info_set is what publishes the description.", {
   channel: channelKey(),
   relays: z.array(z.string()).describe("Relay multiaddrs to publish to. Two is the design — one is a single point of failure, and a subscriber takes the union of both"),
   access: z.enum(["public", "open", "invite_only"]).describe("public = anyone reads; open = anyone may ask and is admitted; invite_only = the administrator decides each request"),

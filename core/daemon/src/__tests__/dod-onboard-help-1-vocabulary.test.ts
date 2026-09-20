@@ -193,7 +193,10 @@ describe("DOD-ONBOARD-HELP-1 §2b — SOURCE AUDIT: the daemon never names a com
    * Excluded, correctly:
    *  - comments — they document the IPC METHOD, whose name is accurate and does not move,
    *  - `handlers.set("cello_x")` — the IPC wire name. Renaming it would break a new daemon talking
-   *    to an OLD connect shim (connect has no daemon dep, so they are not pinned together),
+   *    to an OLD connect shim (connect has no daemon dep, so they are not pinned together). Its
+   *    mirror, `handlers.get("cello_x")` (024: a composing handler DISPATCHING to a wire method,
+   *    e.g. cello_channel_create calling cello_register), is the same wire name, never shown to a
+   *    user, so it is excluded on the same grounds,
    *  - a `for (const tool of [` array of tool names, if one returns. ⚠️ THE ONE THIS NAMED IS GONE:
    *    it was the MCP-001 `not_implemented` loop, which ended holding only
    *    `cello_get_inclusion_proof` and was deleted with it by `DOD-M15-INCLUSION-1`. The skip stays
@@ -207,7 +210,7 @@ describe("DOD-ONBOARD-HELP-1 §2b — SOURCE AUDIT: the daemon never names a com
         .forEach((raw, i) => {
           const t = raw.trim();
           if (t.startsWith("//") || t.startsWith("*") || t.startsWith("/*")) return; // comment
-          if (/handlers\.set\(/.test(raw)) return; // IPC method registration
+          if (/handlers\.(?:set|get)\(/.test(raw)) return; // IPC method registration or dispatch (wire name)
           if (/for \(const tool of \[/.test(raw)) return; // a bulk tool-name array (none today)
           const code = raw.replace(/\s\/\/[^"'`]*$/, ""); // drop a trailing inline comment
           for (const m of code.matchAll(re)) {

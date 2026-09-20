@@ -1572,7 +1572,8 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       { name: "read", summary: "Read new posts on a channel you follow." },
       { name: "name", summary: "Label a channel so you can tell it apart. Only you see it." },
       { name: "leave", summary: "Stop receiving a channel's posts. Local — nothing is sent." },
-      { name: "setup", summary: "Make a channel you hold the key to publishable. Do this first." },
+      { name: "create", summary: "Make a new channel you run — register it, record its relays, describe it. Do this first." },
+      { name: "setup", summary: "Change the relays or access on a channel you already run." },
       { name: "publish", summary: "Publish a post to your channel." },
       { name: "info-set", summary: "Publish your channel's description so others can find it." },
       { name: "approve", summary: "Admit someone who asked to join an invite-only channel." },
@@ -1586,6 +1587,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "       cello channel join <channel> [<note>] [--agent <agent>]\n" +
       "       cello channel read <channel> [--all] [--agent <agent>]\n" +
       "       cello channel name <channel> <label> | leave <channel>\n" +
+      "       cello channel create <name> <access> <relay> <relay> [preAuthToken] [--agent <agent>]\n" +
       "       cello channel setup <channel> <access> <relay> <relay> [--agent <agent>]\n" +
       "       cello channel publish <channel> <title> <body> [--agent <agent>]\n" +
       "       cello channel info-set <channel> [--agent <agent>]\n" +
@@ -1593,9 +1595,11 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "       cello channel resend <channel> [<relay>] [--agent <agent>]\n" +
       "       cello channel eject <channel> <member> | approve <channel> <member> | refuse <channel> <member>\n" +
       "  <channel> is the channel's 64-character hex public key.\n" +
-      "  'setup' comes FIRST and is what makes a channel publishable at all: it records the two\n" +
-      "  relays and whether the channel is public. Without it every other command says the channel\n" +
-      "  is unknown. <access> is public (anyone reads), open (anyone may ask to join) or invite_only.\n" +
+      "  'create' comes FIRST for a channel you run: it registers the channel identity <name> (a\n" +
+      "  channel costs a full registration, same as an agent, so it takes a pre-auth token too),\n" +
+      "  records its two relays and access, and publishes its description — in one step. 'setup'\n" +
+      "  CHANGES the relays or access on a channel that already exists. <access> is public (anyone\n" +
+      "  reads), open (anyone may ask to join) or invite_only.\n" +
       "  A post is signed by BOTH the channel key and your agent key, so a reader can tell which\n" +
       "  operator published it, not only which channel.\n" +
       "  It goes to the channel's two relays. ONE relay refusing is not a failed publish — the post\n" +
@@ -1619,6 +1623,18 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       const { agent, positional } = parityOpts(args);
       const [sub, channel, a, b, ...rest] = positional;
       const withAgent = (p: Record<string, unknown>) => (agent ? { ...p, agent } : p);
+      if (sub === "create" && channel && a !== undefined && b !== undefined) {
+        // `channel` is the new channel's <name>, `a` its access, then EXACTLY two relays and an
+        // optional pre-auth token: `create <name> <access> <relay> <relay> [preAuthToken]`. The
+        // token falls back to CELLO_PREAUTH_TOKEN, exactly as register-agent does, so it need not
+        // appear in shell history. The daemon validates the relay count and refuses one relay.
+        const relays = [b, ...(rest[0] !== undefined ? [rest[0]] : [])];
+        const preAuthToken = rest[1] ?? process.env.CELLO_PREAUTH_TOKEN;
+        return legacy(await channelVerb(ctx.celloDir, "cello_channel_create", withAgent({
+          name: channel, access: a, relays,
+          ...(preAuthToken !== undefined ? { preAuthToken } : {}),
+        })));
+      }
       if (sub === "setup" && channel && a !== undefined && b !== undefined) {
         // Every positional after the access word is a relay, so two (the design) is the ordinary
         // call and more is possible without a second syntax.

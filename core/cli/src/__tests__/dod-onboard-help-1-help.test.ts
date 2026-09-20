@@ -114,6 +114,15 @@ describe("§2b — CLI ↔ MCP name parity: one capability, one name", () => {
     expect(findCommand("initiate-session")!.ipcMethod).toBe("cello_initiate_session");
     expect(findCommand("contacts")!.ipcMethod).toBe("cello_contact_list"); // wire name unchanged
   });
+
+  // 024-CREATE Part B — the guard that would have caught a channel with no way to be created. A
+  // channel needs one command that brings it into existence, and that command has to be BOTH a
+  // `channel` subcommand an operator can type and a dual-surface verb an agent can call.
+  it("`create` is a channel subcommand AND cello_channel_create is a dual-surface verb", () => {
+    const channel = findCommand("channel");
+    expect(channel?.verbs?.map((v) => v.name), "cello channel create must be a listed subcommand").toContain("create");
+    expect(DUAL_SURFACE_VERBS.map((v) => v.mcp), "cello_channel_create must be in the vocabulary").toContain("cello_channel_create");
+  });
 });
 
 describe("§4 — the wording is accurate and jargon-free", () => {

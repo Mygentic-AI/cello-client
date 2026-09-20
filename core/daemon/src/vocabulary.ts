@@ -107,6 +107,10 @@ const ALWAYS_ON_VERBS: readonly DualSurfaceVerb[] = [
   { mcp: "cello_channel_read", cli: "cello channel read" },
   { mcp: "cello_channel_name", cli: "cello channel name" },
   { mcp: "cello_channel_leave", cli: "cello channel leave" },
+  // 024-CREATE: the publisher's first step — it brings a channel into existence (register + config
+  // + info-set), so it leads the publisher verbs. Unlike setup/name, its tool name DOES match its
+  // daemon method: `cello_channel_create` is a new composing handler, not a rename.
+  { mcp: "cello_channel_create", cli: "cello channel create" },
   { mcp: "cello_channel_setup", cli: "cello channel setup" },
   { mcp: "cello_channel_publish", cli: "cello channel publish" },
   { mcp: "cello_channel_info_set", cli: "cello channel info-set" },

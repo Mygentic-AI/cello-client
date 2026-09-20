@@ -270,7 +270,12 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // is the exact hole this order exists to close: nothing in production sent a join request and
     // nothing read a post back out, so a person could publish to a channel nobody could subscribe
     // to — for five orders, with every suite green.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(112);
+    //
+    // 112 → 113 for M16 024-CREATE's `registerChannelCreateHandler` (channel-create-handler.ts).
+    // Unwired, the one command that brings a channel into existence would be registered by nothing:
+    // the daemon would serve every channel verb EXCEPT the one that creates the channel they all
+    // operate on, which is the state every order before this shipped.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(113);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",

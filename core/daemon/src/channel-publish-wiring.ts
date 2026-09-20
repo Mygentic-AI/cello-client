@@ -14,10 +14,11 @@ import type { Logger } from "./types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { ScreenContext, ScreenVerdict } from "@cello-protocol/gateway";
-import { registerChannelPublishHandlers } from "./channel-publish-handlers.js";
+import { registerChannelPublishHandlers, recordChannelConfig, depositChannelInfo } from "./channel-publish-handlers.js";
+import { registerChannelCreateHandler } from "./channel-create-handler.js";
 import { ChannelPublisher } from "./channel-publisher.js";
 import { ChannelLogStore } from "./channel-log-store.js";
-import { ChannelConfigStore } from "./channel-config-store.js";
+import { ChannelConfigStore, type ChannelConfig } from "./channel-config-store.js";
 import { ChannelRelayClient } from "./channel-relay-client.js";
 import { ChannelCollector } from "./channel-collector.js";
 import { ChannelSubscriptionStore } from "./channel-subscription-store.js";
@@ -131,36 +132,76 @@ export function wireChannelPublishing(
     signalingFor: (agentId) => deps.signalingFor(agentId),
   });
 
+  const setChannelConfig = (agentName: string, channelHex: string, cfg: ChannelConfig):
+    { ok: true } | { ok: false; reason: string; guidance?: string } => {
+    // The channel key must be one this daemon HOLDS. Recording relays for a channel we cannot
+    // sign for would leave every later verb failing on a key lookup, which describes neither the
+    // mistake nor how to correct it.
+    if (channelKeyByPubkey(channelHex) === null) {
+      return {
+        ok: false, reason: "channel_key_not_held",
+        guidance: "This daemon does not hold that channel's key. A channel is an agent — create it with 'cello create-agent' and use its public key here.",
+      };
+    }
+    if (!keyProviders.has(agentName)) {
+      return { ok: false, reason: "no_such_agent", guidance: `${agentName} is not an agent this daemon holds.` };
+    }
+    /**
+     * ⚠️ **THE ADMIN AGENT IS RECORDED HERE, and it is what makes the channel joinable at all.**
+     * `agentName` is the agent running the setup, and in this release the publisher and the admin
+     * are the same operator — so that agent's key is the one a subscriber will check the answering
+     * party against. Leaving it empty was how 019's first cut produced a channel that refused
+     * every join with `not_admin_of_channel` on a channel it demonstrably administered.
+     */
+    const adminAgent = deps.loadedAgents.find((a) => a.name === agentName);
+    config.set(channelHex, { ...cfg, admin_pubkey: adminAgent?.pubkey ?? "" }, Date.now());
+    return { ok: true };
+  };
+
   registerChannelPublishHandlers({
     handlers: deps.handlers,
     logger,
     resolveCurrentAgent: deps.resolveCurrentAgent,
     getPublisher: buildPublisher,
     wakeMembers: (agentName, channelHex) => sendWake(agentName, channelHex),
-    setChannelConfig: (agentName, channelHex, cfg) => {
-      // The channel key must be one this daemon HOLDS. Recording relays for a channel we cannot
-      // sign for would leave every later verb failing on a key lookup, which describes neither the
-      // mistake nor how to correct it.
-      if (channelKeyByPubkey(channelHex) === null) {
-        return {
-          ok: false, reason: "channel_key_not_held",
-          guidance: "This daemon does not hold that channel's key. A channel is an agent — create it with 'cello create-agent' and use its public key here.",
-        };
+    setChannelConfig,
+  });
+
+  /**
+   * M16 024-CREATE: the one command that brings a channel into existence, composing register →
+   * config → info-set in-process. The three steps are the EXISTING code, reused: registration goes
+   * through the `cello_register` handler, and config/info-set through the functions the publish
+   * handlers were refactored onto (`recordChannelConfig` / `depositChannelInfo`).
+   */
+  registerChannelCreateHandler({
+    handlers: deps.handlers,
+    logger,
+    resolveCurrentAgent: deps.resolveCurrentAgent,
+    agentPubkey: (agentName) => deps.loadedAgents.find((a) => a.name === agentName)?.pubkey ?? null,
+    registerChannel: async ({ name, preAuthToken, adminPubkeyHex, access, correlationId }) => {
+      const register = deps.handlers.get("cello_register");
+      if (!register) {
+        return { ok: false, reason: "register_unavailable", guidance: "The daemon has no registration handler wired." };
       }
-      if (!keyProviders.has(agentName)) {
-        return { ok: false, reason: "no_such_agent", guidance: `${agentName} is not an agent this daemon holds.` };
+      const reg = (await register(
+        { agent: name, preAuthToken, channel: true, adminPubkeyHex, access, correlationId },
+        "internal:channel-create",
+      )) as { ok?: boolean; reason?: string; guidance?: string };
+      if (reg?.ok !== true) {
+        return { ok: false, reason: reg?.reason ?? "register_failed", guidance: reg?.guidance };
       }
-      /**
-       * ⚠️ **THE ADMIN AGENT IS RECORDED HERE, and it is what makes the channel joinable at all.**
-       * `agentName` is the agent running the setup, and in this release the publisher and the admin
-       * are the same operator — so that agent's key is the one a subscriber will check the answering
-       * party against. Leaving it empty was how 019's first cut produced a channel that refused
-       * every join with `not_admin_of_channel` on a channel it demonstrably administered.
-       */
-      const adminAgent = deps.loadedAgents.find((a) => a.name === agentName);
-      config.set(channelHex, { ...cfg, admin_pubkey: adminAgent?.pubkey ?? "" }, Date.now());
-      return { ok: true };
+      // The channel's own pubkey is its loaded K_local key — what a post is signed with and what
+      // config/info-set are addressed by (agent NAME is a mutable display label).
+      const channel = deps.loadedAgents.find((a) => a.name === name);
+      if (!channel) {
+        return { ok: false, reason: "channel_key_not_held", guidance: "The channel registered but its key is not loaded on this daemon." };
+      }
+      return { ok: true, channelPubkeyHex: channel.pubkey };
     },
+    applyChannelConfig: (agentName, channelHex, cfg) =>
+      recordChannelConfig({ logger, setChannelConfig }, agentName, channelHex, cfg),
+    depositChannelInfo: (agentName, channelHex) =>
+      depositChannelInfo({ getPublisher: buildPublisher }, agentName, channelHex),
   });
 
   /**

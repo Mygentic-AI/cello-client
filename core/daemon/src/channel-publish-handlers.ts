@@ -75,6 +75,59 @@ function needChannel(params: Record<string, unknown> | undefined):
   return { ok: true, channelHex: raw.toLowerCase() };
 }
 
+/**
+ * Record a publisher's decisions for a channel it holds the key to — the SAME code
+ * `cello_channel_config` runs, extracted so `cello_channel_create` (024) composes it rather than
+ * copying it. Returns only success/failure; the config handler adds its own operator-facing shape.
+ */
+export function recordChannelConfig(
+  deps: Pick<ChannelPublishDeps, "logger" | "setChannelConfig">,
+  agentName: string,
+  channelHex: string,
+  cfg: ChannelConfig,
+): { ok: true } | { ok: false; reason: string; guidance?: string } {
+  const saved = deps.setChannelConfig(agentName, channelHex, cfg);
+  if (!saved.ok) return { ok: false, reason: saved.reason, guidance: saved.guidance };
+  deps.logger.info("channel.config.recorded", {
+    channel_pubkey: channelHex, access: cfg.access, relays: cfg.relays.length,
+  });
+  return { ok: true };
+}
+
+/**
+ * Sign and deposit a channel's info record — the SAME code `cello_channel_info_set` runs, extracted
+ * so `cello_channel_create` (024) composes it rather than copying it.
+ */
+export async function depositChannelInfo(
+  deps: Pick<ChannelPublishDeps, "getPublisher">,
+  agentName: string,
+  channelHex: string,
+): Promise<
+  | { ok: true; bytes: number; relays_ok: string[]; relays_failed: Array<{ relay: string; reason?: string }> }
+  | { ok: false; reason: string; detail?: string; guidance?: string }
+> {
+  const publisher = deps.getPublisher(agentName);
+  if (!publisher) return { ok: false, reason: "channel_unknown" };
+
+  const result = await publisher.publishInfo(agentName, channelHex);
+  if (!result.ok) {
+    return {
+      ok: false, reason: result.reason, detail: result.detail,
+      guidance: result.reason === "no_relay_accepted"
+        ? "No relay took the channel's description, so nobody can discover this channel yet. Check the relays are reachable and run it again."
+        : undefined,
+    };
+  }
+  return {
+    ok: true,
+    bytes: result.info_cbor.length,
+    // WHICH relays hold it, not just that it was signed. A subscriber can only find this channel
+    // through a relay that actually took the record.
+    relays_ok: result.relays.filter((r) => r.ok).map((r) => r.relay),
+    relays_failed: result.relays.filter((r) => !r.ok).map((r) => ({ relay: r.relay, reason: r.reason })),
+  };
+}
+
 export function registerChannelPublishHandlers(deps: ChannelPublishDeps): void {
   const { handlers, logger } = deps;
 
@@ -158,14 +211,11 @@ export function registerChannelPublishHandlers(deps: ChannelPublishDeps): void {
       ? retention
       : DEFAULT_RETENTION_SECONDS;
 
-    const saved = deps.setChannelConfig(agent.agentName, channel.channelHex, {
+    const recorded = recordChannelConfig(deps, agent.agentName, channel.channelHex, {
       access, relays, guidance, retention_seconds,
     });
-    if (!saved.ok) return { ok: false, reason: saved.reason, guidance: saved.guidance };
+    if (!recorded.ok) return { ok: false, reason: recorded.reason, guidance: recorded.guidance };
 
-    logger.info("channel.config.recorded", {
-      channel_pubkey: channel.channelHex, access, relays: relays.length,
-    });
     return {
       ok: true, channel: channel.channelHex, access, relays, retention_seconds,
       guidance: "Recorded locally. Run 'cello channel info-set' to publish the description so subscribers can find the channel.",
@@ -177,26 +227,7 @@ export function registerChannelPublishHandlers(deps: ChannelPublishDeps): void {
     if (!agent.ok) return agent.answer;
     const channel = needChannel(params);
     if (!channel.ok) return channel.answer;
-    const publisher = deps.getPublisher(agent.agentName);
-    if (!publisher) return { ok: false, reason: "channel_unknown" };
-
-    const result = await publisher.publishInfo(agent.agentName, channel.channelHex);
-    if (!result.ok) {
-      return {
-        ok: false, reason: result.reason, detail: result.detail,
-        guidance: result.reason === "no_relay_accepted"
-          ? "No relay took the channel's description, so nobody can discover this channel yet. Check the relays are reachable and run it again."
-          : undefined,
-      };
-    }
-    return {
-      ok: true,
-      bytes: result.info_cbor.length,
-      // WHICH relays hold it, not just that it was signed. A subscriber can only find this channel
-      // through a relay that actually took the record.
-      relays_ok: result.relays.filter((r) => r.ok).map((r) => r.relay),
-      relays_failed: result.relays.filter((r) => !r.ok).map((r) => ({ relay: r.relay, reason: r.reason })),
-    };
+    return depositChannelInfo(deps, agent.agentName, channel.channelHex);
   });
 
   handlers.set("cello_channel_prune", async (params, connectionId) => {

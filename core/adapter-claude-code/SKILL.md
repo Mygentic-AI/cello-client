@@ -469,10 +469,16 @@ cello_channel_leave({ channel, agent? })     — stop collecting. LOCAL: nothing
 Publishing, for a channel whose key this agent holds:
 
 ```
+cello_channel_create({ name, access, relays, preAuthToken?, agent? })
+                                             — DO THIS FIRST. Makes a NEW channel in one step:
+                                               registers the identity `name`, records its relays and
+                                               access, and publishes its description. Costs a full
+                                               registration, same as an agent, so it takes a pre-auth
+                                               token. The attending agent administers it.
 cello_channel_setup({ channel, relays, access, guidance?, retention_seconds?, agent? })
-                                             — DO THIS FIRST. Records the relays, who may join and
-                                               what the channel is for. Nothing publishes until it
-                                               exists. Writes locally; deposits nothing.
+                                             — CHANGES the relays, who may join, or what a channel
+                                               that already exists is for. Writes locally; deposits
+                                               nothing.
 cello_channel_publish({ channel, title, body, agent? })
                                              — post. Says which relays took it. If none did, the
                                                post still exists locally — resend it rather than
