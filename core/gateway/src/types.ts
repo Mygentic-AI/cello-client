@@ -13,6 +13,9 @@
  */
 
 import { withProvenance } from "./screen/affordance.js";
+import type { InjectionScanDetail } from "./detect/injection-scanner.js";
+
+export type { InjectionScanDetail };
 
 /** Which direction the content is flowing relative to the daemon. */
 export type ScreenDirection = "outbound" | "inbound";
@@ -91,6 +94,13 @@ export interface ScreenVerdict {
   guidance?: string;
   /** The governance findings behind this verdict — the daemon renders them to the agent. */
   events?: GovernanceEvent[];
+  /**
+   * INBOUND only: what the semantic classifier scored and on which text (see `InjectionScanDetail`).
+   * Present whenever a copy was scored, on allow as well as block; absent when Layer 2 is off or the
+   * classifier failed on every copy. This is what lets the daemon log say WHY a message was flagged
+   * or blocked instead of only THAT it was.
+   */
+  scan?: InjectionScanDetail;
   /**
    * Set on a `block` whose cause is the CONTENT itself — a detector rejected these exact bytes
    * (inbound: a confident non-allowlisted language, a high-score injection; outbound likewise).

@@ -224,6 +224,10 @@ async function main(): Promise<void> {
           ...(v.terminal !== undefined ? { terminal: v.terminal } : {}),
           ...(v.reason !== undefined ? { reason: v.reason } : {}),
           ...(v.guidance !== undefined ? { guidance: v.guidance } : {}),
+          // The live score and which text it was read from. Dropped here, it is computed and never
+          // seen: this literal is the third place that copies a fixed field list (with server.ts and
+          // client.ts), and the in-process tests never cross it.
+          ...(v.scan !== undefined ? { scan: v.scan } : {}),
         };
         recordOutcome("inbound", verdict, req.content, req.correlationId);
         return verdict;

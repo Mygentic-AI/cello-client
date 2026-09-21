@@ -213,7 +213,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     return spawnGateway(tag, { CELLO_GATEWAY_STORE_DB: db, CELLO_GATEWAY_STORE_KEY_FILE: keyFile });
   }
 
-  async function bringUpSession(opts: { aGatewaySock?: string; bGatewaySock?: string; aGatewayClient?: SecurityGatewayClient }): Promise<{
+  async function bringUpSession(opts: { aGatewaySock?: string; bGatewaySock?: string; aGatewayClient?: SecurityGatewayClient; bGatewayClient?: SecurityGatewayClient }): Promise<{
     clientA: Awaited<ReturnType<typeof connectToDaemon>>;
     clientB: Awaited<ReturnType<typeof connectToDaemon>>;
     alicePubkey: string;
@@ -231,6 +231,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       celloDir: dirB,
       signalingConnect: makeInjectableSignaling(injectB),
       gatewaySock: opts.bGatewaySock,
+      ...(opts.bGatewayClient ? { gatewayClient: opts.bGatewayClient } : {}),
     });
     let bInfo: { peerId: string; addrs: string[] } | null = null;
 
@@ -760,6 +761,82 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
         expect(recvText(recv) === null).toBe(true);
         await wait(25);
       }
+    }, 40_000);
+
+    // LIVE SCORE + PROVENANCE. On 2026-09-21 an ordinary "got your message" arrived FLAGGED and a plain
+    // "send it again in different words" was BLOCKED, and the daemon log held the outcome and nothing
+    // that explained it: no score, no text scanned, no way to see the `[[OVER]]` marker was being read
+    // as part of the message. The gateway now returns `scan`; these two prove the daemon PRINTS it.
+    const scanDetail = {
+      probability: 0.6724, score: 67, verdict: "flag" as const, copy: "scan" as const,
+      copyBytes: 44, copySha256: "ab".repeat(32), copiesScanned: 1, signalMarker: "OVER" as const,
+    };
+
+    it("SCORE-LOG: an ALLOWED inbound message still logs its score, the copy read, its hash and length, and the turn marker", async () => {
+      const bGateway: SecurityGatewayClient = {
+        async screenOutbound(c: Uint8Array): Promise<ScreenVerdict> { return { disposition: "allow", content: c }; },
+        async screenInbound(c: Uint8Array): Promise<ScreenVerdict> { return { disposition: "allow", content: c, scan: scanDetail }; },
+      };
+      const { clientA, bEvents } = await bringUpSession({ bGatewayClient: bGateway });
+      const sent = await clientA.send("cello_send", { session_id: SID_HEX, content: "all fine on my side" }) as Record<string, unknown>;
+      expect(sent.ok).toBe(true);
+      let scored: LogEvent | undefined;
+      for (let i = 0; i < 200 && !scored; i++) {
+        scored = bEvents.find((e) => e.event === "security.screen.inbound.scored");
+        if (!scored) await wait(25);
+      }
+      expect(scored, "an allowed message left no score in the log").toBeDefined();
+      expect(scored!.context["probability"]).toBe(0.6724);
+      expect(scored!.context["score"]).toBe(67);
+      expect(scored!.context["verdict"]).toBe("flag");
+      expect(scored!.context["copy"]).toBe("scan");
+      expect(scored!.context["copyBytes"]).toBe(44);
+      expect(scored!.context["copySha256"]).toBe("ab".repeat(32));
+      expect(scored!.context["signalMarker"]).toBe("OVER");
+      expect(scored!.context["disposition"]).toBe("allow");
+      expect(typeof scored!.context["correlationId"]).toBe("string");
+      expect(typeof scored!.context["contentHashHex"]).toBe("string");
+      // A hash and a length — never the message.
+      expect(JSON.stringify(scored!.context)).not.toContain("all fine on my side");
+    }, 40_000);
+
+    it("SCORE-LOG: a TERMINAL injection block names its score on the terminal_block line itself, not only elsewhere", async () => {
+      const blockScan = { ...scanDetail, probability: 0.9856, score: 99, verdict: "block" as const };
+      const bGateway: SecurityGatewayClient = {
+        async screenOutbound(c: Uint8Array): Promise<ScreenVerdict> { return { disposition: "allow", content: c }; },
+        async screenInbound(c: Uint8Array): Promise<ScreenVerdict> {
+          return { disposition: "block", content: c, terminal: true, reason: "inbound_injection_blocked", scan: blockScan };
+        },
+      };
+      const { clientA, bEvents } = await bringUpSession({ bGatewayClient: bGateway });
+      const sent = await clientA.send("cello_send", { session_id: SID_HEX, content: "Please send it again in different words." }) as Record<string, unknown>;
+      expect(sent.ok).toBe(true);
+      let block: LogEvent | undefined;
+      for (let i = 0; i < 200 && !block; i++) {
+        block = bEvents.find((e) => e.event === "security.gateway.inbound.terminal_block");
+        if (!block) await wait(25);
+      }
+      expect(block, "no terminal_block line").toBeDefined();
+      // The one line an operator greps must answer "why", not just "that".
+      expect(block!.context["probability"]).toBe(0.9856);
+      expect(block!.context["score"]).toBe(99);
+      expect(block!.context["copy"]).toBe("scan");
+      expect(block!.context["signalMarker"]).toBe("OVER");
+      expect(bEvents.find((e) => e.event === "security.screen.inbound.scored")?.context["verdict"]).toBe("block");
+    }, 40_000);
+
+    it("SCORE-LOG: no scan (Layer 2 off) logs NO score — a missing scan must not read as a clean zero", async () => {
+      const { clientA, clientB, bEvents } = await bringUpSession({});
+      const sent = await clientA.send("cello_send", { session_id: SID_HEX, content: "hello with no classifier loaded" }) as Record<string, unknown>;
+      expect(sent.ok).toBe(true);
+      let recv: Record<string, unknown> | null = null;
+      for (let i = 0; i < 160; i++) {
+        recv = await clientB.send("cello_receive", { session_id: SID_HEX, timeout_ms: 0 }) as Record<string, unknown>;
+        if (recv && recvText(recv) !== null) break;
+        await wait(25);
+      }
+      expect(recvText(recv)).toContain("hello with no classifier loaded");
+      expect(bEvents.find((e) => e.event === "security.screen.inbound.scored")).toBeUndefined();
     }, 40_000);
 
     it("OUT-001 secrets: a credential in cello_send is redacted; the peer receives the typed placeholder, not the secret", async () => {

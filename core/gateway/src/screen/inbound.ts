@@ -27,7 +27,8 @@ import { sanitizeInbound } from "../detect/sanitize.js";
 import { injectionPatternsReady, scanInjectionPatterns } from "../detect/injection-patterns.js";
 import { scanVariants } from "../detect/scan-variants.js";
 import { screenInboundLanguage, type LanguageOptions } from "../detect/language.js";
-import { InjectionScanner, type ScanResult } from "../detect/injection-scanner.js";
+import { createHash } from "node:crypto";
+import { InjectionScanner, type InjectionScanDetail, type ScanResult } from "../detect/injection-scanner.js";
 import type { GovernanceEvent } from "./outbound.js";
 
 export interface InboundVerdict {
@@ -42,6 +43,12 @@ export interface InboundVerdict {
   reason?: string;
   /** Actionable text the agent sees on a terminal block (INV-7). */
   guidance?: string;
+  /**
+   * What the semantic classifier scored and on which text. Present whenever a copy was actually
+   * scored — allow, redact and block alike — and ABSENT when Layer 2 is off or the classifier failed
+   * on every copy, so a missing scan never reads as a clean zero.
+   */
+  scan?: InjectionScanDetail;
 }
 
 export interface InboundScreenerOptions {
@@ -163,21 +170,43 @@ export class InboundScreener {
     content: Uint8Array,
     scanText: string,
     hiddenText: string,
-  ): Promise<ScanResult & { degraded?: number; scanned?: number }> {
+  ): Promise<ScanResult & { degraded?: number; scanned?: number; detail?: InjectionScanDetail }> {
     const raw = new TextDecoder().decode(content);
-    const copies = [scanText, raw, hiddenText].filter(
-      (c, i, all) => c !== "" && all.indexOf(c) === i,
+    // Each copy keeps its NAME. A copy equal to an earlier one is dropped, so the name a duplicate
+    // shares resolves to the first (`scan`, then `raw`, then `hidden`) — the plain-message case is
+    // `scan` alone.
+    const named: Array<{ kind: InjectionScanDetail["copy"]; text: string }> = [
+      { kind: "scan", text: scanText },
+      { kind: "raw", text: raw },
+      { kind: "hidden", text: hiddenText },
+    ];
+    const copies = named.filter(
+      (c, i, all) => c.text !== "" && all.findIndex((o) => o.text === c.text) === i,
     );
     let worst: ScanResult | null = null;
+    let worstCopy: { kind: InjectionScanDetail["copy"]; text: string } | null = null;
     let degraded = 0;
     for (const copy of copies) {
       if (worst?.verdict === "block") break;
-      const next = await this.#injection.scan(copy);
+      const next = await this.#injection.scan(copy.text);
       if (!next.available) { degraded++; continue; }
-      if (worst === null || (next.score ?? 0) > (worst.score ?? 0)) worst = next;
+      if (worst === null || (next.score ?? 0) > (worst.score ?? 0)) { worst = next; worstCopy = copy; }
     }
-    if (worst === null) return { available: false, degraded };
-    return { ...worst, ...(degraded > 0 ? { degraded, scanned: copies.length } : {}) };
+    if (worst === null || worstCopy === null) return { available: false, degraded };
+    const bytes = Buffer.from(worstCopy.text, "utf8");
+    const marker = /\[\[(OVER|WRAP|STANDBY)(?:\s[^\]]*)?\]\]\s*$/.exec(worstCopy.text);
+    const detail: InjectionScanDetail = {
+      probability: worst.probability ?? (worst.score ?? 0) / 100,
+      score: worst.score ?? 0,
+      verdict: worst.verdict ?? "pass",
+      copy: worstCopy.kind,
+      copyBytes: bytes.length,
+      copySha256: createHash("sha256").update(bytes).digest("hex"),
+      copiesScanned: copies.length,
+      ...(degraded > 0 ? { degraded } : {}),
+      signalMarker: marker === null ? null : (marker[1] as "OVER" | "WRAP" | "STANDBY"),
+    };
+    return { ...worst, detail, ...(degraded > 0 ? { degraded, scanned: copies.length } : {}) };
   }
 
   async screen(content: Uint8Array): Promise<InboundVerdict> {
@@ -282,8 +311,12 @@ export class InboundScreener {
 
     // IN-002: semantic injection scanner (Layer-2). Off when no model is loaded — available()===false,
     // so the call short-circuits and inbound behaviour is unchanged until the model is installed.
+    // Set only when a copy was actually scored, and carried on EVERY verdict from here on — an
+    // allowed message's score is exactly what an operator asks for when a block looks wrong.
+    let scanDetail: InjectionScanDetail | undefined;
     if (this.#injection.available()) {
       const scan = await this.#scanHighest(content, scanText, r.hiddenText);
+      scanDetail = scan.detail;
       // The model is installed and loaded, so "unavailable" here means the message itself broke
       // every copy's scan. Silence would be indistinguishable from a clean score.
       if (!scan.available) {
@@ -319,6 +352,7 @@ export class InboundScreener {
               "If you believe it is legitimate, ask the sender to rephrase it without instruction-like " +
               "framing, or have the operator inspect it directly.",
             ),
+          ...(scanDetail !== undefined ? { scan: scanDetail } : {}),
         };
       }
       if (scan.verdict === "flag") {
@@ -397,6 +431,7 @@ export class InboundScreener {
               "There is no legitimate reason to write a sentence in invisible codepoints, so this one is refused rather than flagged. " +
               "If you believe the sender did it by accident, ask them to resend the message as ordinary text.",
             ),
+          ...(scanDetail !== undefined ? { scan: scanDetail } : {}),
         };
       }
     }
@@ -452,6 +487,7 @@ export class InboundScreener {
       disposition: annotated ? "redact" : "allow",
       content: annotated ? TEXT_ENCODER.encode(wrapped) : content,
       events,
+      ...(scanDetail !== undefined ? { scan: scanDetail } : {}),
     };
   }
 }

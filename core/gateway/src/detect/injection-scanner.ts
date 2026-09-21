@@ -42,10 +42,50 @@ export interface InjectionClassifier {
   classify(text: string): Promise<{ injectionProbability: number; label?: string }>;
 }
 
+/**
+ * What the classifier scored and on WHICH text — the provenance of a verdict, for the operator's log.
+ *
+ * Deliberately a hash and a length, never the text: this is written to a log, and the protocol's
+ * promise is that the conversation stays with its participants. To check a suspected input, hash the
+ * candidate (sha256 over its UTF-8 bytes) and compare `copySha256`.
+ */
+export interface InjectionScanDetail {
+  /** The model's unrounded P(injection), 0..1. */
+  probability: number;
+  /** The integer score the verdict was decided on (`probability` × 100, rounded). */
+  score: number;
+  verdict: InjectionVerdict;
+  /**
+   * Which copy of the message produced the winning (highest) score: `scan` is the cleaned,
+   * decoded detection copy; `raw` the bytes as received; `hidden` a smuggled-instruction channel.
+   */
+  copy: "scan" | "raw" | "hidden";
+  /** UTF-8 byte length of exactly the text the model read on the winning copy. */
+  copyBytes: number;
+  /** sha256 (hex) of those bytes. */
+  copySha256: string;
+  /** How many distinct copies were scored (duplicates are scored once; a block ends the loop early). */
+  copiesScanned: number;
+  /** How many copies the classifier FAILED on; absent when none did. */
+  degraded?: number;
+  /**
+   * The trailing turn marker the sending tool appends (`OVER`, `WRAP` or `STANDBY`) when the winning
+   * copy ends with one, else null. It is CELLO's own signal, not something the sender wrote, yet it
+   * is in the text the model reads — so it is named rather than left to be inferred from byte counts.
+   */
+  signalMarker: "OVER" | "WRAP" | "STANDBY" | null;
+}
+
 export interface ScanResult {
   /** false when Layer-2 is off (no model/runtime) — Layer-1 still ran; the message is not blocked here. */
   available: boolean;
   score?: number;
+  /**
+   * The model's UNROUNDED P(injection) in [0,1]. `score` is this rounded to an integer, and the
+   * verdict compares the ROUNDED value — so 0.9856 scores 99 and blocks at a 99 bar. Carried so an
+   * operator can see that rounding rather than infer it.
+   */
+  probability?: number;
   verdict?: InjectionVerdict;
   /** The model's raw label (informational only — the SCORE governs the verdict, AC-003). */
   label?: string;
@@ -83,6 +123,12 @@ export class InjectionScanner {
     const { injectionProbability, label } = classified;
     const score = Math.round(Math.max(0, Math.min(1, injectionProbability)) * 100);
     // The score governs the verdict (AC-003): a model `label` of SAFE with a high score still blocks.
-    return { available: true, score, verdict: scoreToVerdict(score), label };
+    return {
+      available: true,
+      score,
+      probability: Math.max(0, Math.min(1, injectionProbability)),
+      verdict: scoreToVerdict(score),
+      label,
+    };
   }
 }

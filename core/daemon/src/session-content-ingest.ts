@@ -22,6 +22,7 @@ import { decodeStructure1 } from "@cello-protocol/protocol-types";
 import { openSessionContent } from "@cello-protocol/crypto";
 import { CELLO_CONTENT_PROTOCOL_ID, type CelloNode } from "@cello-protocol/transport";
 import { GATEWAY_UNAVAILABLE, GOVERNANCE_TIMEOUT, type SecurityGatewayClient } from "@cello-protocol/gateway";
+import { scanFields } from "./screen-score-fields.js";
 import type { Stream } from "@libp2p/interface";
 import { contentHashFor, resolveContentHashAlg } from "./wire-content-hash.js";
 import { SALT_ADOPTION_LABEL_MAX } from "./session-salt-agreement.js";
@@ -738,6 +739,9 @@ export class SessionContentIngest {
         disposition: inboundVerdict.disposition,
         reason: inboundVerdict.reason,
         correlationId,
+        // The score belongs on THIS line too: this is the one an operator greps when a counterparty
+        // says "you never got my message", and a block with no number is a dead end (screen-score-fields).
+        ...scanFields(inboundVerdict.scan),
       });
       /**
        * DOD-M15-REFUSEDEVIDENCE-1 — retention for a terminal block happens where its LEAF happens,
@@ -828,6 +832,16 @@ export class SessionContentIngest {
     // what the recipient reads, and until now neither left a trace anywhere — an operator asking
     // "why did my agent see a warning on that message?" had nothing to read. `correlationId` is the
     // ingest's own, so the finding, the leaf and the delivery are one story.
+    // WHAT THE CLASSIFIER SCORED, AND ON WHICH TEXT — on every scored message, ALLOWED ones included:
+    // an allowed score is the baseline that makes a block legible. See `screen-score-fields.ts`.
+    if (inboundVerdict.scan !== undefined) {
+      this.#ctx.logger.info("security.screen.inbound.scored", {
+        sessionId, agentName, contentHashHex, correlationId,
+        disposition: inboundVerdict.disposition,
+        ...scanFields(inboundVerdict.scan),
+      });
+    }
+
     if (inboundVerdict.disposition === "redact") {
       const findings = (inboundVerdict.events ?? [])
         .filter((e) => String(e.category).startsWith("injection:"))

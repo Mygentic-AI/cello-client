@@ -34,7 +34,7 @@ export { PRIVILEGED_TURN_MARKERS, PIPE_TURN_MARKER_SOURCE, pipeTurnMarkerRegex, 
 export { screenInboundLanguage, SCRIPTS, isScript } from "./detect/language.js";
 export type { LanguageVerdict, LanguageOptions, Script } from "./detect/language.js";
 export { InjectionScanner, scoreToVerdict, BLOCK_THRESHOLD, FLAG_THRESHOLD } from "./detect/injection-scanner.js";
-export type { InjectionClassifier, InjectionVerdict, ScanResult } from "./detect/injection-scanner.js";
+export type { InjectionClassifier, InjectionScanDetail, InjectionVerdict, ScanResult } from "./detect/injection-scanner.js";
 export { isModelInstalled, installModel, sha256File } from "./detect/model-installer.js";
 export type { InstallResult, InstallOptions } from "./detect/model-installer.js";
 export { SCREENER_MODEL, screenerModelTotalBytes, localPathOf } from "./detect/screener-model-manifest.js";

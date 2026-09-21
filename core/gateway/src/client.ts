@@ -255,6 +255,7 @@ export class LocalSidecarGatewayClient implements SecurityGatewayClient {
     // than a rule each new guard has to remember (and F10 shipped with four producers that hadn't).
     if (wire.guidance !== undefined) verdict.guidance = withProvenance(wire.guidance);
     if (wire.events !== undefined) verdict.events = wire.events;
+    if (wire.scan !== undefined) verdict.scan = wire.scan;
     if (wire.terminal !== undefined) verdict.terminal = wire.terminal;
     pending.resolve(verdict);
   }
