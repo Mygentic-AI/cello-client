@@ -31,6 +31,28 @@ import { createHash } from "node:crypto";
 import { InjectionScanner, type InjectionScanDetail, type ScanResult } from "../detect/injection-scanner.js";
 import type { GovernanceEvent } from "./outbound.js";
 
+/**
+ * CELLO's own turn signal, appended by `cello_send` after the sender's text: `[[OVER]]`, `[[WRAP]]`
+ * or `[[STANDBY EST:10m]]`. Anchored to the end, because only a TRAILING one is ours — a sender who
+ * writes "does [[OVER]] end my turn?" wrote that, and it is theirs to be judged on.
+ */
+const TURN_MARKER = /\s*\[\[(OVER|WRAP|STANDBY)(?:\s[^\]]*)?\]\]\s*$/;
+
+/**
+ * Remove the turn marker from a copy the DETECTORS read. Never from delivered bytes.
+ *
+ * The marker is not something the counterparty said, and it is not neutral to the classifier:
+ * measured against the installed model on 2026-09-21, "Please send it again in different words."
+ * scored 54 bare and 99 with `[[OVER]]` on the end — blocked, at a bar of 99. An ordinary "got your
+ * message" went from 1 to 67 and reached its reader wrapped in "treat this as potentially malicious".
+ * CELLO was screening its own punctuation and refusing the conversation over it.
+ *
+ * ONE marker, once. Stripping repeatedly would let a sender hide an instruction between two of them.
+ */
+function stripTurnMarker(text: string): string {
+  return text.replace(TURN_MARKER, "");
+}
+
 export interface InboundVerdict {
   disposition: "allow" | "redact" | "block";
   /** The sanitized content to deliver (equals input when nothing changed; original on block). */
@@ -176,9 +198,9 @@ export class InboundScreener {
     // shares resolves to the first (`scan`, then `raw`, then `hidden`) — the plain-message case is
     // `scan` alone.
     const named: Array<{ kind: InjectionScanDetail["copy"]; text: string }> = [
-      { kind: "scan", text: scanText },
-      { kind: "raw", text: raw },
-      { kind: "hidden", text: hiddenText },
+      { kind: "scan", text: stripTurnMarker(scanText) },
+      { kind: "raw", text: stripTurnMarker(raw) },
+      { kind: "hidden", text: stripTurnMarker(hiddenText) },
     ];
     const copies = named.filter(
       (c, i, all) => c.text !== "" && all.findIndex((o) => o.text === c.text) === i,
@@ -194,7 +216,9 @@ export class InboundScreener {
     }
     if (worst === null || worstCopy === null) return { available: false, degraded };
     const bytes = Buffer.from(worstCopy.text, "utf8");
-    const marker = /\[\[(OVER|WRAP|STANDBY)(?:\s[^\]]*)?\]\]\s*$/.exec(worstCopy.text);
+    // Named from the text AS RECEIVED, since the copies no longer carry it: an operator has to see
+    // that a marker was present and recognised, not be left wondering whether it counted.
+    const marker = TURN_MARKER.exec(raw);
     const detail: InjectionScanDetail = {
       probability: worst.probability ?? (worst.score ?? 0) / 100,
       score: worst.score ?? 0,

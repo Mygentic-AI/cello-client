@@ -66,15 +66,16 @@ describe("verdict.scan — the live score and where it came from", () => {
     expect(v.scan!.verdict).toBe("block");
   });
 
-  it("hashes and measures EXACTLY the text the model read — the sender's words plus the marker", async () => {
+  it("hashes and measures EXACTLY the text the model read — which is not what arrived on the wire", async () => {
     const clf = recording(() => 0.5);
     const sent = "Miss_Chelly here: got your message. [[OVER]]";
     const v = await new InboundScreener({ injectionScanner: new InjectionScanner(clf) }).screen(enc(sent));
     expect(clf.seen).toHaveLength(1);
     expect(v.scan!.copySha256).toBe(sha(clf.seen[0]!));
     expect(v.scan!.copyBytes).toBe(Buffer.byteLength(clf.seen[0]!, "utf8"));
-    // The whole point: 44 bytes scored, not the 35 the sender wrote.
-    expect(v.scan!.copyBytes).toBe(44);
+    // The whole point: the provenance describes the SCORED text, not the 44 bytes received — here
+    // the 35 the sender wrote, after `scan-marker-strip` removes CELLO's own turn marker.
+    expect(v.scan!.copyBytes).toBe(35);
   });
 
   it("names the turn marker when the scored text carries one, and null when it does not", async () => {
@@ -133,8 +134,8 @@ describe("verdict.scan — the live score and where it came from", () => {
       expect(v.scan).toBeDefined();
       expect(v.scan!.probability).toBeCloseTo(0.6724, 6);
       expect(v.scan!.score).toBe(67);
-      expect(v.scan!.copyBytes).toBe(44);
-      expect(v.scan!.signalMarker).toBe("OVER");
+      expect(v.scan!.copyBytes).toBe(35); // the scored text: the marker is stripped before scoring
+      expect(v.scan!.signalMarker).toBe("OVER"); // …but still NAMED, so its presence is visible
     } finally {
       await client.close();
       await server.stop();
