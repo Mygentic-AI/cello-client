@@ -53,6 +53,36 @@ function stripTurnMarker(text: string): string {
   return text.replace(TURN_MARKER, "");
 }
 
+/**
+ * CELLO's own redaction placeholder, written by OUTBOUND governance in place of a secret or a PII
+ * value: `[REDACTED:pii:email]`, `[REDACTED:aws_key]`. The rule id inside is `[\w:.-]+`, matching
+ * what `secrets.ts` and `outbound.ts` produce, so an arbitrary bracketed phrase the SENDER wrote is
+ * not touched — that is their text and it is theirs to be judged on.
+ */
+const REDACTION_PLACEHOLDER = /\[REDACTED:[\w:.-]+\]/g;
+
+/**
+ * Neutralise the redaction placeholder in a copy the DETECTORS read. Never in delivered bytes.
+ *
+ * The second instance of the same defect as the turn marker, and worse in its consequences: CELLO
+ * refused its own redaction. Measured against the installed model on 2026-09-21, "reach me at
+ * stranger@other.example" scores 20 and is delivered, while the redacted form CELLO itself produced
+ * scores 99 and is REFUSED — so redacting an email or a phone number made the message vanish, with
+ * outbound reporting it sent and the counterparty never seeing it.
+ *
+ * The replacement is a BARE WORD, because the brackets are what the model reacts to: `[redacted]`
+ * still scores 94, `redacted` scores 2. Lowercase and unbracketed is the whole point — swapping the
+ * wording inside the brackets would fix nothing.
+ */
+function neutralizeRedactionPlaceholders(text: string): string {
+  return text.replace(REDACTION_PLACEHOLDER, "redacted");
+}
+
+/** Both of CELLO's own insertions, removed from a detection copy in one step. */
+function stripOwnMarkup(text: string): string {
+  return neutralizeRedactionPlaceholders(stripTurnMarker(text));
+}
+
 export interface InboundVerdict {
   disposition: "allow" | "redact" | "block";
   /** The sanitized content to deliver (equals input when nothing changed; original on block). */
@@ -198,9 +228,9 @@ export class InboundScreener {
     // shares resolves to the first (`scan`, then `raw`, then `hidden`) — the plain-message case is
     // `scan` alone.
     const named: Array<{ kind: InjectionScanDetail["copy"]; text: string }> = [
-      { kind: "scan", text: stripTurnMarker(scanText) },
-      { kind: "raw", text: stripTurnMarker(raw) },
-      { kind: "hidden", text: stripTurnMarker(hiddenText) },
+      { kind: "scan", text: stripOwnMarkup(scanText) },
+      { kind: "raw", text: stripOwnMarkup(raw) },
+      { kind: "hidden", text: stripOwnMarkup(hiddenText) },
     ];
     const copies = named.filter(
       (c, i, all) => c.text !== "" && all.findIndex((o) => o.text === c.text) === i,
