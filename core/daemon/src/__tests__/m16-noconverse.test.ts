@@ -424,7 +424,7 @@ describe("M16 006-NOCONVERSE: a real daemon refuses an inbound session to its ch
         initiatorSessionPeerId: "12D3KooWInitiator",
         counterpartySessionPeerId: "12D3KooWReceiver",
       });
-      inbound(frame);
+      inbound!(frame);
     };
     await push("chan", 7);
     await push("bob", 8);
