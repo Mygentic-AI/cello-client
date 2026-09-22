@@ -45,6 +45,11 @@ function makeStubStore() {
     setSetting: vi.fn(),
     // Returns true = "a row was removed", the shape the handler reports as `cleared`.
     deleteSetting: vi.fn().mockReturnValue(true),
+    // DOD-M15-NOTACCEPTING-1: shutting a tier is one transaction over three keys, so the handler
+    // calls the store rather than writing them itself — and it asks whether a tier is shut before
+    // letting a limit be set on it.
+    setTierNotAccepting: vi.fn(),
+    isTierNotAccepting: vi.fn(() => false),
     setTelegramSettings: vi.fn(),
   };
 }

@@ -41,6 +41,8 @@ import { SessionNodeManager, type ISessionNodeFactory, type SessionNodeConfig } 
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Logger } from "../types.js";
 import type { DaemonDatabase } from "../sqlcipher-db.js";
+import { registerContactHandlers } from "../contact-handlers.js";
+import type { IpcHandler } from "../ipc-server.js";
 
 const silent: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 
@@ -254,5 +256,103 @@ describe("DOD-M15-NOTACCEPTING-1 — D10, the knock record", () => {
     } finally {
       await again.stop?.();
     }
+  });
+});
+
+describe("DOD-M15-NOTACCEPTING-1 — what the handler does with it", () => {
+  let tempDir: string;
+  let mgr: SessionNodeManager;
+  let call: (name: string, params?: Record<string, unknown>) => Promise<Record<string, unknown>>;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "dod-notacc-h-"));
+    const dbPath = join(tempDir, "sessions.db");
+    const seed = openTestDb(dbPath);
+    await seedAgents(seed, ["alice"]);
+    seed.close();
+    mgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: silent, dbPath });
+    await mgr.initialize();
+    // The REAL store, not a stub: the property under test is that one command leaves a CONSISTENT
+    // tier, and a stub that records calls cannot show three keys landing together.
+    const handlers = new Map<string, IpcHandler>();
+    registerContactHandlers({
+      handlers,
+      sessionNodeManager: mgr,
+      getConnState: () => ({ currentAgent: "alice" }),
+      resolveCurrentAgent: (cs, explicit) => explicit ?? cs?.currentAgent ?? null,
+      agents: [{ name: "alice", state: "online" as const }],
+      setAgentMoniker: () => true,
+      logger: silent,
+      startTelegramPollerIfConfigured: () => {},
+    } as unknown as Parameters<typeof registerContactHandlers>[0]);
+    call = (name, params) => handlers.get(name)!(params, "conn-1") as Promise<Record<string, unknown>>;
+  });
+  afterEach(async () => {
+    await mgr.stop?.();
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it("★ a 0 typed at the tool is refused, and the refusal tells the operator what to type instead", async () => {
+    const res = await call("cello_settings_set", { key: boundSettingKey("unknown", "max_sessions"), value: "0" });
+    expect(res["ok"]).toBe(false);
+    expect(res["reason"]).toBe("invalid_value");
+    expect(String(res["guidance"])).toContain("bounds.unknown.not_accepting");
+    // And it changed nothing — a refusal that half-applied would be the worst of both.
+    expect(mgr.resolveTierBound("alice", TIER.UNKNOWN, "max_sessions")).toBe(DEFAULT_TIER_BOUNDS[TIER.UNKNOWN].maxSessionsPerSender);
+  });
+
+  it("★ ONE command shuts the tier — all three keys land, so a half-shut tier cannot be produced", async () => {
+    const res = await call("cello_settings_set", { key: notAcceptingSettingKey("unknown"), value: "true" });
+    expect(res["ok"]).toBe(true);
+    expect(mgr.resolveTierBound("alice", TIER.UNKNOWN, "max_sessions")).toBe(0);
+    expect(mgr.resolveTierBound("alice", TIER.UNKNOWN, "max_bytes")).toBe(0);
+    expect(mgr.isTierNotAccepting("alice", TIER.UNKNOWN)).toBe(true);
+    // The response tells the operator what callers will now hear — the control is not silent about
+    // what it did on their behalf.
+    expect(String(res["guidance"])).toContain("not accepting connections");
+  });
+
+  it("★ D2c: a number cannot re-open a shut tier — it is refused, naming the gesture that does", async () => {
+    await call("cello_settings_set", { key: notAcceptingSettingKey("known"), value: "true" });
+    const res = await call("cello_settings_set", { key: boundSettingKey("known", "max_sessions"), value: "5" });
+    expect(res["ok"], "a limit on a shut tier would read as re-opening it").toBe(false);
+    expect(res["reason"]).toBe("tier_not_accepting");
+    expect(String(res["guidance"])).toContain("not_accepting");
+    // The tier is still shut. A refusal that left the mark cleared would be the drift D2c prevents.
+    expect(mgr.isTierNotAccepting("alice", TIER.KNOWN)).toBe(true);
+    expect(mgr.resolveTierBound("alice", TIER.KNOWN, "max_sessions")).toBe(0);
+  });
+
+  it("★ re-opening takes a number in the same gesture, or the built-in default without one", async () => {
+    await call("cello_settings_set", { key: notAcceptingSettingKey("known"), value: "true" });
+    const withNumber = await call("cello_settings_set", { key: notAcceptingSettingKey("known"), value: "false", max_sessions: 9 });
+    expect(withNumber["ok"]).toBe(true);
+    expect(mgr.resolveTierBound("alice", TIER.KNOWN, "max_sessions")).toBe(9);
+
+    await call("cello_settings_set", { key: notAcceptingSettingKey("known"), value: "true" });
+    await call("cello_settings_set", { key: notAcceptingSettingKey("known"), value: "false" });
+    expect(mgr.resolveTierBound("alice", TIER.KNOWN, "max_sessions")).toBe(DEFAULT_TIER_BOUNDS[TIER.KNOWN].maxSessionsPerSender);
+
+    // A 0 offered as the re-open number is refused rather than re-shutting the tier inside the
+    // command that re-opens it.
+    await call("cello_settings_set", { key: notAcceptingSettingKey("known"), value: "true" });
+    const zero = await call("cello_settings_set", { key: notAcceptingSettingKey("known"), value: "false", max_sessions: 0 });
+    expect(zero["ok"]).toBe(false);
+    expect(mgr.isTierNotAccepting("alice", TIER.KNOWN), "a refused re-open leaves the tier shut").toBe(true);
+  });
+
+  it("★ CLEARING the mark re-opens the tier — it does not leave the two zeros behind", async () => {
+    /**
+     * The failure this pins: a plain delete of the mark row would report the setting cleared, show
+     * nothing set for the tier on the next `settings get`, and still refuse every caller — from two
+     * rows the operator never typed and can no longer see the cause of.
+     */
+    await call("cello_settings_set", { key: notAcceptingSettingKey("vip"), value: "true" });
+    const res = await call("cello_settings_set", { key: notAcceptingSettingKey("vip"), value: null });
+    expect(res["ok"]).toBe(true);
+    expect(res["cleared"]).toBe(true);
+    expect(mgr.isTierNotAccepting("alice", TIER.VIP)).toBe(false);
+    expect(mgr.resolveTierBound("alice", TIER.VIP, "max_sessions")).toBe(DEFAULT_TIER_BOUNDS[TIER.VIP].maxSessionsPerSender);
+    expect(mgr.resolveTierBound("alice", TIER.VIP, "max_bytes")).toBe(DEFAULT_TIER_BOUNDS[TIER.VIP].maxBytesPerSession);
   });
 });

@@ -642,6 +642,50 @@ describe("M8C-AWAY-1: away response", () => {
     expect(JSON.stringify(refusals[2]!)).not.toContain("max_sessions_per_sender");
   });
 
+  it("★ DoD 9: a repeat knock does no repeat WORK — one row, a counter, and no session machinery", async () => {
+    /**
+     * The reason says retrying will not help, so it must not itself feed a loop. The shape being
+     * ruled out is the one measured live on 2026-09-04: a refusal re-fetched twice a second for 62
+     * hours, 232,056 events and a 484 MB log, because each refusal scheduled the work that produced
+     * the next one.
+     *
+     * A session-request refusal cannot do that — it returns before any session, node, leaf fetch or
+     * park drain exists — and this asserts it rather than reasoning about it: five knocks produce
+     * five refusals and NO session-creation or leaf-fetch work, and the operator's durable record
+     * stays one row whose counter moves.
+     */
+    const { logger, events } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const sent: Array<Record<string, unknown>> = [];
+    const h = await start(logger, new FakeNode(), makeInjectableSignaling(injectRef, sent));
+    await wait(50);
+    const snm = h.getSessionNodeManager();
+    await snm.ensureStandingReceiverForAgent("bob");
+    snm.setTierNotAccepting("bob", "unknown", true);
+    const caller = fixtureIdentity().pubkeyHex;
+
+    const before = events.length;
+    for (let i = 0; i < 5; i++) {
+      const sid = Uint8Array.from(Array.from({ length: 16 }, (_, j) => (notAcceptingSid + j) & 0xff));
+      notAcceptingSid += 0x10;
+      injectRef.inject!(await assignmentFrame(caller, bobPubkey, sid));
+      await wait(120);
+    }
+
+    expect(sent.filter((f) => f["type"] === "session_refused"), "each knock is answered once, and only once").toHaveLength(5);
+    const after = events.slice(before).map((e) => e.event);
+    // Nothing that would come back around: no session accepted, no node built for them, no leaf
+    // fetch scheduled, no park drain kicked.
+    for (const forbidden of ["session.inbound.accepted", "session.leaf.fetch.scheduled", "session.content.fetch.requested"]) {
+      expect(after.filter((e) => e === forbidden), `${forbidden} after a refusal is repeat work`).toEqual([]);
+    }
+    // One caller, one row — the counter is what grows.
+    const knocks = snm.listKnocks("bob");
+    expect(knocks).toHaveLength(1);
+    expect(knocks[0]!.times).toBe(5);
+  });
+
   it("★ DoD 8/8a: the operator keeps their record — the refusal AND who knocked, by key", async () => {
     const { events, snm, caller } = await driveNotAcceptingRefusal((s) => {
       s.setTierNotAccepting("bob", "unknown", true);
