@@ -95,7 +95,16 @@ function inboundHarness(opts: { tier?: number } = {}) {
     events.push({ event, context: context ?? {} });
   };
   const logger: Logger = { debug: push(), info: push(), warn: push(), error: push() };
-  let inbound: ((frame: Record<string, unknown>) => void) | null = null;
+  /**
+   * ⚠️ EVERY HANDLER, NOT THE LAST ONE. The production wiring registers several handlers on one
+   * stream (seal-interrupted, session_assignment, session_refused), and a stub holding a single
+   * slot silently keeps whichever registered LAST — so injecting an assignment reached nothing the
+   * moment a third handler was added, and every test here failed for a reason that had nothing to
+   * do with what it was testing. The real manager fans out; so does this.
+   */
+  const inboundHandlers: Array<(frame: Record<string, unknown>) => void> = [];
+  const inbound = (frame: Record<string, unknown>): void => { for (const h of [...inboundHandlers]) h(frame); };
+
   const durable: Array<{ agent: string; session: string; reason: string }> = [];
   /** Re-closing the receiver gate to the offered dialer — half of what `refuseInboundSession` does. */
   const revoked: Array<{ agent: string; session: string; dialer: string | null }> = [];
@@ -145,8 +154,8 @@ function inboundHarness(opts: { tier?: number } = {}) {
       name === ALICE && counterpartyHex.toLowerCase() === COUNTERPARTY.toLowerCase() && aliceSubscribes,
     sharedSignaling: {
       registerInboundHandler(h: (frame: Record<string, unknown>) => void) {
-        inbound = h;
-        return () => {};
+        inboundHandlers.push(h);
+        return () => { const i = inboundHandlers.indexOf(h); if (i >= 0) inboundHandlers.splice(i, 1); };
       },
     },
     sendOver: async (_agent: string, frame: Record<string, unknown>) => {
@@ -187,7 +196,7 @@ function inboundHarness(opts: { tier?: number } = {}) {
       sig[0] ^= 0x01;
       assignment.directory_signature = sig;
     }
-    inbound?.(frame);
+    inbound(frame);
   }
 
   return {
@@ -415,7 +424,7 @@ describe("M16 006-NOCONVERSE: a real daemon refuses an inbound session to its ch
         initiatorSessionPeerId: "12D3KooWInitiator",
         counterpartySessionPeerId: "12D3KooWReceiver",
       });
-      inbound?.(frame);
+      inbound(frame);
     };
     await push("chan", 7);
     await push("bob", 8);

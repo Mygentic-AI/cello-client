@@ -73,7 +73,16 @@ function harness(opts: {
   tier?: number;
 }) {
   const { logger, events } = makeLogger();
-  let inbound: ((frame: Record<string, unknown>) => void) | null = null;
+  /**
+   * ⚠️ EVERY HANDLER, NOT THE LAST ONE. The production wiring registers several handlers on one
+   * stream (seal-interrupted, session_assignment, session_refused), and a stub holding a single
+   * slot silently keeps whichever registered LAST — so injecting an assignment reached nothing the
+   * moment a third handler was added, and every test here failed for a reason that had nothing to
+   * do with what it was testing. The real manager fans out; so does this.
+   */
+  const inboundHandlers: Array<(frame: Record<string, unknown>) => void> = [];
+  const inbound = (frame: Record<string, unknown>): void => { for (const h of [...inboundHandlers]) h(frame); };
+
   const revoked: Array<{ agent: string; session: string }> = [];
   const accepted: string[] = [];
   /** The DURABLE refusal rows — what stops parked content re-pulling forever across a restart. */
@@ -129,8 +138,8 @@ function harness(opts: {
     agents: [{ name: AGENT, pubkey: AGENT_PUBKEY }],
     sharedSignaling: {
       registerInboundHandler(h: (frame: Record<string, unknown>) => void) {
-        inbound = h;
-        return () => {};
+        inboundHandlers.push(h);
+        return () => { const i = inboundHandlers.indexOf(h); if (i >= 0) inboundHandlers.splice(i, 1); };
       },
     },
     sendOver: async (_agent: string, frame: Record<string, unknown>) => {
@@ -178,12 +187,12 @@ function harness(opts: {
       initiatorSessionPeerId: assignedDialer,
       signWith: signer,
     });
-    inbound?.(frame);
+    inbound(frame);
   };
 
   return {
     inject,
-    injectRaw: (f: Record<string, unknown>) => inbound?.(f),
+    injectRaw: (f: Record<string, unknown>) => inbound(f),
     events,
     revoked,
     accepted,
