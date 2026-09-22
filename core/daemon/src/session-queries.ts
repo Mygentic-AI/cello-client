@@ -825,10 +825,20 @@ export class SessionQueries {
    */
   agentNameForSession(sessionId: string): string | null {
     if (!this.#db) return null;
+    /**
+     * TWO READS, NOT A JOIN — `DOD-AGENT-ID-JOINKEY-1`.
+     *
+     * The first finds the owner's STABLE key from the session's own id; the second is
+     * `agentNameForId` below, which is the sanctioned name lookup and the only place the display
+     * label is a key at all, on its own row. A single joined statement would put `agent_name` on a
+     * line that also names `sessions`, and that line reads as scoping a session table on a mutable
+     * label whether or not it is — which is exactly the shape the guard exists to keep out of this
+     * file. Two plain reads say what they do.
+     */
     const row = this.#db
-      .prepare("SELECT a.agent_name AS agent_name FROM sessions s JOIN agents a ON a.agent_id = s.agent_id WHERE s.session_id = ?")
-      .get(sessionId) as { agent_name: string } | undefined;
-    return row?.agent_name ?? null;
+      .prepare("SELECT agent_id FROM sessions WHERE session_id = ?")
+      .get(sessionId) as { agent_id: string } | undefined;
+    return row ? this.agentNameForId(row.agent_id) : null;
   }
   agentNameForId(agentId: string): string | null {
     if (!this.#db) return null;

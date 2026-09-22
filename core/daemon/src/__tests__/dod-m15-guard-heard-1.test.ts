@@ -97,6 +97,9 @@ async function inboxFor(
     // DOD-M15-NOTACCEPTING-1: the inbox now also lists WHO was turned away by a shut tier.
     // Empty here — this stub's agent has shut nothing, and the door must stay quiet for it.
     listKnocks: () => [],
+    // The knock notice names a tier that is actually ACCEPTING, so the door asks. Nothing is
+    // shut for this stub's agent.
+    isTierNotAccepting: () => false,
     // DOD-M15-NO-SILENT-REFUSAL-1: the inbox reads refusal notices too. Empty here — this fake
     // exists to isolate a DIFFERENT section, and a fake that omits the method makes the whole
     // handler throw rather than the section it is testing fail.
