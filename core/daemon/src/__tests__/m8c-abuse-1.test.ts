@@ -294,8 +294,18 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     injectRef.inject!(frame);
     await wait(150);
 
-    // Refused with the SAME reason an over-cap unknown gets — no distinguishing oracle (DOD-TIER-3 AC1).
-    expect(events.find((e) => e.event === "session.inbound.accept.failed" && e.context.reason === "abuse_bound_sessions_per_sender")).toBeDefined();
+    /**
+     * ⚠️ REWRITTEN BY `DOD-M15-NOTACCEPTING-1`, AND THE ORACLE PROPERTY IS UNCHANGED — IT MOVED.
+     *
+     * This line used to require the OPERATOR'S OWN LOG to name a blocked sender with the over-cap
+     * code, on the argument that the two must be indistinguishable. They must be indistinguishable
+     * TO THE CALLER, and this log line never left the operator's machine: what it bought was the
+     * operator being told "cap reached" about a cap of 0 they had declared, and sent looking for
+     * sessions to close that do not exist. The refusal the CALLER receives is now asserted
+     * byte-for-byte across blocked, a shut tier and a KNOWN sender in `m8c-away-1.test.ts`, which is
+     * where the property belongs.
+     */
+    expect(events.find((e) => e.event === "session.inbound.accept.failed" && e.context.reason === "not_accepting_connections")).toBeDefined();
     // AC2: nothing created — no session node, no accept, no away reply, no Telegram doorbell. This is
     // the direct test for the reviewer's bypass (moving any of these ABOVE the bound check).
     expect(events.find((e) => e.event === "session.inbound.accepted")).toBeUndefined();

@@ -1499,7 +1499,8 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "  ('true' shuts that tier, 'false' re-opens it), away.default, away.tier.<tier> (away text).\n" +
       "  To SHUT a tier use not_accepting rather than a 0 limit: it sets both of that tier's bounds to 0 in one\n" +
       "  step, and every caller it refuses is told the agent is not accepting connections instead of being left\n" +
-      "  to time out. A named contact is never closed off by a shut tier. Callers turned away are listed, with\n" +
+      "  to time out. Shutting one tier leaves the others alone, so a contact you have raised to a tier that is\n" +
+      "  still accepting keeps getting through. Callers turned away are listed, with\n" +
       "  how many times, under `knocks` in cello inbox.\n" +
       "  An unset key uses the built-in default. Example:  cello settings set bounds.known.max_sessions 8 --agent alice\n" +
       "                                                    cello settings set bounds.unknown.not_accepting true\n" +

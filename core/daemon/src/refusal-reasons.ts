@@ -294,11 +294,11 @@ export const REFUSAL_GUIDANCE: Record<RefusalReason, string> = {
    * want — letting this specific person through — needs it.
    */
   [REFUSAL_REASONS.NOT_ACCEPTING_CONNECTIONS]:
-    "You turned this caller away, because the trust tier they fall in is set to not accept " +
+    "This caller was refused on purpose, by you: the trust tier they fall in is set to not accept " +
     "connections (or they are blocked). Nothing is broken and there is no cap to clear. They were " +
     "told the agent is not accepting connections and that retrying will not help, so they are not " +
     "sitting waiting. If you want this one person through, raise them with cello_contact_set_tier " +
-    "to a tier that is accepting — a named contact is not closed off by a shut tier. See " +
+    "to a tier you have left accepting — shutting one tier leaves the others alone. See " +
     "`knocks` in cello_inbox for who has been turned away, how often, and since when.",
 
   /**

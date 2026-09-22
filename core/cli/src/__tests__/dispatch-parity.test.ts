@@ -190,7 +190,12 @@ describe("T2: the registry forwards EXACTLY what the old switch forwarded", () =
     await run("settings", ["get"]); // key omitted → list all
     expect(parity.settingsGet).toHaveBeenLastCalledWith(CELLO_DIR, undefined, { agent: undefined, pretty: false });
     await run("settings", ["set", "bounds.known.max_sessions", "8"]);
-    expect(parity.settingsSet).toHaveBeenCalledWith(CELLO_DIR, "bounds.known.max_sessions", "8", { agent: undefined, pretty: false });
+    // DOD-M15-NOTACCEPTING-1 added a 5th argument: the optional limit a tier is RE-OPENED at.
+    // Absent here, and asserted as absent rather than ignored — a test that stopped checking the
+    // argument list would stop noticing an argument being forwarded that the operator never typed.
+    expect(parity.settingsSet).toHaveBeenCalledWith(CELLO_DIR, "bounds.known.max_sessions", "8", { agent: undefined, pretty: false }, undefined);
+    await run("settings", ["set", "bounds.known.not_accepting", "false", "4"]);
+    expect(parity.settingsSet).toHaveBeenLastCalledWith(CELLO_DIR, "bounds.known.not_accepting", "false", { agent: undefined, pretty: false }, 4);
 
     await run("moniker", ["set", "Bob", "--agent", "alice"]);
     expect(parity.monikerSet).toHaveBeenCalledWith(CELLO_DIR, "Bob", { agent: "alice", pretty: false });

@@ -426,8 +426,8 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
         first_knocked_at: k.first_refused_at,
         last_knocked_at: k.last_refused_at,
         reason: k.last_reason,
-        // The one action the operator may want, ready to paste. A shut tier closes a CATEGORY; it
-        // never closes a door opened for a named contact, so raising this one person is enough.
+        // The one action the operator may want, ready to paste. Shutting one tier leaves the others
+        // alone, so raising this one person into a tier still accepting is enough to let them in.
         notice:
           `Turned away ${k.times} time(s), most recently ${new Date(k.last_refused_at).toISOString()}. ` +
           `They were told this agent is not accepting connections. To let this one person through: ` +
