@@ -64,10 +64,14 @@ class FixedFactory implements ISessionNodeFactory {
 /** Injectable signaling stub — the directory's push channel (mirrors seam-2-inbound-session.test.ts). */
 function makeInjectableSignaling(
   injectRef: { inject?: (frame: unknown) => void },
+  // DOD-M15-NOTACCEPTING-1: the frames this daemon SENDS. `sendRaw` hands the object to
+  // `stream.send` untouched, so this is the wire, not a paraphrase of it — which is what lets the
+  // byte-identity test below compare what two different callers actually receive.
+  sent?: Array<Record<string, unknown>>,
 ): () => Promise<ConnectResult> {
   let inbound: ((frame: unknown) => void) | null = null;
   const stream: SignalingStream = {
-    send: async () => {},
+    send: async (frame: unknown) => { sent?.push(frame as Record<string, unknown>); },
     onMessage: (h: (frame: unknown) => void) => { inbound = h; },
     close: () => {},
   };
@@ -534,9 +538,122 @@ describe("M8C-AWAY-1: away response", () => {
 
   it("M12-P18: an UNKNOWN sender over the cap is SILENT — no block/throttle oracle", async () => {
     // UNKNOWN cap is 3; three pre-seeded puts the fourth over, and no contact row keeps it UNKNOWN.
+    //
+    // ⚠️ STILL CORRECT AFTER DOD-M15-NOTACCEPTING-1, and deliberately left alone. That unit made a
+    // SHUT tier answer every caller; this tier is not shut, it is FULL — a state that clears on its
+    // own — so the oracle argument still holds here and the silence is still the behaviour.
     const events = await driveOverCapRefusal(TIER.UNKNOWN, 3);
     expect(events.find((e) => e.event === "session.inbound.accept.failed" && e.context.reason === "abuse_bound_sessions_per_sender")).toBeDefined();
     expect(events.find((e) => e.event === "session.inbound.refusal.notified"), "a stranger is NEVER told").toBeUndefined();
     expect(events.find((e) => e.event === "session.inbound.refusal.silent")).toBeDefined();
+  });
+
+  // ─── DOD-M15-NOTACCEPTING-1: a SHUT tier answers every caller, in the same words ───────────────
+  //
+  // What the caller lived with before: nothing came back, their own daemon waited 30 seconds and
+  // reported `timeout` — "the directory did not return a session assignment; retry once cello
+  // status shows directory_signaling connected". Wrong machine, and a retry that could never work.
+  let notAcceptingSid = 0x40;
+  /**
+   * ONE daemon, one caller, one posture. A restart is deliberately NOT used to vary the posture:
+   * stopping the daemon takes its agents offline, so the next boot drops the injected assignment as
+   * `session.inbound.not_local` and the drive returns no frames at all — a comparison over empty
+   * lists, which would have passed the moment the expectation was loosened.
+   */
+  async function driveNotAcceptingRefusal(setup: (snm: ReturnType<Awaited<ReturnType<typeof startDaemon>>["getSessionNodeManager"]>, callerPubkey: string) => void) {
+    const { logger, events } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const sent: Array<Record<string, unknown>> = [];
+    const h = await start(logger, new FakeNode(), makeInjectableSignaling(injectRef, sent));
+    await wait(50);
+    const snm = h.getSessionNodeManager();
+    await snm.ensureStandingReceiverForAgent("bob");
+    const caller = fixtureIdentity().pubkeyHex;
+    setup(snm, caller);
+    injectRef.inject!(await assignmentFrame(caller, bobPubkey));
+    await wait(200);
+    return { events, refusals: sent.filter((f) => f["type"] === "session_refused"), snm, caller };
+  }
+
+  it("★ DoD 4: a BLOCKED caller is TOLD — one sentence, and it says retrying will not help", async () => {
+    const { refusals, events } = await driveNotAcceptingRefusal((snm, caller) => {
+      snm.addContact("bob", caller, undefined, null, TIER.BLOCKED);
+    });
+    expect(refusals, "silence is what made the caller's daemon blame the directory").toHaveLength(1);
+    expect(refusals[0]!["reason"]).toBe("not_accepting_connections");
+    // The exact sentence, not a shape: this is the text a stranger reads about the operator.
+    expect(refusals[0]!["guidance"]).toBe("This agent is not accepting connections. Retrying will not change this.");
+    // It must carry NOTHING that separates one shut posture from another.
+    expect(Object.keys(refusals[0]!).sort()).toEqual(["guidance", "initiatorPubkey", "reason", "sessionId", "type"]);
+    expect(events.find((e) => e.event === "session.inbound.refusal.silent"), "a shut door no longer answers with silence").toBeUndefined();
+  });
+
+  it("★ DoD 5: the refusal is BYTE-IDENTICAL across every cause — blocked, a marked tier, a KNOWN sender", async () => {
+    /**
+     * The oracle property, asserted rather than asserted-about. Three postures on ONE agent, three
+     * different callers; if any produced its own wording, two callers comparing notes could work
+     * out their standing with the operator.
+     */
+    const { logger } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const sent: Array<Record<string, unknown>> = [];
+    const h = await start(logger, new FakeNode(), makeInjectableSignaling(injectRef, sent));
+    await wait(50);
+    const snm = h.getSessionNodeManager();
+    await snm.ensureStandingReceiverForAgent("bob");
+
+    const blockedCaller = fixtureIdentity().pubkeyHex;
+    snm.addContact("bob", blockedCaller, undefined, null, TIER.BLOCKED);
+    const strangerCaller = fixtureIdentity().pubkeyHex; // no contact row → UNKNOWN
+    snm.setTierNotAccepting("bob", "unknown", true);
+    const knownCaller = fixtureIdentity().pubkeyHex;
+    snm.addContact("bob", knownCaller, undefined, null, TIER.KNOWN);
+    snm.setTierNotAccepting("bob", "known", true);
+    // The postures really are the ones named — a shut `unknown` tier would otherwise refuse all
+    // three and the test would compare one posture with itself, three times.
+    expect(snm.getTier("bob", blockedCaller)).toBe(TIER.BLOCKED);
+    expect(snm.getTier("bob", strangerCaller)).toBe(TIER.UNKNOWN);
+    expect(snm.getTier("bob", knownCaller)).toBe(TIER.KNOWN);
+
+    /**
+     * ⚠️ A FRESH SESSION ID PER KNOCK. `assignmentFrame` defaults to one fixed id and a refused
+     * session is recorded DURABLY, so a second offer on the same id is declined by that memory
+     * before the tier is ever consulted — and the drive would produce no frame at all.
+     */
+    for (const caller of [blockedCaller, strangerCaller, knownCaller]) {
+      const sid = Uint8Array.from(Array.from({ length: 16 }, (_, i) => (notAcceptingSid + i) & 0xff));
+      notAcceptingSid += 0x10;
+      injectRef.inject!(await assignmentFrame(caller, bobPubkey, sid));
+      await wait(200);
+    }
+
+    const refusals = sent.filter((f) => f["type"] === "session_refused");
+    expect(refusals, "every one of the three is answered").toHaveLength(3);
+    const strip = (f: Record<string, unknown>): Record<string, unknown> => {
+      const { sessionId: _s, initiatorPubkey: _i, ...rest } = f;
+      return rest;
+    };
+    expect(strip(refusals[1]!), "a shut tier reads exactly like a block").toEqual(strip(refusals[0]!));
+    expect(strip(refusals[2]!), "and so does a shut tier a trusted contact falls in").toEqual(strip(refusals[0]!));
+    // D6: the KNOWN sender did NOT get the cap-quoting message, which would have told them they
+    // already hold 0 sessions and to close one.
+    expect(JSON.stringify(refusals[2]!)).not.toContain("max_sessions_per_sender");
+  });
+
+  it("★ DoD 8/8a: the operator keeps their record — the refusal AND who knocked, by key", async () => {
+    const { events, snm, caller } = await driveNotAcceptingRefusal((s) => {
+      s.setTierNotAccepting("bob", "unknown", true);
+    });
+    // The operator's own log names the posture, not a cap they should go and clear.
+    expect(events.find((e) => e.event === "session.inbound.accept.failed" && e.context.reason === "not_accepting_connections")).toBeDefined();
+    // ...and the cap ALARM does not fire: a zero the operator declared is not a limit to clear, and
+    // an ERROR telling them to close sessions would name sessions that do not exist.
+    expect(events.find((e) => e.event === "session.inbound.cap.reached")).toBeUndefined();
+    const knocks = snm.listKnocks("bob");
+    expect(knocks).toHaveLength(1);
+    expect(knocks[0]!.counterparty_pubkey).toBe(caller);
+    expect(knocks[0]!.last_reason).toBe("not_accepting_connections");
   });
 });
