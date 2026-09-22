@@ -333,7 +333,15 @@ export default [
     // threaded through the context anyway, at the same cost, with the two halves further apart.
     // Its own hook rather than a second job for the document one, because one callback doing two
     // unrelated jobs is how the second gets silently dropped when the first is rewired.
-    rules: { "max-lines": ["error", { max: 3418, skipBlankLines: false, skipComments: false }] },
+    //
+    // ⚠️ AND 3418 → 3430 FOR `DOD-M15-NOTACCEPTING-1`: four delegators (shut a tier, is it shut,
+    // record a turned-away caller, list them) plus the line at the acceptance gate that reads the
+    // operator's mark, with its note. The data and every word of reasoning live in
+    // `session-records.ts`, which is where they grew — what lands here is the public handle, because
+    // this manager IS the handle every consumer holds and the file has no records accessor. Adding
+    // one would be a wider change than the twelve characters it saves. Same bound as its
+    // neighbours; only ever shrinks.
+    rules: { "max-lines": ["error", { max: 3430, skipBlankLines: false, skipComments: false }] },
   },
   {
     // 040-DAEMONROOT, lowered every unit; the target is under 1,000 and this pin is what stops the

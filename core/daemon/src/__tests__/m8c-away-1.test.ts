@@ -631,10 +631,9 @@ describe("M8C-AWAY-1: away response", () => {
 
     const refusals = sent.filter((f) => f["type"] === "session_refused");
     expect(refusals, "every one of the three is answered").toHaveLength(3);
-    const strip = (f: Record<string, unknown>): Record<string, unknown> => {
-      const { sessionId: _s, initiatorPubkey: _i, ...rest } = f;
-      return rest;
-    };
+    // Everything EXCEPT the two fields that are per-caller by construction.
+    const strip = (f: Record<string, unknown>): Record<string, unknown> =>
+      Object.fromEntries(Object.entries(f).filter(([k]) => k !== "sessionId" && k !== "initiatorPubkey"));
     expect(strip(refusals[1]!), "a shut tier reads exactly like a block").toEqual(strip(refusals[0]!));
     expect(strip(refusals[2]!), "and so does a shut tier a trusted contact falls in").toEqual(strip(refusals[0]!));
     // D6: the KNOWN sender did NOT get the cap-quoting message, which would have told them they
