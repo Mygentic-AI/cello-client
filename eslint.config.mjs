@@ -341,7 +341,12 @@ export default [
     // this manager IS the handle every consumer holds and the file has no records accessor. Adding
     // one would be a wider change than the twelve characters it saves. Same bound as its
     // neighbours; only ever shrinks.
-    rules: { "max-lines": ["error", { max: 3430, skipBlankLines: false, skipComments: false }] },
+    //
+    // ⚠️ AND 3430 → 3433 (+3, same unit, caller's half): the three delegators the refusal path needs
+    // — record the counterparty's refusal, read it back on the next send or read, and find which
+    // local agent owns a session id. Same argument as the line above: the data and the reasoning are
+    // in `session-records.ts` and `session-queries.ts`; this file is the handle every consumer holds.
+    rules: { "max-lines": ["error", { max: 3433, skipBlankLines: false, skipComments: false }] },
   },
   {
     // 040-DAEMONROOT, lowered every unit; the target is under 1,000 and this pin is what stops the
