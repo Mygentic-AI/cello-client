@@ -224,6 +224,33 @@ export function ensureSessionSchema(
     )
   `);
 
+  /**
+   * `DOD-M15-NOTACCEPTING-1` D10 — WHO knocked and was turned away, so the operator can whitelist
+   * them or call them back.
+   *
+   * ⚠️ **KEYED ON THE CALLER, NOT ON THE SESSION, AND THAT IS THE ANTI-SPAM CONTROL.**
+   * `refused_sessions` above is keyed on session id and every knock carries a fresh
+   * directory-assigned one, so it writes one row per knock and prunes to the most recent N — which
+   * means a flooder does not merely fill it, **they evict every genuine caller from it**, and the
+   * list still looks complete afterwards. Here volume adds no rows: a thousand knocks from one key
+   * is one row with `times` at a thousand, and nobody can be pushed off by someone else's traffic.
+   * A row cap over the wrong key is a mute button with the operator's name on it.
+   *
+   * It carries nothing the CALLER chose — in particular not the name they offered for themselves,
+   * which a peer refused at the gate must not get to put in front of the operator.
+   */
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS refused_callers (
+      agent_id            TEXT NOT NULL,
+      counterparty_pubkey TEXT NOT NULL,
+      first_refused_at    INTEGER NOT NULL,
+      last_refused_at     INTEGER NOT NULL,
+      times               INTEGER NOT NULL,
+      last_reason         TEXT NOT NULL,
+      PRIMARY KEY (agent_id, counterparty_pubkey)
+    )
+  `);
+
   // M12-P17: the POST-SEAL ANNEX — verified content that arrived for a session which had already
   // ended. It cannot join the sealed chain (that would change `sealed_root` and invalidate the
   // notarization), and it must not be thrown away: it is a real message, provably sent to this

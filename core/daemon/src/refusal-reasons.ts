@@ -204,6 +204,17 @@ export const REFUSAL_REASONS = {
    * channel's pubkey and is trading on the trust the operator already has in it.
    */
   SESSION_FROM_SUBSCRIBED_CHANNEL: "session_from_subscribed_channel",
+  /**
+   * `DOD-M15-NOTACCEPTING-1` — the operator has SHUT the tier this caller falls in, or has blocked
+   * them. Not a capacity bound: nothing will free up, because nothing is full.
+   *
+   * ⚠️ IT IS NOT A CAPACITY REASON, AND THE SPLIT IS THE POINT. A zero cap the operator DECLARED
+   * reads back through the cap path as *"you already have 0 session(s) open with them… close one
+   * and try again"* — nonsense to the caller, and on the operator's own side it would appear as a
+   * cap to go and clear, sending them looking for sessions that do not exist. One posture, one
+   * code, said the same way to both.
+   */
+  NOT_ACCEPTING_CONNECTIONS: "not_accepting_connections",
 } as const;
 
 export type RefusalReason = (typeof REFUSAL_REASONS)[keyof typeof REFUSAL_REASONS];
@@ -260,7 +271,36 @@ export type AnyRefusalReason = RefusalReason | CapacityReason;
  * which is worse than no advice because they will try to follow it. The retry advice belongs in the
  * `session_refused` frame, which goes to the side that can act on it.
  */
+/**
+ * `DOD-M15-NOTACCEPTING-1` D5 — THE ONE SENTENCE EVERY TURNED-AWAY CALLER GETS.
+ *
+ * ⚠️ **ONE MESSAGE FOR EVERY CAUSE, AND THE SAMENESS IS THE SECURITY PROPERTY.** Blocked, a tier the
+ * operator shut, and whitelist-only all produce this and nothing else. It names no tier and no
+ * cause, so a caller cannot work out which posture was chosen — and two callers comparing what they
+ * received learn nothing about each other's standing. A per-tier custom text was considered on
+ * 2026-09-22 and DECLINED for exactly this reason (D9); it is revisited only if operators ask.
+ *
+ * ⚠️ AND IT SAYS RETRYING WILL NOT HELP, which is the half the old behaviour got backwards. Silence
+ * made the caller's own daemon report a 30-second `timeout` blaming the directory and advising a
+ * retry — an instruction that could never succeed, against a machine that was not at fault.
+ */
+export const NOT_ACCEPTING_CALLER_GUIDANCE =
+  "This agent is not accepting connections. Retrying will not change this.";
+
 export const REFUSAL_GUIDANCE: Record<RefusalReason, string> = {
+  /**
+   * The OPERATOR's half. The reader here is the person who shut the tier, so it must not read as a
+   * fault: it is the control working. It names the caller's key because the one action they may
+   * want — letting this specific person through — needs it.
+   */
+  [REFUSAL_REASONS.NOT_ACCEPTING_CONNECTIONS]:
+    "You turned this caller away, because the trust tier they fall in is set to not accept " +
+    "connections (or they are blocked). Nothing is broken and there is no cap to clear. They were " +
+    "told the agent is not accepting connections and that retrying will not help, so they are not " +
+    "sitting waiting. If you want this one person through, raise them with cello_contact_set_tier " +
+    "to a tier that is accepting — a named contact is not closed off by a shut tier. See " +
+    "`knocks` in cello_inbox for who has been turned away, how often, and since when.",
+
   /**
    * ⛔ THE REPORTING LINE IS OWED AND IS DELIBERATELY ABSENT — `CELLO_Reporting` DOES NOT EXIST YET.
    *

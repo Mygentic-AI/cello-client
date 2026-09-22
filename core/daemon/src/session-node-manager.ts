@@ -38,7 +38,7 @@ import { ensureIdentitySchema } from "./db-identity-store.js";
 import { TIER } from "./contacts-tier-migration.js";
 import { normalizeContactPubkey } from "./contact-pubkey-case.js";
 import { type RefusalKind } from "./refusal-reasons.js";
-import { settableTierName, awayTierSettingKey, AWAY_DEFAULT_KEY } from "./agent-settings-keys.js";
+import { settableTierName, awayTierSettingKey, AWAY_DEFAULT_KEY, type SettableTierName } from "./agent-settings-keys.js";
 import * as lp from "it-length-prefixed";
 import { encodeCbor } from "@cello-protocol/protocol-types";
 import type { Stream } from "@libp2p/interface";
@@ -602,6 +602,16 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
   getSetting(agentName: string, key: string): string | null { return this.#records.getSetting(agentName, key); }
   deleteSetting(agentName: string, key: string): boolean { return this.#records.deleteSetting(agentName, key); }
   setSetting(agentName: string, key: string, value: string): void { return this.#records.setSetting(agentName, key, value); }
+  /** DOD-M15-NOTACCEPTING-1: shut a tier (or re-open it) — mark and both bounds in one transaction. */
+  setTierNotAccepting(agentName: string, tier: SettableTierName, notAccepting: boolean, maxSessions?: number): void {
+    return this.#records.setTierNotAccepting(agentName, tier, notAccepting, maxSessions);
+  }
+  /** DOD-M15-NOTACCEPTING-1: is this tier shut? BLOCKED always is. */
+  isTierNotAccepting(agentName: string, tier: number): boolean { return this.#records.isTierNotAccepting(agentName, tier); }
+  /** DOD-M15-NOTACCEPTING-1 D10: record a turned-away caller (keyed on THEM, so volume evicts nobody). */
+  recordKnock(agentName: string, counterpartyPubkey: string, reason: string): void { return this.#records.recordKnock(agentName, counterpartyPubkey, reason); }
+  /** DOD-M15-NOTACCEPTING-1 D10: who knocked and was turned away, most recent first. */
+  listKnocks(agentName: string): ReturnType<SessionRecords["listKnocks"]> { return this.#records.listKnocks(agentName); }
   getAllSettings(agentName: string): Array<{ key: string; value: string }> { return this.#records.getAllSettings(agentName); }
   recordRelayWitnessUnreadable(agentName: string, relayPeerId: string, why: string): void { return this.#records.recordRelayWitnessUnreadable(agentName, relayPeerId, why); }
   getWitnessUnreadable(agentName: string): ReadonlyArray<{ relayPeerId: string; why: string; count: number }> { return this.#records.getWitnessUnreadable(agentName); }
@@ -1708,6 +1718,22 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     counterpartyPubkey: string,
   ): { ok: true } | { ok: false; reason: CapacityReason } {
     const tier = this.#records.getTier(agentName, counterpartyPubkey);
+    /**
+     * `DOD-M15-NOTACCEPTING-1` D2c — A SHUT TIER IS REFUSED HERE, BEFORE ANY COUNTING.
+     *
+     * The mark is the operator's recorded intent, so it has to bite at the GATE. Reading only the
+     * number would mean a tier whose mark says shut and whose stored cap says 5 quietly starts
+     * accepting again — the mark reduced to a label that picks wording. The setter refuses that
+     * combination; this is the line that holds if a row is ever edited around it.
+     *
+     * The reason is unchanged and deliberately so: it is the same CAPACITY code every other refusal
+     * on this path returns, so nothing in the refusal VALUE separates a shut tier from a full one.
+     * Which message the caller receives is decided in `inbound-sessions.ts`, where the tier is read
+     * again — and there every shut posture produces one identical frame.
+     */
+    if (this.#records.isTierNotAccepting(agentName, tier)) {
+      return { ok: false, reason: CAPACITY_REASONS.ABUSE_BOUND_SESSIONS_PER_SENDER };
+    }
     const perSenderCap = this.#records.resolveTierBound(agentName, tier, "max_sessions");
     const perSender = this.#queries.countActiveSessionsForCounterparty(agentName, counterpartyPubkey);
     if (perSender >= perSenderCap) {

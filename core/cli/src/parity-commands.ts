@@ -527,13 +527,20 @@ export function settingsGet(celloDir: string, key: string | undefined, opts: Par
 }
 
 /** `cello settings set <key> <value>` → cello_settings_set. The DAEMON validates the key and, for
- *  bound keys, that the value is a finite positive integer; the CLI surfaces its verdict verbatim. */
-export function settingsSet(celloDir: string, key: string, value: string | null, opts: ParityOptions): Promise<CliOutput> {
+ *  bound keys, that the value is a positive integer — 0 is refused, and its refusal names
+ *  `bounds.<tier>.not_accepting true` as the way to shut a tier. The CLI surfaces that verdict
+ *  verbatim, so the remedy reaches the operator without being restated here. */
+export function settingsSet(celloDir: string, key: string, value: string | null, opts: ParityOptions, maxSessions?: number): Promise<CliOutput> {
   // `value: null` CLEARS the setting (`cello settings clear <key>`), the same shape
   // cello_contact_set_away has always taken. Sent explicitly rather than as an omitted field: the
   // handler distinguishes "clear this" from "you forgot the value", and an absent key would read as
   // the latter.
-  return ipcCommand(celloDir, IPC_METHODS["settings-set"], { key, value }, opts);
+  return ipcCommand(
+    celloDir,
+    IPC_METHODS["settings-set"],
+    { key, value, ...(maxSessions !== undefined ? { max_sessions: maxSessions } : {}) },
+    opts,
+  );
 }
 
 // ─── DOD-M9B-SURFACE-1: the security layer's control surface (policy D-4) ──────────────────────

@@ -412,6 +412,27 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
         // codes and speak for themselves); only the security reasons carry guidance.
         ...(guidanceFor(e.reason) !== undefined ? { guidance: guidanceFor(e.reason) } : {}),
       }));
+      /**
+       * `DOD-M15-NOTACCEPTING-1` D10 — WHO KNOCKED WHILE THE DOOR WAS SHUT.
+       *
+       * The `refused` list above is per SESSION, in memory, capped, and gone at the next restart —
+       * so "who tried to reach me overnight" had no answer, and a flood pushed the one caller the
+       * operator cared about off the end of it. This list is per CALLER and durable: one row each,
+       * with how many times and since when, and the command to let that person through.
+       */
+      const knocks = sessionNodeManager.listKnocks(agent).map((k) => ({
+        from: k.counterparty_pubkey,
+        times: k.times,
+        first_knocked_at: k.first_refused_at,
+        last_knocked_at: k.last_refused_at,
+        reason: k.last_reason,
+        // The one action the operator may want, ready to paste. A shut tier closes a CATEGORY; it
+        // never closes a door opened for a named contact, so raising this one person is enough.
+        notice:
+          `Turned away ${k.times} time(s), most recently ${new Date(k.last_refused_at).toISOString()}. ` +
+          `They were told this agent is not accepting connections. To let this one person through: ` +
+          `cello_contact_set_tier { pubkey: "${k.counterparty_pubkey}", tier: 3 }.`,
+      }));
       const unread = sessionNodeManager.getUnreadSummary(agent);
       const ended_unread = sessionNodeManager.getEndedUnread(agent);
       const total_unread = unread.reduce((sum, u) => sum + u.unread_count, 0);
@@ -459,6 +480,10 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
           // ended-unread history stopped being told which sessions it had TURNED AWAY. That is the
           // exact surface M12-P18 added so a cap firing did not require reading the daemon log.
           ...(refused.length > 0 ? { refused_session_requests: refused } : {}),
+          // BOTH return sites, deliberately — DOD-M12B-INBOX-TRUTH-1 above is the record of what
+          // happens when a list is added to one of them: an agent with ended-unread history takes
+          // the other exit and silently stops being told.
+          ...(knocks.length > 0 ? { knocks } : {}),
           unread,
           total_unread, rename_notices, ...documentSection(agent), ...witnessSection(agent),
           ...refusalSection(agent, connectionId),
@@ -506,7 +531,7 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
       }
       return { agent, pending_session_requests: pending, expired_session_requests: expired,
         ...(screeningNotice && (pending.length > 0 || unread.length > 0) ? { screening_notice: screeningNotice } : {}),
-        ...pendingGuidance, ...expiredGuidance, ...(refused.length > 0 ? { refused_session_requests: refused } : {}), unread, total_unread, rename_notices, ...documentSection(agent), ...witnessSection(agent), ...refusalSection(agent, connectionId) };
+        ...pendingGuidance, ...expiredGuidance, ...(refused.length > 0 ? { refused_session_requests: refused } : {}), ...(knocks.length > 0 ? { knocks } : {}), unread, total_unread, rename_notices, ...documentSection(agent), ...witnessSection(agent), ...refusalSection(agent, connectionId) };
     });
 
     const totalUnread = agents.reduce((sum, a) => sum + a.total_unread, 0);

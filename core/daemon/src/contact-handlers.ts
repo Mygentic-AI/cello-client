@@ -23,7 +23,13 @@ import {
   allSettingKeys,
   validateSettingValue,
   AWAY_MESSAGE_MAX_LEN,
+  isBoundKey,
+  isNotAcceptingKey,
+  notAcceptingSettingKey,
+  boundsKeyTier,
+  tierIndexForName,
 } from "./agent-settings-keys.js";
+import { NOT_ACCEPTING_CALLER_GUIDANCE } from "./refusal-reasons.js";
 
 import { resolveNamedAgent } from "./resolve-named-agent.js";
 import type { AgentInfo } from "./types.js";
@@ -313,6 +319,24 @@ export function registerContactHandlers(deps: ContactHandlerDeps): void {
       // unset key reads as the no-op it is instead of implying something was removed.
       const resolvedClear = resolveContactAgent(getConnState(connectionId), params);
       if (!resolvedClear.ok) return resolvedClear;
+      /**
+       * `DOD-M15-NOTACCEPTING-1` — CLEARING THE MARK IS RE-OPENING, and it must take the same route.
+       *
+       * A plain `deleteSetting` here would remove the mark and LEAVE BOTH ZEROS BEHIND. The operator
+       * would be told the tier was cleared, `cello settings get` would show nothing set for it, and
+       * every caller would still be refused — by two rows the operator never typed and can no longer
+       * see the cause of. Route it through the transaction that owns all three keys.
+       */
+      const clearTier = isNotAcceptingKey(key) ? boundsKeyTier(key) : null;
+      if (clearTier !== null) {
+        const wasSet = sessionNodeManager.getSetting(resolvedClear.agent, key) !== null;
+        sessionNodeManager.setTierNotAccepting(resolvedClear.agent, clearTier, false);
+        logger.info("setting.cleared", { agentName: resolvedClear.agent, key, removed: wasSet });
+        return {
+          ok: true, agent: resolvedClear.agent, key, value: null, cleared: wasSet,
+          guidance: `The '${clearTier}' tier is accepting connections again, at its built-in default limits.`,
+        };
+      }
       const removed = sessionNodeManager.deleteSetting(resolvedClear.agent, key);
       logger.info("setting.cleared", { agentName: resolvedClear.agent, key, removed });
       return {
@@ -340,6 +364,77 @@ export function registerContactHandlers(deps: ContactHandlerDeps): void {
     }
     const resolved = resolveContactAgent(getConnState(connectionId), params);
     if (!resolved.ok) return resolved;
+
+    /**
+     * `DOD-M15-NOTACCEPTING-1` — SHUTTING OR RE-OPENING A TIER IS ONE TRANSACTION, NOT ONE ROW.
+     *
+     * Writing the mark alone would leave the tier marked and its bounds untouched, which is the
+     * drift D2c exists to prevent: the operator declares the tier shut and it keeps accepting.
+     * `setTierNotAccepting` owns all three keys together, so one command can only produce a
+     * consistent tier.
+     *
+     * Re-opening takes an OPTIONAL `max_sessions` in the same gesture (D2b). Omitted, the tier
+     * returns to its grid default — that is the documented outcome, not a missing argument.
+     */
+    const markTier = isNotAcceptingKey(key) ? boundsKeyTier(key) : null;
+    if (markTier !== null) {
+      const shutting = value === "true"; // validateSettingValue already refused everything else
+      let maxSessions: number | undefined;
+      if (!shutting && params?.max_sessions !== undefined && params.max_sessions !== null) {
+        const n = Number(params.max_sessions);
+        if (!Number.isInteger(n) || n <= 0) {
+          return {
+            ok: false,
+            reason: "invalid_value",
+            guidance:
+              `'max_sessions' must be a positive integer when re-opening a tier, or omit it to use the ` +
+              `built-in default. A 0 here would re-shut the tier inside the command that re-opens it.`,
+          };
+        }
+        maxSessions = n;
+      }
+      if (shutting && params?.max_sessions !== undefined && params.max_sessions !== null) {
+        return {
+          ok: false,
+          reason: "invalid_params",
+          guidance: `'max_sessions' has no meaning when shutting a tier — not_accepting true sets both of its bounds to 0.`,
+        };
+      }
+      sessionNodeManager.setTierNotAccepting(resolved.agent, markTier, shutting, maxSessions);
+      logger.info("setting.changed", { agentName: resolved.agent, key, notAccepting: shutting });
+      return {
+        ok: true, agent: resolved.agent, key, value,
+        guidance: shutting
+          ? `The '${markTier}' tier is shut: both of its bounds are now 0, and every caller it refuses is told ` +
+            `"${NOT_ACCEPTING_CALLER_GUIDANCE}" — they are not left waiting. Re-open it with ` +
+            `cello_settings_set { key: "${key}", value: "false" }. Callers turned away are listed in cello_inbox.`
+          : `The '${markTier}' tier is accepting connections again, at ` +
+            `${maxSessions !== undefined ? `${maxSessions} session(s) per sender` : "its built-in default limits"}.`,
+      };
+    }
+
+    /**
+     * `DOD-M15-NOTACCEPTING-1` D2c — A NUMBER CANNOT RE-OPEN A TIER THE OPERATOR SHUT.
+     *
+     * The alternative was to clear the mark as a side effect, and that is the dangerous one: a
+     * command that says nothing about re-opening would re-open the door, and the operator would
+     * learn it from the next stranger rather than from the command. Refusing names the gesture that
+     * does mean it.
+     */
+    if (isBoundKey(key)) {
+      const boundTier = boundsKeyTier(key);
+      if (boundTier !== null && sessionNodeManager.isTierNotAccepting(resolved.agent, tierIndexForName(boundTier))) {
+        return {
+          ok: false,
+          reason: "tier_not_accepting",
+          guidance:
+            `The '${boundTier}' tier is set to not accept connections, so a limit for it would have no effect. ` +
+            `Re-open it first: cello_settings_set { key: "${notAcceptingSettingKey(boundTier)}", value: "false" } ` +
+            `— and you can pass max_sessions in that same call to set this limit at the same time.`,
+        };
+      }
+    }
+
     sessionNodeManager.setSetting(resolved.agent, key, value);
     logger.info("setting.changed", { agentName: resolved.agent, key });
     return { ok: true, agent: resolved.agent, key, value };

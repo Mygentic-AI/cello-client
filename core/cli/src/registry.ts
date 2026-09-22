@@ -1495,17 +1495,28 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "Usage: cello settings get [key] [--agent <name>] | cello settings set <key> <value> [--agent <name>]\n" +
       "       cello settings clear <key> [--agent <name>]  — unset it; the built-in default applies again\n" +
       "  Per-agent reachability policy (DOD-SETTINGS-1). Keys: bounds.<tier>.max_sessions, bounds.<tier>.max_bytes\n" +
-      "  (tier = unknown|known|whitelisted|vip; a finite positive integer), away.default, away.tier.<tier> (away text).\n" +
-      "  An unset key uses the built-in default. Example:  cello settings set bounds.known.max_sessions 8 --agent alice",
+      "  (tier = unknown|known|whitelisted|vip; a POSITIVE integer — 0 is refused), bounds.<tier>.not_accepting\n" +
+      "  ('true' shuts that tier, 'false' re-opens it), away.default, away.tier.<tier> (away text).\n" +
+      "  To SHUT a tier use not_accepting rather than a 0 limit: it sets both of that tier's bounds to 0 in one\n" +
+      "  step, and every caller it refuses is told the agent is not accepting connections instead of being left\n" +
+      "  to time out. A named contact is never closed off by a shut tier. Callers turned away are listed, with\n" +
+      "  how many times, under `knocks` in cello inbox.\n" +
+      "  An unset key uses the built-in default. Example:  cello settings set bounds.known.max_sessions 8 --agent alice\n" +
+      "                                                    cello settings set bounds.unknown.not_accepting true\n" +
+      "                                                    cello settings set bounds.unknown.not_accepting false 4",
     flags: AGENT_FLAG,
     jsonOut: true,
     async run(ctx, args) {
       const { agent, pretty, positional } = parityOpts(args);
       const opts = { agent, pretty };
-      const [sub, key, value] = positional;
+      const [sub, key, value, extra] = positional;
       if (sub === "get") return settingsGet(ctx.celloDir, key, opts); // key optional → all
       if (sub === "set" && key && value !== undefined) {
-        return settingsSet(ctx.celloDir, key, value, opts);
+        // A 4th positional is the re-open limit: `settings set bounds.known.not_accepting false 9`.
+        // Parsed here rather than dropped, so the CLI can express the same one gesture the tool
+        // surface can — a flag the daemon accepts and no command can send is a flag nobody has.
+        const maxSessions = extra !== undefined ? Number(extra) : undefined;
+        return settingsSet(ctx.celloDir, key, value, opts, maxSessions);
       }
       // `clear` mirrors `cello moniker clear` — the established verb for putting a setting back to
       // its built-in default. There is deliberately no second way to do this: `set <key> ""` stays

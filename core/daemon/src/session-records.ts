@@ -16,7 +16,7 @@ import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
 import { normalizeContactPubkey } from "./contact-pubkey-case.js";
 import { TIER, normalizeTier, isKnownTierValue, tierBoundsFor } from "./contacts-tier-migration.js";
-import { boundSettingKey, settableTierName, isValidSettingKey } from "./agent-settings-keys.js";
+import { boundSettingKey, settableTierName, isValidSettingKey, notAcceptingSettingKey, type SettableTierName } from "./agent-settings-keys.js";
 import { MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
 import { type TranscriptEntry, UNREAD_RECEIVED_WHERE, TERMINAL_STATUSES } from "./session-node-types.js";
 import { quarantineRedaction } from "./quarantine-framing.js";
@@ -79,12 +79,23 @@ export class SessionRecords {
     }
     return normalizeTier(row?.tier);
   }
-  /** DOD-TIER-BOUNDS-SETTINGS: the effective bound for (agent, tier, field) — a per-agent SETTINGS
-   *  override if one is set and valid, else the hardcoded grid default (DEFAULT_TIER_BOUNDS). With no
-   *  settings this is byte-identical to Step 2 (the daemon runs on defaults alone). A stored value
-   *  that is somehow non-positive/non-finite (should be impossible — validated at SET time) falls back
-   *  to the grid default rather than removing the bound (INV-TIER-BOUND, defensive). BLOCKED is never
-   *  settable — it always returns the fixed grid value (0). */
+  /**
+   * DOD-TIER-BOUNDS-SETTINGS: the effective bound for (agent, tier, field) — a per-agent SETTINGS
+   * override if one is set and valid, else the hardcoded grid default (DEFAULT_TIER_BOUNDS). With no
+   * settings this is byte-identical to Step 2 (the daemon runs on defaults alone). BLOCKED is never
+   * settable — it always returns the fixed grid value (0).
+   *
+   * ⚠️ **ZERO IS A VALUE HERE, NOT CORRUPTION — `DOD-M15-NOTACCEPTING-1` REWROTE THIS COMMENT AND
+   * THE GUARD UNDER IT.** The old text cited INV-TIER-BOUND and reverted any stored `<= 0` to the
+   * grid default. INV-TIER-BOUND forbids an UNBOUNDED tier — it is about `Infinity`, and zero is the
+   * tightest bound there is, not the removal of one. Treating it as corrupt made the guard fail
+   * OPEN on the one value an operator sets to shut a door: they marked the tier not accepting, the
+   * mark wrote 0, and this method handed the caller the default back. `blocked`'s own fixed 0/0
+   * passes through the same path, so the old guard was contradicting the grid it claimed to defend.
+   *
+   * A NEGATIVE or NON-FINITE value is still corruption and still reverts — that half is unchanged,
+   * and it is reachable only by a hand-edited database, since `validateSettingValue` refuses both.
+   */
   resolveTierBound(agentName: string, tier: number, field: "max_sessions" | "max_bytes"): number {
     const gridDefault = field === "max_sessions"
       ? tierBoundsFor(tier).maxSessionsPerSender
@@ -94,7 +105,7 @@ export class SessionRecords {
     const raw = this.getSetting(agentName, boundSettingKey(name, field));
     if (raw === null) return gridDefault; // unset → default
     const parsed = Number(raw);
-    if (!Number.isFinite(parsed) || parsed <= 0) {
+    if (!Number.isFinite(parsed) || parsed < 0 || !Number.isInteger(parsed)) {
       // Should be impossible (validated at SET time) → a config-integrity failure. Surface it: this
       // reverts a possibly-TIGHTENED bound to the looser default, so a silent revert would hide a real
       // problem. Still fail SAFE (grid default, never unbounded — INV-TIER-BOUND).
@@ -102,6 +113,110 @@ export class SessionRecords {
       return gridDefault;
     }
     return parsed;
+  }
+
+  /**
+   * `DOD-M15-NOTACCEPTING-1` — is this tier SHUT? One reader, so one answer.
+   *
+   * ⚠️ **THE MARK IS CHECKED AT THE ACCEPTANCE GATE, NOT ONLY WHERE THE MESSAGE IS PICKED.** If this
+   * only chose wording, a tier whose mark says shut and whose number says 5 would quietly start
+   * accepting again and the mark would be decoration. The setter refuses that combination (D2c);
+   * this is the half that holds if a row is ever edited around it.
+   *
+   * `BLOCKED` is true unconditionally and stores nothing: it is simply the tier that is permanently
+   * in this state, which is why there is ONE designation and ONE message rather than two.
+   *
+   * The `max_sessions === 0` arm is no longer reachable by an operator gesture — a bare zero is
+   * refused at SET time — and is kept so that `blocked`'s fixed 0/0 and any zero already in a
+   * database behave identically to a mark. Two rules for one state is how the caller ends up
+   * getting two different messages for the same posture.
+   */
+  isTierNotAccepting(agentName: string, tier: number): boolean {
+    const name = settableTierName(tier);
+    if (name === null) return tier === TIER.BLOCKED; // BLOCKED: permanently shut. Out-of-range: not.
+    if (this.getSetting(agentName, notAcceptingSettingKey(name)) === "true") return true;
+    return this.resolveTierBound(agentName, tier, "max_sessions") === 0;
+  }
+
+  /**
+   * `DOD-M15-NOTACCEPTING-1` — shut a tier, or re-open it. **ONE TRANSACTION, deliberately.**
+   *
+   * Shutting writes the mark AND both zeros together, so no operator gesture can leave a tier half
+   * shut — the state where sessions open and every message is starved, which reads to the caller as
+   * a working connection that silently carries nothing.
+   *
+   * Re-opening removes the mark and BOTH overrides, so the tier returns to its grid default. It
+   * deliberately does not invent a number: the zeros it is clearing were never the operator's, so
+   * there is no remembered value to restore. `maxSessions` lets the operator name one in the same
+   * gesture; it is validated by the caller (a zero there is refused, or re-opening would re-shut).
+   */
+  setTierNotAccepting(agentName: string, tier: SettableTierName, notAccepting: boolean, maxSessions?: number): void {
+    if (!this.#db) throw new Error(`setTierNotAccepting('${agentName}'): database not initialized`);
+    if (maxSessions !== undefined && (!Number.isInteger(maxSessions) || maxSessions <= 0)) {
+      // A backstop, not the boundary: the handler validates. A zero reaching here would re-shut the
+      // tier inside the call that re-opens it, and report success for the opposite of what was asked.
+      throw new Error(`setTierNotAccepting: maxSessions must be a positive integer, got ${maxSessions}`);
+    }
+    const mark = notAcceptingSettingKey(tier);
+    const sessions = boundSettingKey(tier, "max_sessions");
+    const bytes = boundSettingKey(tier, "max_bytes");
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      if (notAccepting) {
+        this.setSetting(agentName, mark, "true");
+        this.setSetting(agentName, sessions, "0");
+        this.setSetting(agentName, bytes, "0");
+      } else {
+        this.deleteSetting(agentName, mark);
+        this.deleteSetting(agentName, bytes);
+        if (maxSessions === undefined) this.deleteSetting(agentName, sessions);
+        else this.setSetting(agentName, sessions, String(maxSessions));
+      }
+      this.#db.exec("COMMIT");
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+    this.#ctx.logger.info("settings.tier.not_accepting", { agentName, tier, notAccepting, maxSessions: maxSessions ?? null });
+  }
+
+  /**
+   * `DOD-M15-NOTACCEPTING-1` D10 — record that someone knocked and was turned away.
+   *
+   * ⚠️ **KEYED ON THE CALLER, AND THE KEY IS THE ANTI-SPAM CONTROL.** The durable `refused_sessions`
+   * table is keyed on session id, and every knock carries a fresh directory-assigned one — so a
+   * flooder does not merely fill it, **they evict every genuine caller from it** while the list
+   * still looks complete, and the one person the operator wanted to call back is the one they lose.
+   * Keyed on the pubkey, ten thousand knocks are one row with `times` at ten thousand and no volume
+   * of them can push anyone off. A row cap over the wrong key is the flooder's mute button.
+   *
+   * Nothing the caller CHOSE is stored — in particular not the name they offered for themselves. A
+   * peer refused at the gate must not get to pick how they appear in the operator's inbox.
+   */
+  recordKnock(agentName: string, counterpartyPubkey: string, reason: string): void {
+    if (!this.#db) return; // a knock is a courtesy record; it never fails a refusal
+    const now = Date.now();
+    this.#db
+      .prepare(
+        `INSERT INTO refused_callers (agent_id, counterparty_pubkey, first_refused_at, last_refused_at, times, last_reason)
+         VALUES (?, ?, ?, ?, 1, ?)
+         ON CONFLICT(agent_id, counterparty_pubkey) DO UPDATE SET
+           last_refused_at = excluded.last_refused_at,
+           times = times + 1,
+           last_reason = excluded.last_reason`,
+      )
+      .run(this.#ctx.requireAgentId(agentName), normalizeContactPubkey(counterpartyPubkey), now, now, reason);
+  }
+
+  /** `DOD-M15-NOTACCEPTING-1` D10 — who knocked and was turned away, most recent first. */
+  listKnocks(agentName: string): Array<{ counterparty_pubkey: string; first_refused_at: number; last_refused_at: number; times: number; last_reason: string }> {
+    if (!this.#db) return [];
+    return this.#db
+      .prepare(
+        `SELECT counterparty_pubkey, first_refused_at, last_refused_at, times, last_reason
+         FROM refused_callers WHERE agent_id = ? ORDER BY last_refused_at DESC`,
+      )
+      .all(this.#ctx.requireAgentId(agentName)) as Array<{ counterparty_pubkey: string; first_refused_at: number; last_refused_at: number; times: number; last_reason: string }>;
   }
   /** M8C-CONTACT-1: pin a contact at add time — idempotent (re-adding an existing contact is a
    *  no-op, never refreshes added_at; identity does not get re-resolved). MONIKER-3 AC2: an

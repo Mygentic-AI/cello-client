@@ -54,6 +54,8 @@ function setTier(db: DaemonDatabase, agentId: string, pubkey: string, tier: numb
 }
 
 describe("DOD-TIER-BOUNDS-SETTINGS — value validation (AC2, INV-TIER-BOUND)", () => {
+  // `0` stays in this list: `DOD-M15-NOTACCEPTING-1` made it MORE firmly refused, not less — it is
+  // written only by `bounds.<tier>.not_accepting`, never typed. The refusal's text is asserted there.
   it("a bound value must be a finite positive integer; Infinity / negative / 0 / decimal are refused", () => {
     const key = boundSettingKey("known", "max_sessions");
     expect(validateSettingValue(key, "8").ok).toBe(true);
@@ -100,8 +102,22 @@ describe("DOD-TIER-BOUNDS-SETTINGS — resolveTierBound + the override in effect
   it("a setting overrides the default; a corrupt stored value falls back to the default (never unbounded)", () => {
     mgr.setSetting("alice", boundSettingKey("known", "max_sessions"), "8");
     expect(mgr.resolveTierBound("alice", TIER.KNOWN, "max_sessions")).toBe(8);
-    // Defensive: a value that somehow got stored non-positive falls back, never removes the bound.
-    mgr.setSetting("alice", boundSettingKey("known", "max_bytes"), "0"); // (validateSettingValue would reject this at the handler)
+    /**
+     * ⚠️ REWRITTEN BY `DOD-M15-NOTACCEPTING-1`, AND THE OLD ASSERTION IS THE INTERESTING PART.
+     *
+     * This line used to store `"0"` and assert the reader handed back the grid DEFAULT, describing
+     * it as "never removes the bound". Zero does not remove a bound — it is the tightest one there
+     * is — so that fallback did not fail safe, it failed OPEN: it was the second of the two guards
+     * that made a tier impossible to shut. An operator marked the tier not accepting, the mark wrote
+     * 0, and this method gave the caller the default back. Zero now reads back as zero (asserted in
+     * `dod-m15-notaccepting-1.test.ts`, through the mark that is its only producer).
+     *
+     * The defensive fallback is KEPT for what INV-TIER-BOUND is actually about — a value that is
+     * not a bound at all. Reachable only by a hand-edited database; the validator refuses both.
+     */
+    mgr.setSetting("alice", boundSettingKey("known", "max_bytes"), "-1");
+    expect(mgr.resolveTierBound("alice", TIER.KNOWN, "max_bytes")).toBe(DEFAULT_TIER_BOUNDS[TIER.KNOWN].maxBytesPerSession);
+    mgr.setSetting("alice", boundSettingKey("known", "max_bytes"), "Infinity");
     expect(mgr.resolveTierBound("alice", TIER.KNOWN, "max_bytes")).toBe(DEFAULT_TIER_BOUNDS[TIER.KNOWN].maxBytesPerSession);
   });
 

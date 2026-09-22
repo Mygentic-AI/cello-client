@@ -23,7 +23,7 @@ import { frameValueToHex } from "./frame-values.js";
 import { computeGenesisPrevRoot, computeChainAnchor, decodeTrustSignalEnvelope, hashTrustSignalEnvelope, verifyTrustSignalHash, decodeCbor, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
 import { TrustSignalStore } from "./trust-signal-store.js";
 import { verifyInboundAssignment } from "./assignment-verify.js";
-import { REFUSAL_REASONS, type RefusalReason, type AnyRefusalReason } from "./refusal-reasons.js";
+import { REFUSAL_REASONS, NOT_ACCEPTING_CALLER_GUIDANCE, type RefusalReason, type AnyRefusalReason } from "./refusal-reasons.js";
 import { parseSessionAssignment } from "./session-assignment-parser.js";
 import { extractOfferedMoniker } from "./session-assignment-parser.js";
 import { TIER } from "./contacts-tier-migration.js";
@@ -814,10 +814,23 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       reapDeadHalfOpenSessions(agentName);
       const bound = sessionNodeManager.checkUnknownSenderAcceptanceBound(agentName, parsed.participantAPubkeyHex);
       if (!bound.ok) {
+        /**
+         * ─── `DOD-M15-NOTACCEPTING-1` — IS THIS A FULL DOOR, OR A SHUT ONE? ───────────────────
+         *
+         * The two are different facts and were being reported as one. A cap is a state that clears;
+         * a shut tier is a decision that does not. Everything below branches on it: the code that
+         * is recorded, whether the operator's cap alarm is the right alarm to fire, and — the half
+         * the caller lives with — whether they are told anything at all.
+         */
+        const senderTier = sessionNodeManager.getTier(agentName, parsed.participantAPubkeyHex);
+        const notAccepting = sessionNodeManager.isTierNotAccepting(agentName, senderTier);
+        const refusalReason: AnyRefusalReason = notAccepting
+          ? REFUSAL_REASONS.NOT_ACCEPTING_CONNECTIONS
+          : bound.reason;
         logger.warn("session.inbound.accept.failed", {
           sessionId: parsed.sessionIdHex,
           agentName,
-          reason: bound.reason,
+          reason: refusalReason,
           correlationId,
         });
         // DOD-CAP-SELF-HEAL-1 — TELL THE OPERATOR. Their own cap just refused someone and they are
@@ -832,7 +845,14 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         //
         // ONCE PER PEER PER COOLDOWN. The peer controls the retry rate, so an unbounded alarm hands
         // them the daemon's ERROR log. The suppressed count rides on the next one.
-        const capInfo = bound.reason === "abuse_bound_sessions_per_sender"
+        //
+        // `DOD-M15-NOTACCEPTING-1` EXTENDS THE BLOCKED CARVE-OUT TO EVERY SHUT TIER, on the same
+        // argument the note above makes for BLOCKED: this alarm exists for a limit the operator did
+        // not mean to hit, and a tier they shut on purpose is the opposite of that. An ERROR telling
+        // them to close sessions, when the cap is 0 because they declared it, buries the case the
+        // alarm is for — and there are no sessions to close. They still get the refusal in their
+        // inbox, and now the caller's key with it.
+        const capInfo = bound.reason === "abuse_bound_sessions_per_sender" && !notAccepting
           ? sessionNodeManager.capDiagnostics(agentName, parsed.participantAPubkeyHex)
           : null;
         if (capInfo && !capInfo.blocked) {
@@ -865,11 +885,23 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         // require reading the log to discover. Measured: a per-sender cap refused a session and the
         // only trace was one warn line — the parked content for it then failed authentication 297
         // times before anyone noticed.
-        recordRefusal(agentName, parsed.sessionIdHex, parsed.participantAPubkeyHex, bound.reason);
+        recordRefusal(agentName, parsed.sessionIdHex, parsed.participantAPubkeyHex, refusalReason);
+        /**
+         * `DOD-M15-NOTACCEPTING-1` D10 — WHO knocked, durably, keyed on THEM.
+         *
+         * The in-memory list above dies with the process and holds the last 20, so the morning after
+         * a busy night the operator had no way to answer "who tried to reach me" — and the one
+         * caller they wanted to let in was the one a flood had pushed off the end. This row survives
+         * a restart and cannot be evicted by volume: see `refused_callers` for why the key is the
+         * caller and not the session.
+         */
+        if (notAccepting) {
+          sessionNodeManager.recordKnock(agentName, parsed.participantAPubkeyHex, refusalReason);
+        }
         // M12-P18: DURABLE record too — content parked for this refused session arrives later and
         // survives restarts, and this is what lets the drain sweep it instead of re-pulling it
         // forever (the 78-times-per-message counterparty_unknown loop).
-        sessionNodeManager.recordRefusedSession(agentName, parsed.sessionIdHex, bound.reason);
+        sessionNodeManager.recordRefusedSession(agentName, parsed.sessionIdHex, refusalReason);
 
         // M12-P18: TELL THE SENDER — but only if we already trust them.
         //
@@ -885,7 +917,36 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         // is N" is THEIR OWN state, which they already know. So they get the reason and the numbers.
         // UNKNOWN and BLOCKED still get silence — a stranger learns nothing, and a blocked party
         // cannot tell blocking from throttling.
-        const senderTier = sessionNodeManager.getTier(agentName, parsed.participantAPubkeyHex);
+        /**
+         * `DOD-M15-NOTACCEPTING-1` — A SHUT DOOR ANSWERS EVERY CALLER, INCLUDING A STRANGER.
+         *
+         * ⚠️ **THE ORACLE ARGUMENT BELOW IS PRESERVED, NOT ABANDONED — read this before restoring
+         * the silence.** That argument says a BLOCKED peer and an over-cap peer must be
+         * indistinguishable. One identical sentence for every shut posture keeps exactly that: a
+         * blocked caller, a caller in a tier the operator shut, and a caller of a whitelist-only
+         * agent all receive the same bytes, so none of them can tell which it was, and two of them
+         * comparing notes learn nothing about each other. What silence added on top was not
+         * protection — it was a 30-second wait ending in the caller's own daemon blaming the
+         * DIRECTORY and telling them to retry, forever, against a decision that will never change.
+         *
+         * Nothing here is interpolated: the sentence is a constant, the frame carries no tier, no
+         * cause, no count and no text from the caller.
+         */
+        if (notAccepting) {
+          void deps.sendOver(agentName, {
+            type: "session_refused",
+            sessionId: parsed.sessionIdHex,
+            initiatorPubkey: parsed.participantAPubkeyHex,
+            reason: REFUSAL_REASONS.NOT_ACCEPTING_CONNECTIONS,
+            guidance: NOT_ACCEPTING_CALLER_GUIDANCE,
+          }).then((sent) => {
+            logger.info("session.inbound.refusal.notified", {
+              agentName, sessionId: parsed.sessionIdHex, reason: REFUSAL_REASONS.NOT_ACCEPTING_CONNECTIONS,
+              delivered: sent.ok, tier: senderTier, correlationId,
+            });
+          }).catch(() => { /* best-effort: the local record above is the durable half */ });
+          return;
+        }
         if (senderTier >= TIER.KNOWN && senderTier <= TIER.VIP) {
           // The EFFECTIVE cap for THIS operator, not the grid default — caps are per-agent settings
           // (DOD-TIER-BOUNDS-SETTINGS), so quoting the default would lie to anyone who raised theirs.
