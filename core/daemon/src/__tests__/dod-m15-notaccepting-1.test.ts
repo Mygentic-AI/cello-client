@@ -43,6 +43,7 @@ import type { Logger } from "../types.js";
 import type { DaemonDatabase } from "../sqlcipher-db.js";
 import { registerContactHandlers } from "../contact-handlers.js";
 import type { IpcHandler } from "../ipc-server.js";
+import { registerNotificationHandlers } from "../notification-handlers.js";
 
 const silent: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 
@@ -354,5 +355,70 @@ describe("DOD-M15-NOTACCEPTING-1 — what the handler does with it", () => {
     expect(mgr.isTierNotAccepting("alice", TIER.VIP)).toBe(false);
     expect(mgr.resolveTierBound("alice", TIER.VIP, "max_sessions")).toBe(DEFAULT_TIER_BOUNDS[TIER.VIP].maxSessionsPerSender);
     expect(mgr.resolveTierBound("alice", TIER.VIP, "max_bytes")).toBe(DEFAULT_TIER_BOUNDS[TIER.VIP].maxBytesPerSession);
+  });
+});
+
+describe("DOD-M15-NOTACCEPTING-1 — the inbox notice names a door that is actually open", () => {
+  /**
+   * The review finding, pinned. The command was hardcoded to tier 3, so an operator who had also
+   * shut the whitelisted tier would follow it exactly and drop the caller into a second shut tier —
+   * still unreachable, and the notice would have told them it was enough.
+   */
+  let tempDir: string;
+  let mgr: SessionNodeManager;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "dod-notacc-n-"));
+    const dbPath = join(tempDir, "sessions.db");
+    const seed = openTestDb(dbPath);
+    await seedAgents(seed, ["alice"]);
+    seed.close();
+    mgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: silent, dbPath });
+    await mgr.initialize();
+    mgr.recordKnock("alice", "77".repeat(32), "not_accepting_connections");
+  });
+  afterEach(async () => {
+    await mgr.stop?.();
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  const notice = async (): Promise<string> => {
+    const handlers = new Map<string, IpcHandler>();
+    registerNotificationHandlers({
+      handlers,
+      sessionNodeManager: mgr,
+      getConnState: () => ({ currentAgent: "alice" }),
+      resolveCurrentAgent: (cs: { currentAgent?: string } | undefined, explicit?: string) => explicit ?? cs?.currentAgent ?? null,
+      agents: [{ name: "alice", state: "online" as const }],
+      loadedAgents: [{ name: "alice", pubkey: "aa".repeat(32) }],
+      reapExpiredInboundSessions: () => {},
+      inboundSessionQueues: new Map(),
+      expiredSessionRequests: new Map(),
+      refusedSessionRequests: new Map(),
+      logger: silent,
+    } as unknown as Parameters<typeof registerNotificationHandlers>[0]);
+    const res = await handlers.get("cello_check_notifications")!({}, "conn-1") as Record<string, unknown>;
+    // The door answers per agent, so the knocks ride on this agent's section, not the envelope.
+    const section = (res["agents"] as Array<Record<string, unknown>>).find((a) => a["agent"] === "alice")!;
+    const knocks = section["knocks"] as Array<{ notice: string }>;
+    expect(knocks, "a turned-away caller must be listed").toHaveLength(1);
+    return knocks[0]!.notice;
+  };
+
+  it("★ it names the highest tier still ACCEPTING, not a fixed one", async () => {
+    mgr.setTierNotAccepting("alice", "unknown", true);
+    mgr.setTierNotAccepting("alice", "vip", true);
+    // VIP is shut, so the advice must drop to whitelisted rather than name a shut door.
+    expect(await notice()).toContain(`tier: ${TIER.WHITELISTED}`);
+    mgr.setTierNotAccepting("alice", "whitelisted", true);
+    expect(await notice()).toContain(`tier: ${TIER.KNOWN}`);
+  });
+
+  it("★ with EVERY tier shut it says raising them would not help — no command that resolves to nothing", async () => {
+    for (const t of ["unknown", "known", "whitelisted", "vip"] as const) mgr.setTierNotAccepting("alice", t, true);
+    const text = await notice();
+    expect(text).not.toContain("cello_contact_set_tier");
+    expect(text).toContain("EVERY tier");
+    expect(text).toContain("not_accepting");
   });
 });

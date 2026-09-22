@@ -16,6 +16,7 @@ import type { Logger } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
 import type { InboundSessionEvent, ExpiredSessionRequest, RefusedSessionRequest } from "./inbound-sessions.js";
 import { resolveNamedAgent } from "./resolve-named-agent.js";
+import { TIER } from "./contacts-tier-migration.js";
 import { screeningSessionNotice } from "./screening-status.js";
 import type { AgentInfo } from "./types.js";
 import { extractErrorMessage } from "./error-message.js";
@@ -420,18 +421,30 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
        * operator cared about off the end of it. This list is per CALLER and durable: one row each,
        * with how many times and since when, and the command to let that person through.
        */
+      /**
+       * ⚠️ THE TIER IN THE COMMAND IS LOOKED UP, NOT TYPED — review finding.
+       *
+       * It was hardcoded to 3 (whitelisted) under the promise "to let this one person through". An
+       * operator who has ALSO shut the whitelisted tier would follow that command exactly and drop
+       * the caller into a second shut tier, still unable to reach them — an affordance that resolves
+       * to nothing, which is worse than no advice because they will act on it. So the highest tier
+       * this operator has actually left accepting is chosen, and when there is none the notice says
+       * so instead of naming a door that is also shut.
+       */
+      const openTier = [TIER.VIP, TIER.WHITELISTED, TIER.KNOWN].find((t) => !sessionNodeManager.isTierNotAccepting(agent, t)) ?? null;
       const knocks = sessionNodeManager.listKnocks(agent).map((k) => ({
         from: k.counterparty_pubkey,
         times: k.times,
         first_knocked_at: k.first_refused_at,
         last_knocked_at: k.last_refused_at,
         reason: k.last_reason,
-        // The one action the operator may want, ready to paste. Shutting one tier leaves the others
-        // alone, so raising this one person into a tier still accepting is enough to let them in.
         notice:
           `Turned away ${k.times} time(s), most recently ${new Date(k.last_refused_at).toISOString()}. ` +
-          `They were told this agent is not accepting connections. To let this one person through: ` +
-          `cello_contact_set_tier { pubkey: "${k.counterparty_pubkey}", tier: 3 }.`,
+          `They were told this agent is not accepting connections. ` +
+          (openTier !== null
+            ? `To let this one person through: cello_contact_set_tier { pubkey: "${k.counterparty_pubkey}", tier: ${openTier} }.`
+            : `EVERY tier is currently set to not accept connections, so raising them would not help — ` +
+              `re-open one first with cello_settings_set { key: "bounds.<tier>.not_accepting", value: "false" }.`),
       }));
       const unread = sessionNodeManager.getUnreadSummary(agent);
       const ended_unread = sessionNodeManager.getEndedUnread(agent);
