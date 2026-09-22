@@ -208,6 +208,31 @@ export class SessionRecords {
       .run(this.#ctx.requireAgentId(agentName), normalizeContactPubkey(counterpartyPubkey), now, now, reason);
   }
 
+  /**
+   * `DOD-M15-NOTACCEPTING-1` — the counterparty refused a session WE opened. Recorded, never
+   * answered live: their frame lands after `cello_initiate_session` has already returned.
+   *
+   * Idempotent on (agent, session): a second refusal for one session is the same fact.
+   */
+  recordCounterpartyRefusal(agentName: string, sessionId: string, reason: string): void {
+    if (!this.#db) throw new Error(`recordCounterpartyRefusal('${agentName}'): database not initialized`);
+    this.#db
+      .prepare(
+        `INSERT INTO counterparty_refusals (agent_id, session_id, reason, refused_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(agent_id, session_id) DO UPDATE SET reason = excluded.reason, refused_at = excluded.refused_at`,
+      )
+      .run(this.#ctx.requireAgentId(agentName), sessionId, reason, Date.now());
+  }
+
+  /** `DOD-M15-NOTACCEPTING-1` — the counterparty's refusal for this session, or null. */
+  getCounterpartyRefusal(agentName: string, sessionId: string): { reason: string; refused_at: number } | null {
+    if (!this.#db) return null;
+    const row = this.#db
+      .prepare("SELECT reason, refused_at FROM counterparty_refusals WHERE agent_id = ? AND session_id = ?")
+      .get(this.#ctx.requireAgentId(agentName), sessionId) as { reason: string; refused_at: number } | undefined;
+    return row ?? null;
+  }
+
   /** `DOD-M15-NOTACCEPTING-1` D10 — who knocked and was turned away, most recent first. */
   listKnocks(agentName: string): Array<{ counterparty_pubkey: string; first_refused_at: number; last_refused_at: number; times: number; last_reason: string }> {
     if (!this.#db) return [];

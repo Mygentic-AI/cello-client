@@ -29,6 +29,7 @@ import { REFUSAL_COUNT_GUIDANCE, REFUSAL_KIND_GUIDANCE, type RefusalKind } from 
 import { extractErrorMessage } from "./error-message.js";
 import { SESSION_CLOSED_GUIDANCE, SESSION_CLOSED_REASON, SESSION_SEALING_IMPACT, closedSessionImpact, isClosedStatus } from "./session-closed.js";
 import { replyLag, type ReplyLag } from "./reply-lag.js";
+import { callerTextForRefusal } from "./counterparty-refusal.js";
 
 /** Whether the other side's latest replies were written before they saw this side's newest message. */
 function replyLagFor(snm: { getDb(): import("./sqlcipher-db.js").DaemonDatabase; resolveAgentId(n: string): string }, agentName: string, sessionId: string): ReplyLag | undefined {
@@ -331,6 +332,28 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
      * relay defaults to an in-memory store, so a restart tells every client the same string for
      * sessions that are perfectly alive.
      */
+    /**
+     * ─── `DOD-M15-NOTACCEPTING-1` — THE COUNTERPARTY REFUSED THIS SESSION ───────────────────────
+     *
+     * Checked BEFORE the generic closed-status refusal below, and that order is the whole point.
+     * The session IS closed — it was abandoned when their refusal arrived — but "this conversation
+     * has ended" is not what happened and does not tell the operator what to do. What happened is
+     * that the other side declined it before it began, for a stated reason, and the sentence for
+     * that reason is written locally (never their prose — see `counterparty-refusal.ts`).
+     *
+     * Before this, the refusal arrived a millisecond after `cello_initiate_session` had already
+     * returned success, with nothing listening, and the operator's next send answered *"Sent…
+     * sealed, witnessed and on its way… No action is needed."*
+     */
+    const refusal = sessionNodeManager.getCounterpartyRefusal(agentName, sessionId);
+    if (refusal) {
+      return {
+        ok: false,
+        reason: refusal.reason,
+        impact: "Nothing was sent. The counterparty never opened this session, so there is nothing on the other side to receive it.",
+        guidance: callerTextForRefusal(refusal.reason),
+      };
+    }
     if (isClosedStatus(record.status)) {
       logger.info("session.send.refused_closed", {
         sessionId, agentName, status: record.status, trigger: "status",
@@ -1055,6 +1078,22 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     // to read them or the badge can never clear. Reading is a transcript operation: the read below
     // works from the durable transcript alone. Only a session with NEITHER a row
     // NOR transcript rows is truly not found.
+    /**
+     * `DOD-M15-NOTACCEPTING-1` — the same answer on the READ side, and this is the surface that was
+     * actively misleading: a read on a session the counterparty declined answered *"Nothing
+     * arrived… THIS IS A FAULT ON THIS MACHINE — the connection is fine and your counterparty is
+     * not involved."* Every clause of that was wrong, and it sent the operator to debug their own
+     * machine over someone else's decision.
+     */
+    const readRefusal = record ? sessionNodeManager.getCounterpartyRefusal(agentName, sessionId) : null;
+    if (readRefusal) {
+      return {
+        ok: false,
+        reason: readRefusal.reason,
+        impact: "Nothing will arrive on this session: the counterparty declined it and it was never opened on their side.",
+        guidance: callerTextForRefusal(readRefusal.reason),
+      };
+    }
     let transcriptOnly = false;
     if (!record) {
       /**

@@ -24,6 +24,7 @@ import { computeGenesisPrevRoot, computeChainAnchor, decodeTrustSignalEnvelope, 
 import { TrustSignalStore } from "./trust-signal-store.js";
 import { verifyInboundAssignment } from "./assignment-verify.js";
 import { REFUSAL_REASONS, NOT_ACCEPTING_CALLER_GUIDANCE, type RefusalReason, type AnyRefusalReason } from "./refusal-reasons.js";
+import { WIRE_REASON_RE } from "./counterparty-refusal.js";
 import { parseSessionAssignment } from "./session-assignment-parser.js";
 import { extractOfferedMoniker } from "./session-assignment-parser.js";
 import { TIER } from "./contacts-tier-migration.js";
@@ -1893,6 +1894,67 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     mgr.registerInboundHandler((frame) => {
       if (frame["type"] !== "session_assignment") return;
       handleInboundSessionAssignment(frame as Record<string, unknown>, streamAgentName);
+    });
+    mgr.registerInboundHandler((frame) => {
+      if (frame["type"] !== "session_refused") return;
+      handleLateSessionRefused(frame as Record<string, unknown>, streamAgentName);
+    });
+  }
+
+  /**
+   * ─── `DOD-M15-NOTACCEPTING-1` — THE COUNTERPARTY'S REFUSAL, ARRIVING AFTER WE ASKED ──────────
+   *
+   * **Why a permanent handler and not the one in `outbound-sessions.ts`.** That one exists, and it
+   * can never fire: it is unregistered the instant the DIRECTORY's assignment resolves the
+   * initiate, and the directory answers the caller BEFORE the responder has seen the offer at all.
+   * Measured live on 2026-09-22 — the refusal landed one millisecond too late, with nobody
+   * listening. The caller then held a session the other side never opened, and was told *"Sent…
+   * sealed, witnessed and on its way"* and then *"THIS IS A FAULT ON THIS MACHINE"*. The same race
+   * has always swallowed the over-cap refusal M12-P18 added, so no caller has ever seen one.
+   *
+   * **⚠️ A REFUSAL CAN ONLY END A SESSION THAT HAS NOT STARTED.** This frame arrives over the
+   * DIRECTORY stream and carries no signature, so a hostile or compromised directory can mint one
+   * naming any session id. The narrowest possible effect is therefore the rule: it is acted on only
+   * for a session this agent OWNS, that is still `active`, and that has NOTHING in it — no message
+   * either way. A directory could already refuse to broker the session at all, so ending a
+   * conversation that never began takes nothing from it that it did not already have; ending a LIVE
+   * one would hand it a remote kill switch over conversations it is meant to be blind to.
+   *
+   * **The counterparty's `guidance` string is read by nothing.** See `counterparty-refusal.ts`.
+   */
+  function handleLateSessionRefused(frame: Record<string, unknown>, streamAgentName?: string): void {
+    const sessionIdHex = typeof frame["sessionId"] === "string" ? frame["sessionId"] : null;
+    const reason = typeof frame["reason"] === "string" ? frame["reason"] : null;
+    if (!sessionIdHex || !/^[0-9a-f]{32}$/i.test(sessionIdHex)) return;
+    if (!reason || !WIRE_REASON_RE.test(reason)) {
+      // Not a code this build will put anywhere. Named, because a peer sending prose where a code
+      // belongs is a version skew someone has to see.
+      logger.warn("session.outbound.refusal.unusable", { sessionId: sessionIdHex, why: "reason is missing or not a bare code" });
+      return;
+    }
+    const agentName = streamAgentName ?? sessionNodeManager.findAgentForSession(sessionIdHex);
+    if (!agentName) return; // not ours to act on
+    const record = sessionNodeManager.getSessionRecord(agentName, sessionIdHex);
+    if (!record || record.status !== "active" || record.message_count > 0) {
+      logger.warn("session.outbound.refusal.ignored", {
+        agentName, sessionId: sessionIdHex, reason,
+        why: record ? `status=${record.status} messages=${record.message_count}` : "no such session for this agent",
+        impact: "a refusal only ends a conversation that never started; a live one is never torn down by an unsigned frame.",
+      });
+      return;
+    }
+    sessionNodeManager.recordCounterpartyRefusal(agentName, sessionIdHex, reason);
+    logger.warn("session.outbound.refused_by_counterparty", {
+      agentName, sessionId: sessionIdHex, reason,
+      impact:
+        "the counterparty declined this session, so it was never opened on their side. It is ended here " +
+        "rather than left looking live, and the next send or read on it says so.",
+    });
+    // Ends the half-formed session: status flips synchronously, then the node is retired. Without
+    // it the caller keeps a session whose transport can never negotiate, which is what produced
+    // "your own machine is at fault" on the next read.
+    void sessionNodeManager.abandonSession(agentName, sessionIdHex).catch((err: unknown) => {
+      logger.warn("session.outbound.refusal.teardown_failed", { agentName, sessionId: sessionIdHex, reason: extractErrorMessage(err) });
     });
   }
   // CONN-001: test path only — the shared manager's inbound session/seal responders. Production

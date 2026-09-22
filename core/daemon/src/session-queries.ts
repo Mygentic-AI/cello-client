@@ -815,6 +815,21 @@ export class SessionQueries {
    * and loudly — which is correct. Filtering retired agents out here would instead make the row
    * unattributable and the failure mute.
    */
+  /**
+   * `DOD-M15-NOTACCEPTING-1` — which local agent owns this session, or null.
+   *
+   * Production wires one signaling stream per agent, so the owner is known from the stream and this
+   * is not consulted. It exists for the shared-manager test path, where a frame arrives with no
+   * agent attached. Joined to `agents` so the answer is a NAME, resolved from the stable `agent_id`
+   * the sessions row actually stores.
+   */
+  agentNameForSession(sessionId: string): string | null {
+    if (!this.#db) return null;
+    const row = this.#db
+      .prepare("SELECT a.agent_name AS agent_name FROM sessions s JOIN agents a ON a.agent_id = s.agent_id WHERE s.session_id = ?")
+      .get(sessionId) as { agent_name: string } | undefined;
+    return row?.agent_name ?? null;
+  }
   agentNameForId(agentId: string): string | null {
     if (!this.#db) return null;
     const row = this.#db

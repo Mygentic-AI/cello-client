@@ -225,6 +225,29 @@ export function ensureSessionSchema(
   `);
 
   /**
+   * `DOD-M15-NOTACCEPTING-1` — THE COUNTERPARTY REFUSED A SESSION **WE** OPENED.
+   *
+   * The mirror of `refused_sessions` above, which records sessions WE declined. This one is the
+   * caller's half, and it is durable for the same reason: the refusal arrives about a millisecond
+   * after `cello_initiate_session` has already returned, so there is no call left to answer with it
+   * — the operator learns of it on their next send, read or inbox, which may be after a restart.
+   *
+   * ⚠️ NO COUNTERPARTY PROSE IS STORED. Only the reason CODE crosses the wire into this table, and
+   * the sentence shown to the operator is written locally from it (`counterparty-refusal.ts`).
+   * Storing their `guidance` string would put an arbitrary peer's paragraph in front of the
+   * operator's agent, which is an injection surface reachable by anyone who can refuse a session.
+   */
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS counterparty_refusals (
+      agent_id   TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      reason     TEXT NOT NULL,
+      refused_at INTEGER NOT NULL,
+      PRIMARY KEY (agent_id, session_id)
+    )
+  `);
+
+  /**
    * `DOD-M15-NOTACCEPTING-1` D10 — WHO knocked and was turned away, so the operator can whitelist
    * them or call them back.
    *

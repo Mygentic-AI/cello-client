@@ -606,6 +606,9 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
   setTierNotAccepting(agentName: string, tier: SettableTierName, notAccepting: boolean, maxSessions?: number): void { return this.#records.setTierNotAccepting(agentName, tier, notAccepting, maxSessions); }
   isTierNotAccepting(agentName: string, tier: number): boolean { return this.#records.isTierNotAccepting(agentName, tier); }
   recordKnock(agentName: string, counterpartyPubkey: string, reason: string): void { return this.#records.recordKnock(agentName, counterpartyPubkey, reason); }
+  recordCounterpartyRefusal(agentName: string, sessionId: string, reason: string): void { return this.#records.recordCounterpartyRefusal(agentName, sessionId, reason); }
+  getCounterpartyRefusal(agentName: string, sessionId: string): { reason: string; refused_at: number } | null { return this.#records.getCounterpartyRefusal(agentName, sessionId); }
+  findAgentForSession(sessionId: string): string | null { return this.#queries.agentNameForSession(sessionId); }
   listKnocks(agentName: string): ReturnType<SessionRecords["listKnocks"]> { return this.#records.listKnocks(agentName); }
   getAllSettings(agentName: string): Array<{ key: string; value: string }> { return this.#records.getAllSettings(agentName); }
   recordRelayWitnessUnreadable(agentName: string, relayPeerId: string, why: string): void { return this.#records.recordRelayWitnessUnreadable(agentName, relayPeerId, why); }
