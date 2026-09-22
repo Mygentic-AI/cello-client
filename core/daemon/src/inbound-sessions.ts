@@ -1932,8 +1932,27 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       logger.warn("session.outbound.refusal.unusable", { sessionId: sessionIdHex, why: "reason is missing or not a bare code" });
       return;
     }
+    const initiatorPubkey = typeof frame["initiatorPubkey"] === "string" ? frame["initiatorPubkey"].toLowerCase() : null;
     const agentName = streamAgentName ?? sessionNodeManager.findAgentForSession(sessionIdHex);
     if (!agentName) return; // not ours to act on
+    /**
+     * ⚠️ **WE MUST BE THE ONE WHO ASKED.** A refusal answers a session REQUEST, so it may only end a
+     * session this agent INITIATED — never one it accepted. Without this, the same unsigned frame
+     * would let a directory (or anyone who learns a session id and can reach one) end a conversation
+     * that arrived at this agent and was taken, which is the opposite direction of travel from
+     * anything a refusal describes. The `sessions` row records no initiator, so the check is against
+     * the frame's own `initiatorPubkey` and this agent's identity key: a forged frame can then only
+     * name a session WE opened, and the emptiness test below keeps even that to one that never began.
+     */
+    const ourPubkey = agents.find((ag) => ag.name === agentName)?.pubkey?.toLowerCase() ?? null;
+    if (!initiatorPubkey || !ourPubkey || initiatorPubkey !== ourPubkey) {
+      logger.warn("session.outbound.refusal.ignored", {
+        agentName, sessionId: sessionIdHex, reason,
+        why: "this agent is not the initiator named on the refusal",
+        impact: "a refusal answers a request WE made; it can never end a session this agent accepted.",
+      });
+      return;
+    }
     const record = sessionNodeManager.getSessionRecord(agentName, sessionIdHex);
     if (!record || record.status !== "active" || record.message_count > 0) {
       logger.warn("session.outbound.refusal.ignored", {
