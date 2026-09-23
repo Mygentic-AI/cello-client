@@ -43,7 +43,7 @@ the `@cello-protocol/connect` package only (the adapter).
 ## Step 1 — Push the smoke test tag
 
 ```bash
-cd /Users/andrep/Documents/code/cello-client
+cd /Users/andrep/code/cello-client
 git tag v0.0.0-scaffold.1
 git push origin v0.0.0-scaffold.1
 ```
