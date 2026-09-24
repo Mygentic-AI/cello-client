@@ -282,7 +282,14 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // session — in both directions — deadlocked behind the gap. Extracting it here makes it testable;
     // unwired, the join exchange would send frames that vanish from this side's record exactly as
     // before, with nothing failing.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(114);
+    //
+    // 114 → 115 for M16 028-GROUPPUB's `ensureCurrentGroupKey` (channel-join-exchange.ts) — the ONE
+    // mint-or-reuse of a channel's group key, reached by BOTH admitting a member and publishing. It
+    // matches the `ensure` verb and is called from channel-membership-wiring.ts (the encryptor and
+    // the fetch-key path) and from the exchange's own `acceptInto`. Unwired it is silent in this
+    // corpus's own way: publish would fall back to the placeholder that rejects every private post,
+    // which is exactly the defect this order removes.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(115);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",
