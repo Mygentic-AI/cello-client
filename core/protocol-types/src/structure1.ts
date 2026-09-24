@@ -95,8 +95,8 @@ export interface Structure1Fields {
   sessionId: Uint8Array;
   lastSeenSeq: number;
   /**
-   * `number` for a legacy float64 leaf, `bigint` for the canonical uint64 form. Never re-encoded on
-   * a verification path — the signature is over the bytes as received, so both are carried as read.
+   * `number` for a value that fits 32 bits, `bigint` above it (see the encoding rule above). Never
+   * re-encoded on a verification path — the signature is over the bytes as received.
    */
   timestamp: number | bigint;
   /**

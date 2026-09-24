@@ -35,7 +35,7 @@ function shimFingerprint(pubkey: unknown): string {
  * The marker says the name came from its owner rather than from the operator. `whoKnown` is true
  * only when the operator has set a local pet name, so it appears for every contact they have not
  * named — not only new ones. Nothing in the protocol ever verifies a name.
- *  - No `who` at all (old daemon) → shim-side fingerprint of the counterparty key. Never blank.
+ *  - No `who` (the daemon resolved no label) → shim-side fingerprint of the counterparty key. Never blank.
  * Names are NEVER truncated (only fingerprints shorten, by construction).
  */
 function renderWho(data: Record<string, unknown>): string {
@@ -57,10 +57,8 @@ function doorbellText(type: string, data: Record<string, unknown>): string {
       // gets nothing back from cello_receive should already know why. Still content-free: a count of
       // attending sessions is routing metadata and says nothing about what arrived.
       //
-      // An OLDER daemon sends no `attendance` at all, and versions skew by design (CLAUDE.md
-      // forbids pinning, so shim-newer-than-daemon is the expected state, not the exception).
-      // `Number(undefined)` is NaN, so the guard is explicit: absent means "this daemon cannot
-      // tell me", which is not "you are alone" — say nothing rather than assert solitude.
+      // `Number(undefined)` is NaN, so the guard is explicit: a missing or non-numeric count is not
+      // "you are alone" — say nothing rather than assert solitude.
       const raw = data["attendance"];
       const attending = typeof raw === "number" && Number.isFinite(raw) ? raw : null;
       const shared = attending !== null && attending > 1

@@ -758,8 +758,8 @@ export class SignalingManager {
 
     // DOD-AUTH-2: start the background manifest poll now the stream is live. Poll
     // lifecycle = connection lifecycle — stopPolling() is the symmetric call on stream
-    // death below. #schedulePoll is a no-op when no pollScheduler was configured (M6
-    // backward-compat), so this is safe on every connection.
+    // death below. #schedulePoll is a no-op when no pollScheduler was configured (a local
+    // daemon with no consortium manifest), so this is safe on every connection.
     this.startPolling();
 
     await this.waitForStreamDeath();

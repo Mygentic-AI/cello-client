@@ -156,9 +156,8 @@ export function encodeSessionLivenessResponse(frame: SessionLivenessResponse): U
     counterparty_pubkey: frame.counterparty_pubkey,
     liveness: frame.liveness,
     observed_at: frame.observed_at,
-    // The KEY is omitted when there is nothing to say, never written as an explicit undefined: an
-    // older relay omits it entirely, and a build that can be told apart from an older one by the
-    // shape of its silence is a build whose silence means two different things.
+    // The KEY is omitted when there is nothing to say, never written as an explicit undefined, so
+    // silence has one shape.
     ...(frame.attendance !== undefined ? { attendance: frame.attendance } : {}),
     ...(frame.attendance_observed_at !== undefined ? { attendance_observed_at: frame.attendance_observed_at } : {}),
   }) as Uint8Array;

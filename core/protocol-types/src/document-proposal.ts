@@ -25,10 +25,9 @@
  *
  * ── THE FEATURE VERSION (§16.7-8) ─────────────────────────────────────────────────────────────
  *
- * Alpha owes no backward compatibility, so this is not a negotiation — it is the difference
- * between a human answer and a timeout. A peer whose client predates documents does not understand
- * the proposal at all, and without a version the symptom is silence: the proposal is never
- * answered and the operator sees a hang. `documentFeatureIncompatibility` turns that into "your
+ * This is not a negotiation — it is the difference between a human answer and a timeout. A peer
+ * whose client cannot handle the proposal's feature version would otherwise answer with silence:
+ * the proposal is never answered and the operator sees a hang. `documentFeatureIncompatibility` turns that into "your
  * peer's client doesn't support shared documents yet — ask them to upgrade".
  */
 

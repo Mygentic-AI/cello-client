@@ -738,7 +738,7 @@ class CelloNodeImpl implements CelloNode {
     try {
       reservations.get(peerId)?.signal?.abort?.();
     } catch {
-      // An older shape with no signal: the delete below is still correct, there is just no orphan.
+      // An abort that throws must not stop the delete below.
     }
     reservations.delete(peerId);
     return true;

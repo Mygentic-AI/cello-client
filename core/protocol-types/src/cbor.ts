@@ -15,8 +15,8 @@
  * payloads are all ARRAYS and encode identically either way, so signatures do not depend on this;
  * what depends on it is whether a non-cbor-x implementation can read our wire and our seals.
  *
- * Decoding uses cbor-x's `decode`, which reads byte strings, tag-64, and records alike. That
- * tolerance is for data that predates this module — it is not a licence to write a second format.
+ * Decoding uses cbor-x's `decode`, which reads byte strings, tag-64, and records alike. Nothing in
+ * CELLO writes the other two; reading them is the library's default, not a second format.
  */
 import { Encoder, decode } from "cbor-x";
 
@@ -121,7 +121,7 @@ export function encodeCbor(value: unknown): Uint8Array {
   return ENCODER.encode(value) as Uint8Array;
 }
 
-/** Decode CBOR. Tolerates the older tag-64 and record encodings so pre-migration data still reads. */
+/** Decode CBOR. */
 export function decodeCbor(bytes: Uint8Array): unknown {
   return decode(bytes);
 }

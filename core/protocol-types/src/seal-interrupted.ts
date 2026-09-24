@@ -57,11 +57,8 @@ export interface SealInterruptedRequest {
   counterpartyPubkey: string;
   leafCountAtInterruption: number;
   /**
-   * Hex-encoded Merkle root the initiator computed at interruption. The
-   * initiator's client (the holder of the session Merkle tree) supplies this;
-   * the daemon itself does not compute Merkle roots. Carried so the counterparty
-   * co-signs over the same root. Empty string when the initiator's client did not
-   * supply one (the bilateral commitment then binds leafCount only).
+   * Hex-encoded root of the SIGNER's own session tree at interruption. Each side
+   * signs its own tree's root; the responder never signs the one the initiator sent.
    */
   merkleRootAtInterruption: string;
   /**
