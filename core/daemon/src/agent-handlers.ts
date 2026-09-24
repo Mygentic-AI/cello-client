@@ -113,7 +113,8 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
       // Runtime-add: make the agent immediately registrable/usable (the register handler resolves
       // identity from keyProviders/loadedAgents; per-agent signaling is created lazily on register).
       keyProviders.set(name, keyProvider);
-      const loaded: LoadedAgent = { name, pubkey: pubkeyHex, keyProvider };
+      // M9D 002-PQKEYS: a freshly created agent has no post-quantum identity yet — registration mints it.
+      const loaded: LoadedAgent = { name, pubkey: pubkeyHex, keyProvider, mlDsaProvider: null, mlKemSeed: null };
       loadedAgents.push(loaded);
       // The LOAD outcome, not the operator-facing state — that is derived per call by
       // resolveAgentState. This agent has just been created and has no FROST share, so it derives as

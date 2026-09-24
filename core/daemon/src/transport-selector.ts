@@ -41,7 +41,9 @@
  *   return {ok:true, 'relay', dcutrSettled}             // dial does NOT await dcutr
  */
 
-import type { SessionAssignment } from "@cello-protocol/protocol-types";
+// M9D 002-PQKEYS: the transport layer handles the PARSED assignment — it reads only session, relay
+// and endpoint fields, never the per-party key fields, which assignment-verify.ts judges.
+import type { ParsedSessionAssignment } from "./session-assignment-parser.js";
 import type { Logger } from "./types.js";
 import type { Dialability } from "@cello-protocol/transport";
 import { extractErrorMessage } from "./error-message.js";
@@ -101,7 +103,7 @@ export interface TransportDialOptions {
  * the composition root when CELLO_ENV is 'local'|'test').
  */
 export interface ITransportSelector {
-  dial(assignment: SessionAssignment, opts: TransportDialOptions): Promise<TransportResult>;
+  dial(assignment: ParsedSessionAssignment, opts: TransportDialOptions): Promise<TransportResult>;
 }
 
 // ─── SessionNegotiator (the WIRE-001/SIGNAL-001 seam) ─────────────────────────
@@ -126,7 +128,7 @@ export interface SessionNegotiationContext {
 export type SessionNegotiationResult =
   | {
       ok: true;
-      assignment: SessionAssignment;
+      assignment: ParsedSessionAssignment;
       /**
        * 038-KEYBIND. The COUNTERPARTY's FROST group public key, hex — the value the initiator
        * records so a responder-first seal can be verified locally instead of accepted
@@ -140,6 +142,10 @@ export type SessionNegotiationResult =
        * must not be reachable from an unchecked field.
        */
       counterpartyPrimaryHex: string;
+      /** M9D 002-PQKEYS: the counterparty's ML-DSA key, hex — only ever from a verified v2 binding. */
+      counterpartyMlDsaHex: string;
+      /** M9D 002-PQKEYS: the counterparty's ML-KEM key, hex — only ever from a verified v2 binding. */
+      counterpartyMlKemHex: string;
     }
   | { ok: false; reason: string; guidance: string };
 
@@ -173,14 +179,14 @@ export interface TransportDialer {
    * registry (populated during directory connection) — NOT parsed from the
    * assignment's address fields, and available regardless of transport_mode (AC-006).
    */
-  relayCircuitAddr(assignment: SessionAssignment): string;
+  relayCircuitAddr(assignment: ParsedSessionAssignment): string;
   /** Attempt a dcutr hole-punch upgrade. Throws on failure (non-fatal — SI-003). */
   attemptDcutr(peerId: string | undefined): Promise<void>;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function sessionIdHex(assignment: SessionAssignment): string {
+function sessionIdHex(assignment: ParsedSessionAssignment): string {
   return Buffer.from(assignment.session_id).toString("hex");
 }
 
@@ -206,7 +212,7 @@ export class TransportSelector implements ITransportSelector {
   }
 
   async dial(
-    assignment: SessionAssignment,
+    assignment: ParsedSessionAssignment,
     opts: TransportDialOptions,
   ): Promise<TransportResult> {
     const sessionId = sessionIdHex(assignment);
@@ -315,7 +321,7 @@ export class LocalTransportSelectorStub implements ITransportSelector {
       result ?? { ok: true, mode: "relay", dcutrSettled: Promise.resolve(false) };
   }
 
-  async dial(_assignment: SessionAssignment, _opts: TransportDialOptions): Promise<TransportResult> {
+  async dial(_assignment: ParsedSessionAssignment, _opts: TransportDialOptions): Promise<TransportResult> {
     return this.#result;
   }
 

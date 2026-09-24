@@ -119,45 +119,54 @@ export interface SessionAssignmentFrost extends SessionAssignmentCommon {
   signer_pubkey: Uint8Array; // 32-byte FROST group public key — required for 'frost'
 
   /**
-   * 038-KEYBIND — the three fields that let each party PLACE the other's group key.
+   * 038-KEYBIND, extended by M9D 002-PQKEYS — the fields that let each party PLACE the other's keys:
+   * the group key (seal trust anchor), the ML-DSA key (post-quantum signature twin) and the ML-KEM key
+   * (what content sealed to that party is encapsulated to).
    *
-   * ⚠️ `?` HERE IS A PARSE CONCERN, NOT A TOLERATED SHAPE. A current directory always sends all
-   * three, and the verifiers REFUSE by name when one is absent (`inbound_assignment_no_key_binding`
-   * / `assignment_counterparty_binding_absent`). They are optional in the TYPE only so an absent
-   * value survives parsing far enough to be refused for what it is, instead of collapsing into
-   * "the assignment was malformed" — which is the one message an operator cannot act on. There is
-   * no code path that proceeds without them.
+   * ALL REQUIRED. A directory that cannot fill one refuses to broker (`counterparty_keys_unavailable`).
+   * The type cannot stop a hostile directory sending a frame without one, so the verifiers still
+   * check presence at runtime and refuse BY NAME — `verifyKeyBinding` returns `key_binding_missing`
+   * / `key_binding_pq_missing` before it looks at anything else, instead of collapsing into "the
+   * assignment was malformed", the one message an operator cannot act on. There is no code path that
+   * proceeds without them.
    *
    * ─── Why they are safe to carry outside the directory's signature ────────────────────────────
    *
    * Every other unsigned field on this frame is a liability: a MITM can change it and nothing
-   * breaks. These are the opposite. Each is a signature by a participant's own K_local, so its
-   * integrity does not rest on the carrier at all — a directory that alters one produces a binding
-   * that fails verification, and a directory that strips one produces a refusal. That is what makes
-   * the carrier untrusted BY CONSTRUCTION rather than by policy.
+   * breaks. These are the opposite. Each binding is signed by a participant's own K_local AND ML-DSA
+   * key over all four of that participant's keys (`buildKeyBindingTbs`), so a directory that alters
+   * any key or signature produces a binding that fails verification, and one that strips a field
+   * produces a refusal.
+   *
+   * ⚠️ WHAT THIS DOES NOT COVER, said plainly: the ML-DSA half is checked under the ML-DSA key the
+   * same binding introduces, so against a quantum attacker who can forge K_local's Ed25519 signature
+   * the binding is self-certifying. `007-PQBUNDLE` closes that by putting a digest of both parties'
+   * keys into the establishment statement FROST and T directories sign.
    */
 
-  /**
-   * 64-byte Ed25519 signature by `participant_a`'s K_local over
-   * (`participant_a.pubkey`, `signer_pubkey`). The RESPONDER verifies this before it will verify
-   * the assignment's threshold signature, which is what stops the signature being checked against
-   * a key the same frame supplied.
-   */
-  participant_a_key_binding?: Uint8Array;
+  /** 64-byte Ed25519 signature by `participant_a`'s K_local over participant_a's v2 binding TBS. */
+  participant_a_key_binding: Uint8Array;
+  /** 2420-byte ML-DSA-44 signature by participant_a's ML-DSA key over the same TBS. */
+  participant_a_key_binding_pq: Uint8Array;
+  /** participant_a's 1312-byte ML-DSA-44 public key. */
+  participant_a_ml_dsa_pubkey: Uint8Array;
+  /** participant_a's 1184-byte ML-KEM-768 public key. */
+  participant_a_ml_kem_pubkey: Uint8Array;
 
   /**
    * `participant_b`'s 32-byte FROST group public key. Carried so the INITIATOR learns the
    * responder's group key too — without it a responder-first seal reaches the initiator signed by a
    * key it does not hold, and is accepted `verified:false` / `signer_key_not_held`.
    */
-  participant_b_primary_pubkey?: Uint8Array;
-
-  /**
-   * 64-byte Ed25519 signature by `participant_b`'s K_local over
-   * (`participant_b.pubkey`, `participant_b_primary_pubkey`). The INITIATOR verifies this before
-   * recording the responder's group key as the seal trust anchor.
-   */
-  participant_b_key_binding?: Uint8Array;
+  participant_b_primary_pubkey: Uint8Array;
+  /** 64-byte Ed25519 signature by `participant_b`'s K_local over participant_b's v2 binding TBS. */
+  participant_b_key_binding: Uint8Array;
+  /** 2420-byte ML-DSA-44 signature by participant_b's ML-DSA key over the same TBS. */
+  participant_b_key_binding_pq: Uint8Array;
+  /** participant_b's 1312-byte ML-DSA-44 public key. */
+  participant_b_ml_dsa_pubkey: Uint8Array;
+  /** participant_b's 1184-byte ML-KEM-768 public key. */
+  participant_b_ml_kem_pubkey: Uint8Array;
 }
 
 /**

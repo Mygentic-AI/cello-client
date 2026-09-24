@@ -2,7 +2,7 @@
  * RegistrationManager — REG-001, ML-DSA keygen, DKG (daemon port).
  *
  * Ported from cello-client's RegistrationManager. Owns registration domain
- * state (#registrationState, #mlDsaProvider). The only adaptation vs the client
+ * state (#registrationState, #pqIdentity). The only adaptation vs the client
  * is the signaling seam: the client wrote directly to a raw persistent libp2p
  * Stream, whereas the daemon's directory signaling lives behind SignalingManager.
  * So RegistrationContext exposes `sendSignalingFrame` (→ SignalingManager.sendRaw,
@@ -14,7 +14,10 @@
 
 import { randomUUID } from "node:crypto";
 import { encodeCbor } from "@cello-protocol/protocol-types";
-import { mlDsaGenerateSeed, mlDsaProviderFromSeed, buildKeyBindingTbs } from "@cello-protocol/crypto";
+import {
+  mlDsaGenerateSeed, mlDsaProviderFromSeed, mlKemGenerateSeed, mlKemKeypairFromSeed,
+  buildKeyBindingTbs, signMlDsa, ML_DSA_SEED_BYTES, ML_KEM_SEED_BYTES,
+} from "@cello-protocol/crypto";
 import type { IThresholdSigner, MlDsaKeyProvider } from "@cello-protocol/crypto";
 import type { RegistrationState } from "@cello-protocol/protocol-types";
 import { NetworkDirectoryNode, runNetworkDkg } from "./network-directory-node.js";
@@ -43,7 +46,12 @@ export interface SignalingSendResult {
 export interface RegistrationContext {
   readonly keyProvider: KeyProvider;
   readonly logger: Logger;
-  readonly persistence: DaemonRegistrationPersistence | null;
+  /**
+   * REQUIRED (M9D 002-PQKEYS). A registration whose post-quantum seeds are not persisted would leave
+   * the directory holding public keys this agent can never use again after a restart, so there is no
+   * registration without persistence — the no-persistence branch is deleted.
+   */
+  readonly persistence: DaemonRegistrationPersistence;
   /**
    * The live directory-facing libp2p node FROST DKG opens streams on. May be
    * null even when signaling reads connected (brief stream-death window) — the
@@ -98,12 +106,30 @@ export interface ChannelRegistrationOpts {
 
 const ADMIN_PUBKEY_HEX_RE = /^[0-9a-f]{64}$/;
 
+/**
+ * M9D 002-PQKEYS: an agent's post-quantum identity in memory — the ML-DSA signing key and the ML-KEM
+ * seed. Held by the manager after a registration so the daemon can sign and decapsulate without a
+ * restart; loaded from the `agents` row at boot otherwise (agent-loader.ts).
+ */
+export interface PqIdentity {
+  mlDsaProvider: MlDsaKeyProvider;
+  mlKemSeed: Uint8Array;
+}
+
+/** The post-quantum identity plus its public keys, as this registration uses them. */
+interface PqKeys extends PqIdentity {
+  mlDsaPubkey: Uint8Array;
+  mlKemPubkey: Uint8Array;
+  mlDsaPubkeyHex: string;
+  mlKemPubkeyHex: string;
+}
+
 export class RegistrationManager {
   readonly #ctx: RegistrationContext;
 
   // Registration state owned by this manager
   #registrationState: RegistrationState | null = null;
-  #mlDsaProvider: MlDsaKeyProvider | null = null;
+  #pqIdentity: PqIdentity | null = null;
 
   constructor(ctx: RegistrationContext) {
     this.#ctx = ctx;
@@ -119,12 +145,9 @@ export class RegistrationManager {
     this.#registrationState = state;
   }
 
-  getMlDsaProvider(): MlDsaKeyProvider | null {
-    return this.#mlDsaProvider;
-  }
-
-  setMlDsaProvider(provider: MlDsaKeyProvider | null): void {
-    this.#mlDsaProvider = provider;
+  /** M9D 002-PQKEYS: the post-quantum identity, once `register()` has succeeded. */
+  getPqIdentity(): PqIdentity | null {
+    return this.#pqIdentity;
   }
 
   /**
@@ -147,34 +170,126 @@ export class RegistrationManager {
   }
 
   /**
-   * The awaited identity-persist operations for a successful registration: the ML-DSA keypair (only
-   * when its secret blob is available) and ALWAYS the registration state. Registration state is never
-   * gated on the ml-dsa blob — so an agent is never left durably-unregistered when the blob is absent.
-   * Requires `this.#ctx.persistence` to be present (callers check).
+   * The awaited registration-state persist for a successful registration. The post-quantum seeds are
+   * NOT here: they were persisted before `register_request` was sent (`#loadOrMintPqKeys`), so the
+   * directory can never hold public keys whose secrets this machine failed to keep.
    */
   #identityPersistOps(
     state: RegistrationState,
-    mlDsaPubkeyHex: string,
-    mlDsaSecretKeyBlob: Uint8Array | null,
-    keyBinding: string,
+    binding: { keyBinding: string; keyBindingPq: string },
     channelOpts: ChannelRegistrationOpts | undefined,
   ): Array<() => Promise<void>> {
-    const persistence = this.#ctx.persistence!;
-    const ops: Array<() => Promise<void>> = [];
-    if (mlDsaSecretKeyBlob) {
-      ops.push(() => persistence.persistMlDsaKeypair({ mlDsaPubkey: mlDsaPubkeyHex, secretKeyBlob: mlDsaSecretKeyBlob }));
-    }
-    ops.push(() => persistence.persistRegistrationState({
+    const persistence = this.#ctx.persistence;
+    return [() => persistence.persistRegistrationState({
       agentId: state.agent_id,
       primaryPubkey: state.primary_pubkey,
       mlDsaPubkey: state.ml_dsa_pubkey,
+      mlKemPubkey: state.ml_kem_pubkey,
       registeredAt: state.registered_at,
-      keyBinding,
+      keyBinding: binding.keyBinding,
+      keyBindingPq: binding.keyBindingPq,
       // Only ever reached after #channelEchoed passed, so a persisted channel is one the directory
       // recorded as a channel.
       ...(channelOpts ? { channel: true, adminPubkey: channelOpts.adminPubkeyHex } : {}),
-    }));
-    return ops;
+    })];
+  }
+
+  /**
+   * M9D 002-PQKEYS — the post-quantum identity this registration presents, persisted FIRST.
+   *
+   * Reuses the seeds a previous attempt persisted (a retried registration must present the same public
+   * keys, or the directory could end up holding a profile for keys this row does not hold). Mints both
+   * only when neither is stored. ONE stored without the other is a fault — the row was written
+   * half-way by something — and it fails loud: minting the missing half would pair it with a key this
+   * machine may already have registered.
+   *
+   * Mirrors K_local, which is persisted at agent creation, before any registration.
+   */
+  async #loadOrMintPqKeys(
+    correlationId: string,
+    kLocalPubkeyHex: string,
+  ): Promise<{ ok: true; keys: PqKeys } | { ok: false; error: string; detail: string }> {
+    const refuse = (reason: string, detail: string) => {
+      this.#ctx.logger.error("registration.pq_keys.refused", { agentPubkey: kLocalPubkeyHex, reason, correlationId });
+      return { ok: false as const, error: "pq_keys_not_persisted", detail };
+    };
+    let stored;
+    try {
+      stored = await this.#ctx.persistence.loadPqIdentity();
+    } catch (err: unknown) {
+      return refuse("pq_identity_unreadable", `This agent's stored post-quantum keys could not be read: ${extractErrorMessage(err)}. Nothing was sent to the directory.`);
+    }
+    const hasDsa = stored.mlDsaSeed !== null;
+    const hasKem = stored.mlKemSeed !== null;
+    if (hasDsa !== hasKem) {
+      return refuse(
+        "pq_identity_incomplete",
+        `This agent's row holds an ${hasDsa ? "ML-DSA" : "ML-KEM"} seed but no ${hasDsa ? "ML-KEM" : "ML-DSA"} seed, so it cannot register without pairing a new key with one it may already have presented. Nothing was sent. Remove this agent and create a new one.`,
+      );
+    }
+    let mlDsaSeed: Uint8Array;
+    let mlKemSeed: Uint8Array;
+    let minted = false;
+    if (hasDsa && hasKem) {
+      mlDsaSeed = stored.mlDsaSeed!;
+      mlKemSeed = stored.mlKemSeed!;
+      if (mlDsaSeed.length !== ML_DSA_SEED_BYTES || mlKemSeed.length !== ML_KEM_SEED_BYTES) {
+        return refuse(
+          "pq_identity_invalid",
+          `This agent's stored post-quantum seeds have the wrong width (ML-DSA ${mlDsaSeed.length} of ${ML_DSA_SEED_BYTES}, ML-KEM ${mlKemSeed.length} of ${ML_KEM_SEED_BYTES} bytes). Nothing was sent. Remove this agent and create a new one.`,
+        );
+      }
+    } else {
+      mlDsaSeed = mlDsaGenerateSeed();
+      mlKemSeed = mlKemGenerateSeed();
+      minted = true;
+    }
+    const mlDsaProvider = await mlDsaProviderFromSeed(mlDsaSeed);
+    const mlDsaPubkey = await mlDsaProvider.getPublicKey();
+    const { publicKey: mlKemPubkey } = await mlKemKeypairFromSeed(mlKemSeed);
+    const keys: PqKeys = {
+      mlDsaProvider, mlKemSeed, mlDsaPubkey, mlKemPubkey,
+      mlDsaPubkeyHex: Buffer.from(mlDsaPubkey).toString("hex"),
+      mlKemPubkeyHex: Buffer.from(mlKemPubkey).toString("hex"),
+    };
+    if (minted) {
+      try {
+        await this.#ctx.persistence.persistPqIdentity({
+          mlDsaSeed, mlDsaPubkey: keys.mlDsaPubkeyHex, mlKemSeed, mlKemPubkey: keys.mlKemPubkeyHex,
+        });
+      } catch (err: unknown) {
+        const message = extractErrorMessage(err);
+        const reason = message.startsWith("ml_kem_persist_failed") ? "ml_kem_persist_failed" : "ml_dsa_persist_failed";
+        return refuse(
+          reason,
+          `This agent's post-quantum keys could not be saved (${message}), so registration was not attempted: the directory would have stored public keys this machine could not use after a restart. Check the daemon's database, then retry.`,
+        );
+      }
+    }
+    return { ok: true, keys };
+  }
+
+  /**
+   * M9D 002-PQKEYS — an `already_registered` answer names the keys the directory HOLDS for this agent.
+   * They must be the ones this row holds: keys are fixed at registration, so a directory profile with
+   * other PQ keys is one this agent cannot sign or decrypt for, and accepting it would record a
+   * registration that is unusable. Returns null when they match, or the error to return verbatim.
+   */
+  #echoedPqKeysMismatch(frame: Record<string, unknown>, keys: PqKeys, kLocalPubkeyHex: string): { error: string; detail: string } | null {
+    const dsa = typeof frame["ml_dsa_pubkey"] === "string" ? frame["ml_dsa_pubkey"].toLowerCase() : null;
+    const kem = typeof frame["ml_kem_pubkey"] === "string" ? frame["ml_kem_pubkey"].toLowerCase() : null;
+    if (dsa === keys.mlDsaPubkeyHex && kem === keys.mlKemPubkeyHex) return null;
+    this.#ctx.logger.error("registration.pq_keys.mismatch", {
+      agentPubkey: kLocalPubkeyHex,
+      dsaMatches: dsa === keys.mlDsaPubkeyHex,
+      kemMatches: kem === keys.mlKemPubkeyHex,
+      impact: "the directory already holds a profile for this agent under post-quantum keys this machine does not hold; nothing was persisted, because the registration could not sign or decrypt post-quantum",
+    });
+    return {
+      error: "registration_pq_keys_mismatch",
+      detail:
+        "The directory already holds this agent under post-quantum keys this machine does not have — most likely it was registered from another device or before a reset. Nothing was saved. Use the device that registered it, or create a new agent.",
+    };
   }
 
   /**
@@ -236,12 +351,22 @@ export class RegistrationManager {
    * value to the counterparty and cannot forge it, cannot swap it, and cannot lift it onto another
    * identity — the signed bytes name the K_local it belongs to as well as the group key.
    */
-  async #mintKeyBinding(kLocalPubkeyHex: string, primaryPubkeyHex: string): Promise<string> {
-    const tbs = buildKeyBindingTbs(
-      new Uint8Array(Buffer.from(kLocalPubkeyHex, "hex")),
-      new Uint8Array(Buffer.from(primaryPubkeyHex, "hex")),
-    );
-    return Buffer.from(await this.#ctx.keyProvider.sign(tbs)).toString("hex");
+  async #mintKeyBinding(
+    kLocalPubkeyHex: string,
+    primaryPubkeyHex: string,
+    keys: PqKeys,
+  ): Promise<{ keyBinding: string; keyBindingPq: string }> {
+    // M9D 002-PQKEYS: ONE TBS naming all four keys, signed by BOTH K_local and the ML-DSA key.
+    const tbs = buildKeyBindingTbs({
+      kLocal: new Uint8Array(Buffer.from(kLocalPubkeyHex, "hex")),
+      group: new Uint8Array(Buffer.from(primaryPubkeyHex, "hex")),
+      mlDsa: keys.mlDsaPubkey,
+      mlKem: keys.mlKemPubkey,
+    });
+    return {
+      keyBinding: Buffer.from(await this.#ctx.keyProvider.sign(tbs)).toString("hex"),
+      keyBindingPq: Buffer.from(await signMlDsa(keys.mlDsaProvider, "cello-mldsa-key-binding-v1", tbs)).toString("hex"),
+    };
   }
 
   /**
@@ -266,8 +391,9 @@ export class RegistrationManager {
   async #mintCorroboratedKeyBinding(
     kLocalPubkeyHex: string,
     answeredPrimaryHex: string,
-  ): Promise<{ ok: true; keyBinding: string } | { ok: false; error: string; detail: string }> {
-    const share = await this.#ctx.persistence?.loadActiveFrostKeyShare();
+    keys: PqKeys,
+  ): Promise<{ ok: true; keyBinding: string; keyBindingPq: string } | { ok: false; error: string; detail: string }> {
+    const share = await this.#ctx.persistence.loadActiveFrostKeyShare();
     if (!share) {
       this.#ctx.logger.error("registration.key_binding.no_share", {
         agentPubkey: kLocalPubkeyHex,
@@ -294,12 +420,13 @@ export class RegistrationManager {
           "The directory named a different threshold key for this agent than the one its signing share belongs to. Nothing was saved. Retry registration; if it repeats, the node that answered is serving a profile that does not match this agent and cello status will show which one it was.",
       };
     }
-    return { ok: true, keyBinding: await this.#mintKeyBinding(kLocalPubkeyHex, answeredPrimaryHex) };
+    return { ok: true, ...(await this.#mintKeyBinding(kLocalPubkeyHex, answeredPrimaryHex, keys)) };
   }
 
   /**
    * Register this agent with the directory.
-   * REG-001: ML-DSA keygen → signaling stream → register_request → DKG → register_success.
+   * REG-001: PQ keys (load or mint, persisted FIRST) → signaling stream → register_request → DKG →
+   * dkg_complete (v2 binding, both signatures) → register_success.
    */
   async register(
     phoneStub: string = "",
@@ -311,13 +438,6 @@ export class RegistrationManager {
       return { error: "already_registered" };
     }
     const correlationId = randomUUID();
-
-    // Step 2: generate the ML-DSA-44 key. The persisted secret is its 32-byte seed (M9D Contract 1).
-    const mlDsaSeed = mlDsaGenerateSeed();
-    const mlDsaProvider: MlDsaKeyProvider = await mlDsaProviderFromSeed(mlDsaSeed);
-    const mlDsaSecretKeyBlob: Uint8Array | null = this.#ctx.persistence ? mlDsaSeed : null;
-    const mlDsaPubkey = await mlDsaProvider.getPublicKey();
-    const mlDsaPubkeyHex = Buffer.from(mlDsaPubkey).toString("hex");
 
     // Step 3: require the directory signaling stream to be connected.
     // (The daemon keeps it connected via SignalingManager; we don't open it here.)
@@ -331,6 +451,12 @@ export class RegistrationManager {
       this.#ctx.setMyPubkeyHex(Buffer.from(pubkey).toString("hex"));
     }
     const kLocalPubkeyHex = this.#ctx.getMyPubkeyHex()!;
+
+    // Step 4b (M9D 002-PQKEYS): the post-quantum identity, loaded or minted, and PERSISTED before
+    // anything is sent. A failure here sends nothing.
+    const pq = await this.#loadOrMintPqKeys(correlationId, kLocalPubkeyHex);
+    if (!pq.ok) return { error: pq.error, detail: pq.detail };
+    const keys = pq.keys;
 
     // Step 4a (M16): a channel names its administrator, and cannot administer itself. Refused
     // before anything reaches the directory.
@@ -359,7 +485,8 @@ export class RegistrationManager {
       type: "register_request",
       phone_stub: phoneStub,
       k_local_pubkey: kLocalPubkeyHex,
-      ml_dsa_pubkey: mlDsaPubkeyHex,
+      ml_dsa_pubkey: keys.mlDsaPubkeyHex,
+      ml_kem_pubkey: keys.mlKemPubkeyHex,
       ...(reachableNodeIds ? { reachable_node_ids: reachableNodeIds } : {}),
       // M16: present only for a channel. An ordinary registration carries neither key — absent
       // means not a channel, and there is no `channel: false` on the wire.
@@ -400,29 +527,28 @@ export class RegistrationManager {
         dkgReadyFrame["agent_id"] &&
         dkgReadyFrame["primary_pubkey"]
       ) {
+        const pqMismatch = this.#echoedPqKeysMismatch(dkgReadyFrame, keys, kLocalPubkeyHex);
+        if (pqMismatch) return pqMismatch;
         const state: RegistrationState = {
           agent_id: dkgReadyFrame["agent_id"] as string,
           primary_pubkey: dkgReadyFrame["primary_pubkey"] as string,
-          ml_dsa_pubkey: (dkgReadyFrame["ml_dsa_pubkey"] as string | undefined) ?? mlDsaPubkeyHex,
+          ml_dsa_pubkey: keys.mlDsaPubkeyHex,
+          ml_kem_pubkey: keys.mlKemPubkeyHex,
           registered_at: Date.now(),
           status: "active",
         };
         const echo = this.#channelEchoed(channelOpts, dkgReadyFrame, correlationId, kLocalPubkeyHex);
         if (echo) return echo;
         // SI-003: persist BEFORE caching the in-memory registered state, so a persist failure does
-        // not leave a phantom "registered" manager (which would short-circuit a retry). Registration
-        // state is persisted whenever persistence is present — NOT gated on the ml-dsa blob (so an
-        // already_registered agent is never left durably-unregistered when the blob is absent).
-        if (this.#ctx.persistence) {
-          // 038-KEYBIND: no ceremony runs on this path, so the group key comes from the directory's
-          // reply — checked against this machine's own share before K_local signs over it (F4).
-          const minted = await this.#mintCorroboratedKeyBinding(kLocalPubkeyHex, state.primary_pubkey);
-          if (!minted.ok) return { error: minted.error, detail: minted.detail };
-          const ok = await this.#persistAll(this.#identityPersistOps(state, mlDsaPubkeyHex, mlDsaSecretKeyBlob, minted.keyBinding, channelOpts));
-          if (!ok) return { error: "identity_persist_failed" };
-        }
+        // not leave a phantom "registered" manager (which would short-circuit a retry).
+        // 038-KEYBIND: no ceremony runs on this path, so the group key comes from the directory's
+        // reply — checked against this machine's own share before K_local signs over it (F4).
+        const minted = await this.#mintCorroboratedKeyBinding(kLocalPubkeyHex, state.primary_pubkey, keys);
+        if (!minted.ok) return { error: minted.error, detail: minted.detail };
+        const ok = await this.#persistAll(this.#identityPersistOps(state, minted, channelOpts));
+        if (!ok) return { error: "identity_persist_failed" };
         this.#registrationState = state;
-        this.#mlDsaProvider = mlDsaProvider;
+        this.#pqIdentity = { mlDsaProvider: keys.mlDsaProvider, mlKemSeed: keys.mlKemSeed };
         return state;
       }
       return { error: reason };
@@ -531,7 +657,7 @@ export class RegistrationManager {
       dkgPrimaryPubkeyHex = Buffer.from(dkgResult.primaryPubkey).toString("hex");
       this.#ctx.setThresholdSigner(dkgResult.signer);
       this.#ctx.setMyPrimaryPubkey(new Uint8Array(dkgResult.primaryPubkey));
-      if (this.#ctx.persistence) {
+      {
         shareToPersist = {
           epochId,
           primaryPubkey: dkgPrimaryPubkeyHex,
@@ -574,7 +700,7 @@ export class RegistrationManager {
     }
     // SI-003/AC-005: AWAIT the share persist (was fire-and-forget) before register reports success —
     // so a register-success guarantees the share is durably committed (no can't-sign zombie).
-    if (shareToPersist && this.#ctx.persistence) {
+    if (shareToPersist) {
       const persistence = this.#ctx.persistence;
       const share = shareToPersist;
       const ok = await this.#persistAll([() => persistence.persistFrostKeyShare(share)]);
@@ -593,13 +719,15 @@ export class RegistrationManager {
      * It rides on `dkg_complete` rather than in a frame of its own so the directory can never hold
      * a group key it has no binding for: one frame, both values, or neither.
      */
-    const keyBinding = await this.#mintKeyBinding(kLocalPubkeyHex, dkgPrimaryPubkeyHex);
+    const binding = await this.#mintKeyBinding(kLocalPubkeyHex, dkgPrimaryPubkeyHex, keys);
 
-    // Step 5c: send dkg_complete (SignalingManager CBOR/lp-encodes the frame)
+    // Step 5c: send dkg_complete (SignalingManager CBOR/lp-encodes the frame). M9D 002-PQKEYS: both
+    // halves of the v2 binding — the directory refuses the registration unless both verify.
     const dkgSent = await this.#ctx.sendSignalingFrame({
       type: "dkg_complete",
       primary_pubkey: dkgPrimaryPubkeyHex,
-      key_binding: keyBinding,
+      key_binding: binding.keyBinding,
+      key_binding_pq: binding.keyBindingPq,
     });
     if (!dkgSent.ok) {
       return { error: dkgSent.reason ?? "directory_unreachable" };
@@ -628,28 +756,29 @@ export class RegistrationManager {
         responseWithTimeout["agent_id"] &&
         responseWithTimeout["primary_pubkey"]
       ) {
+        const pqMismatch = this.#echoedPqKeysMismatch(responseWithTimeout, keys, kLocalPubkeyHex);
+        if (pqMismatch) return pqMismatch;
         const state: RegistrationState = {
           agent_id: responseWithTimeout["agent_id"] as string,
           primary_pubkey: responseWithTimeout["primary_pubkey"] as string,
-          ml_dsa_pubkey: (responseWithTimeout["ml_dsa_pubkey"] as string | undefined) ?? mlDsaPubkeyHex,
+          ml_dsa_pubkey: keys.mlDsaPubkeyHex,
+          ml_kem_pubkey: keys.mlKemPubkeyHex,
           registered_at: Date.now(),
           status: "active",
         };
         const echo = this.#channelEchoed(channelOpts, responseWithTimeout, correlationId, kLocalPubkeyHex);
         if (echo) return echo;
         // SI-003: persist before caching the registered state (see the dkg_ready branch).
-        if (this.#ctx.persistence) {
-          // 038-KEYBIND: the DKG ran, but the directory already held a profile and answered with
-          // ITS key. Checked against this machine's own share before signing over it (F4) — an
-          // answer that disagrees with the share is a directory contradicting the ceremony, not a
-          // more authoritative value.
-          const minted = await this.#mintCorroboratedKeyBinding(kLocalPubkeyHex, state.primary_pubkey);
-          if (!minted.ok) return { error: minted.error, detail: minted.detail };
-          const ok = await this.#persistAll(this.#identityPersistOps(state, mlDsaPubkeyHex, mlDsaSecretKeyBlob, minted.keyBinding, channelOpts));
-          if (!ok) return { error: "identity_persist_failed" };
-        }
+        // 038-KEYBIND: the DKG ran, but the directory already held a profile and answered with
+        // ITS key. Checked against this machine's own share before signing over it (F4) — an
+        // answer that disagrees with the share is a directory contradicting the ceremony, not a
+        // more authoritative value.
+        const minted = await this.#mintCorroboratedKeyBinding(kLocalPubkeyHex, state.primary_pubkey, keys);
+        if (!minted.ok) return { error: minted.error, detail: minted.detail };
+        const ok = await this.#persistAll(this.#identityPersistOps(state, minted, channelOpts));
+        if (!ok) return { error: "identity_persist_failed" };
         this.#registrationState = state;
-        this.#mlDsaProvider = mlDsaProvider;
+        this.#pqIdentity = { mlDsaProvider: keys.mlDsaProvider, mlKemSeed: keys.mlKemSeed };
         return state;
       }
       return { error: reason };
@@ -698,20 +827,17 @@ export class RegistrationManager {
     const state: RegistrationState = {
       agent_id: agentId,
       primary_pubkey: primaryPubkey,
-      ml_dsa_pubkey: mlDsaPubkeyHex,
+      ml_dsa_pubkey: keys.mlDsaPubkeyHex,
+      ml_kem_pubkey: keys.mlKemPubkeyHex,
       registered_at: Date.now(),
       status: "active",
     };
     // SI-003: AWAIT the final identity persists before reporting success, and cache the registered
     // state only after they commit — a register-success guarantees a durable identity row.
-    if (this.#ctx.persistence) {
-      const ok = await this.#persistAll(this.#identityPersistOps(
-        state, mlDsaPubkeyHex, mlDsaSecretKeyBlob, keyBinding, channelOpts,
-      ));
-      if (!ok) return { error: "identity_persist_failed" };
-    }
+    const ok = await this.#persistAll(this.#identityPersistOps(state, binding, channelOpts));
+    if (!ok) return { error: "identity_persist_failed" };
     this.#registrationState = state;
-    this.#mlDsaProvider = mlDsaProvider;
+    this.#pqIdentity = { mlDsaProvider: keys.mlDsaProvider, mlKemSeed: keys.mlKemSeed };
     // M16 024-CREATE: a channel registration comes back with the two relays the directory picked
     // from its pool. Nobody typed them; the client records exactly these. Filtered to strings so a
     // malformed echo cannot smuggle a non-multiaddr into the channel's relay list.

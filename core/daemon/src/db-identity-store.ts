@@ -19,10 +19,12 @@ import { MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
 import { checkChannelFacts } from "./registration-persistence.js";
+import { extractErrorMessage } from "./error-message.js";
 import type {
   DaemonRegistrationPersistence,
   RegistrationStateRecord,
-  MlDsaKeypairRecord,
+  PqIdentityRecord,
+  StoredPqIdentity,
   FrostKeyShareRecord,
   AgentUserLinkRecord,
 } from "./registration-persistence.js";
@@ -45,10 +47,14 @@ const CREATE_AGENTS_SQL = `
     k_local_pubkey         TEXT NOT NULL,
     -- lifecycle: 'created' (K_local exists, not yet registered) | 'registered' | 'retired'.
     state                  TEXT NOT NULL DEFAULT 'created',
-    -- ML-DSA keypair.
+    -- ML-DSA-44 identity. ml_dsa_secret holds the 32-byte FIPS 204 SEED (M9D 002-PQKEYS), never the
+    -- 2,560-byte expanded key. Written before register_request is sent; never regenerated.
     ml_dsa_pubkey          TEXT,
     ml_dsa_secret          BLOB,
     ml_dsa_algorithm       TEXT,
+    -- M9D 002-PQKEYS: ML-KEM-768 identity — the 64-byte FIPS 203 seed and its public key. Same rules.
+    ml_kem_seed            BLOB,
+    ml_kem_pubkey          TEXT,
     -- FROST signing share.
     frost_epoch_id         TEXT,
     frost_primary_pubkey   TEXT,
@@ -69,12 +75,16 @@ const CREATE_AGENTS_SQL = `
     reg_agent_id           TEXT,
     reg_primary_pubkey     TEXT,
     reg_ml_dsa_pubkey      TEXT,
+    -- M9D 002-PQKEYS: the ML-KEM public key the directory registered.
+    reg_ml_kem_pubkey      TEXT,
     reg_registered_at      INTEGER,
     reg_status             TEXT,
-    -- 038-KEYBIND: hex 64-byte Ed25519 signature by k_local_seed's public half over
-    -- (k_local_pubkey, reg_primary_pubkey). Minted once at the tail of registration — the only
+    -- 038-KEYBIND: hex 64-byte Ed25519 signature by k_local_seed's public half over the v2 binding
+    -- TBS naming all four keys (M9D 002-PQKEYS). Minted once at the tail of registration — the only
     -- moment both keys are on this machine together — and never re-derived by a second DKG.
     reg_key_binding        TEXT,
+    -- M9D 002-PQKEYS: the ML-DSA half of the v2 binding (hex 2420 bytes), over the same TBS.
+    reg_key_binding_pq     TEXT,
     -- M16: 1 when this identity is a broadcast channel (publish-only, never converses), with the
     -- hex pubkey of the agent that administers it. Written once, from the directory's echo at
     -- registration; nothing updates either column afterwards.
@@ -191,6 +201,11 @@ export function ensureIdentitySchema(db: DaemonDatabase): void {
     if (!cols.some((c) => c.name === "admin_pubkey")) {
       db.exec("ALTER TABLE agents ADD COLUMN admin_pubkey TEXT NOT NULL DEFAULT ''");
     }
+    // M9D 002-PQKEYS. Nullable in SQLite; presence is enforced where it matters — `loadAgents`
+    // refuses a REGISTERED row missing either seed, and registration refuses to start without both.
+    for (const col of ["ml_kem_seed BLOB", "ml_kem_pubkey TEXT", "reg_ml_kem_pubkey TEXT", "reg_key_binding_pq TEXT"]) {
+      if (!cols.some((c) => c.name === col.split(" ")[0])) db.exec(`ALTER TABLE agents ADD COLUMN ${col}`);
+    }
   }
   db.exec(CREATE_ACTIVE_NAME_INDEX_SQL);
   // M10-D18: DROP the M8 `trust_signals` scaffold. It held canonical-JSON records keyed by a RAW hash;
@@ -221,6 +236,12 @@ export interface AgentRow {
   channel: boolean;
   /** M16: hex pubkey of the administering agent; "" when `channel` is false. */
   adminPubkey: string;
+  /** 'active' once registration completed; null for a created-but-unregistered agent. */
+  regStatus: string | null;
+  /** M9D 002-PQKEYS: the stored 32-byte ML-DSA seed, AS STORED (the loader judges its width). */
+  mlDsaSeed: Uint8Array | null;
+  /** M9D 002-PQKEYS: the stored 64-byte ML-KEM seed, AS STORED. */
+  mlKemSeed: Uint8Array | null;
 }
 
 export class DbIdentityStore {
@@ -321,11 +342,12 @@ export class DbIdentityStore {
   listAgents(): AgentRow[] {
     const rows = this.#db
       .prepare(
-        "SELECT agent_id, agent_name, k_local_seed, k_local_pubkey, state, channel, admin_pubkey FROM agents WHERE state != 'retired' ORDER BY agent_name ASC",
+        "SELECT agent_id, agent_name, k_local_seed, k_local_pubkey, state, channel, admin_pubkey, reg_status, ml_dsa_secret, ml_kem_seed FROM agents WHERE state != 'retired' ORDER BY agent_name ASC",
       )
       .all() as Array<{
         agent_id: string; agent_name: string; k_local_seed: unknown; k_local_pubkey: string; state: string;
         channel: number | bigint; admin_pubkey: string;
+        reg_status: string | null; ml_dsa_secret: unknown; ml_kem_seed: unknown;
       }>;
     return rows.map((r) => ({
       agentId: r.agent_id,
@@ -335,6 +357,9 @@ export class DbIdentityStore {
       state: r.state,
       channel: Number(r.channel) === 1,
       adminPubkey: r.admin_pubkey,
+      regStatus: typeof r.reg_status === "string" ? r.reg_status : null,
+      mlDsaSeed: r.ml_dsa_secret == null ? null : toBytes(r.ml_dsa_secret),
+      mlKemSeed: r.ml_kem_seed == null ? null : toBytes(r.ml_kem_seed),
     }));
   }
 
@@ -433,31 +458,44 @@ export class DbRegistrationPersistence implements DaemonRegistrationPersistence 
     }
   }
 
-  async persistMlDsaKeypair(opts: { mlDsaPubkey: string; secretKeyBlob: Uint8Array }): Promise<void> {
-    // secretKeyBlob is written to the encrypted DB only — never logged.
-    this.#updateRow("ml_dsa_pubkey = ?, ml_dsa_secret = ?, ml_dsa_algorithm = ?", [
-      opts.mlDsaPubkey,
-      toBuf(opts.secretKeyBlob),
-      ML_DSA_ALGORITHM,
-    ]);
-    this.#logger.info("registration.mldsa.persisted", { mlDsaPubkey: opts.mlDsaPubkey });
+  async persistPqIdentity(r: PqIdentityRecord): Promise<void> {
+    // The seeds are written to the encrypted DB only — never logged. Two writes, ML-DSA first, so a
+    // failure names the half that did not land.
+    try {
+      this.#updateRow("ml_dsa_pubkey = ?, ml_dsa_secret = ?, ml_dsa_algorithm = ?", [
+        r.mlDsaPubkey, toBuf(r.mlDsaSeed), ML_DSA_ALGORITHM,
+      ]);
+    } catch (err: unknown) {
+      throw new Error(`ml_dsa_persist_failed: ${extractErrorMessage(err)}`);
+    }
+    try {
+      this.#updateRow("ml_kem_pubkey = ?, ml_kem_seed = ?", [r.mlKemPubkey, toBuf(r.mlKemSeed)]);
+    } catch (err: unknown) {
+      throw new Error(`ml_kem_persist_failed: ${extractErrorMessage(err)}`);
+    }
+    this.#logger.info("registration.pq_keys.persisted", {
+      mlDsaPubkeyPrefix: r.mlDsaPubkey.slice(0, 16),
+      mlKemPubkeyPrefix: r.mlKemPubkey.slice(0, 16),
+    });
   }
 
   async persistRegistrationState(opts: {
     agentId: string;
     primaryPubkey: string;
     mlDsaPubkey: string;
+    mlKemPubkey: string;
     registeredAt: number;
     keyBinding: string;
+    keyBindingPq: string;
     channel?: boolean;
     adminPubkey?: string;
   }): Promise<void> {
     const { channel, adminPubkey } = checkChannelFacts(opts, await this.loadRegistrationState());
     this.#updateRow(
-      "reg_agent_id = ?, reg_primary_pubkey = ?, reg_ml_dsa_pubkey = ?, reg_registered_at = ?, reg_key_binding = ?, channel = ?, admin_pubkey = ?, reg_status = 'active', state = 'registered'",
+      "reg_agent_id = ?, reg_primary_pubkey = ?, reg_ml_dsa_pubkey = ?, reg_ml_kem_pubkey = ?, reg_registered_at = ?, reg_key_binding = ?, reg_key_binding_pq = ?, channel = ?, admin_pubkey = ?, reg_status = 'active', state = 'registered'",
       [
-        opts.agentId, opts.primaryPubkey, opts.mlDsaPubkey, opts.registeredAt, opts.keyBinding,
-        channel ? 1 : 0, adminPubkey,
+        opts.agentId, opts.primaryPubkey, opts.mlDsaPubkey, opts.mlKemPubkey, opts.registeredAt,
+        opts.keyBinding, opts.keyBindingPq, channel ? 1 : 0, adminPubkey,
       ],
     );
     this.#logger.info("registration.state.persisted", {
@@ -531,24 +569,27 @@ export class DbRegistrationPersistence implements DaemonRegistrationPersistence 
       agentId: String(r["reg_agent_id"]),
       primaryPubkey: String(r["reg_primary_pubkey"]),
       mlDsaPubkey: String(r["reg_ml_dsa_pubkey"]),
+      mlKemPubkey: typeof r["reg_ml_kem_pubkey"] === "string" ? r["reg_ml_kem_pubkey"] : "",
       registeredAt: Number(r["reg_registered_at"]),
       status: String(r["reg_status"]),
       // 038-KEYBIND: null for a row written before this column existed. `String(null)` would hand
       // callers the four characters "null" as if they were a signature, which is why this is a
       // typeof check and not the String() every field above uses.
       keyBinding: typeof r["reg_key_binding"] === "string" ? r["reg_key_binding"] : null,
+      keyBindingPq: typeof r["reg_key_binding_pq"] === "string" ? r["reg_key_binding_pq"] : null,
       channel: Number(r["channel"]) === 1,
       adminPubkey: typeof r["admin_pubkey"] === "string" ? r["admin_pubkey"] : "",
     };
   }
 
-  async loadMlDsaKeypair(): Promise<MlDsaKeypairRecord | null> {
+  async loadPqIdentity(): Promise<StoredPqIdentity> {
     const r = this.#row();
-    if (!r || r["ml_dsa_secret"] == null) return null;
+    const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
     return {
-      mlDsaPubkey: String(r["ml_dsa_pubkey"]),
-      secretKeyBlob: toBytes(r["ml_dsa_secret"]),
-      algorithm: String(r["ml_dsa_algorithm"]),
+      mlDsaSeed: r && r["ml_dsa_secret"] != null ? toBytes(r["ml_dsa_secret"]) : null,
+      mlDsaPubkey: r ? str(r["ml_dsa_pubkey"]) : null,
+      mlKemSeed: r && r["ml_kem_seed"] != null ? toBytes(r["ml_kem_seed"]) : null,
+      mlKemPubkey: r ? str(r["ml_kem_pubkey"]) : null,
     };
   }
 

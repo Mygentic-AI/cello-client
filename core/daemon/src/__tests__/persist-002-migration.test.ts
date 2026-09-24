@@ -112,10 +112,13 @@ describe("PERSIST-002 Unit 4/6 — flat-file + plaintext-DB migration (AC-006/AC
       const share = await persistence.loadActiveFrostKeyShare();
       expect(share).not.toBeNull();
       expect(Buffer.from(share!.signingShare).equals(Buffer.from(signingShare))).toBe(true);
-      const ml = await persistence.loadMlDsaKeypair();
-      expect(ml).not.toBeNull();
-      expect(ml!.mlDsaPubkey).toBe("mlpub");
-      expect(ml!.secretKeyBlob.length).toBe(64);
+      // M9D 002-PQKEYS: the legacy ML-DSA secret is copied as-is (a wrong width for the 32-byte seed
+      // format) and there is no ML-KEM seed — so `loadAgents` refuses this agent as registered but
+      // unusable post-quantum, which is the intended result under the M9D wipe.
+      const ml = await persistence.loadPqIdentity();
+      expect(ml.mlDsaPubkey).toBe("mlpub");
+      expect(ml.mlDsaSeed!.length).toBe(64);
+      expect(ml.mlKemSeed).toBeNull();
       const reg = await persistence.loadRegistrationState();
       expect(reg).toMatchObject({ agentId: "agent-alice", primaryPubkey: "prim", mlDsaPubkey: "mlpub", registeredAt: 99, status: "active" });
       const link = await persistence.loadAgentUserLink();

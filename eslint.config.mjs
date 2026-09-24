@@ -354,7 +354,11 @@ export default [
     // — record the counterparty's refusal, read it back on the next send or read, and find which
     // local agent owns a session id. Same argument as the line above: the data and the reasoning are
     // in `session-records.ts` and `session-queries.ts`; this file is the handle every consumer holds.
-    rules: { "max-lines": ["error", { max: 3433, skipBlankLines: false, skipComments: false }] },
+    //
+    // ⚠️ 3433 → 3434 (+1) for M9D 002-PQKEYS: `recordCounterpartyPrimary` became
+    // `recordCounterpartyKeys` (same line) and `counterpartyPqKeys` joined it — the one reader later
+    // orders use for a counterparty's post-quantum keys. The query lives in `session-queries.ts`.
+    rules: { "max-lines": ["error", { max: 3434, skipBlankLines: false, skipComments: false }] },
   },
   {
     // 040-DAEMONROOT, lowered every unit; the target is under 1,000 and this pin is what stops the
@@ -397,7 +401,9 @@ export default [
     // 1,457 → 1,460 (+3, M16 022-SUBSCRIBE): `openSessionFor` reaches the membership wiring, so
     // `join` can open a session with a channel's admin — a subscriber has never spoken to them.
     // Three lines, and they are a seam the root is the only place to pass.
-    rules: { "max-lines": ["error", { max: 1460, skipBlankLines: false, skipComments: false }] },
+    // 1,460 → 1,461 (+1, M9D 002-PQKEYS): the register handler receives the per-agent post-quantum
+    // identity map, so an agent registered in this run can sign post-quantum without a restart.
+    rules: { "max-lines": ["error", { max: 1461, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/daemon-handle.ts"],
@@ -500,7 +506,9 @@ export default [
   },
   {
     files: ["core/daemon/src/boot-agents.ts"],
-    rules: { "max-lines": ["error", { max: 282, skipBlankLines: false, skipComments: false }] },
+    // 282 → 283 (+1, M9D 002-PQKEYS): the per-agent post-quantum identity map, built by
+    // `buildPqIdentities` in agent-loader.ts so the reasoning lives there, not here.
+    rules: { "max-lines": ["error", { max: 283, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/boot-core.ts"],

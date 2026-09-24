@@ -16,7 +16,7 @@ import type { ConnState } from "./contact-handlers.js";
 import { selectAdvertisedAddress, type ITransportSelector, type SessionNegotiator } from "./transport-selector.js";
 import { TIER } from "./contacts-tier-migration.js";
 import { relayOnlyState, dialableAddrs } from "./relay-only.js";
-import type { SessionAssignment } from "@cello-protocol/protocol-types";
+import type { ParsedSessionAssignment } from "./session-assignment-parser.js";
 import type { IAutoNatService } from "@cello-protocol/transport";
 
 export interface InitiateSessionDeps {
@@ -34,7 +34,7 @@ export interface InitiateSessionDeps {
   resolvedSessionNegotiator: SessionNegotiator;
   transportSelector: ITransportSelector;
   autoNatService: IAutoNatService;
-  buildRelayConnectParams: (agentName: string, assignment: SessionAssignment) => Promise<RelayConnectParams | undefined>;
+  buildRelayConnectParams: (agentName: string, assignment: ParsedSessionAssignment) => Promise<RelayConnectParams | undefined>;
   getRelayCircuitAddress?: () => string;
   /**
    * M16: is this LOCAL agent a broadcast channel? A channel never opens a session, so the opener
@@ -315,7 +315,13 @@ export function registerInitiateSessionHandler(deps: InitiateSessionDeps): {
      * writing an unverified key here — so the value comes from the negotiation result, which exists
      * only once the responder's own identity key has signed for it.
      */
-    sessionNodeManager.recordCounterpartyPrimary(agentName, sessionId, negotiation.counterpartyPrimaryHex);
+    // M9D 002-PQKEYS: the responder's post-quantum keys ride the same verified result, proved by the
+    // same v2 binding, and are recorded in the same write.
+    sessionNodeManager.recordCounterpartyKeys(agentName, sessionId, {
+      primaryHex: negotiation.counterpartyPrimaryHex,
+      mlDsaHex: negotiation.counterpartyMlDsaHex,
+      mlKemHex: negotiation.counterpartyMlKemHex,
+    });
     // SEAM 1b: the session node N_A must hold the connection its content stream rides — so
     // dial the counterparty THROUGH N_A. The counterparty's advertised SESSION addresses are
     // the source of truth for dialability (a NATed node advertises a relay-circuit address; a

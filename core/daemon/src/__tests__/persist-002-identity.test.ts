@@ -111,7 +111,7 @@ describe("PERSIST-002 Unit 2 — DbRegistrationPersistence (AC-002/AC-003/AC-005
   it("loads return null on a freshly-created (unregistered) agent", async () => {
     const db = open();
     const p = seededStore(db, makeLogger().logger);
-    expect(await p.loadMlDsaKeypair()).toBeNull();
+    expect(await p.loadPqIdentity()).toEqual({ mlDsaSeed: null, mlDsaPubkey: null, mlKemSeed: null, mlKemPubkey: null });
     expect(await p.loadActiveFrostKeyShare()).toBeNull();
     expect(await p.loadRegistrationState()).toBeNull();
     expect(await p.loadAgentUserLink()).toBeNull();
@@ -123,11 +123,12 @@ describe("PERSIST-002 Unit 2 — DbRegistrationPersistence (AC-002/AC-003/AC-005
     const p = seededStore(db, logger);
 
     const mlSecret = SEED(11);
+    const kemSeed = new Uint8Array(64).fill(12);
     const signingShare = SEED(22);
     const commitments = SEED(33);
     const verifying = SEED(44);
 
-    await p.persistMlDsaKeypair({ mlDsaPubkey: "mldsapub", secretKeyBlob: mlSecret });
+    await p.persistPqIdentity({ mlDsaSeed: mlSecret, mlDsaPubkey: "mldsapub", mlKemSeed: kemSeed, mlKemPubkey: "mlkempub" });
     await p.persistFrostKeyShare({
       epochId: "epoch-1",
       primaryPubkey: "primarypub",
@@ -143,9 +144,11 @@ describe("PERSIST-002 Unit 2 — DbRegistrationPersistence (AC-002/AC-003/AC-005
       agentId: "agent-1",
       primaryPubkey: "primarypub",
       mlDsaPubkey: "mldsapub",
+      mlKemPubkey: "mlkempub",
       registeredAt: 1234,
       // 038-KEYBIND: persisted beside the share, and reloaded below with the rest of the bundle.
       keyBinding: "ab".repeat(64),
+      keyBindingPq: "bc".repeat(2420),
     });
     await p.persistAgentUserLink({ agentId: "agent-1", preAuthToken: "tok-abc", linkedAt: 5678 });
 
@@ -153,11 +156,11 @@ describe("PERSIST-002 Unit 2 — DbRegistrationPersistence (AC-002/AC-003/AC-005
     // process boundary, not just an in-memory cache).
     const p2 = new DbRegistrationPersistence({ db: open(), agentName: "alice", logger });
 
-    const ml = await p2.loadMlDsaKeypair();
-    expect(ml).not.toBeNull();
-    expect(Buffer.from(ml!.secretKeyBlob).equals(Buffer.from(mlSecret))).toBe(true);
-    expect(ml!.mlDsaPubkey).toBe("mldsapub");
-    expect(ml!.algorithm).toBe("ML-DSA-44");
+    const ml = await p2.loadPqIdentity();
+    expect(Buffer.from(ml.mlDsaSeed!).equals(Buffer.from(mlSecret))).toBe(true);
+    expect(ml.mlDsaPubkey).toBe("mldsapub");
+    expect(Buffer.from(ml.mlKemSeed!).equals(Buffer.from(kemSeed))).toBe(true);
+    expect(ml.mlKemPubkey).toBe("mlkempub");
 
     const share = await p2.loadActiveFrostKeyShare();
     expect(share).not.toBeNull();
@@ -171,7 +174,10 @@ describe("PERSIST-002 Unit 2 — DbRegistrationPersistence (AC-002/AC-003/AC-005
     expect(share!.dkgMethod).toBe("network_dkg");
 
     const reg = await p2.loadRegistrationState();
-    expect(reg).toMatchObject({ agentId: "agent-1", primaryPubkey: "primarypub", mlDsaPubkey: "mldsapub", registeredAt: 1234, status: "active" });
+    expect(reg).toMatchObject({
+      agentId: "agent-1", primaryPubkey: "primarypub", mlDsaPubkey: "mldsapub", mlKemPubkey: "mlkempub",
+      registeredAt: 1234, status: "active", keyBindingPq: "bc".repeat(2420),
+    });
 
     const link = await p2.loadAgentUserLink();
     expect(link).toMatchObject({ agentId: "agent-1", preAuthToken: "tok-abc", linkedAt: 5678 });
@@ -207,7 +213,8 @@ describe("PERSIST-002 Unit 2 — DbRegistrationPersistence (AC-002/AC-003/AC-005
     const p = seededStore(db, logger);
     const signingShare = SEED(77);
     const mlSecret = SEED(88);
-    await p.persistMlDsaKeypair({ mlDsaPubkey: "mp", secretKeyBlob: mlSecret });
+    const kemSeed = new Uint8Array(64).fill(89);
+    await p.persistPqIdentity({ mlDsaSeed: mlSecret, mlDsaPubkey: "mp", mlKemSeed: kemSeed, mlKemPubkey: "kp" });
     await p.persistFrostKeyShare({
       epochId: "e", primaryPubkey: "pp", identifier: "i", signingShare,
       threshold: 1, participants: 1, commitmentsCbor: SEED(5), verifyingSharesCbor: SEED(6), dkgMethod: "trusted_dealer",
@@ -215,5 +222,6 @@ describe("PERSIST-002 Unit 2 — DbRegistrationPersistence (AC-002/AC-003/AC-005
     const blob = JSON.stringify(events);
     expect(blob).not.toContain(Buffer.from(signingShare).toString("hex"));
     expect(blob).not.toContain(Buffer.from(mlSecret).toString("hex"));
+    expect(blob).not.toContain(Buffer.from(kemSeed).toString("hex"));
   });
 });

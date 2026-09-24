@@ -39,7 +39,7 @@ const REGISTRATION_REPLY_TYPES = new Set(["dkg_ready", "register_success", "regi
 export class DaemonRegistrationContext implements RegistrationContext {
   readonly keyProvider: KeyProvider;
   readonly logger: Logger;
-  readonly persistence: DaemonRegistrationPersistence | null;
+  readonly persistence: DaemonRegistrationPersistence;
 
   readonly #signaling: SignalingSeam;
   readonly #getDirectoryNode: () => CelloNode | null;
@@ -59,7 +59,7 @@ export class DaemonRegistrationContext implements RegistrationContext {
     getDirectoryEndpoint: () => { peer_id: string; multiaddrs: string[] } | null;
     getConsortiumEndpoints?: () => ConsortiumEndpoint[] | null;
     keyProvider: KeyProvider;
-    persistence: DaemonRegistrationPersistence | null;
+    persistence: DaemonRegistrationPersistence;
     logger: Logger;
   }) {
     this.#signaling = opts.signaling;

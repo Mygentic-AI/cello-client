@@ -611,7 +611,13 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
         };
       }
       logger.info("session.negotiate.assignment.received", { agentName, correlationId, signatureType: assignment.signature_type, signatureVerified: true });
-      return { ok: true, assignment, counterpartyPrimaryHex: verified.counterpartyPrimaryHex };
+      return {
+        ok: true,
+        assignment,
+        counterpartyPrimaryHex: verified.counterpartyPrimaryHex,
+        counterpartyMlDsaHex: verified.counterpartyMlDsaHex,
+        counterpartyMlKemHex: verified.counterpartyMlKemHex,
+      };
     } finally {
       unregister();
     }

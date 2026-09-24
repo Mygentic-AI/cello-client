@@ -21,7 +21,7 @@
  * to apply is "is this a `let` assigned below?", not "would this value freeze?" — the freezing cases
  * announce themselves.
  */
-import { loadAgents } from "./agent-loader.js";
+import { loadAgents, buildPqIdentities } from "./agent-loader.js";
 import { DbRegistrationPersistence } from "./db-identity-store.js";
 import { createContentPark } from "./content-park.js";
 import { createReconnectDrain } from "./reconnect-drain.js";
@@ -82,7 +82,7 @@ export async function startBootAgents(deps: BootAgentsDeps) {
     ...failedAgents.map((a) => ({
       name: a.name,
       state: "load_failed" as const,
-      error: a.error,
+      error: a.error, ...(a.remedy !== undefined ? { remedy: a.remedy } : {}),
     })),
   ];
 
@@ -99,6 +99,7 @@ export async function startBootAgents(deps: BootAgentsDeps) {
   // constructor because this map is built after the manager exists — the same reason
   // `setParkedDrainHook` is a setter.
   sessionNodeManager.setKeyProviderResolver((agentName: string) => keyProviders.get(agentName));
+  const pqIdentities = buildPqIdentities(loadedAgents); // M9D 002-PQKEYS — see buildPqIdentities
 
   // Constructed HERE, before ANY boot-time caller. autoRecoverForAgent is invoked from an agent's
   // onConnected and from the seal-upgrade content gate — both of which run long before the IPC
@@ -276,7 +277,7 @@ export async function startBootAgents(deps: BootAgentsDeps) {
   }
 
   return {
-    loadedAgents, getPersistence, agents, keyProviders, contentPark,
+    loadedAgents, getPersistence, agents, keyProviders, pqIdentities, contentPark,
     autoRecoverForAgent, onSignalingConnected, submissionRetries, recordIssuedSubmission,
   };
 }

@@ -32,7 +32,37 @@
  * is the out-of-band value, and no field on this frame can vouch for it.
  */
 
-import type { SessionAssignment } from "@cello-protocol/protocol-types";
+import type { SessionAssignmentFrost, SessionAssignmentSingle } from "@cello-protocol/protocol-types";
+
+/**
+ * The per-party key fields of a FROST assignment (038-KEYBIND, M9D 002-PQKEYS). REQUIRED on the wire
+ * type — a directory always sends them — but a frame from a hostile or broken directory may not, so
+ * the PARSED shape carries each as possibly `undefined` and `assignment-verify.ts` refuses by name.
+ */
+export const ASSIGNMENT_KEY_FIELDS = [
+  "participant_a_key_binding", "participant_a_key_binding_pq", "participant_a_ml_dsa_pubkey", "participant_a_ml_kem_pubkey",
+  "participant_b_primary_pubkey", "participant_b_key_binding", "participant_b_key_binding_pq",
+  "participant_b_ml_dsa_pubkey", "participant_b_ml_kem_pubkey",
+] as const;
+type AssignmentKeyField = (typeof ASSIGNMENT_KEY_FIELDS)[number];
+
+/** A FROST assignment as parsed: every key field present-and-right-width, or `undefined`. */
+export type ParsedSessionAssignmentFrost =
+  Omit<SessionAssignmentFrost, AssignmentKeyField> & { [K in AssignmentKeyField]: Uint8Array | undefined };
+export type ParsedSessionAssignment = ParsedSessionAssignmentFrost | SessionAssignmentSingle;
+
+/** The width each key field must have; any other width parses as `undefined`. */
+const KEY_FIELD_BYTES: Record<AssignmentKeyField, number> = {
+  participant_a_key_binding: 64,
+  participant_a_key_binding_pq: 2420,
+  participant_a_ml_dsa_pubkey: 1312,
+  participant_a_ml_kem_pubkey: 1184,
+  participant_b_primary_pubkey: 32,
+  participant_b_key_binding: 64,
+  participant_b_key_binding_pq: 2420,
+  participant_b_ml_dsa_pubkey: 1312,
+  participant_b_ml_kem_pubkey: 1184,
+};
 
 function toU8Safe(v: unknown): Uint8Array | null {
   if (v instanceof Uint8Array) return v;
@@ -134,7 +164,7 @@ export function parseSessionAssignment(
    * logger (the inbound and outbound session paths) pass one; the rest are unaffected.
    */
   onTolerated?: (field: ToleratedField) => void,
-): SessionAssignment | null {
+): ParsedSessionAssignment | null {
   const sessionId = toU8Safe(raw["session_id"]);
   if (!sessionId || sessionId.length !== 16) return null;
 
@@ -238,16 +268,16 @@ export function parseSessionAssignment(
      * them. Carrying the absence one layer further is what lets the refusal say
      * "this counterparty's directory did not supply the proof that its group key is theirs".
      */
-    const bindA = toU8Safe(raw["participant_a_key_binding"]);
-    const bPrimary = toU8Safe(raw["participant_b_primary_pubkey"]);
-    const bindB = toU8Safe(raw["participant_b_key_binding"]);
+    const keyFields = {} as { [K in AssignmentKeyField]: Uint8Array | undefined };
+    for (const f of ASSIGNMENT_KEY_FIELDS) {
+      const v = toU8Safe(raw[f]);
+      keyFields[f] = v && v.length === KEY_FIELD_BYTES[f] ? v : undefined;
+    }
     return {
       ...common,
       signature_type: "frost" as const,
       signer_pubkey: signerPubkey,
-      participant_a_key_binding: bindA && bindA.length === 64 ? bindA : undefined,
-      participant_b_primary_pubkey: bPrimary && bPrimary.length === 32 ? bPrimary : undefined,
-      participant_b_key_binding: bindB && bindB.length === 64 ? bindB : undefined,
+      ...keyFields,
     };
   }
   return { ...common, signature_type: "single" as const };

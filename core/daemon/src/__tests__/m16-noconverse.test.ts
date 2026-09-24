@@ -28,6 +28,7 @@ import { TIER } from "../contacts-tier-migration.js";
 import { makeSignedAssignmentFrame, fixtureIdentity, registerFixtureSigner } from "./helpers/signed-assignment.js";
 import type { SessionNegotiator } from "../transport-selector.js";
 import type { DaemonConfig, Logger } from "../types.js";
+import { fixturePqIdentityRecord, registeredPqFields } from "./helpers/pq-identity.js";
 
 // ─── Outbound ──────────────────────────────────────────────────────────────────────────────────
 
@@ -409,8 +410,11 @@ describe("M16 006-NOCONVERSE: a real daemon refuses an inbound session to its ch
     handle = await startDaemon(config);
     await new Promise((r) => setTimeout(r, 50));
     const snm = handle.getSessionNodeManager();
-    await new DbRegistrationPersistence({ db: snm.getDb(), agentName: "chan", logger: config.logger }).persistRegistrationState({
-      agentId: "fixture-channel-chan", primaryPubkey: "5b".repeat(32), mlDsaPubkey: "6c".repeat(32),
+    const chanPersistence = new DbRegistrationPersistence({ db: snm.getDb(), agentName: "chan", logger: config.logger });
+    const chanPq = await fixturePqIdentityRecord("channel-chan");
+    await chanPersistence.persistPqIdentity(chanPq);
+    await chanPersistence.persistRegistrationState({
+      agentId: "fixture-channel-chan", primaryPubkey: "5b".repeat(32), ...registeredPqFields(chanPq),
       registeredAt: Date.now(), keyBinding: "7d".repeat(64), channel: true, adminPubkey: pubkeys.get("bob")!,
     });
     await snm.ensureStandingReceiverForAgent("chan");

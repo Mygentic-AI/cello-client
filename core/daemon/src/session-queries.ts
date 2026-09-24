@@ -1083,10 +1083,29 @@ export class SessionQueries {
       .prepare("UPDATE sessions SET seal_legibility = ?, sealed_root_hex = ?, updated_at = ? WHERE agent_id = ? AND session_id = ?")
       .run(legibilityJson, sealedRootHex, Date.now(), this.#ctx.requireAgentId(agentName), sessionId);
   }
-  recordCounterpartyPrimary(agentName: string, sessionId: string, primaryPubkeyHex: string): void {
+  /**
+   * M9D 002-PQKEYS (replaces recordCounterpartyPrimary): the counterparty's group key AND both
+   * post-quantum keys, in ONE write — every value here came through a v2 key binding the caller
+   * verified, so they are recorded together or not at all.
+   */
+  recordCounterpartyKeys(agentName: string, sessionId: string, keys: { primaryHex: string; mlDsaHex: string; mlKemHex: string }): void {
     if (!this.#db) return;
     this.#db
-      .prepare("UPDATE sessions SET counterparty_primary_pubkey = ?, updated_at = ? WHERE agent_id = ? AND session_id = ?")
-      .run(primaryPubkeyHex, Date.now(), this.#ctx.requireAgentId(agentName), sessionId);
+      .prepare("UPDATE sessions SET counterparty_primary_pubkey = ?, counterparty_ml_dsa_pubkey = ?, counterparty_ml_kem_pubkey = ?, updated_at = ? WHERE agent_id = ? AND session_id = ?")
+      .run(keys.primaryHex, keys.mlDsaHex, keys.mlKemHex, Date.now(), this.#ctx.requireAgentId(agentName), sessionId);
+  }
+
+  /**
+   * M9D 002-PQKEYS — THE reader for a session counterparty's post-quantum keys. Bytes, not hex.
+   * `null` when the row has neither (a session recorded before this order, or no such session).
+   * Orders 003, 005, 006 and 009 read these keys only through here.
+   */
+  counterpartyPqKeys(agentName: string, sessionId: string): { mlDsa: Uint8Array; mlKem: Uint8Array } | null {
+    if (!this.#db) return null;
+    const row = this.#db
+      .prepare("SELECT counterparty_ml_dsa_pubkey AS d, counterparty_ml_kem_pubkey AS k FROM sessions WHERE agent_id = ? AND session_id = ?")
+      .get(this.#ctx.requireAgentId(agentName), sessionId) as { d: string | null; k: string | null } | undefined;
+    if (!row || typeof row.d !== "string" || typeof row.k !== "string") return null;
+    return { mlDsa: new Uint8Array(Buffer.from(row.d, "hex")), mlKem: new Uint8Array(Buffer.from(row.k, "hex")) };
   }
 }

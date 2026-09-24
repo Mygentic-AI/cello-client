@@ -136,6 +136,8 @@ export interface AgentInfo {
   state: AgentState;
   pubkey?: string;
   error?: string;
+  /** For a `load_failed` agent: what the operator can do about it (M9D 002-PQKEYS). */
+  remedy?: string;
   /**
    * Whether THIS agent currently has an armed standing receiver. Populated on the
    * cello_status surface (getStatus) so a deaf agent — online but unable to accept inbound

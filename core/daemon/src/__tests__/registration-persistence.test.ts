@@ -1,48 +1,49 @@
 /**
- * CELLO-M7-REGISTRATION — daemon registration persistence (step b)
+ * CELLO-M7-REGISTRATION — daemon registration persistence, against the SQLCipher `agents` row.
  *
- * The daemon owns its agents' registration material (ML-DSA keypair, FROST key
- * share, registration state) as per-agent files under ~/.cello/agents/<name>/.
- * This mirrors the existing `key`-file model (agent-loader) rather than dragging
- * the client's SQLCipher ClientStatePersistence into the daemon.
+ * M9D 002-PQKEYS deleted `FileRegistrationPersistence` (a plaintext JSON store no production code
+ * constructed); the tests that exercised only it went with it. The byte-for-byte bundle round trip
+ * lives in persist-002-identity.test.ts. What this file pins:
  *
- * What these tests pin:
- * - All three persist methods round-trip every field exactly (bytes included).
- * - Known case 2 (persistence serialization): the reloaded ML-DSA secret is
- *   exercised in real use — the reconstructed provider signs a message that
- *   verifies against the stored public key. Byte-equality alone is not enough.
- * - Fresh agent → all load methods return null.
- * - A newer FROST share supersedes the prior active share.
- * - Per-agent isolation: two agent dirs never see each other's material.
- * - SI-001/SI-002: secret bytes never appear in any log event.
- * - Secret files are written 0o600.
+ * - The post-quantum identity round-trips AND the reloaded seeds are exercised in real use: the ML-DSA
+ *   seed signs a message that verifies under the stored public key, and the ML-KEM seed decapsulates
+ *   what was encapsulated to the stored public key. Byte-equality alone is not enough.
+ * - A persist failure names which half did not land.
+ * - The two seeds are never logged.
+ * - M16: channel facts default, round-trip, and are immutable.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, stat, readdir, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { mlDsaGenerateSeed, mlDsaProviderFromSeed, signMlDsa, verifyMlDsa } from "@cello-protocol/crypto";
-
-/** A fresh ML-DSA-44 identity key: its provider, and its 32-byte seed — the form that is persisted. */
-async function mlDsaKeyWithSeed() {
-  const secretKeyBlob = mlDsaGenerateSeed();
-  return { provider: await mlDsaProviderFromSeed(secretKeyBlob), secretKeyBlob };
-}
-import { FileRegistrationPersistence } from "../registration-persistence.js";
+import {
+  mlDsaGenerateSeed, mlDsaProviderFromSeed, mlKemGenerateSeed, mlKemKeypairFromSeed,
+  mlKemEncapsulate, mlKemDecapsulate, signMlDsa, verifyMlDsa,
+} from "@cello-protocol/crypto";
 import { DbIdentityStore, DbRegistrationPersistence } from "../db-identity-store.js";
 import { openTestDb } from "./helpers/encrypted-db.js";
+import type { PqIdentityRecord } from "../registration-persistence.js";
 import type { Logger } from "../types.js";
 
-describe("registration-persistence (daemon)", () => {
+async function freshPqIdentity(): Promise<PqIdentityRecord> {
+  const mlDsaSeed = mlDsaGenerateSeed();
+  const mlKemSeed = mlKemGenerateSeed();
+  return {
+    mlDsaSeed,
+    mlDsaPubkey: Buffer.from(await (await mlDsaProviderFromSeed(mlDsaSeed)).getPublicKey()).toString("hex"),
+    mlKemSeed,
+    mlKemPubkey: Buffer.from((await mlKemKeypairFromSeed(mlKemSeed)).publicKey).toString("hex"),
+  };
+}
+
+describe("registration-persistence (daemon, SQLCipher)", () => {
   let root: string;
-  let agentDir: string;
   let logEvents: Array<{ level: string; event: string; context: Record<string, unknown> }>;
   let logger: Logger;
 
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), "cello-reg-persist-"));
-    agentDir = join(root, "agents", "alice");
     logEvents = [];
     logger = {
       debug(event, context) { logEvents.push({ level: "debug", event, context }); },
@@ -56,205 +57,10 @@ describe("registration-persistence (daemon)", () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  // ─── Registration state ──────────────────────────────────────────────────
-
-  it("round-trips registration state with every field", async () => {
-    const p = new FileRegistrationPersistence({ agentDir, logger });
-    await p.persistRegistrationState({
-      agentId: "agent-123",
-      primaryPubkey: "aa".repeat(32),
-      mlDsaPubkey: "bb".repeat(32),
-      registeredAt: 1781725000000,
-    });
-
-    const loaded = await p.loadRegistrationState();
-    expect(loaded).not.toBeNull();
-    expect(loaded!.agentId).toBe("agent-123");
-    expect(loaded!.primaryPubkey).toBe("aa".repeat(32));
-    expect(loaded!.mlDsaPubkey).toBe("bb".repeat(32));
-    expect(loaded!.registeredAt).toBe(1781725000000);
-    expect(loaded!.status).toBe("active");
-  });
-
-  it("loadRegistrationState returns null for a fresh agent", async () => {
-    const p = new FileRegistrationPersistence({ agentDir, logger });
-    expect(await p.loadRegistrationState()).toBeNull();
-    expect(await p.loadMlDsaKeypair()).toBeNull();
-    expect(await p.loadActiveFrostKeyShare()).toBeNull();
-  });
-
-  // ─── ML-DSA keypair (Known case 2 — exercise the reloaded key) ────────────
-
-  it("round-trips the ML-DSA keypair AND the reloaded secret signs verifiably", async () => {
-    const { provider, secretKeyBlob } = await mlDsaKeyWithSeed();
-    const pubkey = await provider.getPublicKey();
-    const pubkeyHex = Buffer.from(pubkey).toString("hex");
-
-    const p = new FileRegistrationPersistence({ agentDir, logger });
-    await p.persistMlDsaKeypair({ mlDsaPubkey: pubkeyHex, secretKeyBlob });
-
-    const loaded = await p.loadMlDsaKeypair();
-    expect(loaded).not.toBeNull();
-    expect(loaded!.mlDsaPubkey).toBe(pubkeyHex);
-    expect(Buffer.from(loaded!.secretKeyBlob).equals(Buffer.from(secretKeyBlob))).toBe(true);
-
-    // Real use: reconstruct a provider from the reloaded bytes, sign, verify.
-    const reconstructed = await mlDsaProviderFromSeed(loaded!.secretKeyBlob);
-    const msg = new TextEncoder().encode("daemon registration round-trip");
-    const sig = await signMlDsa(reconstructed, "cello-mldsa-endorsement-v1", msg);
-    expect(await verifyMlDsa(pubkey, "cello-mldsa-endorsement-v1", msg, sig)).toBe(true);
-  });
-
-  // ─── FROST key share ──────────────────────────────────────────────────────
-
-  it("round-trips the FROST key share including every byte field", async () => {
-    const signingShare = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
-    const commitmentsCbor = new Uint8Array([10, 20, 30, 40]);
-    const verifyingSharesCbor = new Uint8Array([99, 98, 97]);
-
-    const p = new FileRegistrationPersistence({ agentDir, logger });
-    await p.persistFrostKeyShare({
-      epochId: "epoch:1",
-      primaryPubkey: "cc".repeat(32),
-      identifier: "client:abcd",
-      signingShare,
-      threshold: 2,
-      participants: 2,
-      commitmentsCbor,
-      verifyingSharesCbor,
-      dkgMethod: "network_dkg",
-    });
-
-    const loaded = await p.loadActiveFrostKeyShare();
-    expect(loaded).not.toBeNull();
-    expect(loaded!.epochId).toBe("epoch:1");
-    expect(loaded!.primaryPubkey).toBe("cc".repeat(32));
-    expect(loaded!.identifier).toBe("client:abcd");
-    expect(loaded!.threshold).toBe(2);
-    expect(loaded!.participants).toBe(2);
-    expect(loaded!.dkgMethod).toBe("network_dkg");
-    expect(Buffer.from(loaded!.signingShare).equals(Buffer.from(signingShare))).toBe(true);
-    expect(Buffer.from(loaded!.commitmentsCbor).equals(Buffer.from(commitmentsCbor))).toBe(true);
-    expect(Buffer.from(loaded!.verifyingSharesCbor).equals(Buffer.from(verifyingSharesCbor))).toBe(true);
-  });
-
-  it("a newer FROST share supersedes the previously active one", async () => {
-    const p = new FileRegistrationPersistence({ agentDir, logger });
-    await p.persistFrostKeyShare({
-      epochId: "epoch:1", primaryPubkey: "11".repeat(32), identifier: "id1",
-      signingShare: new Uint8Array([1]), threshold: 2, participants: 2,
-      commitmentsCbor: new Uint8Array([1]), verifyingSharesCbor: new Uint8Array([1]),
-      dkgMethod: "network_dkg",
-    });
-    await p.persistFrostKeyShare({
-      epochId: "epoch:2", primaryPubkey: "22".repeat(32), identifier: "id2",
-      signingShare: new Uint8Array([2]), threshold: 2, participants: 2,
-      commitmentsCbor: new Uint8Array([2]), verifyingSharesCbor: new Uint8Array([2]),
-      dkgMethod: "network_dkg",
-    });
-
-    const loaded = await p.loadActiveFrostKeyShare();
-    expect(loaded!.epochId).toBe("epoch:2");
-    expect(loaded!.primaryPubkey).toBe("22".repeat(32));
-  });
-
-  // ─── Multi-agent isolation ────────────────────────────────────────────────
-
-  it("keeps two agents' material isolated by directory", async () => {
-    const alice = new FileRegistrationPersistence({ agentDir: join(root, "agents", "alice"), logger });
-    const bob = new FileRegistrationPersistence({ agentDir: join(root, "agents", "bob"), logger });
-
-    await alice.persistRegistrationState({
-      agentId: "alice-id", primaryPubkey: "aa".repeat(32), mlDsaPubkey: "a1".repeat(32), registeredAt: 1,
-    });
-
-    expect((await alice.loadRegistrationState())!.agentId).toBe("alice-id");
-    expect(await bob.loadRegistrationState()).toBeNull();
-  });
-
-  // ─── Agent→user link (capture-now-or-lose-it) ─────────────────────────────
-
-  it("round-trips the agent→user link and never logs the pre-auth token", async () => {
-    const p = new FileRegistrationPersistence({ agentDir, logger });
-    const preAuthToken = "preauth-secret-ticket-xyz";
-    await p.persistAgentUserLink({ agentId: "agent-9", preAuthToken, linkedAt: 1781730000000 });
-
-    const loaded = await p.loadAgentUserLink();
-    expect(loaded).toEqual({ agentId: "agent-9", preAuthToken, linkedAt: 1781730000000 });
-    // SI: the bearer ticket must not appear in any log event.
-    expect(JSON.stringify(logEvents)).not.toContain(preAuthToken);
-    expect(logEvents.some((e) => e.event === "registration.user_link.persisted")).toBe(true);
-  });
-
-  it("loadAgentUserLink returns null when no link captured", async () => {
-    const p = new FileRegistrationPersistence({ agentDir, logger });
-    expect(await p.loadAgentUserLink()).toBeNull();
-  });
-
-  // ─── Corrupt-file handling (loud, not silent coercion) ────────────────────
-
-  it("throws a clear error on a corrupt registration file rather than coercing", async () => {
-    const p = new FileRegistrationPersistence({ agentDir, logger });
-    await p.persistRegistrationState({
-      agentId: "agent-1", primaryPubkey: "aa".repeat(32), mlDsaPubkey: "bb".repeat(32), registeredAt: 1,
-    });
-
-    // Corrupt the file: valid JSON, but the required fields are gone. A silent
-    // coercion would read this as registeredAt=NaN, which must not happen.
-    await writeFile(join(agentDir, "registration-state.json"), JSON.stringify({ status: "active" }));
-
-    await expect(p.loadRegistrationState()).rejects.toThrow(/corrupt/);
-  });
-
-  // ─── Security invariants ──────────────────────────────────────────────────
-
-  it("never logs secret bytes (SI-001 signing_share, SI-002 secret_key_blob)", async () => {
-    const { provider, secretKeyBlob } = await mlDsaKeyWithSeed();
-    const pubkeyHex = Buffer.from(await provider.getPublicKey()).toString("hex");
-    const signingShare = new Uint8Array([7, 7, 7, 7]);
-
-    const p = new FileRegistrationPersistence({ agentDir, logger });
-    await p.persistMlDsaKeypair({ mlDsaPubkey: pubkeyHex, secretKeyBlob });
-    await p.persistFrostKeyShare({
-      epochId: "epoch:1", primaryPubkey: "cc".repeat(32), identifier: "id",
-      signingShare, threshold: 2, participants: 2,
-      commitmentsCbor: new Uint8Array([1]), verifyingSharesCbor: new Uint8Array([1]),
-      dkgMethod: "network_dkg",
-    });
-
-    const secretHex = Buffer.from(secretKeyBlob).toString("hex");
-    const shareHex = Buffer.from(signingShare).toString("hex");
-    const serialized = JSON.stringify(logEvents);
-    expect(serialized).not.toContain(secretHex);
-    expect(serialized).not.toContain(shareHex);
-    // Persist events should still have been emitted (observability).
-    expect(logEvents.some((e) => e.event.includes("persisted"))).toBe(true);
-  });
-
-  it("writes secret files with 0o600 permissions", async () => {
-    const { provider, secretKeyBlob } = await mlDsaKeyWithSeed();
-    const pubkeyHex = Buffer.from(await provider.getPublicKey()).toString("hex");
-    const p = new FileRegistrationPersistence({ agentDir, logger });
-    await p.persistMlDsaKeypair({ mlDsaPubkey: pubkeyHex, secretKeyBlob });
-    await p.persistFrostKeyShare({
-      epochId: "epoch:1", primaryPubkey: "cc".repeat(32), identifier: "id",
-      signingShare: new Uint8Array([1]), threshold: 2, participants: 2,
-      commitmentsCbor: new Uint8Array([1]), verifyingSharesCbor: new Uint8Array([1]),
-      dkgMethod: "network_dkg",
-    });
-
-    const entries = await readdir(agentDir);
-    const secretFiles = entries.filter((f) => f.includes("ml-dsa") || f.includes("frost"));
-    expect(secretFiles.length).toBeGreaterThanOrEqual(2);
-    for (const f of secretFiles) {
-      const s = await stat(join(agentDir, f));
-      expect(s.mode & 0o777).toBe(0o600);
-    }
-  });
-
-  // ─── M16 004-IDENTITY-WIRE: the daemon knows which of its own identities are channels ──────────
-
-  const REG = { primaryPubkey: "aa".repeat(32), mlDsaPubkey: "bb".repeat(32), registeredAt: 1, keyBinding: "cd".repeat(64) };
+  const REG = {
+    primaryPubkey: "aa".repeat(32), mlDsaPubkey: "bb".repeat(1312), mlKemPubkey: "cc".repeat(1184),
+    registeredAt: 1, keyBinding: "cd".repeat(64), keyBindingPq: "de".repeat(2420),
+  };
   const ADMIN = "ef".repeat(32);
 
   function dbPersistenceFor(...names: string[]) {
@@ -264,13 +70,96 @@ describe("registration-persistence (daemon)", () => {
     return { db, store, persistenceFor: (n: string) => new DbRegistrationPersistence({ db, agentName: n, logger }) };
   }
 
-  it("records default to non-channel", async () => {
-    const file = new FileRegistrationPersistence({ agentDir, logger });
-    await file.persistRegistrationState({ agentId: "agent-f", ...REG });
-    const fileLoaded = await file.loadRegistrationState();
-    expect(fileLoaded!.channel).toBe(false);
-    expect(fileLoaded!.adminPubkey).toBe("");
+  // ─── M9D 002-PQKEYS: the post-quantum identity ────────────────────────────
 
+  it("a fresh agent has no post-quantum identity: every field reads null", async () => {
+    const { db, persistenceFor } = dbPersistenceFor("alice");
+    try {
+      expect(await persistenceFor("alice").loadPqIdentity())
+        .toEqual({ mlDsaSeed: null, mlDsaPubkey: null, mlKemSeed: null, mlKemPubkey: null });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("round-trips the PQ identity, and the RELOADED seeds sign and decapsulate for the stored keys", async () => {
+    const { db, persistenceFor } = dbPersistenceFor("alice");
+    try {
+      const id = await freshPqIdentity();
+      await persistenceFor("alice").persistPqIdentity(id);
+      const back = await persistenceFor("alice").loadPqIdentity();
+      expect(back.mlDsaPubkey).toBe(id.mlDsaPubkey);
+      expect(back.mlKemPubkey).toBe(id.mlKemPubkey);
+      expect(back.mlDsaSeed!.length).toBe(32);
+      expect(back.mlKemSeed!.length).toBe(64);
+
+      // Real use of the reloaded ML-DSA seed.
+      const provider = await mlDsaProviderFromSeed(back.mlDsaSeed!);
+      const msg = new TextEncoder().encode("daemon registration round-trip");
+      const sig = await signMlDsa(provider, "cello-mldsa-key-binding-v1", msg);
+      expect(await verifyMlDsa(new Uint8Array(Buffer.from(id.mlDsaPubkey, "hex")), "cello-mldsa-key-binding-v1", msg, sig)).toBe(true);
+
+      // Real use of the reloaded ML-KEM seed.
+      const { ciphertext, sharedSecret } = await mlKemEncapsulate(new Uint8Array(Buffer.from(id.mlKemPubkey, "hex")));
+      expect(Buffer.from(await mlKemDecapsulate(back.mlKemSeed!, ciphertext))).toEqual(Buffer.from(sharedSecret));
+    } finally {
+      db.close();
+    }
+  });
+
+  it("two agents' post-quantum identities stay on their own rows", async () => {
+    const { db, persistenceFor } = dbPersistenceFor("alice", "bob");
+    try {
+      const a = await freshPqIdentity();
+      const b = await freshPqIdentity();
+      await persistenceFor("alice").persistPqIdentity(a);
+      await persistenceFor("bob").persistPqIdentity(b);
+      expect((await persistenceFor("alice").loadPqIdentity()).mlKemPubkey).toBe(a.mlKemPubkey);
+      expect((await persistenceFor("bob").loadPqIdentity()).mlKemPubkey).toBe(b.mlKemPubkey);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("a persist against a missing row fails and NAMES the half that did not land (ml_dsa first)", async () => {
+    const { db } = dbPersistenceFor();
+    try {
+      const ghost = new DbRegistrationPersistence({ db, agentName: "ghost", logger });
+      await expect(ghost.persistPqIdentity(await freshPqIdentity())).rejects.toThrow(/^ml_dsa_persist_failed/);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("never logs either seed", async () => {
+    const { db, persistenceFor } = dbPersistenceFor("alice");
+    try {
+      const id = await freshPqIdentity();
+      await persistenceFor("alice").persistPqIdentity(id);
+      const serialized = JSON.stringify(logEvents);
+      expect(serialized).not.toContain(Buffer.from(id.mlDsaSeed).toString("hex"));
+      expect(serialized).not.toContain(Buffer.from(id.mlKemSeed).toString("hex"));
+      expect(logEvents.some((e) => e.event === "registration.pq_keys.persisted")).toBe(true);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("registration state carries the ML-KEM key and the ML-DSA binding half", async () => {
+    const { db, persistenceFor } = dbPersistenceFor("alice");
+    try {
+      await persistenceFor("alice").persistRegistrationState({ agentId: "agent-a", ...REG });
+      const back = await persistenceFor("alice").loadRegistrationState();
+      expect(back!.mlKemPubkey).toBe(REG.mlKemPubkey);
+      expect(back!.keyBindingPq).toBe(REG.keyBindingPq);
+    } finally {
+      db.close();
+    }
+  });
+
+  // ─── M16 004-IDENTITY-WIRE: the daemon knows which of its own identities are channels ──────────
+
+  it("records default to non-channel", async () => {
     const { db, persistenceFor } = dbPersistenceFor("alice");
     try {
       await persistenceFor("alice").persistRegistrationState({ agentId: "agent-d", ...REG });
@@ -283,12 +172,6 @@ describe("registration-persistence (daemon)", () => {
   });
 
   it("channel fields round-trip", async () => {
-    const file = new FileRegistrationPersistence({ agentDir, logger });
-    await file.persistRegistrationState({ agentId: "agent-f", ...REG, channel: true, adminPubkey: ADMIN });
-    const fileLoaded = await file.loadRegistrationState();
-    expect(fileLoaded!.channel).toBe(true);
-    expect(fileLoaded!.adminPubkey).toBe(ADMIN);
-
     const { db, store, persistenceFor } = dbPersistenceFor("news", "alice");
     try {
       await persistenceFor("news").persistRegistrationState({ agentId: "agent-n", ...REG, channel: true, adminPubkey: ADMIN });
@@ -304,20 +187,10 @@ describe("registration-persistence (daemon)", () => {
     }
   });
 
-  it("channel fields are immutable once registered (both stores)", async () => {
+  it("channel fields are immutable once registered", async () => {
     // Review F1: a second registration write must not flip a channel back to an agent, or swap its
     // admin. It throws; it does not silently keep the old value either.
     const OTHER_ADMIN = "12".repeat(32);
-    const file = new FileRegistrationPersistence({ agentDir, logger });
-    await file.persistRegistrationState({ agentId: "agent-f", ...REG, channel: true, adminPubkey: ADMIN });
-    await expect(file.persistRegistrationState({ agentId: "agent-f", ...REG })).rejects.toThrow(/channel_fields_immutable/);
-    await expect(
-      file.persistRegistrationState({ agentId: "agent-f", ...REG, channel: true, adminPubkey: OTHER_ADMIN }),
-    ).rejects.toThrow(/channel_fields_immutable/);
-    expect((await file.loadRegistrationState())!.adminPubkey).toBe(ADMIN);
-    // The same values again are not a change.
-    await file.persistRegistrationState({ agentId: "agent-f", ...REG, channel: true, adminPubkey: ADMIN });
-
     const { db, store, persistenceFor } = dbPersistenceFor("news", "alice");
     try {
       await persistenceFor("news").persistRegistrationState({ agentId: "agent-n", ...REG, channel: true, adminPubkey: ADMIN });
@@ -328,6 +201,8 @@ describe("registration-persistence (daemon)", () => {
       ).rejects.toThrow(/channel_fields_immutable/);
       expect(store.isChannelAgent("news")).toBe(true);
       expect((await persistenceFor("news").loadRegistrationState())!.adminPubkey).toBe(ADMIN);
+      // The same values again are not a change.
+      await persistenceFor("news").persistRegistrationState({ agentId: "agent-n", ...REG, channel: true, adminPubkey: ADMIN });
       // An ordinary agent cannot be turned INTO a channel by a later write either.
       await persistenceFor("alice").persistRegistrationState({ agentId: "agent-a", ...REG });
       await expect(
@@ -339,10 +214,8 @@ describe("registration-persistence (daemon)", () => {
     }
   });
 
-  it("a channel without an admin pubkey is refused by both stores", async () => {
+  it("a channel without an admin pubkey is refused", async () => {
     // Review F3.
-    const file = new FileRegistrationPersistence({ agentDir, logger });
-    await expect(file.persistRegistrationState({ agentId: "agent-f", ...REG, channel: true })).rejects.toThrow(/admin/);
     const { db, persistenceFor } = dbPersistenceFor("news");
     try {
       await expect(persistenceFor("news").persistRegistrationState({ agentId: "agent-n", ...REG, channel: true, adminPubkey: "" }))

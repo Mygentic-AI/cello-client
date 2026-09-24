@@ -27,8 +27,12 @@
  * tampered field tests that the binding holds, which is the property that matters.
  */
 
-import { generateKeypair, buildKeyBindingTbs, CONTEXT_SESSION_ESTABLISHMENT } from "@cello-protocol/crypto";
-import type { KeyProvider } from "@cello-protocol/crypto";
+import { createHash } from "node:crypto";
+import {
+  generateKeypair, buildKeyBindingTbs, CONTEXT_SESSION_ESTABLISHMENT,
+  mlDsaProviderFromSeed, mlKemKeypairFromSeed, signMlDsa,
+} from "@cello-protocol/crypto";
+import type { KeyProvider, MlDsaKeyProvider } from "@cello-protocol/crypto";
 import { buildSessionEstablishmentTbs, computeGenesisPrevRoot } from "@cello-protocol/protocol-types";
 
 /**
@@ -74,6 +78,52 @@ const FIXTURE_KEYS = new Map<string, KeyProvider>();
  * passes when the producer and the copy drift together, which is the failure it is meant to catch.
  */
 export const FIXTURE_RESPONDER_PRIMARY = new Uint8Array(32).fill(0x5b);
+
+/**
+ * M9D 002-PQKEYS — a fixture identity's post-quantum keys: REAL ML-DSA-44 and ML-KEM-768 keys over
+ * seeds derived from its pubkey, so every fixture identity has a stable, signable PQ identity without
+ * threading one through every call site. A real key from a known seed is not a mock.
+ */
+export async function fixturePqKeys(pubkeyHex: string): Promise<{
+  mlDsaProvider: MlDsaKeyProvider;
+  mlDsaPubkey: Uint8Array;
+  mlKemSeed: Uint8Array;
+  mlKemPubkey: Uint8Array;
+}> {
+  const hex = pubkeyHex.toLowerCase();
+  const mlDsaSeed = new Uint8Array(createHash("sha256").update(`fixture-mldsa:${hex}`).digest());
+  const mlKemSeed = new Uint8Array(createHash("sha512").update(`fixture-mlkem:${hex}`).digest());
+  const mlDsaProvider = await mlDsaProviderFromSeed(mlDsaSeed);
+  return {
+    mlDsaProvider,
+    mlDsaPubkey: await mlDsaProvider.getPublicKey(),
+    mlKemSeed,
+    mlKemPubkey: (await mlKemKeypairFromSeed(mlKemSeed)).publicKey,
+  };
+}
+
+/**
+ * The v2 binding for one party — both signatures over one `buildKeyBindingTbs`. `forgeEd25519` /
+ * `forgePq` sign that half with a DIFFERENT genuine key, which is the exemplar refusal: another
+ * party's real signature, not noise.
+ */
+async function partyBinding(
+  kLocalKp: KeyProvider,
+  kLocal: Uint8Array,
+  group: Uint8Array,
+  opts: { forgeEd25519?: boolean; forgePq?: boolean } = {},
+): Promise<{ keyBinding: Uint8Array; keyBindingPq: Uint8Array; mlDsaPubkey: Uint8Array; mlKemPubkey: Uint8Array }> {
+  const pq = await fixturePqKeys(Buffer.from(kLocal).toString("hex"));
+  const tbs = buildKeyBindingTbs({ kLocal, group, mlDsa: pq.mlDsaPubkey, mlKem: pq.mlKemPubkey });
+  const edSigner = opts.forgeEd25519 ? generateKeypair() : kLocalKp;
+  const pqSigner = opts.forgePq ? (await fixturePqKeys("third-party-" + Math.random())).mlDsaProvider : pq.mlDsaProvider;
+  return {
+    keyBinding: await edSigner.sign(tbs),
+    keyBindingPq: await signMlDsa(pqSigner, "cello-mldsa-key-binding-v1", tbs),
+    mlDsaPubkey: pq.mlDsaPubkey,
+    mlKemPubkey: pq.mlKemPubkey,
+  };
+}
 
 export function fixtureIdentity(): FixtureIdentity {
   const kp = generateKeypair();
@@ -122,6 +172,10 @@ export interface SignedAssignmentOpts {
   omitCounterpartyBinding?: boolean;
   /** 038-KEYBIND: sign the counterparty binding with a DIFFERENT key — the initiator-side failure. */
   forgeCounterpartyBinding?: boolean;
+  /** M9D 002-PQKEYS: participant_a's ML-DSA binding half signed by a THIRD agent's genuine key. */
+  forgeKeyBindingPq?: boolean;
+  /** M9D 002-PQKEYS: participant_b's ML-DSA binding half signed by a THIRD agent's genuine key. */
+  forgeCounterpartyBindingPq?: boolean;
 }
 
 export async function makeSignedAssignmentFrame(
@@ -179,8 +233,10 @@ export async function makeSignedAssignmentFrame(
         "used here. Build the identity with fixtureIdentity() and use its .pubkeyHex / .pubkey.",
     );
   }
-  const bindingSigner = opts.forgeKeyBinding ? generateKeypair() : initiatorKp;
-  const keyBinding = await bindingSigner.sign(buildKeyBindingTbs(initiatorPubkey, signerPubkey));
+  const aBinding = await partyBinding(initiatorKp, initiatorPubkey, signerPubkey, {
+    ...(opts.forgeKeyBinding ? { forgeEd25519: true } : {}),
+    ...(opts.forgeKeyBindingPq ? { forgePq: true } : {}),
+  });
 
   /**
    * 038-KEYBIND — the OTHER direction, which only the INITIATOR path reads.
@@ -193,10 +249,11 @@ export async function makeSignedAssignmentFrame(
    */
   const responderKp = FIXTURE_KEYS.get(Buffer.from(opts.responderPubkey).toString("hex").toLowerCase());
   const responderPrimary = FIXTURE_RESPONDER_PRIMARY;
-  const counterpartyBinding = responderKp
-    ? await (opts.forgeCounterpartyBinding ? generateKeypair() : responderKp).sign(
-        buildKeyBindingTbs(opts.responderPubkey, responderPrimary),
-      )
+  const bBinding = responderKp
+    ? await partyBinding(responderKp, opts.responderPubkey, responderPrimary, {
+        ...(opts.forgeCounterpartyBinding ? { forgeEd25519: true } : {}),
+        ...(opts.forgeCounterpartyBindingPq ? { forgePq: true } : {}),
+      })
     : undefined;
 
   return {
@@ -225,11 +282,20 @@ export async function makeSignedAssignmentFrame(
         ...(opts.priorRelayId !== undefined ? { prior_relay_id: opts.priorRelayId } : {}),
         // 038-KEYBIND. Omitted only when a fixture is deliberately testing the absent-binding
         // refusal — the production directory always sends it.
-        ...(opts.omitKeyBinding ? {} : { participant_a_key_binding: keyBinding }),
-        ...(counterpartyBinding && !opts.omitCounterpartyBinding
+        // M9D 002-PQKEYS: participant_a's PQ keys always ride; the binding pair unless omitted.
+        participant_a_ml_dsa_pubkey: aBinding.mlDsaPubkey,
+        participant_a_ml_kem_pubkey: aBinding.mlKemPubkey,
+        ...(opts.omitKeyBinding ? {} : {
+          participant_a_key_binding: aBinding.keyBinding,
+          participant_a_key_binding_pq: aBinding.keyBindingPq,
+        }),
+        ...(bBinding && !opts.omitCounterpartyBinding
           ? {
               participant_b_primary_pubkey: responderPrimary,
-              participant_b_key_binding: counterpartyBinding,
+              participant_b_key_binding: bBinding.keyBinding,
+              participant_b_key_binding_pq: bBinding.keyBindingPq,
+              participant_b_ml_dsa_pubkey: bBinding.mlDsaPubkey,
+              participant_b_ml_kem_pubkey: bBinding.mlKemPubkey,
             }
           : {}),
       },

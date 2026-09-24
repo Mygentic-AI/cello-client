@@ -16,6 +16,7 @@ import { openEncryptedDatabaseAtPath } from "../sqlcipher-db.js";
 import { DbRegistrationPersistence } from "../db-identity-store.js";
 import { spawnRealDaemon, makeCelloDir, cleanupCelloDir, type SpawnedDaemon } from "./helpers/spawn-real-daemon.js";
 import type { Logger } from "../types.js";
+import { fixturePqIdentityRecord, registeredPqFields } from "./helpers/pq-identity.js";
 
 const AGENT = "singleton-test-agent";
 const silent: Logger = { debug() {}, info() {}, warn() {}, error() {} };
@@ -45,10 +46,13 @@ describe("M16 006-NOCONVERSE enforcer: cello_initiate_session as a channel over 
     // Record the agent as a registered channel, exactly as a channel registration leaves the row.
     const db = openEncryptedDatabaseAtPath(join(celloDir, "sessions.db"));
     try {
-      await new DbRegistrationPersistence({ db, agentName: AGENT, logger: silent }).persistRegistrationState({
+      const enforcerPersistence = new DbRegistrationPersistence({ db, agentName: AGENT, logger: silent });
+      const enforcerPq = await fixturePqIdentityRecord("enforcer-channel");
+      await enforcerPersistence.persistPqIdentity(enforcerPq);
+      await enforcerPersistence.persistRegistrationState({
         agentId: "enforcer-channel",
         primaryPubkey: "5b".repeat(32),
-        mlDsaPubkey: "6c".repeat(32),
+        ...registeredPqFields(enforcerPq),
         registeredAt: Date.now(),
         keyBinding: "7d".repeat(64),
         channel: true,

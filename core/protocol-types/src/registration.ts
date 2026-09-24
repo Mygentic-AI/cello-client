@@ -8,7 +8,9 @@
  * CLIENT → DIRECTORY (on existing authenticated /cello/signaling/1.0.0 stream):
  *   1. Client generates a 32-byte ML-DSA-44 seed via mlDsaGenerateSeed() and its provider via
  *      mlDsaProviderFromSeed() (NIST FIPS 204; the seed is what is persisted)
- *   2. Client sends register_request { phone_stub, k_local_pubkey, ml_dsa_pubkey }
+ *      and a 64-byte ML-KEM-768 seed via mlKemGenerateSeed(), and PERSISTS both before step 2
+ *      (M9D 002-PQKEYS)
+ *   2. Client sends register_request { phone_stub, k_local_pubkey, ml_dsa_pubkey, ml_kem_pubkey }
  *
  * DIRECTORY validates:
  *   a. phone_stub non-empty → else register_error { reason: 'invalid_verification' }
@@ -26,15 +28,20 @@
  *   3. Client runs runNetworkDkg (or createInProcessStubs in test) → primary_pubkey
  *      (this said bootstrapNetworkKeyShares until 2026-09-07; that was the trustedDealer
  *      test shortcut, which threw outside NODE_ENV=test and has now been deleted as dead)
- *   4. Client sends dkg_complete { primary_pubkey }
+ *   4. Client sends dkg_complete { primary_pubkey, key_binding, key_binding_pq } — the v2 binding
+ *      over all four keys, signed by K_local and by the ML-DSA key
  *
  * DIRECTORY verifies dkg_complete:
  *   - Checks primary_pubkey is consistent with the commitments stored during DKG
  *   - If mismatch → register_error { reason: 'dkg_verification_failed' }
+ *   - Verifies BOTH binding signatures (verifyKeyBinding) against the signaling-authenticated K_local
+ *   - If either fails → register_error { reason: 'key_binding_refused', detail: <KeyBindingRefusal> },
+ *     and no profile is stored
  *
  * DIRECTORY on success:
  *   - Generates 16-byte CSPRNG agent_id
- *   - Stores AgentProfile { k_local_pubkey, primary_pubkey, ml_dsa_pubkey, phone_stub_hash: SHA-256(phone_stub), ... }
+ *   - Stores AgentProfile { k_local_pubkey, primary_pubkey, ml_dsa_pubkey, ml_kem_pubkey, key_binding,
+ *     key_binding_pq, phone_stub_hash: SHA-256(phone_stub), ... } — the PQ keys are never rewritten
  *   - NEVER stores raw phone_stub (SI-001)
  *   - Sends register_success { agent_id, primary_pubkey }
  *
@@ -69,6 +76,12 @@ export interface RegisterRequest {
   k_local_pubkey: string;
   /** Hex-encoded ML-DSA-44 public key (1312 bytes, NIST FIPS 204) */
   ml_dsa_pubkey: string;
+  /**
+   * M9D 002-PQKEYS. Hex-encoded ML-KEM-768 public key (1184 bytes, NIST FIPS 203) — what content
+   * sealed to this agent is encapsulated to. Minted and persisted on this machine BEFORE this frame
+   * is sent, and fixed for the life of the agent.
+   */
+  ml_kem_pubkey: string;
   /**
    * M8B quorum registration: nodeIds (stable manifest labels, e.g. "us-east-1") of the consortium
    * directory nodes the client resolved / can reach right now (its live roster). The directory picks the
@@ -107,8 +120,8 @@ export interface DkgComplete {
   /** Hex-encoded FROST group public key (32 bytes). Derived from DKG commitments. */
   primary_pubkey: string;
   /**
-   * 038-KEYBIND. Hex-encoded 64-byte Ed25519 signature by this agent's K_local over
-   * (`k_local_pubkey`, `primary_pubkey`) under `CONTEXT_KEY_BINDING`.
+   * 038-KEYBIND. Hex-encoded 64-byte Ed25519 signature by this agent's K_local over the key-binding
+   * TBS (`buildKeyBindingTbs`) under `CONTEXT_KEY_BINDING`.
    *
    * THIS FRAME IS THE ONLY MOMENT IT CAN BE MADE. At agent creation the group key does not exist
    * yet; after registration the DKG is over. This is the one point where both keys are on the
@@ -117,8 +130,17 @@ export interface DkgComplete {
    *
    * The directory stores it and serves it on every session assignment. It cannot forge one (it
    * holds no K_local) and it cannot swap one (the binding names the identity it belongs to).
+   *
+   * M9D 002-PQKEYS: the signed bytes are the v2 TBS naming all four keys — K_local, the group key,
+   * the ML-DSA key and the ML-KEM key (`buildKeyBindingTbs`).
    */
   key_binding: string;
+  /**
+   * M9D 002-PQKEYS. Hex-encoded 2420-byte ML-DSA-44 signature by this agent's ML-DSA key over the
+   * SAME v2 TBS, under `cello-mldsa-key-binding-v1`. The directory refuses the registration unless
+   * both this and `key_binding` verify.
+   */
+  key_binding_pq: string;
 }
 
 // ─── Direction: directory → client ───────────────────────────────────────────
@@ -183,14 +205,29 @@ export interface RegisterSuccess {
 /**
  * Directory rejects registration.
  * SI-001: reason field NEVER carries raw phone_stub.
+ *
+ * `already_registered` carries the stored profile's keys so the client can reconstruct its state —
+ * all REQUIRED on that variant (M9D 002-PQKEYS: no optional post-quantum fields). Every other reason
+ * carries none of them.
  */
-export interface RegisterError {
+export type RegisterError = RegisterErrorAlreadyRegistered | RegisterErrorOther;
+
+export interface RegisterErrorAlreadyRegistered {
   type: "register_error";
-  reason: RegisterErrorReason;
-  /** Only set when reason === "already_registered" — allows client to reconstruct state */
-  agent_id?: string;
-  primary_pubkey?: string;
-  ml_dsa_pubkey?: string;
+  reason: "already_registered";
+  agent_id: string;
+  primary_pubkey: string;
+  /** Hex ML-DSA-44 public key the directory holds for this agent (1312 bytes). */
+  ml_dsa_pubkey: string;
+  /** Hex ML-KEM-768 public key the directory holds for this agent (1184 bytes). */
+  ml_kem_pubkey: string;
+}
+
+export interface RegisterErrorOther {
+  type: "register_error";
+  reason: Exclude<RegisterErrorReason, "already_registered">;
+  /** For `key_binding_refused`: the `KeyBindingRefusal` naming which check failed. */
+  detail?: string;
 }
 
 export type RegisterErrorReason =
@@ -200,7 +237,8 @@ export type RegisterErrorReason =
   | "dkg_failed"             // FROST DKG below threshold or ceremony failure
   | "not_authenticated"      // register_request arrived before signaling_auth_ok
   | "dkg_verification_failed" // primary_pubkey from dkg_complete doesn't match DKG commitments
-  | "invalid_channel_registration"; // channel/admin_pubkey fields malformed or inconsistent
+  | "invalid_channel_registration" // channel/admin_pubkey fields malformed or inconsistent
+  | "key_binding_refused";   // M9D 002-PQKEYS: the v2 binding's Ed25519 or ML-DSA signature did not verify
 
 // ─── AgentProfile (stored in DirectoryStore) ────────────────────────────────
 
@@ -216,6 +254,8 @@ export interface AgentProfile {
   primary_pubkey: string;
   /** Hex-encoded ML-DSA-44 public key (1312 bytes, FIPS 204) */
   ml_dsa_pubkey: string;
+  /** M9D 002-PQKEYS. Hex-encoded ML-KEM-768 public key (1184 bytes, FIPS 203). Immutable. */
+  ml_kem_pubkey: string;
   /** Hex SHA-256(phone_stub) — 32 bytes per FIPS 180-4. Raw phone_stub NEVER stored. */
   phone_stub_hash: string;
   /** Extensible agent profile data — empty in M3 */
@@ -227,21 +267,17 @@ export interface AgentProfile {
   /** Hex-encoded 16-byte CSPRNG agent ID */
   agent_id: string;
   /**
-   * 038-KEYBIND. Hex 64-byte Ed25519 signature by this agent's K_local over
-   * (`k_local_pubkey`, `primary_pubkey`), taken from `dkg_complete`.
+   * 038-KEYBIND, v2 since M9D 002-PQKEYS. Hex 64-byte Ed25519 signature by this agent's K_local over
+   * the v2 TBS naming all four keys, taken from `dkg_complete`.
    *
-   * The directory STORES and SERVES it; it can neither produce nor alter one, because the signer is
-   * a key no directory holds. That is what makes the directory an untrusted carrier here rather
-   * than an authority: the only thing it can do to this value is withhold it, and both clients
-   * refuse a session assignment that arrives without one.
-   *
-   * Optional on the TYPE for the profile rows of agents registered before the field existed. Those
-   * agents cannot be reached — not because the directory refuses (it cannot verify a binding, so it
-   * brokers and logs `session.key_binding.unavailable` naming which side is unbound) but because
-   * BOTH CLIENTS refuse an assignment that arrives without one. The operator re-registers, which
-   * mints the binding from key material the daemon already holds.
+   * The directory VERIFIES it at registration (with `key_binding_pq`) and refuses to store a profile
+   * whose binding fails, then serves it on every session assignment. It can neither produce nor alter
+   * one, because the signers are keys no directory holds — the only thing it can do is withhold it,
+   * and both clients refuse a session assignment that arrives without one.
    */
-  key_binding?: string;
+  key_binding: string;
+  /** M9D 002-PQKEYS. Hex 2420-byte ML-DSA-44 signature over the same v2 TBS. Required. */
+  key_binding_pq: string;
   /** True when this identity is a broadcast channel. Immutable. */
   channel: boolean;
   /** Hex admin pubkey when channel === true; "" otherwise. Immutable. */
@@ -270,6 +306,8 @@ export interface RegistrationState {
   primary_pubkey: string;
   /** Hex-encoded ML-DSA-44 public key (1312 bytes) */
   ml_dsa_pubkey: string;
+  /** M9D 002-PQKEYS. Hex-encoded ML-KEM-768 public key (1184 bytes) */
+  ml_kem_pubkey: string;
   /** Unix ms timestamp of registration */
   registered_at: number;
   /** Registration status */

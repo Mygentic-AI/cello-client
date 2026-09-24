@@ -16,7 +16,8 @@
 // having that call available is how a future edit reintroduces the bypass.
 import { verifyFrostSignature, verifyKeyBinding, CONTEXT_SESSION_ESTABLISHMENT } from "@cello-protocol/crypto";
 import { buildSessionEstablishmentTbs, computeGenesisPrevRoot } from "@cello-protocol/protocol-types";
-import type { SessionAssignment } from "@cello-protocol/protocol-types";
+import type { KeyBindingRefusal } from "@cello-protocol/crypto";
+import type { ParsedSessionAssignment, ParsedSessionAssignmentFrost } from "./session-assignment-parser.js";
 import type { DbRegistrationPersistence } from "./db-identity-store.js";
 import type { Logger } from "./types.js";
 
@@ -28,8 +29,54 @@ import type { Logger } from "./types.js";
  * same defect with more code. `DOD-M15-ASSIGN-1`'s receiver gate reads this assignment; gating on a
  * document nobody verified relocates trust rather than closing it.
  */
+/**
+ * M9D 002-PQKEYS — verify one party's v2 key binding off an assignment: all four of their keys,
+ * signed by BOTH their K_local and their ML-DSA key. The reason on refusal IS the `KeyBindingRefusal`
+ * (missing, pq missing, malformed, Ed25519 mismatch, ML-DSA mismatch) — five different things an
+ * operator and a reviewer need to tell apart. An absent key field rides into the builder as
+ * `undefined` and comes back `key_binding_malformed`.
+ */
+async function verifyPartyBinding(
+  a: ParsedSessionAssignmentFrost,
+  party: "a" | "b",
+): Promise<{ ok: true; group: Uint8Array; mlDsa: Uint8Array; mlKem: Uint8Array } | { ok: false; reason: KeyBindingRefusal }> {
+  const group = party === "a" ? a.signer_pubkey : a.participant_b_primary_pubkey;
+  const mlDsa = party === "a" ? a.participant_a_ml_dsa_pubkey : a.participant_b_ml_dsa_pubkey;
+  const mlKem = party === "a" ? a.participant_a_ml_kem_pubkey : a.participant_b_ml_kem_pubkey;
+  const r = await verifyKeyBinding({
+    keys: {
+      kLocal: party === "a" ? a.participant_a.pubkey : a.participant_b.pubkey,
+      group: group as Uint8Array,
+      mlDsa: mlDsa as Uint8Array,
+      mlKem: mlKem as Uint8Array,
+    },
+    signature: party === "a" ? a.participant_a_key_binding : a.participant_b_key_binding,
+    signaturePq: party === "a" ? a.participant_a_key_binding_pq : a.participant_b_key_binding_pq,
+  });
+  if (!r.ok) return r;
+  return { ok: true, group: group!, mlDsa: mlDsa!, mlKem: mlKem! };
+}
+
+/** Operator guidance per binding refusal — what happened, what was not done, what to do. */
+function bindingGuidance(reason: KeyBindingRefusal, side: "counterparty" | "initiator"): string {
+  const who = side === "counterparty" ? "your counterparty" : "the agent that opened this session";
+  const absent =
+    `The directory's session assignment is missing part of ${who}'s key binding — the signatures that prove their keys belong to their identity. Nothing was opened and nothing was sent. Retry; a different directory node will serve it. If it repeats on every node, ${who} registered before this proof existed and must re-register.`;
+  switch (reason) {
+    case "key_binding_missing":
+    case "key_binding_pq_missing":
+      return absent;
+    case "key_binding_malformed":
+      return `The directory's session assignment carries ${who}'s keys or key binding in the wrong shape. Nothing was opened and nothing was sent. Retry; if it repeats across nodes, the directory is not serving valid profiles and cello status will show which node answered.`;
+    case "key_binding_signature_mismatch":
+      return `The directory named keys for ${who} that their identity key has not signed for. This is refused rather than reported because it cannot tell a directory fault from an attempt to put keys it controls in their place; cause undetermined. Retry, and if it repeats across nodes confirm ${who}'s pubkey with their operator out of band.`;
+    case "key_binding_pq_signature_mismatch":
+      return `${side === "counterparty" ? "Your counterparty's" : "The initiator's"} post-quantum key did not sign for the keys the directory named, though their identity key did. Nothing was opened and nothing was sent. This is refused because accepting it would trust keys only the classical signature vouches for; cause undetermined. Retry, and if it repeats across nodes confirm their pubkey out of band.`;
+  }
+}
+
 export async function verifyAssignmentSignature(
-  assignment: SessionAssignment,
+  assignment: ParsedSessionAssignment,
   persistence: DbRegistrationPersistence,
   logger: Logger,
   agentName: string,
@@ -44,6 +91,10 @@ export async function verifyAssignmentSignature(
        * come through the binding check below.
        */
       counterpartyPrimaryHex: string;
+      /** M9D 002-PQKEYS: the counterparty's ML-DSA key, hex — proved by the same v2 binding. */
+      counterpartyMlDsaHex: string;
+      /** M9D 002-PQKEYS: the counterparty's ML-KEM key, hex — proved by the same v2 binding. */
+      counterpartyMlKemHex: string;
     }
   | { ok: false; reason: string; guidance: string }
 > {
@@ -177,37 +228,25 @@ export async function verifyAssignmentSignature(
      * nothing reaches `recordCounterpartyPrimary` unless `participant_b` is the counterparty the
      * operator asked for. The ordering is load-bearing and lives at the call site, not here.
      */
-    const counterpartyBinding = assignment.participant_b_key_binding;
-    const counterpartyPrimary = assignment.participant_b_primary_pubkey;
-    if (!counterpartyBinding || !counterpartyPrimary) {
-      // ABSENT AND MALFORMED TAKE THIS PATH TOGETHER (the parser maps a wrong-length value to
-      // undefined). An attacker who cannot forge a binding evades a mismatch check by supplying
-      // none, so "we could not tell" must cost exactly what "it was wrong" costs.
-      logger.error("session.assignment.counterparty_binding_absent", {
-        agentName, correlationId,
-        hasBinding: !!counterpartyBinding, hasPrimary: !!counterpartyPrimary,
-        impact: "the assignment carried no proof that the counterparty's threshold group key is theirs, so this agent could not learn a key it would later have to trust for their seal; the session was refused before any dial and nothing was sent",
-      });
-      return {
-        ok: false,
-        reason: "assignment_counterparty_binding_absent",
-        guidance: "The directory returned a session assignment without the counterparty's key binding — the signature that proves their threshold key belongs to the identity you asked for. Nothing was opened and nothing you wrote was sent. Retry cello_initiate_session; a different directory node will serve it. If it repeats on every node, the counterparty registered against a directory that predates this proof and they need to re-register before you can reach them.",
-      };
-    }
-    if (!verifyKeyBinding(counterpartyBinding, assignment.participant_b.pubkey, counterpartyPrimary)) {
-      logger.error("session.assignment.counterparty_binding_invalid", {
-        agentName, correlationId,
+    // M9D 002-PQKEYS: the counterparty's v2 binding — all four of their keys, BOTH signatures.
+    // Absent and malformed take the refuse path with the same cost as "wrong": an attacker who cannot
+    // forge a binding evades a mismatch check by supplying none.
+    const bound = await verifyPartyBinding(assignment, "b");
+    if (!bound.ok) {
+      logger.error("session.assignment.counterparty_binding_refused", {
+        agentName, correlationId, reason: bound.reason,
         counterpartyPrefix: Buffer.from(assignment.participant_b.pubkey).toString("hex").slice(0, 16),
-        impact: "the assignment named a threshold group key for the counterparty that their own identity key has not vouched for; it was refused before any dial, so no conversation was opened and nothing was sent",
+        impact: "the assignment named keys for the counterparty that their own identity and post-quantum keys have not both vouched for; it was refused before any dial, so no conversation was opened and nothing was sent",
       });
-      return {
-        ok: false,
-        reason: "assignment_counterparty_binding_invalid",
-        guidance: "The directory named a threshold key for your counterparty that their own identity key has not signed for. This is refused rather than reported because the observation cannot tell a directory fault from an attempt to put a key it controls in their place; cause undetermined. Run cello_status to see which node answered and retry — if it repeats across nodes, confirm the counterparty's pubkey with their operator out of band before trying again.",
-      };
+      return { ok: false, reason: bound.reason, guidance: bindingGuidance(bound.reason, "counterparty") };
     }
 
-    return { ok: true, counterpartyPrimaryHex: Buffer.from(counterpartyPrimary).toString("hex") };
+    return {
+      ok: true,
+      counterpartyPrimaryHex: Buffer.from(bound.group).toString("hex"),
+      counterpartyMlDsaHex: Buffer.from(bound.mlDsa).toString("hex"),
+      counterpartyMlKemHex: Buffer.from(bound.mlKem).toString("hex"),
+    };
   }
 }
 
@@ -268,10 +307,13 @@ export async function verifyAssignmentSignature(
  * the operator's out-of-band problem and always was — but a directory can no longer substitute a
  * group key, which is what this function existed to be unable to say.
  */
-export function verifyInboundAssignment(
-  assignment: SessionAssignment,
+export async function verifyInboundAssignment(
+  assignment: ParsedSessionAssignment,
   expectedSignerHex: string | null,
-): { ok: true; mode: "pinned" | "bound" } | { ok: false; reason: string; detail: string } {
+): Promise<
+  | { ok: true; mode: "pinned" | "bound"; initiatorMlDsa: Uint8Array; initiatorMlKem: Uint8Array }
+  | { ok: false; reason: string; detail: string }
+> {
   if (assignment.signature_type !== "frost") {
     return {
       ok: false,
@@ -297,22 +339,11 @@ export function verifyInboundAssignment(
    * verifying a key against itself. The parser maps a malformed value to `undefined`, so missing
    * and malformed take this same path.
    */
-  const binding = assignment.participant_a_key_binding;
-  if (!binding) {
-    return {
-      ok: false,
-      reason: "inbound_assignment_no_key_binding",
-      detail:
-        "the assignment carried no key binding for the initiator, so the threshold key it names could not be placed against their identity",
-    };
-  }
-  if (!verifyKeyBinding(binding, assignment.participant_a.pubkey, signer)) {
-    return {
-      ok: false,
-      reason: "inbound_assignment_key_binding_invalid",
-      detail:
-        "the initiator's identity key has not signed for the threshold key this assignment names as theirs",
-    };
+  // M9D 002-PQKEYS: the initiator's v2 binding names all four of their keys and carries BOTH
+  // signatures; the refusal reason is the `KeyBindingRefusal` itself.
+  const bound = await verifyPartyBinding(assignment, "a");
+  if (!bound.ok) {
+    return { ok: false, reason: bound.reason, detail: bindingGuidance(bound.reason, "initiator") };
   }
   /**
    * The key the BINDING proved — not the key the frame supplied.
@@ -373,5 +404,10 @@ export function verifyInboundAssignment(
   // A first contact now verifies under a group key the counterparty's own identity key signed
   // for, so the old word would assert a weaker property than the code holds and send the next
   // reader looking for a gap that has been closed.
-  return { ok: true, mode: expectedSignerHex !== null ? "pinned" : "bound" };
+  return {
+    ok: true,
+    mode: expectedSignerHex !== null ? "pinned" : "bound",
+    initiatorMlDsa: bound.mlDsa,
+    initiatorMlKem: bound.mlKem,
+  };
 }

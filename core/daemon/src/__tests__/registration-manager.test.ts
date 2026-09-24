@@ -40,8 +40,8 @@ vi.mock("../network-directory-node.js", async (importOriginal) => {
 
 import { RegistrationManager, type RegistrationContext, type SignalingSendResult } from "../registration-manager.js";
 import type { ConsortiumEndpoint } from "../directory-bootstrap.js";
-import type { DaemonRegistrationPersistence } from "../registration-persistence.js";
-import { generateKeypair, verifyKeyBinding } from "@cello-protocol/crypto";
+import type { DaemonRegistrationPersistence, PqIdentityRecord, StoredPqIdentity } from "../registration-persistence.js";
+import { generateKeypair, verifyKeyBinding, mlDsaGenerateSeed } from "@cello-protocol/crypto";
 import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 
@@ -57,14 +57,24 @@ const stubNode = {} as unknown as CelloNode;
  * directory-supplied `primary_pubkey` against before K_local signs a statement about it. `null`
  * models a machine holding no share, which is now a refusal rather than a licence to sign.
  */
-function makeRecordingPersistence(sharePrimaryHex: string | null = "cc".repeat(32)) {
-  const calls = { mlDsa: [] as unknown[], reg: [] as unknown[], frost: [] as unknown[] };
+function makeRecordingPersistence(
+  sharePrimaryHex: string | null = "cc".repeat(32),
+  opts: { stored?: StoredPqIdentity; failPq?: "ml_dsa" | "ml_kem" } = {},
+) {
+  const calls = { pq: [] as PqIdentityRecord[], reg: [] as unknown[], frost: [] as unknown[] };
+  // M9D 002-PQKEYS: the row's post-quantum identity, as stored — persisted seeds are what a later
+  // registration attempt on the same row reads back.
+  let stored: StoredPqIdentity = opts.stored ?? { mlDsaSeed: null, mlDsaPubkey: null, mlKemSeed: null, mlKemPubkey: null };
   const persistence: DaemonRegistrationPersistence = {
-    async persistMlDsaKeypair(o) { calls.mlDsa.push(o); },
+    async persistPqIdentity(r) {
+      if (opts.failPq) throw new Error(`${opts.failPq}_persist_failed: disk full`);
+      calls.pq.push(r);
+      stored = { mlDsaSeed: r.mlDsaSeed, mlDsaPubkey: r.mlDsaPubkey, mlKemSeed: r.mlKemSeed, mlKemPubkey: r.mlKemPubkey };
+    },
     async persistRegistrationState(o) { calls.reg.push(o); },
     async persistFrostKeyShare(o) { calls.frost.push(o); },
     async loadRegistrationState() { return null; },
-    async loadMlDsaKeypair() { return null; },
+    async loadPqIdentity() { return stored; },
     async loadActiveFrostKeyShare() {
       return sharePrimaryHex === null
         ? null
@@ -78,7 +88,7 @@ function makeRecordingPersistence(sharePrimaryHex: string | null = "cc".repeat(3
 
 function makeFakeCtx(opts: Partial<{
   logger: Logger;
-  persistence: DaemonRegistrationPersistence | null;
+  persistence: DaemonRegistrationPersistence;
   getNode: () => CelloNode | null;
   getDirectoryEndpoint: () => { peer_id: string; multiaddrs: string[] } | null;
   getConsortiumEndpoints: () => ConsortiumEndpoint[];
@@ -93,11 +103,13 @@ function makeFakeCtx(opts: Partial<{
    * it does not own — the binding would fail its own verifier and no test could assert on it.
    */
   let pubkeyHex: string | null = stubKeyProviderPubkeyHex;
+  // Every frame sent, in order — the register_request's PQ keys are what an honest directory echoes.
+  const frames: Array<Record<string, unknown>> = [];
 
   const ctx: RegistrationContext = {
     keyProvider: stubKeyProvider,
     logger: opts.logger ?? noopLogger,
-    persistence: opts.persistence ?? null,
+    persistence: opts.persistence ?? makeRecordingPersistence().persistence,
     getNode: opts.getNode ?? (() => stubNode),
     getMyPubkeyHex: () => pubkeyHex,
     setMyPubkeyHex: (h) => { pubkeyHex = h; },
@@ -108,13 +120,23 @@ function makeFakeCtx(opts: Partial<{
     getMyPrimaryPubkey: () => null,
     setMyPrimaryPubkey: () => {},
     isSignalingConnected: opts.isSignalingConnected ?? (() => true),
-    sendSignalingFrame: opts.sendSignalingFrame ?? (async () => ({ ok: true })),
+    sendSignalingFrame: async (f) => {
+      frames.push(f);
+      return opts.sendSignalingFrame ? opts.sendSignalingFrame(f) : { ok: true };
+    },
     setPendingDkgReadyResolve: (r) => { pendingDkg = r; },
     setPendingRegisterResolve: (r) => { pendingReg = r; },
   };
 
   return {
     ctx,
+    frames,
+    /** The PQ keys this registration sent — what an honest directory's `already_registered` echoes. */
+    echoKeys: () => {
+      const req = frames.find((f) => f["type"] === "register_request");
+      if (!req) throw new Error("echoKeys: no register_request was sent");
+      return { ml_dsa_pubkey: req["ml_dsa_pubkey"], ml_kem_pubkey: req["ml_kem_pubkey"] };
+    },
     deliverDkg: (f: Record<string, unknown>) => pendingDkg?.(f),
     deliverReg: (f: Record<string, unknown>) => pendingReg?.(f),
     getPendingDkg: () => pendingDkg,
@@ -127,7 +149,7 @@ describe("RegistrationManager (daemon port) — seam paths", () => {
     const { ctx } = makeFakeCtx();
     const mgr = new RegistrationManager(ctx);
     mgr.setRegistrationState({
-      agent_id: "x", primary_pubkey: "p", ml_dsa_pubkey: "m", registered_at: 1, status: "active",
+      agent_id: "x", primary_pubkey: "p", ml_dsa_pubkey: "m", ml_kem_pubkey: "k", registered_at: 1, status: "active",
     });
     expect(await mgr.register("", "token")).toEqual({ error: "already_registered" });
   });
@@ -182,13 +204,14 @@ describe("RegistrationManager (daemon port) — seam paths", () => {
       reason: "already_registered",
       agent_id: "agent-77",
       primary_pubkey: "cc".repeat(32),
-      ml_dsa_pubkey: "dd".repeat(32),
+      ...h.echoKeys(),
     });
     const result = await promise;
     expect(result).toMatchObject({ agent_id: "agent-77", status: "active" });
-    // persistence path → both writes happened, and the ML-DSA secret persisted is the 32-byte seed
-    expect(calls.mlDsa).toHaveLength(1);
-    expect((calls.mlDsa[0] as { secretKeyBlob: Uint8Array }).secretKeyBlob.length).toBe(32);
+    // The PQ identity was persisted (32-byte ML-DSA seed, 64-byte ML-KEM seed), then the state.
+    expect(calls.pq).toHaveLength(1);
+    expect(calls.pq[0]!.mlDsaSeed.length).toBe(32);
+    expect(calls.pq[0]!.mlKemSeed.length).toBe(64);
     expect(calls.reg).toHaveLength(1);
     expect(calls.reg[0]).toMatchObject({ agentId: "agent-77" });
   });
@@ -198,11 +221,10 @@ describe("RegistrationManager (daemon port) — seam paths", () => {
   // with an uncommitted identity (the can't-sign-zombie failure mode).
   it("fails the registration with identity_persist_failed when a persist rejects (not fire-and-forget)", async () => {
     const rejectingPersistence: DaemonRegistrationPersistence = {
-      async persistMlDsaKeypair() { throw new Error("disk full"); },
-      async persistRegistrationState() { /* unreached */ },
+      ...makeRecordingPersistence().persistence,
+      async persistRegistrationState() { throw new Error("disk full"); },
       async persistFrostKeyShare() { /* unreached */ },
       async loadRegistrationState() { return null; },
-      async loadMlDsaKeypair() { return null; },
       // 038-KEYBIND: a share that agrees with the directory's answer, so this test still reaches
       // the persist it is about rather than stopping at the binding corroboration.
       async loadActiveFrostKeyShare() {
@@ -220,7 +242,7 @@ describe("RegistrationManager (daemon port) — seam paths", () => {
       reason: "already_registered",
       agent_id: "agent-88",
       primary_pubkey: "cc".repeat(32),
-      ml_dsa_pubkey: "dd".repeat(32),
+      ...h.echoKeys(),
     });
     // Must surface the persist failure as a registration failure — NOT return the state.
     expect(await promise).toEqual({ error: "identity_persist_failed" });
@@ -322,26 +344,33 @@ describe("038-KEYBIND: the binding this daemon MINTS", () => {
       reason: "already_registered",
       agent_id: "agent-mint",
       primary_pubkey: answeredPrimary,
-      ml_dsa_pubkey: "dd".repeat(32),
+      ...h.echoKeys(),
     });
     return promise;
   }
 
-  it("★ signs a binding the PRODUCTION verifier accepts, over (K_local, the group key)", async () => {
+  it("★ signs a v2 binding the PRODUCTION verifier accepts — both halves, over all four keys", async () => {
     const { persistence, calls } = makeRecordingPersistence(GROUP);
     await registerAgainstAlreadyRegistered(persistence);
 
-    const persisted = calls.reg[0] as { keyBinding: string; primaryPubkey: string };
+    const persisted = calls.reg[0] as { keyBinding: string; keyBindingPq: string; primaryPubkey: string };
+    const hex = (h: string) => new Uint8Array(Buffer.from(h, "hex"));
     // The VALUE, run through `verifyKeyBinding` — not "a 128-char string was stored". A binding over
-    // the group key alone, or under a reused context, or over the wrong identity, fails here.
+    // fewer keys, under a reused context, over the wrong identity, or with either half missing or
+    // signed by the wrong key, fails here.
     expect(
-      verifyKeyBinding(
-        new Uint8Array(Buffer.from(persisted.keyBinding, "hex")),
-        new Uint8Array(Buffer.from(stubKeyProviderPubkeyHex, "hex")),
-        new Uint8Array(Buffer.from(GROUP, "hex")),
-      ),
-      "the binding this daemon mints must verify under its own K_local, over its own group key",
-    ).toBe(true);
+      await verifyKeyBinding({
+        keys: {
+          kLocal: hex(stubKeyProviderPubkeyHex),
+          group: hex(GROUP),
+          mlDsa: hex(calls.pq[0]!.mlDsaPubkey),
+          mlKem: hex(calls.pq[0]!.mlKemPubkey),
+        },
+        signature: hex(persisted.keyBinding),
+        signaturePq: hex(persisted.keyBindingPq),
+      }),
+      "the binding this daemon mints must verify under its own K_local AND its own ML-DSA key",
+    ).toEqual({ ok: true });
     expect(persisted.primaryPubkey).toBe(GROUP);
   });
 
@@ -382,8 +411,7 @@ describe("M16 004-IDENTITY-WIRE: channel registration (client side)", () => {
   // verifies it), so any well-formed hex stands in here.
   const ADMIN_SIG = "ab".repeat(64);
 
-  function makeCapturingCtx(persistence: DaemonRegistrationPersistence | null = null) {
-    const frames: Array<Record<string, unknown>> = [];
+  function makeCapturingCtx(persistence: DaemonRegistrationPersistence = makeRecordingPersistence(GROUP).persistence) {
     const errors: Array<{ event: string; ctx: Record<string, unknown> }> = [];
     const logger: Logger = {
       debug() {}, info() {}, warn() {},
@@ -393,16 +421,15 @@ describe("M16 004-IDENTITY-WIRE: channel registration (client side)", () => {
       logger,
       persistence,
       getConsortiumEndpoints: () => null,
-      sendSignalingFrame: async (f) => { frames.push(f); return { ok: true }; },
     });
-    return { ...h, frames, errors };
+    return { ...h, errors };
   }
 
   /** Drive register() through a completed ceremony to the register_success frame. */
   async function driveToRegisterSuccess(
     h: ReturnType<typeof makeCapturingCtx>,
     promise: Promise<unknown>,
-    success: Record<string, unknown>,
+    success: Record<string, unknown> | (() => Record<string, unknown>),
   ): Promise<unknown> {
     await vi.waitFor(() => expect(h.getPendingDkg()).not.toBeNull());
     dkgSeam.nextResult = {
@@ -417,7 +444,7 @@ describe("M16 004-IDENTITY-WIRE: channel registration (client side)", () => {
     };
     h.deliverDkg({ type: "dkg_ready", epochId: "e1", participants: 1, threshold: 2 });
     await vi.waitFor(() => expect(h.getPendingReg()).not.toBeNull());
-    h.deliverReg({ type: "register_success", agent_id: "agent-ch", primary_pubkey: GROUP, ...success });
+    h.deliverReg({ type: "register_success", agent_id: "agent-ch", primary_pubkey: GROUP, ...(typeof success === "function" ? success() : success) });
     return promise;
   }
 
@@ -511,7 +538,7 @@ describe("M16 004-IDENTITY-WIRE: channel registration (client side)", () => {
     await vi.waitFor(() => expect(h.getPendingDkg()).not.toBeNull());
     h.deliverDkg({
       type: "register_error", reason: "already_registered",
-      agent_id: "agent-old", primary_pubkey: GROUP, ml_dsa_pubkey: "dd".repeat(32),
+      agent_id: "agent-old", primary_pubkey: GROUP, ...h.echoKeys(),
     });
     expect(await promise).toMatchObject({ error: "directory_missing_channel_support" });
     expect(calls.reg).toHaveLength(0);
@@ -523,9 +550,10 @@ describe("M16 004-IDENTITY-WIRE: channel registration (client side)", () => {
     const h = makeCapturingCtx(persistence);
     const mgr = new RegistrationManager(h.ctx);
     const promise = mgr.register("", "token", { channel: true, adminPubkeyHex: ADMIN, adminSignature: ADMIN_SIG });
-    const result = await driveToRegisterSuccess(h, promise, {
-      type: "register_error", reason: "already_registered", ml_dsa_pubkey: "dd".repeat(32),
-    });
+    // Lazy: the echo can only name the keys once register_request has actually been sent.
+    const result = await driveToRegisterSuccess(h, promise, () => ({
+      type: "register_error", reason: "already_registered", ...h.echoKeys(),
+    }));
     expect(result).toMatchObject({ error: "directory_missing_channel_support" });
     expect(calls.reg).toHaveLength(0);
   });
@@ -563,9 +591,73 @@ describe("M16 004-IDENTITY-WIRE: channel registration (client side)", () => {
     await vi.waitFor(() => expect(h.getPendingDkg()).not.toBeNull());
     h.deliverDkg({
       type: "register_error", reason: "already_registered", channel: true,
-      agent_id: "agent-news", primary_pubkey: GROUP, ml_dsa_pubkey: "dd".repeat(32),
+      agent_id: "agent-news", primary_pubkey: GROUP, ...h.echoKeys(),
     });
     expect(await promise).toMatchObject({ error: "channel_fields_immutable" });
+    expect(calls.reg).toHaveLength(0);
+  });
+});
+
+/**
+ * M9D 002-PQKEYS — the post-quantum identity is persisted BEFORE anything is sent, reused on retry,
+ * and never half-minted.
+ */
+describe("002-PQKEYS: the PQ identity is persisted first", () => {
+  it("test 8: persistPqIdentity throws → pq_keys_not_persisted, and NO frame was sent", async () => {
+    const { persistence } = makeRecordingPersistence(undefined, { failPq: "ml_kem" });
+    // Recorder starts UNDEFINED and is only ever set by a send — a default would pass on no send.
+    let firstFrame: Record<string, unknown> | undefined = undefined;
+    const errors: Array<{ event: string; ctx: Record<string, unknown> }> = [];
+    const logger: Logger = {
+      debug() {}, info() {}, warn() {},
+      error(event, ctx) { errors.push({ event, ctx: (ctx ?? {}) as Record<string, unknown> }); },
+    };
+    const h = makeFakeCtx({ persistence, logger, sendSignalingFrame: async (f) => { firstFrame ??= f; return { ok: true }; } });
+    const result = await new RegistrationManager(h.ctx).register("", "token") as { error: string; detail?: string };
+
+    expect(result.error).toBe("pq_keys_not_persisted");
+    expect(result.detail).toMatch(/not attempted/);
+    expect(firstFrame, "nothing may reach the directory when the seeds did not persist").toBeUndefined();
+    const refused = errors.find((e) => e.event === "registration.pq_keys.refused");
+    expect(refused?.ctx["reason"]).toBe("ml_kem_persist_failed");
+    expect(typeof refused?.ctx["correlationId"]).toBe("string");
+  });
+
+  it("test 9: a retried registration reuses the persisted seeds — the second register_request carries the same keys", async () => {
+    const { persistence, calls } = makeRecordingPersistence();
+    // First attempt persists, then fails to send.
+    const first = makeFakeCtx({ persistence, sendSignalingFrame: async () => ({ ok: false, reason: "signaling_lost" }) });
+    expect(await new RegistrationManager(first.ctx).register("", "token")).toEqual({ error: "signaling_lost" });
+    const firstKeys = first.echoKeys();
+
+    const second = makeFakeCtx({ persistence, sendSignalingFrame: async () => ({ ok: false, reason: "signaling_lost" }) });
+    await new RegistrationManager(second.ctx).register("", "token");
+    expect(second.echoKeys()).toEqual(firstKeys);
+    expect(calls.pq, "the seeds are minted and persisted exactly once").toHaveLength(1);
+  });
+
+  it("test 10: a row holding an ML-DSA seed and no ML-KEM seed fails loud — nothing minted, nothing sent", async () => {
+    const { persistence, calls } = makeRecordingPersistence(undefined, {
+      stored: { mlDsaSeed: mlDsaGenerateSeed(), mlDsaPubkey: "aa", mlKemSeed: null, mlKemPubkey: null },
+    });
+    const h = makeFakeCtx({ persistence });
+    const result = await new RegistrationManager(h.ctx).register("", "token") as { error: string; detail?: string };
+    expect(result.error).toBe("pq_keys_not_persisted");
+    expect(result.detail).toMatch(/ML-DSA seed but no ML-KEM seed/);
+    expect(calls.pq, "the missing half must not be minted").toHaveLength(0);
+    expect(h.frames).toHaveLength(0);
+  });
+
+  it("an already_registered answer naming OTHER post-quantum keys is refused, and nothing is persisted", async () => {
+    const { persistence, calls } = makeRecordingPersistence();
+    const h = makeFakeCtx({ persistence });
+    const promise = new RegistrationManager(h.ctx).register("", "token");
+    await vi.waitFor(() => expect(h.getPendingDkg()).not.toBeNull());
+    h.deliverDkg({
+      type: "register_error", reason: "already_registered", agent_id: "agent-x",
+      primary_pubkey: "cc".repeat(32), ml_dsa_pubkey: h.echoKeys().ml_dsa_pubkey, ml_kem_pubkey: "ee".repeat(1184),
+    });
+    expect(await promise).toMatchObject({ error: "registration_pq_keys_mismatch" });
     expect(calls.reg).toHaveLength(0);
   });
 });

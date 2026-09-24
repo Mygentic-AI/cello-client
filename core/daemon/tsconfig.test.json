@@ -194,6 +194,8 @@
     "src/__tests__/helpers/session-genesis.ts",
     "src/__tests__/helpers/spawn-real-daemon.ts",
     "src/__tests__/helpers/two-connection-fixture.ts",
+    // M9D 002-PQKEYS: real post-quantum identities for fixtures that register a row by hand.
+    "src/__tests__/helpers/pq-identity.ts",
     // M9D 001-PQPRIM: the D4 scan's positive control (scanned by core/crypto's d4-single-frame test).
     "src/__tests__/fixtures/d4-offender.ts"
   ]

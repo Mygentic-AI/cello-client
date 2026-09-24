@@ -202,7 +202,7 @@ async function startDaemonHoldingLock(
   // 040-DAEMONROOT unit 7 (phase 2): the agents this daemon holds, their keys, the content park,
   // the reconnect drain and the submission retry queue → boot-agents.ts.
   const {
-    loadedAgents, getPersistence, agents, keyProviders, contentPark,
+    loadedAgents, getPersistence, agents, keyProviders, pqIdentities, contentPark,
     autoRecoverForAgent, onSignalingConnected, submissionRetries, recordIssuedSubmission,
   } = await startBootAgents({
     config, logger, sessionNodeManager, securityGateway,
@@ -654,6 +654,7 @@ async function startDaemonHoldingLock(
     handlers,
     logger,
     keyProviders,
+    pqIdentities,
     getPersistence,
     getAgentSignaling,
     waitForSignalingConnected,

@@ -24,6 +24,7 @@ import type { IManifestProvider } from "@cello-protocol/transport";
 import { manifestNodesToEndpoints } from "./directory-bootstrap.js";
 import { DaemonRegistrationContext } from "./registration-context.js";
 import { RegistrationManager } from "./registration-manager.js";
+import type { PqIdentity } from "./registration-manager.js";
 import { validatorNodes } from "@cello-protocol/protocol-types";
 import { classifyManifestValidity } from "./manifest-validity.js";
 import { extractErrorMessage } from "./error-message.js";
@@ -32,6 +33,11 @@ export interface RegisterHandlerDeps {
   handlers: Map<string, IpcHandler>;
   logger: Logger;
   keyProviders: Map<string, KeyProvider>;
+  /**
+   * M9D 002-PQKEYS: each loaded agent's post-quantum identity. A registration that completes adds its
+   * agent here, so an agent registered in this run can sign post-quantum without a restart.
+   */
+  pqIdentities: Map<string, PqIdentity>;
   getPersistence: (agentName: string) => DbRegistrationPersistence;
   getAgentSignaling: (agentName: string, keyProvider: KeyProvider, pubkeyHex: string) => { signaling: SignalingManager; getNode: () => CelloNode | null };
   waitForSignalingConnected: (mgr: SignalingManager, timeoutMs: number) => Promise<boolean>;
@@ -51,7 +57,7 @@ export interface RegisterHandlerDeps {
 
 export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
   const {
-    handlers, logger, keyProviders, getPersistence,
+    handlers, logger, keyProviders, pqIdentities, getPersistence,
     getAgentSignaling, waitForSignalingConnected, dropAgentSignaling, startAgentInternal,
     directoryEndpointResolver, loadedAgents, registrationGuidance, manifestProvider,
   } = deps;
@@ -283,7 +289,8 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
         logger,
       });
       try {
-        const result = await new RegistrationManager(ctx).register(phoneStub, preAuthToken, channelOpts);
+        const manager = new RegistrationManager(ctx);
+        const result = await manager.register(phoneStub, preAuthToken, channelOpts);
         if ("error" in result) {
           logger.warn("registration.failed", { ...cid, agentName: name, reason: result.error });
           // Terminal failure for THIS agent — drop its dedicated signaling manager so it
@@ -301,6 +308,9 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
         // committed at this point (RegistrationManager awaits the persist before returning success).
         // SI-001: never log a secret — only the agent name + PUBLIC key.
         logger.info("persist.identity.persisted", { ...cid, agentName: name, agentPubkey: agentPubkeyHex });
+        // M9D 002-PQKEYS: a successful registration always holds its post-quantum identity.
+        const pq = manager.getPqIdentity();
+        if (pq) pqIdentities.set(name, pq);
         // CC-2 (2026-07-07): registration succeeded — arm this agent's standing receiver NOW so a
         // brand-new agent can receive inbound immediately. Without this the agent reports
         // standing_receiver_ready:false and cannot receive until the operator restarts (logout/login),

@@ -31,6 +31,7 @@ import type { SecurityGatewayClient } from "../../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
 import { fakeRelayAnchor } from "../relay-client-fake.js";
+import { fixturePqIdentityRecord, registeredPqFields } from "./pq-identity.js";
 
 /** A libp2p node that goes nowhere. The daemon-side bookkeeping under test never dials. */
 export class FakeNode implements Partial<CelloNode> {
@@ -239,11 +240,14 @@ export async function startTwoConnectionFixture(
   };
   const handle = await startDaemon(config);
   for (const name of opts.channelAgents ?? []) {
-    await new DbRegistrationPersistence({ db: handle.getSessionNodeManager().getDb(), agentName: name, logger: capturing })
+    const channelPersistence = new DbRegistrationPersistence({ db: handle.getSessionNodeManager().getDb(), agentName: name, logger: capturing });
+    const channelPq = await fixturePqIdentityRecord(`channel-${name}`);
+    await channelPersistence.persistPqIdentity(channelPq);
+    await channelPersistence
       .persistRegistrationState({
         agentId: `fixture-channel-${name}`,
         primaryPubkey: "5b".repeat(32),
-        mlDsaPubkey: "6c".repeat(32),
+        ...registeredPqFields(channelPq),
         registeredAt: Date.now(),
         keyBinding: "7d".repeat(64),
         channel: true,

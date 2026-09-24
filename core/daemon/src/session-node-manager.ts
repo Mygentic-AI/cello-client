@@ -537,7 +537,8 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
    * it describes. The row-writing itself lives in `session-queries.ts`.
    */
   recordSealCertificate(agentName: string, sessionId: string, sealedRootHex: string, legibilityJson: string): void { return this.#queries.recordSealCertificate(agentName, sessionId, sealedRootHex, legibilityJson); }
-  recordCounterpartyPrimary(agentName: string, sessionId: string, primaryPubkeyHex: string): void { return this.#queries.recordCounterpartyPrimary(agentName, sessionId, primaryPubkeyHex); }
+  recordCounterpartyKeys(agentName: string, sessionId: string, keys: { primaryHex: string; mlDsaHex: string; mlKemHex: string }): void { return this.#queries.recordCounterpartyKeys(agentName, sessionId, keys); }
+  counterpartyPqKeys(agentName: string, sessionId: string): { mlDsa: Uint8Array; mlKem: Uint8Array } | null { return this.#queries.counterpartyPqKeys(agentName, sessionId); }
 
   /**
    * ─── DELEGATORS — the salt API other files call, unchanged by the split ─────────────────────

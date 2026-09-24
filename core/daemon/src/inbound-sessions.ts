@@ -15,6 +15,7 @@
 import { randomUUID } from "node:crypto";
 import { SignalingManager } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
+import { KEY_BINDING_REFUSALS } from "@cello-protocol/crypto";
 import type { IpcHandler } from "./ipc-server.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { AgentInfo, Logger, SessionRecord } from "./types.js";
@@ -793,6 +794,12 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     agentName: string,
     correlationId: string,
     verification: "pinned" | "first_contact",
+    /**
+     * M9D 002-PQKEYS: the initiator's post-quantum keys, hex, as `verifyInboundAssignment` PROVED
+     * them through the initiator's v2 binding. Passed in rather than read off the frame, so the only
+     * keys that can be recorded for a counterparty are ones a binding verified.
+     */
+    initiatorPqKeys: { mlDsaHex: string; mlKemHex: string },
   ): Promise<void> {
     // M12-P16: refuse BEFORE anything else — in particular before ensureStandingReceiverForAgent,
     // whose first line would resurrect the receiver this agent was just relieved of.
@@ -1056,7 +1063,11 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       // signer, carried as signer_pubkey on the FROST-signed assignment) so the bilateral seal
       // signature can be verified locally rather than accepted on faith.
       if (parsed.signerPubkeyHex) {
-        sessionNodeManager.recordCounterpartyPrimary(agentName, parsed.sessionIdHex, parsed.signerPubkeyHex);
+        sessionNodeManager.recordCounterpartyKeys(agentName, parsed.sessionIdHex, {
+          primaryHex: parsed.signerPubkeyHex,
+          mlDsaHex: initiatorPqKeys.mlDsaHex,
+          mlKemHex: initiatorPqKeys.mlKemHex,
+        });
       }
 
       // H1: genesis_prev_root is the canonical two-party genesis value — the SAME value
@@ -1251,7 +1262,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
    *   a frame with no parseable assignment cannot say which local agent it was addressed to — and
    *   the refusal below still has to be filed under someone, or the operator never sees it.
    */
-  function handleInboundSessionAssignment(frame: Record<string, unknown>, streamAgentName?: string): void {
+  async function handleInboundSessionAssignment(frame: Record<string, unknown>, streamAgentName?: string): Promise<void> {
     // M4: one correlationId minted per inbound flow, threaded through EVERY event below.
     const correlationId = randomUUID();
     const parsed = extractInboundSessionAssignment(frame);
@@ -1498,6 +1509,19 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     }
 
     /**
+     * M9D 002-PQKEYS — CLAIM THE SESSION NOW, before the first await.
+     *
+     * Verifying the initiator's binding checks an ML-DSA signature, which is asynchronous. Until
+     * then this handler ran synchronously from the dedup check above to the claim below, so a
+     * retransmitted assignment could never slip between them. With an await in between, it could:
+     * both copies would pass the check and both would be accepted. So the claim moves up to the
+     * check, and every refusal below releases it.
+     */
+    const inFlightKey = offerKey(localAgent.name, parsed.sessionIdHex);
+    inboundInFlight.add(inFlightKey);
+    const releaseInFlight = (): void => { inboundInFlight.delete(inFlightKey); };
+
+    /**
      * DOD-M15-RESPONDER-VERIFY-1 — THE RESPONDER NOW VERIFIES, and this is what unblocks
      * `DOD-M15-OFFER-SIGNED-1`.
      *
@@ -1552,9 +1576,15 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         });
       },
     );
-    const verdict = rawAssignment === null
-      ? { ok: false as const, reason: "inbound_assignment_unparseable", detail: "the assignment object failed shape validation" }
-      : verifyInboundAssignment(rawAssignment, pinnedSigner);
+    let verdict: Awaited<ReturnType<typeof verifyInboundAssignment>>;
+    try {
+      verdict = rawAssignment === null
+        ? { ok: false as const, reason: "inbound_assignment_unparseable", detail: "the assignment object failed shape validation" }
+        : await verifyInboundAssignment(rawAssignment, pinnedSigner);
+    } catch (err: unknown) {
+      releaseInFlight();
+      throw err;
+    }
     if (!verdict.ok) {
       /**
        * ONLY `signer_not_pinned` is an identity change, and the distinction is load-bearing.
@@ -1584,9 +1614,8 @@ export function createInboundSessions(deps: InboundSessionDeps) {
        * retry produces the same assignment with the same missing field. The action is on THEIR side
        * and it is a re-registration.
        */
-      const isBindingFault =
-        verdict.reason === "inbound_assignment_no_key_binding" ||
-        verdict.reason === "inbound_assignment_key_binding_invalid";
+      // M9D 002-PQKEYS: the binding refusals are now the `KeyBindingRefusal` values themselves.
+      const isBindingFault = (KEY_BINDING_REFUSALS as readonly string[]).includes(verdict.reason);
       logger.error(
         isIdentityChange
           ? "session.inbound.counterparty_primary_changed"
@@ -1655,6 +1684,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
               "reaching is not producing valid assignments — nothing is wrong with your agent.",
         correlationId,
       });
+      releaseInFlight();
       return;
     }
     /**
@@ -1732,6 +1762,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
           "channel's admin agent instead.",
         correlationId,
       });
+      releaseInFlight();
       return;
     }
 
@@ -1760,15 +1791,19 @@ export function createInboundSessions(deps: InboundSessionDeps) {
           "behind it, open the session from your admin agent instead.",
         correlationId,
       });
+      releaseInFlight();
       return;
     }
 
-    inboundInFlight.add(offerKey(localAgent.name, parsed.sessionIdHex));
+    // Claimed above, before verification. From here the accept chain owns the claim.
     // Serialize: the next accept does not begin until this one (and any standing-receiver
     // rebuild it triggers) settles. A throw inside one accept must not break the chain.
     const agentName = localAgent.name;
     inboundAcceptChain = inboundAcceptChain
-      .then(() => acceptInboundAssignment(parsed, agentName, correlationId, verification))
+      .then(() => acceptInboundAssignment(parsed, agentName, correlationId, verification, {
+        mlDsaHex: Buffer.from(verdict.initiatorMlDsa).toString("hex"),
+        mlKemHex: Buffer.from(verdict.initiatorMlKem).toString("hex"),
+      }))
       .catch((err: unknown) => {
         inboundInFlight.delete(offerKey(localAgent.name, parsed.sessionIdHex));
         logger.error("session.inbound.accept.error", {
@@ -1893,7 +1928,13 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     });
     mgr.registerInboundHandler((frame) => {
       if (frame["type"] !== "session_assignment") return;
-      handleInboundSessionAssignment(frame as Record<string, unknown>, streamAgentName);
+      void handleInboundSessionAssignment(frame as Record<string, unknown>, streamAgentName).catch((err: unknown) => {
+        logger.error("session.inbound.assignment.handler_failed", {
+          streamAgentName,
+          error: extractErrorMessage(err),
+          impact: "an inbound session assignment could not be processed; no session was accepted and no receiver was handed over",
+        });
+      });
     });
     mgr.registerInboundHandler((frame) => {
       if (frame["type"] !== "session_refused") return;

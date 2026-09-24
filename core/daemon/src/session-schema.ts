@@ -150,6 +150,11 @@ export function ensureSessionSchema(
     // it to VERIFY the bilateral seal signature locally (the seal is signed by the initiator's
     // primary), not just accept it. NULL when this party initiated (it uses its own primary).
     "ALTER TABLE sessions ADD COLUMN counterparty_primary_pubkey TEXT",
+    // M9D 002-PQKEYS: the counterparty's ML-DSA-44 and ML-KEM-768 public keys (hex), recorded in the
+    // same call as the primary and only after the counterparty's v2 key binding verified. Orders 003,
+    // 005, 006 and 009 read them through `counterpartyPqKeys`, never directly.
+    "ALTER TABLE sessions ADD COLUMN counterparty_ml_dsa_pubkey TEXT",
+    "ALTER TABLE sessions ADD COLUMN counterparty_ml_kem_pubkey TEXT",
     // DOD-SESSION-NAME-1: the operator's own human-readable label for this session. LOCAL AND
     // COSMETIC — it is never sent to the relay or directory, never in a wire frame, never in the
     // transcript, never in the seal or a Merkle leaf, and the counterparty never sees it. It

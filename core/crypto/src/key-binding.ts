@@ -116,12 +116,14 @@ export function buildKeyBindingTbs(k: BoundKeys): Uint8Array {
 }
 
 /** Why a binding was refused — five different things, never collapsed (procedure Invariant 3). */
-export type KeyBindingRefusal =
-  | "key_binding_missing"
-  | "key_binding_pq_missing"
-  | "key_binding_malformed"
-  | "key_binding_signature_mismatch"
-  | "key_binding_pq_signature_mismatch";
+export const KEY_BINDING_REFUSALS = [
+  "key_binding_missing",
+  "key_binding_pq_missing",
+  "key_binding_malformed",
+  "key_binding_signature_mismatch",
+  "key_binding_pq_signature_mismatch",
+] as const;
+export type KeyBindingRefusal = (typeof KEY_BINDING_REFUSALS)[number];
 
 /**
  * Verify a four-key binding: did the holder of `keys.kLocal` AND of `keys.mlDsa` both sign this exact
