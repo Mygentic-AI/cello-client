@@ -152,8 +152,8 @@ export class NotificationDispatcher {
     sessionId: string,
     state: string,
     counterpartyPubkey: string | null,
-    // MONIKER-4 AC2: the resolved display label. Optional and additive — legacy call sites
-    // omit it and the fields stay off the frame; counterpartyPubkey remains the anchor.
+    // MONIKER-4 AC2: the resolved display label. Absent when the change has no counterparty, and
+    // then the fields stay off the frame; counterpartyPubkey remains the anchor.
     who?: { who: string; whoKnown: boolean },
   ): void {
     const notification: IpcNotification = {

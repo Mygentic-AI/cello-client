@@ -95,13 +95,9 @@ export interface WalletSignalInput {
 export interface WalletSignalRow extends WalletSignalInput {
   receivedAt: number;
   /** M10B-D14r2 — may this be presented at all. Distinct from `defaultPresent`, which answers the
-   *  different question of whether to include it BY DEFAULT once it may be presented.
-   *
-   *  NULLABLE, because the COLUMN is (SQLite cannot ADD COLUMN NOT NULL without a default). Declaring
-   *  it non-null would be a type that lies to every future consumer — and the consumer who then
-   *  writes `!== "refused"` ships a NULL straight through as presentable. The predicate tests for
-   *  exactly `accepted`, so NULL fails closed; the type must say so too. */
-  consentState: ConsentState | null;
+   *  different question of whether to include it BY DEFAULT once it may be presented. The column is
+   *  NOT NULL; the presentability predicate tests for exactly `accepted`. */
+  consentState: ConsentState;
   /** Envelope slot 12: issuer and subject are the same operator (policy D-29). */
   sameOperator: boolean;
   /** True = included in the default presentation bundle. _id signals default false; everything else true. */
@@ -366,7 +362,6 @@ function toWalletRow(r: EnvelopeDbRow): WalletSignalRow {
     supersedesHash: r.supersedes_hash,
     status: r.status,
     receivedAt: r.received_at,
-    // Rows written before this column existed have null here; treat as true (default-on).
     defaultPresent: r.default_present !== 0,
   };
 }

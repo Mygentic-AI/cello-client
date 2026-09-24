@@ -56,6 +56,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { openTestDb } from "./helpers/encrypted-db.js";
+import { provisionAgentIdentity } from "../testing.js";
 import { ensureSessionSchema } from "../session-schema.js";
 import { seedAgents } from "./helpers/seed-agents.js";
 import { agreeSessionGenesis } from "./helpers/session-genesis.js";
@@ -323,7 +324,7 @@ describe("SessionNodeManager — unit tests", () => {
       expect(result.reason).toBe("standing_receiver_unavailable");
       expect(result.guidance).toContain("200ms");
     }
-    expect(manager.getStandingReceiverReady()).toBe(false);
+    expect(manager.getStandingReceiverReady("test-agent")).toBe(false);
   });
 
   // ── AC-013: lateral catch audit — distinct error reasons ─────────────────
@@ -891,12 +892,10 @@ describe("SessionNodeManager — integration tests", () => {
 
     try {
       // No SR until an agent comes online.
-      expect(manager.getStandingReceiverReady()).toBe(false);
       expect(manager.getStandingReceiverReady("alice")).toBe(false);
 
       await manager.ensureStandingReceiverForAgent("alice");
       expect(manager.getStandingReceiverReady("alice")).toBe(true);
-      expect(manager.getStandingReceiverReady()).toBe(true); // any agent has one
 
       // A different agent that hasn't come online still has none.
       expect(manager.getStandingReceiverReady("bob")).toBe(false);
@@ -1375,6 +1374,8 @@ describe("SessionNodeManager — integration tests", () => {
   it("AC-011: startDaemon() composition root → standing_receiver_ready reflects per-agent SR in status", async () => {
     const { startDaemon } = await import("../daemon.js");
     const { logger, events } = makeLogger();
+    // alice exists but is not online, so she is listed with no receiver.
+    await provisionAgentIdentity(tempDir, "alice");
 
     const handle = await startDaemon({
     securityGateway: new PassthroughGatewayClient(),
@@ -1388,11 +1389,11 @@ describe("SessionNodeManager — integration tests", () => {
 
     try {
       // No agent online yet → no standing receiver.
-      expect((await handle.getStatus()).standing_receiver_ready).toBe(false);
+      expect((await handle.getStatus()).agents.find((a) => a.name === "alice")?.standing_receiver_ready).toBe(false);
 
       // Bring an agent online (the same call cello_start_agent makes).
       await handle.getSessionNodeManager().ensureStandingReceiverForAgent("alice");
-      expect((await handle.getStatus()).standing_receiver_ready).toBe(true);
+      expect((await handle.getStatus()).agents.find((a) => a.name === "alice")?.standing_receiver_ready).toBe(true);
 
       // session.node.created must have been logged for alice's standing receiver
       const srCreated = events.find(

@@ -767,10 +767,9 @@ export function createInboundSessions(deps: InboundSessionDeps) {
   // Wait (bounded) for THIS AGENT's standing receiver to be ready. acceptSession consumes the
   // agent's standing receiver and rebuilds a replacement asynchronously, so a burst of inbound
   // assignments for that agent would otherwise drop all but the first (review M2). Polling the
-  // per-agent readiness lets each accept proceed once the prior rebuild completes. Must check the
-  // OWNING agent — `getStandingReceiverReady()` with no arg returns true if ANY agent has one,
-  // which in the loopback case (alice + bob on one daemon) would falsely pass while bob's own SR
-  // is still mid-rebuild and drop bob's session (DOD-LOOP-1).
+  // per-agent readiness lets each accept proceed once the prior rebuild completes — for the OWNING
+  // agent, so in the loopback case (alice + bob on one daemon) bob's accept waits for bob's own SR
+  // (DOD-LOOP-1).
   async function waitForStandingReceiver(agentName: string, maxWaitMs = 3_000, stepMs = 25): Promise<boolean> {
     if (sessionNodeManager.getStandingReceiverReady(agentName)) return true;
     const deadline = Date.now() + maxWaitMs;

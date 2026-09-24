@@ -416,7 +416,7 @@ export class SessionNodeManager {
   /** ─── DELEGATORS — the standing-receiver API other files call ───────────────────────── */
   standingReceiverAbsenceReason(agentName: string): "daemon_shutting_down" | "standing_receiver_creating" | "agent_offline" | "no_standing_receiver" { return this.#receivers.standingReceiverAbsenceReason(agentName); }
   getStandingReceiverInfo(agentName: string): { peerId: string; addrs: string[] } | null { return this.#receivers.getStandingReceiverInfo(agentName); }
-  getStandingReceiverReady(agentName?: string): boolean { return this.#receivers.getStandingReceiverReady(agentName); }
+  getStandingReceiverReady(agentName: string): boolean { return this.#receivers.getStandingReceiverReady(agentName); }
   getStandingReceiverNode(agentName?: string): CelloNode | null { return this.#receivers.getStandingReceiverNode(agentName); }
   getStandingReceiverReachability(agentName: string): "reserved" | "ready" | "retrying" | "unreachable" | "absent" { return this.#receivers.getStandingReceiverReachability(agentName); }
   getStandingReceiverAutoNat(): IAutoNatService | null { return this.#receivers.getStandingReceiverAutoNat(); }

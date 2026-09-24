@@ -91,8 +91,7 @@ export function createDaemonStatusReport(deps: DaemonStatusDeps) {
         urlExplicitlyConfigured: directoryHttpUrl !== undefined || process.env["CELLO_DIRECTORY_URL"] !== undefined,
       }),
       // M8B F14 (fix 5): per-agent standing-receiver readiness, so a deaf agent (online but
-      // no armed receiver) is visible in cello_status instead of hiding behind the ANY-agent
-      // aggregate below (kept for backward compatibility).
+      // no armed receiver) is visible in cello_status.
       // CC-8 (F5 parity): the CLI `cello status` surface must show online vs registered like the MCP
       // cello_status does. The stored `a.state` is stale — it stays "registered" even when the agent is
       // online, because startAgentInternal only adds to onlineAgents and never mutates the record — so
@@ -111,7 +110,6 @@ export function createDaemonStatusReport(deps: DaemonStatusDeps) {
           ? { standing_receiver_refusal: sessionNodeManager.getStandingReceiverRefusal(a.name) }
           : {}),
       })),
-      standing_receiver_ready: sessionNodeManager.getStandingReceiverReady(),
       retryQueueDepth: retryQueue.getTotalDepth(),
       interrupted_sessions,
       // M8B F16: per-session liveness so a counterparty-gone session is visible.

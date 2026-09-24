@@ -1221,9 +1221,8 @@ export class StandingReceivers {
     return publishableEndpoint(endpoint, state !== "off");
   }
   /** DOD-LOOP-1: whether the given agent has a standing receiver ready (any agent if omitted). */
-  getStandingReceiverReady(agentName?: string): boolean {
-    if (agentName !== undefined) return this.#ctx.standingReceivers.has(agentName);
-    return this.#ctx.standingReceivers.size > 0;
+  getStandingReceiverReady(agentName: string): boolean {
+    return this.#ctx.standingReceivers.has(agentName);
   }
   /**
    * The standing receiver's libp2p node — a general-purpose node usable for OUTBOUND dials that

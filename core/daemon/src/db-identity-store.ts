@@ -66,7 +66,7 @@ const CREATE_AGENTS_SQL = `
     frost_verifying_shares BLOB,
     frost_dkg_method       TEXT,
     -- JSON array of the directory nodeIds (Q) the DKG ran among, so a restored signer targets the
-    -- actual share-holders, not the full live roster. NULL for agents registered before quorum DKG.
+    -- actual share-holders, not the full live roster. NULL on the local single-node path.
     frost_directory_node_ids TEXT,
     -- Optional outbound-name override. The outbound name defaults to agent_name; this column only
     -- holds an explicit override. Local-only — never sent to the directory.
@@ -463,9 +463,8 @@ export class DbRegistrationPersistence implements DaemonRegistrationPersistence 
       mlKemPubkey: typeof r["reg_ml_kem_pubkey"] === "string" ? r["reg_ml_kem_pubkey"] : "",
       registeredAt: Number(r["reg_registered_at"]),
       status: String(r["reg_status"]),
-      // 038-KEYBIND: null for a row written before this column existed. `String(null)` would hand
-      // callers the four characters "null" as if they were a signature, which is why this is a
-      // typeof check and not the String() every field above uses.
+      // 038-KEYBIND: registration always writes both; a missing value is a corrupt row, and
+      // `String(null)` would hand callers the four characters "null" as if they were a signature.
       keyBinding: typeof r["reg_key_binding"] === "string" ? r["reg_key_binding"] : null,
       keyBindingPq: typeof r["reg_key_binding_pq"] === "string" ? r["reg_key_binding_pq"] : null,
       channel: Number(r["channel"]) === 1,

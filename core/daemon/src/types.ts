@@ -222,12 +222,6 @@ export interface DaemonStatusResponse {
   // ConnectionInfo type stays exported as the shape connected-client visibility will populate;
   // per-connection state lives in perConnectionState.
   /**
-   * True when the standing receiver node is listening and ready to accept the
-   * next inbound session. Set to true by SessionNodeManager.initialize() during
-   * daemon startup, before the IPC socket opens.
-   */
-  standing_receiver_ready: boolean;
-  /**
    * Total count of retry_queue entries across all sessions.
    * Always present as integer >= 0.
    */

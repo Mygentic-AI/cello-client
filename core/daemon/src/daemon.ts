@@ -8,7 +8,7 @@
  *       - On expiry: log directory.auth.manifest.expired at ERROR, skip connection
  *       - On version rollback: log directory.auth.manifest.version.rollback at ERROR
  *       - On success: log directory.auth.manifest.verified at INFO
- *    b. Load agents from ~/.cello/agents/ (or legacy ~/.cello/key)
+ *    b. Load agents from the encrypted `agents` table
  *    c. Acquire lock file atomically
  *    d. Initialize SessionNodeManager (creates standing receiver, detects interrupted sessions)
  *    e. Start IPC server on Unix domain socket

@@ -522,9 +522,9 @@ noteReceivedFromCounterparty(agentName: string, sessionId: string, contentHash: 
        * cause the absence either: whether we hold a genesis depends on our own assignment and our
        * own database, never on anything they send.
        *
-       * The alternative was refusing, and it would have been the wrong kind of strict: a session
-       * restored from a row written before this column existed holds no genesis, and every first
-       * message on it would be refused for something the counterparty did not do.
+       * The alternative was refusing, and it would have been the wrong kind of strict: a missing
+       * genesis is a fault on THIS side, and every first message would be refused for something the
+       * counterparty did not do.
        */
       if (!genesis) {
         this.#ctx.logger.info("session.content.ack_hash.genesis_unavailable", {

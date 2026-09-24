@@ -25,7 +25,7 @@ export interface RegistrationStateRecord {
   status: string;
   /**
    * 038-KEYBIND. Hex 64-byte Ed25519 signature by this agent's K_local over the v2 key-binding TBS
-   * (all four keys, M9D 002-PQKEYS). Null for an agent whose row predates the column.
+   * (all four keys, M9D 002-PQKEYS). Registration always writes it; null only for a corrupt row.
    *
    * ⚠️ **WRITTEN, AND READ BY NOTHING YET** — said plainly rather than implied, because the careful
    * null-handling around it otherwise reads as a decision some caller acts on, and no caller
