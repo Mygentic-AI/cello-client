@@ -39,7 +39,7 @@ export async function provisionAgentIdentity(celloDir: string, name: string): Pr
     const pubkeyHex = Buffer.from(await keyProvider.getPublicKey()).toString("hex");
     store.createAgent(name, seed, pubkeyHex);
     // M9D 003-PQSESSION: registered, with its fixture PQ keys — a session announce needs the ML-DSA key.
-    await registerFixturePqIdentity(db, name, pubkeyHex);
+    await giveFixturePqIdentity(db, name, pubkeyHex);
     return keyProvider;
   } finally {
     db.close();
@@ -76,7 +76,7 @@ export async function fixturePqKeys(pubkeyHex: string): Promise<{
  * Make an agent row a REGISTERED one holding its fixture PQ keys, as registration leaves it — the
  * loader then hands out its ML-DSA provider, which signs every session announce.
  */
-export async function registerFixturePqIdentity(db: DaemonDatabase, name: string, pubkeyHex: string): Promise<void> {
+export async function giveFixturePqIdentity(db: DaemonDatabase, name: string, pubkeyHex: string): Promise<void> {
   const pq = await fixturePqKeys(pubkeyHex);
   await new DbRegistrationPersistence({ db, agentName: name, logger: silent }).persistPqIdentity({
     mlDsaSeed: pq.mlDsaSeed, mlDsaPubkey: Buffer.from(pq.mlDsaPubkey).toString("hex"),

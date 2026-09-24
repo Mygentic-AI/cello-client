@@ -21,7 +21,7 @@ import { InMemoryKeyProvider } from "@cello-protocol/crypto";
 import type { KeyProvider, MlDsaKeyProvider } from "@cello-protocol/crypto";
 import { loadAgents } from "../../agent-loader.js";
 import { DbIdentityStore, ensureIdentitySchema } from "../../db-identity-store.js";
-import { fixturePqKeys, registerFixturePqIdentity } from "../../testing.js";
+import { fixturePqKeys, giveFixturePqIdentity } from "../../testing.js";
 import type { DaemonDatabase } from "../../sqlcipher-db.js";
 import type { Logger } from "../../types.js";
 
@@ -78,7 +78,7 @@ export async function seedAgentKeys(
      * `makeSignedAssignmentFrame` binds for this pubkey, so the counterparty's recorded key matches
      * the key that signs — and the loader hands out its ML-DSA provider.
      */
-    await registerFixturePqIdentity(db, name, pubkeyHex);
+    await giveFixturePqIdentity(db, name, pubkeyHex);
   }
   return agents;
 }
