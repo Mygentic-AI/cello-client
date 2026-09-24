@@ -81,19 +81,10 @@ export class SessionQueries {
    * shutdown-orphaned session will. So the sweep takes a local-cause session once the seal path
    * has either declined it or exhausted it — never before.
    *
-   * **THE CLOCK MUST BE ONE THE COUNTERPARTY CANNOT MOVE.** The obvious fallback for a row with no
-   * `interrupted_at` is `updated_at` — and it is exactly wrong. `ingestReceivedContent` accepts
-   * content into an `interrupted` session (that acceptance is this whole line's premise), and a
-   * successful ingest runs `UPDATE sessions SET message_count = ?, updated_at = <now>`. So
-   * `updated_at` is a clock the reprogrammed peer holds: one message every 24 hours and the session
-   * never expires, forever. The fallback would have handed the attacker the off switch for the
-   * control built to stop them.
-   *
-   * Instead the missing timestamps are STAMPED ONCE, by `#stampMissingInterruptedAt` immediately
-   * before this query runs, and this query reads `interrupted_at` and nothing else. The stamp is
-   * written under `WHERE interrupted_at IS NULL`, so it is monotone — set once, never moved, by us
-   * and not by a peer. A legacy row therefore gets its full window starting from the first sweep
-   * that sees it, which is later than the true interruption but is the only bound that is sound.
+   * **THE CLOCK MUST BE ONE THE COUNTERPARTY CANNOT MOVE.** It is `interrupted_at`, which every
+   * writer of `status = 'interrupted'` stamps with `COALESCE(interrupted_at, ?)` — set once, by us.
+   * `updated_at` would be exactly wrong: a successful ingest into an `interrupted` session moves it,
+   * so one message every 24 hours and the session would never expire.
    *
    * Same retired-agent INNER JOIN as the sibling query: a retired agent's rows are kept for
    * accountability, are not resumable, and are not writable either.
@@ -121,8 +112,7 @@ export class SessionQueries {
    * written, and `session-001`/`cello-list-sessions` failed on it in the gate.
    *
    * `strftime('%s', …) * 1000` parses the ISO string properly and returns NULL for anything it
-   * cannot parse — so a malformed or differently-formatted value falls through the COALESCE to
-   * `updated_at` rather than being read as the year 2026.
+   * cannot parse, which never satisfies the bound — rather than being read as the year 2026.
    */
   listExpiredUnrevivableSessions(
     nowMs: number,
@@ -338,53 +328,6 @@ export class SessionQueries {
       createdAt: r.created_at,
     }));
   }
-  /**
-   * DOD-M12B-REVIVAL-BOUND-1 — give every timestamp-less interrupted session a clock, once.
-   *
-   * A row with `interrupted_at IS NULL` has no bound that can be evaluated, and skipping such rows
-   * would exempt the oldest sessions in the store from the control permanently — the same "open
-   * forever" failure wearing a different NULL. The two rows measured in Entry 41 are exactly this
-   * shape, written by a `destroySessionNode` path that set the cause and no timestamp.
-   *
-   * **`WHERE interrupted_at IS NULL` is the security property, not an optimisation.** It makes the
-   * stamp write-once: this can run on every sweep forever and a row's clock still cannot be moved
-   * after the first one. That is what disqualifies `updated_at`, which a peer moves with every
-   * message it sends into the still-accepting session.
-   *
-   * The cost is honest and bounded: a legacy row's window starts at the first sweep that sees it
-   * rather than at its true interruption, so it survives up to one window longer than it should.
-   * A late close is recoverable; a clock the counterparty winds is not.
-   *
-   * @returns how many rows were stamped.
-   */
-  stampMissingInterruptedAt(nowMs: number): number {
-    if (!this.#db) return 0;
-    try {
-      const res = this.#db
-        .prepare("UPDATE sessions SET interrupted_at = ? WHERE status = 'interrupted' AND interrupted_at IS NULL")
-        .run(new Date(nowMs).toISOString()) as unknown as { changes?: number | bigint };
-      const stamped = Number(res?.changes ?? 0);
-      if (stamped > 0) {
-        this.#ctx.logger.info("session.revival_bound.clock.stamped", {
-          stamped,
-          impact: "these sessions had no interruption timestamp; their revival window starts now",
-        });
-      }
-      return stamped;
-    } catch (err: unknown) {
-      this.#ctx.logger.error("session.revival_bound.clock.stamp.failed", {
-        error: extractErrorMessage(err),
-        impact: "sessions with no interruption timestamp cannot be evaluated and stay open",
-      });
-      return 0;
-    }
-  }
-  /**
-   * M7 legibility-TBS-binding (responder verify): record the counterparty's FROST primary (group)
-   * pubkey from the FROST-signed SessionAssignment, so the responder can VERIFY the bilateral seal
-   * signature locally. Best-effort — a missing row (race) is a no-op; the seal then falls back to
-   * accept-without-verify (still sound: the live frame arrives over the authenticated Noise channel).
-   */
   /**
    * The counterparty's threshold group key as this agent has seen it BEFORE — trust on first use.
    *

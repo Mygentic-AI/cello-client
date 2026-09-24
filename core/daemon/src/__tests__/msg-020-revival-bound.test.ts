@@ -118,36 +118,6 @@ describe("DOD-M12B-REVIVAL-BOUND-1: an unrevivable session reaches a terminal st
     ).toEqual([]);
   }, 60_000);
 
-  it("a NULL interrupted_at is STAMPED write-once, then expires one window later", async () => {
-    // The rows measured in Entry 41 are this shape: interrupted by a `destroySessionNode` path that
-    // wrote the cause and no timestamp. Skipping them would exempt the oldest sessions in the store
-    // from the bound permanently — the same "open forever" failure wearing a different NULL.
-    //
-    // The first build read `updated_at` for these, which the counterparty moves with every message
-    // (see the H1 case). The stamp is the fix, and its cost is visible right here: the row gets its
-    // full window from the first sweep that sees it rather than from its true interruption. A late
-    // close is recoverable; a clock the peer winds is not.
-    fx = await startTwoConnectionFixture({ dirPrefix: "cello-msg020d-" });
-    const t0 = 100 * HOUR;
-    const sid = "04".repeat(32);
-    seed(fx, sid, null, null, { updatedAt: t0 - 30 * HOUR });
-
-    expect(
-      await fx.snm.closeExpiredUnrevivableSessions(t0, 24 * HOUR),
-      "the clock starts at the stamp, so an unstamped row is not instantly terminal",
-    ).toBe(0);
-
-    const stamped = fx.snm.getDb().prepare("SELECT interrupted_at FROM sessions WHERE session_id = ?").get(sid) as { interrupted_at: string };
-    expect(stamped.interrupted_at, "stamped in production format").toBe(new Date(t0).toISOString());
-
-    // Write-once: a second sweep must not move it forward, or the row never expires.
-    await fx.snm.closeExpiredUnrevivableSessions(t0 + 5 * HOUR, 24 * HOUR);
-    const again = fx.snm.getDb().prepare("SELECT interrupted_at FROM sessions WHERE session_id = ?").get(sid) as { interrupted_at: string };
-    expect(again.interrupted_at, "a clock re-stamped on every sweep is a clock that never runs out").toBe(stamped.interrupted_at);
-
-    expect(await fx.snm.closeExpiredUnrevivableSessions(t0 + 25 * HOUR, 24 * HOUR)).toBe(1);
-  }, 60_000);
-
   it("an UNPARSEABLE interrupted_at falls back to updated_at, and is never read as the year 2026", async () => {
     // `CAST('2026-08-18T05:32:04Z' AS INTEGER)` is 2026 — SQLite casts by leading digits. Under that
     // arithmetic every ISO timestamp is older than every epoch bound, so the sweep abandons the whole
@@ -194,17 +164,16 @@ describe("DOD-M12B-REVIVAL-BOUND-1: an unrevivable session reaches a terminal st
   }, 60_000);
 
   it("H1: a peer sending into the interrupted session CANNOT push the deadline out", async () => {
-    // THE FINDING THIS PINS. The first build fell back to `updated_at` when `interrupted_at` was
-    // NULL. `ingestReceivedContent` accepts content into an interrupted session — that acceptance is
-    // this line's whole premise — and a successful ingest writes `updated_at = now`. So the
-    // reprogrammed peer held the expiry clock: one message a day and the session never closes.
-    // The fix stamps `interrupted_at` write-once and reads only that.
+    // `ingestReceivedContent` accepts content into an interrupted session — that acceptance is this
+    // line's whole premise — and a successful ingest writes `updated_at = now`. The expiry clock is
+    // `interrupted_at`, which the peer cannot move; were it `updated_at`, one message a day would
+    // hold the session open forever.
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-msg020g-" });
     const t0 = 100 * HOUR;
     const sid = "07".repeat(32);
-    seed(fx, sid, null, null, { updatedAt: t0 });
+    seed(fx, sid, null, t0, { updatedAt: t0 });
 
-    // First sweep stamps the clock at t0 and closes nothing — the window has not run.
+    // The window has not run.
     expect(await fx.snm.closeExpiredUnrevivableSessions(t0, 24 * HOUR)).toBe(0);
 
     // The peer now does the only thing it can do: send. This moves `updated_at` forward.
@@ -213,7 +182,7 @@ describe("DOD-M12B-REVIVAL-BOUND-1: an unrevivable session reaches a terminal st
     const moved = fx.snm.getDb().prepare("SELECT updated_at FROM sessions WHERE session_id = ?").get(sid) as { updated_at: number };
     expect(moved.updated_at, "the premise of the attack — the peer really can move this column").toBeGreaterThan(t0);
 
-    // 25h after the stamp, it closes anyway.
+    // 25h after the interruption, it closes anyway.
     expect(
       await fx.snm.closeExpiredUnrevivableSessions(t0 + 25 * HOUR, 24 * HOUR),
       "if this is 0, the counterparty holds the off switch for the control built to stop them",

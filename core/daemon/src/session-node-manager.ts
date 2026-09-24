@@ -2305,10 +2305,6 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
    * @returns how many sessions actually flipped — not how many were attempted.
    */
   async closeExpiredUnrevivableSessions(nowMs: number, windowMs: number): Promise<number> {
-    // Stamp FIRST. A row with no clock cannot be evaluated by the query below, and this is the only
-    // thing that gives it one. Running it before every sweep is safe because the write is scoped to
-    // rows that have no timestamp yet.
-    this.#queries.stampMissingInterruptedAt(nowMs);
     const expired = this.#queries.listExpiredUnrevivableSessions(nowMs, windowMs);
     let closed = 0;
     for (const s of expired) {
