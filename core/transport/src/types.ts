@@ -222,10 +222,10 @@ export interface CreateNodeOptions {
  * `remotePeerId` (M12 anti-entropy): the CONNECTION's authenticated remote PeerId
  * (`connection.remotePeer`, established by the Noise handshake) — never a wire claim. Handlers
  * that channel-bind an application-level identity to the transport identity (the AE mutual
- * handshake) MUST use this instead of any peer-supplied field. Optional second parameter, so
- * existing single-arg handlers are unaffected.
+ * handshake) MUST use this instead of any peer-supplied field. Always supplied; a handler that
+ * does not need it may declare only the stream.
  */
-export type CelloStreamHandler = (stream: Stream, remotePeerId?: string) => void | Promise<void>;
+export type CelloStreamHandler = (stream: Stream, remotePeerId: string) => void | Promise<void>;
 
 // ─── CelloNode interface ─────────────────────────────────────────────────────
 

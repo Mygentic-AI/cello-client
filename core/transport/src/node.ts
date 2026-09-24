@@ -538,7 +538,7 @@ class CelloNodeImpl implements CelloNode {
     // Noise-authenticated transport identity — passed through so channel-binding handlers (M12
     // anti-entropy) can pin against it. Single-arg handlers simply ignore the second parameter.
     const streamHandler: StreamHandler = (stream: Stream, connection) =>
-      handler(stream, connection?.remotePeer?.toString());
+      handler(stream, connection.remotePeer.toString());
     // DOD-NAT-REACHABILITY-1: every CELLO protocol must run over a LIMITED relayed
     // connection — a punch-failed session lives on one, and refusing the stream
     // there silently converts "NAT'd but online" into "unreachable" (the mailbox
