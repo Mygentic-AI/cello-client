@@ -162,7 +162,6 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     counterpartyPubkeyHex: string; // participant_b (the local agent)
     initiatorPeerId?: string;
     sessionTimestamp?: number;
-    signatureType?: string;
     // DOD-INBOUND-GUARD-1: the responder's accepted endpoint. The directory OMITS this field
     // when nobody accepted the offer (directory-frames.ts encodes it only when non-empty), so
     // `null` here builds exactly that broken frame. Defaults to present — a complete assignment.
@@ -176,7 +175,6 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
       participant_a: { pubkey: Buffer.from(opts.initiatorPubkeyHex, "hex") },
       participant_b: { pubkey: Buffer.from(opts.counterpartyPubkeyHex, "hex") },
       session_timestamp: opts.sessionTimestamp ?? TS,
-      signature_type: opts.signatureType ?? "frost",
     };
     if (opts.initiatorPeerId !== undefined) assignment["initiator_session_peer_id"] = opts.initiatorPeerId;
     const counterpartyPeerId = opts.counterpartyPeerId === undefined ? "bob-session-peer-id" : opts.counterpartyPeerId;
@@ -431,27 +429,6 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     expect(malformed).toBeDefined();
     expect(malformed!.context["reason"]).toBe("missing_initiator_peer_id");
     expect(events.find((e) => e.event === "session.inbound.accepted")).toBeUndefined();
-  });
-
-  it("L1: refuses a single-key (M1) assignment as unsupported_signature_type", async () => {
-    const { logger, events } = makeLogger();
-    const bobPubkey = await makeAgentDir("bob");
-    const node = new FakeNode();
-    const captured: Record<string, unknown>[] = [];
-    const injectRef: { inject?: (frame: unknown) => void } = {};
-    const h = await start({ logger, node, signalingConnect: makeInjectableSignaling(captured, injectRef) });
-    await wait(50);
-
-    injectRef.inject!(assignmentFrame({
-      initiatorPubkeyHex: fixtureIdentity().pubkeyHex, counterpartyPubkeyHex: bobPubkey,
-      initiatorPeerId: "alice-peer", signatureType: "single",
-    }));
-    await wait(80);
-
-    expect(h.getSessionNodeManager().getSessionRecord("bob", SID_HEX)).toBeNull();
-    const refused = events.find((e) => e.event === "session.inbound.assignment.refused");
-    expect(refused).toBeDefined();
-    expect(refused!.context["reason"]).toBe("unsupported_signature_type");
   });
 
   // ─── DOD-INBOUND-GUARD-1 (D3, M8C-PHANTOM-SESSION-FIX-PLAN §4) ─────────────────────────────

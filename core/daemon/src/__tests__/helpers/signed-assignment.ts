@@ -284,7 +284,6 @@ export async function makeSignedAssignmentFrame(
         session_timestamp: ts,
         directory_pubkey: new Uint8Array(32).fill(0xdd),
         directory_signature: await signer.sign(framed),
-        signature_type: "frost",
         signer_pubkey: signerPubkey,
         initiator_session_peer_id: opts.initiatorSessionPeerId,
         initiator_session_addrs: initiatorAddrs,

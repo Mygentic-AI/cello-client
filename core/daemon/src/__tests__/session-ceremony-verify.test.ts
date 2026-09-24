@@ -1,17 +1,10 @@
 /**
- * F2-a — verifyBilateralSealCertificate must return a REASON on every
- * verified:false (accept-without-independent-verify) branch, so the
- * daemon's session.sealed.signature.checked log can never again read as a
- * silently-tolerated failed check.
+ * verifyBilateralSealCertificate — every bilateral seal is VERIFIED under a group key this party
+ * holds, or REFUSED. The one unverified acceptance is a counterparty the operator removed
+ * (`counterparty_key_forgotten`), which the result names so no caller can present it as proof.
  *
- * The two cheapest, share-free branches are covered here (they pin the new
- * `reason` contract deterministically without a real FROST share):
- *   - non_frost_certificate: signatureType !== "frost" → immediate accept.
- *   - no_frost_share:        persistence holds no share → cannot verify.
- *
- * The share-holding branches (own_primary_unavailable / signer_key_not_held)
- * are exercised end-to-end by the live seal path and the DAEMON-004 IPC seal
- * tests; the reason plumbing they share is validated here.
+ * The M9D purge removed the rest: a non-FROST certificate (there is no other kind), and the
+ * "no share" / "rows that predate key recording" branches that used to accept a seal unverified.
  */
 import { describe, it, expect } from "vitest";
 import { verifyBilateralSealCertificate, wireSessionOfferHandler, wireSessionCeremonyHandler, sendSealFrostSignature } from "../session-ceremony.js";
@@ -26,7 +19,7 @@ const noopLogger: Logger = {
   debug() {}, info() {}, warn() {}, error() {},
 };
 
-/** Minimal persistence stub — only loadActiveFrostKeyShare is reached by these branches. */
+/** Minimal persistence stub — only loadActiveFrostKeyShare is reached by the verifier. */
 function makePersistence(share: unknown): DaemonRegistrationPersistence {
   return {
     async loadActiveFrostKeyShare() { return share as never; },
@@ -35,129 +28,102 @@ function makePersistence(share: unknown): DaemonRegistrationPersistence {
 
 const AGENT_PUBKEY_HEX = "aa".repeat(32);
 
-function baseCert(signatureType: "frost" | "single") {
+/** A share whose commitments[0] is this agent's OWN group key — what the verifier loads. */
+function shareWithOwnPrimary(ownPrimary: Uint8Array) {
+  return { commitmentsCbor: encodeCbor([ownPrimary]) as Uint8Array };
+}
+
+/** A seal signed by `group`: a 1-party FROST signature is plain Ed25519 over frameMessage(ctx, TBS). */
+async function signedCert(group: ReturnType<typeof generateKeypair>) {
+  const sessionId = new Uint8Array(16).fill(3);
+  const sealedRoot = new Uint8Array(32).fill(4);
+  const leafCount = 6;
+  const closeTimestamp = 1_700_000_000_000;
+  const tbs = bindLegibilityToTbs(buildSealTbs(sessionId, sealedRoot, leafCount, closeTimestamp), null);
+  const ctx = new TextEncoder().encode("cello-frost-seal-v1");
+  const framed = new Uint8Array(ctx.length + 1 + tbs.length);
+  framed.set(ctx, 0); framed[ctx.length] = 0x00; framed.set(tbs, ctx.length + 1);
   return {
-    sessionId: new Uint8Array(32),
-    sealedRoot: new Uint8Array(32),
-    leafCount: 4,
-    closeTimestamp: 1,
-    frostSignature: new Uint8Array(64),
-    signerPubkey: new Uint8Array(32), // 32 bytes so the length guard passes
-    signatureType,
+    sessionId, sealedRoot, leafCount, closeTimestamp,
+    frostSignature: await group.sign(framed),
+    signerPubkey: await group.getPublicKey(),
     legibility: null,
   };
 }
 
-describe("F2-a: verifyBilateralSealCertificate returns a reason on verified:false", () => {
-  it("non-FROST certificate → { ok:true, verified:false, reason:'non_frost_certificate' }", async () => {
+describe("verifyBilateralSealCertificate: verified, refused, or — only for a forgotten contact — unverified", () => {
+  it("no local FROST share → REFUSED no_frost_share (it used to be accepted unverified)", async () => {
     const verdict = await verifyBilateralSealCertificate(
-      { persistence: makePersistence(null), agentPubkeyHex: AGENT_PUBKEY_HEX, logger: noopLogger, counterpartyPrimaryHex: null },
-      baseCert("single"),
+      { persistence: makePersistence(null), agentPubkeyHex: AGENT_PUBKEY_HEX, logger: noopLogger, counterpartyPrimaryHex: "11".repeat(32) },
+      await signedCert(generateKeypair()),
     );
-    expect(verdict.ok).toBe(true);
-    expect(verdict).toMatchObject({ ok: true, verified: false, reason: "non_frost_certificate" });
+    expect(verdict).toEqual({ ok: false, reason: "no_frost_share" });
   });
 
-  it("no local FROST share → { ok:true, verified:false, reason:'no_frost_share' }", async () => {
-    const verdict = await verifyBilateralSealCertificate(
-      { persistence: makePersistence(null), agentPubkeyHex: AGENT_PUBKEY_HEX, logger: noopLogger, counterpartyPrimaryHex: null },
-      baseCert("frost"),
-    );
-    expect(verdict.ok).toBe(true);
-    expect(verdict).toMatchObject({ ok: true, verified: false, reason: "no_frost_share" });
-  });
-
-  it("still fails closed: a malformed (short) signer pubkey → { ok:false, reason:'no_signer_pubkey' }", async () => {
-    const cert = baseCert("frost");
-    cert.signerPubkey = new Uint8Array(16); // wrong length
+  it("a malformed (short) signer pubkey → REFUSED no_signer_pubkey", async () => {
+    const cert = await signedCert(generateKeypair());
+    cert.signerPubkey = new Uint8Array(16);
     const verdict = await verifyBilateralSealCertificate(
       { persistence: makePersistence(null), agentPubkeyHex: AGENT_PUBKEY_HEX, logger: noopLogger, counterpartyPrimaryHex: null },
       cert,
     );
-    expect(verdict).toMatchObject({ ok: false, reason: "no_signer_pubkey" });
+    expect(verdict).toEqual({ ok: false, reason: "no_signer_pubkey" });
   });
-});
 
-/**
- * 038-KEYBIND — the RESPONDER-FIRST close, which used to be unverifiable by the initiator.
- *
- * The seal is signed by whichever party closed FIRST. When that was the responder, the initiator
- * held no copy of their group key — it never learned one — so it took the certificate on faith and
- * reported `signer_key_not_held`. The session assignment now carries the responder's group key with
- * a binding under the responder's own identity key, the initiator verifies that binding before it
- * accepts the assignment, and records the result. This asserts the consequence: the same
- * certificate that used to be accepted unverified now VERIFIES.
- */
-describe("038-KEYBIND: a responder-first seal verifies locally instead of signer_key_not_held", () => {
-  /** A share whose commitments[0] is this agent's OWN group key — what the verifier loads. */
-  function shareWithOwnPrimary(ownPrimary: Uint8Array) {
-    return { commitmentsCbor: encodeCbor([ownPrimary]) as Uint8Array };
-  }
-
-  async function responderSignedCert(responderGroup: ReturnType<typeof generateKeypair>) {
-    const sessionId = new Uint8Array(16).fill(3);
-    const sealedRoot = new Uint8Array(32).fill(4);
-    const leafCount = 6;
-    const closeTimestamp = 1_700_000_000_000;
-    // The seal TBS with no legibility — bindLegibilityToTbs is a no-op for null, so this is the
-    // same bytes the directory would sign.
-    const tbs = bindLegibilityToTbs(buildSealTbs(sessionId, sealedRoot, leafCount, closeTimestamp), null);
-    const ctx = new TextEncoder().encode("cello-frost-seal-v1");
-    const framed = new Uint8Array(ctx.length + 1 + tbs.length);
-    framed.set(ctx, 0); framed[ctx.length] = 0x00; framed.set(tbs, ctx.length + 1);
-    return {
-      sessionId, sealedRoot, leafCount, closeTimestamp,
-      frostSignature: await responderGroup.sign(framed),
-      signerPubkey: await responderGroup.getPublicKey(),
-      signatureType: "frost" as const,
-      legibility: null,
-    };
-  }
-
-  it("BEFORE the recording exists (no counterparty primary) it is still accepted unverified — the branch that stays", async () => {
+  it("our OWN seal verifies under our own primary, with no counterparty key needed", async () => {
     const ownGroup = generateKeypair();
-    const responderGroup = generateKeypair();
     const verdict = await verifyBilateralSealCertificate(
-      {
-        persistence: makePersistence(shareWithOwnPrimary(await ownGroup.getPublicKey())),
-        agentPubkeyHex: AGENT_PUBKEY_HEX, logger: noopLogger,
-        counterpartyPrimaryHex: null,
-      },
-      await responderSignedCert(responderGroup),
+      { persistence: makePersistence(shareWithOwnPrimary(await ownGroup.getPublicKey())), agentPubkeyHex: AGENT_PUBKEY_HEX, logger: noopLogger, counterpartyPrimaryHex: null },
+      await signedCert(ownGroup),
     );
-    expect(verdict).toMatchObject({ ok: true, verified: false, reason: "signer_key_not_held" });
+    expect(verdict).toEqual({ ok: true, verified: true });
   });
 
-  it("★ WITH the responder's group key recorded, the same certificate VERIFIES", async () => {
+  it("★ a responder-first seal VERIFIES under the counterparty key recorded at session open", async () => {
     const ownGroup = generateKeypair();
     const responderGroup = generateKeypair();
     const verdict = await verifyBilateralSealCertificate(
       {
         persistence: makePersistence(shareWithOwnPrimary(await ownGroup.getPublicKey())),
         agentPubkeyHex: AGENT_PUBKEY_HEX, logger: noopLogger,
-        // What 038-KEYBIND puts on the session row: the responder's group key, proved theirs by a
-        // binding under their own identity key before it was ever written down.
         counterpartyPrimaryHex: Buffer.from(await responderGroup.getPublicKey()).toString("hex"),
       },
-      await responderSignedCert(responderGroup),
+      await signedCert(responderGroup),
     );
-    // `verified: true` — not merely "it did not fail". A recording that pinned the WRONG key would
-    // take the signer_not_a_session_participant branch below, which is a different outcome.
-    expect(verdict).toMatchObject({ ok: true, verified: true });
+    expect(verdict).toEqual({ ok: true, verified: true });
   });
 
-  it("a WRONG recorded key is a refusal, not a shrug — the recording is load-bearing", async () => {
+  it("a WRONG recorded key is a refusal — the recording is load-bearing", async () => {
     const ownGroup = generateKeypair();
-    const responderGroup = generateKeypair();
     const verdict = await verifyBilateralSealCertificate(
       {
         persistence: makePersistence(shareWithOwnPrimary(await ownGroup.getPublicKey())),
         agentPubkeyHex: AGENT_PUBKEY_HEX, logger: noopLogger,
         counterpartyPrimaryHex: Buffer.from(await generateKeypair().getPublicKey()).toString("hex"),
       },
-      await responderSignedCert(responderGroup),
+      await signedCert(generateKeypair()),
     );
-    expect(verdict).toMatchObject({ ok: false, reason: "signer_not_a_session_participant" });
+    expect(verdict).toEqual({ ok: false, reason: "signer_not_a_session_participant" });
+  });
+
+  it("a counterparty key FORGOTTEN by contact removal → accepted, and says it is unverified", async () => {
+    const ownGroup = generateKeypair();
+    const verdict = await verifyBilateralSealCertificate(
+      { persistence: makePersistence(shareWithOwnPrimary(await ownGroup.getPublicKey())), agentPubkeyHex: AGENT_PUBKEY_HEX, logger: noopLogger, counterpartyPrimaryHex: null },
+      await signedCert(generateKeypair()),
+    );
+    expect(verdict).toEqual({ ok: true, verified: false, reason: "counterparty_key_forgotten" });
+  });
+
+  it("a signature that does not verify is REFUSED signature_invalid", async () => {
+    const ownGroup = generateKeypair();
+    const cert = await signedCert(ownGroup);
+    cert.frostSignature = new Uint8Array(64).fill(9);
+    const verdict = await verifyBilateralSealCertificate(
+      { persistence: makePersistence(shareWithOwnPrimary(await ownGroup.getPublicKey())), agentPubkeyHex: AGENT_PUBKEY_HEX, logger: noopLogger, counterpartyPrimaryHex: null },
+      cert,
+    );
+    expect(verdict).toEqual({ ok: false, reason: "signature_invalid" });
   });
 });
 

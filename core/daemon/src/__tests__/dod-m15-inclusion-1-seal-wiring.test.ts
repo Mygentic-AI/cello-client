@@ -23,10 +23,9 @@
  * with unusable leaves stores nothing. Real Ed25519 over the real Structure 1 bytes is what makes
  * the frame reach the code under test.
  *
- * **`signature_type` is deliberately absent.** The FROST branch verifies a consortium signature this
- * fixture has no way to produce, and that branch has its own tests (`dod-m15-sealwire-1-*`). Omitting
- * it takes the directory's single-key path, which is a real production shape and the one that
- * exercises the leaf-set wiring without re-testing signature verification.
+ * **The seal is really FROST-signed** (`helpers/frost-seal.ts`). Every `session_sealed` is verified
+ * before anything is stored, so a certificate that does not verify would be refused before the
+ * leaf-set wiring runs.
  *
  * Crypto refs: RFC 8032 (Ed25519), RFC 6962 §2.1 (Merkle hash trees).
  */
@@ -42,6 +41,7 @@ import type { SignalingManager } from "@cello-protocol/transport";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory } from "../session-node-manager.js";
 import { createSealCoordinator } from "../seal-coordinator.js";
+import { frostSealer } from "./helpers/frost-seal.js";
 import { encodeStructure1 } from "@cello-protocol/protocol-types";
 import { contentHashFor, CONTENT_HASH_ALGS } from "../wire-content-hash.js";
 import type { Logger } from "../types.js";
@@ -147,10 +147,11 @@ describe("DOD-M15-INCLUSION-1: a real session_sealed frame fills the certified l
       }),
     );
 
+    const sealer = await frostSealer(new Uint8Array(Buffer.from(AGENT_PUB, "hex")));
     const coordinator = createSealCoordinator({
       logger,
       sessionNodeManager: mgr,
-      getPersistence: vi.fn() as never,
+      getPersistence: vi.fn(() => sealer.persistence) as never,
       getKeyProvider: vi.fn(() => undefined),
       recoverContent: vi.fn(async () => { /* nothing parked */ }),
       recordSealFailure: vi.fn(),
@@ -160,26 +161,35 @@ describe("DOD-M15-INCLUSION-1: a real session_sealed frame fills the certified l
 
     expect(mgr.getCertifiedLeafSet(AGENT, SESSION_ID)).toBeNull();
 
+    // THE REAL SHAPE `normalizeLegibility` ACCEPTS. Without `attests: "receipt"` and a non-empty
+    // `disclaimer` it returns undefined, the whole legibility block is skipped, and the frame is
+    // processed to completion having stored nothing and logged nothing about it — which is exactly
+    // how the first run of this test failed, and is worth the comment.
+    const legibility = {
+      attests: "receipt",
+      disclaimer: "This signature attests receipt, never assent.",
+      participants: [{
+        pubkey: Buffer.from(senderPubkey).toString("hex"),
+        content_frontier_seq: 1,
+        last_authored_seq: 2,
+        attestation_mode: "live",
+      }],
+      final_message: { sender_pubkey: Buffer.from(senderPubkey).toString("hex"), seq: 2, answered: true },
+    };
+    const sealedRootBytes = new Uint8Array(Buffer.from(sealedRoot, "hex"));
+    const closeTimestamp = 1_700_000_000_100;
     signaling.deliver({
       type: "session_sealed",
       session_id: SESSION_ID_BYTES,
-      sealed_root: new Uint8Array(Buffer.from(sealedRoot, "hex")),
+      sealed_root: sealedRootBytes,
       leaf_count: certifiedLeaves.length,
-      // THE REAL SHAPE `normalizeLegibility` ACCEPTS. Without `attests: "receipt"` and a non-empty
-      // `disclaimer` it returns undefined, the whole legibility block is skipped, and the frame is
-      // processed to completion having stored nothing and logged nothing about it — which is exactly
-      // how the first run of this test failed, and is worth the comment.
-      legibility: {
-        attests: "receipt",
-        disclaimer: "This signature attests receipt, never assent.",
-        participants: [{
-          pubkey: Buffer.from(senderPubkey).toString("hex"),
-          content_frontier_seq: 1,
-          last_authored_seq: 2,
-          attestation_mode: "live",
-        }],
-        final_message: { sender_pubkey: Buffer.from(senderPubkey).toString("hex"), seq: 2, answered: true },
-      },
+      close_timestamp: closeTimestamp,
+      signer_pubkey: sealer.primary,
+      frost_signature: await sealer.sign({
+        sessionId: SESSION_ID_BYTES, sealedRoot: sealedRootBytes, leafCount: certifiedLeaves.length, closeTimestamp,
+        legibility: legibility as never,
+      }),
+      legibility,
       frontier_leaves: frontierLeaves,
     });
 
@@ -217,10 +227,73 @@ describe("DOD-M15-INCLUSION-1: a real session_sealed frame fills the certified l
       .prepare("INSERT OR IGNORE INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
       .run(SESSION_ID, agentId, "bb".repeat(32), "active", now, now);
 
+    const sealer = await frostSealer(new Uint8Array(Buffer.from(AGENT_PUB, "hex")));
     const coordinator = createSealCoordinator({
       logger,
       sessionNodeManager: mgr,
-      getPersistence: vi.fn() as never,
+      getPersistence: vi.fn(() => sealer.persistence) as never,
+      getKeyProvider: vi.fn(() => undefined),
+      recoverContent: vi.fn(async () => { /* nothing parked */ }),
+      recordSealFailure: vi.fn(),
+    });
+    const signaling = fakeSignaling();
+    coordinator.registerSealListeners(signaling as unknown as SignalingManager, AGENT, AGENT_PUB);
+
+    // No frontier_leaves, and no participant claiming to have received anything — otherwise the
+    // fail-closed guard above rejects the whole certificate and this path is never reached.
+    const legibility = {
+      attests: "receipt",
+      disclaimer: "This signature attests receipt, never assent.",
+      participants: [],
+      final_message: { sender_pubkey: null, seq: null, answered: false },
+    };
+    const sealedRootBytes = new Uint8Array(Buffer.from("dd".repeat(32), "hex"));
+    const closeTimestamp = 1_700_000_000_200;
+    signaling.deliver({
+      type: "session_sealed",
+      session_id: SESSION_ID_BYTES,
+      sealed_root: sealedRootBytes,
+      leaf_count: 3,
+      close_timestamp: closeTimestamp,
+      signer_pubkey: sealer.primary,
+      frost_signature: await sealer.sign({
+        sessionId: SESSION_ID_BYTES, sealedRoot: sealedRootBytes, leafCount: 3, closeTimestamp, legibility: legibility as never,
+      }),
+      legibility,
+    });
+
+    await vi.waitFor(() => expect(mgr.getCertifiedLeafSetState(AGENT, SESSION_ID)).not.toBeNull());
+    // PRESENT party, because this is the bilateral frame — so the operator must NOT be sent to a
+    // counterparty who holds even less.
+    expect(mgr.getCertifiedLeafSetState(AGENT, SESSION_ID)?.state).toBe("not_carried_present_party");
+    expect(mgr.getCertifiedLeafSet(AGENT, SESSION_ID)).toBeNull();
+
+    await mgr.gracefulShutdown();
+  });
+
+  // M9D purge: the handler verified a seal only `if (frame.signature_type === "frost")`, so a frame
+  // that simply left the field out skipped verification and was stored. Every seal is verified now.
+  it("a session_sealed carrying NO signature is REFUSED and stores nothing — omitting a field is not a way around the check", async () => {
+    const { logger, events } = makeLogger();
+    const mgr = new SessionNodeManager({
+      securityGateway: new PassthroughGatewayClient(),
+      factory: NO_FACTORY,
+      logger,
+      dbPath: join(tempDir, "u.db"),
+    });
+    await mgr.initialize();
+    await seedAgents(mgr.getDb(), [AGENT]);
+    const agentId = (mgr.getDb().prepare("SELECT agent_id FROM agents WHERE agent_name = ?").get(AGENT) as { agent_id: string }).agent_id;
+    const now = Date.now();
+    mgr.getDb()
+      .prepare("INSERT OR IGNORE INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(SESSION_ID, agentId, "bb".repeat(32), "active", now, now);
+
+    const sealer = await frostSealer(new Uint8Array(Buffer.from(AGENT_PUB, "hex")));
+    const coordinator = createSealCoordinator({
+      logger,
+      sessionNodeManager: mgr,
+      getPersistence: vi.fn(() => sealer.persistence) as never,
       getKeyProvider: vi.fn(() => undefined),
       recoverContent: vi.fn(async () => { /* nothing parked */ }),
       recordSealFailure: vi.fn(),
@@ -231,10 +304,9 @@ describe("DOD-M15-INCLUSION-1: a real session_sealed frame fills the certified l
     signaling.deliver({
       type: "session_sealed",
       session_id: SESSION_ID_BYTES,
-      sealed_root: new Uint8Array(Buffer.from("dd".repeat(32), "hex")),
-      leaf_count: 3,
-      // No frontier_leaves, and no participant claiming to have received anything — otherwise the
-      // fail-closed guard above rejects the whole certificate and this path is never reached.
+      sealed_root: new Uint8Array(32).fill(0xee),
+      leaf_count: 2,
+      close_timestamp: 1_700_000_000_300,
       legibility: {
         attests: "receipt",
         disclaimer: "This signature attests receipt, never assent.",
@@ -243,11 +315,9 @@ describe("DOD-M15-INCLUSION-1: a real session_sealed frame fills the certified l
       },
     });
 
-    await vi.waitFor(() => expect(mgr.getCertifiedLeafSetState(AGENT, SESSION_ID)).not.toBeNull());
-    // PRESENT party, because this is the bilateral frame — so the operator must NOT be sent to a
-    // counterparty who holds even less.
-    expect(mgr.getCertifiedLeafSetState(AGENT, SESSION_ID)?.state).toBe("not_carried_present_party");
-    expect(mgr.getCertifiedLeafSet(AGENT, SESSION_ID)).toBeNull();
+    await vi.waitFor(() => expect(events.some((e) => e.event === "session.sealed.signature.invalid")).toBe(true));
+    expect(mgr.getCertifiedLeafSetState(AGENT, SESSION_ID)).toBeNull();
+    expect(mgr.getSessionRecord(AGENT, SESSION_ID)?.status).not.toBe("sealed");
 
     await mgr.gracefulShutdown();
   });

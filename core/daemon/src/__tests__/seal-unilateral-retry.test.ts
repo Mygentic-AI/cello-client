@@ -216,6 +216,47 @@ function frameSealMessage(tbs: Uint8Array): Uint8Array {
   return framed;
 }
 
+/**
+ * A `session_sealed` frame that VERIFIES — every seal is verified now. Seeds alice's persisted share
+ * so commitments[0] is a test key, and signs the bilateral seal TBS with it: a 1-party FROST
+ * signature is plain Ed25519 over frameMessage(ctx, TBS). No legibility on the frame, so the bound
+ * TBS is the bare seal TBS.
+ */
+async function signedBilateralSeal(
+  h: Awaited<ReturnType<typeof startDaemon>>,
+  rootHex: string,
+): Promise<Record<string, unknown>> {
+  const certKp = generateKeypair();
+  const certPub = await certKp.getPublicKey();
+  await new DbRegistrationPersistence({
+    db: h.getSessionNodeManager().getDb(),
+    agentName: "alice",
+    logger: { debug() {}, info() {}, warn() {}, error() {} } as unknown as Logger,
+  }).persistFrostKeyShare({
+    epochId: "test-epoch",
+    primaryPubkey: Buffer.from(certPub).toString("hex"),
+    identifier: "1",
+    signingShare: new Uint8Array(32).fill(1),
+    threshold: 1,
+    participants: 1,
+    commitmentsCbor: CBOR_ENC.encode([certPub]) as Uint8Array,
+    verifyingSharesCbor: CBOR_ENC.encode([]) as Uint8Array,
+    dkgMethod: "trusted_dealer",
+  });
+  const sealedRoot = new Uint8Array(Buffer.from(rootHex, "hex"));
+  const leafCount = 2;
+  const closeTimestamp = TS + 2;
+  return {
+    type: "session_sealed",
+    session_id: SID_BYTES,
+    sealed_root: sealedRoot,
+    leaf_count: leafCount,
+    close_timestamp: closeTimestamp,
+    signer_pubkey: new Uint8Array(certPub),
+    frost_signature: await certKp.sign(frameSealMessage(buildSealTbs(SID_BYTES, sealedRoot, leafCount, closeTimestamp))),
+  };
+}
+
 const SID_BYTES = Uint8Array.from(Array.from({ length: 16 }, (_, i) => i + 21));
 const SID_HEX = Buffer.from(SID_BYTES).toString("hex");
 const TS = 1_700_000_000_000;
@@ -279,7 +320,6 @@ describe("M8B FINDING-1: unilateral seal escalation on retry close", () => {
           transport_mode: "direct",
           counterparty_session_peer_id: "dead-counterparty",
           counterparty_session_addrs: [],
-          signature_type: "frost",
           signer_pubkey: new Uint8Array(32),
           /**
            * 069-ORDERPROOF: the two fields that give this session an ANCHOR. Without
@@ -398,7 +438,6 @@ describe("M8B FINDING-1: unilateral seal escalation on retry close", () => {
       frost_signature: frostSig,
       leaf_count: leafCount,
       close_timestamp: closeTimestamp,
-      signature_type: "frost",
     });
 
     const res2 = await close2P;
@@ -413,7 +452,7 @@ describe("M8B FINDING-1: unilateral seal escalation on retry close", () => {
 
   it("auto-ack path: bilateral seal landing within the wait window returns the BILATERAL result — no unilateral escalation", async () => {
     process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"] = "5000";
-    const { client, sig, relay } = await setupSessionWithDeadCounterparty();
+    const { h, client, sig, relay } = await setupSessionWithDeadCounterparty();
 
     // ── The COUNTERPARTY's SEAL ctrl leaf arrives via the relay → auto-ack submits OUR leaf.
     const counterpartyKp = generateKeypair();
@@ -442,7 +481,7 @@ describe("M8B FINDING-1: unilateral seal escalation on retry close", () => {
     const closeP = client.send("cello_close_session", { session_id: SID_HEX, wait_for_seal: true }) as Promise<Record<string, unknown>>;
     await wait(100); // let the close register its waiter inside the (5s) bilateral window
     const bilateralRoot = "ab".repeat(32);
-    sig.inject!({ type: "session_sealed", session_id: SID_BYTES, sealed_root: new Uint8Array(Buffer.from(bilateralRoot, "hex")) });
+    sig.inject!(await signedBilateralSeal(h, bilateralRoot));
     const res = await closeP;
     expect(res.ok).toBe(true);
     expect(res.sealed_root).toBe(bilateralRoot);
@@ -522,7 +561,7 @@ describe("M8B FINDING-1: unilateral seal escalation on retry close", () => {
     const closeP = client.send("cello_close_session", { session_id: SID_HEX, session_name: NONCE_NAME, wait_for_seal: true }) as Promise<Record<string, unknown>>;
     await wait(100);
     const bilateralRoot = "ab".repeat(32);
-    sig.inject!({ type: "session_sealed", session_id: SID_BYTES, sealed_root: new Uint8Array(Buffer.from(bilateralRoot, "hex")) });
+    sig.inject!(await signedBilateralSeal(h, bilateralRoot));
     const res = await closeP;
 
     expect(res.ok, "the close must actually seal — a name must not change that").toBe(true);
