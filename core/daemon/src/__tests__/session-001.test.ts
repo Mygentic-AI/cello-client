@@ -39,6 +39,7 @@
  * SI-001 Security: receipt of session_interrupted frame does NOT auto-seal.
  */
 
+import { createHash } from "node:crypto";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
@@ -65,6 +66,8 @@ import { provisionAgentIdentity } from "../testing.js";
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
+/** The root of a session tree holding no leaves — what a seal binds when nothing was persisted. */
+const EMPTY_TREE_ROOT = createHash("sha256").update(new Uint8Array(0)).digest("hex");
 
 function makeLogger(): { logger: Logger; events: Array<{ level: string; event: string; context: Record<string, unknown> }> } {
   const events: Array<{ level: string; event: string; context: Record<string, unknown> }> = [];
@@ -820,14 +823,14 @@ describe("SESSION-001: SI-002 tampered leaf signature rejected", () => {
         const f = frame as Record<string, unknown>;
         if (typeof f === "object" && f !== null && f.type === "seal_interrupted_request") {
           // Deliver a tampered ack: correct signerPubkey, zeroed signature (64 zero bytes).
-          // leafCount (2) and merkleRootAtInterruption ("") match the initiator's own
-          // state, and the nonce is echoed, so the cross-checks and nonce check pass and
-          // the ONLY thing wrong is the Ed25519 signature — which must be rejected.
+          // leafCount and merkleRootAtInterruption echo the initiator's own state, and the
+          // nonce is echoed, so the cross-checks and nonce check pass and the ONLY thing
+          // wrong is the Ed25519 signature — which must be rejected.
           const tamperedLeaf = {
             type: "SEAL_INTERRUPTED",
             sessionId: f.sessionId,
-            leafCount: 2,
-            merkleRootAtInterruption: "",
+            leafCount: f.leafCountAtInterruption,
+            merkleRootAtInterruption: f.merkleRootAtInterruption,
             timestamp: Date.now(),
             signerPubkey: counterpartyPubkeyHex,
             signature: "00".repeat(64), // zeroed — invalid Ed25519 signature
@@ -1294,8 +1297,6 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
     await makeAgent("alice");
     const cpKp = generateKeypair();
     const cpPubkeyHex = Buffer.from(await cpKp.getPublicKey()).toString("hex");
-    const MROOT = "deadbeefdeadbeefdeadbeefdeadbeef";
-
     let inboundHandler: ((frame: unknown) => void) | null = null;
     const sendStream: SignalingStream = {
       send: async (frame: unknown) => {
@@ -1344,7 +1345,7 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
       await client.send("ipc.connect", { clientType: "test" });
       await client.send("cello_start_agent", { name: "alice" });
       await client.send("cello_use_agent", { name: "alice" });
-      const result = await client.send("cello_close_session", { session_id: sessionId, merkleRootAtInterruption: MROOT }) as Record<string, unknown>;
+      const result = await client.send("cello_close_session", { session_id: sessionId }) as Record<string, unknown>;
 
       expect(result.ok).toBe(true);
       expect(result.status).toBe("seal_interrupted_pending");
@@ -1358,7 +1359,8 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
       db2.close();
       expect(art).toBeTruthy();
       expect(art.role).toBe("initiator");
-      expect(art.merkle_root).toBe(MROOT);
+      // The initiator's OWN tree root — here the empty tree's, since no content was persisted.
+      expect(art.merkle_root).toBe(EMPTY_TREE_ROOT);
       // Both leaves persisted, and the counterparty leaf is the real signed one.
       const cpLeaf = JSON.parse(art.counterparty_leaf) as { signerPubkey: string };
       expect(cpLeaf.signerPubkey).toBe(cpPubkeyHex);
@@ -1440,7 +1442,6 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
     const bobPubkeyHex = await makeAgent("bob");
     const initiatorKp = generateKeypair();
     const initiatorPubkeyHex = Buffer.from(await initiatorKp.getPublicKey()).toString("hex");
-    const MROOT = "cafebabecafebabecafebabe";
 
     const sent: Array<Record<string, unknown>> = [];
     let inboundHandler: ((frame: unknown) => void) | null = null;
@@ -1477,8 +1478,8 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
       sessionId,
       initiatorPubkey: initiatorPubkeyHex,
       counterpartyPubkey: bobPubkeyHex,
-      leafCountAtInterruption: 5,
-      merkleRootAtInterruption: MROOT,
+      leafCountAtInterruption: 0,
+      merkleRootAtInterruption: "caller-supplied-root-is-ignored",
       nonce: "nonce-xyz",
     });
 
@@ -1490,8 +1491,9 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
     expect(ack!.nonce).toBe("nonce-xyz");
     const leaf = ack!.sealInterruptedLeaf as Record<string, unknown>;
     expect(leaf.signerPubkey).toBe(bobPubkeyHex);
-    expect(leaf.leafCount).toBe(5);
-    expect(leaf.merkleRootAtInterruption).toBe(MROOT);
+    expect(leaf.leafCount).toBe(0);
+    // The responder signs ITS OWN tree root, never the one the initiator supplied.
+    expect(leaf.merkleRootAtInterruption).toBe(EMPTY_TREE_ROOT);
 
     // The ack leaf carries a REAL Ed25519 signature over the canonical bytes.
     const sigOk = ed25519Verify(

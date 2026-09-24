@@ -265,7 +265,6 @@ export function createSealFlows(deps: SealFlowDeps) {
     sessionId: string,
     record: import("./types.js").SessionRecord,
     correlationId: string,
-    merkleRootAtInterruption: string,
     /**
      * Send and await on THIS stream instead of the agent's home one.
      *
@@ -288,20 +287,11 @@ export function createSealFlows(deps: SealFlowDeps) {
     const myPubkeyHex = agent?.pubkey ?? "";
     const counterpartyPubkey = record.counterparty_pubkey;
 
-    // DAEMON-004 (AC-007 / SI-001 / finding #2): prefer the daemon-owned tree.
-    // After a SIGKILL+restart the active session is forced to 'interrupted' and
-    // its Merkle tree is reloaded from session_tree_leaves. When that reloaded
-    // tree is non-empty it is the authoritative transcript: the seal binds over
-    // the daemon's OWN reloaded root + size, and any caller-supplied
-    // merkleRootAtInterruption is IGNORED (SI-001). Only when no tree was ever
-    // persisted (legacy / pre-DAEMON-004 sessions) do we fall back to the
-    // caller-supplied root and the message_count column (SESSION-001 behavior).
+    // DAEMON-004 (AC-007 / SI-001): the seal binds over the daemon's OWN tree — reloaded from
+    // session_tree_leaves after a restart — and its size. There is no caller-supplied root.
     const reloadedTree = sessionNodeManager.getSessionTree(record.agent_name, sessionId);
-    const hasOwnTree = reloadedTree.size() > 0;
-    const ownLeafCount = hasOwnTree ? reloadedTree.size() : (record.message_count ?? 0);
-    const effectiveRoot = hasOwnTree
-      ? sessionNodeManager.getSessionTreeRootHex(record.agent_name, sessionId)
-      : merkleRootAtInterruption;
+    const ownLeafCount = reloadedTree.size();
+    const effectiveRoot = sessionNodeManager.getSessionTreeRootHex(record.agent_name, sessionId);
 
     // DB-001: check signaling status before attempting to send
     if (signalingFor(record.agent_name)?.status === "reconnecting") {

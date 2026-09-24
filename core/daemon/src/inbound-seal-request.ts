@@ -49,7 +49,6 @@ export function createInboundSealRequestHandler(deps: InboundSealRequestDeps) {
     const initiatorPubkey = typeof frame["initiatorPubkey"] === "string" ? frame["initiatorPubkey"] : null;
     const counterpartyPubkey = typeof frame["counterpartyPubkey"] === "string" ? frame["counterpartyPubkey"] : null;
     const leafCountReq = typeof frame["leafCountAtInterruption"] === "number" ? frame["leafCountAtInterruption"] : null;
-    const merkleRootReq = typeof frame["merkleRootAtInterruption"] === "string" ? frame["merkleRootAtInterruption"] : "";
     const nonce = typeof frame["nonce"] === "string" ? frame["nonce"] : null;
 
     // Cannot even route a rejection without sessionId + initiatorPubkey.
@@ -151,20 +150,12 @@ export function createInboundSealRequestHandler(deps: InboundSealRequestDeps) {
     // From our perspective the initiator is our counterparty.
     if (localRecord.counterparty_pubkey !== initiatorPubkey) { await reject("initiator_mismatch"); return; }
 
-    // DAEMON-004 (SI-001): we sign over OUR OWN daemon-owned tree, never the
-    // initiator-supplied root.
-    //
-    // round-2 finding #6: for an ACTIVE session the daemon ALWAYS binds its own tree
-    // root — even the canonical EMPTY-tree root when no content has flowed — never the
-    // initiator-supplied `merkleRootReq`. Echoing the caller's root would let an
-    // initiator dictate the root a responder signs (the SI-001 trust hole). Only a
-    // LEGACY 'interrupted' session that predates DAEMON-004 (no tree ever persisted)
-    // falls back to message_count + the supplied root (SESSION-001 behavior).
+    // DAEMON-004 (SI-001): we sign over OUR OWN daemon-owned tree — its canonical EMPTY-tree root when
+    // no content has flowed — never the initiator-supplied root. Echoing the caller's root would let
+    // an initiator dictate the root a responder signs.
     const ownTree = sessionNodeManager.getSessionTree(localAgent.name, sessionId);
-    const isActive = localRecord.status === "active";
-    const useOwnTree = isActive || ownTree.size() > 0;
-    const ownLeafCount = useOwnTree ? ownTree.size() : (localRecord.message_count ?? 0);
-    const ownRoot = useOwnTree ? sessionNodeManager.getSessionTreeRootHex(localAgent.name, sessionId) : merkleRootReq;
+    const ownLeafCount = ownTree.size();
+    const ownRoot = sessionNodeManager.getSessionTreeRootHex(localAgent.name, sessionId);
 
     // SI-002/AC-008: leaf-count agreement against our own state.
     if (ownLeafCount !== leafCountReq) {

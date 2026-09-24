@@ -154,7 +154,7 @@ export interface CloseSessionDeps {
    */
   unilateralTimeoutMs?: number;
   // ── the two seal-initiation flows (seal-flows.ts) ──
-  handleSealInterruptedFlow: (sessionId: string, record: SessionRecord, correlationId: string, merkleRootAtInterruption: string, via?: SignalingManager) => Promise<SealFlowResult>;
+  handleSealInterruptedFlow: (sessionId: string, record: SessionRecord, correlationId: string, via?: SignalingManager) => Promise<SealFlowResult>;
   handleActiveSealFlow: (sessionId: string, record: SessionRecord, correlationId: string) => Promise<ActiveSealResult>;
 }
 
@@ -873,12 +873,6 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
     // (counterparty_unavailable, rejected_by_counterparty, or sealed).
     // The sealInterruptedInProgress Set still guards concurrent calls (AC-011).
     if (record.status === "interrupted") {
-      // H-1: the Merkle root at interruption is held by the client (the daemon
-      // does not maintain the session Merkle tree). The client supplies it here
-      // so both parties co-sign over the same root. Absent → empty string, in
-      // which case the bilateral commitment binds leafCount only.
-      const merkleRootAtInterruption =
-        typeof params?.merkleRootAtInterruption === "string" ? params.merkleRootAtInterruption : "";
       sealInterruptedInProgress.add(sealKey(record.agent_name, sessionId));
       const correlationId = randomUUID();
       // CROSS-NODE: dial the broker for the duration of the seal, exactly as the active path does.
@@ -987,7 +981,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         // still registers immediately — a bilateral seal that lands promptly must not be missed
         // because we were off looking something up.
         sealBrokerConn = await openSealBrokerConnection(record.agent_name, sessionId, correlationId);
-        const first = await handleSealInterruptedFlow(sessionId, record, correlationId, merkleRootAtInterruption);
+        const first = await handleSealInterruptedFlow(sessionId, record, correlationId);
 
         // DISCOVER-AND-RETRY, and only on the one reason that discovery can actually fix. After a
         // restart the broker map is empty, so the attempt above went out on the home stream and the
@@ -1009,7 +1003,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         // be SENT there too. Sent on the home stream it reaches our own node, which holds no stream
         // for a counterparty homed elsewhere, logs "target offline" and answers nothing.
         return await notarize(
-          await handleSealInterruptedFlow(sessionId, record, correlationId, merkleRootAtInterruption, sealBrokerConn.mgr),
+          await handleSealInterruptedFlow(sessionId, record, correlationId, sealBrokerConn.mgr),
         );
       } finally {
         // Release the transient connection; the seal result stands either way.
