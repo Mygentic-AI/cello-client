@@ -137,14 +137,10 @@ export function registerTestHandlers(deps: TestHandlerDeps): void {
       return { error: "no_current_agent", guidance: "Select an agent with cello_use_agent, or pass agentName." };
     }
     const agentId = sessionNodeManager.resolveAgentId(agentName);
-    // The fault-injection IPC seam: a bare queued entry with no ordering record. The algorithm is
-    // the caller's to name — an injected entry claims whatever hash the test computed — and the
-    // leaf kind defaults to nothing: both are required, exactly as on the production writer.
+    // Fault-injection seam: a bare queued entry. Algorithm and leaf kind are required, as in production.
     const contentHashAlg = params?.contentHashAlg;
     const leafKind = params?.leafKind;
-    if (typeof contentHashAlg !== "string" || typeof leafKind !== "number") {
-      return { error: "missing_params", guidance: "Provide contentHashAlg and leafKind — the queue refuses an unlabelled entry." };
-    }
+    if (typeof contentHashAlg !== "string" || typeof leafKind !== "number") return { error: "missing_params", guidance: "Provide contentHashAlg and leafKind." };
     retryQueue.enqueueAwaitingContent(agentId, sessionId, Buffer.from(contentHashHex, "hex"), Buffer.from(contentHex, "hex"), undefined, undefined, contentHashAlg, undefined, leafKind);
     return { queued: true, awaitingDepth: retryQueue.getAwaitingDepth(agentId, sessionId) };
   });

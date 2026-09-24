@@ -59,7 +59,7 @@ const GENESIS = new Uint8Array(32).fill(0x9c);
 /** A content frame exactly as production writes one — the leaf domain and the encryption included. */
 function inboundFrame(fields: Record<string, unknown>): Uint8Array {
   return lp.encode.single(encodeCbor({
-    type: "content_frame",
+    type: "content_frame", content_hash_alg: "sha256",
     leaf_kind: LEAF_KIND_MSG,
     session_id: SID,
     content_hash: wireContentHash(BODY),

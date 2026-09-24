@@ -436,7 +436,7 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the verified signer survives the session lo
     const sig = await kp.sign(s1);
     const s2 = encodeCbor([1, senderPubkey, contentHash, sig, null, null]) as Uint8Array;
     const framed = lp.encode.single(encodeCbor({
-      type: "content_frame",
+      type: "content_frame", content_hash_alg: "sha256",
       session_id: SID,
       content_hash: contentHash,
       content_bytes: sealSessionContent(CONTENT_KEY, BODY),
@@ -577,7 +577,7 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the verified signer survives the session lo
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-orphan-wire-b-" });
     await fx.createSession(SID, "alice", "bb".repeat(32), PEER);
     const bare = lp.encode.single(encodeCbor({
-      type: "content_frame",
+      type: "content_frame", content_hash_alg: "sha256",
       session_id: SID,
       content_hash: wireContentHash(BODY),
       content_bytes: sealSessionContent(CONTENT_KEY, BODY),

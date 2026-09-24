@@ -190,7 +190,7 @@ export const UNSALTED_GUIDANCE: Record<UnsaltedReason, string> = {
   [UNSALTED_REASONS.NO_AGREEMENT_STARTED]:
     "Your counterparty was not connected when you sent this, so there was nobody to agree a salt with — most often they are simply offline and this message is going to their relay mailbox. Nothing is wrong with either build. The agreement only runs at session open, so this session stays unsalted even after they come online; a session started while you are both connected will be salted.",
   [UNSALTED_REASONS.AGREEMENT_TIMED_OUT]:
-    "Your counterparty was connected but did not answer the salt agreement in time. Almost always they are on a build that predates it, in which case this is expected and permanent for this session — start a new session once they upgrade. If you know they are on the same version, look for session.salt.persist.failed on this side and session.salt.announce.failed on either.",
+    "Your counterparty was connected but did not answer the salt agreement in time, so this session is unsalted for its life. Look for session.salt.persist.failed on THIS side first (our own write failing produces this same timeout), then session.salt.announce.failed on either side. A new session will agree one normally once the cause is gone.",
   [UNSALTED_REASONS.PEER_CLOSED_ADOPTION]:
     "Your counterparty declined the salt because their side of this session had already hashed messages — their conversation started before yours could agree one. Both builds are fine and both sides know. Start a new session if you want the protection.",
   [UNSALTED_REASONS.PEER_FRONTIER_UNREADABLE]:
@@ -198,7 +198,7 @@ export const UNSALTED_GUIDANCE: Record<UnsaltedReason, string> = {
   [UNSALTED_REASONS.PEER_EXCHANGE_STALLED]:
     "Your counterparty holds a salt for this session and this side never managed to store one, so the two of you could not converge and both agreed to stop rather than trade messages about it forever. Nobody is at fault and no message was lost. Look for session.salt.persist.failed on this side — if it is there, a write to local storage failed and that is the whole cause. Start a new session; it will agree a salt normally.",
   [UNSALTED_REASONS.PEER_CLOSED_UNSPECIFIED]:
-    "Your counterparty declined the salt for a reason this build does not recognise — most likely they are on a newer build that names a case this one predates. Both sides agree there is no salt, so nothing is broken and no message was lost. The exact reason they gave is in the session.salt.adoption.closed line just above. Start a new session once you both know why.",
+    "Your counterparty declined the salt for a reason this build does not recognise. Both sides agree there is no salt, so nothing is broken and no message was lost. The exact reason they gave is in the session.salt.adoption.closed line just above. Start a new session once you both know why.",
   [UNSALTED_REASONS.SESSION_TORN_DOWN]:
     "This session was closed or reset while the message was still being prepared. This line is about the salt only; look for the close or freeze event just before it for what actually happened to the session.",
   [UNSALTED_REASONS.ADOPTION_CLOSED_LOCALLY]:

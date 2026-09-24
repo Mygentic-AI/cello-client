@@ -301,7 +301,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
     const content = new TextEncoder().encode("hello");
     const contentHash = msgLeafHash(content);
-    const res = await mgr.sendContent("alice", sid, content, contentHash, undefined, LEAF_KIND_MSG);
+    const res = await mgr.sendContent("alice", sid, content, contentHash, undefined, LEAF_KIND_MSG, "sha256");
     expect(res.ok).toBe(true);
     expect(node.sent.length).toBe(1);
   });
@@ -317,7 +317,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
     const rootBefore = mgr.getSessionTreeRootHex("alice", sid);
     const content = new TextEncoder().encode("hello");
-    const res = await mgr.sendContent("alice", sid, content, msgLeafHash(content, undefined, LEAF_KIND_MSG));
+    const res = await mgr.sendContent("alice", sid, content, msgLeafHash(content), undefined, LEAF_KIND_MSG, "sha256");
     expect(res.ok).toBe(false);
     if (!res.ok) {
       expect(typeof res.reason).toBe("string");
@@ -409,7 +409,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
     const content = new TextEncoder().encode("hello");
     const correlationId = "flow-abc-123";
-    const res = await mgr.sendContent("alice", sid, content, msgLeafHash(content), correlationId, LEAF_KIND_MSG);
+    const res = await mgr.sendContent("alice", sid, content, msgLeafHash(content), correlationId, LEAF_KIND_MSG, "sha256");
     expect(res.ok).toBe(true);
     expect(node.sent.length).toBe(1);
 
@@ -469,7 +469,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
     const content = new TextEncoder().encode("loopback-hi");
     const correlationId = "flow-roundtrip-1";
-    const res = await mgr.sendContent("alice", sid, content, msgLeafHash(content), correlationId, LEAF_KIND_MSG);
+    const res = await mgr.sendContent("alice", sid, content, msgLeafHash(content), correlationId, LEAF_KIND_MSG, "sha256");
     expect(res.ok).toBe(true);
     // The loopback delivers synchronously into the handler, which ingests async — drain.
     await new Promise((r) => setImmediate(r));
@@ -504,7 +504,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       // The frame is otherwise perfectly well-formed. Only the sender is wrong.
       node.deliverAs = "stranger-peer-id";
       const content = new TextEncoder().encode("a message alice never received");
-      await mgr.sendContent("alice", sid, content, msgLeafHash(content), "corr-x", LEAF_KIND_MSG);
+      await mgr.sendContent("alice", sid, content, msgLeafHash(content), "corr-x", LEAF_KIND_MSG, "sha256");
       await new Promise((r) => setImmediate(r));
 
       expect(events.find((e) => e.event === "session.content.received"), "nothing may be ingested").toBeUndefined();
@@ -536,7 +536,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
 
       const content = new TextEncoder().encode("no session id on this one");
       // Correct sender, correct everything — except the field simply is not there.
-      node.deliverFrame({ type: "content_frame", content_bytes: sealSessionContent(new Uint8Array(32).fill(0x7e), content), content_encryption: SESSION_CONTENT_ENCRYPTION_V1, content_hash: msgLeafHash(content) }, "bob-peer-id");
+      node.deliverFrame({ type: "content_frame", content_hash_alg: "sha256", content_bytes: sealSessionContent(new Uint8Array(32).fill(0x7e), content), content_encryption: SESSION_CONTENT_ENCRYPTION_V1, content_hash: msgLeafHash(content) }, "bob-peer-id");
       await new Promise((r) => setImmediate(r));
 
       expect(events.find((e) => e.event === "session.content.received")).toBeUndefined();
@@ -606,7 +606,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       const content = new TextEncoder().encode("a message B never wrote");
       const rec = await kpRecord(attacker, content, 1);
       node.deliverFrame({
-        type: "content_frame", session_id: sid,
+        type: "content_frame", content_hash_alg: "sha256", session_id: sid,
         content_bytes: sealSessionContent(new Uint8Array(32).fill(0x7e), content), content_encryption: SESSION_CONTENT_ENCRYPTION_V1, content_hash: rec.contentHash,
         structure1_cbor: rec.structure1Cbor, sender_signature: rec.senderSignature, structure2_cbor: rec.structure2Cbor,
       }, "bob-peer-id");
@@ -634,7 +634,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       const content = new TextEncoder().encode("forged");
       const rec = await kpRecord(counterparty, content, 1, { corruptSig: true });
       node.deliverFrame({
-        type: "content_frame", session_id: sid,
+        type: "content_frame", content_hash_alg: "sha256", session_id: sid,
         content_bytes: sealSessionContent(new Uint8Array(32).fill(0x7e), content), content_encryption: SESSION_CONTENT_ENCRYPTION_V1, content_hash: rec.contentHash,
         structure1_cbor: rec.structure1Cbor, sender_signature: rec.senderSignature, structure2_cbor: rec.structure2Cbor,
       }, "bob-peer-id");
@@ -658,7 +658,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       const content = new TextEncoder().encode("mitm");
       const rec = await kpRecord(attacker, content, 1);
       node.deliverFrame({
-        type: "content_frame", session_id: sid,
+        type: "content_frame", content_hash_alg: "sha256", session_id: sid,
         content_bytes: sealSessionContent(new Uint8Array(32).fill(0x7e), content), content_encryption: SESSION_CONTENT_ENCRYPTION_V1, content_hash: rec.contentHash,
         structure1_cbor: rec.structure1Cbor, sender_signature: rec.senderSignature, structure2_cbor: rec.structure2Cbor,
       }, "bob-peer-id");
@@ -710,7 +710,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       const content = new TextEncoder().encode("unverifiable but not refuted");
       const rec = await kpRecord(kp, content, 1);
       node.deliverFrame({
-        type: "content_frame", session_id: sid,
+        type: "content_frame", content_hash_alg: "sha256", session_id: sid,
         content_bytes: sealSessionContent(new Uint8Array(32).fill(0x7e), content), content_encryption: SESSION_CONTENT_ENCRYPTION_V1, content_hash: rec.contentHash,
         structure1_cbor: rec.structure1Cbor, sender_signature: rec.senderSignature, structure2_cbor: rec.structure2Cbor,
       }, "bob-peer-id");
@@ -755,7 +755,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       const content = new TextEncoder().encode("no relay record, still signed");
       const rec = await kpRecord(counterparty, content, 1);
       node.deliverFrame({
-        type: "content_frame", session_id: sid,
+        type: "content_frame", content_hash_alg: "sha256", session_id: sid,
         content_bytes: sealSessionContent(new Uint8Array(32).fill(0x7e), content), content_encryption: SESSION_CONTENT_ENCRYPTION_V1, content_hash: rec.contentHash,
         // Structure 1 and its signature — and deliberately NO `structure2_cbor`.
         structure1_cbor: rec.structure1Cbor, sender_signature: rec.senderSignature,
@@ -782,7 +782,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
 
       const content = new TextEncoder().encode("who wrote this? nobody can say");
       node.deliverFrame({
-        type: "content_frame", session_id: sid,
+        type: "content_frame", content_hash_alg: "sha256", session_id: sid,
         content_bytes: sealSessionContent(new Uint8Array(32).fill(0x7e), content), content_encryption: SESSION_CONTENT_ENCRYPTION_V1, content_hash: msgLeafHash(content),
       }, "bob-peer-id");
       await new Promise((r) => setTimeout(r, 30));
@@ -806,7 +806,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
 
       const content = new TextEncoder().encode("a real message");
-      await mgr.sendContent("alice", sid, content, msgLeafHash(content), "corr-ok", LEAF_KIND_MSG);
+      await mgr.sendContent("alice", sid, content, msgLeafHash(content), "corr-ok", LEAF_KIND_MSG, "sha256");
       await new Promise((r) => setImmediate(r));
 
       expect(events.find((e) => e.event === "session.content.received")).toBeDefined();

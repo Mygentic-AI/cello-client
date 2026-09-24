@@ -160,7 +160,7 @@ describe("DOD-M12B-ACK-1: content streams are not leaked at the receiver", () =>
     for (let i = 0; i < MESSAGE_COUNT; i++) {
       const text = `message ${i}`;
       const content = new TextEncoder().encode(text);
-      const sent = await A.manager.sendContent("alice", SID, content, msgLeafHash(content), `corr-A-${i}`, LEAF_KIND_MSG);
+      const sent = await A.manager.sendContent("alice", SID, content, msgLeafHash(content), `corr-A-${i}`, LEAF_KIND_MSG, "sha256");
       // `delivered` is the field that separates "went to the peer" from "parked for later". A park
       // here is the defect: there is no relay in this harness, so a parked frame is a lost one.
       expect(sent.ok, `send ${i} refused`).toBe(true);

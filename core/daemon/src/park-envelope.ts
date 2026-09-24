@@ -30,7 +30,7 @@ import { decode as cborDecode } from "cbor-x";
 import { encodeCbor } from "@cello-protocol/protocol-types";
 import { verify, sealToRecipient, type KeyProvider } from "@cello-protocol/crypto";
 import { buildParkContentTbs } from "@cello-protocol/protocol-types";
-import { CONTENT_HASH_ALGS, isKnownContentHashAlg } from "./wire-content-hash.js";
+import { isKnownContentHashAlg } from "./wire-content-hash.js";
 
 /**
  * Compare an identity key (raw bytes) against a stored hex pubkey — on BYTES, never on the hex

@@ -632,12 +632,11 @@ export class SessionSalts {
        */
       this.#ctx.logger.warn("session.salt.agreement.timeout", {
         agentName, sessionId, waitedMs: pending.boundMs,
-        impact: "the counterparty did not answer the salt agreement in time, so this session is unsalted FOR ITS LIFE — the message is being sent now rather than held any longer. Nothing is lost and nothing is degraded relative to any shipped release.",
+        impact: "the counterparty did not answer the salt agreement in time, so this session is unsalted FOR ITS LIFE — the message is being sent now rather than held any longer. Nothing is lost.",
         // Review F4: `session.salt.persist.failed` reaches this same timeout by a completely
         // different route — the peer answered promptly and OUR OWN write failed, so we returned
-        // before announcing and nothing came back. Omitting it sent that operator to ask their
-        // counterparty about a version mismatch that was never involved.
-        guidance: "Most often the counterparty is on a build that predates the salt agreement, in which case this is expected and permanent for this session — a newer one will agree normally. If you know they are on the same version, look for session.salt.persist.failed on THIS side first (our own write failing produces this same timeout), then session.salt.announce.failed on either side.",
+        // before announcing and nothing came back.
+        guidance: "Look for session.salt.persist.failed on THIS side first (our own write failing produces this same timeout), then session.salt.announce.failed on either side. A new session will agree a salt normally once the cause is gone.",
       });
       return { salt: null, reason: UNSALTED_REASONS.AGREEMENT_TIMED_OUT };
     }

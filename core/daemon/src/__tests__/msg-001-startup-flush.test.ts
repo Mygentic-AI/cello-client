@@ -79,8 +79,7 @@ describe("CELLO-M7-MSG-001 daemon startup flush of un-acked content", () => {
 
     // DOD-AGENT-ID-JOINKEY-1: enqueue_awaiting_content now requires a resolvable OWNING agent (it
     // resolves the name to an agent_id and throws agent_id_unresolved otherwise). Production always
-    // has an agent by the time content is awaiting ACK; a flat-file agent + the one-time migration
-    // that runs inside startDaemon gives this daemon a real `agents` row for "alice" to resolve.
+    // has an agent by the time content is awaiting ACK; provisionAgentIdentity writes that row before the daemon starts; provisionAgentIdentity writes a real `agents` row for "alice" to resolve.
     await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
     await provisionAgentIdentity(tempDir, "alice");
 
@@ -95,6 +94,8 @@ describe("CELLO-M7-MSG-001 daemon startup flush of un-acked content", () => {
           sessionId,
           contentHash: contentHashHex,
           content: Buffer.from(content).toString("hex"),
+          contentHashAlg: "sha256",
+          leafKind: 0,
         }) as { queued: boolean; awaitingDepth: number };
         expect(res.queued).toBe(true);
         expect(res.awaitingDepth).toBe(1);
@@ -162,7 +163,7 @@ describe("CELLO-M7-MSG-001 daemon startup flush of un-acked content", () => {
       const client = await connectToDaemon(socketPath);
       try {
         await client.send("enqueue_awaiting_content", {
-          agentName: "alice", sessionId, contentHash: contentHashHex, content: Buffer.from(content).toString("hex"),
+          agentName: "alice", sessionId, contentHash: contentHashHex, content: Buffer.from(content).toString("hex"), contentHashAlg: "sha256", leafKind: 0,
         });
         // The persisted ACK arrives → clear the durable awaiting entry.
         const acked = await client.send("mark_content_acked", {
@@ -221,7 +222,7 @@ describe("CELLO-M7-MSG-001 daemon startup flush of un-acked content", () => {
       await client.send("ipc.connect", { clientType: "test" });
       const content = randomBytes(48);
       const contentHashHex = createHash("sha256").update(new Uint8Array([0x00])).update(content).digest().toString("hex");
-      await client.send("enqueue_awaiting_content", { agentName: "alice", sessionId, contentHash: contentHashHex, content: Buffer.from(content).toString("hex") });
+      await client.send("enqueue_awaiting_content", { agentName: "alice", sessionId, contentHash: contentHashHex, content: Buffer.from(content).toString("hex"), contentHashAlg: "sha256", leafKind: 0 });
 
       // Bring alice online → her standing receiver comes up → the per-agent re-park flush fires.
       logEvents.length = 0;

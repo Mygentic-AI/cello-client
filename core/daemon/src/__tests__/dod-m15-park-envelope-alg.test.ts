@@ -1,32 +1,16 @@
 /**
  * THE PARK ENVELOPE CARRIES THE CONTENT-HASH ALGORITHM — `DOD-M15-SEALWIRE-1` bullet 6, part B2a.
  *
- * ─── Why this must land BEFORE anything salts ──────────────────────────────────────────────────
+ * A message takes one of two routes: the direct stream, or the relay park when direct delivery
+ * fails. Both must name the algorithm, or the park route verifies a salted message as `sha256`,
+ * refuses it, KEEPS the relay copy, and pulls it again on every drain.
  *
- * A message takes one of two routes: the direct peer-to-peer stream, or the relay park when direct
- * delivery fails. Part B1 taught the DIRECT route to carry a `content_hash_alg` and verify under it.
- * The park route carries no such field, so both of its verifiers assume `sha256`.
+ * There is one envelope shape, and it always carries the name (M9D purge).
  *
- * That is provably correct today — nothing salts — and becomes a defect the instant part B2b turns
- * salting on. It is worth stating the cost precisely, because it is not just a refused message:
- * `content-park.ts`'s annex check refuses the entry, **does not annex it, and KEEPS the relay copy**,
- * so the next drain pulls it again, refuses again, and keeps it again. A tamper report and a re-pull
- * loop, for a message whose only sin was taking the long way round.
- *
- * ─── RECEIVER FIRST AGAIN, but this time it is self-gating ─────────────────────────────────────
- *
- * The decoder learns v3. The encoder emits v3 **only when the algorithm is not the default**, so
- * every envelope this build actually produces is still v2 and decodes on any current peer. The gate
- * is structural rather than a promise: a salted envelope can only be addressed to a peer that
- * completed the salt agreement, and a build that can do that necessarily has this decoder.
- *
- * ─── Why the algorithm is NOT inside the signature, which is a deliberate call ──────────────────
- *
- * `parkSig` covers `(session_id, recipient_pubkey, content_hash)` — the HASH, not the name of the
- * function that produced it. Adding the name to that statement would change `buildParkContentTbs`,
- * a cross-repo type, for no security gain: flipping the name cannot make altered content verify,
- * because the computed hash must still equal the SIGNED one. A flipped name can only produce a
- * refusal — and the tests below pin exactly that, because "only a refusal" is a claim, not a hope.
+ * Why the algorithm is NOT inside the signature: `parkSig` covers `(session_id, recipient_pubkey,
+ * content_hash)` — the HASH, not the name of the function that produced it. Flipping the name cannot
+ * make altered content verify, because the computed hash must still equal the SIGNED one. A flipped
+ * name can only produce a refusal — and the tests below pin exactly that.
  */
 
 import { describe, it, expect } from "vitest";
@@ -36,7 +20,6 @@ import {
   authenticateParkedEntry,
   sealParkEnvelope,
   PARK_ENVELOPE_VERSION,
-  PARK_ENVELOPE_VERSION_ALG,
 } from "../park-envelope.js";
 import { CONTENT_HASH_ALGS, contentHashFor, wireContentHash } from "../wire-content-hash.js";
 import {
@@ -62,43 +45,17 @@ const SALT = deriveSessionSalt(
   new Uint8Array(SALT_CONTRIBUTION_BYTES).fill(0x22),
 );
 
-describe("the envelope version is chosen by the algorithm, not bumped for everyone", () => {
-  it("★ an UNSALTED envelope is still v2 — every current peer must keep decoding what we send", () => {
-    /**
-     * The compatibility assertion, and the one that would break all store-and-forward mail at once
-     * if it regressed. `authenticateParkedEntry` refuses anything whose version it does not know as
-     * `unsigned_envelope`, so emitting v3 unconditionally would make every parked message from this
-     * build unrecoverable by every peer that has not upgraded.
-     */
-    const env = encodeParkEnvelope({
-      content: CONTENT, senderPubkey: new Uint8Array(32).fill(1), parkSig: new Uint8Array(64).fill(2),
-      contentHashAlg: "sha256",
-      leafKind: 0,
-    });
-    expect(decodeParkEnvelope(env).version).toBe(PARK_ENVELOPE_VERSION);
-    expect(PARK_ENVELOPE_VERSION).toBe(2);
-  });
-
-  it("★ explicitly naming sha256 STILL emits v2 — the default must not silently bump the version", () => {
-    // The subtle break: a caller that starts passing the algorithm explicitly would otherwise push
-    // every envelope to v3 without anyone deciding to.
-    const env = encodeParkEnvelope({
-      content: CONTENT, senderPubkey: new Uint8Array(32).fill(1), parkSig: new Uint8Array(64).fill(2),
-      contentHashAlg: CONTENT_HASH_ALGS.SHA256,
-      leafKind: 0,
-    });
-    expect(decodeParkEnvelope(env).version).toBe(PARK_ENVELOPE_VERSION);
-  });
-
-  it("★ a SALTED envelope is v3 and carries the name", () => {
-    const env = encodeParkEnvelope({
-      content: CONTENT, senderPubkey: new Uint8Array(32).fill(1), parkSig: new Uint8Array(64).fill(2),
-      contentHashAlg: CONTENT_HASH_ALGS.HMAC_SALT_V1,
-      leafKind: 0,
-    });
-    const decoded = decodeParkEnvelope(env);
-    expect(decoded.version).toBe(PARK_ENVELOPE_VERSION_ALG);
-    expect(decoded.contentHashAlg).toBe(CONTENT_HASH_ALGS.HMAC_SALT_V1);
+describe("every envelope names its algorithm, in the one shape", () => {
+  it("★ both algorithms round-trip their name through the same version", () => {
+    for (const alg of [CONTENT_HASH_ALGS.SHA256, CONTENT_HASH_ALGS.HMAC_SALT_V1]) {
+      const decoded = decodeParkEnvelope(encodeParkEnvelope({
+        content: CONTENT, senderPubkey: new Uint8Array(32).fill(1), parkSig: new Uint8Array(64).fill(2),
+        contentHashAlg: alg,
+        leafKind: 0,
+      }));
+      expect(decoded.version).toBe(PARK_ENVELOPE_VERSION);
+      expect(decoded.contentHashAlg, `${alg} must travel as a name, never as an absence`).toBe(alg);
+    }
   });
 
   it("★ the EMPTY STRING is refused, not folded into 'absent' — review B2a F4", () => {
@@ -108,7 +65,7 @@ describe("the envelope version is chosen by the algorithm, not bumped for everyo
      * read, not a peer that sent no name — and this file's own `contentHashAlg` doc cites B1 for it.
      * The decoder honoured the rule; the encoder re-introduced it on the producer side.
      *
-     * A caller whose algorithm variable is `""` would have emitted a v2 envelope labelled
+     * A caller whose algorithm variable is `""` would have emitted an envelope labelled
      * sha256-by-absence, and the recipient would report a TAMPER on a message nobody touched.
      *
      * ⚠️ This test exists because the mutant survived. My own mutation loop reported it CAUGHT, and
@@ -132,30 +89,11 @@ describe("the envelope version is chosen by the algorithm, not bumped for everyo
     })).toThrow(/cannot itself reproduce/);
   });
 
-  it("★ a v2 envelope decodes with NO algorithm — absent, not defaulted to a string", () => {
-    /**
-     * `undefined` is what `resolveContentHashAlg` reads as "a peer that predates the field", which is
-     * the only value that means legacy. Defaulting to the literal `"sha256"` here would work today
-     * and quietly erase the distinction between "they said sha256" and "they said nothing" — the
-     * same collapse B1's empty-string case exists to prevent.
-     */
-    const env = encodeParkEnvelope({
-      content: CONTENT, senderPubkey: new Uint8Array(32).fill(1), parkSig: new Uint8Array(64).fill(2),
-      contentHashAlg: "sha256",
-      leafKind: 0,
-    });
-    expect(decodeParkEnvelope(env).contentHashAlg).toBeUndefined();
-  });
 });
 
-describe("a v3 envelope authenticates exactly as a v2 one does", () => {
-  it("★ BOTH signed versions are accepted — bumping the constant must not orphan v2", () => {
-    /**
-     * The trap this test exists for: `authenticateParkedEntry` refused anything whose version was
-     * not the single `PARK_ENVELOPE_VERSION` constant. Bump that constant to 3 and every v2 envelope
-     * in every relay mailbox becomes `unsigned_envelope` — mail loss, reported as an attack.
-     */
-    for (const version of [PARK_ENVELOPE_VERSION, PARK_ENVELOPE_VERSION_ALG]) {
+describe("an envelope in any other shape is refused as unsigned", () => {
+  it("★ an UNKNOWN version is refused — there is one shape", () => {
+    for (const version of [0, 2, 3, 99]) {
       const verdict = authenticateParkedEntry({
         env: {
           version, content: CONTENT,
@@ -166,29 +104,13 @@ describe("a v3 envelope authenticates exactly as a v2 one does", () => {
         contentHash: wireContentHash(CONTENT),
         counterpartyPubkeyHex: "01".repeat(32),
       });
-      // Both get PAST the version gate — they fail later, on the signature, which is the point.
-      expect(verdict.ok === false && verdict.reason, `v${version} must not be refused as unsigned`)
-        .not.toBe("unsigned_envelope");
+      expect(verdict.ok === false && verdict.reason, `v${version}`).toBe("unsigned_envelope");
     }
-  });
-
-  it("★ an UNKNOWN version is still refused as unsigned — the set is closed", () => {
-    const verdict = authenticateParkedEntry({
-      env: {
-        version: 99, content: CONTENT,
-        senderPubkey: new Uint8Array(32).fill(1), parkSig: new Uint8Array(64).fill(2),
-      },
-      sessionIdHex: SESSION,
-      recipientPubkey: new Uint8Array(32).fill(3),
-      contentHash: wireContentHash(CONTENT),
-      counterpartyPubkeyHex: "01".repeat(32),
-    });
-    expect(verdict.ok === false && verdict.reason).toBe("unsigned_envelope");
   });
 });
 
 describe("the producer round-trips through the real consumer", () => {
-  it("★ a SALTED envelope seals, unseals, decodes as v3, and authenticates", async () => {
+  it("★ a SALTED envelope seals, unseals, decodes, and authenticates", async () => {
     /**
      * The whole path in one test, against the real `sealParkEnvelope` — the pattern this file's
      * predecessor established after a producer signing the wrong statement was found to be invisible
@@ -206,7 +128,7 @@ describe("the producer round-trips through the real consumer", () => {
     });
     const env = decodeParkEnvelope(await openAsRecipient(recipient, sealed));
 
-    expect(env.version).toBe(PARK_ENVELOPE_VERSION_ALG);
+    expect(env.version).toBe(PARK_ENVELOPE_VERSION);
     expect(env.contentHashAlg).toBe(CONTENT_HASH_ALGS.HMAC_SALT_V1);
     const verdict = authenticateParkedEntry({
       env, sessionIdHex: SESSION, recipientPubkey: recipientPub, contentHash,

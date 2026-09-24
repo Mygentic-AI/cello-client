@@ -31,7 +31,7 @@ import type { Stream } from "@libp2p/interface";
 import { generateKeypair } from "@cello-protocol/crypto";
 import { buildStructure2, encodeStructure2 } from "@cello-protocol/protocol-types";
 import { encodeStructure1 } from "@cello-protocol/protocol-types";
-import { encodeParkEnvelope, sealParkEnvelope } from "../park-envelope.js";
+import { encodeParkEnvelope, sealParkEnvelope, PARK_ENVELOPE_VERSION } from "../park-envelope.js";
 import { seedAgents } from "./helpers/seed-agents.js";
 import { TEST_SESSION_GENESIS } from "./helpers/session-genesis.js";
 import { receivedCount, receivedRows } from "./helpers/received-rows.js";
@@ -246,7 +246,7 @@ describe("DOD-MSG-4: strict in-order content gate", () => {
     expect(mgr.getSessionTree(AGENT, sid).size()).toBe(1);
   });
 
-  it("2b/SEC-1: the SIGNED park envelope round-trips content + ordering record; legacy shapes decode as v1 (so they can be REFUSED by name)", async () => {
+  it("2b/SEC-1: the SIGNED park envelope round-trips content + ordering record; any other shape decodes as unreadable (so it can be REFUSED by name)", async () => {
     const mgr = await makeManager(logger, join(tempDir, "env.db"));
     const content = new TextEncoder().encode("payload");
     const s1 = new Uint8Array([0x01, 0x02, 0x03]);
@@ -256,7 +256,7 @@ describe("DOD-MSG-4: strict in-order content gate", () => {
 
     // With the ordering record (the live-park path).
     const dec = mgr.decodeParkEnvelope(encodeParkEnvelope({ content, structure1Cbor: s1, structure2Cbor: s2, senderPubkey, parkSig, contentHashAlg: "sha256", leafKind: 0 }));
-    expect(dec.version).toBe(2);
+    expect(dec.version).toBe(PARK_ENVELOPE_VERSION);
     expect(Buffer.from(dec.content).toString()).toBe("payload");
     expect(dec.structure1Cbor && Buffer.from(dec.structure1Cbor).toString("hex")).toBe(Buffer.from(s1).toString("hex"));
     expect(dec.structure2Cbor && Buffer.from(dec.structure2Cbor).toString("hex")).toBe(Buffer.from(s2).toString("hex"));
@@ -265,17 +265,17 @@ describe("DOD-MSG-4: strict in-order content gate", () => {
 
     // Without a record (the startup-flush crash-backstop path) — still SIGNED (SEC-1).
     const dec2 = mgr.decodeParkEnvelope(encodeParkEnvelope({ content, senderPubkey, parkSig, contentHashAlg: "sha256", leafKind: 0 }));
-    expect(dec2.version).toBe(2);
+    expect(dec2.version).toBe(PARK_ENVELOPE_VERSION);
     expect(Buffer.from(dec2.content).toString()).toBe("payload");
     expect(dec2.structure1Cbor).toBeUndefined();
     expect(dec2.structure2Cbor).toBeUndefined();
     expect(dec2.senderPubkey).toBeDefined();
 
-    // SEC-1: a legacy bare-content seal still DECODES (as v1, unsigned) — decoding is not accepting.
+    // SEC-1: bare content still DECODES (as version 0, unreadable) — decoding is not accepting.
     // recoverParkedEntry refuses it as `unsigned_envelope`; see sec-1-park-authentication.test.ts.
-    const bare = new TextEncoder().encode("legacy bare content, not an envelope at all");
+    const bare = new TextEncoder().encode("bare content, not an envelope at all");
     const decBare = mgr.decodeParkEnvelope(bare);
-    expect(decBare.version).toBe(1);
+    expect(decBare.version).toBe(0);
     expect(Buffer.from(decBare.content).toString("hex")).toBe(Buffer.from(bare).toString("hex"));
     expect(decBare.senderPubkey).toBeUndefined();
   });

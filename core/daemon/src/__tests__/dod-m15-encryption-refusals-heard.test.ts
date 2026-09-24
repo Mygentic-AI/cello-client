@@ -43,7 +43,7 @@ const AGREED = new Uint8Array(32).fill(0x7e);
 
 function frame(fields: Record<string, unknown>): Uint8Array {
   return lp.encode.single(encodeCbor({
-    type: "content_frame",
+    type: "content_frame", content_hash_alg: "sha256",
     session_id: SID,
     content_hash: wireContentHash(BODY),
     content_bytes: sealSessionContent(AGREED, BODY),

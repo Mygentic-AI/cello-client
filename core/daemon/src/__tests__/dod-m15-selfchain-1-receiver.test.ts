@@ -69,7 +69,7 @@ async function frameFrom(
     prevOwnHash: links.prevOwnHash,
   });
   const frame = lp.encode.single(encodeCbor({
-    type: "content_frame",
+    type: "content_frame", content_hash_alg: "sha256",
     session_id: SID,
     content_hash: contentHash,
     content_bytes: sealSessionContent(CONTENT_KEY, content),

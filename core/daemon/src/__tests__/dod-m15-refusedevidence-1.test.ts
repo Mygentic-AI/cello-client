@@ -109,7 +109,7 @@ describe("DOD-M15-REFUSEDEVIDENCE-1 — a refused message is kept, flagged, and 
     // The hash the sender COMMITTED to does not describe these bytes: a tamper.
     const wrongHash = msgLeafHash(new TextEncoder().encode("a completely different message"));
     const res = await snm.ingestReceivedContent(
-      "alice", SID, content, wrongHash, "corr-1", undefined, undefined,
+      "alice", SID, content, wrongHash, "corr-1", undefined, "sha256",
       { senderPubkey, senderSig: sig },
     );
     expect(res, "the tamper is still refused — retention does not admit it").toMatchObject({

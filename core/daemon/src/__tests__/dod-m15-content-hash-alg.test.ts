@@ -143,13 +143,11 @@ describe("the two algorithms produce different bytes for the same message", () =
 });
 
 describe("a name we do not know is REFUSED, never guessed at", () => {
-  it("★ an unknown algorithm is not a legacy peer — it is an unreadable one", () => {
+  it("★ an unknown algorithm is an unreadable one", () => {
     /**
-     * Decision #15 draws this line explicitly. ABSENT means legacy: a peer that predates the field,
-     * and we know exactly what it computed. NAMED-AND-KNOWN means verify under that name.
-     * NAMED-AND-UNKNOWN means a peer built something we cannot reproduce, and there is no correct
-     * hash to compare against — falling back to unsalted there would compare two unrelated values
-     * and report a tamper.
+     * NAMED-AND-KNOWN means verify under that name. NAMED-AND-UNKNOWN means a peer built something
+     * we cannot reproduce, and there is no correct hash to compare against — falling back to
+     * unsalted there would compare two unrelated values and report a tamper.
      */
     expect(isKnownContentHashAlg("hmac-sha512-salt-v9")).toBe(false);
     expect(isKnownContentHashAlg(CONTENT_HASH_ALGS.SHA256)).toBe(true);
@@ -174,9 +172,9 @@ describe("a name we do not know is REFUSED, never guessed at", () => {
 });
 
 describe("resolving what a frame says it used", () => {
-  it("★ an ABSENT field means the legacy algorithm — a peer that predates the field", () => {
-    expect(resolveContentHashAlg(undefined)).toEqual({ ok: true, alg: CONTENT_HASH_ALGS.SHA256 });
-    expect(resolveContentHashAlg(null)).toEqual({ ok: true, alg: CONTENT_HASH_ALGS.SHA256 });
+  it("★ an ABSENT field is refused — every sender names it, so absence is a malformed frame", () => {
+    expect(resolveContentHashAlg(undefined)).toEqual({ ok: false, value: "(absent)" });
+    expect(resolveContentHashAlg(null)).toEqual({ ok: false, value: "(absent)" });
   });
 
   it("★ a NAMED known algorithm resolves to itself", () => {
@@ -199,12 +197,8 @@ describe("resolving what a frame says it used", () => {
     expect(resolveContentHashAlg({} as unknown as string).ok).toBe(false);
   });
 
-  it("★ the EMPTY STRING is refused rather than treated as absent", () => {
-    /**
-     * The gap a truthiness check leaves. `if (!alg) return SHA256` would fold `""` into "legacy",
-     * so a peer that sends an empty name — a serialisation bug on their side, or a deliberate probe
-     * — would be silently verified as unsalted instead of being told its frame is unreadable.
-     */
+  it("★ the EMPTY STRING is refused, and named as what it is", () => {
+    // A truthiness check would fold `""` into absence; it is its own unreadable value.
     expect(resolveContentHashAlg("").ok).toBe(false);
   });
 });

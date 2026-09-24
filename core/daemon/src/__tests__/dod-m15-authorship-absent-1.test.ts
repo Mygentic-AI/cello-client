@@ -68,7 +68,7 @@ function sentFrames(node: CelloNode | null): Array<Record<string, unknown>> {
  */
 function inboundFrame(fields: Record<string, unknown>): Uint8Array {
   return lp.encode.single(encodeCbor({
-    type: "content_frame",
+    type: "content_frame", content_hash_alg: "sha256",
     // 034-CARRYLEAF: production names the leaf DOMAIN on every content frame, and a frame without
     // one is refused — witnessing under a guessed domain puts a wrong statement in the record.
     leaf_kind: 0x00,

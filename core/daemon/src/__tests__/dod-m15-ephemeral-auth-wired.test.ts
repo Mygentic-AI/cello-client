@@ -168,7 +168,7 @@ describe("DOD-M15-EPHEMERAL-AUTH-1: the real exchange, over a real connection", 
 
     const text = "the price is 40,000 and we close on Friday";
     const content = new TextEncoder().encode(text);
-    const sent = await A.manager.sendContent("alice", SID, content, msgLeafHash(content), "corr-send", LEAF_KIND_MSG) as { ok: boolean; delivered?: boolean };
+    const sent = await A.manager.sendContent("alice", SID, content, msgLeafHash(content), "corr-send", LEAF_KIND_MSG, "sha256") as { ok: boolean; delivered?: boolean };
     expect(sent.ok, "the send failed even though both sides agreed a key").toBe(true);
     expect(
       sent.delivered,
@@ -205,7 +205,7 @@ describe("DOD-M15-EPHEMERAL-AUTH-1: the real exchange, over a real connection", 
 
     const text = "a sentence a relay must not be able to read";
     const content = new TextEncoder().encode(text);
-    await A.manager.sendContent("alice", SID, content, msgLeafHash(content), "corr-wire", LEAF_KIND_MSG);
+    await A.manager.sendContent("alice", SID, content, msgLeafHash(content), "corr-wire", LEAF_KIND_MSG, "sha256");
     await pollFor(() => receivedCount(B.manager, "bob", SID) >= 1 || null);
 
     const frame = seen.find((f) => f["type"] === "content_frame");
@@ -312,7 +312,7 @@ describe("DOD-M15-EPHEMERAL-AUTH-1: the real exchange, over a real connection", 
 
     const text = "this must not travel in the clear";
     const content = new TextEncoder().encode(text);
-    const sent = await A.manager.sendContent("alice", SID, content, msgLeafHash(content), "corr-nokey", LEAF_KIND_MSG) as { ok: boolean; delivered?: boolean };
+    const sent = await A.manager.sendContent("alice", SID, content, msgLeafHash(content), "corr-nokey", LEAF_KIND_MSG, "sha256") as { ok: boolean; delivered?: boolean };
 
     expect(
       sent.delivered,
@@ -341,7 +341,7 @@ describe("DOD-M15-EPHEMERAL-AUTH-1: the real exchange, over a real connection", 
 
     // A document update is a content send with the DOC leaf kind.
     const update = new TextEncoder().encode("yjs-update-bytes-stand-in");
-    const sent = await A.manager.sendContent("alice", SID, update, msgLeafHash(update), "corr-doc", LEAF_KIND_DOC) as { ok: boolean; delivered?: boolean };
+    const sent = await A.manager.sendContent("alice", SID, update, msgLeafHash(update), "corr-doc", LEAF_KIND_DOC, "sha256") as { ok: boolean; delivered?: boolean };
     expect(sent.delivered, "the document update did not go direct").toBe(true);
 
     await pollFor(() => (routed.length > 0 ? routed : null));
@@ -412,7 +412,7 @@ describe("DOD-M15-EPHEMERAL-AUTH-1: the real exchange, over a real connection", 
 
     const content = new TextEncoder().encode("delivered in the clear, if you let me");
     await B.manager.handleContentFrameForTest("bob", SID, framed({
-      type: "content_frame", session_id: SID,
+      type: "content_frame", content_hash_alg: "sha256", session_id: SID,
       content_bytes: content, content_hash: msgLeafHash(content),
     }), A.manager.getSessionNodePeerId("alice", SID) ?? undefined);
 
@@ -429,7 +429,7 @@ describe("DOD-M15-EPHEMERAL-AUTH-1: the real exchange, over a real connection", 
 
     const content = new TextEncoder().encode("sealed to a key this session never agreed");
     await B.manager.handleContentFrameForTest("bob", SID, framed({
-      type: "content_frame", session_id: SID,
+      type: "content_frame", content_hash_alg: "sha256", session_id: SID,
       content_bytes: sealSessionContent(new Uint8Array(32).fill(0x99), content),
       content_encryption: SESSION_CONTENT_ENCRYPTION_V1,
       content_hash: msgLeafHash(content),

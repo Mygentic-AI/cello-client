@@ -30,7 +30,7 @@ import { makeFakeRelay, tick, noopLogger, fakeRelayAnchor, pushAck } from "./rel
 import { DatabaseSync } from "node:sqlite";
 import { SessionSealLeafStore } from "../session-seal-leaf-store.js";
 import { RelayReceiptStore } from "../relay-receipt-store.js";
-import { encodeParkEnvelope, decodeParkEnvelope, PARK_ENVELOPE_VERSION_S1SIG } from "../park-envelope.js";
+import { encodeParkEnvelope, decodeParkEnvelope, PARK_ENVELOPE_VERSION } from "../park-envelope.js";
 import { startTwoConnectionFixture, FakeNode, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import { wireContentHash } from "../wire-content-hash.js";
@@ -710,7 +710,7 @@ describe("034-CARRYLEAF — the MAILBOX route carries what the recipient needs t
    * relay will not accept for a counter-submit. So a counterparty who parked instead of
    * hand-delivering still truncated the record.
    */
-  it("★★ a v4 envelope round-trips the author's ordering claim, its SIGNATURE, and its leaf domain", () => {
+  it("★★ the envelope round-trips the author's ordering claim, its SIGNATURE, and its leaf domain", () => {
     const content = new TextEncoder().encode("the message they would rather you could not witness");
     const claim = new Uint8Array([0xa1, 0xa2, 0xa3]);
     const claimSig = new Uint8Array(64).fill(0x77);
@@ -726,7 +726,7 @@ describe("034-CARRYLEAF — the MAILBOX route carries what the recipient needs t
     });
     const env = decodeParkEnvelope(bytes);
 
-    expect(env.version, "a signed ordering claim promotes the envelope to v4").toBe(PARK_ENVELOPE_VERSION_S1SIG);
+    expect(env.version).toBe(PARK_ENVELOPE_VERSION);
     expect(Buffer.from(env.structure1Cbor!).toString("hex")).toBe(Buffer.from(claim).toString("hex"));
     expect(
       Buffer.from(env.structure1Signature!).toString("hex"),
@@ -741,14 +741,7 @@ describe("034-CARRYLEAF — the MAILBOX route carries what the recipient needs t
     expect(Buffer.from(env.parkSig!).toString("hex")).toBe(Buffer.from(parkSig).toString("hex"));
   });
 
-  it("★ an envelope with NO signature over the claim stays v2 — older peers keep reading their mail", () => {
-    /**
-     * The compatibility half, and it is not decoration: `SIGNED_ENVELOPE_VERSIONS` exists because
-     * bumping a version constant once turned every envelope sitting in every relay mailbox into
-     * `unsigned_envelope` — store-and-forward mail destroyed and reported as an attack.
-     *
-     * So a sender with nothing to sign emits exactly what it emitted before.
-     */
+  it("★ an envelope with NO signature over the claim carries none — nothing to confuse for one", () => {
     const env = decodeParkEnvelope(encodeParkEnvelope({
       content: new TextEncoder().encode("ordinary mail"),
       senderPubkey: new Uint8Array(32).fill(0x22),
@@ -757,8 +750,8 @@ describe("034-CARRYLEAF — the MAILBOX route carries what the recipient needs t
       contentHashAlg: "sha256",
       leafKind: 0,
     }));
-    expect(env.version).toBe(2);
-    expect(env.structure1Signature, "and it carries no signature to be confused for one").toBeUndefined();
+    expect(env.version).toBe(PARK_ENVELOPE_VERSION);
+    expect(env.structure1Signature).toBeUndefined();
   });
 });
 
@@ -811,7 +804,7 @@ describe("033-ACKEMIT — what the operator is told when the RELAY refuses", () 
 /** An inbound content frame, built the way a real sender builds one. `fields` is spread LAST. */
 function inboundFrame(fields: Record<string, unknown>): Uint8Array {
   return lp.encode.single(encodeCbor({
-    type: "content_frame",
+    type: "content_frame", content_hash_alg: "sha256",
     // 034-CARRYLEAF: production names the leaf DOMAIN on every content frame, and a frame without
     // one is refused — witnessing under a guessed domain puts a wrong statement in the record.
     leaf_kind: LEAF_KIND_MSG,

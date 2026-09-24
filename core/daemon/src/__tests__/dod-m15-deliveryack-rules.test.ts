@@ -147,7 +147,7 @@ describe("DELIVERYACK: the five rules, on the inbound path", () => {
 
     const content = new TextEncoder().encode("a message worth acknowledging");
     const hash = msgLeafHash(content);
-    const res = await mgr.sendContent("alice", SID, content, hash, "corr", LEAF_KIND_MSG);
+    const res = await mgr.sendContent("alice", SID, content, hash, "corr", LEAF_KIND_MSG, "sha256");
     expect(res.ok).toBe(true);
 
     const ack = (over: { sig?: Uint8Array | undefined; hash?: Uint8Array; level?: string }): unknown =>
@@ -341,7 +341,7 @@ describe("DELIVERYACK: the five rules, on the inbound path", () => {
     mgr.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     const content = new TextEncoder().encode("to a session with no usable counterparty key");
     const hash = msgLeafHash(content);
-    expect((await mgr.sendContent("alice", SID, content, hash, "corr", LEAF_KIND_MSG)).ok).toBe(true);
+    expect((await mgr.sendContent("alice", SID, content, hash, "corr", LEAF_KIND_MSG, "sha256")).ok).toBe(true);
 
     const bob = new InMemoryKeyProvider(new Uint8Array(randomBytes(32)));
     node.invokeHandler(

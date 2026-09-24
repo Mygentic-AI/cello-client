@@ -69,7 +69,7 @@ describe("the queued row REMEMBERS how its message was hashed", () => {
     expect(
       rq.enqueueAwaitingContent(
         "id-alice", "s1", new Uint8Array(32).fill(0xa1), new TextEncoder().encode("hello"),
-        undefined, undefined, "hmac-sha256-salt-v1",
+        undefined, undefined, "hmac-sha256-salt-v1", undefined, 0,
       ),
       "precondition: the enqueue must succeed",
     ).toBe(true);

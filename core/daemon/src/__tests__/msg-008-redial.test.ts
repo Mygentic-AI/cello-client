@@ -144,7 +144,7 @@ describe("DOD-M12B-REDIAL-1: a lost connection is re-dialled on demand", () => {
 
   async function send(A: { manager: SessionNodeManager }, text: string) {
     const content = new TextEncoder().encode(text);
-    return A.manager.sendContent("alice", SID, content, msgLeafHash(content), `corr-${text}`, LEAF_KIND_MSG);
+    return A.manager.sendContent("alice", SID, content, msgLeafHash(content), `corr-${text}`, LEAF_KIND_MSG, "sha256");
   }
 
   it("a send that finds no connection re-dials and delivers, instead of parking for the rest of the session", async () => {
@@ -205,7 +205,7 @@ describe("DOD-M12B-REDIAL-1: a lost connection is re-dialled on demand", () => {
     expect(created.ok).toBe(true);
 
     const content = new TextEncoder().encode("no way home");
-    await A.manager.sendContent("alice", SID, content, msgLeafHash(content), "corr", LEAF_KIND_MSG);
+    await A.manager.sendContent("alice", SID, content, msgLeafHash(content), "corr", LEAF_KIND_MSG, "sha256");
 
     expect(A.events.find((e) => e.event === "session.transport.redial.unavailable"), "the limitation must be named").toBeDefined();
     expect(A.events.find((e) => e.event === "session.transport.redial.attempted"), "and nothing may be dialled").toBeUndefined();

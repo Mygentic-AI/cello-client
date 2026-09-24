@@ -365,7 +365,7 @@ describe("RetryQueue", () => {
       const sessionId = "sess-msg001";
       const contentHash = new Uint8Array(randomBytes(32));
       const contentBlob = new Uint8Array([7, 7, 7, 9]);
-      retryQueue.enqueueAwaitingContent("alice", sessionId, contentHash, contentBlob);
+      retryQueue.enqueueAwaitingContent("alice", sessionId, contentHash, contentBlob, undefined, undefined, "sha256", undefined, 0);
       expect(retryQueue.getAwaitingDepth("alice", sessionId)).toBe(1);
       // The direct-resend queue is untouched (separate FIFO).
       expect(retryQueue.getSessionDepth(sessionId)).toBe(0);
@@ -383,7 +383,7 @@ describe("RetryQueue", () => {
     it("a park failure keeps the entry queued for the next reconnect / startup flush (AC-019)", async () => {
       const sessionId = "sess-fail";
       const ch = new Uint8Array(randomBytes(32));
-      retryQueue.enqueueAwaitingContent("alice", sessionId, ch, new Uint8Array([1]));
+      retryQueue.enqueueAwaitingContent("alice", sessionId, ch, new Uint8Array([1]), undefined, undefined, "sha256", undefined, 0);
       const first = await retryQueue.drainAwaitingToPark("alice", sessionId, async () => ({ parked: false, error: "relay_down" }));
       expect(first).toBe(0);
       expect(retryQueue.getAwaitingDepth("alice", sessionId)).toBe(1);
@@ -407,7 +407,7 @@ describe("RetryQueue", () => {
        */
       const sessionId = "sess-retryafter";
       for (let i = 0; i < 5; i++) {
-        retryQueue.enqueueAwaitingContent("alice", sessionId, new Uint8Array(randomBytes(32)), new Uint8Array([i]));
+        retryQueue.enqueueAwaitingContent("alice", sessionId, new Uint8Array(randomBytes(32)), new Uint8Array([i]), undefined, undefined, "sha256", undefined, 0);
       }
 
       const delays: number[] = [];
@@ -437,7 +437,7 @@ describe("RetryQueue", () => {
        */
       const sessionId = "sess-maxdelay";
       for (let i = 0; i < 3; i++) {
-        retryQueue.enqueueAwaitingContent("alice", sessionId, new Uint8Array(randomBytes(32)), new Uint8Array([i]));
+        retryQueue.enqueueAwaitingContent("alice", sessionId, new Uint8Array(randomBytes(32)), new Uint8Array([i]), undefined, undefined, "sha256", undefined, 0);
       }
 
       const seen: number[] = [];
@@ -466,7 +466,7 @@ describe("RetryQueue", () => {
     it("markContentAcked removes the un-acked entry (no park needed)", () => {
       const sessionId = "sess-ack";
       const ch = new Uint8Array(randomBytes(32));
-      retryQueue.enqueueAwaitingContent("alice", sessionId, ch, new Uint8Array([2]));
+      retryQueue.enqueueAwaitingContent("alice", sessionId, ch, new Uint8Array([2]), undefined, undefined, "sha256", undefined, 0);
       retryQueue.markContentAcked("alice", sessionId, ch);
       expect(retryQueue.getAwaitingDepth("alice", sessionId)).toBe(0);
     });
@@ -475,7 +475,7 @@ describe("RetryQueue", () => {
       const sessionId = "sess-restart";
       const ch = new Uint8Array(randomBytes(32));
       const blob = new Uint8Array([3, 1, 4, 1, 5]);
-      retryQueue.enqueueAwaitingContent("alice", sessionId, ch, blob);
+      retryQueue.enqueueAwaitingContent("alice", sessionId, ch, blob, undefined, undefined, "sha256", undefined, 0);
 
       // Simulate a daemon restart: a fresh RetryQueue over the same DB, loadFromDb first.
       const rq2 = new RetryQueue(db, logger);
@@ -532,7 +532,7 @@ describe("RetryQueue", () => {
       const sessionId = "session-owner-retired";
       const agentId = "agent-id-retired-0001";
       const hash = randomBytes(32);
-      retryQueue.enqueueAwaitingContent(agentId, sessionId, hash, randomBytes(64));
+      retryQueue.enqueueAwaitingContent(agentId, sessionId, hash, randomBytes(64), undefined, undefined, "sha256", undefined, 0);
       logEvents.length = 0;
 
       const parked = await retryQueue.drainAwaitingToPark(agentId, sessionId, async () => ({
@@ -564,7 +564,7 @@ describe("RetryQueue", () => {
       ]) {
         const sessionId = `session-${reason}`;
         const agentId = "agent-id-alice-0001";
-        retryQueue.enqueueAwaitingContent(agentId, sessionId, randomBytes(32), randomBytes(64));
+        retryQueue.enqueueAwaitingContent(agentId, sessionId, randomBytes(32), randomBytes(64), undefined, undefined, "sha256", undefined, 0);
 
         await retryQueue.drainAwaitingToPark(agentId, sessionId, async () => ({ parked: false, error: reason }));
 
@@ -701,7 +701,7 @@ describe("RetryQueue", () => {
       const sessionId = "session-mixed";
       const agentId = "agent-id-alice-0001";
       retryQueue.enqueue(sessionId, randomBytes(32), randomBytes(64));
-      retryQueue.enqueueAwaitingContent(agentId, sessionId, randomBytes(32), randomBytes(64));
+      retryQueue.enqueueAwaitingContent(agentId, sessionId, randomBytes(32), randomBytes(64), undefined, undefined, "sha256", undefined, 0);
 
       const reaped = retryQueue.reapTerminalSession(sessionId, "sealed");
 
@@ -841,8 +841,8 @@ describe("DOD-AGENT-ID-JOINKEY-1 — retry_queue: two local agents, one session,
     expect(AGENT_A, "the two agents must be distinct or this proves nothing").not.toBe(AGENT_B);
 
     const rq = new RetryQueue(db2, log2);
-    rq.enqueueAwaitingContent(AGENT_A, SESSION, HASH, CONTENT);
-    rq.enqueueAwaitingContent(AGENT_B, SESSION, HASH, CONTENT);
+    rq.enqueueAwaitingContent(AGENT_A, SESSION, HASH, CONTENT, undefined, undefined, "sha256", undefined, 0);
+    rq.enqueueAwaitingContent(AGENT_B, SESSION, HASH, CONTENT, undefined, undefined, "sha256", undefined, 0);
 
     // In-memory, both look healthy — this is the mask. The loss is invisible until a restart.
     expect(rq.getAwaitingDepth(AGENT_A, SESSION)).toBe(1);
@@ -887,8 +887,8 @@ describe("DOD-AGENT-ID-JOINKEY-1 — retry_queue: two local agents, one session,
     const AGENT_B = "agent-id-bob-0002";
 
     const rq = new RetryQueue(db2, log2);
-    rq.enqueueAwaitingContent(AGENT_A, SESSION, HASH, CONTENT);
-    rq.enqueueAwaitingContent(AGENT_B, SESSION, HASH, CONTENT);
+    rq.enqueueAwaitingContent(AGENT_A, SESSION, HASH, CONTENT, undefined, undefined, "sha256", undefined, 0);
+    rq.enqueueAwaitingContent(AGENT_B, SESSION, HASH, CONTENT, undefined, undefined, "sha256", undefined, 0);
 
     // A's content is acknowledged. B's identical content is a DIFFERENT agent's durable state.
     rq.markContentAcked(AGENT_A, SESSION, HASH);
@@ -919,7 +919,7 @@ describe("DOD-AGENT-ID-JOINKEY-1 — retry_queue: two local agents, one session,
     const S2 = Buffer.from([0xa2, 0x03, 0x04]);
 
     const rq = new RetryQueue(db2, log2);
-    rq.enqueueAwaitingContent(AGENT, SESSION, HASH, CONTENT, S1, S2);
+    rq.enqueueAwaitingContent(AGENT, SESSION, HASH, CONTENT, S1, S2, "sha256", undefined, 0);
 
     // A brand-new instance over the same database — what a restarted daemon does.
     const afterRestart = new RetryQueue(db2, log2);
@@ -948,7 +948,7 @@ describe("DOD-AGENT-ID-JOINKEY-1 — retry_queue: two local agents, one session,
     const CONTENT = Buffer.from("no order carried");
 
     const rq = new RetryQueue(db2, log2);
-    rq.enqueueAwaitingContent(AGENT, SESSION, HASH, CONTENT);
+    rq.enqueueAwaitingContent(AGENT, SESSION, HASH, CONTENT, undefined, undefined, "sha256", undefined, 0);
 
     const afterRestart = new RetryQueue(db2, log2);
     afterRestart.loadFromDb();

@@ -148,7 +148,7 @@ describe("DOD-M12B-ACK-1: liveness stops claiming `alive` when writes fail", () 
 
   async function send(A: ReturnType<typeof makeManager>, text: string): Promise<{ ok: boolean }> {
     const content = new TextEncoder().encode(text);
-    return A.manager.sendContent("alice", SID, content, msgLeafHash(content), `corr-${text}`, LEAF_KIND_MSG) as Promise<{ ok: boolean }>;
+    return A.manager.sendContent("alice", SID, content, msgLeafHash(content), `corr-${text}`, LEAF_KIND_MSG, "sha256") as Promise<{ ok: boolean }>;
   }
 
   it("a failed direct send moves liveness off `alive`, and a later success restores it", async () => {
@@ -202,7 +202,7 @@ describe("DOD-M12B-ACK-1: liveness stops claiming `alive` when writes fail", () 
     expect(A.manager.getSessionLiveness("alice", UNSEEN)).toBe("unknown");
 
     const content = new TextEncoder().encode("into the void");
-    await A.manager.sendContent("alice", UNSEEN, content, msgLeafHash(content), "corr-U", LEAF_KIND_MSG);
+    await A.manager.sendContent("alice", UNSEEN, content, msgLeafHash(content), "corr-U", LEAF_KIND_MSG, "sha256");
     expect(A.manager.getSessionLiveness("alice", UNSEEN)).toBe("impaired");
   }, 60_000);
 

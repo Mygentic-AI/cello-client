@@ -184,7 +184,7 @@ describe("MSG-001: delivery ACK / TTF (daemon)", () => {
 
     const content = new TextEncoder().encode("hello over the wire");
     const hash = msgLeafHash(content);
-    const res = await mgrA.sendContent("alice", SID, content, hash, "corr-a", LEAF_KIND_MSG);
+    const res = await mgrA.sendContent("alice", SID, content, hash, "corr-a", LEAF_KIND_MSG, "sha256");
     expect(res.ok).toBe(true);
 
     // The receiver ingested it, and it is readable by cello_receive.
@@ -239,7 +239,7 @@ describe("MSG-001: delivery ACK / TTF (daemon)", () => {
 
     const content = new TextEncoder().encode("level test");
     const hash = msgLeafHash(content);
-    const res = await mgrA.sendContent("alice", SID, content, hash, "corr-a", LEAF_KIND_MSG);
+    const res = await mgrA.sendContent("alice", SID, content, hash, "corr-a", LEAF_KIND_MSG, "sha256");
     expect(res.ok).toBe(true);
 
     const bobSig = await signDeliveryAck(bobKp, Buffer.from(SID, "hex"), hash);

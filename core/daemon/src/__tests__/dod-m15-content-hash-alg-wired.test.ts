@@ -87,6 +87,7 @@ async function contentFrame(
   return lp.encode.single(encodeCbor({
     type: "content_frame", session_id: SID, content_bytes: sealSessionContent(new Uint8Array(32).fill(0x7e), CONTENT), content_encryption: SESSION_CONTENT_ENCRYPTION_V1,
     structure1_cbor: structure1, sender_signature: await COUNTERPARTY.sign(structure1),
+    content_hash_alg: CONTENT_HASH_ALGS.SHA256,
     ...fields,
   }) as Uint8Array).subarray();
 }
@@ -106,24 +107,20 @@ function agreedSalt(fx: TwoConnectionFixture): Uint8Array {
   return new Uint8Array(row.content_salt!);
 }
 
-describe("DOD-M15-SEALWIRE-1 part B1: an ABSENT name still works — every peer in existence today", () => {
+describe("DOD-M15-SEALWIRE-1 part B1: an ABSENT name is refused, a named one verifies", () => {
   let fx: TwoConnectionFixture | null = null;
   afterEach(async () => { if (fx) await fx.cleanup(); fx = null; });
 
-  it("★ a frame with no algorithm field verifies as sha256 and is ingested", async () => {
-    /**
-     * The compatibility assertion, and the one that would strand every live conversation if it
-     * broke. Nothing in the field is not a peer doing something wrong — it is every peer on every
-     * currently published build.
-     */
+  it("★ a frame with no algorithm field is refused by name, not verified as sha256", async () => {
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-alg-a-" });
     await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
 
-    const res = await fx.snm.ingestReceivedContent("alice", SID, CONTENT, wireContentHash(CONTENT), "corr", undefined, "sha256");
-    expect(res.ok, "an unnamed frame must still be accepted").toBe(true);
+    const res = await fx.snm.ingestReceivedContent("alice", SID, CONTENT, wireContentHash(CONTENT), "corr", undefined, undefined);
+    expect(res.ok).toBe(false);
+    expect(res.ok === false && res.reason).toBe("content_hash_alg_unknown");
   }, 60_000);
 
-  it("★ an explicit sha256 name verifies identically to an absent one", async () => {
+  it("★ an explicit sha256 name verifies", async () => {
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-alg-b-" });
     await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
 
@@ -422,8 +419,7 @@ describe("DOD-M15-SEALWIRE-1 part B2a: the PARK route carries the algorithm too"
     const contentHash = contentHashFor(body, { alg, salt });
     const sealed = await sealParkEnvelope({
       signer: sender, sessionIdHex: sessionId, recipientPubkey: recipientPub,
-      content: body, contentHash,
-      ...(alg === CONTENT_HASH_ALGS.SHA256 ? {} : { contentHashAlg: alg }),
+      content: body, contentHash, contentHashAlg: alg, leafKind: 0,
     });
     const plaintext = await recipient.openContentSeal!(sealed);
     return { agent, sessionId, plaintext: plaintext!, contentHash, recipientPub, sender };
@@ -443,8 +439,9 @@ describe("DOD-M15-SEALWIRE-1 part B2a: the PARK route carries the algorithm too"
     const recipientPub = await recipient.getPublicKey();
     const contentHash = wireContentHash(CONTENT);
     const parkSig = await sender.sign(buildParkContentTbs(sessionId, recipientPub, contentHash));
+    // The one envelope shape, built by hand so it can carry a name the producer refuses to write.
     const envelope = encodeCbor([
-      3, CONTENT, null, null, await sender.getPublicKey(), parkSig, alg,
+      4, CONTENT, null, null, await sender.getPublicKey(), parkSig, alg, null, 0,
     ]) as Uint8Array;
     const plaintext = await recipient.openContentSeal!(sealToRecipient(recipientPub, envelope));
     return {
@@ -566,15 +563,7 @@ describe("DOD-M15-SEALWIRE-1 part B2a: the PARK route carries the algorithm too"
     ).toBe(1);
   }, 60_000);
 
-  it("a v2 parked entry still verifies — REGRESSION GUARD, not coverage of this change", async () => {
-    /**
-     * Named honestly after review pass 2: this test is green under every mutant of this unit,
-     * because `contentHashFor` with `sha256` returns exactly what the old hardcoded expression did.
-     * It does NOT survive the revert test and is not evidence for the change.
-     *
-     * It earns its place anyway — it is the assertion that goes red if the algorithm work ever
-     * breaks the path every peer in existence uses today.
-     */
+  it("an unsalted parked entry verifies — REGRESSION GUARD for the sha256 path", async () => {
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-park-alg-c-" });
     await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
 
@@ -583,7 +572,7 @@ describe("DOD-M15-SEALWIRE-1 part B2a: the PARK route carries the algorithm too"
       .run(Buffer.from(await e.sender.getPublicKey()).toString("hex"), SID);
 
     const res = await fx.snm.recoverParkedEntry("alice", SID, e.recipientPub, e.plaintext, e.contentHash, "corr");
-    expect(res.ok, `a v2 entry must keep working: ${JSON.stringify(res)}`).toBe(true);
+    expect(res.ok, `an unsalted entry must verify: ${JSON.stringify(res)}`).toBe(true);
   }, 60_000);
 });
 
@@ -645,8 +634,8 @@ describe("DOD-M15-SEALWIRE-1 part B1: the receiver can verify a SALTED frame onc
     await wait(200);
     expect(agreedSalt(fx).length, "precondition: this side holds a salt").toBe(32);
 
-    // The peer has NOT upgraded: it sends an unsalted hash and names nothing. A daemon reading its
-    // own row would salt the comparison and refuse this.
+    // The peer sends an unsalted hash and NAMES sha256. A daemon reading its own row would salt the
+    // comparison and refuse this.
     await fx.snm.handleContentFrameForTest(
       "alice", SID, await contentFrame({ content_hash: wireContentHash(CONTENT) }), PEER,
     );
@@ -659,39 +648,28 @@ describe("DOD-M15-SEALWIRE-1 part B1: the receiver can verify a SALTED frame onc
     ).toBe(0);
   }, 60_000);
 
-  it("★ an explicit CBOR null in the field is LEGACY, and a number is refused as a non-string", async () => {
+  it("★ an explicit CBOR null is refused as ABSENT, and a number as a non-string", async () => {
     /**
-     * The seventh mutant, and it survived all twenty tests: change the frame read from a pass-through
-     * to `String(declaredAlg)`. The pure tests exercise `resolveContentHashAlg(null)` and
-     * `resolveContentHashAlg(42)` DIRECTLY, and every wired test put a string in the field — so
-     * nothing covered the boundary where an arbitrary CBOR value crosses into the resolver.
-     *
-     * Both halves of the mutant are wrong in ways that matter. `null` is legacy-equivalent and must
-     * be accepted; coerced it becomes `"null"` and the peer is refused. A number must be reported as
-     * `(number)` so the operator sees a SHAPE problem; coerced it becomes the plausible-looking
-     * `"42"`, which reads like a real algorithm name they should go and look up.
+     * The boundary where an arbitrary CBOR value crosses into the resolver. A `String(declaredAlg)`
+     * coercion would turn null into the name "null" and 42 into the plausible-looking "42"; the
+     * operator must see that the first named nothing and the second was not a string at all.
      */
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-alg-j-" });
     await fx.createSession(SID, "alice", await counterpartyHex(), PEER);
 
-    // Explicit null — a peer that encoded the field but left it empty. Legacy, so it must ingest.
     await fx.snm.handleContentFrameForTest(
       "alice", SID, await contentFrame({ content_hash: wireContentHash(CONTENT), content_hash_alg: null }), PEER,
     );
     await wait(300);
-    expect(
-      fx.eventsNamed("session.content.cross_check.failed").length,
-      "an explicit null must mean the same as an absent field, not the string \"null\"",
-    ).toBe(0);
+    const nullFailure = fx.eventsNamed("session.content.cross_check.failed").at(-1);
+    expect(nullFailure!.ctx!.reason).toBe("content_hash_alg_unknown");
+    expect(nullFailure!.ctx!.declaredAlg, "null is an absence, not the string \"null\"").toBe("(absent)");
 
-    // A number — not a name at all. Refused, and the log must say it was the wrong SHAPE.
-    //
-    // ⚠️ SECOND FRAME ON THIS SESSION, so it links to the FIRST. Left at the default it would be
-    // refused for a broken chain before the algorithm was ever looked at, and this test would pass
-    // on a refusal that has nothing to do with its subject.
+    // A number — not a name at all. Refused, and the log must say it was the wrong SHAPE. Still a
+    // FIRST message on the chain: the null frame above was refused, so nothing links to it.
     await fx.snm.handleContentFrameForTest(
       "alice", SID,
-      await contentFrame({ content_hash: wireContentHash(CONTENT), content_hash_alg: 42 }, wireContentHash(CONTENT)),
+      await contentFrame({ content_hash: wireContentHash(CONTENT), content_hash_alg: 42 }),
       PEER,
     );
     await wait(300);
