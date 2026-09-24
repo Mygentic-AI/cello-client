@@ -1,6 +1,6 @@
 {
   "name": "@cello-protocol/transport",
-  "version": "0.0.113-m9d.3",
+  "version": "0.0.113-m9d.4",
   "private": false,
   "type": "module",
   "engines": {
