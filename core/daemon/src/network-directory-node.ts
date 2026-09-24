@@ -473,7 +473,7 @@ async function dkgRound3WithNode(
     agentPubkey: agentPubkeyHex,
     epochId,
     sharesForMe: sharesForMe.map((s) => ({
-      identifier: s.signerIdentifier,
+      signerIdentifier: s.signerIdentifier,
       targetIdentifier: s.targetIdentifier,
       signingShare: s.signingShare,
     })),
@@ -552,10 +552,7 @@ function parseDkgRound2Response(bytes: Uint8Array): FrostDkgRound2Response | nul
     for (const item of rawShares) {
       if (typeof item !== "object" || item === null) return null;
       const s = item as Record<string, unknown>;
-      // Accept both "signerIdentifier" (protocol-types canonical) and "identifier" (new wire)
-      const signerIdentifier =
-        typeof s["signerIdentifier"] === "string" ? s["signerIdentifier"] :
-        typeof s["identifier"] === "string" ? s["identifier"] : null;
+      const signerIdentifier = typeof s["signerIdentifier"] === "string" ? s["signerIdentifier"] : null;
       const targetIdentifier = typeof s["targetIdentifier"] === "string" ? s["targetIdentifier"] : null;
       const signingShare = toU8(s["signingShare"]);
       if (!signerIdentifier || !targetIdentifier || !signingShare) return null;
