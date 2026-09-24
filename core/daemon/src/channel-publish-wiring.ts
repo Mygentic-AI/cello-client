@@ -24,6 +24,7 @@ import { ChannelLogStore } from "./channel-log-store.js";
 import { ChannelConfigStore, type ChannelConfig } from "./channel-config-store.js";
 import { ChannelRelayClient } from "./channel-relay-client.js";
 import { ChannelCollector } from "./channel-collector.js";
+import { createChannelFetchAuth } from "./channel-fetch-auth.js";
 import { ChannelSubscriptionStore } from "./channel-subscription-store.js";
 import { ChannelInboxStore } from "./channel-inbox-store.js";
 import { createChannelCollectTicker } from "./channel-collect-tick.js";
@@ -312,12 +313,12 @@ export function wireChannelPublishing(
     inbox,
     fetch: (addr, req) => relay.fetch(addr, req),
     /**
-     * ⚠️ **PUBLIC CHANNELS ONLY, UNTIL 019.** `undefined` means "send no auth", which is correct for
-     * a public channel and correct nowhere else: 019 owns the fetch key. A non-public channel is
-     * refused by the RELAY rather than silently fetched — the failure is visible and belongs to the
-     * side that can check it.
+     * ⚠️ **THE MEMBER PROVES MEMBERSHIP ON EVERY FETCH.** Signs with the fetch key derived from the
+     * member's newest held group key, which the relay verifies against the admin's deposited fetch
+     * pubkey; public → no auth, no key held → no auth + a warn. Extracted and unit-tested in
+     * `channel-fetch-auth.ts`; this half only supplies the group keys the membership half stores.
      */
-    fetchAuth: () => Promise.resolve(undefined),
+    fetchAuth: createChannelFetchAuth({ keysFor: (a, c) => subscriptions.keysFor(a, c), logger }),
     // The reader count is best-effort and never affects delivery, so declaring nothing costs only
     // the publisher's view of how many read a post. 019 records the membership this reads from.
     localAgentKeys: () => [],

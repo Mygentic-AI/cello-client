@@ -131,7 +131,7 @@ async function main(): Promise<void> {
         fetch: (relay, req) => relayClient.fetch(relay, req),
         // The same fixed group key the publisher used, so the derived fetch key matches what the
         // relays were told to require. A subscriber that could not sign would be turned away.
-        fetchAuth: async (_access, chHex, sinceSeq) => {
+        fetchAuth: async (_agentId, _access, chHex, sinceSeq) => {
           const channelPubkey = new Uint8Array(Buffer.from(chHex, "hex"));
           const fetchKey = await deriveFetchKey(ENFORCER_GROUP_KEY, channelPubkey);
           const timeMs = Date.now();

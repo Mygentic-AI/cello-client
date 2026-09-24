@@ -61,8 +61,11 @@ export interface ChannelCollectorOptions {
   subscriptions: ChannelSubscriptionStore;
   inbox: ChannelInboxStore;
   fetch: RelayFetchSeam;
-  /** The fetch-key signature for a non-public channel. 019 owns the key; `undefined` means public. */
-  fetchAuth: (access: ChannelAccess, channelHex: string, sinceSeq: number) => Promise<{ signature: Uint8Array; time_ms: number } | undefined>;
+  /**
+   * The fetch-key signature for a non-public channel. `agentId` is first so the member's held group
+   * keys can be looked up by identity; `undefined` means no auth (public, or no key held).
+   */
+  fetchAuth: (agentId: string, access: ChannelAccess, channelHex: string, sinceSeq: number) => Promise<{ signature: Uint8Array; time_ms: number } | undefined>;
   /** Local agent keys to declare for the reader count. Best-effort, and never affects delivery. */
   localAgentKeys: (channelHex: string) => Uint8Array[];
   /** Ask the PUBLISHER to re-deposit a range. It answers by re-depositing, never by sending posts. */
@@ -107,7 +110,7 @@ export class ChannelCollector {
     if (!sub || sub.status !== "active") return;
 
     const since = sub.delivered_through + 1;
-    const auth = await this.#opts.fetchAuth(sub.access, channelHex, since);
+    const auth = await this.#opts.fetchAuth(sub.agent_id, sub.access, channelHex, since);
     const agentKeys = this.#opts.localAgentKeys(channelHex).slice(0, MAX_AGENT_KEYS_PER_FETCH);
     const channelPubkey = new Uint8Array(Buffer.from(channelHex, "hex"));
 

@@ -324,7 +324,7 @@ describe("M16 018-PUBCOLLECT: collecting", () => {
         sawAuth = req.auth !== undefined;
         return Promise.resolve({ ok: true as const, posts: [], first_held_seq: null, last_seq: null });
       },
-      fetchAuth: (access) => Promise.resolve(access === "public" ? undefined : { signature: new Uint8Array(64), time_ms: 1 }),
+      fetchAuth: (_agentId, access) => Promise.resolve(access === "public" ? undefined : { signature: new Uint8Array(64), time_ms: 1 }),
       requestRepair: () => Promise.resolve(),
     });
 
@@ -338,6 +338,29 @@ describe("M16 018-PUBCOLLECT: collecting", () => {
     });
     await collector.collectOnce(AGENT, h.channelHex);
     expect(sawAuth, "a non-public channel is gated on the fetch key").toBe(true);
+  });
+
+  it("21. the collector passes the subscription's agent id to fetchAuth", async () => {
+    const h = await harness();
+    // Starts undefined and is asserted BY NAME below — a fetchAuth that ignored its first argument
+    // would leave this undefined and fail, which is the whole point: the member's keys are looked up
+    // by agent id, so the collector must hand the id through.
+    let seenAgentId: string | undefined;
+    const collector = new ChannelCollector({
+      db, logger: recorder().logger, subscriptions: h.subs, inbox: h.inbox,
+      now: () => 1_800_000_000_000, localAgentKeys: () => [],
+      fetch: () => Promise.resolve({ ok: true as const, posts: [], first_held_seq: null, last_seq: null }),
+      fetchAuth: (agentId) => { seenAgentId = agentId; return Promise.resolve(undefined); },
+      requestRepair: () => Promise.resolve(),
+    });
+
+    h.subs.upsert({
+      agent_id: "agent-X", channel_pubkey: h.channelHex,
+      admin_pubkey: Buffer.from(await h.adminKp.getPublicKey()).toString("hex"),
+      access: "open", relays: [RELAY_A, RELAY_B],
+    });
+    await collector.collectOnce("agent-X", h.channelHex);
+    expect(seenAgentId, "fetchAuth must be told which agent's keys to look up").toBe("agent-X");
   });
 
   it("20. processed_through NEVER moves, across everything above", async () => {
