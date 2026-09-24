@@ -44,6 +44,7 @@ import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { openTestDb } from "./helpers/encrypted-db.js";
+import { ensureSessionSchema } from "../session-schema.js";
 import { seedAgents } from "./helpers/seed-agents.js";
 import type { DaemonDatabase } from "../sqlcipher-db.js";
 import { Encoder } from "cbor-x";
@@ -365,51 +366,6 @@ describe("SESSION-001: SQLite schema extension", () => {
     await rm(tempDir, { recursive: true, force: true });
   });
 
-  it("adds message_count and interrupted_at columns to existing DB", async () => {
-    // First: create a DB with the old schema (no new columns)
-    const dbPath = join(tempDir, "old.db");
-    const db = openTestDb(dbPath);
-    db.exec(`
-      CREATE TABLE sessions (
-        session_id TEXT PRIMARY KEY,
-        agent_name TEXT NOT NULL,
-        counterparty_pubkey TEXT NOT NULL,
-        status TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
-      )
-    `);
-    db.close();
-
-    // Now initialize SessionNodeManager — it should run the idempotent ALTER TABLE
-    const { logger } = makeLogger();
-    const mgr = new SessionNodeManager({
-      securityGateway: new PassthroughGatewayClient(),
-      factory: new StubNodeFactory(),
-      logger,
-      dbPath,
-    });
-    await mgr.initialize();
-
-    // Verify the columns exist by inserting and reading back
-    const sessionId = "ee1122334455667788aabbcc001122334455667788aabbcc0011223344556677";
-    const db2 = mgr.getDb();
-    // DOD-AGENT-ID-JOINKEY-1: `sessions` is now keyed by agent_id — seed a real agent for "dave".
-    const daveId = (await seedAgents(db2, ["dave"])).get("dave")!;
-    insertSession(db2, {
-      sessionId,
-      agentId: daveId,
-      counterpartyPubkey: "ffee11",
-      status: "interrupted",
-      messageCount: 7,
-      interruptedAt: new Date().toISOString(),
-    });
-
-    const row = db2.prepare("SELECT * FROM sessions WHERE session_id = ?").get(sessionId) as SessionRecord;
-    expect(row.message_count).toBe(7);
-    expect(row.interrupted_at).toBeTruthy();
-  });
-
   it("idempotent: re-initializing does not throw on existing columns", async () => {
     const dbPath = join(tempDir, "idem.db");
     const { logger } = makeLogger();
@@ -523,33 +479,18 @@ describe("SESSION-001: daemon status interrupted_sessions field", () => {
     // Pre-populate the DB with interrupted sessions before starting the daemon
     const dbPath = join(tempDir, "sessions.db");
     const db = openTestDb(dbPath);
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS sessions (
-        session_id TEXT PRIMARY KEY,
-        agent_name TEXT NOT NULL,
-        counterparty_pubkey TEXT NOT NULL,
-        status TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL,
-        message_count INTEGER NOT NULL DEFAULT 0,
-        interrupted_at TEXT
-      )
-    `);
+    ensureSessionSchema(db, l.logger, () => {});
     const now = Date.now();
     const isoNow = new Date(now).toISOString();
     const sid1 = "aabb1122334455667788aabbcc001122334455667788aabbcc00112233445566";
     const sid2 = "bbcc1122334455667788aabbcc001122334455667788aabbcc00112233445567";
-    // DOD-AGENT-ID-JOINKEY-1: this hand-rolled OLD schema (agent_name, no agent_id) simulates a
-    // pre-migration database. `SessionNodeManager.initialize()` re-keys it to agent_id by JOINing
-    // against `agents` — production always has that row by the time a session exists, so seed real
-    // agents named "alice"/"bob" here too (on the SAME connection) before the daemon starts.
-    await seedAgents(db, ["alice", "bob"]);
+    const ids = await seedAgents(db, ["alice", "bob"]);
     db.prepare(
-      "INSERT INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-    ).run(sid1, "alice", "pubkey1", "interrupted", now, now, 3, isoNow);
+      "INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(sid1, ids.get("alice")!, "pubkey1", "interrupted", now, now, 3, isoNow);
     db.prepare(
-      "INSERT INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-    ).run(sid2, "bob", "pubkey2", "interrupted", now, now, 0, isoNow);
+      "INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(sid2, ids.get("bob")!, "pubkey2", "interrupted", now, now, 0, isoNow);
     db.close();
 
     const config: DaemonConfig = {
@@ -609,7 +550,7 @@ describe("SESSION-001: cello_close_session error codes", () => {
   async function makeAgentDir(agentName: string): Promise<void> {
     const agentDir = join(tempDir, "agents", agentName);
     await mkdir(agentDir, { recursive: true });
-    await provisionAgentIdentity(tempDir, name);
+    await provisionAgentIdentity(tempDir, agentName);
   }
 
   async function startTestDaemon(): Promise<Awaited<ReturnType<typeof startDaemon>>> {
@@ -753,7 +694,7 @@ describe("SESSION-001: AC-011 seal_in_progress guard", () => {
     // Create an agent directory so the daemon recognises it
     const agentDir = join(tempDir, "agents", "alice");
     await mkdir(agentDir, { recursive: true });
-    await provisionAgentIdentity(tempDir, name);
+    await provisionAgentIdentity(tempDir, "alice");
 
     // Fake signalingConnect: the stream's send() hangs forever (never resolves) so
     // handleSealInterruptedFlow is stuck awaiting sendRaw() — keeping the sessionId
@@ -862,7 +803,7 @@ describe("SESSION-001: SI-002 tampered leaf signature rejected", () => {
     // Create agent dir
     const agentDir = join(tempDir, "agents", "alice");
     await mkdir(agentDir, { recursive: true });
-    await provisionAgentIdentity(tempDir, name);
+    await provisionAgentIdentity(tempDir, "alice");
 
     // Generate a real Ed25519 keypair so the counterparty_pubkey is a real 32-byte pubkey.
     // The tampered leaf will use the correct signerPubkey but a zeroed signature —

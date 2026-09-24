@@ -26,63 +26,6 @@ function makeLogger(): Logger {
   return { debug() {}, info() {}, warn() {}, error() {} };
 }
 
-const colNames = (db: DatabaseSync): string[] =>
-  (db.prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>).map((c) => c.name);
-
-// ─── AC2: the additive, guarded migration ────────────────────────────────────
-
-describe("MONIKER-1 AC2 — moniker column migration", () => {
-  it("a fresh DB gets the column via CREATE (no ALTER needed)", () => {
-    const db = new DatabaseSync(":memory:");
-    ensureIdentitySchema(db);
-    expect(colNames(db)).toContain("moniker");
-  });
-
-  it("adds the column to a pre-moniker agents table, idempotently", () => {
-    const db = new DatabaseSync(":memory:");
-    // A pre-moniker table: stable-agent_id shape WITH the M8B column, WITHOUT moniker.
-    db.exec(`CREATE TABLE agents (
-      agent_id TEXT PRIMARY KEY, agent_name TEXT NOT NULL, k_local_seed BLOB NOT NULL,
-      k_local_pubkey TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'created',
-      frost_directory_node_ids TEXT,
-      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`);
-    db.exec(`INSERT INTO agents (agent_id, agent_name, k_local_seed, k_local_pubkey, created_at, updated_at)
-      VALUES ('id1', 'alice', x'00', 'aa', 1, 1)`);
-    expect(colNames(db)).not.toContain("moniker");
-
-    ensureIdentitySchema(db);
-
-    expect(colNames(db)).toContain("moniker");
-    // Existing rows → NULL, no data loss.
-    const row = db.prepare("SELECT agent_name, moniker FROM agents WHERE agent_id = 'id1'").get() as {
-      agent_name: string;
-      moniker: string | null;
-    };
-    expect(row.agent_name).toBe("alice");
-    expect(row.moniker).toBeNull();
-    // SQLite has no ADD COLUMN IF NOT EXISTS — a second run must not throw.
-    expect(() => ensureIdentitySchema(db)).not.toThrow();
-  });
-
-  it("a table missing BOTH quorum and moniker columns receives BOTH ALTERs", () => {
-    // Guards the independent-`if` structure: a chained `else if` would apply only the
-    // first missing-column ALTER and silently skip the second.
-    const db = new DatabaseSync(":memory:");
-    db.exec(`CREATE TABLE agents (
-      agent_id TEXT PRIMARY KEY, agent_name TEXT NOT NULL, k_local_seed BLOB NOT NULL,
-      k_local_pubkey TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'created',
-      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`);
-    expect(colNames(db)).not.toContain("frost_directory_node_ids");
-    expect(colNames(db)).not.toContain("moniker");
-
-    ensureIdentitySchema(db);
-
-    expect(colNames(db)).toContain("frost_directory_node_ids");
-    expect(colNames(db)).toContain("moniker");
-    expect(() => ensureIdentitySchema(db)).not.toThrow();
-  });
-});
-
 // ─── AC1 + AC3: store-level persistence, default, and the invalid-write backstop ──
 
 describe("MONIKER-1 — DbIdentityStore moniker accessors", () => {

@@ -24,41 +24,30 @@ import { startDaemon } from "../daemon.js";
 import type { DaemonConfig, Logger } from "../types.js";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import { seedAgents } from "./helpers/seed-agents.js";
+import { ensureSessionSchema } from "../session-schema.js";
 
 const LOCAL_SID = "11".repeat(32);
 const THEIRS_SID = "22".repeat(32);
-/** No `interrupted_by` at all — the shape of every row written before the column existed. */
+/** No `interrupted_by` recorded. */
 const UNKNOWN_SID = "33".repeat(32);
 
 const NOOP_LOGGER: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 
-/** The shape a shutdown leaves behind, plus one the counterparty ended. Old (pre-agent_id) schema
- *  on purpose — `initialize()` re-keys it, which is the upgrade path a real operator's DB takes. */
+/** The shape a shutdown leaves behind, plus one the counterparty ended and one with no cause. */
 async function seedOrphans(tempDir: string): Promise<void> {
   const db = openTestDb(join(tempDir, "sessions.db"));
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS sessions (
-      session_id TEXT PRIMARY KEY,
-      agent_name TEXT NOT NULL,
-      counterparty_pubkey TEXT NOT NULL,
-      status TEXT NOT NULL,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
-      message_count INTEGER NOT NULL DEFAULT 0,
-      interrupted_at TEXT,
-      interrupted_by TEXT
-    )
-  `);
-  await seedAgents(db, ["alice"]);
+  ensureSessionSchema(db, NOOP_LOGGER, () => {});
+  const agents = await seedAgents(db, ["alice"]);
+  const aliceId = agents.get("alice")!;
   const now = Date.now();
   const iso = new Date(now).toISOString();
   const ins = db.prepare(
-    `INSERT INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at, interrupted_by)
-     VALUES (?, 'alice', ?, 'interrupted', ?, ?, 6, ?, ?)`,
+    `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at, interrupted_by)
+     VALUES (?, ?, ?, 'interrupted', ?, ?, 6, ?, ?)`,
   );
-  ins.run(LOCAL_SID, "aa".repeat(32), now, now, iso, "local");
-  ins.run(THEIRS_SID, "bb".repeat(32), now, now, iso, "counterparty");
-  ins.run(UNKNOWN_SID, "cc".repeat(32), now, now, iso, null);
+  ins.run(LOCAL_SID, aliceId, "aa".repeat(32), now, now, iso, "local");
+  ins.run(THEIRS_SID, aliceId, "bb".repeat(32), now, now, iso, "counterparty");
+  ins.run(UNKNOWN_SID, aliceId, "cc".repeat(32), now, now, iso, null);
   db.close();
 }
 

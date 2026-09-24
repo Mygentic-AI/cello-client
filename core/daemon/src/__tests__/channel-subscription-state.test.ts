@@ -155,8 +155,8 @@ describe("M16 019 Part D — subscription state", () => {
      * live in different tables and nothing bridges them — this is what pins that.
      */
     db.exec(`CREATE TABLE IF NOT EXISTS contacts (
-      agent_name TEXT NOT NULL, pubkey TEXT NOT NULL, added_at INTEGER NOT NULL,
-      PRIMARY KEY (agent_name, pubkey))`);
+      agent_id TEXT NOT NULL, pubkey TEXT NOT NULL, added_at INTEGER NOT NULL,
+      PRIMARY KEY (agent_id, pubkey))`);
 
     subs.upsert({
       agent_id: AGENT, channel_pubkey: "ee".repeat(32), admin_pubkey: ADMIN,

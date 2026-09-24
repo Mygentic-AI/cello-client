@@ -25,6 +25,8 @@ import { randomBytes } from "node:crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
+import { ensureSessionSchema } from "../session-schema.js";
+import { RetryQueue } from "../retry-queue.js";
 import type { Logger, DaemonConfig, DaemonStatusResponse } from "../types.js";
 
 describe("daemon retry-queue and nonce-dedup integration", () => {
@@ -108,35 +110,8 @@ describe("daemon retry-queue and nonce-dedup integration", () => {
       const dbPath = join(tempDir, "sessions.db");
       const db = openTestDb(dbPath);
 
-      // Create the sessions table (SessionNodeManager creates this)
-      db.exec(`
-        CREATE TABLE IF NOT EXISTS sessions (
-          session_id TEXT PRIMARY KEY,
-          agent_name TEXT NOT NULL,
-          counterparty_pubkey TEXT NOT NULL,
-          status TEXT NOT NULL,
-          created_at INTEGER NOT NULL,
-          updated_at INTEGER NOT NULL
-        )
-      `);
-
-      // Create retry_queue table
-      db.exec(`
-        CREATE TABLE IF NOT EXISTS retry_queue (
-          id              INTEGER PRIMARY KEY AUTOINCREMENT,
-          session_id      TEXT    NOT NULL,
-          nonce_hex       TEXT    NOT NULL,
-          content_blob    BLOB    NOT NULL,
-          queued_at       INTEGER NOT NULL,
-          attempts        INTEGER NOT NULL DEFAULT 1,
-          position        INTEGER NOT NULL,
-          UNIQUE(session_id, nonce_hex)
-        )
-      `);
-      db.exec(`
-        CREATE INDEX IF NOT EXISTS retry_queue_by_session_position
-          ON retry_queue(session_id, position ASC)
-      `);
+      ensureSessionSchema(db, logger, () => {});
+      new RetryQueue(db, logger);
 
       // Insert 3 retry_queue entries for session-A
       for (let i = 0; i < 3; i++) {
@@ -272,22 +247,8 @@ describe("daemon retry-queue and nonce-dedup integration", () => {
       // Pre-populate DB with entries across 2 sessions
       const dbPath = join(tempDir, "sessions.db");
       const db = openTestDb(dbPath);
-      db.exec(`
-        CREATE TABLE IF NOT EXISTS sessions (
-          session_id TEXT PRIMARY KEY, agent_name TEXT NOT NULL,
-          counterparty_pubkey TEXT NOT NULL, status TEXT NOT NULL,
-          created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
-        )
-      `);
-      db.exec(`
-        CREATE TABLE IF NOT EXISTS retry_queue (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
-          nonce_hex TEXT NOT NULL, content_blob BLOB NOT NULL,
-          queued_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 1,
-          position INTEGER NOT NULL, UNIQUE(session_id, nonce_hex)
-        )
-      `);
-      db.exec("CREATE INDEX IF NOT EXISTS retry_queue_by_session_position ON retry_queue(session_id, position ASC)");
+      ensureSessionSchema(db, logger, () => {});
+      new RetryQueue(db, logger);
       db.exec(`
         CREATE TABLE IF NOT EXISTS session_seen_nonces (
           session_id TEXT NOT NULL, nonce_hex TEXT NOT NULL,
@@ -383,22 +344,8 @@ describe("daemon retry-queue and nonce-dedup integration", () => {
       // Pre-populate DB with 3 entries in specific FIFO order
       const dbPath = join(tempDir, "sessions.db");
       const db = openTestDb(dbPath);
-      db.exec(`
-        CREATE TABLE IF NOT EXISTS sessions (
-          session_id TEXT PRIMARY KEY, agent_name TEXT NOT NULL,
-          counterparty_pubkey TEXT NOT NULL, status TEXT NOT NULL,
-          created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
-        )
-      `);
-      db.exec(`
-        CREATE TABLE IF NOT EXISTS retry_queue (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
-          nonce_hex TEXT NOT NULL, content_blob BLOB NOT NULL,
-          queued_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 1,
-          position INTEGER NOT NULL, UNIQUE(session_id, nonce_hex)
-        )
-      `);
-      db.exec("CREATE INDEX IF NOT EXISTS retry_queue_by_session_position ON retry_queue(session_id, position ASC)");
+      ensureSessionSchema(db, logger, () => {});
+      new RetryQueue(db, logger);
       db.exec(`
         CREATE TABLE IF NOT EXISTS session_seen_nonces (
           session_id TEXT NOT NULL, nonce_hex TEXT NOT NULL,

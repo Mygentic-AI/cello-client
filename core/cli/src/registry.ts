@@ -243,8 +243,8 @@ function flagError(err: unknown): CliOutput {
   throw err;
 }
 
-/** Adapt a legacy CommandResult (single `output` string, always stdout) to the CliOutput triple. */
-function legacy(result: CommandResult): CliOutput {
+/** Adapt a CommandResult (single `output` string, always stdout) to the CliOutput triple. */
+function asCliOutput(result: CommandResult): CliOutput {
   // DOD-M15-CLIJSON-1: `guidance` is human help and goes to STDERR, so a command that advertises
   // JSON emits only JSON on stdout. Dropping it here instead would delete the onboarding hint.
   return { stdout: result.output, stderr: result.guidance ?? "", exitCode: result.exitCode };
@@ -342,7 +342,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
     summary: "Start the local CELLO daemon and bring your agents online.",
     help: "Usage: cello login  — start the daemon (or connect to an existing one).",
     async run(ctx) {
-      return legacy(await login(ctx.celloDir, ctx.daemonBin, ctx.logger));
+      return asCliOutput(await login(ctx.celloDir, ctx.daemonBin, ctx.logger));
     },
   },
   {
@@ -354,7 +354,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       // DOD-LOGOUT-WAIT-1: logout WAITS for the daemon to actually die before claiming
       // "Daemon stopped." — the immediate progress line tells the operator the command
       // activated and the short pause is expected.
-      return legacy(await logout(ctx.celloDir, ctx.onProgress));
+      return asCliOutput(await logout(ctx.celloDir, ctx.onProgress));
     },
   },
   {
@@ -495,7 +495,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
     summary: "Show whether the daemon is running and which agents are online.",
     help: "Usage: cello status  — query the daemon and print the structured status JSON.",
     async run(ctx) {
-      return legacy(await status(ctx.celloDir));
+      return asCliOutput(await status(ctx.celloDir));
     },
   },
   {
@@ -508,7 +508,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       `  Name rule: 1–64 characters, letters/digits/'-'/'_' only, no spaces (regex ${MONIKER_RE.source}).\n` +
       "  Next step: 'cello register-agent <name> <pre-auth-token>' to register it with the directory.",
     async run(ctx, args) {
-      return legacy(await createAgent(ctx.celloDir, args[0] ?? ""));
+      return asCliOutput(await createAgent(ctx.celloDir, args[0] ?? ""));
     },
   },
   {
@@ -528,7 +528,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       const agent = args[0] ?? "";
       const preAuthToken = args[1] ?? process.env.CELLO_PREAUTH_TOKEN ?? "";
       const phoneStub = args[2] ?? "";
-      return legacy(await register(ctx.celloDir, agent, preAuthToken, phoneStub));
+      return asCliOutput(await register(ctx.celloDir, agent, preAuthToken, phoneStub));
     },
   },
   {
@@ -537,7 +537,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
     summary: "Retire an agent permanently and free its name. Cannot be undone.",
     help: "Usage: cello remove-agent <name>  — retires a local agent (one-way) and frees its name.",
     async run(ctx, args) {
-      return legacy(await removeAgent(ctx.celloDir, args[0] ?? ""));
+      return asCliOutput(await removeAgent(ctx.celloDir, args[0] ?? ""));
     },
   },
 
@@ -631,7 +631,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "  Requires the directory to be reachable (the agent must be online and connected).\n" +
       "  Occasional hygiene, not something you need day to day.",
     async run(ctx, args) {
-      return legacy(await refreshShares(ctx.celloDir, args[0] ?? ""));
+      return asCliOutput(await refreshShares(ctx.celloDir, args[0] ?? ""));
     },
   },
 
@@ -744,7 +744,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       // null and stores as a CLEAR: the operator wipes the label off a session while trying to read
       // the usage. Clearing is what --clear is for, and it has to be asked for.
       if (!clear && words.length === 0) {
-        return legacy({
+        return asCliOutput({
           exitCode: 1,
           output: "Usage: cello name-session <session-id> <name...>  — or --clear to remove the name.",
         });
@@ -774,7 +774,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       const { agent, pretty, positional } = parityOpts(args);
       const [sessionId] = positional;
       if (!sessionId) {
-        return legacy({ exitCode: 1, output: "Usage: cello dismiss <session-id>" });
+        return asCliOutput({ exitCode: 1, output: "Usage: cello dismiss <session-id>" });
       }
       return dismissSession(ctx.celloDir, sessionId, { agent, pretty });
     },
@@ -985,7 +985,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       // Scoped to the selected agent, like the MCP tool. --all-agents opts into the daemon-wide
       // view, which cannot be agent-scoped and therefore takes the non-parity path.
       if (args.includes("--all-agents")) {
-        return legacy(await sessions(ctx.celloDir, { filter, limit }));
+        return asCliOutput(await sessions(ctx.celloDir, { filter, limit }));
       }
       const { agent, pretty } = parityOpts(args);
       return listSessions(ctx.celloDir, { filter, limit, agent, pretty });
@@ -1086,7 +1086,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "  delivery, one per message.\n" +
       "  It says NOTHING about the conversation being agreed or sealed. That is 'cello sealed-receipt'.",
     async run(ctx, args) {
-      return legacy(await relayReceipts(ctx.celloDir, args[0] ?? ""));
+      return asCliOutput(await relayReceipts(ctx.celloDir, args[0] ?? ""));
     },
   },
 
@@ -1200,7 +1200,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "  cello attestations issue b23c24dd\u2026 -- cut p99 by -30ms on the auth path",
     async run(ctx, args) {
       const [sub, ...rest] = args;
-      return legacy(await attestations(ctx.celloDir, sub ?? "", rest));
+      return asCliOutput(await attestations(ctx.celloDir, sub ?? "", rest));
     },
   },
 
@@ -1235,7 +1235,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "  cello trust-signals revoke b23c24dd",
     async run(ctx, args) {
       const [sub, ...rest] = args;
-      return legacy(await trustSignals(ctx.celloDir, sub ?? "", rest));
+      return asCliOutput(await trustSignals(ctx.celloDir, sub ?? "", rest));
     },
   },
 
@@ -1569,7 +1569,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
     jsonOut: true,
     async run(ctx, args) {
       const { agent } = parityOpts(args);
-      return legacy(await channelVerb(ctx.celloDir, "cello_channels", agent ? { agent } : {}));
+      return asCliOutput(await channelVerb(ctx.celloDir, "cello_channels", agent ? { agent } : {}));
     },
   },
   {
@@ -1651,7 +1651,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
         // through as `relays` so the daemon answers with the one canonical `channel_needs_no_token`,
         // rather than the CLI inventing a second message that could drift from it.
         const strays = [b, ...rest].filter((x) => x !== undefined);
-        return legacy(await channelVerb(ctx.celloDir, "cello_channel_create", withAgent({
+        return asCliOutput(await channelVerb(ctx.celloDir, "cello_channel_create", withAgent({
           name: channel, access: a,
           ...(guidanceFlag !== undefined ? { guidance: guidanceFlag } : {}),
           ...(strays.length > 0 ? { relays: strays } : {}),
@@ -1660,16 +1660,16 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       if (sub === "setup" && channel && a !== undefined && b !== undefined) {
         // Every positional after the access word is a relay, so two (the design) is the ordinary
         // call and more is possible without a second syntax.
-        return legacy(await channelVerb(ctx.celloDir, "cello_channel_config", withAgent({
+        return asCliOutput(await channelVerb(ctx.celloDir, "cello_channel_config", withAgent({
           channel, access: a, relays: [b, ...rest],
           ...(guidanceFlag !== undefined ? { guidance: guidanceFlag } : {}),
         })));
       }
       if (sub === "publish" && channel && a !== undefined && b !== undefined) {
-        return legacy(await channelVerb(ctx.celloDir, "cello_channel_publish", withAgent({ channel, title: a, body: b })));
+        return asCliOutput(await channelVerb(ctx.celloDir, "cello_channel_publish", withAgent({ channel, title: a, body: b })));
       }
       if (sub === "info-set" && channel) {
-        return legacy(await channelVerb(ctx.celloDir, "cello_channel_info_set", withAgent({ channel })));
+        return asCliOutput(await channelVerb(ctx.celloDir, "cello_channel_info_set", withAgent({ channel })));
       }
       if (sub === "prune" && channel && a !== undefined) {
         // Parsed here so a non-numeric argument is a usage error in the terminal rather than a
@@ -1678,18 +1678,18 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
         if (!Number.isSafeInteger(through) || through < 1) {
           return { stdout: "through_seq must be a whole number of 1 or more", stderr: "", exitCode: 1 };
         }
-        return legacy(await channelVerb(ctx.celloDir, "cello_channel_prune", withAgent({ channel, through_seq: through })));
+        return asCliOutput(await channelVerb(ctx.celloDir, "cello_channel_prune", withAgent({ channel, through_seq: through })));
       }
       if (sub === "resend" && channel) {
         // A relay is OPTIONAL: with none, the daemon refills every relay the channel publishes to.
         // Requiring a multiaddr here made the only repair command unrunnable in practice.
-        return legacy(await channelVerb(
+        return asCliOutput(await channelVerb(
           ctx.celloDir, "cello_channel_resend", withAgent(a !== undefined ? { channel, relay: a } : { channel }),
         ));
       }
       // ─── M16 022: the three verbs that make the other eleven mean anything ───
       if (sub === "info" && channel) {
-        return legacy(await channelVerb(ctx.celloDir, "cello_channel_info", withAgent({ channel })));
+        return asCliOutput(await channelVerb(ctx.celloDir, "cello_channel_info", withAgent({ channel })));
       }
       if (sub === "join" && channel) {
         // A NOTE is optional and a relay is not a thing you pass: relays are the publisher's choice
@@ -1700,7 +1700,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
         if (a !== undefined && a.startsWith("--")) {
           return { stdout: helpForSpec("channel"), stderr: "", exitCode: 1 };
         }
-        return legacy(await channelVerb(
+        return asCliOutput(await channelVerb(
           ctx.celloDir, "cello_channel_join", withAgent(a !== undefined ? { channel, note: a } : { channel }),
         ));
       }
@@ -1711,25 +1711,25 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
         if (a !== undefined && a !== "--all") {
           return { stdout: helpForSpec("channel"), stderr: "", exitCode: 1 };
         }
-        return legacy(await channelVerb(
+        return asCliOutput(await channelVerb(
           ctx.celloDir, "cello_channel_read", withAgent(a === "--all" ? { channel, all: true } : { channel }),
         ));
       }
       // ─── M16 019: the SUBSCRIBER's side, and the admin's membership decisions ───
       if (sub === "name" && channel && a !== undefined) {
-        return legacy(await channelVerb(ctx.celloDir, "cello_channel_set_moniker", withAgent({ channel, moniker: a })));
+        return asCliOutput(await channelVerb(ctx.celloDir, "cello_channel_set_moniker", withAgent({ channel, moniker: a })));
       }
       if (sub === "leave" && channel) {
-        return legacy(await channelVerb(ctx.celloDir, "cello_channel_leave", withAgent({ channel })));
+        return asCliOutput(await channelVerb(ctx.celloDir, "cello_channel_leave", withAgent({ channel })));
       }
       if (sub === "eject" && channel && a !== undefined) {
-        return legacy(await channelVerb(ctx.celloDir, "cello_channel_eject", withAgent({ channel, subscriber: a })));
+        return asCliOutput(await channelVerb(ctx.celloDir, "cello_channel_eject", withAgent({ channel, subscriber: a })));
       }
       if (sub === "approve" && channel && a !== undefined) {
-        return legacy(await channelVerb(ctx.celloDir, "cello_channel_approve", withAgent({ channel, subscriber: a })));
+        return asCliOutput(await channelVerb(ctx.celloDir, "cello_channel_approve", withAgent({ channel, subscriber: a })));
       }
       if (sub === "refuse" && channel && a !== undefined) {
-        return legacy(await channelVerb(ctx.celloDir, "cello_channel_refuse", withAgent({ channel, subscriber: a })));
+        return asCliOutput(await channelVerb(ctx.celloDir, "cello_channel_refuse", withAgent({ channel, subscriber: a })));
       }
       return { stdout: helpForSpec("channel"), stderr: "", exitCode: 1 };
     },
@@ -1746,7 +1746,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
     async run(ctx, args) {
       const [sub, botToken, chatId] = args;
       if (sub === "set-token" && botToken && chatId) {
-        return legacy(await telegramSetToken(ctx.celloDir, botToken, chatId));
+        return asCliOutput(await telegramSetToken(ctx.celloDir, botToken, chatId));
       }
       return { stdout: "Usage: cello telegram set-token <bot_token> <allowlisted_chat_id>", stderr: "", exitCode: 1 };
     },
@@ -1836,7 +1836,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
         };
       }
       const { installHermes } = await import("./hermes/install-hermes.js");
-      return legacy(await installHermes(opts));
+      return asCliOutput(await installHermes(opts));
     },
   },
 ];

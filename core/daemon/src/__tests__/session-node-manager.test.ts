@@ -56,6 +56,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { openTestDb } from "./helpers/encrypted-db.js";
+import { ensureSessionSchema } from "../session-schema.js";
 import { seedAgents } from "./helpers/seed-agents.js";
 import { agreeSessionGenesis } from "./helpers/session-genesis.js";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
@@ -1327,27 +1328,14 @@ describe("SessionNodeManager — integration tests", () => {
 
     // Simulate SIGKILL: write 'active' rows directly to the DB
     const db = openTestDb(dbPath);
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS sessions (
-        session_id TEXT PRIMARY KEY,
-        agent_name TEXT NOT NULL,
-        counterparty_pubkey TEXT NOT NULL,
-        status TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
-      )
-    `);
+    ensureSessionSchema(db, makeLogger().logger, () => {});
+    const ids = await seedAgents(db, ["alice", "bob"]);
     const now = Date.now();
-    db.prepare("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?)").run(
-      "orphan-1", "alice", "pk-alice", "active", now, now,
+    const ins = db.prepare(
+      "INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
     );
-    db.prepare("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?)").run(
-      "orphan-2", "bob", "pk-bob", "active", now, now,
-    );
-    // DOD-AGENT-ID-JOINKEY-1: initialize() re-keys this table from agent_name to agent_id, backfilling
-    // by resolving each row's name against `agents` — production always has these rows already
-    // (REMOVE-001 created them long before this migration exists), so seed them here too.
-    await seedAgents(db, ["alice", "bob"]);
+    ins.run("orphan-1", ids.get("alice")!, "pk-alice", "active", now, now);
+    ins.run("orphan-2", ids.get("bob")!, "pk-bob", "active", now, now);
     db.close();
 
     // Fresh daemon restart — should detect and fix orphans

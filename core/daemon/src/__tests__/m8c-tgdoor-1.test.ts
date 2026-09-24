@@ -109,7 +109,7 @@ describe("M8C-TGDOOR-1: Telegram doorbell", () => {
   async function makeAgentDir(name: string): Promise<void> {
     const dir = join(tempDir, "agents", name);
     await mkdir(dir, { recursive: true });
-    await provisionAgentIdentity(tempDir, "bob");
+    await provisionAgentIdentity(tempDir, name);
   }
 
   async function start(withBot: boolean, signalingConnect?: () => Promise<ConnectResult>): Promise<Awaited<ReturnType<typeof startDaemon>>> {
