@@ -33,7 +33,7 @@ export interface SealFrontierLeaf {
 
 export type ReDeriveResult =
   | { ok: true; frontiers: Map<string, number> }
-  | { ok: false; reason: "leaf_signature_invalid" | "leaf_malformed" | "leaf_session_mismatch" };
+  | { ok: false; reason: "leaf_signature_invalid" | "leaf_malformed" | "leaf_session_mismatch" | "frontier_leaves_missing" };
 
 function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false;
@@ -117,14 +117,12 @@ export interface UnilateralFrontierCheck {
    *  - verified:           leaves present, no CLIENT-VERIFIABLE ('live') frontier exceeded its leaves.
    *  - corrected:          leaves present, one or more 'live' frontiers were inflated and overridden
    *                        DOWN to the re-derived value (see `corrections`).
-   *  - directory_attested: no frontier_leaves shipped (a directory defect — every directory ships
-   *                        them to the present party) — the cert stays directory-attested.
-   *  - leaves_invalid:     frontier_leaves are forged / cross-session (reDeriveFrontiers failed) — a
-   *                        tamper signal; persist the directory-attested frontiers, log loudly. NEVER
+   *  - leaves_invalid:     frontier_leaves are missing, forged or cross-session — a defect or tamper
+   *                        signal; 'live' frontiers are corrected to 0, logged loudly. NEVER
    *                        rejected: the unilateral dedup guard makes rejection an unrecoverable
    *                        dead-end.
    */
-  status: "verified" | "corrected" | "directory_attested" | "leaves_invalid";
+  status: "verified" | "corrected" | "leaves_invalid";
   /** lowercased pubkey → corrected content_frontier_seq, for inflated 'live' parties. The caller
    *  lowers the persisted frontier to this before recording the receipt. Empty unless status is 'corrected'. */
   corrections: Map<string, number>;
@@ -159,11 +157,12 @@ export function checkUnilateralFrontier(
 ): UnilateralFrontierCheck {
   const corrections = new Map<string, number>();
   const haveLeaves = Array.isArray(frontierLeaves) && frontierLeaves.length > 0;
-  // A directory that ships no leaves leaves the cert directory-attested. Never reject — rejecting
-  // would break unilateral seals against a not-yet-upgraded directory during rollout.
-  if (!haveLeaves) return { status: "directory_attested", corrections };
-
-  const rederived = reDeriveFrontiers(frontierLeaves as SealFrontierLeaf[], sessionId);
+  // Every directory ships the leaves, so their absence is a defect or a strip — treated exactly like
+  // forged leaves: zero trustworthy evidence. Shipping nothing must not be an easier inflation
+  // bypass than shipping something unverifiable.
+  const rederived: ReturnType<typeof reDeriveFrontiers> = haveLeaves
+    ? reDeriveFrontiers(frontierLeaves as SealFrontierLeaf[], sessionId)
+    : { ok: false, reason: "frontier_leaves_missing" };
   // Forged / cross-session leaves are the STRONGEST tamper evidence, so they get the strongest
   // correction: treat them as ZERO trustworthy evidence (an empty derived map), which drives any
   // 'live' frontier > 0 down to 0. Do NOT leave the published value untouched on invalid leaves —

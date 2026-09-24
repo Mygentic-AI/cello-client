@@ -743,25 +743,15 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
               parties: guardParticipants.filter((p) => p.attestation_mode === "live").length,
               path: "unilateral",
             });
-          } else if (check.status === "leaves_invalid") {
-            // Forged / cross-session leaves — a tamper signal. The 'live' frontier(s) have been
-            // corrected to 0 above (zero trustworthy evidence); persist that (never reject → never
-            // dead-end). Surfaced loudly for audit.
+          } else {
+            // Missing, forged or cross-session leaves — a defect or tamper signal. The 'live'
+            // frontier(s) have been corrected to 0 above (zero trustworthy evidence); persist that
+            // (never reject → never dead-end). Surfaced loudly for audit.
             logger.error("seal.certificate.frontier.leaves_invalid", {
               sessionId: sidHex,
               reason: check.reason,
               corrections: [...check.corrections.entries()].map(([party, seq]) => ({ party, correctedTo: seq })),
               path: "unilateral",
-            });
-          } else {
-            // directory_attested: the confirm frame carried no frontier_leaves — a directory defect.
-            // Frontiers stay DIRECTORY-attested (already marked per-participant) — visible/auditable,
-            // never silently presented as client-verified.
-            logger.error("seal.certificate.frontier.directory_attested", {
-              sessionId: sidHex,
-              reason: "no_frontier_leaves",
-              path: "unilateral",
-              impact: "the present party's frontier could not be re-derived; it is recorded as the directory's word",
             });
           }
         }
@@ -866,8 +856,8 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
       // sent:false → NO receipt (never a receipt for content B could not verify). B may hold no local
       // `sessions` row (recordSealCertificateEnsuringRow inserts a stub, counterparty = A's pubkey).
       // The notification carries no frontier_leaves (FINDING-5 ships those only on the present party's
-      // confirm frame), so B's legibility is directory-attested — consistent with FINDING-5's
-      // directory_attested path; B trusts its own KERNEL-verified content, not a re-derivation.
+      // confirm frame), so B's legibility is directory-attested; B trusts its own KERNEL-verified
+      // content, not a re-derivation.
       if (result.sent) {
         try {
           // ONE-WAY RATCHET (cascade-2 FINDING-6 review): a re-delivered seal_unilateral_notification

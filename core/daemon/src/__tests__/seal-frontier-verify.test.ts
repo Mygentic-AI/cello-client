@@ -213,7 +213,7 @@ describe("FINDING-5: checkUnilateralFrontier (attestation-aware, override-not-re
     expect(check.corrections.has(bHex)).toBe(false);
   });
 
-  it("NO frontier_leaves → directory_attested (FINDING-3 back-compat, never rejected, no corrections)", async () => {
+  it("NO frontier_leaves → leaves_invalid, live frontier corrected to 0 (every directory ships them; absence is a defect, never trusted)", async () => {
     const { aHex, bHex } = await liveAbsent();
     const check = checkUnilateralFrontier(
       [
@@ -223,8 +223,11 @@ describe("FINDING-5: checkUnilateralFrontier (attestation-aware, override-not-re
       undefined,
       SID,
     );
-    expect(check.status).toBe("directory_attested");
-    expect(check.corrections.size).toBe(0);
+    expect(check.status).toBe("leaves_invalid");
+    expect(check.reason).toBe("frontier_leaves_missing");
+    // Shipping nothing must not be an easier inflation bypass than shipping forged leaves.
+    expect(check.corrections.get(aHex)).toBe(0);
+    expect(check.corrections.has(bHex)).toBe(false);
   });
 
   it("forged leaves + an INFLATED live value → leaves_invalid AND corrected to 0 (strongest tamper → strongest correction)", async () => {
