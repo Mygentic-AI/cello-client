@@ -219,6 +219,55 @@ export class NotificationDispatcher {
     }
   }
 
+  /**
+   * M16 032-NOTICES — the three CHANNEL doorbells, each routed exactly like `dispatchCelloMessage`:
+   * to the connections where this agent is current, and to no other agent's connections.
+   *
+   * INV-CONTENTFREE holds, the same rule `dispatchCelloMessage` states. What travels is the channel
+   * KEY, a COUNT, and OUTCOME WORDS drawn from a fixed vocabulary — never a post title or body, never
+   * a join note. Those are counterparty content and reach the agent only through `cello_channel_read`
+   * (a subscriber's posts) or the operator's own decision (a join request's note), which is screened.
+   * A count of stored posts and the words `admitted`/`pending`/`refused` say that SOMETHING happened,
+   * not WHAT was said.
+   */
+
+  /** A collect pass advanced this agent's delivered position: `count` new posts, now `through`. */
+  dispatchChannelPosts(agentName: string, channelHex: string, count: number, through: number): void {
+    this.#dispatchToCurrent(agentName, "channel_posts", {
+      agent: agentName, type: "channel_posts", channel: channelHex, count, through,
+    });
+  }
+
+  /** This agent's own join request was answered: `admitted` | `pending` | `refused` (+ reason). */
+  dispatchChannelJoinAnswer(
+    agentName: string,
+    channelHex: string,
+    outcome: "admitted" | "pending" | "refused",
+    reason?: string,
+  ): void {
+    this.#dispatchToCurrent(agentName, "channel_join_answer", {
+      agent: agentName, type: "channel_join_answer", channel: channelHex, outcome,
+      ...(reason !== undefined ? { reason } : {}),
+    });
+  }
+
+  /** A new pending request landed on an invite-only channel this agent administers. */
+  dispatchChannelJoinRequest(agentName: string, channelHex: string, subscriberHex: string): void {
+    this.#dispatchToCurrent(agentName, "channel_join_request", {
+      agent: agentName, type: "channel_join_request", channel: channelHex, subscriber: subscriberHex,
+    });
+  }
+
+  /** Route a frame to every connection where `agentName` is current — the cello_message rule. */
+  #dispatchToCurrent(agentName: string, notificationType: string, data: Record<string, unknown>): void {
+    const notification: IpcNotification = { notification: notificationType, data };
+    for (const connectionId of this.#getConnectionIds()) {
+      if (this.#currentAgentMap.get(connectionId) === agentName) {
+        this.#safeSend(connectionId, notification, notificationType);
+      }
+    }
+  }
+
   #safeSend(connectionId: string, notification: IpcNotification, notificationType: string): void {
     try {
       const success = this.#sendNotification(connectionId, notification);

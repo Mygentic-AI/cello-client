@@ -723,4 +723,54 @@ describe("MCP-002: notification routing", () => {
     expect(dispatchFailed[0].level).toBe("debug");
     expect(dispatchFailed[0].context.error).toBe("sendNotification returned false");
   });
+
+  // ─── M16 032-NOTICES test 4 — the three channel doorbells are content-free and route to the
+  // current agent only ───────────────────────────────────────────────────────────────────────
+  it("4. channel doorbells reach ONLY the current-agent connection, and carry exactly the content-free fields", () => {
+    const silentUnit: Logger = { debug() {}, info() {}, warn() {}, error() {} };
+    const captured: Array<{ connectionId: string; notification: IpcNotification }> = [];
+    const dispatcher = new NotificationDispatcher({
+      logger: silentUnit,
+      sendNotification: (connectionId, notification) => { captured.push({ connectionId, notification }); return true; },
+      getConnectionIds: () => ["conn-current", "conn-other"],
+    });
+    // Two connections; alice is current on one, bob on the other. Same routing as cello_message.
+    dispatcher.registerConnection("conn-current");
+    dispatcher.registerConnection("conn-other");
+    dispatcher.setCurrentAgent("conn-current", "alice");
+    dispatcher.setCurrentAgent("conn-other", "bob");
+
+    const CH = "ab".repeat(32); // a 64-hex channel key
+    const SUB = "cd".repeat(32);
+    dispatcher.dispatchChannelPosts("alice", CH, 3, 3);
+    dispatcher.dispatchChannelJoinAnswer("alice", CH, "refused", "ejected");
+    dispatcher.dispatchChannelJoinAnswer("alice", CH, "admitted");
+    dispatcher.dispatchChannelJoinRequest("alice", CH, SUB);
+
+    // Only alice's connection was rung, once per dispatch — bob's never.
+    expect(captured.map((c) => c.connectionId)).toEqual(
+      ["conn-current", "conn-current", "conn-current", "conn-current"],
+    );
+
+    expect(captured[0].notification.notification).toBe("channel_posts");
+    // "Exactly the listed fields": channel key + counts, and NOTHING that could be a post title/body.
+    expect(captured[0].notification.data).toEqual(
+      { agent: "alice", type: "channel_posts", channel: CH, count: 3, through: 3 },
+    );
+
+    expect(captured[1].notification.notification).toBe("channel_join_answer");
+    expect(captured[1].notification.data).toEqual(
+      { agent: "alice", type: "channel_join_answer", channel: CH, outcome: "refused", reason: "ejected" },
+    );
+
+    // An admission carries no reason — reason rides only on a refusal.
+    expect(captured[2].notification.data).toEqual(
+      { agent: "alice", type: "channel_join_answer", channel: CH, outcome: "admitted" },
+    );
+
+    expect(captured[3].notification.notification).toBe("channel_join_request");
+    expect(captured[3].notification.data).toEqual(
+      { agent: "alice", type: "channel_join_request", channel: CH, subscriber: SUB },
+    );
+  });
 });
