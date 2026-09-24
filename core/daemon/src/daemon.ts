@@ -53,6 +53,7 @@ import { registerTestHandlers } from "./test-handlers.js";
 import { registerAgentAdminHandlers } from "./agent-admin-handlers.js";
 // M16 018-PUBCOLLECT — the channel publishing half.
 import { wireChannelPublishing } from "./channel-publish-wiring.js";
+import { createIsAgentOnlineById } from "./agent-online.js";
 import { ChannelSubscriptionStore } from "./channel-subscription-store.js";
 import { wireChannelMembership } from "./channel-membership-wiring.js";
 import { createChannelFrameSender } from "./channel-frame-send.js";
@@ -709,7 +710,13 @@ async function startDaemonHoldingLock(
     loadedAgents, keyProviders,
     resolveCurrentAgent: (connectionId, explicitAgent) =>
       resolveCurrentAgent(perConnectionState.get(connectionId), explicitAgent),
-    isAgentOnline: (agentId) => onlineAgents.has(agentId) && !explicitlyOfflineAgents.has(agentId),
+    // 029-COLLECTID: the collector passes a subscription's STABLE agent_id; the online sets are
+    // keyed by NAME. Map id → name first, or every subscriber reads as offline and no post is
+    // fetched. Unknown id → offline.
+    isAgentOnline: createIsAgentOnlineById({
+      onlineAgents, explicitlyOfflineAgents,
+      agentNameForId: (id) => sessionNodeManager.agentNameForId(id),
+    }),
     // From the membership half, which owns the group key. This is what carries a re-key to the
     // relays on the next post, and so what makes an ejection lock a member out AT the relay.
     currentFetchKey: channelMembership.currentFetchKey,

@@ -18,6 +18,7 @@ import {
   createChannelCollectTicker, jitterForChannel,
   COLLECT_TICK_INTERVAL_MS, COLLECT_JITTER_MS, COLLECT_MAX_BACKOFF_MS, COLLECT_RETRY_SPREAD_MS,
 } from "../channel-collect-tick.js";
+import { createIsAgentOnlineById } from "../agent-online.js";
 
 const silent: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 const AGENT = "agent-1";
@@ -162,6 +163,27 @@ describe("M16 021 — the doorbell, and the timer as a backstop", () => {
     // across subscribers but cannot stagger the WAVE of daemons returning after a relay outage,
     // because every failing channel lands on the same ceiling.
     expect(COLLECT_RETRY_SPREAD_MS).toBeGreaterThan(0);
+  });
+
+  it("11c. a wake through the PRODUCTION isAgentOnline (id → name → online set) collects", async () => {
+    /**
+     * ⚠️ 029-COLLECTID. The subscription is keyed by the STABLE agent_id (AGENT); the online sets are
+     * keyed by NAME. The id and the name are deliberately DIFFERENT here — the collector passes the
+     * id, the set holds the name, and only the id→name map makes the two meet. A stubbed
+     * `() => true` hid the defect for four orders; this wires the real `createIsAgentOnlineById` so a
+     * wake for an online subscriber actually reaches `collectOnce`.
+     */
+    const ONLINE_NAME = "alice";
+    const isAgentOnline = createIsAgentOnlineById({
+      onlineAgents: new Set([ONLINE_NAME]),
+      explicitlyOfflineAgents: new Set<string>(),
+      agentNameForId: (id) => (id === AGENT ? ONLINE_NAME : null),
+    });
+    const { t, collected } = ticker({ isAgentOnline });
+    await t.collectNow(AGENT);
+    expect(collected.sort(), "the id resolved to an online name, so both channels collected").toEqual(
+      [CHANNEL, CHANNEL_B].sort(),
+    );
   });
 
   it("15b. a collect failure on one channel does not stop the others", async () => {

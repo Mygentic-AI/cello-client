@@ -289,7 +289,13 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // the fetch-key path) and from the exchange's own `acceptInto`. Unwired it is silent in this
     // corpus's own way: publish would fall back to the placeholder that rejects every private post,
     // which is exactly the defect this order removes.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(115);
+    //
+    // 115 → 116 for M16 029-COLLECTID's `createIsAgentOnlineById` (agent-online.ts). Unwired it is
+    // silent in this corpus's own way: the collector would keep asking the online sets with an
+    // agent_id they are not keyed by, every subscriber would read as offline, and no wake or backstop
+    // would fetch a post — every suite green, delivered_through stuck at 0. It is wired into daemon.ts
+    // as the collector's isAgentOnline, so it lands in `checked`, not EXEMPT.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(116);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",

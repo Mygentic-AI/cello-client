@@ -201,7 +201,8 @@ export function createChannelCollectTicker(deps: ChannelCollectTickDeps): Channe
    */
   async function collectNow(agentId: string): Promise<void> {
     if (!isAgentOnline(agentId)) {
-      logger.debug("channel.collect.wake_ignored", { reason: "agent_offline" });
+      // 029-COLLECTID: name the agent that was skipped, so the next reader sees WHICH one.
+      logger.debug("channel.collect.wake_ignored", { reason: "agent_offline", agentId });
       return;
     }
     for (const sub of subscriptions.active()) {
