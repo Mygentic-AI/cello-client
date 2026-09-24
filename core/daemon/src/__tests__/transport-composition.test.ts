@@ -195,7 +195,7 @@ describe("AC-010: composition root wires transport adapters by CELLO_ENV", () =>
     await client.send("cello_use_agent", { name: "alice" });
 
     const result = (await client.send("cello_initiate_session", {
-      counterparty_pubkey: "bb".repeat(32),
+      target_pubkey: "bb".repeat(32),
     })) as { ok: boolean; sessionId?: string };
     expect(result.ok).toBe(true);
 
