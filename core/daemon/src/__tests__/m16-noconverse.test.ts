@@ -53,8 +53,11 @@ describe("M16 006-NOCONVERSE: a channel cannot initiate a session", () => {
   it("initiating as a channel is refused at the IPC entry", async () => {
     const { negotiator, calls } = recordingNegotiator();
     fx = await startTwoConnectionFixture({ agents: ["chan", "alice"], channelAgents: ["chan"], sessionNegotiator: negotiator });
-    const client = await fx.connectAs("chan");
-    const result = (await client.send("cello_initiate_session", { target_pubkey: "ab".repeat(32) })) as {
+    // M16 033-CHANNELVIEW: a channel can no longer be SELECTED via cello_use_agent (it is refused
+    // channel_not_an_agent), so this gate is reached by naming the channel explicitly — the
+    // defense-in-depth backstop in the opener still refuses it BEFORE any directory traffic.
+    const client = await fx.connect();
+    const result = (await client.send("cello_initiate_session", { agent: "chan", target_pubkey: "ab".repeat(32) })) as {
       ok: boolean; reason?: string; guidance?: string;
     };
     expect(result.ok).toBe(false);
