@@ -116,6 +116,15 @@ const SENDRAW_SELECTORS = [
  *
  * The ratchet's function is intact: it stops a file REGROWING through feature creep, and these are
  * the measured cost of one named unit. They only ever shrink from here.
+ *
+ * ⚠️ **ONE MOVED ON 2026-09-24 FOR `025-JOINSCREEN`.** `session-content-ingest.ts` 2283 → 2304.
+ * This file shipped the defect: it screened every inbound message before offering it to the join
+ * hook, so a CBOR join frame was judged as prose by the injection model — an admin's refusal scored
+ * 99 and blocked, a join request 86–89, and joining could not work at all. The fix adds a join-frame
+ * screen-skip fork beside the existing document one (nine lines of code) and the comment that states
+ * the trade — what is skipped, why, and that size is bounded at classify. That prose is the finding;
+ * deleting it to stay under the number is how the next author rescreens join frames as prose. The
+ * fork belongs here — it is the single inbound funnel — so a split is not what this unit is for.
  */
 const ERROR_FORMAT_SELECTORS = [
   {
@@ -555,7 +564,9 @@ export default [
      * and lower it whenever the file gets smaller.
      */
     files: ["core/daemon/src/session-content-ingest.ts"],
-    rules: { "max-lines": ["error", { max: 2283, skipBlankLines: false, skipComments: false }] },
+    // 2283 → 2304 on 2026-09-24 for 025-JOINSCREEN (the join-frame screen-skip); see the recorded
+    // reason in the ratchet-policy comment above. Only ever shrinks from here.
+    rules: { "max-lines": ["error", { max: 2304, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/session-lifecycle.ts"],

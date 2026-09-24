@@ -646,19 +646,15 @@ export class SessionContentIngest {
     // signed envelope destroys it), and language/injection judge a UTF-8 decode of binary. Size stays
     // bounded twice (MAX_DOCUMENT_FRAME_BYTES at classify, the gate's own cap).
     //
-    // DOD-M16-JOIN-1: a channel JOIN frame skips the screen for the SAME reason and takes the SAME
-    // trade. A join frame is CBOR, so the injection model reads a UTF-8 decode of those bytes as
-    // prose — measured on the first live channel test, the admin's `channel_is_public` refusal
-    // scored 99 and was blocked, and a join request 86–89, so joining could not work at all. The
-    // frame reaches no agent's context on this path (it is consumed by the join branch below into a
-    // `msg` leaf, with no transcript row and no doorbell — the note is dropped, guidance and relays
-    // are stored, never listed), so screening it as text protects nothing and blocks everything.
-    // WHAT IS SKIPPED: only frames `channelJoinFrameType` recognises by a FULL strict decode — a
-    // frame whose slot 0 is a join type but whose body fails to decode is NOT skipped; it is
-    // screened and lands in a transcript, the safe direction. Size stays bounded at classify:
-    // `channelJoinFrameType` rejects anything over MAX_JOIN_FRAME_BYTES before it decodes. Unlike
-    // the document skip, this is fail-CLOSED in neither direction to worry about — a non-join frame
-    // is simply screened as today.
+    // DOD-M16-JOIN-1: a channel JOIN frame skips the screen for the SAME reason. It is CBOR, so the
+    // injection model reads a UTF-8 decode of those bytes as prose — measured on the first live
+    // channel test, an admin's refusal scored 99 and blocked, a join request 86–89, so joining could
+    // not work. The frame reaches no agent (consumed below into a `msg` leaf, no transcript row, no
+    // doorbell; the note is dropped, guidance/relays stored but never listed), so screening it as
+    // text protects nothing. WHAT IS SKIPPED: only frames `channelJoinFrameType` accepts by a FULL
+    // strict decode — a join type in slot 0 with a body that fails decode is NOT skipped, it is
+    // screened and lands in a transcript (the safe direction). Size is bounded at classify:
+    // `channelJoinFrameType` rejects anything over MAX_JOIN_FRAME_BYTES before it decodes.
     //
     // WHAT IS TRADED, stated plainly: the screen skipped here is fail-CLOSED (a gateway that is down
     // returns a transient block, and the frame is held un-acked for redelivery). Its replacement —
