@@ -1,4 +1,5 @@
 import { LEAF_KIND_MSG } from "../session-relay-client.js";
+import { recordFixtureKeysFor } from "./helpers/seed-agents.js";
 /**
  * Seam 3 — two-session-core content round-trip over REAL local libp2p, in-process.
  *
@@ -143,6 +144,7 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
       { mgr: B.manager, agentName: "bob" },
     ]);
     const created = await A.manager.createSessionNode(SID, "alice", B_PUB, bInfo!.peerId, "corr-A");
+    await recordFixtureKeysFor(A.manager, "alice", SID, B_PUB);
     expect(created.ok).toBe(true);
     if (!created.ok) return;
     const connected = await A.manager.connectToCounterparty("alice", SID, bInfo!.addrs);
@@ -151,6 +153,7 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
     // B: accept the inbound session (seam 2 core) — hands off the standing receiver gated
     // to N_A and registers B's content handler. MUST happen before A sends.
     const accepted = await B.manager.acceptSession(SID, "bob", A_PUB, created.peerId, "corr-B");
+    await recordFixtureKeysFor(B.manager, "bob", SID, A_PUB);
     expect(accepted.ok).toBe(true);
     /**
      * ⚠️ **THE CONTENT KEY IS THE REAL ONE HERE, NOT A SEEDED CONSTANT** —
@@ -225,11 +228,13 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
       { mgr: B.manager, agentName: "bob" },
     ]);
     const created = await A.manager.createSessionNode(SID, "alice", B_PUB, bInfo!.peerId, "corr-A");
+    await recordFixtureKeysFor(A.manager, "alice", SID, B_PUB);
     expect(created.ok).toBe(true);
     if (!created.ok) return;
     const connected = await A.manager.connectToCounterparty("alice", SID, bInfo!.addrs);
     expect(connected.ok).toBe(true);
     const accepted = await B.manager.acceptSession(SID, "bob", A_PUB, created.peerId, "corr-B");
+    await recordFixtureKeysFor(B.manager, "bob", SID, A_PUB);
     expect(accepted.ok).toBe(true);
     /**
      * ⚠️ **THE CONTENT KEY IS THE REAL ONE HERE, NOT A SEEDED CONSTANT** —

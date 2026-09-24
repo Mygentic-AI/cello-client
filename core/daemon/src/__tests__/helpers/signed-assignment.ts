@@ -79,28 +79,9 @@ const FIXTURE_KEYS = new Map<string, KeyProvider>();
  */
 export const FIXTURE_RESPONDER_PRIMARY = new Uint8Array(32).fill(0x5b);
 
-/**
- * M9D 002-PQKEYS — a fixture identity's post-quantum keys: REAL ML-DSA-44 and ML-KEM-768 keys over
- * seeds derived from its pubkey, so every fixture identity has a stable, signable PQ identity without
- * threading one through every call site. A real key from a known seed is not a mock.
- */
-export async function fixturePqKeys(pubkeyHex: string): Promise<{
-  mlDsaProvider: MlDsaKeyProvider;
-  mlDsaPubkey: Uint8Array;
-  mlKemSeed: Uint8Array;
-  mlKemPubkey: Uint8Array;
-}> {
-  const hex = pubkeyHex.toLowerCase();
-  const mlDsaSeed = new Uint8Array(createHash("sha256").update(`fixture-mldsa:${hex}`).digest());
-  const mlKemSeed = new Uint8Array(createHash("sha512").update(`fixture-mlkem:${hex}`).digest());
-  const mlDsaProvider = await mlDsaProviderFromSeed(mlDsaSeed);
-  return {
-    mlDsaProvider,
-    mlDsaPubkey: await mlDsaProvider.getPublicKey(),
-    mlKemSeed,
-    mlKemPubkey: (await mlKemKeypairFromSeed(mlKemSeed)).publicKey,
-  };
-}
+// The deterministic fixture PQ keys live in `../../testing.ts`, shared with `provisionAgentIdentity`.
+export { fixturePqKeys } from "../../testing.js";
+import { fixturePqKeys } from "../../testing.js";
 
 /**
  * The v2 binding for one party — both signatures over one `buildKeyBindingTbs`. `forgeEd25519` /

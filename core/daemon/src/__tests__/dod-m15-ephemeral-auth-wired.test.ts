@@ -23,12 +23,15 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { fixturePqKeys } from "../testing.js";
+import type { MlDsaKeyProvider } from "@cello-protocol/crypto";
+import { recordFixtureKeysFor, carryEphemeralsUntilAgreed } from "./helpers/seed-agents.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createNode } from "@cello-protocol/transport";
 import {
-  generateKeypair, msgLeafHash, signSessionEphemeral, sealSessionContent,
+  generateKeypair, msgLeafHash, signSessionEphemeral, sealSessionContent, generateSessionEphemeral,
   type KeyProvider,
 } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
@@ -99,6 +102,7 @@ describe("DOD-M15-EPHEMERAL-AUTH-1: the real exchange, over a real connection", 
     await rm(tempDir, { recursive: true, force: true });
   });
 
+  const pqReady: Array<Promise<unknown>> = [];
   function makeManager(agent: string, kp: KeyProvider): { manager: SessionNodeManager; events: LogEvent[] } {
     const { logger, events } = makeLogger();
     const dbPath = join(tempDir, `snm-${Math.random().toString(36).slice(2)}.db`);
@@ -108,6 +112,13 @@ describe("DOD-M15-EPHEMERAL-AUTH-1: the real exchange, over a real connection", 
     // Exactly as `daemon.ts` wires it — the manager signs each session's throwaway key with the
     // agent's identity, so it needs the same provider the daemon holds.
     manager.setKeyProviderResolver((name: string) => (name === agent ? kp : undefined));
+    // M9D 003-PQSESSION: the announce is signed by the agent's ML-DSA key too — the fixture key for
+    // this identity, the one the counterparty records.
+    const pq = kp.getPublicKey().then((p) => fixturePqKeys(Buffer.from(p).toString("hex")));
+    let mlDsa: MlDsaKeyProvider | undefined;
+    void pq.then((k) => { mlDsa = k.mlDsaProvider; });
+    manager.setMlDsaProviderResolver((name: string) => (name === agent ? mlDsa : undefined));
+    pqReady.push(pq);
     managers.push(manager);
     return { manager, events };
   }
@@ -121,6 +132,7 @@ describe("DOD-M15-EPHEMERAL-AUTH-1: the real exchange, over a real connection", 
 
     const A = makeManager("alice", aliceKp);
     const B = makeManager("bob", bobKp);
+    await Promise.all(pqReady);
     await A.manager.initialize();
     await B.manager.initialize();
     await seedAgents(A.manager.getDb(), ["alice"]);
@@ -136,10 +148,12 @@ describe("DOD-M15-EPHEMERAL-AUTH-1: the real exchange, over a real connection", 
       { mgr: B.manager, agentName: "bob" },
     ]);
     const created = await A.manager.createSessionNode(SID, "alice", bobPub, bInfo!.peerId, "corr-A");
+    await recordFixtureKeysFor(A.manager, "alice", SID, bobPub);
     expect(created.ok).toBe(true);
     if (!created.ok) throw new Error("createSessionNode failed");
     expect((await A.manager.connectToCounterparty("alice", SID, bInfo!.addrs)).ok).toBe(true);
     expect((await B.manager.acceptSession(SID, "bob", alicePub, created.peerId, "corr-B")).ok).toBe(true);
+    await recordFixtureKeysFor(B.manager, "bob", SID, alicePub);
     return { A, B, alicePub, bobPub, aliceKp, bobKp };
   }
 
@@ -258,8 +272,10 @@ describe("DOD-M15-EPHEMERAL-AUTH-1: the real exchange, over a real connection", 
       "PRECONDITION: the restart produced a DIFFERENT half, or there is no re-key to adopt",
     ).not.toBe(Buffer.from(beforeHalf!).toString("hex"));
 
-    const sig = await signSessionEphemeral(bobKp, Buffer.from(SID, "hex"), afterHalf!);
-    await A.manager.handleEphemeralFrameForTest("alice", SID, { ephemeralPublic: afterHalf!, signature: sig });
+    // M9D 003: carried both ways until agreed — the re-keyed side may now be the one that
+    // encapsulates, so its ciphertext has to cross too.
+    await carryEphemeralsUntilAgreed(SID, { mgr: A.manager, agentName: "alice" }, { mgr: B.manager, agentName: "bob" });
+    void bobKp;
 
     expect(
       A.events.filter((e) => e.event === "session.key.agreed" && e.context["rekey"] === true).length,
@@ -277,12 +293,13 @@ describe("DOD-M15-EPHEMERAL-AUTH-1: the real exchange, over a real connection", 
      */
     const { A, B, bobKp } = await liveSession();
     await wait(600);
-    const half = B.manager.sessionEphemeralPublicForTest("bob", SID)!;
-    const sig = await signSessionEphemeral(bobKp, Buffer.from(SID, "hex"), half);
+    // B's own signed v2 half — exactly what it re-announces on every connect.
+    const half = (await B.manager.signOwnEphemeralForTest("bob", SID))!;
+    void bobKp;
 
     const before = A.events.filter((e) => e.event === "session.key.agreed").length;
-    await A.manager.handleEphemeralFrameForTest("alice", SID, { ephemeralPublic: half, signature: sig });
-    await A.manager.handleEphemeralFrameForTest("alice", SID, { ephemeralPublic: half, signature: sig });
+    await A.manager.handleEphemeralFrameForTest("alice", SID, half);
+    await A.manager.handleEphemeralFrameForTest("alice", SID, half);
     expect(
       A.events.filter((e) => e.event === "session.key.agreed").length,
       "the same half re-announced churned the key — both sides depend on it not moving mid-session",
@@ -385,11 +402,14 @@ describe("DOD-M15-EPHEMERAL-AUTH-1: the real exchange, over a real connection", 
      */
     const { B } = await liveSession();
     const relayKp = generateKeypair();
-    const relayEph = new Uint8Array(32).fill(0x55);
-    const relaySig = await signSessionEphemeral(relayKp, Buffer.from(SID, "hex"), relayEph);
+    const relayPq = await fixturePqKeys("relay-" + Buffer.from(await relayKp.getPublicKey()).toString("hex"));
+    const relayEph = await generateSessionEphemeral();
+    const { sig: relaySig, pqSig: relayPqSig } = await signSessionEphemeral(
+      relayKp, relayPq.mlDsaProvider, Buffer.from(SID, "hex"), relayEph.publicKey, relayEph.mlKemPublic,
+    );
 
     await B.manager.handleEphemeralFrameForTest("bob", SID, {
-      ephemeralPublic: relayEph, signature: relaySig,
+      ephemeralPublic: relayEph.publicKey, mlkemPublic: relayEph.mlKemPublic, signature: relaySig, pqSignature: relayPqSig,
     });
 
     const refused = B.events.find((e) => e.event === "session.key.refused");

@@ -13,7 +13,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { SessionEphemerals, type SessionEphemeralContext } from "../session-ephemerals.js";
 import { SESSION_KEY_ANNOUNCE_RETRIES, SESSION_KEY_ANNOUNCE_RETRY_MS } from "../session-node-types.js";
-import { InMemoryKeyProvider } from "@cello-protocol/crypto";
+import { InMemoryKeyProvider, mlDsaGenerateSeed, mlDsaProviderFromSeed } from "@cello-protocol/crypto";
 import { randomBytes } from "node:crypto";
 
 const AGENT = "Agent_A";
@@ -26,6 +26,13 @@ const SESSION = "0646b474d919e8b9a866b0c85c11ea6a";
  * the old ternary printed `[object Object]`. A test that throws a real `Error` passes under BOTH
  * implementations and proves nothing, which is exactly what the first version of test 3 did.
  */
+// M9D 003-PQSESSION: the announce is signed by an ML-DSA key too; without one it stops before the stream.
+const ML_DSA = await mlDsaProviderFromSeed(mlDsaGenerateSeed());
+// The ML-DSA signature completes on node's crypto thread pool, which a fake clock does not drive, so
+// each drain step also yields a few REAL milliseconds for the signature to land.
+const REAL_SET_TIMEOUT = globalThis.setTimeout;
+const realPause = (): Promise<void> => new Promise((r) => REAL_SET_TIMEOUT(r, 15));
+
 const LIBP2P_SHAPED_THROW = {
   name: "CodeError",
   code: "ERR_UNSUPPORTED_PROTOCOL",
@@ -54,6 +61,8 @@ function makeCtx(
     sessionKey: (a, s) => `${a}:${s}`,
     activeEntry: () => entry as unknown as ReturnType<SessionEphemeralContext["activeEntry"]>,
     keyProvider: () => keyProvider,
+    mlDsaProvider: () => ML_DSA,
+    counterpartyPqKeys: () => null,
     freezeSessionForKeyRefusal: async () => {},
   };
   return ctx;
@@ -66,7 +75,7 @@ describe("DOD-M15-KEYANNOUNCE-LOOP-1: a failing key announce gives up", () => {
   it("★★ stops after a bounded number of attempts and says so — it does not retry forever", async () => {
     const events: Array<{ event: string; ctx: Record<string, unknown> }> = [];
     const eph = new SessionEphemerals(makeCtx(events));
-    eph.mintSessionEphemeral(AGENT, SESSION);
+    await eph.mintSessionEphemeral(AGENT, SESSION);
 
     await eph.sendEphemeralFrame(AGENT, SESSION, "test");
 
@@ -74,6 +83,7 @@ describe("DOD-M15-KEYANNOUNCE-LOOP-1: a failing key announce gives up", () => {
     // terminates keeps producing failures and blows the assertion below.
     for (let i = 0; i < SESSION_KEY_ANNOUNCE_RETRIES + 5; i++) {
       await vi.advanceTimersByTimeAsync(SESSION_KEY_ANNOUNCE_RETRY_MS * (SESSION_KEY_ANNOUNCE_RETRIES + 2));
+      await realPause();
     }
 
     const failures = events.filter((e) => e.event === "session.key.announce.failed");
@@ -87,11 +97,12 @@ describe("DOD-M15-KEYANNOUNCE-LOOP-1: a failing key announce gives up", () => {
   it("★★ each attempt is NUMBERED, so the log shows the chain advancing rather than restarting", async () => {
     const events: Array<{ event: string; ctx: Record<string, unknown> }> = [];
     const eph = new SessionEphemerals(makeCtx(events));
-    eph.mintSessionEphemeral(AGENT, SESSION);
+    await eph.mintSessionEphemeral(AGENT, SESSION);
 
     await eph.sendEphemeralFrame(AGENT, SESSION, "test");
     for (let i = 0; i < SESSION_KEY_ANNOUNCE_RETRIES + 5; i++) {
       await vi.advanceTimersByTimeAsync(SESSION_KEY_ANNOUNCE_RETRY_MS * (SESSION_KEY_ANNOUNCE_RETRIES + 2));
+      await realPause();
     }
 
     const attempts = events
@@ -104,7 +115,7 @@ describe("DOD-M15-KEYANNOUNCE-LOOP-1: a failing key announce gives up", () => {
   it("★★ a NON-Error libp2p throw reaches the log with its code — not \"[object Object]\"", async () => {
     const events: Array<{ event: string; ctx: Record<string, unknown> }> = [];
     const eph = new SessionEphemerals(makeCtx(events, LIBP2P_SHAPED_THROW));
-    eph.mintSessionEphemeral(AGENT, SESSION);
+    await eph.mintSessionEphemeral(AGENT, SESSION);
 
     await eph.sendEphemeralFrame(AGENT, SESSION, "test");
 
@@ -122,11 +133,12 @@ describe("DOD-M15-KEYANNOUNCE-LOOP-1: a failing key announce gives up", () => {
   it("★ the give-up line reports how many attempts were ACTUALLY made", async () => {
     const events: Array<{ event: string; ctx: Record<string, unknown> }> = [];
     const eph = new SessionEphemerals(makeCtx(events));
-    eph.mintSessionEphemeral(AGENT, SESSION);
+    await eph.mintSessionEphemeral(AGENT, SESSION);
 
     await eph.sendEphemeralFrame(AGENT, SESSION, "test");
     for (let i = 0; i < SESSION_KEY_ANNOUNCE_RETRIES + 5; i++) {
       await vi.advanceTimersByTimeAsync(SESSION_KEY_ANNOUNCE_RETRY_MS * (SESSION_KEY_ANNOUNCE_RETRIES + 2));
+      await realPause();
     }
 
     const gaveUp = events.find((e) => e.event === "session.key.announce.gave_up");

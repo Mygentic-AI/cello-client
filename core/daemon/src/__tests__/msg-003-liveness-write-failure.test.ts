@@ -1,4 +1,5 @@
 import { LEAF_KIND_MSG } from "../session-relay-client.js";
+import { recordFixtureKeysFor } from "./helpers/seed-agents.js";
 /**
  * DOD-M12B-ACK-1 (second half) — a session whose writes are failing must stop reporting `alive`.
  *
@@ -125,10 +126,12 @@ describe("DOD-M12B-ACK-1: liveness stops claiming `alive` when writes fail", () 
       { mgr: B.manager, agentName: "bob" },
     ]);
     const created = await A.manager.createSessionNode(SID, "alice", B_PUB, bInfo!.peerId, "corr-A");
+    await recordFixtureKeysFor(A.manager, "alice", SID, B_PUB);
     expect(created.ok).toBe(true);
     if (!created.ok) throw new Error("createSessionNode failed");
     expect((await A.manager.connectToCounterparty("alice", SID, bInfo!.addrs)).ok).toBe(true);
     expect((await B.manager.acceptSession(SID, "bob", A_PUB, created.peerId, "corr-B")).ok).toBe(true);
+    await recordFixtureKeysFor(B.manager, "bob", SID, A_PUB);
     /**
      * ⚠️ **THE CONTENT KEY IS THE REAL ONE HERE, NOT A SEEDED CONSTANT** —
      * `DOD-M15-AUTHORSHIP-ABSENT-1`.

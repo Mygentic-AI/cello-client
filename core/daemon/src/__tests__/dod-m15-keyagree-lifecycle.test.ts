@@ -65,7 +65,7 @@ describe("006-CRYPTO: the throwaway key is minted once, held in memory, and dest
     const first = fx.snm.sessionEphemeralPublicForTest("alice", SID);
     expect(first, "PRECONDITION: a keypair exists to be preserved").not.toBeNull();
 
-    fx.snm.mintSessionEphemeralForTest("alice", SID);
+    await fx.snm.mintSessionEphemeralForTest("alice", SID);
 
     const second = fx.snm.sessionEphemeralPublicForTest("alice", SID);
     expect(
@@ -183,7 +183,7 @@ describe("006-CRYPTO: the throwaway key is minted once, held in memory, and dest
 
     // A keypair THIS TEST owns, so the buffer can be inspected after the daemon is done with it.
     // Asserting the event alone would pass for an implementation that logs and never overwrites.
-    const mine = generateSessionEphemeral();
+    const mine = await generateSessionEphemeral();
     fx.snm.setSessionEphemeralForTest("alice", SID, mine);
     expect(mine.secretKey.some((b) => b !== 0), "PRECONDITION: a real secret to destroy").toBe(true);
 
@@ -197,6 +197,7 @@ describe("006-CRYPTO: the throwaway key is minted once, held in memory, and dest
       mine.secretKey.every((b) => b === 0),
       "the entry was dropped without ZEROING it — the bytes are still wherever the collector left them",
     ).toBe(true);
+    expect(mine.mlKemSeed.every((b) => b === 0), "D12: the ML-KEM seed outlived the session").toBe(true);
   }, 60_000);
 
   it("★★ SHUTDOWN zeroes every live session's secret, not just the map", async () => {
@@ -214,7 +215,7 @@ describe("006-CRYPTO: the throwaway key is minted once, held in memory, and dest
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-keylife-shutdown-" });
     await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
 
-    const mine = generateSessionEphemeral();
+    const mine = await generateSessionEphemeral();
     fx.snm.setSessionEphemeralForTest("alice", SID, mine);
     expect(mine.secretKey.some((b) => b !== 0), "PRECONDITION: a real secret to destroy").toBe(true);
 
@@ -224,6 +225,7 @@ describe("006-CRYPTO: the throwaway key is minted once, held in memory, and dest
       mine.secretKey.every((b) => b === 0),
       "the daemon shut down and left a live session's secret in memory for as long as the process lingers",
     ).toBe(true);
+    expect(mine.mlKemSeed.every((b) => b === 0), "D12: shutdown left the ML-KEM seed in memory").toBe(true);
   }, 60_000);
 
   it("★★ the key SURVIVES while a seal is in flight — it is not destroyed early", async () => {

@@ -31,7 +31,7 @@ import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-man
 import type { SessionNegotiator } from "../transport-selector.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
 import type { SessionAssignment } from "@cello-protocol/protocol-types";
-import { provisionAgentIdentity } from "../testing.js";
+import { provisionAgentIdentity, fixtureCounterpartyKeysHex } from "../testing.js";
 
 function makeLogger(): Logger {
   return { debug() {}, info() {}, warn() {}, error() {} };
@@ -192,7 +192,7 @@ describe("M8B F16: counterparty-gone surfaces on cello_receive and cello_status"
           signature_type: "frost",
           signer_pubkey: new Uint8Array(32),
         };
-        return { ok: true, assignment, counterpartyPrimaryHex: "11".repeat(32), counterpartyMlDsaHex: "12".repeat(1312), counterpartyMlKemHex: "13".repeat(1184) };
+        return { ok: true, assignment, ...(await fixtureCounterpartyKeysHex(bobPubkey)) };
       },
     };
     const A = await startDaemon({

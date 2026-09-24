@@ -24,6 +24,7 @@
  * explicitly). The only addition is a gateway sidecar per daemon.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { carryEphemeralsUntilAgreed } from "./helpers/seed-agents.js";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { readFileSync, readdirSync, writeFileSync, existsSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
@@ -43,7 +44,7 @@ import type { SessionNegotiator } from "../transport-selector.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
 import type { SessionAssignment } from "@cello-protocol/protocol-types";
 import { extractErrorMessage } from "../error-message.js";
-import { provisionAgentIdentity } from "../testing.js";
+import { provisionAgentIdentity, fixtureCounterpartyKeysHex } from "../testing.js";
 
 /** cello_receive returns a `messages` array; null when nothing was delivered. */
 function recvText(r: Record<string, unknown> | undefined): string | null {
@@ -253,7 +254,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
           signature_type: "frost",
           signer_pubkey: new Uint8Array(32),
         };
-        return { ok: true, assignment, counterpartyPrimaryHex: "11".repeat(32), counterpartyMlDsaHex: "12".repeat(1312), counterpartyMlKemHex: "13".repeat(1184) };
+        return { ok: true, assignment, ...(await fixtureCounterpartyKeysHex(bobPubkey)) };
       },
     };
     const { h: A, events: aEvents } = await startOne({
@@ -331,12 +332,11 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
      * agreed key.
      */
     await wait(400);
-    // Carry B's signed half to A, which is what a two-way link would have done. Seeding a key
-    // instead is fragile now: a seeded key records no peer half, so the first genuine announce
-    // replaces it (correctly) and the two ends drift apart.
-    const bHalf = await B.getSessionNodeManager().signOwnEphemeralForTest("bob", SID_HEX);
-    expect(bHalf, "PRECONDITION: B could sign its half").not.toBeNull();
-    await A.getSessionNodeManager().handleEphemeralFrameForTest("alice", SID_HEX, bHalf!);
+    // Carry the signed halves between the two by hand, which is what a two-way link would have done
+    // (M9D 003: both ways, until the encapsulator's ciphertext has crossed too). Seeding a key
+    // instead is fragile: a seeded key records no peer half, so the first genuine announce replaces
+    // it (correctly) and the two ends drift apart.
+    await carryEphemeralsUntilAgreed(SID_HEX, { mgr: A.getSessionNodeManager(), agentName: "alice" }, { mgr: B.getSessionNodeManager(), agentName: "bob" });
 
     return { clientA, clientB, alicePubkey, aEvents, bEvents, bHandle: B };
   }

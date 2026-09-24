@@ -1,4 +1,5 @@
 import { LEAF_KIND_MSG } from "../session-relay-client.js";
+import { recordFixtureKeysFor } from "./helpers/seed-agents.js";
 /**
  * DOD-M12B-REDIAL-1 — a lost connection must not end the conversation.
  *
@@ -121,10 +122,12 @@ describe("DOD-M12B-REDIAL-1: a lost connection is re-dialled on demand", () => {
       { mgr: B.manager, agentName: "bob" },
     ]);
     const created = await A.manager.createSessionNode(SID, "alice", B_PUB, bInfo!.peerId, "corr-A");
+    await recordFixtureKeysFor(A.manager, "alice", SID, B_PUB);
     expect(created.ok).toBe(true);
     if (!created.ok) throw new Error("createSessionNode failed");
     expect((await A.manager.connectToCounterparty("alice", SID, bInfo!.addrs)).ok).toBe(true);
     expect((await B.manager.acceptSession(SID, "bob", A_PUB, created.peerId, "corr-B")).ok).toBe(true);
+    await recordFixtureKeysFor(B.manager, "bob", SID, A_PUB);
     /**
      * ⚠️ **THE CONTENT KEY IS THE REAL ONE HERE, NOT A SEEDED CONSTANT** —
      * `DOD-M15-AUTHORSHIP-ABSENT-1`.
@@ -196,6 +199,7 @@ describe("DOD-M12B-REDIAL-1: a lost connection is re-dialled on demand", () => {
     // earlier, for a different reason, and never reach the re-dial branch below.
     agreeSessionGenesis(SID, [{ mgr: A.manager, agentName: "alice" }]);
     const created = await A.manager.createSessionNode(SID, "alice", B_PUB, "12D3KooWQYV9dGMFoRzNStwpXztXaBUjtPqi6aMghfATmPnRAENn", "corr-A");
+    await recordFixtureKeysFor(A.manager, "alice", SID, B_PUB);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key. STILL
     // SEEDED HERE, unlike the connected cases above: this session has no counterparty and never
     // dials one, so nothing can complete the real exchange and there is no race to lose. Without a

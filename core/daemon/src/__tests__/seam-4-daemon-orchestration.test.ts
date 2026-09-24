@@ -31,6 +31,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { carryEphemeralsUntilAgreed } from "./helpers/seed-agents.js";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -45,7 +46,7 @@ import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-man
 import type { SessionNegotiator } from "../transport-selector.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
 import type { SessionAssignment } from "@cello-protocol/protocol-types";
-import { provisionAgentIdentity } from "../testing.js";
+import { provisionAgentIdentity, fixtureCounterpartyKeysHex } from "../testing.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 
@@ -179,7 +180,7 @@ describe("Seam 4: full daemon-IPC two-daemon local orchestration", () => {
           signature_type: "frost",
           signer_pubkey: new Uint8Array(32),
         };
-        return { ok: true, assignment, counterpartyPrimaryHex: "11".repeat(32), counterpartyMlDsaHex: "12".repeat(1312), counterpartyMlKemHex: "13".repeat(1184) };
+        return { ok: true, assignment, ...(await fixtureCounterpartyKeysHex(bobPubkey)) };
       },
     };
     const { h: A, events: aEvents } = await startOne({
@@ -253,12 +254,11 @@ describe("Seam 4: full daemon-IPC two-daemon local orchestration", () => {
        * exchange produces, and it stays put because deriving is idempotent.
        */
       await wait(400);
-      // Carry B's signed half to A, which is what a two-way link would have done. Seeding a key
-      // instead is fragile now: a seeded key records no peer half, so the first genuine announce
-      // replaces it (correctly) and the two ends drift apart.
-      const bHalf = await B.getSessionNodeManager().signOwnEphemeralForTest("bob", SID_HEX);
-      expect(bHalf, "PRECONDITION: B could sign its half").not.toBeNull();
-      await A.getSessionNodeManager().handleEphemeralFrameForTest("alice", SID_HEX, bHalf!);
+      // Carry the signed halves between the two by hand, which is what a two-way link would have done
+      // (M9D 003: both ways, until the encapsulator's ciphertext has crossed too). Seeding a key
+      // instead is fragile: a seeded key records no peer half, so the first genuine announce replaces
+      // it (correctly) and the two ends drift apart.
+      await carryEphemeralsUntilAgreed(SID_HEX, { mgr: A.getSessionNodeManager(), agentName: "alice" }, { mgr: B.getSessionNodeManager(), agentName: "bob" });
       expect(awaited.counterparty_pubkey).toBe(alicePubkey);
 
       // ── A sends; B receives over the live N_A ↔ B connection.

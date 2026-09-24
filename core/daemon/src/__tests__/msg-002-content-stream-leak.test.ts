@@ -1,4 +1,5 @@
 import { LEAF_KIND_MSG } from "../session-relay-client.js";
+import { recordFixtureKeysFor } from "./helpers/seed-agents.js";
 /**
  * DOD-M12B-ACK-1 — a conversation must not die on its 33rd frame.
  *
@@ -135,11 +136,13 @@ describe("DOD-M12B-ACK-1: content streams are not leaked at the receiver", () =>
       { mgr: B.manager, agentName: "bob" },
     ]);
     const created = await A.manager.createSessionNode(SID, "alice", B_PUB, bInfo!.peerId, "corr-A");
+    await recordFixtureKeysFor(A.manager, "alice", SID, B_PUB);
     expect(created.ok).toBe(true);
     if (!created.ok) return;
     const connected = await A.manager.connectToCounterparty("alice", SID, bInfo!.addrs);
     expect(connected.ok).toBe(true);
     const accepted = await B.manager.acceptSession(SID, "bob", A_PUB, created.peerId, "corr-B");
+    await recordFixtureKeysFor(B.manager, "bob", SID, A_PUB);
     expect(accepted.ok).toBe(true);
     /**
      * ⚠️ **THE CONTENT KEY IS THE REAL ONE HERE, NOT A SEEDED CONSTANT** —
