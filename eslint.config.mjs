@@ -559,7 +559,7 @@ export default [
      * and lower it whenever the file gets smaller.
      */
     files: ["core/daemon/src/session-content-ingest.ts"],
-    rules: { "max-lines": ["error", { max: 2283, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 2279, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/session-lifecycle.ts"],

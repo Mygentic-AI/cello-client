@@ -94,14 +94,11 @@ export async function startBootAgents(deps: BootAgentsDeps) {
   for (const a of loadedAgents) {
     keyProviders.set(a.name, a.keyProvider);
   }
-  // DOD-M15-EPHEMERAL-AUTH-1: the session manager signs each session's throwaway key with the
-  // agent's identity, so it needs the same providers. Injected here rather than through the
-  // constructor because this map is built after the manager exists — the same reason
-  // `setParkedDrainHook` is a setter.
+  // DOD-M15-EPHEMERAL-AUTH-1 / M9D 003: the manager signs each session's announce with K_local AND the
+  // agent's ML-DSA key. Setters because these maps exist only after the manager does; the ML-DSA one
+  // reads the live map, so an agent registered in this run signs without a restart.
   sessionNodeManager.setKeyProviderResolver((agentName: string) => keyProviders.get(agentName));
   const pqIdentities = buildPqIdentities(loadedAgents); // M9D 002-PQKEYS — see buildPqIdentities
-  // M9D 003-PQSESSION: the session announce is signed by the agent's ML-DSA key too. The resolver reads
-  // the live map, so an agent that registers in this run is signable as soon as register-handler adds it.
   sessionNodeManager.setMlDsaProviderResolver((agentName: string) => pqIdentities.get(agentName)?.mlDsaProvider);
 
   // Constructed HERE, before ANY boot-time caller. autoRecoverForAgent is invoked from an agent's

@@ -27,12 +27,11 @@
  * tampered field tests that the binding holds, which is the property that matters.
  */
 
-import { createHash } from "node:crypto";
 import {
   generateKeypair, buildKeyBindingTbs, CONTEXT_SESSION_ESTABLISHMENT,
-  mlDsaProviderFromSeed, mlKemKeypairFromSeed, signMlDsa,
+  signMlDsa,
 } from "@cello-protocol/crypto";
-import type { KeyProvider, MlDsaKeyProvider } from "@cello-protocol/crypto";
+import type { KeyProvider } from "@cello-protocol/crypto";
 import { buildSessionEstablishmentTbs, computeGenesisPrevRoot } from "@cello-protocol/protocol-types";
 
 /**

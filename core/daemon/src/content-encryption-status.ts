@@ -186,3 +186,8 @@ export const CONTENT_ENCRYPTION_INBOUND_GUIDANCE: Record<ContentEncryptionReason
 export function contentEncryptionGuidanceFor(reason: ContentEncryptionReason): string {
   return CONTENT_ENCRYPTION_GUIDANCE[reason];
 }
+
+/** The inbound refusal's `impact` when a held frame's post-quantum ciphertext never arrives (M9D 003). */
+export const PQ_HELD_REFUSAL_IMPACT =
+  "an encrypted message arrived before your counterparty's half of the post-quantum session key, and " +
+  "that half never came, so the message could not be opened. Refused unread.";

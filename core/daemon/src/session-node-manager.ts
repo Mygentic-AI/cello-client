@@ -762,7 +762,6 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
    * machines.
    */
   #keyProviderResolver: ((agentName: string) => KeyProvider | undefined) | null = null;
-  /** M9D 003-PQSESSION: each agent's ML-DSA provider, injected by the daemon like the key providers. */
   #mlDsaProviderResolver: ((agentName: string) => MlDsaKeyProvider | undefined) | null = null;
   /** Test-only observer of decoded inbound content frames — see `observeInboundContentFramesForTest`. */
   #inboundFrameObserver: ((frame: Record<string, unknown>) => void) | null = null;
@@ -2897,10 +2896,8 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     this.#keyProviderResolver = resolver;
   }
 
-  /** M9D 003-PQSESSION: injected by the daemon once its per-agent post-quantum identities exist. */
-  setMlDsaProviderResolver(resolver: (agentName: string) => MlDsaKeyProvider | undefined): void {
-    this.#mlDsaProviderResolver = resolver;
-  }
+  /** M9D 003: the per-agent ML-DSA providers, injected like the key providers above. */
+  setMlDsaProviderResolver(resolver: (agentName: string) => MlDsaKeyProvider | undefined): void { this.#mlDsaProviderResolver = resolver; }
 
   /**
    * Test seam: run the auto-acknowledge gate, exactly as the counterparty's SEAL ctrl leaf does.

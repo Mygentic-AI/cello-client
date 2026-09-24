@@ -26,7 +26,7 @@ import { scanFields } from "./screen-score-fields.js";
 import type { Stream } from "@libp2p/interface";
 import { contentHashFor, resolveContentHashAlg } from "./wire-content-hash.js";
 import { SALT_ADOPTION_LABEL_MAX } from "./session-salt-agreement.js";
-import { CONTENT_ENCRYPTION_INBOUND_GUIDANCE, CONTENT_ENCRYPTION_REASONS, SESSION_CONTENT_ENCRYPTION_V1 } from "./content-encryption-status.js";
+import { CONTENT_ENCRYPTION_INBOUND_GUIDANCE, CONTENT_ENCRYPTION_REASONS, PQ_HELD_REFUSAL_IMPACT, SESSION_CONTENT_ENCRYPTION_V1 } from "./content-encryption-status.js";
 import { REFUSAL_KINDS } from "./refusal-reasons.js";
 import { refuseIfSessionClosed } from "./session-closed.js";
 import { triageOrphanedContent } from "./orphan-triage.js";
@@ -1666,11 +1666,7 @@ export class SessionContentIngest {
     this.#ctx.refusals.noteRefusedOnDirectPath(agentName, sessionId, contentHash);
   }
 
-  /**
-   * One decoded frame from a content stream. Split out of `#handleContentStream` (M9D 003-PQSESSION) so
-   * a content frame that arrives before the post-quantum ciphertext can be HELD and handled again, in
-   * arrival order, once the key is agreed — without a stream to read from.
-   */
+  /** One decoded frame. Split from the stream reader (M9D 003) so a held frame can be replayed. */
   async #handleFrame(agentName: string, sessionId: string, frame: Record<string, unknown>, remotePeerId?: string): Promise<void> {
     const correlationId = typeof frame["correlation_id"] === "string" ? frame["correlation_id"] : undefined;
     const frameType = typeof frame["type"] === "string" ? frame["type"] : "(absent)";
@@ -1791,17 +1787,9 @@ export class SessionContentIngest {
      * by name — so a non-Uint8Array in either slot must arrive at that function as ABSENT, not as
      * a present-but-wrong value it would then try to use.
      */
-    /**
-     * 007-CRYPTO — the peer's SIGNED ephemeral.
-     *
-     * Fields are read defensively rather than cast, exactly like the salt frame below: an inbound
-     * value is whatever a peer chose to encode, and `verifySessionEphemeral` refuses a missing or
-     * wrong-width one BY NAME — so a non-`Uint8Array` must arrive there as ABSENT rather than as a
-     * present-but-wrong value it would try to use.
-     */
+    // 007-CRYPTO / M9D 003: the peer's signed announce, decoded in ONE place — a non-Uint8Array
+    // field arrives as ABSENT and the verifier refuses it by name.
     if (frame["type"] === "session_key_agreement") {
-      // Decoded in ONE place (decision 12): a non-Uint8Array field arrives as ABSENT and the
-      // verifier refuses it by name.
       await this.#ctx.ephemerals.handleEphemeralFrame(agentName, sessionId, decodeSessionKeyAgreementFrame(frame), correlationId);
       return;
     }
@@ -1888,21 +1876,12 @@ export class SessionContentIngest {
       return;
     }
     if (encState.key === null) {
-      /**
-       * HELD, NOT REFUSED, while the post-quantum ciphertext is on its way — decision 11. The
-       * encapsulator can send the moment it has derived; this side derives one frame later. The
-       * frame is replayed through this same handler once the key exists, or refused as
-       * `pq_ciphertext_not_received` if it never does.
-       */
-      const held = this.#ctx.ephemerals.holdForPqCiphertext(
-        agentName, sessionId, contentBytes.length,
+      // M9D 003 decision 11: HELD, not refused, while the PQ ciphertext is on its way; replayed through
+      // this handler once the key exists, or refused as `pq_ciphertext_not_received` if it never does.
+      if (this.#ctx.ephemerals.holdForPqCiphertext(agentName, sessionId, contentBytes.length,
         () => this.#handleFrame(agentName, sessionId, frame, remotePeerId),
-        () => this.#refuseInboundContent(agentName, sessionId, "pq_ciphertext_not_received", contentHash, {
-          impact: "an encrypted message arrived before your counterparty's half of the post-quantum session key, and that half never came, so the message could not be opened. Refused unread.",
-          guidance: CONTENT_ENCRYPTION_INBOUND_GUIDANCE[CONTENT_ENCRYPTION_REASONS.PQ_CIPHERTEXT_NOT_RECEIVED],
-        }, correlationId),
-      );
-      if (held) return;
+        () => this.#refuseInboundContent(agentName, sessionId, "pq_ciphertext_not_received", contentHash, { impact: PQ_HELD_REFUSAL_IMPACT,
+          guidance: CONTENT_ENCRYPTION_INBOUND_GUIDANCE[CONTENT_ENCRYPTION_REASONS.PQ_CIPHERTEXT_NOT_RECEIVED] }, correlationId))) return;
       this.#refuseInboundContent(agentName, sessionId, "no_session_key", contentHash, {
         detail: encState.reason,
         impact: "an encrypted message arrived and this side has no agreed key to open it, so it was refused unread rather than shown as garbage.",
