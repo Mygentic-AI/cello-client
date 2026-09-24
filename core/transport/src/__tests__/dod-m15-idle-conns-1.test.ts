@@ -183,7 +183,7 @@ describe("I3: a connection carries what a reaper needs to judge it", () => {
     });
     const addr = listener.listenAddresses().find((a) => a.includes("/p2p/"));
     if (!addr) throw new Error("listener has no addressed multiaddr");
-    await dialer.dial(addr);
+    const { peerId: listenerPeerId } = await dialer.dial(addr);
     await waitUntil(() => listener.getConnections().length > 0, 5000);
 
     const [inbound] = listener.getConnections();
@@ -192,7 +192,16 @@ describe("I3: a connection carries what a reaper needs to judge it", () => {
     expect(inbound!.direction).toBe("inbound");
     expect(typeof inbound!.openedAt).toBe("number");
     expect(inbound!.openedAt).toBeGreaterThan(0);
-    expect(inbound!.streamCount).toBe(0);
+
+    // The count is not pinned at 0 on connect: libp2p opens its own identify streams on a new
+    // connection, and whether they have landed when this reads is up to libp2p. What the reaper
+    // relies on is that a stream OPENED on the connection shows in the count — so open one.
+    const PROTO = "/cello/test-idle-count/1.0.0";
+    await listener.handle(PROTO, () => {});
+    const before = listener.getConnections()[0]!.streamCount;
+    await dialer.newStream(listenerPeerId, PROTO);
+    await waitUntil(() => listener.getConnections()[0]!.streamCount > before, 5000);
+    expect(listener.getConnections()[0]!.streamCount).toBeGreaterThan(before);
 
     const [outbound] = dialer.getConnections();
     expect(outbound!.direction).toBe("outbound");
