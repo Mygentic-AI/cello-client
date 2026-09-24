@@ -4,10 +4,12 @@
  *
  * Scans every NON-TEST source in core/*\/src with the TypeScript compiler API and fails on, outside
  * `pq-frame.ts` and `ml-dsa.ts`:
- *   1. a `.sign(...)` call whose receiver's type is an ML-DSA provider — declared by `ml-dsa.ts`
- *      (`MlDsaKeyProvider`, `InMemoryMlDsaKeyProvider`);
- *   2. `subtle.sign|verify` / `crypto.sign|verify` with an argument whose text matches /ML[-_]?DSA/i
- *      (so an imported `ML_DSA_ALGORITHM_LABEL` is caught as well as the literal);
+ *   1. any reach for `sign` on a receiver whose type is an ML-DSA provider declared by `ml-dsa.ts`
+ *      (`MlDsaKeyProvider`, `InMemoryMlDsaKeyProvider`): `p.sign(x)`, `p.sign.call/bind`, `p["sign"]`,
+ *      `const { sign } = p`;
+ *   2. a `sign`/`verify` call on a Web Crypto receiver — matched by name (`subtle`, `crypto`) OR by
+ *      type (`SubtleCrypto`, so an alias is caught) — with an argument that names ML-DSA by text
+ *      (/ML[-_]?DSA/i) or by resolved literal type (so `{ name: LABEL }` in a variable is caught);
  *   3. a string literal "ML-DSA-44" or "ML-KEM-768" anywhere outside ml-dsa.ts, ml-kem.ts, pq-frame.ts
  *      (and pq-warnings.ts, which only matches Node's warning text).
  *
@@ -20,7 +22,7 @@
  */
 import { describe, it, expect } from "vitest";
 import ts from "typescript";
-import { readdirSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -79,6 +81,15 @@ function declaredInMlDsa(type: ts.Type): boolean {
   return false;
 }
 
+/** Does this argument's TYPE name ML-DSA — a string literal type, or an object whose `name` is one? */
+function namesMlDsa(checker: ts.TypeChecker, arg: ts.Expression): boolean {
+  const literal = (t: ts.Type | undefined): boolean => !!t && t.isStringLiteral() && /ML-DSA/.test(t.value);
+  const t = checker.getTypeAtLocation(arg);
+  if (literal(t)) return true;
+  const nameProp = t.getProperty("name");
+  return !!nameProp && literal(checker.getTypeOfSymbolAtLocation(nameProp, arg));
+}
+
 export function scan(files: string[]): string[] {
   const program = ts.createProgram(files, {
     target: ts.ScriptTarget.ES2022,
@@ -102,16 +113,36 @@ export function scan(files: string[]): string[] {
       if (ts.isStringLiteralLike(node) && PQ_LITERALS.has(node.text) && !LITERAL_FILES.has(r)) {
         offences.push(`${where(node)} literal "${node.text}" outside ml-dsa.ts/ml-kem.ts/pq-frame.ts`);
       }
-      if (ts.isCallExpression(node) && !FRAME_FILES.has(r) && ts.isPropertyAccessExpression(node.expression)) {
-        const callee = node.expression;
-        const method = callee.name.text;
-        if (method === "sign" && declaredInMlDsa(checker.getTypeAtLocation(callee.expression))) {
+      if (!FRAME_FILES.has(r)) {
+        // Rule 1 — ANY reach for an ML-DSA provider's `sign`, not only a direct call: `p.sign(x)`,
+        // `p.sign.call(..)`, `p.sign.bind(..)`, `p["sign"](x)`, and `const { sign } = p`.
+        const isMlDsa = (e: ts.Expression): boolean => declaredInMlDsa(checker.getTypeAtLocation(e));
+        if (ts.isPropertyAccessExpression(node) && node.name.text === "sign" && isMlDsa(node.expression)) {
           offences.push(`${where(node)} raw ML-DSA provider.sign() outside the Contract 2 frame`);
         }
-        const recv = callee.expression.getText(sf);
-        if ((method === "sign" || method === "verify") && /(^|\.)(subtle|crypto)$/.test(recv)
-            && node.arguments.some((a) => /ML[-_]?DSA/i.test(a.getText(sf)))) {
-          offences.push(`${where(node)} ${recv}.${method}(ML-DSA…) outside the Contract 2 frame`);
+        if (ts.isElementAccessExpression(node) && ts.isStringLiteralLike(node.argumentExpression)
+            && node.argumentExpression.text === "sign" && isMlDsa(node.expression)) {
+          offences.push(`${where(node)} raw ML-DSA provider["sign"] outside the Contract 2 frame`);
+        }
+        if (ts.isBindingElement(node) && ts.isObjectBindingPattern(node.parent)
+            && (node.propertyName ?? node.name).getText(sf) === "sign"
+            && ts.isVariableDeclaration(node.parent.parent) && node.parent.parent.initializer
+            && isMlDsa(node.parent.parent.initializer)) {
+          offences.push(`${where(node)} raw ML-DSA provider sign destructured outside the Contract 2 frame`);
+        }
+        // Rule 2 — a Web Crypto / node:crypto sign or verify with an ML-DSA algorithm. The receiver is
+        // matched by TYPE (so an aliased `const s = crypto.subtle` is caught) as well as by name, and
+        // the algorithm by its resolved literal type (so `{ name: LABEL }` in a variable is caught).
+        if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
+          const callee = node.expression;
+          const method = callee.name.text;
+          const recvText = callee.expression.getText(sf);
+          const recvType = checker.typeToString(checker.getTypeAtLocation(callee.expression));
+          const isCryptoRecv = /(^|\.)(subtle|crypto)$/.test(recvText) || /SubtleCrypto/.test(recvType);
+          if ((method === "sign" || method === "verify") && isCryptoRecv
+              && node.arguments.some((a) => /ML[-_]?DSA/i.test(a.getText(sf)) || namesMlDsa(checker, a))) {
+            offences.push(`${where(node)} ${recvText}.${method}(ML-DSA…) outside the Contract 2 frame`);
+          }
         }
       }
       ts.forEachChild(node, visit);
@@ -129,12 +160,16 @@ describe("001-PQPRIM Part D — D4: the Contract 2 frame is the only ML-DSA rout
     expect(files).toContain("daemon/src/registration-manager.ts");
   });
 
-  it("POSITIVE CONTROL: reports all three offence kinds in core/daemon's d4-offender fixture", () => {
+  it("POSITIVE CONTROL: reports EVERY line marked OFFENCE in core/daemon's d4-offender fixture", () => {
     const fixture = join(CORE, "daemon/src/__tests__/fixtures/d4-offender.ts");
+    const marked = readFileSync(fixture, "utf8").split("\n")
+      .map((line, i) => (line.includes("// OFFENCE:") ? i + 1 : 0))
+      .filter((n) => n > 0);
+    expect(marked.length).toBeGreaterThanOrEqual(9);
     const offences = scan([fixture]);
-    expect(offences.some((o) => o.includes("raw ML-DSA provider.sign()")), offences.join("\n")).toBe(true);
-    expect(offences.some((o) => o.includes("subtle.sign(ML-DSA…)")), offences.join("\n")).toBe(true);
-    expect(offences.some((o) => o.includes('literal "ML-KEM-768"')), offences.join("\n")).toBe(true);
+    const reported = new Set(offences.map((o) => Number(/:(\d+) /.exec(o)?.[1])));
+    const missed = marked.filter((n) => !reported.has(n));
+    expect(missed, `unreported OFFENCE lines: ${missed.join(", ")}\n${offences.join("\n")}`).toEqual([]);
   });
 
   it("finds no ML-DSA signature produced or checked outside pq-frame.ts / ml-dsa.ts", () => {
