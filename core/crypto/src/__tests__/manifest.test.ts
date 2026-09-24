@@ -508,7 +508,8 @@ describe("M12 ROLE-MANIFEST-1: verifyManifest and node roles", () => {
     const manifest = makeTestManifest(makeNodes());
     const unsigned = { ...manifest, nodes: manifest.nodes.map((n, i) => {
       if (i !== 1) return n;
-      const { role: _r, ...rest } = n as Record<string, unknown>;
+      const rest = { ...(n as Record<string, unknown>) };
+      delete rest["role"];
       return rest;
     }) };
     const result = verifyManifest(unsigned, TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD);
@@ -520,7 +521,8 @@ describe("M12 ROLE-MANIFEST-1: verifyManifest and node roles", () => {
     const manifest = makeTestManifest(makeNodes());
     const stripped = { ...manifest, nodes: manifest.nodes.map((n, i) => {
       if (i !== 0) return n;
-      const { peerId: _p, ...rest } = n as Record<string, unknown>;
+      const rest = { ...(n as Record<string, unknown>) };
+      delete rest["peerId"];
       return rest;
     }) };
     const result = verifyManifest(stripped, TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD);
