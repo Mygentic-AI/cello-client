@@ -19,6 +19,7 @@
 import { mkdir, readFile, rename, chmod, unlink, open as fsOpen } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { join, dirname } from "node:path";
+import { ML_DSA_ALGORITHM_LABEL } from "@cello-protocol/crypto";
 import type { Logger } from "./types.js";
 
 // ─── Loaded record shapes (returned by load* on restart) ─────────────────────
@@ -201,7 +202,7 @@ export class FileRegistrationPersistence implements DaemonRegistrationPersistenc
     await this.#writeJsonAtomic(FILE_MLDSA_KEYPAIR, {
       mlDsaPubkey: opts.mlDsaPubkey,
       secretKeyBlob: hex(opts.secretKeyBlob),
-      algorithm: "ML-DSA-44",
+      algorithm: ML_DSA_ALGORITHM_LABEL,
     });
     this.#logger.info("registration.mldsa.persisted", { mlDsaPubkey: opts.mlDsaPubkey });
   }

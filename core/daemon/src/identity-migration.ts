@@ -33,7 +33,7 @@ import {
 import { join, dirname } from "node:path";
 import { createDecipheriv, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
-import { InMemoryKeyProvider, decodeKeyFileSeed } from "@cello-protocol/crypto";
+import { InMemoryKeyProvider, decodeKeyFileSeed, ML_DSA_ALGORITHM_LABEL } from "@cello-protocol/crypto";
 import {
   openEncryptedDatabase,
   isPlaintextSqliteFile,
@@ -424,7 +424,7 @@ function importFlatIdentity(celloDir: string, encDb: DaemonDatabase, logger: Log
     if (mlDsa) {
       encDb
         .prepare("UPDATE agents SET ml_dsa_pubkey = ?, ml_dsa_secret = ?, ml_dsa_algorithm = ? WHERE agent_name = ?")
-        .run(String(mlDsa["mlDsaPubkey"]), Buffer.from(hexToBytes(String(mlDsa["secretKeyBlob"]))), String(mlDsa["algorithm"] ?? "ML-DSA-44"), a.name);
+        .run(String(mlDsa["mlDsaPubkey"]), Buffer.from(hexToBytes(String(mlDsa["secretKeyBlob"]))), String(mlDsa["algorithm"] ?? ML_DSA_ALGORITHM_LABEL), a.name);
     }
     if (frost) {
       encDb

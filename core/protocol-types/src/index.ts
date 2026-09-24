@@ -107,7 +107,6 @@ export type {
 
 export type {
   MlDsaKeyProvider,
-  MlDsaVerifier,
   PseudonymBinding,
   Endorsement,
   Attestation,
@@ -126,7 +125,7 @@ export type {
 
 export {
   MAX_PSEUDONYM_LABEL_BYTES,
-  ML_DSA_PUBKEY_BYTES,
+  ML_DSA_PUBLIC_KEY_BYTES,
   ML_DSA_SIGNATURE_BYTES,
   buildPseudonymBinding,
   verifyPseudonymBinding,

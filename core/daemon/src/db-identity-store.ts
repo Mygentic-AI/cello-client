@@ -14,6 +14,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { ML_DSA_ALGORITHM_LABEL } from "@cello-protocol/crypto";
 import { MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
@@ -26,7 +27,7 @@ import type {
   AgentUserLinkRecord,
 } from "./registration-persistence.js";
 
-const ML_DSA_ALGORITHM = "ML-DSA-44";
+const ML_DSA_ALGORITHM = ML_DSA_ALGORITHM_LABEL;
 
 /**
  * The `agents` schema. The store is keyed by a STABLE `agent_id`, never by `agent_name` — durable

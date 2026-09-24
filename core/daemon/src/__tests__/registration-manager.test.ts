@@ -98,7 +98,6 @@ function makeFakeCtx(opts: Partial<{
     keyProvider: stubKeyProvider,
     logger: opts.logger ?? noopLogger,
     persistence: opts.persistence ?? null,
-    mlDsaKeyFile: undefined,
     getNode: opts.getNode ?? (() => stubNode),
     getMyPubkeyHex: () => pubkeyHex,
     setMyPubkeyHex: (h) => { pubkeyHex = h; },
@@ -187,8 +186,9 @@ describe("RegistrationManager (daemon port) — seam paths", () => {
     });
     const result = await promise;
     expect(result).toMatchObject({ agent_id: "agent-77", status: "active" });
-    // persistence path (mlDsaKeyFile=undefined) → both writes happened
+    // persistence path → both writes happened, and the ML-DSA secret persisted is the 32-byte seed
     expect(calls.mlDsa).toHaveLength(1);
+    expect((calls.mlDsa[0] as { secretKeyBlob: Uint8Array }).secretKeyBlob.length).toBe(32);
     expect(calls.reg).toHaveLength(1);
     expect(calls.reg[0]).toMatchObject({ agentId: "agent-77" });
   });

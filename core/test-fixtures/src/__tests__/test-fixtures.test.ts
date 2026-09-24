@@ -19,8 +19,7 @@ import {
 } from "@claude-flow/testing";
 import type { TestScope } from "@claude-flow/testing";
 import {
-  FakeMlDsaKeyProvider,
-  FakeMultiVerifier,
+  testMlDsaProvider,
   buildValidatedPackage,
   buildPackageWithExpiredEndorsement,
   buildPackageWithTargetMismatch,
@@ -35,6 +34,7 @@ import {
   INFERENCE_OPEN_POLICY,
 } from "../index.js";
 import type { ConnectionPolicy } from "@cello-protocol/protocol-types";
+import { verifyPseudonymBinding } from "@cello-protocol/protocol-types";
 
 setupV3Tests();
 
@@ -42,55 +42,34 @@ let scope: TestScope;
 beforeEach(() => { scope = createTestScope(); });
 afterEach(async () => { await scope.run(async () => {}); });
 
-// ─── AC-001: FakeMlDsaKeyProvider determinism and byte lengths ────────────────
+// ─── AC-001: testMlDsaProvider — a REAL key from a fixed seed (001-PQPRIM) ──────
 
-describe("AC-001: FakeMlDsaKeyProvider — determinism and byte lengths", () => {
-  it("two instances with same seed produce identical pubkeys and signatures", async () => {
-    const seed = new Uint8Array(32).fill(0x42);
-    const p1 = new FakeMlDsaKeyProvider(seed);
-    const p2 = new FakeMlDsaKeyProvider(seed);
-    const msg = new Uint8Array([1, 2, 3]);
-
-    const pk1 = await p1.getPublicKey();
-    const pk2 = await p2.getPublicKey();
-    const sig1 = await p1.sign(msg);
-    const sig2 = await p2.sign(msg);
-
+describe("AC-001: testMlDsaProvider — deterministic, real ML-DSA-44", () => {
+  it("the same n gives the same real key; a different n gives a different one", async () => {
+    const pk1 = await (await testMlDsaProvider(0x42)).getPublicKey();
+    const pk2 = await (await testMlDsaProvider(0x42)).getPublicKey();
+    const pk3 = await (await testMlDsaProvider(0x43)).getPublicKey();
     expect(pk1).toEqual(pk2);
-    expect(sig1).toEqual(sig2);
+    expect(pk1).not.toEqual(pk3);
     expect(pk1.byteLength).toBe(1312);
-    expect(sig1.byteLength).toBe(2420);
   });
 });
 
-// ─── AC-002: FakeMultiVerifier matches provider ────────────────────────────────
+// ─── AC-002: the stub pseudonym binding is really signed ──────────────────────
 
-describe("AC-002: FakeMultiVerifier — verify matching and non-matching pubkeys", () => {
-  it("verifier returns true for matching pubkey, false for different seed", async () => {
-    const seedA = new Uint8Array(32).fill(0xaa);
-    const seedB = new Uint8Array(32).fill(0xbb);
-    const providerA = new FakeMlDsaKeyProvider(seedA);
-    const providerB = new FakeMlDsaKeyProvider(seedB);
-    const pubkeyA = await providerA.getPublicKey();
-    const pubkeyB = await providerB.getPublicKey();
-
-    const multi = new FakeMultiVerifier();
-    multi.register(providerA, pubkeyA);
-
-    const verifier = multi.asVerifier();
-    const msg = new Uint8Array([9, 8, 7]);
-    const sigA = await providerA.sign(msg);
-
-    expect(verifier(pubkeyA, msg, sigA)).toBe(true);
-    expect(verifier(pubkeyB, msg, sigA)).toBe(false);
+describe("AC-002: the package builders carry a pseudonym binding that verifies", () => {
+  it("verifyPseudonymBinding accepts the stub binding, and refuses it with one byte of its label changed", async () => {
+    const { pseudonym_binding } = await buildValidatedPackage({ pseudonymLabel: "alice" });
+    expect(await verifyPseudonymBinding(pseudonym_binding)).toBe(true);
+    expect(await verifyPseudonymBinding({ ...pseudonym_binding, pseudonym_label: "alicf" })).toBe(false);
   });
 });
 
 // ─── AC-003: buildValidatedPackage with options ───────────────────────────────
 
 describe("AC-003: buildValidatedPackage — respects options", () => {
-  it("returns valid: true with correct endorsement count, label, and attestation", () => {
-    const result = buildValidatedPackage({
+  it("returns valid: true with correct endorsement count, label, and attestation", async () => {
+    const result = await buildValidatedPackage({
       endorsements: 3,
       pseudonymLabel: "alice",
       attestationType: "capability",
@@ -109,8 +88,8 @@ describe("AC-003: buildValidatedPackage — respects options", () => {
 // ─── AC-004: buildPackageWithExpiredEndorsement ───────────────────────────────
 
 describe("AC-004: buildPackageWithExpiredEndorsement", () => {
-  it("returns valid: true with one expired endorsement", () => {
-    const result = buildPackageWithExpiredEndorsement();
+  it("returns valid: true with one expired endorsement", async () => {
+    const result = await buildPackageWithExpiredEndorsement();
 
     expect(result.valid).toBe(true);
     if (!result.valid) return;
@@ -122,8 +101,8 @@ describe("AC-004: buildPackageWithExpiredEndorsement", () => {
 // ─── AC-005: buildPackageWithTargetMismatch ───────────────────────────────────
 
 describe("AC-005: buildPackageWithTargetMismatch", () => {
-  it("returns valid: true with one target_mismatch endorsement", () => {
-    const result = buildPackageWithTargetMismatch();
+  it("returns valid: true with one target_mismatch endorsement", async () => {
+    const result = await buildPackageWithTargetMismatch();
 
     expect(result.valid).toBe(true);
     if (!result.valid) return;
@@ -181,7 +160,7 @@ describe("AC-008: writeTrustStore / readTrustStore round-trip", () => {
     const path = join(tmpdir(), `cello-test-store-endorsement-${Date.now()}.json`);
     scope.addCleanup(() => unlink(path).catch(() => {}));
 
-    const validPackage = buildValidatedPackage({ endorsements: 1 });
+    const validPackage = await buildValidatedPackage({ endorsements: 1 });
     const endorsement = validPackage.endorsements[0];
     const store = {
       endorsements_received: [endorsement],

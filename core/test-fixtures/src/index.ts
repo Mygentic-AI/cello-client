@@ -7,10 +7,10 @@
  */
 
 import { readFile, writeFile } from "node:fs/promises";
-import { createHash, createHmac, randomBytes } from "node:crypto";
+import { createHash } from "node:crypto";
+import { mlDsaProviderFromSeed } from "@cello-protocol/crypto";
+import type { MlDsaKeyProvider } from "@cello-protocol/crypto";
 import type {
-  MlDsaKeyProvider,
-  MlDsaVerifier,
   PseudonymBinding,
   Endorsement,
   Attestation,
@@ -21,8 +21,9 @@ import type {
   DirectoryContext,
 } from "@cello-protocol/protocol-types";
 import {
-  ML_DSA_PUBKEY_BYTES,
+  ML_DSA_PUBLIC_KEY_BYTES,
   ML_DSA_SIGNATURE_BYTES,
+  buildPseudonymBinding,
 } from "@cello-protocol/protocol-types";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -33,76 +34,20 @@ function padToLength(src: Uint8Array, targetLen: number): Uint8Array {
   return out;
 }
 
-function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
-  return diff === 0;
-}
-
 function makeTestKey(label: string, len: number): Uint8Array {
   const hash = createHash("sha256").update(label).digest();
   return padToLength(hash, len);
 }
 
-// ─── FakeMlDsaKeyProvider ─────────────────────────────────────────────────────
+// ─── ML-DSA test keys ─────────────────────────────────────────────────────────
 
 /**
- * Deterministic fake ML-DSA-44 key provider for structural tests.
- *
- * sign(msg)      = HMAC-SHA256(seed, msg) padded to ML_DSA_SIGNATURE_BYTES (2420)
- * getPublicKey() = SHA-256(seed) padded to ML_DSA_PUBKEY_BYTES (1312)
- *
- * NOT cryptographically secure — tests only.
+ * A REAL ML-DSA-44 provider over a fixed seed (`new Uint8Array(32).fill(n)`). A real key from a known
+ * seed is not a mock: it signs and verifies exactly as a production key does. (M9D 001-PQPRIM deleted
+ * the HMAC "fake ML-DSA" provider and verifier this package used to export — no mocks for crypto.)
  */
-export class FakeMlDsaKeyProvider implements MlDsaKeyProvider {
-  readonly #seed: Uint8Array;
-
-  constructor(seed?: Uint8Array) {
-    this.#seed = seed ?? randomBytes(32);
-  }
-
-  async getPublicKey(): Promise<Uint8Array> {
-    const hash = createHash("sha256").update(this.#seed).digest();
-    return padToLength(hash, ML_DSA_PUBKEY_BYTES);
-  }
-
-  async sign(message: Uint8Array): Promise<Uint8Array> {
-    const mac = createHmac("sha256", this.#seed).update(message).digest();
-    return padToLength(mac, ML_DSA_SIGNATURE_BYTES);
-  }
-
-  getSeed(): Uint8Array {
-    return this.#seed;
-  }
-}
-
-// ─── FakeMultiVerifier ────────────────────────────────────────────────────────
-
-/**
- * Verifier that supports multiple registered FakeMlDsaKeyProvider instances.
- * Maps pubkey hex → seed for multi-endorser structural tests.
- */
-export class FakeMultiVerifier {
-  readonly #map: Map<string, Uint8Array> = new Map();
-
-  register(provider: FakeMlDsaKeyProvider, pubkey: Uint8Array): void {
-    this.#map.set(Buffer.from(pubkey).toString("hex"), provider.getSeed());
-  }
-
-  asVerifier(): MlDsaVerifier {
-    return (publicKey: Uint8Array, message: Uint8Array, signature: Uint8Array): boolean => {
-      const hex = Buffer.from(publicKey).toString("hex");
-      const seed = this.#map.get(hex);
-      if (!seed) return false;
-
-      const expectedPubkey = padToLength(createHash("sha256").update(seed).digest(), ML_DSA_PUBKEY_BYTES);
-      if (!bytesEqual(publicKey, expectedPubkey)) return false;
-
-      const expectedSig = padToLength(createHmac("sha256", seed).update(message).digest(), ML_DSA_SIGNATURE_BYTES);
-      return bytesEqual(signature, expectedSig);
-    };
-  }
+export function testMlDsaProvider(n: number): Promise<MlDsaKeyProvider> {
+  return mlDsaProviderFromSeed(new Uint8Array(32).fill(n));
 }
 
 // ─── PackageValidationResult factories ────────────────────────────────────────
@@ -114,22 +59,32 @@ interface BuildValidatedPackageOpts {
   createdAt?: number;
 }
 
-function makeStubPseudonymBinding(label: string, createdAt: number): PseudonymBinding {
-  return {
-    pseudonym_label: label,
-    k_local_pubkey: makeTestKey("klocal", 32),
-    primary_pubkey: makeTestKey("primary", 64),
-    ml_dsa_pubkey: makeTestKey("ml-dsa-pubkey", ML_DSA_PUBKEY_BYTES),
-    created_at: createdAt,
-    ml_dsa_signature: makeTestKey("binding-sig", ML_DSA_SIGNATURE_BYTES),
-  };
+/** A pseudonym binding really signed by a fixed-seed ML-DSA-44 key: it verifies. */
+async function makeStubPseudonymBinding(label: string, createdAt: number): Promise<PseudonymBinding> {
+  const provider = await testMlDsaProvider(0x5b);
+  const result = await buildPseudonymBinding(
+    {
+      pseudonym_label: label,
+      k_local_pubkey: makeTestKey("klocal", 32),
+      primary_pubkey: makeTestKey("primary", 64),
+      ml_dsa_pubkey: await provider.getPublicKey(),
+      created_at: createdAt,
+    },
+    provider,
+  );
+  if (!result.ok) throw new Error(`test-fixtures: pseudonym binding refused: ${result.reason}`);
+  return result.binding;
 }
+
+// The endorsement and attestation stubs below are VALIDATION RESULTS (already annotated), not
+// artifacts a verifier checks, and nothing in the tree signs endorsements or attestations yet — so
+// their signature fields are fixed opaque bytes and are never passed to a verifier.
 
 function makeStubEndorsement(status: "valid" | "expired" | "target_mismatch"): ValidatedEndorsement {
   const now = 1_746_057_600_000;
   return {
     endorser_pubkey: makeTestKey("endorser-ed25519", 32),
-    endorser_ml_dsa_pubkey: makeTestKey("endorser-ml-dsa", ML_DSA_PUBKEY_BYTES),
+    endorser_ml_dsa_pubkey: makeTestKey("endorser-ml-dsa", ML_DSA_PUBLIC_KEY_BYTES),
     target_pubkey: makeTestKey("klocal", 32),
     endorsement_type: "peer_trust",
     created_at: now,
@@ -143,7 +98,7 @@ function makeStubAttestation(type: string): ValidatedAttestation {
   const now = 1_746_057_600_000;
   return {
     attester_pubkey: makeTestKey("attester-ed25519", 32),
-    attester_ml_dsa_pubkey: makeTestKey("attester-ml-dsa", ML_DSA_PUBKEY_BYTES),
+    attester_ml_dsa_pubkey: makeTestKey("attester-ml-dsa", ML_DSA_PUBLIC_KEY_BYTES),
     attestation_type: type,
     attestation_data: makeTestKey("attest-data", 32),
     created_at: now,
@@ -153,7 +108,7 @@ function makeStubAttestation(type: string): ValidatedAttestation {
   };
 }
 
-export function buildValidatedPackage(opts: BuildValidatedPackageOpts = {}): Extract<PackageValidationResult, { valid: true }> {
+export async function buildValidatedPackage(opts: BuildValidatedPackageOpts = {}): Promise<Extract<PackageValidationResult, { valid: true }>> {
   const label = opts.pseudonymLabel ?? "test-agent";
   const createdAt = opts.createdAt ?? 1_746_057_600_000;
   const endorsementCount = opts.endorsements ?? 1;
@@ -167,25 +122,25 @@ export function buildValidatedPackage(opts: BuildValidatedPackageOpts = {}): Ext
 
   return {
     valid: true,
-    pseudonym_binding: makeStubPseudonymBinding(label, createdAt),
+    pseudonym_binding: await makeStubPseudonymBinding(label, createdAt),
     endorsements,
     attestations,
   };
 }
 
-export function buildPackageWithExpiredEndorsement(): Extract<PackageValidationResult, { valid: true }> {
+export async function buildPackageWithExpiredEndorsement(): Promise<Extract<PackageValidationResult, { valid: true }>> {
   return {
     valid: true,
-    pseudonym_binding: makeStubPseudonymBinding("test-agent", 1_746_057_600_000),
+    pseudonym_binding: await makeStubPseudonymBinding("test-agent", 1_746_057_600_000),
     endorsements: [makeStubEndorsement("expired")],
     attestations: [],
   };
 }
 
-export function buildPackageWithTargetMismatch(): Extract<PackageValidationResult, { valid: true }> {
+export async function buildPackageWithTargetMismatch(): Promise<Extract<PackageValidationResult, { valid: true }>> {
   return {
     valid: true,
-    pseudonym_binding: makeStubPseudonymBinding("test-agent", 1_746_057_600_000),
+    pseudonym_binding: await makeStubPseudonymBinding("test-agent", 1_746_057_600_000),
     endorsements: [makeStubEndorsement("target_mismatch")],
     attestations: [],
   };

@@ -40,7 +40,6 @@ export class DaemonRegistrationContext implements RegistrationContext {
   readonly keyProvider: KeyProvider;
   readonly logger: Logger;
   readonly persistence: DaemonRegistrationPersistence | null;
-  readonly mlDsaKeyFile: string | undefined;
 
   readonly #signaling: SignalingSeam;
   readonly #getDirectoryNode: () => CelloNode | null;
@@ -62,7 +61,6 @@ export class DaemonRegistrationContext implements RegistrationContext {
     keyProvider: KeyProvider;
     persistence: DaemonRegistrationPersistence | null;
     logger: Logger;
-    mlDsaKeyFile?: string | undefined;
   }) {
     this.#signaling = opts.signaling;
     this.#getDirectoryNode = opts.getDirectoryNode;
@@ -74,7 +72,6 @@ export class DaemonRegistrationContext implements RegistrationContext {
     this.keyProvider = opts.keyProvider;
     this.persistence = opts.persistence;
     this.logger = opts.logger;
-    this.mlDsaKeyFile = opts.mlDsaKeyFile;
     this.#unregisterInbound = this.#signaling.registerInboundHandler((frame) => this.#onInbound(frame));
   }
 

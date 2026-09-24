@@ -17,12 +17,14 @@
  *   3. Build TBS positional array:
  *      [pseudonym_label, k_local_pubkey, primary_pubkey, ml_dsa_pubkey, created_at]
  *      canonical CBOR per RFC 8949 §4.2.1 (Encoder({tagUint8Array: false}))
- *   4. ml_dsa_signature = await keyProvider.sign(TBS_bytes)  [ML-DSA, NIST FIPS 204]
+ *   4. ml_dsa_signature = signMlDsa(provider, "cello-mldsa-pseudonym-binding-v1", TBS_bytes)
+ *      [ML-DSA-44, NIST FIPS 204, M9D Contract 2 frame]
  *   5. Return PseudonymBinding with all six fields
  *
  * PseudonymBinding verification:
  *   1. Rebuild TBS same as above (excluding ml_dsa_signature)
- *   2. mlDsaVerify(ml_dsa_pubkey, TBS_bytes, ml_dsa_signature) → boolean
+ *   2. verifyMlDsa(ml_dsa_pubkey, "cello-mldsa-pseudonym-binding-v1", TBS_bytes, ml_dsa_signature)
+ *      → boolean (endorsements and attestations under their own contexts)
  *
  * Endorsement TBS = canonical CBOR of all fields except endorser_ml_dsa_signature:
  *   [endorser_pubkey, endorser_ml_dsa_pubkey, target_pubkey, endorsement_type,
@@ -63,26 +65,14 @@
 
 import { encodeCbor } from "./cbor.js";
 import { decode as cborDecode } from "cbor-x";
+import { signMlDsa, verifyMlDsa } from "@cello-protocol/crypto";
+import type { MlDsaKeyProvider } from "@cello-protocol/crypto";
 
-/**
- * ML-DSA-44 key provider interface.
- *
- * Defined here (not imported from @cello-protocol/crypto) because protocol-types is a leaf
- * package that @cello-protocol/crypto will import from, not the reverse.
- *
- * The crypto package's InMemoryMlDsaKeyProvider and FileMlDsaKeyProvider will
- * implement this interface.
- *
- * Key sizes for ML-DSA-44 (NIST FIPS 204):
- *   - Public key:  1312 bytes
- *   - Signature:   2420 bytes
- */
-export interface MlDsaKeyProvider {
-  /** Returns the 1312-byte ML-DSA-44 public key. */
-  getPublicKey(): Promise<Uint8Array>;
-  /** Signs the message; returns a 2420-byte ML-DSA-44 signature. */
-  sign(message: Uint8Array): Promise<Uint8Array>;
-}
+// M9D 001-PQPRIM: the ML-DSA key provider, the byte widths and the sign/verify frame all come from
+// @cello-protocol/crypto. This file used to declare its own copies and take an injected raw
+// verifier; both are gone — every signature here goes through the Contract 2 frame.
+export type { MlDsaKeyProvider } from "@cello-protocol/crypto";
+export { ML_DSA_PUBLIC_KEY_BYTES, ML_DSA_SIGNATURE_BYTES } from "@cello-protocol/crypto";
 
 // ─── Wire types ───────────────────────────────────────────────────────────────
 
@@ -295,12 +285,6 @@ export type BuildPseudonymBindingResult =
 /** Maximum pseudonym_label size in UTF-8 bytes (AC-007, AC-008). */
 export const MAX_PSEUDONYM_LABEL_BYTES = 64;
 
-/** Expected ML-DSA-44 public key size in bytes (NIST FIPS 204). */
-export const ML_DSA_PUBKEY_BYTES = 1312;
-
-/** Expected ML-DSA-44 signature size in bytes (NIST FIPS 204). */
-export const ML_DSA_SIGNATURE_BYTES = 2420;
-
 // ─── TBS (to-be-signed) encoders ─────────────────────────────────────────────
 
 /**
@@ -370,27 +354,6 @@ function buildAttestationTbs(a: Omit<Attestation, "attester_ml_dsa_signature">):
   ]));
 }
 
-// ─── ML-DSA verify helper ─────────────────────────────────────────────────────
-
-/**
- * Verify an ML-DSA-44 signature.
- *
- * This function is a thin wrapper that enables real ML-DSA verification once
- * a native binding is available. Currently delegates to the provided verifier
- * function — this indirection is necessary because protocol-types cannot import
- * @cello-protocol/crypto (direction of the dependency would be inverted).
- *
- * Callers that need verification MUST supply a verifier. The default throws to
- * prevent silent acceptance if the caller forgets to wire one in.
- *
- * For tests, pass the real node-oqs verify function directly.
- */
-export type MlDsaVerifier = (
-  publicKey: Uint8Array,
-  message: Uint8Array,
-  signature: Uint8Array
-) => boolean;
-
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /**
@@ -425,7 +388,7 @@ export async function buildPseudonymBinding(
     params.created_at
   );
 
-  const ml_dsa_signature = await mlDsaKeyProvider.sign(tbs);
+  const ml_dsa_signature = await signMlDsa(mlDsaKeyProvider, "cello-mldsa-pseudonym-binding-v1", tbs);
 
   return {
     ok: true,
@@ -446,10 +409,7 @@ export async function buildPseudonymBinding(
  * Exported so endorsement stripping tests (SI-002 pattern) can verify items
  * outside of a full package.
  */
-export function verifyPseudonymBinding(
-  binding: PseudonymBinding,
-  mlDsaVerify: MlDsaVerifier
-): boolean {
+export async function verifyPseudonymBinding(binding: PseudonymBinding): Promise<boolean> {
   const tbs = buildPseudonymBindingTbs(
     binding.pseudonym_label,
     binding.k_local_pubkey,
@@ -457,7 +417,7 @@ export function verifyPseudonymBinding(
     binding.ml_dsa_pubkey,
     binding.created_at
   );
-  return mlDsaVerify(binding.ml_dsa_pubkey, tbs, binding.ml_dsa_signature);
+  return verifyMlDsa(binding.ml_dsa_pubkey, "cello-mldsa-pseudonym-binding-v1", tbs, binding.ml_dsa_signature);
 }
 
 /**
@@ -465,13 +425,11 @@ export function verifyPseudonymBinding(
  *
  * SI-002: each item independently verifiable outside of a package.
  */
-export function verifyEndorsement(
-  endorsement: Endorsement,
-  mlDsaVerify: MlDsaVerifier
-): boolean {
+export async function verifyEndorsement(endorsement: Endorsement): Promise<boolean> {
   const tbs = buildEndorsementTbs(endorsement);
-  return mlDsaVerify(
+  return verifyMlDsa(
     endorsement.endorser_ml_dsa_pubkey,
+    "cello-mldsa-endorsement-v1",
     tbs,
     endorsement.endorser_ml_dsa_signature
   );
@@ -482,13 +440,11 @@ export function verifyEndorsement(
  *
  * SI-002: each item independently verifiable outside of a package.
  */
-export function verifyAttestation(
-  attestation: Attestation,
-  mlDsaVerify: MlDsaVerifier
-): boolean {
+export async function verifyAttestation(attestation: Attestation): Promise<boolean> {
   const tbs = buildAttestationTbs(attestation);
-  return mlDsaVerify(
+  return verifyMlDsa(
     attestation.attester_ml_dsa_pubkey,
+    "cello-mldsa-attestation-v1",
     tbs,
     attestation.attester_ml_dsa_signature
   );
@@ -509,14 +465,17 @@ export function verifyAttestation(
  * @param pkg - The connection package to validate
  * @param sender_k_local_pubkey - Sender's K_local pubkey (for endorsement target check)
  * @param current_timestamp_ms - Current time (for expiry checks)
- * @param mlDsaVerify - ML-DSA verify function (injected to avoid circular deps)
+ *
+ * Signatures are checked through @cello-protocol/crypto's `verifyMlDsa`, each item under its own
+ * context. (This used to take an injected verifier "to avoid circular deps"; protocol-types has
+ * depended on crypto for a long time, and an injected verifier let any caller pass one that
+ * accepted everything.)
  */
-export function validateConnectionPackage(
+export async function validateConnectionPackage(
   pkg: ConnectionPackage,
   sender_k_local_pubkey: Uint8Array,
-  current_timestamp_ms: number,
-  mlDsaVerify: MlDsaVerifier
-): PackageValidationResult {
+  current_timestamp_ms: number
+): Promise<PackageValidationResult> {
   // Check label byte length (validate even if building was bypassed)
   const labelBytes = new TextEncoder().encode(pkg.pseudonym_binding.pseudonym_label);
   if (labelBytes.length > MAX_PSEUDONYM_LABEL_BYTES) {
@@ -524,15 +483,14 @@ export function validateConnectionPackage(
   }
 
   // SI-001: pseudonym binding must pass — checked before items
-  const bindingOk = verifyPseudonymBinding(pkg.pseudonym_binding, mlDsaVerify);
+  const bindingOk = await verifyPseudonymBinding(pkg.pseudonym_binding);
   if (!bindingOk) {
     return { valid: false, reason: "pseudonym_binding_invalid" };
   }
 
   // Per-endorsement validation (annotate, do not reject)
-  const validatedEndorsements: ValidatedEndorsement[] = pkg.endorsements.map((e) => {
-    const sigOk = verifyEndorsement(e, mlDsaVerify);
-    if (!sigOk) {
+  const validatedEndorsements: ValidatedEndorsement[] = await Promise.all(pkg.endorsements.map(async (e) => {
+    if (!(await verifyEndorsement(e))) {
       return { ...e, validation_status: "signature_invalid" as const };
     }
     if (e.expires_at <= current_timestamp_ms) {
@@ -542,19 +500,18 @@ export function validateConnectionPackage(
       return { ...e, validation_status: "target_mismatch" as const };
     }
     return { ...e, validation_status: "valid" as const };
-  });
+  }));
 
   // Per-attestation validation (annotate, do not reject)
-  const validatedAttestations: ValidatedAttestation[] = pkg.attestations.map((a) => {
-    const sigOk = verifyAttestation(a, mlDsaVerify);
-    if (!sigOk) {
+  const validatedAttestations: ValidatedAttestation[] = await Promise.all(pkg.attestations.map(async (a) => {
+    if (!(await verifyAttestation(a))) {
       return { ...a, validation_status: "signature_invalid" as const };
     }
     if (a.expires_at <= current_timestamp_ms) {
       return { ...a, validation_status: "expired" as const };
     }
     return { ...a, validation_status: "valid" as const };
-  });
+  }));
 
   return {
     valid: true,

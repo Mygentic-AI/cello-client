@@ -1,27 +1,17 @@
 /**
- * CELLO-CONNREQ-001 — ConnectionPackage tests
+ * CELLO-CONNREQ-001 — ConnectionPackage tests (ported to real ML-DSA-44 in 001-PQPRIM).
  *
  * Every AC and SI from the story spec maps to a named test below.
- * Tests are written RED-first per SPARC Phase R.
  *
- * ML-DSA operations use a fake provider that produces deterministic "signatures"
- * for CBOR structure tests, and a real-ML-DSA-backed verifier is injected where
- * actual signature verification is required.
+ * REAL CRYPTO, no mocks. Every key is a real ML-DSA-44 key from `mlDsaProviderFromSeed`, and every
+ * signature goes through the Contract 2 frame (`signMlDsa` / `verifyMlDsa`) under the artifact's own
+ * context: `cello-mldsa-pseudonym-binding-v1`, `cello-mldsa-endorsement-v1`,
+ * `cello-mldsa-attestation-v1`. The HMAC "fake ML-DSA" this suite used to run on is deleted — a
+ * double that returns plausible bytes is how a broken verifier stays green.
  *
- * Because node-oqs is not yet in the workspace, we simulate ML-DSA operations
- * using a deterministic HMAC-SHA256 scheme for tests that verify STRUCTURE
- * (encode/decode, label length, CBOR canonicality) and a real-signing-based
- * approach for tests that require actual cryptographic verification.
- *
- * The ML-DSA test harness works as follows:
- *   - A FakeMlDsaKeyProvider holds a 32-byte seed.
- *   - sign(msg): HMAC-SHA256(seed, msg) padded to 2420 bytes — deterministic.
- *   - getPublicKey(): SHA-256(seed) padded to 1312 bytes — deterministic.
- *   - FakeMlDsaVerifier: re-signs and compares to simulate real verify.
- *     (This is intentionally NOT cryptographically secure — tests only.)
- *
- * For production: @cello-protocol/crypto will provide InMemoryMlDsaKeyProvider wrapping
- * node-oqs, which implements the MlDsaKeyProvider interface defined here.
+ * The one exception is AC-009, a pinned CBOR ENCODING vector: its byte fields are fixed opaque values
+ * (not a signature, and never verified), because encoding does not look at them and a real ML-DSA
+ * signature is randomized (FIPS 204 hedged signing), so it could never be pinned.
  *
  * References:
  *   NIST FIPS 204 — ML-DSA (Module-Lattice-Based Digital Signature Standard)
@@ -31,7 +21,7 @@
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createHmac, createHash, randomBytes } from "node:crypto";
+import { createHmac, createHash } from "node:crypto";
 import {
   setupV3Tests,
   createTestScope,
@@ -42,6 +32,9 @@ import {
   afterEach,
 } from "@claude-flow/testing";
 import type { TestScope } from "@claude-flow/testing";
+import { Encoder } from "cbor-x";
+import { mlDsaGenerateSeed, mlDsaProviderFromSeed, signMlDsa } from "@cello-protocol/crypto";
+import type { MlDsaKeyProvider } from "@cello-protocol/crypto";
 import {
   buildPseudonymBinding,
   validateConnectionPackage,
@@ -51,98 +44,19 @@ import {
   verifyAttestation,
   verifyPseudonymBinding,
   MAX_PSEUDONYM_LABEL_BYTES,
-  ML_DSA_PUBKEY_BYTES,
+  ML_DSA_PUBLIC_KEY_BYTES,
   ML_DSA_SIGNATURE_BYTES,
-} from "../connection-package.js";
+} from "../index.js";
 import type {
-  MlDsaKeyProvider,
-  MlDsaVerifier,
   PseudonymBinding,
   Endorsement,
   Attestation,
   ConnectionPackage,
-} from "../connection-package.js";
+} from "../index.js";
 
 setupV3Tests();
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-
-// ─── Fake ML-DSA harness (test-only, NOT production crypto) ──────────────────
-
-/**
- * Deterministic fake ML-DSA key provider for tests.
- *
- * sign(msg) = HMAC-SHA256(seed, msg) padded to ML_DSA_SIGNATURE_BYTES
- * getPublicKey() = SHA-256(seed) padded to ML_DSA_PUBKEY_BYTES
- *
- * The pad-to-length approach means keys and signatures are the correct
- * byte lengths for structural tests, while remaining fully deterministic.
- */
-class FakeMlDsaKeyProvider implements MlDsaKeyProvider {
-  readonly #seed: Uint8Array;
-
-  constructor(seed?: Uint8Array) {
-    this.#seed = seed ?? randomBytes(32);
-  }
-
-  async getPublicKey(): Promise<Uint8Array> {
-    const hash = createHash("sha256").update(this.#seed).digest();
-    return padToLength(hash, ML_DSA_PUBKEY_BYTES);
-  }
-
-  async sign(message: Uint8Array): Promise<Uint8Array> {
-    const mac = createHmac("sha256", this.#seed).update(message).digest();
-    return padToLength(mac, ML_DSA_SIGNATURE_BYTES);
-  }
-
-  /** Expose seed for building a matching verifier. */
-  getSeed(): Uint8Array {
-    return this.#seed;
-  }
-}
-
-/**
- * ML-DSA verifier that matches FakeMlDsaKeyProvider.
- * Re-derives pubkey from seed and re-signs to compare.
- */
-function makeFakeVerifier(seed: Uint8Array): MlDsaVerifier {
-  return (publicKey: Uint8Array, message: Uint8Array, signature: Uint8Array): boolean => {
-    // Verify that pubkey matches seed
-    const expectedPubkey = padToLength(
-      createHash("sha256").update(seed).digest(),
-      ML_DSA_PUBKEY_BYTES
-    );
-    if (!bytesEqual(publicKey, expectedPubkey)) return false;
-
-    // Verify that signature matches re-sign of message
-    const expectedSig = padToLength(
-      createHmac("sha256", seed).update(message).digest(),
-      ML_DSA_SIGNATURE_BYTES
-    );
-    return bytesEqual(signature, expectedSig);
-  };
-}
-
-/**
- * A combined verifier that knows about multiple providers (by public key).
- * Maps pubkey hex → seed so it can verify endorsements from different endorsers.
- */
-class FakeMultiVerifier {
-  private readonly map: Map<string, Uint8Array> = new Map();
-
-  register(provider: FakeMlDsaKeyProvider, pubkey: Uint8Array): void {
-    this.map.set(Buffer.from(pubkey).toString("hex"), provider.getSeed());
-  }
-
-  asVerifier(): MlDsaVerifier {
-    return (publicKey: Uint8Array, message: Uint8Array, signature: Uint8Array): boolean => {
-      const hex = Buffer.from(publicKey).toString("hex");
-      const seed = this.map.get(hex);
-      if (!seed) return false;
-      return makeFakeVerifier(seed)(publicKey, message, signature);
-    };
-  }
-}
 
 /** Pad a byte array to the target length by repeating it cyclically. */
 function padToLength(src: Uint8Array, targetLen: number): Uint8Array {
@@ -163,147 +77,102 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
 
 // ─── Test data factories ──────────────────────────────────────────────────────
 
-/** Generate deterministic-ish test keys of the given length. */
+/** Deterministic test bytes of the given length (Ed25519/FROST key slots — not signed with here). */
 function makeTestKey(label: string, len: number): Uint8Array {
   const hash = createHash("sha256").update(label).digest();
   return padToLength(hash, len);
 }
 
-/** Build a PseudonymBinding using a FakeMlDsaKeyProvider. */
+async function newProvider(): Promise<MlDsaKeyProvider> {
+  return mlDsaProviderFromSeed(mlDsaGenerateSeed());
+}
+
+const cbor = new Encoder({ tagUint8Array: false });
+const ts = (n: number): number | bigint => (n > 0xffffffff ? BigInt(n) : n);
+
+/** The binding TBS, built independently of the private builder (positional canonical CBOR). */
+function bindingTbs(b: Omit<PseudonymBinding, "ml_dsa_signature">): Uint8Array {
+  return cbor.encode([b.pseudonym_label, b.k_local_pubkey, b.primary_pubkey, b.ml_dsa_pubkey, ts(b.created_at)]);
+}
+function endorsementTbs(e: Omit<Endorsement, "endorser_ml_dsa_signature">): Uint8Array {
+  return cbor.encode([e.endorser_pubkey, e.endorser_ml_dsa_pubkey, e.target_pubkey, e.endorsement_type, ts(e.created_at), ts(e.expires_at)]);
+}
+function attestationTbs(a: Omit<Attestation, "attester_ml_dsa_signature">): Uint8Array {
+  return cbor.encode([a.attester_pubkey, a.attester_ml_dsa_pubkey, a.attestation_type, a.attestation_data, ts(a.created_at), ts(a.expires_at)]);
+}
+
+/** Build a PseudonymBinding signed by a real ML-DSA provider. */
 async function makePseudonymBinding(
   opts: {
     label?: string;
     kLocalPubkey?: Uint8Array;
     primaryPubkey?: Uint8Array;
-    provider?: FakeMlDsaKeyProvider;
+    provider?: MlDsaKeyProvider;
     createdAt?: number;
   } = {}
-): Promise<{
-  binding: PseudonymBinding;
-  provider: FakeMlDsaKeyProvider;
-  mlDsaPubkey: Uint8Array;
-  verifier: MlDsaVerifier;
-}> {
-  const provider = opts.provider ?? new FakeMlDsaKeyProvider();
+): Promise<{ binding: PseudonymBinding; provider: MlDsaKeyProvider; mlDsaPubkey: Uint8Array }> {
+  const provider = opts.provider ?? (await newProvider());
   const mlDsaPubkey = await provider.getPublicKey();
-  const kLocalPubkey = opts.kLocalPubkey ?? makeTestKey("klocal", 32);
-  const primaryPubkey = opts.primaryPubkey ?? makeTestKey("primary", 64);
   const result = await buildPseudonymBinding(
     {
       pseudonym_label: opts.label ?? "test-agent",
-      k_local_pubkey: kLocalPubkey,
-      primary_pubkey: primaryPubkey,
+      k_local_pubkey: opts.kLocalPubkey ?? makeTestKey("klocal", 32),
+      primary_pubkey: opts.primaryPubkey ?? makeTestKey("primary", 64),
       ml_dsa_pubkey: mlDsaPubkey,
       created_at: opts.createdAt ?? 1_746_057_600_000,
     },
     provider
   );
   if (!result.ok) throw new Error(`makePseudonymBinding failed: ${result.reason}`);
-  const multiVerifier = new FakeMultiVerifier();
-  multiVerifier.register(provider, mlDsaPubkey);
-  return {
-    binding: result.binding,
-    provider,
-    mlDsaPubkey,
-    verifier: multiVerifier.asVerifier(),
-  };
+  return { binding: result.binding, provider, mlDsaPubkey };
 }
 
-/** Build an Endorsement signed by a FakeMlDsaKeyProvider. */
+/** Build an Endorsement signed by a real ML-DSA provider (nothing in the tree produces one yet). */
 async function makeEndorsement(
   opts: {
     targetPubkey?: Uint8Array;
     endorsementType?: string;
     createdAt?: number;
     expiresAt?: number;
-    endorserProvider?: FakeMlDsaKeyProvider;
+    endorserProvider?: MlDsaKeyProvider;
   } = {}
-): Promise<{
-  endorsement: Endorsement;
-  endorserProvider: FakeMlDsaKeyProvider;
-}> {
-  const endorserProvider = opts.endorserProvider ?? new FakeMlDsaKeyProvider();
-  const endorserMlDsaPubkey = await endorserProvider.getPublicKey();
-  const endorserPubkey = makeTestKey("endorser-ed25519", 32);
-  const targetPubkey = opts.targetPubkey ?? makeTestKey("klocal", 32);
+): Promise<{ endorsement: Endorsement; endorserProvider: MlDsaKeyProvider }> {
+  const endorserProvider = opts.endorserProvider ?? (await newProvider());
   const createdAt = opts.createdAt ?? 1_746_057_600_000;
-  const expiresAt = opts.expiresAt ?? createdAt + 86_400_000;
-
-  // Build TBS and sign manually (mirrors internal logic)
-  const { Encoder } = await import("cbor-x");
-  const enc = new Encoder({ tagUint8Array: false });
-  const createdEncoded = createdAt > 0xffffffff ? BigInt(createdAt) : createdAt;
-  const expiresEncoded = expiresAt > 0xffffffff ? BigInt(expiresAt) : expiresAt;
-  const tbs = enc.encode([
-    endorserPubkey,
-    endorserMlDsaPubkey,
-    targetPubkey,
-    opts.endorsementType ?? "peer_trust",
-    createdEncoded,
-    expiresEncoded,
-  ]);
-
-  const sig = await endorserProvider.sign(tbs);
-
-  const endorsement: Endorsement = {
-    endorser_pubkey: endorserPubkey,
-    endorser_ml_dsa_pubkey: endorserMlDsaPubkey,
-    target_pubkey: targetPubkey,
+  const body = {
+    endorser_pubkey: makeTestKey("endorser-ed25519", 32),
+    endorser_ml_dsa_pubkey: await endorserProvider.getPublicKey(),
+    target_pubkey: opts.targetPubkey ?? makeTestKey("klocal", 32),
     endorsement_type: opts.endorsementType ?? "peer_trust",
     created_at: createdAt,
-    expires_at: expiresAt,
-    endorser_ml_dsa_signature: sig,
+    expires_at: opts.expiresAt ?? createdAt + 86_400_000,
   };
-
-  return { endorsement, endorserProvider };
+  const sig = await signMlDsa(endorserProvider, "cello-mldsa-endorsement-v1", endorsementTbs(body));
+  return { endorsement: { ...body, endorser_ml_dsa_signature: sig }, endorserProvider };
 }
 
-/** Build an Attestation signed by a FakeMlDsaKeyProvider. */
+/** Build an Attestation signed by a real ML-DSA provider (nothing in the tree produces one yet). */
 async function makeAttestation(
   opts: {
     attestationType?: string;
     attestationData?: Uint8Array;
     createdAt?: number;
     expiresAt?: number;
-    attesterProvider?: FakeMlDsaKeyProvider;
+    attesterProvider?: MlDsaKeyProvider;
   } = {}
-): Promise<{
-  attestation: Attestation;
-  attesterProvider: FakeMlDsaKeyProvider;
-}> {
-  const attesterProvider = opts.attesterProvider ?? new FakeMlDsaKeyProvider();
-  const attesterMlDsaPubkey = await attesterProvider.getPublicKey();
-  const attesterPubkey = makeTestKey("attester-ed25519", 32);
+): Promise<{ attestation: Attestation; attesterProvider: MlDsaKeyProvider }> {
+  const attesterProvider = opts.attesterProvider ?? (await newProvider());
   const createdAt = opts.createdAt ?? 1_746_057_600_000;
-  const expiresAt = opts.expiresAt ?? createdAt + 86_400_000;
-  const attestationData = opts.attestationData ?? new Uint8Array([1, 2, 3]);
-
-  const { Encoder } = await import("cbor-x");
-  const enc = new Encoder({ tagUint8Array: false });
-  const createdEncoded = createdAt > 0xffffffff ? BigInt(createdAt) : createdAt;
-  const expiresEncoded = expiresAt > 0xffffffff ? BigInt(expiresAt) : expiresAt;
-  const tbs = enc.encode([
-    attesterPubkey,
-    attesterMlDsaPubkey,
-    opts.attestationType ?? "capability",
-    attestationData,
-    createdEncoded,
-    expiresEncoded,
-  ]);
-
-  const sig = await attesterProvider.sign(tbs);
-
-  const attestation: Attestation = {
-    attester_pubkey: attesterPubkey,
-    attester_ml_dsa_pubkey: attesterMlDsaPubkey,
+  const body = {
+    attester_pubkey: makeTestKey("attester-ed25519", 32),
+    attester_ml_dsa_pubkey: await attesterProvider.getPublicKey(),
     attestation_type: opts.attestationType ?? "capability",
-    attestation_data: attestationData,
+    attestation_data: opts.attestationData ?? new Uint8Array([1, 2, 3]),
     created_at: createdAt,
-    expires_at: expiresAt,
-    attester_ml_dsa_signature: sig,
+    expires_at: opts.expiresAt ?? createdAt + 86_400_000,
   };
-
-  return { attestation, attesterProvider };
+  const sig = await signMlDsa(attesterProvider, "cello-mldsa-attestation-v1", attestationTbs(body));
+  return { attestation: { ...body, attester_ml_dsa_signature: sig }, attesterProvider };
 }
 
 // ─── Test scope ───────────────────────────────────────────────────────────────
@@ -320,24 +189,16 @@ afterEach(async () => {
 
 describe("AC-001: package with pseudonym binding only — CBOR deterministic, sig verifies", () => {
   it("AC-001: encodes deterministically; ML-DSA sig verifies; re-encoding produces identical bytes", async () => {
-    const { binding, verifier } = await makePseudonymBinding();
+    const { binding } = await makePseudonymBinding();
 
-    const pkg: ConnectionPackage = {
-      pseudonym_binding: binding,
-      endorsements: [],
-      attestations: [],
-    };
+    const pkg: ConnectionPackage = { pseudonym_binding: binding, endorsements: [], attestations: [] };
 
     const bytes1 = encodeConnectionPackage(pkg);
     const bytes2 = encodeConnectionPackage(pkg);
-
-    // Deterministic encoding
     expect(bytesEqual(bytes1, bytes2)).toBe(true);
 
-    // Sig verifies
-    expect(verifyPseudonymBinding(binding, verifier)).toBe(true);
+    expect(await verifyPseudonymBinding(binding)).toBe(true);
 
-    // Round-trip: decode and re-encode produces identical bytes
     const decoded = decodeConnectionPackage(bytes1);
     const bytes3 = encodeConnectionPackage(decoded);
     expect(bytesEqual(bytes1, bytes3)).toBe(true);
@@ -349,29 +210,17 @@ describe("AC-001: package with pseudonym binding only — CBOR deterministic, si
 describe("AC-002: package with 3 endorsements + 1 attestation — all 5 sigs verify independently", () => {
   it("AC-002: pseudonym sig + 3 endorsement sigs + 1 attestation sig all verify", async () => {
     const kLocalPubkey = makeTestKey("klocal", 32);
-    const { binding, provider: bindingProvider } = await makePseudonymBinding({ kLocalPubkey });
+    const { binding } = await makePseudonymBinding({ kLocalPubkey });
+    const { endorsement: e1 } = await makeEndorsement({ targetPubkey: kLocalPubkey });
+    const { endorsement: e2 } = await makeEndorsement({ targetPubkey: kLocalPubkey });
+    const { endorsement: e3 } = await makeEndorsement({ targetPubkey: kLocalPubkey });
+    const { attestation: a1 } = await makeAttestation();
 
-    const { endorsement: e1, endorserProvider: ep1 } = await makeEndorsement({ targetPubkey: kLocalPubkey });
-    const { endorsement: e2, endorserProvider: ep2 } = await makeEndorsement({ targetPubkey: kLocalPubkey });
-    const { endorsement: e3, endorserProvider: ep3 } = await makeEndorsement({ targetPubkey: kLocalPubkey });
-    const { attestation: a1, attesterProvider: ap1 } = await makeAttestation();
-
-    const multi = new FakeMultiVerifier();
-    const bindingPubkey = await bindingProvider.getPublicKey();
-    multi.register(bindingProvider, bindingPubkey);
-    multi.register(ep1, await ep1.getPublicKey());
-    multi.register(ep2, await ep2.getPublicKey());
-    multi.register(ep3, await ep3.getPublicKey());
-    multi.register(ap1, await ap1.getPublicKey());
-
-    const verifier = multi.asVerifier();
-
-    // All 5 sigs verify independently
-    expect(verifyPseudonymBinding(binding, verifier)).toBe(true);
-    expect(verifyEndorsement(e1, verifier)).toBe(true);
-    expect(verifyEndorsement(e2, verifier)).toBe(true);
-    expect(verifyEndorsement(e3, verifier)).toBe(true);
-    expect(verifyAttestation(a1, verifier)).toBe(true);
+    expect(await verifyPseudonymBinding(binding)).toBe(true);
+    expect(await verifyEndorsement(e1)).toBe(true);
+    expect(await verifyEndorsement(e2)).toBe(true);
+    expect(await verifyEndorsement(e3)).toBe(true);
+    expect(await verifyAttestation(a1)).toBe(true);
   });
 });
 
@@ -380,22 +229,17 @@ describe("AC-002: package with 3 endorsements + 1 attestation — all 5 sigs ver
 describe("AC-003: tampered pseudonym binding sig → { valid: false, reason: 'pseudonym_binding_invalid' }", () => {
   it("AC-003: flip one byte in ml_dsa_signature → validateConnectionPackage returns pseudonym_binding_invalid", async () => {
     const kLocalPubkey = makeTestKey("klocal", 32);
-    const { binding, provider } = await makePseudonymBinding({ kLocalPubkey });
+    const { binding } = await makePseudonymBinding({ kLocalPubkey });
 
-    // Flip one byte
     const tamperedSig = new Uint8Array(binding.ml_dsa_signature);
     tamperedSig[0] ^= 0xff;
-    const tamperedBinding: PseudonymBinding = { ...binding, ml_dsa_signature: tamperedSig };
-
     const pkg: ConnectionPackage = {
-      pseudonym_binding: tamperedBinding,
+      pseudonym_binding: { ...binding, ml_dsa_signature: tamperedSig },
       endorsements: [],
       attestations: [],
     };
 
-    const multi = new FakeMultiVerifier();
-    multi.register(provider, await provider.getPublicKey());
-    const result = validateConnectionPackage(pkg, kLocalPubkey, Date.now(), multi.asVerifier());
+    const result = await validateConnectionPackage(pkg, kLocalPubkey, Date.now());
     expect(result.valid).toBe(false);
     if (!result.valid) {
       expect(result.reason).toBe("pseudonym_binding_invalid");
@@ -408,28 +252,18 @@ describe("AC-003: tampered pseudonym binding sig → { valid: false, reason: 'ps
 describe("AC-004: tampered endorsement → signature_invalid; package still valid", () => {
   it("AC-004: pseudonym binding passes; tampered endorsement marked signature_invalid; package valid", async () => {
     const kLocalPubkey = makeTestKey("klocal", 32);
-    const { binding, provider: bp } = await makePseudonymBinding({ kLocalPubkey });
-    const { endorsement, endorserProvider } = await makeEndorsement({ targetPubkey: kLocalPubkey });
+    const { binding } = await makePseudonymBinding({ kLocalPubkey });
+    const { endorsement } = await makeEndorsement({ targetPubkey: kLocalPubkey });
 
-    // Tamper endorsement sig
     const tamperedSig = new Uint8Array(endorsement.endorser_ml_dsa_signature);
     tamperedSig[10] ^= 0x01;
-    const tamperedEndorsement: Endorsement = {
-      ...endorsement,
-      endorser_ml_dsa_signature: tamperedSig,
-    };
-
     const pkg: ConnectionPackage = {
       pseudonym_binding: binding,
-      endorsements: [tamperedEndorsement],
+      endorsements: [{ ...endorsement, endorser_ml_dsa_signature: tamperedSig }],
       attestations: [],
     };
 
-    const multi = new FakeMultiVerifier();
-    multi.register(bp, await bp.getPublicKey());
-    multi.register(endorserProvider, await endorserProvider.getPublicKey());
-    const result = validateConnectionPackage(pkg, kLocalPubkey, 1_746_057_500_000, multi.asVerifier());
-
+    const result = await validateConnectionPackage(pkg, kLocalPubkey, 1_746_057_500_000);
     expect(result.valid).toBe(true);
     if (result.valid) {
       expect(result.endorsements).toHaveLength(1);
@@ -444,23 +278,12 @@ describe("AC-005: expired endorsement → marked 'expired'; package valid", () =
   it("AC-005: endorsement with expires_at 1ms in past → marked expired; package passes", async () => {
     const now = 1_746_057_600_000;
     const kLocalPubkey = makeTestKey("klocal", 32);
-    const { binding, provider: bp } = await makePseudonymBinding({ kLocalPubkey });
-    const { endorsement, endorserProvider } = await makeEndorsement({
-      targetPubkey: kLocalPubkey,
-      expiresAt: now - 1,
-    });
+    const { binding } = await makePseudonymBinding({ kLocalPubkey });
+    const { endorsement } = await makeEndorsement({ targetPubkey: kLocalPubkey, expiresAt: now - 1 });
 
-    const pkg: ConnectionPackage = {
-      pseudonym_binding: binding,
-      endorsements: [endorsement],
-      attestations: [],
-    };
+    const pkg: ConnectionPackage = { pseudonym_binding: binding, endorsements: [endorsement], attestations: [] };
 
-    const multi = new FakeMultiVerifier();
-    multi.register(bp, await bp.getPublicKey());
-    multi.register(endorserProvider, await endorserProvider.getPublicKey());
-    const result = validateConnectionPackage(pkg, kLocalPubkey, now, multi.asVerifier());
-
+    const result = await validateConnectionPackage(pkg, kLocalPubkey, now);
     expect(result.valid).toBe(true);
     if (result.valid) {
       expect(result.endorsements[0].validation_status).toBe("expired");
@@ -473,26 +296,12 @@ describe("AC-005: expired endorsement → marked 'expired'; package valid", () =
 describe("AC-006: endorsement target_pubkey mismatch → marked 'target_mismatch'", () => {
   it("AC-006: endorsement target ≠ sender k_local_pubkey → target_mismatch status", async () => {
     const kLocalPubkey = makeTestKey("klocal", 32);
-    const wrongTarget = makeTestKey("wrong-klocal", 32);
-    const { binding, provider: bp } = await makePseudonymBinding({ kLocalPubkey });
+    const { binding } = await makePseudonymBinding({ kLocalPubkey });
+    const { endorsement } = await makeEndorsement({ targetPubkey: makeTestKey("wrong-klocal", 32) });
 
-    // Endorsement targets wrong pubkey
-    const { endorsement, endorserProvider } = await makeEndorsement({
-      targetPubkey: wrongTarget,
-    });
+    const pkg: ConnectionPackage = { pseudonym_binding: binding, endorsements: [endorsement], attestations: [] };
 
-    const pkg: ConnectionPackage = {
-      pseudonym_binding: binding,
-      endorsements: [endorsement],
-      attestations: [],
-    };
-
-    const multi = new FakeMultiVerifier();
-    multi.register(bp, await bp.getPublicKey());
-    multi.register(endorserProvider, await endorserProvider.getPublicKey());
-    // Validate with sender_k_local_pubkey = kLocalPubkey, but target = wrongTarget
-    const result = validateConnectionPackage(pkg, kLocalPubkey, 1_746_057_500_000, multi.asVerifier());
-
+    const result = await validateConnectionPackage(pkg, kLocalPubkey, 1_746_057_500_000);
     expect(result.valid).toBe(true);
     if (result.valid) {
       expect(result.endorsements[0].validation_status).toBe("target_mismatch");
@@ -506,16 +315,17 @@ describe("AC-007: pseudonym_label exactly 64 UTF-8 bytes → construction succee
   it("AC-007: 64-byte label builds successfully", async () => {
     const label = "a".repeat(MAX_PSEUDONYM_LABEL_BYTES);
     expect(new TextEncoder().encode(label).length).toBe(64);
+    const provider = await newProvider();
 
     const result = await buildPseudonymBinding(
       {
         pseudonym_label: label,
         k_local_pubkey: makeTestKey("klocal", 32),
         primary_pubkey: makeTestKey("primary", 64),
-        ml_dsa_pubkey: new Uint8Array(ML_DSA_PUBKEY_BYTES),
+        ml_dsa_pubkey: await provider.getPublicKey(),
         created_at: 1_746_057_600_000,
       },
-      new FakeMlDsaKeyProvider()
+      provider
     );
 
     expect(result.ok).toBe(true);
@@ -528,16 +338,17 @@ describe("AC-008: pseudonym_label 65 UTF-8 bytes → rejects with pseudonym_labe
   it("AC-008: 65-byte label rejects at build time", async () => {
     const label = "a".repeat(MAX_PSEUDONYM_LABEL_BYTES + 1);
     expect(new TextEncoder().encode(label).length).toBe(65);
+    const provider = await newProvider();
 
     const result = await buildPseudonymBinding(
       {
         pseudonym_label: label,
         k_local_pubkey: makeTestKey("klocal", 32),
         primary_pubkey: makeTestKey("primary", 64),
-        ml_dsa_pubkey: new Uint8Array(ML_DSA_PUBKEY_BYTES),
+        ml_dsa_pubkey: await provider.getPublicKey(),
         created_at: 1_746_057_600_000,
       },
-      new FakeMlDsaKeyProvider()
+      provider
     );
 
     expect(result.ok).toBe(false);
@@ -550,44 +361,33 @@ describe("AC-008: pseudonym_label 65 UTF-8 bytes → rejects with pseudonym_labe
 // ─── AC-009: Fixture vector — canonical CBOR bytes match fixture hex exactly ──
 
 describe("AC-009: fixture test vector — CBOR bytes match pinned fixture hex", () => {
-  it("AC-009: encode from fixture values → bytes match expected_cbor_hex in fixture", async () => {
+  it("AC-009: encode from fixture values → bytes match expected_cbor_hex in fixture", () => {
     const fixturePath = join(__dirname, "../../test/vectors/connection-package-canonical.json");
     const fixture = JSON.parse(readFileSync(fixturePath, "utf8")) as {
       seed_hex: string;
       expected_cbor_hex: string;
     };
 
-    // Deterministic provider seeded from the fixture's seed value
+    // An ENCODING vector: every byte field is a fixed opaque value derived from the fixture seed.
+    // `ml_dsa_signature` is not a signature and is never verified — encoding does not read it, and
+    // a real ML-DSA signature is randomized, so it could not be pinned.
     const seed = Buffer.from(fixture.seed_hex, "hex");
-    const provider = new FakeMlDsaKeyProvider(new Uint8Array(seed));
-    const mlDsaPubkey = await provider.getPublicKey();
-    const kLocalPubkey = makeTestKey("ac009-klocal", 32);
-    const primaryPubkey = makeTestKey("ac009-primary", 64);
-    const createdAt = 1_746_057_600_000;
-
-    const bindingResult = await buildPseudonymBinding(
-      {
-        pseudonym_label: "ac009-agent",
-        k_local_pubkey: kLocalPubkey,
-        primary_pubkey: primaryPubkey,
-        ml_dsa_pubkey: mlDsaPubkey,
-        created_at: createdAt,
-      },
-      provider
-    );
-    if (!bindingResult.ok) throw new Error("fixture build failed");
+    const pseudonym_label = "ac009-agent";
+    const k_local_pubkey = makeTestKey("ac009-klocal", 32);
+    const primary_pubkey = makeTestKey("ac009-primary", 64);
+    const ml_dsa_pubkey = padToLength(createHash("sha256").update(seed).digest(), ML_DSA_PUBLIC_KEY_BYTES);
+    const created_at = 1_746_057_600_000;
+    const tbs = bindingTbs({ pseudonym_label, k_local_pubkey, primary_pubkey, ml_dsa_pubkey, created_at });
+    const ml_dsa_signature = padToLength(createHmac("sha256", seed).update(tbs).digest(), ML_DSA_SIGNATURE_BYTES);
 
     const pkg: ConnectionPackage = {
-      pseudonym_binding: bindingResult.binding,
+      pseudonym_binding: { pseudonym_label, k_local_pubkey, primary_pubkey, ml_dsa_pubkey, created_at, ml_dsa_signature },
       endorsements: [],
       attestations: [],
     };
 
-    const bytes = encodeConnectionPackage(pkg);
-    const hex = Buffer.from(bytes).toString("hex");
-
     // Must match the pinned fixture exactly — any encoding change breaks this test
-    expect(hex).toBe(fixture.expected_cbor_hex);
+    expect(Buffer.from(encodeConnectionPackage(pkg)).toString("hex")).toBe(fixture.expected_cbor_hex);
   });
 });
 
@@ -597,88 +397,70 @@ describe("AC-010: two packages with different endorsement counts — both valid,
   it("AC-010: 3-endorsement package and 1-endorsement package both pass; no hint about withheld items", async () => {
     const now = 1_746_057_600_000;
     const kLocalPubkey = makeTestKey("klocal", 32);
-    const { binding, provider: bp } = await makePseudonymBinding({ kLocalPubkey });
+    const { binding } = await makePseudonymBinding({ kLocalPubkey });
+    const { endorsement: e1 } = await makeEndorsement({ targetPubkey: kLocalPubkey });
+    const { endorsement: e2 } = await makeEndorsement({ targetPubkey: kLocalPubkey });
+    const { endorsement: e3 } = await makeEndorsement({ targetPubkey: kLocalPubkey });
 
-    const { endorsement: e1, endorserProvider: ep1 } = await makeEndorsement({ targetPubkey: kLocalPubkey });
-    const { endorsement: e2, endorserProvider: ep2 } = await makeEndorsement({ targetPubkey: kLocalPubkey });
-    const { endorsement: e3, endorserProvider: ep3 } = await makeEndorsement({ targetPubkey: kLocalPubkey });
-
-    const multi = new FakeMultiVerifier();
-    multi.register(bp, await bp.getPublicKey());
-    multi.register(ep1, await ep1.getPublicKey());
-    multi.register(ep2, await ep2.getPublicKey());
-    multi.register(ep3, await ep3.getPublicKey());
-    const verifier = multi.asVerifier();
-
-    const pkg3: ConnectionPackage = {
-      pseudonym_binding: binding,
-      endorsements: [e1, e2, e3],
-      attestations: [],
-    };
-
-    const pkg1: ConnectionPackage = {
-      pseudonym_binding: binding,
-      endorsements: [e1],
-      attestations: [],
-    };
-
-    const result3 = validateConnectionPackage(pkg3, kLocalPubkey, now, verifier);
-    const result1 = validateConnectionPackage(pkg1, kLocalPubkey, now, verifier);
+    const result3 = await validateConnectionPackage({ pseudonym_binding: binding, endorsements: [e1, e2, e3], attestations: [] }, kLocalPubkey, now);
+    const result1 = await validateConnectionPackage({ pseudonym_binding: binding, endorsements: [e1], attestations: [] }, kLocalPubkey, now);
 
     expect(result3.valid).toBe(true);
     expect(result1.valid).toBe(true);
-
     if (result3.valid) expect(result3.endorsements).toHaveLength(3);
     if (result1.valid) expect(result1.endorsements).toHaveLength(1);
-
-    // Neither result carries a count of total endorsements the agent holds
-    // (this is inherent to the structure — package only contains what's in it)
   });
 });
 
 // ─── AC-011: Endorsements from two different endorsers — each verifies against its own key
 
 describe("AC-011: endorsements from different endorsers — each verifies against own pubkey", () => {
-  it("AC-011: two endorsements from different endorsers each verify independently", async () => {
+  it("AC-011: two endorsements from different endorsers each verify; e1's signature under e2's key does not", async () => {
     const kLocalPubkey = makeTestKey("klocal", 32);
-
     const { endorsement: e1, endorserProvider: ep1 } = await makeEndorsement({ targetPubkey: kLocalPubkey });
     const { endorsement: e2, endorserProvider: ep2 } = await makeEndorsement({ targetPubkey: kLocalPubkey });
 
-    // Confirm keys are different
     const ep1Pub = await ep1.getPublicKey();
     const ep2Pub = await ep2.getPublicKey();
     expect(bytesEqual(ep1Pub, ep2Pub)).toBe(false);
 
-    const multi = new FakeMultiVerifier();
-    multi.register(ep1, ep1Pub);
-    multi.register(ep2, ep2Pub);
-    const verifier = multi.asVerifier();
+    expect(await verifyEndorsement(e1)).toBe(true);
+    expect(await verifyEndorsement(e2)).toBe(true);
 
-    // Each endorsement verifies against its own endorser's pubkey
-    expect(verifyEndorsement(e1, verifier)).toBe(true);
-    expect(verifyEndorsement(e2, verifier)).toBe(true);
+    // e1's genuine signature, presented as if ep2 had made it: refused.
+    expect(await verifyEndorsement({ ...e1, endorser_ml_dsa_pubkey: ep2Pub })).toBe(false);
+  });
+});
 
-    // Cross-verification: e1's sig does not verify under ep2's key.
-    // Build the real TBS for e1 (same logic as buildEndorsementTbs in production code)
-    // then assert that ep2's verifier rejects it — exercising both the key-mismatch
-    // and the message-content path through the verifier.
-    const { Encoder: Enc } = await import("cbor-x");
-    const enc = new Enc({ tagUint8Array: false });
-    const e1CreatedEncoded = e1.created_at > 0xffffffff ? BigInt(e1.created_at) : e1.created_at;
-    const e1ExpiresEncoded = e1.expires_at > 0xffffffff ? BigInt(e1.expires_at) : e1.expires_at;
-    const e1Tbs = enc.encode([
-      e1.endorser_pubkey,
-      e1.endorser_ml_dsa_pubkey,
-      e1.target_pubkey,
-      e1.endorsement_type,
-      e1CreatedEncoded,
-      e1ExpiresEncoded,
-    ]);
-    // ep2's verifier: pubkey must match SHA-256(ep2_seed), not SHA-256(ep1_seed)
-    // AND re-sign of e1Tbs with ep2_seed would differ from e1's actual sig (signed with ep1_seed)
-    const crossVerifier = makeFakeVerifier(ep2.getSeed());
-    expect(crossVerifier(ep1Pub, e1Tbs, e1.endorser_ml_dsa_signature)).toBe(false);
+// ─── 001-PQPRIM test 18 — the binding's own context, not another artifact's ──
+
+describe("001-PQPRIM test 18: a pseudonym binding re-signed under the endorsement context is refused", () => {
+  it("the same TBS, the binding's own genuine key, but the endorsement context → refused", async () => {
+    const { binding, provider } = await makePseudonymBinding();
+    const tbs = bindingTbs(binding);
+
+    // Positive control: the hand-built TBS signed under the RIGHT context verifies, so the refusal
+    // below is the context and nothing else.
+    const right = await signMlDsa(provider, "cello-mldsa-pseudonym-binding-v1", tbs);
+    expect(await verifyPseudonymBinding({ ...binding, ml_dsa_signature: right })).toBe(true);
+
+    const wrong = await signMlDsa(provider, "cello-mldsa-endorsement-v1", tbs);
+    expect(await verifyPseudonymBinding({ ...binding, ml_dsa_signature: wrong })).toBe(false);
+  });
+});
+
+// ─── 001-PQPRIM test 19 — an endorsement signed by a key other than the one it names ──
+
+describe("001-PQPRIM test 19: an endorsement signed by a genuine third key is refused", () => {
+  it("names endorser A's ML-DSA key, carries C's genuine signature over the same TBS and context → refused", async () => {
+    const { endorsement } = await makeEndorsement();
+    const third = await newProvider();
+    const { endorser_ml_dsa_signature: _drop, ...body } = endorsement;
+    void _drop;
+    const bySomeoneElse = await signMlDsa(third, "cello-mldsa-endorsement-v1", endorsementTbs(body));
+
+    expect(await verifyEndorsement(endorsement)).toBe(true);
+    expect(await verifyEndorsement({ ...endorsement, endorser_ml_dsa_signature: bySomeoneElse })).toBe(false);
   });
 });
 
@@ -687,26 +469,19 @@ describe("AC-011: endorsements from different endorsers — each verifies agains
 describe("SI-001: invalid pseudonym binding rejects whole package, even with valid endorsements", () => {
   it("SI-001: valid endorsements + invalid pseudonym binding → pseudonym_binding_invalid", async () => {
     const kLocalPubkey = makeTestKey("klocal", 32);
-    const { binding, provider: bp } = await makePseudonymBinding({ kLocalPubkey });
-    const { endorsement, endorserProvider } = await makeEndorsement({ targetPubkey: kLocalPubkey });
+    const { binding } = await makePseudonymBinding({ kLocalPubkey });
+    const { endorsement } = await makeEndorsement({ targetPubkey: kLocalPubkey });
 
-    // Tamper pseudonym binding
     const tamperedSig = new Uint8Array(binding.ml_dsa_signature);
     tamperedSig[0] ^= 0xff;
     tamperedSig[1] ^= 0xff;
-    const tamperedBinding: PseudonymBinding = { ...binding, ml_dsa_signature: tamperedSig };
-
     const pkg: ConnectionPackage = {
-      pseudonym_binding: tamperedBinding,
+      pseudonym_binding: { ...binding, ml_dsa_signature: tamperedSig },
       endorsements: [endorsement],
       attestations: [],
     };
 
-    const multi = new FakeMultiVerifier();
-    multi.register(bp, await bp.getPublicKey());
-    multi.register(endorserProvider, await endorserProvider.getPublicKey());
-    const result = validateConnectionPackage(pkg, kLocalPubkey, 1_746_057_500_000, multi.asVerifier());
-
+    const result = await validateConnectionPackage(pkg, kLocalPubkey, 1_746_057_500_000);
     expect(result.valid).toBe(false);
     if (!result.valid) {
       expect(result.reason).toBe("pseudonym_binding_invalid");
@@ -718,25 +493,21 @@ describe("SI-001: invalid pseudonym binding rejects whole package, even with val
 
 describe("SI-002: endorsement independently verifiable when stripped from package", () => {
   it("SI-002: take endorsement out of package and verify standalone → true", async () => {
-    const kLocalPubkey = makeTestKey("klocal", 32);
-    const { endorsement, endorserProvider } = await makeEndorsement({ targetPubkey: kLocalPubkey });
-
-    const multi = new FakeMultiVerifier();
-    multi.register(endorserProvider, await endorserProvider.getPublicKey());
-    const verifier = multi.asVerifier();
-
-    // Verify endorsement standalone — without any package context
-    expect(verifyEndorsement(endorsement, verifier)).toBe(true);
+    const { endorsement } = await makeEndorsement({ targetPubkey: makeTestKey("klocal", 32) });
+    expect(await verifyEndorsement(endorsement)).toBe(true);
   });
 
   it("SI-002b: attestation independently verifiable when stripped from package", async () => {
+    const { attestation } = await makeAttestation();
+    expect(await verifyAttestation(attestation)).toBe(true);
+  });
+
+  it("SI-002c: an endorsement signature does not verify as an attestation (context separation)", async () => {
     const { attestation, attesterProvider } = await makeAttestation();
-
-    const multi = new FakeMultiVerifier();
-    multi.register(attesterProvider, await attesterProvider.getPublicKey());
-    const verifier = multi.asVerifier();
-
-    expect(verifyAttestation(attestation, verifier)).toBe(true);
+    const { attester_ml_dsa_signature: _drop, ...body } = attestation;
+    void _drop;
+    const underEndorsement = await signMlDsa(attesterProvider, "cello-mldsa-endorsement-v1", attestationTbs(body));
+    expect(await verifyAttestation({ ...attestation, attester_ml_dsa_signature: underEndorsement })).toBe(false);
   });
 });
 
@@ -744,64 +515,45 @@ describe("SI-002: endorsement independently verifiable when stripped from packag
 
 describe("SI-003: buildPseudonymBinding type signature enforces provider injection", () => {
   it("SI-003: function signature only accepts MlDsaKeyProvider — no raw signature parameter exists", () => {
-    // This is a static TypeScript check: the function signature is:
-    //   buildPseudonymBinding(params, mlDsaKeyProvider: MlDsaKeyProvider): Promise<...>
-    // There is no third parameter for a raw signature.
-    // If someone wanted to inject a pre-computed signature, they cannot — the type system blocks it.
-    //
-    // We verify this by checking the function accepts exactly 2 arguments and
-    // that params does NOT include a signature field.
-
     type BuildParams = Parameters<typeof buildPseudonymBinding>[0];
 
-    // TypeScript enforces at compile time that BuildParams has no 'ml_dsa_signature' field.
-    // The test below would be a compile error if it did:
     const params: BuildParams = {
       pseudonym_label: "test",
       k_local_pubkey: new Uint8Array(32),
       primary_pubkey: new Uint8Array(64),
-      ml_dsa_pubkey: new Uint8Array(ML_DSA_PUBKEY_BYTES),
+      ml_dsa_pubkey: new Uint8Array(ML_DSA_PUBLIC_KEY_BYTES),
       created_at: 1_000_000_000,
     };
 
-    // Verify the params type does NOT have ml_dsa_signature
     // @ts-expect-error — 'ml_dsa_signature' does not exist on BuildParams
     const _shouldFail = params.ml_dsa_signature;
     void _shouldFail;
 
-    // Test passes if TypeScript compilation succeeds (the @ts-expect-error above ensures
-    // that ml_dsa_signature is NOT a valid field on BuildParams).
-    expect(true).toBe(true);
+    expect(buildPseudonymBinding.length).toBe(2);
   });
 });
 
 // ─── Additional: encode/decode round-trip with full package ──────────────────
 
 describe("encode/decode round-trip", () => {
-  it("round-trip: full package with endorsements and attestations round-trips losslessly", async () => {
+  it("round-trip: full package with endorsements and attestations round-trips losslessly and still verifies", async () => {
     const kLocalPubkey = makeTestKey("klocal", 32);
     const { binding } = await makePseudonymBinding({ kLocalPubkey });
     const { endorsement } = await makeEndorsement({ targetPubkey: kLocalPubkey });
     const { attestation } = await makeAttestation();
 
-    const pkg: ConnectionPackage = {
-      pseudonym_binding: binding,
-      endorsements: [endorsement],
-      attestations: [attestation],
-    };
+    const pkg: ConnectionPackage = { pseudonym_binding: binding, endorsements: [endorsement], attestations: [attestation] };
+    const decoded = decodeConnectionPackage(encodeConnectionPackage(pkg));
 
-    const encoded = encodeConnectionPackage(pkg);
-    const decoded = decodeConnectionPackage(encoded);
-
-    // Structural equality
     expect(decoded.pseudonym_binding.pseudonym_label).toBe(pkg.pseudonym_binding.pseudonym_label);
     expect(decoded.pseudonym_binding.created_at).toBe(pkg.pseudonym_binding.created_at);
     expect(bytesEqual(decoded.pseudonym_binding.k_local_pubkey, pkg.pseudonym_binding.k_local_pubkey)).toBe(true);
     expect(bytesEqual(decoded.pseudonym_binding.ml_dsa_signature, pkg.pseudonym_binding.ml_dsa_signature)).toBe(true);
     expect(decoded.endorsements).toHaveLength(1);
     expect(decoded.attestations).toHaveLength(1);
-    expect(bytesEqual(decoded.endorsements[0].endorser_ml_dsa_signature, endorsement.endorser_ml_dsa_signature)).toBe(true);
-    expect(bytesEqual(decoded.attestations[0].attester_ml_dsa_signature, attestation.attester_ml_dsa_signature)).toBe(true);
+    expect(await verifyPseudonymBinding(decoded.pseudonym_binding)).toBe(true);
+    expect(await verifyEndorsement(decoded.endorsements[0])).toBe(true);
+    expect(await verifyAttestation(decoded.attestations[0])).toBe(true);
   });
 
   it("decode throws on non-CBOR input", () => {

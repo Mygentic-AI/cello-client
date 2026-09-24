@@ -1,15 +1,31 @@
 export type { KeyProvider, PublicKey, Signature, KeyFileCorruptError } from "./types.js";
 export { InMemoryKeyProvider, FileKeyProvider, generateKeypair, generateKLocalSeed, decodeKeyFileSeed, verify } from "./ed25519.js";
-export type { MlDsaPublicKey, MlDsaSignature, MlDsaKeyPair, MlDsaKeyProvider } from "./ml-dsa.js";
+// M9D 001-PQPRIM: ML-DSA-44 and ML-KEM-768 on native node:crypto (Contract 1), and the Contract 2
+// frame — `signMlDsa`/`verifyMlDsa` are the only route to an ML-DSA signature. The provider's raw
+// `sign` and the frame builder are deliberately not reachable from here.
+export type { MlDsaPublicKey, MlDsaSignature, MlDsaKeyProvider } from "./ml-dsa.js";
 export {
-  InMemoryMlDsaKeyProvider,
-  FileMlDsaKeyProvider,
-  mlDsaKeygen,
-  mlDsaKeygenWithBytes,
-  mlDsaSign,
-  mlDsaVerify,
-  mlDsaEnsureLoaded,
+  ML_DSA_PUBLIC_KEY_BYTES,
+  ML_DSA_SIGNATURE_BYTES,
+  ML_DSA_SEED_BYTES,
+  ML_DSA_ALGORITHM_LABEL,
+  mlDsaGenerateSeed,
+  mlDsaProviderFromSeed,
 } from "./ml-dsa.js";
+export {
+  ML_KEM_PUBLIC_KEY_BYTES,
+  ML_KEM_CIPHERTEXT_BYTES,
+  ML_KEM_SEED_BYTES,
+  ML_KEM_SHARED_SECRET_BYTES,
+  mlKemGenerateSeed,
+  mlKemKeypairFromSeed,
+  mlKemEncapsulate,
+  mlKemDecapsulate,
+} from "./ml-kem.js";
+export { PQ_CONTEXTS, signMlDsa, verifyMlDsa } from "./pq-frame.js";
+export type { PqContext } from "./pq-frame.js";
+export { PqCryptoError } from "./pq-errors.js";
+export type { PqCryptoErrorReason } from "./pq-errors.js";
 export { hash, msgLeafHash, nodeHash, ctrlLeafHash, docLeafHash, rejectLeafHash, opaqueLeafHash, buildRelayAckTbs, RELAY_ORDER_DOMAIN } from "./hashing.js";
 export type { MerkleTree, LeafInput } from "./merkle.js";
 export { buildMerkleTree, merkleRoot, inclusionProof, verifyInclusion } from "./merkle.js";

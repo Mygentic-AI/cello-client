@@ -14,7 +14,7 @@
 
 import { randomUUID } from "node:crypto";
 import { encodeCbor } from "@cello-protocol/protocol-types";
-import { mlDsaKeygen, mlDsaKeygenWithBytes, FileMlDsaKeyProvider, buildKeyBindingTbs } from "@cello-protocol/crypto";
+import { mlDsaGenerateSeed, mlDsaProviderFromSeed, buildKeyBindingTbs } from "@cello-protocol/crypto";
 import type { IThresholdSigner, MlDsaKeyProvider } from "@cello-protocol/crypto";
 import type { RegistrationState } from "@cello-protocol/protocol-types";
 import { NetworkDirectoryNode, runNetworkDkg } from "./network-directory-node.js";
@@ -44,7 +44,6 @@ export interface RegistrationContext {
   readonly keyProvider: KeyProvider;
   readonly logger: Logger;
   readonly persistence: DaemonRegistrationPersistence | null;
-  readonly mlDsaKeyFile: string | undefined;
   /**
    * The live directory-facing libp2p node FROST DKG opens streams on. May be
    * null even when signaling reads connected (brief stream-death window) — the
@@ -313,18 +312,10 @@ export class RegistrationManager {
     }
     const correlationId = randomUUID();
 
-    // Step 2: generate or load ML-DSA-44 keypair
-    let mlDsaProvider: MlDsaKeyProvider;
-    let mlDsaSecretKeyBlob: Uint8Array | null = null;
-    if (this.#ctx.mlDsaKeyFile) {
-      mlDsaProvider = await FileMlDsaKeyProvider.load(this.#ctx.mlDsaKeyFile);
-    } else if (this.#ctx.persistence) {
-      const { provider, secretKeyBlob } = await mlDsaKeygenWithBytes();
-      mlDsaProvider = provider;
-      mlDsaSecretKeyBlob = secretKeyBlob;
-    } else {
-      mlDsaProvider = await mlDsaKeygen();
-    }
+    // Step 2: generate the ML-DSA-44 key. The persisted secret is its 32-byte seed (M9D Contract 1).
+    const mlDsaSeed = mlDsaGenerateSeed();
+    const mlDsaProvider: MlDsaKeyProvider = await mlDsaProviderFromSeed(mlDsaSeed);
+    const mlDsaSecretKeyBlob: Uint8Array | null = this.#ctx.persistence ? mlDsaSeed : null;
     const mlDsaPubkey = await mlDsaProvider.getPublicKey();
     const mlDsaPubkeyHex = Buffer.from(mlDsaPubkey).toString("hex");
 

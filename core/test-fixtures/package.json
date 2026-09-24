@@ -19,6 +19,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@cello-protocol/crypto": "workspace:*",
     "@cello-protocol/protocol-types": "workspace:*"
   },
   "devDependencies": {

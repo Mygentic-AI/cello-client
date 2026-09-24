@@ -22,7 +22,13 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, stat, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { mlDsaKeygenWithBytes, mlDsaVerify, InMemoryMlDsaKeyProvider } from "@cello-protocol/crypto";
+import { mlDsaGenerateSeed, mlDsaProviderFromSeed, signMlDsa, verifyMlDsa } from "@cello-protocol/crypto";
+
+/** A fresh ML-DSA-44 identity key: its provider, and its 32-byte seed — the form that is persisted. */
+async function mlDsaKeyWithSeed() {
+  const secretKeyBlob = mlDsaGenerateSeed();
+  return { provider: await mlDsaProviderFromSeed(secretKeyBlob), secretKeyBlob };
+}
 import { FileRegistrationPersistence } from "../registration-persistence.js";
 import { DbIdentityStore, DbRegistrationPersistence } from "../db-identity-store.js";
 import { openTestDb } from "./helpers/encrypted-db.js";
@@ -80,7 +86,7 @@ describe("registration-persistence (daemon)", () => {
   // ─── ML-DSA keypair (Known case 2 — exercise the reloaded key) ────────────
 
   it("round-trips the ML-DSA keypair AND the reloaded secret signs verifiably", async () => {
-    const { provider, secretKeyBlob } = await mlDsaKeygenWithBytes();
+    const { provider, secretKeyBlob } = await mlDsaKeyWithSeed();
     const pubkey = await provider.getPublicKey();
     const pubkeyHex = Buffer.from(pubkey).toString("hex");
 
@@ -93,10 +99,10 @@ describe("registration-persistence (daemon)", () => {
     expect(Buffer.from(loaded!.secretKeyBlob).equals(Buffer.from(secretKeyBlob))).toBe(true);
 
     // Real use: reconstruct a provider from the reloaded bytes, sign, verify.
-    const reconstructed = new InMemoryMlDsaKeyProvider(pubkey, loaded!.secretKeyBlob);
+    const reconstructed = await mlDsaProviderFromSeed(loaded!.secretKeyBlob);
     const msg = new TextEncoder().encode("daemon registration round-trip");
-    const sig = await reconstructed.sign(msg);
-    expect(mlDsaVerify(pubkey, msg, sig)).toBe(true);
+    const sig = await signMlDsa(reconstructed, "cello-mldsa-endorsement-v1", msg);
+    expect(await verifyMlDsa(pubkey, "cello-mldsa-endorsement-v1", msg, sig)).toBe(true);
   });
 
   // ─── FROST key share ──────────────────────────────────────────────────────
@@ -203,7 +209,7 @@ describe("registration-persistence (daemon)", () => {
   // ─── Security invariants ──────────────────────────────────────────────────
 
   it("never logs secret bytes (SI-001 signing_share, SI-002 secret_key_blob)", async () => {
-    const { provider, secretKeyBlob } = await mlDsaKeygenWithBytes();
+    const { provider, secretKeyBlob } = await mlDsaKeyWithSeed();
     const pubkeyHex = Buffer.from(await provider.getPublicKey()).toString("hex");
     const signingShare = new Uint8Array([7, 7, 7, 7]);
 
@@ -226,7 +232,7 @@ describe("registration-persistence (daemon)", () => {
   });
 
   it("writes secret files with 0o600 permissions", async () => {
-    const { provider, secretKeyBlob } = await mlDsaKeygenWithBytes();
+    const { provider, secretKeyBlob } = await mlDsaKeyWithSeed();
     const pubkeyHex = Buffer.from(await provider.getPublicKey()).toString("hex");
     const p = new FileRegistrationPersistence({ agentDir, logger });
     await p.persistMlDsaKeypair({ mlDsaPubkey: pubkeyHex, secretKeyBlob });
