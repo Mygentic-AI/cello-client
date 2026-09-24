@@ -15,8 +15,12 @@ import {
   encodeChannelJoinRefused, decodeChannelJoinRefused,
   encodeChannelRekey, decodeChannelRekey,
   isChannelJoinFrame,
+  channelJoinFrameType,
   MAX_JOIN_NOTE_CHARS,
+  MAX_JOIN_FRAME_BYTES,
+  JOIN_REQUEST_TYPE, JOIN_ACCEPTED_TYPE, JOIN_REFUSED_TYPE, REKEY_TYPE,
 } from "../channel-join.js";
+import { encodeCbor } from "../cbor.js";
 
 const CHANNEL = new Uint8Array(Buffer.alloc(32, 0xa1));
 const SUBSCRIBER = new Uint8Array(Buffer.alloc(32, 0xb2));
@@ -133,5 +137,62 @@ describe("M16 019 Part B — the join frames", () => {
     expect(decodeChannelJoinAccepted(refused).ok).toBe(false);
     expect(decodeChannelRekey(refused).ok).toBe(false);
     expect(decodeChannelJoinRequest(refused).ok).toBe(false);
+  });
+});
+
+describe("025-JOINSCREEN — channelJoinFrameType is strict, by full decode", () => {
+  // Test 1: each of the four valid frames still classifies to its own type.
+  it("each valid frame classifies to its own type", () => {
+    expect(channelJoinFrameType(encodeChannelJoinRequest({
+      channel_pubkey: CHANNEL, subscriber_pubkey: SUBSCRIBER, note: "hi",
+    }))).toBe(JOIN_REQUEST_TYPE);
+    expect(channelJoinFrameType(encodeChannelJoinAccepted({
+      channel_pubkey: CHANNEL, key_bundle: BUNDLE, guidance: "release notes",
+      retention_seconds: 3600, access: "invite_only", relays: [RELAY_A, RELAY_B], members_visible: false,
+    }))).toBe(JOIN_ACCEPTED_TYPE);
+    expect(channelJoinFrameType(encodeChannelJoinRefused({
+      channel_pubkey: CHANNEL, reason: "channel_is_public",
+    }))).toBe(JOIN_REFUSED_TYPE);
+    expect(channelJoinFrameType(encodeChannelRekey({
+      channel_pubkey: CHANNEL, key_bundle: BUNDLE, generation: 3,
+    }))).toBe(REKEY_TYPE);
+  });
+
+  // Test 2: a valid type string in slot 0 with a body the decoder rejects is NOT a join frame.
+  // Built with encodeCbor directly, because the encoders refuse exactly these bodies. Red before
+  // the rewrite: the loose classifier returned the type on slot 0 alone.
+  it("a valid type in slot 0 with a bad body is not a join frame", () => {
+    // request with a 31-byte channel key
+    expect(channelJoinFrameType(encodeCbor([
+      JOIN_REQUEST_TYPE, new Uint8Array(31).fill(0xa1), SUBSCRIBER, "",
+    ]))).toBeNull();
+    // refused with an invented reason
+    expect(channelJoinFrameType(encodeCbor([
+      JOIN_REFUSED_TYPE, CHANNEL, "made_up",
+    ]))).toBeNull();
+    // accepted naming a PUBLIC channel — there is nothing to join
+    expect(channelJoinFrameType(encodeCbor([
+      JOIN_ACCEPTED_TYPE, CHANNEL, BUNDLE, "", 3600, "public", [RELAY_A], false,
+    ]))).toBeNull();
+    // rekey to generation 0 — "no key has ever been issued"
+    expect(channelJoinFrameType(encodeCbor([
+      REKEY_TYPE, CHANNEL, BUNDLE, 0,
+    ]))).toBeNull();
+  });
+
+  // Test 4: the cap admits the LARGEST legitimate frame. (Test 3 is deliberately not written — see
+  // the order: an "oversized → null" test passes with the cap deleted, so the cap is proven here and
+  // by the reviewer reading that the length check precedes decodeCbor.)
+  it("the cap admits the largest legitimate acceptance", () => {
+    const bigBundle = new Uint8Array(4096).fill(0xc3);
+    const clef = "\u{1D11E}"; // 𝄞 — 4 UTF-8 bytes, one code point
+    const guidance = clef.repeat(2000);
+    const relays = Array.from({ length: 8 }, () => clef.repeat(512));
+    const frame = encodeChannelJoinAccepted({
+      channel_pubkey: CHANNEL, key_bundle: bigBundle, guidance,
+      retention_seconds: 3600, access: "open", relays, members_visible: true,
+    });
+    expect(frame.length).toBeLessThanOrEqual(MAX_JOIN_FRAME_BYTES);
+    expect(channelJoinFrameType(frame)).toBe(JOIN_ACCEPTED_TYPE);
   });
 });

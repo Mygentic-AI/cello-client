@@ -406,7 +406,7 @@ export {
   encodeChannelRekey, decodeChannelRekey,
   isChannelJoinFrame,
   channelJoinFrameType,
-  MAX_JOIN_NOTE_CHARS, MAX_JOIN_GUIDANCE_CHARS, MAX_JOIN_RELAYS,
+  MAX_JOIN_NOTE_CHARS, MAX_JOIN_GUIDANCE_CHARS, MAX_JOIN_RELAYS, MAX_JOIN_FRAME_BYTES,
   JOIN_REQUEST_TYPE, JOIN_ACCEPTED_TYPE, JOIN_REFUSED_TYPE, REKEY_TYPE,
 } from "./channel-join.js";
 export type {
