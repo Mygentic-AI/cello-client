@@ -23,6 +23,9 @@
 
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { hexToBytes } from "./hex.js";
+import { ML_DSA_PUBLIC_KEY_BYTES, ML_DSA_SIGNATURE_BYTES } from "./ml-dsa.js";
+import { ML_KEM_PUBLIC_KEY_BYTES } from "./ml-kem.js";
+import { verifyMlDsa } from "./pq-frame.js";
 
 /**
  * Structural type for ConsortiumManifest — compatible with
@@ -35,7 +38,20 @@ export interface ConsortiumManifestInput {
   expires: string;
   nodes: readonly Record<string, unknown>[];
   signatures: readonly { officerIndex: number; signature: string }[];
+  /** M9D 004: the ML-DSA officer signatures, over the same body. */
+  pq_signatures?: readonly { officerIndex: number; signature: string }[];
   [key: string]: unknown;
+}
+
+/**
+ * The roots a manifest is verified against. M9D 004-PQNODEKEYS: BOTH signature sets are required —
+ * Ed25519 officers at `threshold` and ML-DSA officers at `pqThreshold`.
+ */
+export interface ManifestVerifyOptions {
+  rootKeys: readonly string[];
+  threshold: number;
+  rootKeysPq: readonly string[];
+  pqThreshold: number;
 }
 
 // ─── Result type ─────────────────────────────────────────────────────────────
@@ -54,9 +70,17 @@ export interface ManifestVerifyDiagnostics {
   skippedEntries: ManifestVerifySkippedEntry[];
 }
 
+/** Each refusal names its own cause; the PQ ones are never merged into `manifest_signature_invalid`. */
+export type ManifestVerifyReason =
+  | "manifest_signature_invalid"
+  | "manifest_pq_signatures_missing"
+  | "manifest_pq_signatures_below_threshold"
+  | "manifest_node_mldsa_pubkey_invalid"
+  | "manifest_mlkem_intake_key_invalid";
+
 export type ManifestVerifyResult =
-  | { ok: true; signerCount: number }
-  | { ok: false; reason: "manifest_signature_invalid"; detail: string; diagnostics: ManifestVerifyDiagnostics };
+  | { ok: true; signerCount: number; pqSignerCount: number }
+  | { ok: false; reason: ManifestVerifyReason; detail: string; diagnostics: ManifestVerifyDiagnostics };
 
 // ─── Canonical serialization ─────────────────────────────────────────────────
 
@@ -64,18 +88,20 @@ export type ManifestVerifyResult =
  * Produce the canonical byte representation of a manifest body for signing.
  *
  * Pseudocode (RFC 8032 — signing input):
- *   1. Copy all fields from manifest EXCEPT `signatures`.
+ *   1. Copy all fields from manifest EXCEPT `signatures` and `pq_signatures` (M9D 004: both sets
+ *      sign the same body, and neither covers the other).
  *   2. Sort object keys lexicographically at EVERY nesting level (recursive).
  *   3. Serialize as JSON with no whitespace and no trailing newline.
  *   4. Encode as UTF-8 bytes.
  *
- * The resulting bytes are the message that officers sign with Ed25519.
+ * The resulting bytes are the message the Ed25519 officers sign, and — framed under
+ * `cello-mldsa-consortium-manifest-v1` — the message the ML-DSA officers sign.
  */
 export function canonicalManifestBody(manifest: ConsortiumManifestInput): Uint8Array {
-  // Step 1: exclude signatures — build body object with all fields except signatures
+  // Step 1: exclude both signature sets
   const body: Record<string, unknown> = {};
   for (const key of Object.keys(manifest)) {
-    if (key !== "signatures") {
+    if (key !== "signatures" && key !== "pq_signatures") {
       body[key] = (manifest as Record<string, unknown>)[key];
     }
   }
@@ -121,11 +147,11 @@ function sortedReplacer(_key: string, value: unknown): unknown {
  *
  * This function NEVER throws. All error conditions produce a result value.
  */
-export function verifyManifest(
+export async function verifyManifest(
   manifest: ConsortiumManifestInput,
-  rootKeys: readonly string[],
-  threshold: number,
-): ManifestVerifyResult {
+  opts: ManifestVerifyOptions,
+): Promise<ManifestVerifyResult> {
+  const { rootKeys, threshold } = opts;
   // A manifest with no nodes is structurally invalid — the consumer has no nodes
   // to connect to and cannot distinguish "empty by design" from "tampered" (AC-003(d)).
   if (manifest.nodes.length === 0) {
@@ -174,6 +200,30 @@ export function verifyManifest(
       ok: false,
       reason: "manifest_signature_invalid",
       detail: "manifest contains no validator nodes (all replicas)",
+      diagnostics: { threshold, validOfficers: [], skippedEntries: [] },
+    };
+  }
+
+  // M9D 004: every node names its ML-DSA key (unique), and the manifest names the ML-KEM intake key.
+  const seenMlDsa = new Set<string>();
+  for (const n of manifest.nodes) {
+    const k = (n as { mldsa_pubkey?: unknown }).mldsa_pubkey;
+    if (typeof k !== "string" || !MLDSA_PUBKEY_HEX.test(k) || seenMlDsa.has(k)) {
+      return {
+        ok: false,
+        reason: "manifest_node_mldsa_pubkey_invalid",
+        detail: `node ${JSON.stringify((n as { nodeId?: unknown }).nodeId)} has a missing, malformed or duplicate mldsa_pubkey (expected ${ML_DSA_PUBLIC_KEY_BYTES * 2} lowercase hex chars, unique)`,
+        diagnostics: { threshold, validOfficers: [], skippedEntries: [] },
+      };
+    }
+    seenMlDsa.add(k);
+  }
+  const kem = manifest["mlkem_intake_key"];
+  if (typeof kem !== "string" || !MLKEM_INTAKE_KEY_HEX.test(kem)) {
+    return {
+      ok: false,
+      reason: "manifest_mlkem_intake_key_invalid",
+      detail: `mlkem_intake_key is missing or malformed (expected ${ML_KEM_PUBLIC_KEY_BYTES * 2} lowercase hex chars)`,
       diagnostics: { threshold, validOfficers: [], skippedEntries: [] },
     };
   }
@@ -230,21 +280,61 @@ export function verifyManifest(
 
   const signerCount = verifiedIndices.size;
 
-  if (signerCount >= threshold) {
-    return { ok: true, signerCount };
+  if (signerCount < threshold) {
+    return {
+      ok: false,
+      reason: "manifest_signature_invalid",
+      detail: `${signerCount} valid of ${threshold} required`,
+      diagnostics: {
+        threshold,
+        validOfficers: Array.from(verifiedIndices).sort((a, b) => a - b),
+        skippedEntries,
+      },
+    };
   }
 
-  return {
-    ok: false,
-    reason: "manifest_signature_invalid",
-    detail: `${signerCount} valid of ${threshold} required`,
-    diagnostics: {
-      threshold,
-      validOfficers: Array.from(verifiedIndices).sort((a, b) => a - b),
-      skippedEntries,
-    },
-  };
+  // ─── M9D 004: the ML-DSA officer set, over the SAME body. Both sets are required. ───
+  const pq = manifest.pq_signatures;
+  if (!Array.isArray(pq) || pq.length === 0) {
+    return {
+      ok: false,
+      reason: "manifest_pq_signatures_missing",
+      detail: "the manifest carries no post-quantum officer signatures",
+      diagnostics: { threshold: opts.pqThreshold, validOfficers: [], skippedEntries: [] },
+    };
+  }
+  const pqVerified = new Set<number>();
+  const pqSkipped: ManifestVerifySkippedEntry[] = [];
+  for (const { officerIndex, signature } of pq) {
+    if (!Number.isInteger(officerIndex) || officerIndex < 0 || officerIndex >= opts.rootKeysPq.length) {
+      pqSkipped.push({ index: officerIndex, reason: "out_of_bounds" });
+      continue;
+    }
+    const sigBytes = hexToBytes(signature, ML_DSA_SIGNATURE_BYTES);
+    if (sigBytes === null) { pqSkipped.push({ index: officerIndex, reason: "malformed_signature" }); continue; }
+    const keyBytes = hexToBytes(opts.rootKeysPq[officerIndex]!, ML_DSA_PUBLIC_KEY_BYTES);
+    if (keyBytes === null) { pqSkipped.push({ index: officerIndex, reason: "malformed_key" }); continue; }
+    if (!(await verifyMlDsa(keyBytes, "cello-mldsa-consortium-manifest-v1", body, sigBytes))) {
+      pqSkipped.push({ index: officerIndex, reason: "verification_failed" });
+      continue;
+    }
+    // Uniqueness after verification — only the first valid signature per officer counts.
+    if (pqVerified.has(officerIndex)) { pqSkipped.push({ index: officerIndex, reason: "duplicate" }); continue; }
+    pqVerified.add(officerIndex);
+  }
+  if (pqVerified.size < opts.pqThreshold) {
+    return {
+      ok: false,
+      reason: "manifest_pq_signatures_below_threshold",
+      detail: `${pqVerified.size} valid post-quantum officer signatures of ${opts.pqThreshold} required`,
+      diagnostics: { threshold: opts.pqThreshold, validOfficers: Array.from(pqVerified).sort((a, b) => a - b), skippedEntries: pqSkipped },
+    };
+  }
+  return { ok: true, signerCount, pqSignerCount: pqVerified.size };
 }
+
+const MLDSA_PUBKEY_HEX = new RegExp("^[0-9a-f]{" + ML_DSA_PUBLIC_KEY_BYTES * 2 + "}$");
+const MLKEM_INTAKE_KEY_HEX = new RegExp("^[0-9a-f]{" + ML_KEM_PUBLIC_KEY_BYTES * 2 + "}$");
 
 // ─── Internal helpers ────────────────────────────────────────────────────────
 

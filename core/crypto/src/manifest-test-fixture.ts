@@ -12,8 +12,12 @@
  * Crypto reference: RFC 8032 (Ed25519).
  */
 
+import { createHash } from "node:crypto";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { canonicalManifestBody } from "./manifest.js";
+import { mlDsaProviderFromSeed } from "./ml-dsa.js";
+import { mlKemKeypairFromSeed } from "./ml-kem.js";
+import { signMlDsa } from "./pq-frame.js";
 import type { ConsortiumManifestInput } from "./manifest.js";
 
 /**
@@ -32,6 +36,8 @@ export const TEST_OFFICER_SEEDS: readonly [Uint8Array, Uint8Array, Uint8Array, U
 
 /** Node entry for makeTestManifest input. Structurally matches ConsortiumNode from protocol-types. */
 export type TestConsortiumNode = {
+  /** M9D 004: defaults to a deterministic key per nodeId. */
+  mldsa_pubkey?: string;
   nodeId: string;
   pubkey: string;
   region: string;
@@ -53,44 +59,71 @@ export interface MakeTestManifestOpts {
  * Create a test ConsortiumManifest signed by officers 0, 1, 2 with Ed25519 (RFC 8032)
  * over the canonical body bytes from canonicalManifestBody.
  */
-export function makeTestManifest(
+export async function makeTestManifest(
   nodes: TestConsortiumNode[],
   opts?: MakeTestManifestOpts,
-): ConsortiumManifestInput {
+): Promise<ConsortiumManifestInput> {
   const manifest: ConsortiumManifestInput = {
     version: opts?.version ?? 1,
     not_before: opts?.notBefore ?? "2026-01-01T00:00:00Z",
     /**
-     * ⚠️ A FIXTURE THAT EXPIRES IS A TEST SUITE WITH A FUSE. This defaulted to `2027-01-01`, four
-     * months out when it was found (2026-08-24) — after which every default-fixture manifest becomes
-     * EXPIRED and every test that needs an in-window one goes red **on a date, with no code change**.
-     * It would also have silently switched on the lapsed-manifest branches added by
-     * `DOD-M15-EXPIRY-CONSUMER-POLICY-1` for every existing verifier test at the same moment.
-     *
-     * Far-future and FIXED, not `Date.now() + 1y`: a rolling default makes the fixture's window
-     * depend on the clock, and the tests that care about window boundaries pass their own dates
-     * anyway — which is the reason this default only ever needs to mean "in window".
+     * ⚠️ A FIXTURE THAT EXPIRES IS A TEST SUITE WITH A FUSE. Far-future and FIXED, not a rolling
+     * default: a rolling default makes the fixture's window depend on the clock, and the tests that
+     * care about window boundaries pass their own dates anyway.
      */
     expires: opts?.expires ?? "2099-01-01T00:00:00Z",
-    nodes: nodes.map((n) => ({
+    nodes: await Promise.all(nodes.map(async (n) => ({
       ...n,
       role: n.role ?? "validator",
       peerId: n.peerId ?? `12D3KooWTest${n.nodeId}`,
-    })) as readonly Record<string, unknown>[],
+      // M9D 004: every node names its ML-DSA key — deterministic per nodeId unless the test names one.
+      mldsa_pubkey: n.mldsa_pubkey ?? await testNodeMlDsaPubkeyHex(n.nodeId),
+    }))) as readonly Record<string, unknown>[],
+    intake_key: { key_id: "test-intake-0", pubkey: "d".repeat(64) },
+    mlkem_intake_key: await testMlKemIntakeKeyHex(),
     signatures: [],
+    pq_signatures: [],
   };
 
-  // Compute canonical body for signing
+  // Both officer sets sign the same canonical body (which excludes both signature fields).
   const body = canonicalManifestBody(manifest);
-
-  // Sign with officers 0, 1, 2 — meeting threshold of 3
-  const signatures = [0, 1, 2].map((idx) => ({
+  manifest.signatures = [0, 1, 2].map((idx) => ({
     officerIndex: idx,
     signature: Buffer.from(ed25519.sign(body, TEST_OFFICER_SEEDS[idx])).toString("hex"),
   }));
-
-  manifest.signatures = signatures;
+  manifest.pq_signatures = await Promise.all([0, 1, 2].map(async (idx) => ({
+    officerIndex: idx,
+    signature: Buffer.from(await signMlDsa(await mlDsaProviderFromSeed(TEST_OFFICER_PQ_SEEDS[idx]), "cello-mldsa-consortium-manifest-v1", body)).toString("hex"),
+  })));
   return manifest;
+}
+
+// ─── Test root keys (M9D 004: moved here from the deleted consortium-keys.ts) ──
+
+export const TEST_CONSORTIUM_ROOT_KEYS: readonly string[] = TEST_OFFICER_SEEDS.map((s) =>
+  Buffer.from(ed25519.getPublicKey(s)).toString("hex"),
+);
+export const TEST_CONSORTIUM_THRESHOLD = 3;
+
+/** The test ML-DSA officer seeds — distinct from the Ed25519 ones. Never exported from the index. */
+export const TEST_OFFICER_PQ_SEEDS: readonly Uint8Array[] = [0x11, 0x12, 0x13, 0x14, 0x15].map((b) => new Uint8Array(32).fill(b));
+
+/** The test ML-DSA officer PUBLIC keys, hex — the PQ roots a test verifies against. */
+export async function testConsortiumRootKeysPq(): Promise<string[]> {
+  return Promise.all(TEST_OFFICER_PQ_SEEDS.map(async (s) =>
+    Buffer.from(await (await mlDsaProviderFromSeed(s)).getPublicKey()).toString("hex")));
+}
+export const TEST_CONSORTIUM_PQ_THRESHOLD = 3;
+
+/** A test node's ML-DSA public key, deterministic from its nodeId. */
+export async function testNodeMlDsaPubkeyHex(nodeId: string): Promise<string> {
+  const seed = new Uint8Array(createHash("sha256").update(`cello-test-node-mldsa:${nodeId}`).digest());
+  return Buffer.from(await (await mlDsaProviderFromSeed(seed)).getPublicKey()).toString("hex");
+}
+
+/** A deterministic test ML-KEM intake public key, hex. */
+export async function testMlKemIntakeKeyHex(): Promise<string> {
+  return Buffer.from((await mlKemKeypairFromSeed(new Uint8Array(64).fill(0x6b))).publicKey).toString("hex");
 }
 
 // ─── Test directory node keypair ─────────────────────────────────────────────

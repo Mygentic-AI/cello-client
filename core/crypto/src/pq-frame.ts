@@ -33,6 +33,8 @@ export const PQ_CONTEXTS = [
   "cello-mldsa-key-binding-v1",
   // 003-PQSESSION — the session-ephemeral announce.
   "cello-mldsa-session-ephemeral-v1",
+  // 004-PQNODEKEYS — every consortium manifest pq_signatures entry.
+  "cello-mldsa-consortium-manifest-v1",
 ] as const;
 
 export type PqContext = (typeof PQ_CONTEXTS)[number];

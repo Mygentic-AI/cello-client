@@ -150,19 +150,22 @@ export {
 } from "./session-content-seal.js";
 
 // M7-MANIFEST-001: consortium manifest verification and root key constants
-export type { ManifestVerifyResult, ManifestVerifyDiagnostics, ManifestVerifySkipReason, ManifestVerifySkippedEntry, ConsortiumManifestInput } from "./manifest.js";
+export type { ManifestVerifyResult, ManifestVerifyReason, ManifestVerifyOptions, ManifestVerifyDiagnostics, ManifestVerifySkipReason, ManifestVerifySkippedEntry, ConsortiumManifestInput } from "./manifest.js";
 export { canonicalManifestBody, verifyManifest } from "./manifest.js";
 // M8B-PREAUTH-CAP: signed pre-authorization capability (replaces the opaque single-use token).
 export type { PreAuthCapability, PreAuthCapabilityBody, CapabilityVerifyResult, CapabilityVerifyReason } from "./preauth-capability.js";
 export { canonicalCapabilityBody, signCapability, verifyCapability, encodeCapability, decodeCapability } from "./preauth-capability.js";
+export type { TestConsortiumNode, MakeTestManifestOpts } from "./manifest-test-fixture.js";
 export {
-  CONSORTIUM_ROOT_KEYS,
-  CONSORTIUM_THRESHOLD,
+  makeTestManifest,
+  TEST_DIRECTORY_NODE_KEYPAIR,
   TEST_CONSORTIUM_ROOT_KEYS,
   TEST_CONSORTIUM_THRESHOLD,
-} from "./consortium-keys.js";
-export type { TestConsortiumNode, MakeTestManifestOpts } from "./manifest-test-fixture.js";
-export { makeTestManifest, TEST_DIRECTORY_NODE_KEYPAIR } from "./manifest-test-fixture.js";
+  testConsortiumRootKeysPq,
+  TEST_CONSORTIUM_PQ_THRESHOLD,
+  testNodeMlDsaPubkeyHex,
+  testMlKemIntakeKeyHex,
+} from "./manifest-test-fixture.js";
 
 // M12 DOD-AE-APPEND-1: directory<->directory anti-entropy peer-auth TBS
 export { buildAePeerAuthTbs, verifyAePeerAuth, AE_PEER_AUTH_DOMAIN } from "./ae-peer-auth.js";
