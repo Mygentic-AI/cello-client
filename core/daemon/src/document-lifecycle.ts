@@ -49,9 +49,8 @@ export class DocumentLifecycle {
     removedFor: (ownerAgentId: string, documentId: string) => boolean,
     /**
      * SYNC-P4 review F2 — "is this document ended?", answered by the fold, never the status
-     * column. `derived: false` means the chain does not derive (legacy bilateral, undecodable
-     * bytes); ONLY there does the stored column stand in, because for a pre-pivot document the
-     * column IS the record of its ending.
+     * column. `derived: false` means the chain does not derive (no genesis record, undecodable
+     * bytes); ONLY there does the stored column stand in.
      */
     endedFor: (
       ownerAgentId: string,

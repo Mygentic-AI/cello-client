@@ -132,8 +132,7 @@ export function applyJsonToMap(
         continue;
       }
       if (nestable) {
-        // Either absent, or a legacy PLAIN object written before nesting existed. Both become a
-        // nested map here; that is the whole migration, and it happens on first touch.
+        // Absent: it becomes a nested map here.
         const child = newYMap(map);
         map.set(key, child);
         written.push(...applyJsonToMap(child, value as { [k: string]: JsonValue }, doc, path));

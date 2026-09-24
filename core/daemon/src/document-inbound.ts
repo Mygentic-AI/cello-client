@@ -115,9 +115,8 @@ export interface DocumentInboundDeps {
   ): "participant" | "invited" | "removed" | "stranger" | "unknown";
   /**
    * DOD-MP-INBOUND-N-1 — the CURRENT derived holders, or null when the chain does not derive.
-   * When it derives, membership is the WHOLE sender gate — the genesis-peer column is a
-   * bilateral-legacy fallback, never a permanent credential (the same rule the ack gate
-   * learned in FANOUT-1's review).
+   * When it derives, membership is the WHOLE sender gate; when it does not, the envelope is
+   * refused (the same rule the ack gate learned in FANOUT-1's review).
    */
   currentHolders(ownerAgentId: string, documentId: string): string[] | null;
   /**
@@ -261,8 +260,7 @@ export class DocumentInbound {
     // non-party confirms the document exists and what state it is in. When the chain DERIVES,
     // derived membership is
     // the whole gate — a joined third holder's envelope is as admissible as the genesis peer's,
-    // and a removed genesis peer's is not admissible at all. Only when the chain cannot answer
-    // (bilateral legacy, no genesis record) does the row's peer column stand in.
+    // and a removed genesis peer's is not admissible at all.
     // SYNC-G1 (R20): admissibility is ruled AT THE ENVELOPE'S SIGNED FRONTIER — the governance
     // world its author actually held — never at our current state, which refuses a removed
     // author's legitimate earlier work and breaks convergence for every holder who was behind
@@ -272,30 +270,24 @@ export class DocumentInbound {
     // position could have authored — the same bounded concession the governance fold accepted,
     // and the fold's removal dominance keeps such a daemon out of governance regardless.
     const senderHolders = this.#d.currentHolders(ownerAgentId, env.document_id);
-    let senderIsParty: boolean;
     if (senderHolders === null) {
-      // Bilateral legacy — no derivable chain; the row's peer column is the membership. A
-      // genesis-less document can hold no validated entries, so `standingOf` answers `unknown`
-      // here and the removed branch below is unreachable in practice — kept so the two paths
-      // cannot drift about what "removed" means (SYNC-D8: one derivation).
-      if (this.#d.standingOf(ownerAgentId, env.document_id, env.sender_agent_id) === "removed") {
-        this.#d.logger.warn("document.inbound.sender_removed", {
-          documentId: env.document_id,
-          senderAgentId: env.sender_agent_id,
-          correlationId,
-        });
-        return {
-          ok: false,
-          reason: "document_sender_removed",
-          terminal: true,
-          envelopeHash,
-          detail:
-            "this holder was removed from the document — the removal is forward-only (your " +
-            "copy is yours), but new edits are no longer accepted",
-        };
-      }
-      senderIsParty = env.sender_agent_id === doc.peerAgentId;
-    } else {
+      // The chain does not derive: this holder has no genesis record for the document, or its bytes
+      // do not decode. Every document starts from a recorded proposal, so this is a local fault —
+      // refused, never answered from a stored peer column.
+      this.#d.logger.error("document.inbound.chain_not_derivable", {
+        documentId: env.document_id,
+        senderAgentId: env.sender_agent_id,
+        correlationId,
+      });
+      return {
+        ok: false,
+        reason: "document_genesis_missing",
+        envelopeHash,
+        detail: "this holder cannot derive the document's membership — its genesis record is missing or unreadable",
+      };
+    }
+    let senderIsParty: boolean;
+    {
       const at = this.#d.deriveAtFrontier(
         ownerAgentId, env.document_id, env.governance_parents,
       );
@@ -405,30 +397,11 @@ export class DocumentInbound {
       };
     }
 
-    // 4b (SYNC-G1): the epoch-equality ruling and the current-state removed-sender check are
-    // GONE — both are the causal sender gate's job now, ruled at the envelope's signed
-    // frontier before anything else ran. (D7: the epoch stamp itself dies with this phase.)
-    // 5. The document must still ACCEPT — but for a document whose chain DERIVES, the ending
-    // ruling already happened at step 4 (R30: an ending in the envelope's own named ancestors
-    // refuses terminally; a frontier free of endings MUST be admitted, AC16 — the last edits
-    // before an agreed close are precisely the content the exchange still owes every holder,
-    // and the status column is a display projection that can lag the fold; review F1). Only a
-    // LEGACY document — no derivable chain, so no frontier to rule at — is judged by its stored
-    // status here, because for the pre-pivot bilateral record the column IS its ending.
-    if (senderHolders === null && (doc.status === "killed" || doc.status === "closed")) {
-      // TERMINAL, and for the same reason `document_stalled` below is NOT: these are DECISIONS.
-      // Nothing the sender does makes a killed or closed legacy document accept this envelope.
-      return {
-        ok: false,
-        reason: doc.status === "killed" ? "document_killed" : "document_closed",
-        terminal: true,
-        envelopeHash,
-        detail:
-          doc.status === "killed"
-            ? "this document was ended locally and no longer accepts updates"
-            : "this document was closed by agreement and no longer accepts updates",
-      };
-    }
+    // 5. The document must still ACCEPT. The ending ruling already happened at step 4 (R30: an
+    // ending in the envelope's own named ancestors refuses terminally; a frontier free of endings
+    // MUST be admitted, AC16 — the last edits before an agreed close are precisely the content the
+    // exchange still owes every holder, and the status column is a display projection that can lag
+    // the fold; review F1).
     const accepts = this.#d.rejections.acceptsUpdates(ownerAgentId, env.document_id);
     if (!accepts.ok) {
       // The stall reason, composed by the unit that owns the stall. Reporting this envelope's own

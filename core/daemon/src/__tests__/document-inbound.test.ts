@@ -146,13 +146,12 @@ function newFixture(
   const inbound = new DocumentInbound({
     store, engine, gate, rejections, logger,
     ...(opts.screenProjected ? { screenProjected: opts.screenProjected } : {}),
-    // Null = bilateral legacy (the row's peer column is the gate) — the pre-fan-out semantics
-    // every older test in this file was written against.
-    currentHolders: opts.currentHolders ?? (() => null),
+    // Default: a two-party document whose chain derives to its genesis peer.
+    currentHolders: opts.currentHolders ?? (() => [PEER]),
     deriveAtFrontier:
       opts.deriveAtFrontier ??
       ((o: string, d: string) => {
-        const holders = (opts.currentHolders ?? (() => null))(o, d);
+        const holders = (opts.currentHolders ?? (() => [PEER]))(o, d);
         if (holders === null) return { ok: false as const, reason: "document_genesis_missing" };
         // The fake mirrors the layer's real semantics for a CURRENT-frontier envelope: current
         // participants minus anyone the recorded chain says is removed.
@@ -617,7 +616,9 @@ describe("DocumentInbound — a gate refusal becomes a REJECTION, and the ack sa
 
 
 describe("DocumentInbound — a document that has STOPPED accepting does not admit", () => {
-  for (const status of ["killed", "closed", "stalled"] as const) {
+  // Killed and closed are rulings of the derived chain (the ending branch), not of the status
+  // column — see "a DERIVABLE document whose column says closed still ADMITS". Stalled is local.
+  for (const status of ["stalled"] as const) {
     it(`refuses while ${status}, naming that as the cause`, async () => {
       const f = newFixture();
       f.store.setDocumentStatus(AGENT, DOC, status);
@@ -735,18 +736,6 @@ describe("a TERMINAL refusal settles the sender's delivery instead of leaving it
     // The envelope hash is what makes the ack settle THIS delivery rather than the sender's whole
     // backlog. A terminal refusal that cannot name what it refused settles nothing.
     expect((res as { envelopeHash?: string }).envelopeHash).toBe(documentEnvelopeHash(env));
-  });
-
-  it("a KILLED and a CLOSED LEGACY document is terminal — no chain, so the column is its ending", async () => {
-    for (const status of ["killed", "closed"] as const) {
-      const f = newFixture({ status });
-      const env = envelope();
-      const res = await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(env), NOW);
-      // THE HASH, not just the flag. Asserting `terminal` alone let an implementation drop
-      // `envelopeHash` here and still pass — and the router only acks when it has BOTH, so the
-      // defect came straight back with every gate green. Caught in review, not by the gate.
-      expect(res, status).toMatchObject({ terminal: true, envelopeHash: documentEnvelopeHash(env) });
-    }
   });
 
   it("a DERIVABLE document whose column says closed still ADMITS an ending-free frontier (R30/AC16 — review F1)", async () => {

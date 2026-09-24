@@ -32,7 +32,8 @@ import { DocumentPublish } from "../document-publish.js";
 import { DocumentHandshake } from "../document-handshake.js";
 import type { Logger } from "../types.js";
 
-const DOC = "cc".repeat(32);
+/** The document id — the hash of the proposal `openDocument` makes, so it is set per test. */
+let DOC = "";
 const NOW = 1_700_000_000_000;
 
 function recordingLogger(): { logger: Logger; events: Array<{ event: string; fields: Record<string, unknown> }> } {
@@ -67,8 +68,7 @@ async function makeParty(name: string, clientId: number) {
 
   const publish = new DocumentPublish({
     governanceFrontierFor: () => [],
-    // This harness seeds document rows directly (no handshake record), so chain derivation has
-    // nothing to derive from — the bilateral row IS the fixture's arrangement.
+    // The two-party arrangement `openDocument` proposed: the row's peer.
     holdersFor: (o, d) => {
       const doc = layer.store.getDocument(o, d);
       return doc ? [doc.peerAgentId] : null;
@@ -95,7 +95,28 @@ async function makeParty(name: string, clientId: number) {
   return { name, id, layer, publish, workingDoc, events, logger, db, sign: keys.sign.bind(keys) };
 }
 
+/**
+ * Open a document the way production does: A proposes, B records and accepts, and both mint the
+ * row from the agreed terms. The proposal IS the genesis, so the chain derives on both sides.
+ */
 async function openDocument(a: Awaited<ReturnType<typeof makeParty>>, b: Awaited<ReturnType<typeof makeParty>>) {
+  const base: DocumentProposalEnvelope = {
+    type: "document_proposal",
+    feature_version: DOCUMENT_FEATURE_VERSION,
+    proposer_agent_id: a.id,
+    peer_agent_id: b.id,
+    document_type: "markdown",
+    properties: { assurance_tier: ASSURANCE_TIER_V1, schema_enforcement: false, topology: TOPOLOGY_DEFAULT, append_only: false },
+    starting_content: null,
+    nonce: new Uint8Array([1, 2, 3, 4]),
+    proposed_at_ms: 1,
+    signature: new Uint8Array(64),
+  };
+  const proposal = { ...base, signature: await a.sign(buildDocumentProposalTbs(base)) };
+  DOC = documentIdFromProposal(proposal);
+  a.layer.handshake.recordOutgoing(a.id, proposal, 1);
+  expect(b.layer.handshake.recordProposal(b.id, encodeDocumentProposal(proposal), 1)).toMatchObject({ state: "pending" });
+  expect(b.layer.handshake.accept(b.id, DOC, 2).ok).toBe(true);
   for (const [self, peer] of [
     [a, b],
     [b, a],
@@ -105,7 +126,7 @@ async function openDocument(a: Awaited<ReturnType<typeof makeParty>>, b: Awaited
       ownerAgentId: self.id,
       peerAgentId: peer.id,
       documentType: "markdown",
-      properties: {},
+      properties: proposal.properties as unknown as Record<string, unknown>,
       status: "active",
       createdAtMs: 1,
     });
