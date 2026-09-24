@@ -15,15 +15,20 @@
  * missing from it, which is the point: a directory that does not hold participant_a's K_local
  * cannot produce one.
  *
+ * M9D 002-PQKEYS: the binding is v2 — it names all four of the initiator's keys (K_local, group,
+ * ML-DSA, ML-KEM) and carries BOTH an Ed25519 and an ML-DSA signature. The refusal reason is the
+ * `KeyBindingRefusal` itself. Tests 13 and 14 of the order live at the foot of the file.
+ *
  * REAL CRYPTO ONLY. The unit IS a signature check.
  */
 import { describe, it, expect } from "vitest";
-import { generateKeypair, buildKeyBindingTbs, CONTEXT_SESSION_ESTABLISHMENT } from "@cello-protocol/crypto";
+import { generateKeypair, buildKeyBindingTbs, CONTEXT_SESSION_ESTABLISHMENT, signMlDsa } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { buildSessionEstablishmentTbs, computeGenesisPrevRoot } from "@cello-protocol/protocol-types";
-import type { SessionAssignment } from "@cello-protocol/protocol-types";
 import { verifyInboundAssignment } from "../assignment-verify.js";
 import { parseSessionAssignment } from "../session-assignment-parser.js";
+import type { ParsedSessionAssignment } from "../session-assignment-parser.js";
+import { fixturePqKeys } from "./helpers/signed-assignment.js";
 
 const SESSION_ID = new Uint8Array(16).fill(9);
 const TS = 1_700_000_000_000;
@@ -46,6 +51,8 @@ async function frameFor(opts: {
   malformedBinding?: boolean;
   /** Change a signed field after signing. */
   tamperAfterSigning?: boolean;
+  /** M9D 002-PQKEYS: sign the ML-DSA half with a THIRD agent's genuine ML-DSA key. */
+  pqSignedByThirdParty?: boolean;
 }): Promise<Record<string, unknown>> {
   const initiatorPub = await opts.initiator.getPublicKey();
   const groupPub = await opts.groupSigner.getPublicKey();
@@ -62,9 +69,13 @@ async function frameFor(opts: {
   const framed = new Uint8Array(ctx.length + 1 + tbs.length);
   framed.set(ctx, 0); framed[ctx.length] = 0x00; framed.set(tbs, ctx.length + 1);
 
+  const pq = await fixturePqKeys(Buffer.from(initiatorPub).toString("hex"));
+  const bindingTbs = buildKeyBindingTbs({ kLocal: initiatorPub, group: groupPub, mlDsa: pq.mlDsaPubkey, mlKem: pq.mlKemPubkey });
   const bindingSigner = opts.claimBindingWith ?? opts.initiator;
-  const fullBinding = await bindingSigner.sign(buildKeyBindingTbs(initiatorPub, groupPub));
+  const fullBinding = await bindingSigner.sign(bindingTbs);
   const binding = opts.malformedBinding ? fullBinding.subarray(0, 32) : fullBinding;
+  const pqSigner = opts.pqSignedByThirdParty ? (await fixturePqKeys("third-party")).mlDsaProvider : pq.mlDsaProvider;
+  const bindingPq = await signMlDsa(pqSigner, "cello-mldsa-key-binding-v1", bindingTbs);
 
   return {
     session_id: SESSION_ID,
@@ -85,11 +96,13 @@ async function frameFor(opts: {
     transport_mode: "relay",
     high_stakes: false,
     prior_relay_id: "",
-    ...(opts.omitBinding ? {} : { participant_a_key_binding: binding }),
+    participant_a_ml_dsa_pubkey: pq.mlDsaPubkey,
+    participant_a_ml_kem_pubkey: pq.mlKemPubkey,
+    ...(opts.omitBinding ? {} : { participant_a_key_binding: binding, participant_a_key_binding_pq: bindingPq }),
   };
 }
 
-function parsed(raw: Record<string, unknown>): SessionAssignment {
+function parsed(raw: Record<string, unknown>): ParsedSessionAssignment {
   const a = parseSessionAssignment(raw);
   if (!a) throw new Error("fixture did not parse — the test would be measuring the parser, not the verifier");
   return a;
@@ -101,7 +114,7 @@ describe("038-KEYBIND: a responder places the caller's group key before verifyin
     const group = generateKeypair();
     const raw = await frameFor({ initiator, groupSigner: group });
 
-    const v = verifyInboundAssignment(parsed(raw), null);
+    const v = await verifyInboundAssignment(parsed(raw), null);
     expect(v.ok, "a legitimate first contact must still connect — a gate that breaks sessions is worse than the hole").toBe(true);
     // `bound`, not `internal`: the verdict names a property the code now holds.
     expect(v.ok && v.mode).toBe("bound");
@@ -121,9 +134,9 @@ describe("038-KEYBIND: a responder places the caller's group key before verifyin
     const directory = generateKeypair();
     const raw = await frameFor({ initiator, groupSigner: directory, claimBindingWith: directory });
 
-    const v = verifyInboundAssignment(parsed(raw), null);
+    const v = await verifyInboundAssignment(parsed(raw), null);
     expect(v.ok).toBe(false);
-    expect(!v.ok && v.reason).toBe("inbound_assignment_key_binding_invalid");
+    expect(!v.ok && v.reason).toBe("key_binding_signature_mismatch");
     expect(!v.ok && v.detail).toContain("identity key");
   });
 
@@ -132,21 +145,22 @@ describe("038-KEYBIND: a responder places the caller's group key before verifyin
     const directory = generateKeypair();
     const raw = await frameFor({ initiator, groupSigner: directory, omitBinding: true });
 
-    const v = verifyInboundAssignment(parsed(raw), null);
+    const v = await verifyInboundAssignment(parsed(raw), null);
     expect(v.ok).toBe(false);
     // A DIFFERENT reason from the failed case: absent means the caller's side is behind, failed
     // means a key was substituted, and the two remedies are not the same.
-    expect(!v.ok && v.reason).toBe("inbound_assignment_no_key_binding");
+    expect(!v.ok && v.reason).toBe("key_binding_missing");
   });
 
-  it("sends a MALFORMED binding down the ABSENT path — missing and malformed never diverge", async () => {
+  it("REFUSES a MALFORMED binding — the parser carries it as absent, so it is refused as missing", async () => {
+    // A wrong-width value parses as `undefined`: the refusal costs exactly what an absent one costs.
     const initiator = generateKeypair();
     const group = generateKeypair();
     const raw = await frameFor({ initiator, groupSigner: group, malformedBinding: true });
 
-    const v = verifyInboundAssignment(parsed(raw), null);
+    const v = await verifyInboundAssignment(parsed(raw), null);
     expect(v.ok).toBe(false);
-    expect(!v.ok && v.reason).toBe("inbound_assignment_no_key_binding");
+    expect(!v.ok && v.reason).toBe("key_binding_missing");
   });
 
   it("REFUSES a binding lifted from ANOTHER agent — the group key alone is not what is signed", async () => {
@@ -158,14 +172,15 @@ describe("038-KEYBIND: a responder places the caller's group key before verifyin
     const group = generateKeypair();
     const otherPub = await other.getPublicKey();
     const groupPub = await group.getPublicKey();
-    const liftable = await other.sign(buildKeyBindingTbs(otherPub, groupPub));
+    const otherPq = await fixturePqKeys(Buffer.from(otherPub).toString("hex"));
+    const liftable = await other.sign(buildKeyBindingTbs({ kLocal: otherPub, group: groupPub, mlDsa: otherPq.mlDsaPubkey, mlKem: otherPq.mlKemPubkey }));
 
     const raw = await frameFor({ initiator, groupSigner: group });
     raw["participant_a_key_binding"] = liftable;
 
-    const v = verifyInboundAssignment(parsed(raw), null);
+    const v = await verifyInboundAssignment(parsed(raw), null);
     expect(v.ok).toBe(false);
-    expect(!v.ok && v.reason).toBe("inbound_assignment_key_binding_invalid");
+    expect(!v.ok && v.reason).toBe("key_binding_signature_mismatch");
   });
 
   it("still catches a TAMPERED frame — the binding is an addition, not a replacement", async () => {
@@ -173,7 +188,7 @@ describe("038-KEYBIND: a responder places the caller's group key before verifyin
     const group = generateKeypair();
     const raw = await frameFor({ initiator, groupSigner: group, tamperAfterSigning: true });
 
-    const v = verifyInboundAssignment(parsed(raw), null);
+    const v = await verifyInboundAssignment(parsed(raw), null);
     expect(v.ok).toBe(false);
     expect(!v.ok && v.reason).toBe("inbound_assignment_signature_invalid");
   });
@@ -186,7 +201,7 @@ describe("038-KEYBIND: a responder places the caller's group key before verifyin
     const raw = await frameFor({ initiator, groupSigner: group });
     const pinned = Buffer.from(await generateKeypair().getPublicKey()).toString("hex");
 
-    const v = verifyInboundAssignment(parsed(raw), pinned);
+    const v = await verifyInboundAssignment(parsed(raw), pinned);
     expect(v.ok).toBe(false);
     expect(!v.ok && v.reason).toBe("inbound_assignment_signer_not_pinned");
   });
@@ -197,7 +212,7 @@ describe("038-KEYBIND: a responder places the caller's group key before verifyin
     const raw = await frameFor({ initiator, groupSigner: group });
     const pinned = Buffer.from(await group.getPublicKey()).toString("hex");
 
-    const v = verifyInboundAssignment(parsed(raw), pinned);
+    const v = await verifyInboundAssignment(parsed(raw), pinned);
     expect(v.ok).toBe(true);
     expect(v.ok && v.mode).toBe("pinned");
   });
@@ -210,8 +225,56 @@ describe("038-KEYBIND: a responder places the caller's group key before verifyin
     const raw = await frameFor({ initiator, groupSigner: group, omitBinding: true });
     const pinned = Buffer.from(await group.getPublicKey()).toString("hex");
 
-    const v = verifyInboundAssignment(parsed(raw), pinned);
+    const v = await verifyInboundAssignment(parsed(raw), pinned);
     expect(v.ok).toBe(false);
-    expect(!v.ok && v.reason).toBe("inbound_assignment_no_key_binding");
+    expect(!v.ok && v.reason).toBe("key_binding_missing");
+  });
+});
+
+describe("002-PQKEYS: the responder requires BOTH halves of the initiator's v2 binding", () => {
+  it("test 13: a genuine Ed25519 half beside a THIRD agent's genuine ML-DSA half → key_binding_pq_signature_mismatch", async () => {
+    const initiator = generateKeypair();
+    const group = generateKeypair();
+    const raw = await frameFor({ initiator, groupSigner: group, pqSignedByThirdParty: true });
+
+    const v = await verifyInboundAssignment(parsed(raw), null);
+    expect(v.ok).toBe(false);
+    expect(!v.ok && v.reason).toBe("key_binding_pq_signature_mismatch");
+    // The verdict carries no keys, so the accept path has nothing it could record.
+    expect("initiatorMlDsa" in v).toBe(false);
+  });
+
+  it("the ML-DSA half ABSENT (the Ed25519 half present) → key_binding_pq_missing", async () => {
+    const initiator = generateKeypair();
+    const group = generateKeypair();
+    const raw = await frameFor({ initiator, groupSigner: group });
+    delete raw["participant_a_key_binding_pq"];
+
+    const v = await verifyInboundAssignment(parsed(raw), null);
+    expect(!v.ok && v.reason).toBe("key_binding_pq_missing");
+  });
+
+  it("an ML-KEM key swapped under both kept signatures → refused", async () => {
+    const initiator = generateKeypair();
+    const group = generateKeypair();
+    const raw = await frameFor({ initiator, groupSigner: group });
+    raw["participant_a_ml_kem_pubkey"] = (await fixturePqKeys("someone-else")).mlKemPubkey;
+
+    const v = await verifyInboundAssignment(parsed(raw), null);
+    expect(!v.ok && v.reason).toBe("key_binding_signature_mismatch");
+  });
+
+  it("test 14 (responder half): on success the verdict returns exactly the initiator's two PQ keys", async () => {
+    const initiator = generateKeypair();
+    const group = generateKeypair();
+    const raw = await frameFor({ initiator, groupSigner: group });
+    const pq = await fixturePqKeys(Buffer.from(await initiator.getPublicKey()).toString("hex"));
+
+    const v = await verifyInboundAssignment(parsed(raw), null);
+    expect(v.ok).toBe(true);
+    if (v.ok) {
+      expect(Buffer.from(v.initiatorMlDsa)).toEqual(Buffer.from(pq.mlDsaPubkey));
+      expect(Buffer.from(v.initiatorMlKem)).toEqual(Buffer.from(pq.mlKemPubkey));
+    }
   });
 });

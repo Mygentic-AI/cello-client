@@ -14,9 +14,10 @@
  * keypair rather than stubbing the primitive.
  */
 import { describe, it, expect } from "vitest";
-import { generateKeypair, buildKeyBindingTbs, CONTEXT_SESSION_ESTABLISHMENT } from "@cello-protocol/crypto";
+import { generateKeypair, buildKeyBindingTbs, CONTEXT_SESSION_ESTABLISHMENT, signMlDsa } from "@cello-protocol/crypto";
 import { buildSessionEstablishmentTbs, computeGenesisPrevRoot } from "@cello-protocol/protocol-types";
-import type { SessionAssignment } from "@cello-protocol/protocol-types";
+import type { ParsedSessionAssignment as SessionAssignment } from "../session-assignment-parser.js";
+import { fixturePqKeys } from "./helpers/signed-assignment.js";
 import { verifyAssignmentSignature } from "../assignment-verify.js";
 import type { DbRegistrationPersistence } from "../db-identity-store.js";
 import type { Logger } from "../types.js";
@@ -65,6 +66,8 @@ async function makeAssignment(opts: {
   omitCounterpartyBinding?: boolean;
   /** 038-KEYBIND: have someone OTHER than participant_b vouch for participant_b's group key. */
   forgeCounterpartyBinding?: boolean;
+  /** M9D 002-PQKEYS: participant_b's ML-DSA half signed by a THIRD agent's genuine ML-DSA key. */
+  forgeCounterpartyBindingPq?: boolean;
   announceKey?: Uint8Array;
   counterpartyPeerId?: string;
   tamperAfterSigning?: boolean;
@@ -106,6 +109,10 @@ async function makeAssignment(opts: {
   framed.set(enc, 0); framed[enc.length] = 0x00; framed.set(tbs, enc.length + 1);
   const sig = await opts.signWith.sign(framed);
 
+  // M9D 002-PQKEYS: participant_b's v2 binding — all four of their keys, both signatures.
+  const bPq = await fixturePqKeys(Buffer.from(PUB_B).toString("hex"));
+  const bTbs = buildKeyBindingTbs({ kLocal: PUB_B, group: PUB_B_GROUP, mlDsa: bPq.mlDsaPubkey, mlKem: bPq.mlKemPubkey });
+
   return {
     ...base,
     signature_type: "frost",
@@ -116,9 +123,14 @@ async function makeAssignment(opts: {
       ? {}
       : {
           participant_b_primary_pubkey: PUB_B_GROUP,
-          participant_b_key_binding: await (
-            opts.forgeCounterpartyBinding ? generateKeypair() : RESPONDER
-          ).sign(buildKeyBindingTbs(PUB_B, PUB_B_GROUP)),
+          participant_b_ml_dsa_pubkey: bPq.mlDsaPubkey,
+          participant_b_ml_kem_pubkey: bPq.mlKemPubkey,
+          participant_b_key_binding: await (opts.forgeCounterpartyBinding ? generateKeypair() : RESPONDER).sign(bTbs),
+          participant_b_key_binding_pq: await signMlDsa(
+            opts.forgeCounterpartyBindingPq ? (await fixturePqKeys("third-party")).mlDsaProvider : bPq.mlDsaProvider,
+            "cello-mldsa-key-binding-v1",
+            bTbs,
+          ),
         }),
     // TAMPERED AFTER SIGNING: the address set the daemon would dial is changed, the signature is
     // not. This is the shape a compromised directory produces.
@@ -275,9 +287,9 @@ describe("038-KEYBIND: the initiator learns the responder's group key, or refuse
 
     const r = await verifyAssignmentSignature(asg, persistenceWith(hex), logger, "alice", "corr");
     expect(r.ok).toBe(false);
-    expect(!r.ok && r.reason).toBe("assignment_counterparty_binding_absent");
+    expect(!r.ok && r.reason).toBe("key_binding_missing");
     expect(!r.ok && r.guidance.length).toBeGreaterThan(0);
-    expect(seen).toContain("session.assignment.counterparty_binding_absent");
+    expect(seen).toContain("session.assignment.counterparty_binding_refused");
   });
 
   it("REFUSES — with a DIFFERENT reason — when someone other than the counterparty vouched for their group key", async () => {
@@ -290,8 +302,32 @@ describe("038-KEYBIND: the initiator learns the responder's group key, or refuse
     expect(r.ok).toBe(false);
     // Distinct from the absent case: one says the directory is behind, the other says a key was
     // substituted. Collapsing them would send the operator to the wrong remedy.
-    expect(!r.ok && r.reason).toBe("assignment_counterparty_binding_invalid");
-    expect(seen).toContain("session.assignment.counterparty_binding_invalid");
+    expect(!r.ok && r.reason).toBe("key_binding_signature_mismatch");
+    expect(seen).toContain("session.assignment.counterparty_binding_refused");
+  });
+
+  it("002-PQKEYS test 12: genuine Ed25519 beside a THIRD agent's genuine ML-DSA → key_binding_pq_signature_mismatch, no keys returned", async () => {
+    const kp = generateKeypair();
+    const hex = Buffer.from(await kp.getPublicKey()).toString("hex");
+    const asg = await makeAssignment({ signWith: kp, forgeCounterpartyBindingPq: true });
+
+    const r = await verifyAssignmentSignature(asg, persistenceWith(hex), silent, "alice", "corr");
+    expect(r.ok).toBe(false);
+    expect(!r.ok && r.reason).toBe("key_binding_pq_signature_mismatch");
+    // Nothing reaches `recordCounterpartyKeys` without the verified result, and there is none.
+    expect("counterpartyMlKemHex" in r).toBe(false);
+  });
+
+  it("002-PQKEYS test 14 (initiator half): returns exactly the responder's two PQ keys", async () => {
+    const kp = generateKeypair();
+    const hex = Buffer.from(await kp.getPublicKey()).toString("hex");
+    const asg = await makeAssignment({ signWith: kp });
+    const bPq = await fixturePqKeys(Buffer.from(await RESPONDER.getPublicKey()).toString("hex"));
+
+    const r = await verifyAssignmentSignature(asg, persistenceWith(hex), silent, "alice", "corr");
+    expect(r.ok).toBe(true);
+    expect(r.ok && r.counterpartyMlDsaHex).toBe(Buffer.from(bPq.mlDsaPubkey).toString("hex"));
+    expect(r.ok && r.counterpartyMlKemHex).toBe(Buffer.from(bPq.mlKemPubkey).toString("hex"));
   });
 });
 
