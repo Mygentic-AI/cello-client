@@ -229,7 +229,10 @@ describe("AC-004: startDaemon manifest loading at startup", () => {
       }));
 
       // The poll fires on a timer; wait for the adopt (no agents involved at all).
-      const deadline = Date.now() + 3000;
+      // 15 s, not 3: under the full suite's load, daemon startup plus the first HTTP poll overran a
+      // 3 s budget and this read the OLD manifest (the 2026-09-24 pre-tag gate failed on exactly
+      // that — "expected 1 to be 2"), while it passes alone. The wait ends the moment v2 is adopted.
+      const deadline = Date.now() + 15_000;
       while (Date.now() < deadline && manifestProvider.getCurrentManifest()?.version !== 2) {
         await new Promise((r) => setTimeout(r, 25));
       }
