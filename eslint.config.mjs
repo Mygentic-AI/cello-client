@@ -398,7 +398,11 @@ export default [
     // 1,457 → 1,460 (+3, M16 022-SUBSCRIBE): `openSessionFor` reaches the membership wiring, so
     // `join` can open a session with a channel's admin — a subscriber has never spoken to them.
     // Three lines, and they are a seam the root is the only place to pass.
-    rules: { "max-lines": ["error", { max: 1460, skipBlankLines: false, skipComments: false }] },
+    // 1,460 → 1,463 (+3, M16 031-KEYSASKEYS): the send path passes the gateway the known public keys
+    // in a message so a public key is not redacted as a secret. The four queries and the extractor
+    // live in `known-public-keys.ts`; what lands here is one import and wiring the dep into the
+    // content handlers — a composition seam the root is the only place to pass.
+    rules: { "max-lines": ["error", { max: 1463, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/daemon-handle.ts"],

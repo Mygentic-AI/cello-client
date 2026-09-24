@@ -86,6 +86,7 @@ import { wireDisconnectCleanup } from "./disconnect-cleanup.js";
 import { createSealCoordinator } from "./seal-coordinator.js";
 import { createTelegramDoorbell } from "./telegram-doorbell.js";
 import { registerSessionContentHandlers } from "./session-content-handlers.js";
+import { createKnownPublicKeysIn, knownPublicKeysDepsFromDaemon } from "./known-public-keys.js";
 // `wireContentHash` is no longer imported here: every outbound hash in this file now comes from
 // `SessionNodeManager.contentHashForSession`, which returns the hash and its ALGORITHM together
 // (`DOD-M15-SEALWIRE-1` part B2b). A direct call would be a hash computed without deciding — or
@@ -1008,6 +1009,8 @@ async function startDaemonHoldingLock(
     advanceConnectionCursor,
     clearTelegramRung,
     attendanceCount,
+    // M16 031: the known public keys in an outbound message the gateway must pass untouched.
+    knownPublicKeys: createKnownPublicKeysIn(knownPublicKeysDepsFromDaemon(sessionNodeManager, logger)),
   });
 
   // cello_check_notifications (notification-handlers.ts): the push-loss reconciler. Notifications are

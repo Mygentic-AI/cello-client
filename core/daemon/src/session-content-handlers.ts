@@ -243,6 +243,13 @@ export interface SessionContentDeps {
   attendanceCount: (agentName: string) => number;
   /** Sends on the wire right now — shared with the away one-shot, which must not close under one. */
   sendClaims: SendClaims;
+  /**
+   * M16 031: the KNOWN public keys (lowercase 64-hex) that appear in this outbound message — the
+   * daemon's own agents'/channels' keys, the sender's contacts, the channels it follows, and the
+   * session's counterparty. Passed to the gateway so a public key passes screening untouched while
+   * every other 64-hex token is screened as today. Optional: omitted, no key is protected.
+   */
+  knownPublicKeys?: (agentName: string, sessionId: string, content: Uint8Array) => string[];
 }
 
 export function registerSessionContentHandlers(deps: SessionContentDeps): void {
@@ -250,7 +257,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     handlers, logger, sessionNodeManager, securityGateway, retryQueue,
     getConnState, resolveCurrentAgent, NO_CURRENT_AGENT_RESPONSE,
     getConnectionCursor, advanceConnectionCursor, clearTelegramRung,
-    attendanceCount, sendClaims,
+    attendanceCount, sendClaims, knownPublicKeys,
   } = deps;
 
   /**
@@ -508,12 +515,16 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     // gateway verdict drives the four cello_send outcomes (M9-FEED-001): block / warn → NOT sent;
     // allow → sent as-is; redact → sent in ALTERED form. A configured-but-unreachable gateway fails
     // closed (block, gateway_unavailable), so a screening outage can never let content out ungated.
+    // M16 031: the known public keys in this message the gateway must pass untouched. Only added when
+    // non-empty, so an ordinary send carries no new field. Never includes private key material.
+    const knownKeys = knownPublicKeys?.(record.agent_name, sessionId, contentBytes) ?? [];
     const outboundVerdict = await securityGateway.screenOutbound(contentBytes, {
       direction: "outbound",
       agentName: record.agent_name,
       sessionId,
       correlationId,
       ...(governanceDecisions !== undefined ? { governanceDecisions } : {}),
+      ...(knownKeys.length > 0 ? { knownPublicKeys: knownKeys } : {}),
     });
     if (outboundVerdict.disposition === "block") {
       if (outboundVerdict.reason === GOVERNANCE_TIMEOUT) {
