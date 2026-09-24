@@ -648,6 +648,14 @@ jobs:
           if [[ "${{ github.ref_name }}" == *-latest ]]; then
             TAG="latest"
           fi
+          # A milestone prerelease (e.g. 0.0.242-m9d.2) gets its own dist-tag, named for the
+          # prerelease id. `beta` is shared with main-line publishes that reuse the same base numbers,
+          # and a plain 0.0.242 outranks 0.0.242-m9d.1 — so on `beta` the milestone build is
+          # overwritten within hours and its consumers silently test main-line code.
+          CONNECT_VER=$(node -p "require('./core/adapter-claude-code/package.json').version")
+          if [[ "$CONNECT_VER" =~ -([a-z][a-z0-9]*)\.[0-9]+$ ]]; then
+            TAG="${BASH_REMATCH[1]}"
+          fi
           echo "Publishing with tag: $TAG"
 
           (cd "$GITHUB_WORKSPACE/trustless-cello/packages/interfaces" && pnpm publish --ignore-workspace --access public --no-git-checks --tag "$TAG") || true
