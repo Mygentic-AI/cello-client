@@ -99,20 +99,14 @@ describe("DOD-END-SUBMIT-1 — the submission_write frame", () => {
 });
 
 describe("DOD-END-SUBMIT-1 — failure modes that would otherwise be silent or misleading", () => {
-  it("names the AMBIGUITY on a version-skew `not_authenticated` — never asserts one cause", async () => {
-    // The trap (M10B-D25r F2): decodeInboundSignalingFrame returns null for an unknown frame kind and
-    // the node replies not_authenticated. Reporting that verbatim is ERROR SUBSTITUTION — the label
-    // names the exit point and sends the operator to the wrong subsystem. Directory nodes deploy
-    // independently per region, so an upgraded daemon meeting an older node is the NORMAL rollout
-    // case, not an edge.
+  it("names the AMBIGUITY on `not_authenticated` — never asserts one cause", async () => {
+    // Reporting the label verbatim is ERROR SUBSTITUTION — it names the exit point. The guidance must
+    // NAME both producers rather than ruling one out: a frame that arrived pre-auth, and a malformed one.
     const s = signalingThatReplies({ type: "not_authenticated" });
     const res = await send(s);
     expect(res.ok).toBe(false);
     if (res.ok) throw new Error("unreachable");
-    expect(res.reason).toBe("submission_unsupported_by_node");
-    expect(res.guidance).toMatch(/has not deployed|version/i);
-    // It must NAME the other two producers rather than ruling them out. An earlier version asserted
-    // "NOT an authentication problem", which is false when the frame really did arrive pre-auth.
+    expect(res.reason).toBe("submission_not_authenticated");
     expect(res.guidance).toMatch(/authentication/i);
     expect(res.guidance).toMatch(/malformed/i);
   });

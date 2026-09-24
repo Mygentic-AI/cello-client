@@ -270,7 +270,7 @@ export async function composeSealedSubmission(
 export type SubmissionSendFailure =
   | "directory_unreachable"
   | "submission_write_timeout"
-  | "submission_unsupported_by_node"
+  | "submission_not_authenticated"
   | "submission_refused_by_node"
   // The two the TRANSPORT returns. They were missing while the code cast `sent.reason` into this
   // union, which made the declared type a lie a consumer could branch on: an operator surface that
@@ -348,13 +348,11 @@ export async function sendSealedSubmission(deps: {
     // submissions is not an exotic case, it is the second endorsement.
     if (t === "submission_write_result" && frame["submission_id"] === id) resolveFrame(frame);
     else if (t === "submission_write_error" && frame["submission_id"] === id) resolveFrame(frame);
-    // `not_authenticated` is DELIBERATELY NOT a resolve path. An older node replies it when its
-    // decoder returns null (M10B-D25r), so it is the version-skew symptom — but it is also what the
-    // node sends for a frame that arrives before auth completes, and for ANY other component's
-    // undecodable frame on this same stream. Resolving on it would let an unrelated
-    // `manifest_poll_request` to an older node report THIS submission as unsupported, while the real
-    // result arrives afterwards and is dropped on the floor. It is recorded as advisory context and
-    // the timeout decides.
+    // `not_authenticated` is DELIBERATELY NOT a resolve path. The node sends it for a frame that
+    // arrives before auth completes, and for ANY other component's undecodable frame on this same
+    // stream. Resolving on it would let an unrelated frame's reply report THIS submission as refused,
+    // while the real result arrives afterwards and is dropped on the floor. It is recorded as
+    // advisory context and the timeout decides.
     else if (t === "not_authenticated") sawNotAuthenticated = true;
   });
 
@@ -393,24 +391,19 @@ export async function sendSealedSubmission(deps: {
     clearTimeout(timer);
 
     if (frame["type"] === "__timeout__") {
-      // F2: NAME THE AMBIGUITY RATHER THAN RESOLVING IT. `not_authenticated` has THREE producers on
-      // the directory side — an undecodable frame from a node that has not deployed this frame kind
-      // (the version-skew case), an undecodable frame from a node that HAS (i.e. our own bug: a
-      // malformed id or an empty ciphertext), and a frame that genuinely arrived before auth
-      // completed. An earlier draft asserted the first with certainty and told the operator it was
-      // "NOT an authentication problem" — which, in the third case, sends them away from the actual
-      // cause and towards a deploy that will never fix it.
-      const reason = sawNotAuthenticated ? "submission_unsupported_by_node" : "submission_write_timeout";
+      // F2: NAME THE AMBIGUITY RATHER THAN RESOLVING IT. `not_authenticated` has two producers on
+      // the directory side — an undecodable frame (our own bug: a malformed id or an empty
+      // ciphertext), and a frame that genuinely arrived before auth completed.
+      const reason = sawNotAuthenticated ? "submission_not_authenticated" : "submission_write_timeout";
       logger.warn("signal.submission.refused", { submissionId: id, reason, timeoutMs, sawNotAuthenticated });
       return {
         ok: false,
         reason,
         guidance: sawNotAuthenticated
-          ? "The directory node did not recognise the frame and never acknowledged the submission. " +
-            "MOST LIKELY it has not deployed submission support yet — nodes deploy independently per " +
-            "region, so check this node's version first. Two other conditions produce the same reply: " +
-            "a malformed submission from this client, and a frame rejected because authentication had " +
-            "not completed (if the signaling stream also dropped, look there). Re-submitting is safe."
+          ? "The directory node answered not_authenticated and never acknowledged the submission. Two " +
+            "conditions produce that reply: a frame rejected because authentication had not completed " +
+            "(if the signaling stream also dropped, look there), and a malformed submission from this " +
+            "client. Re-submitting is safe."
           : `The directory node accepted the frame but did not acknowledge the submission within ${timeoutMs}ms. ` +
             "Whether it was stored is unknown; re-submitting is safe (same submission_id, stored once).",
       };
@@ -504,8 +497,7 @@ export async function fetchSubmissionResults(opts: {
         reason: "submission_results_timeout",
         guidance:
           `The node did not answer within ${timeoutMs}ms. Your outcomes are still held — this is a ` +
-          "slow or old node, not a lost result. An older node that does not know the frame answers " +
-          "nothing at all, which looks the same from here.",
+          "slow node, not a lost result.",
       };
     }
     if (frame["type"] === "submission_results_error") {

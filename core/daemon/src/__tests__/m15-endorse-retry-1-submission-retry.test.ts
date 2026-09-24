@@ -125,7 +125,7 @@ describe("DOD-M15-ENDORSE-RETRY-1 — classification (clauses 1 and 3)", () => {
     // The node never decoded the frame. Nodes deploy independently per region, so the reconnect
     // this retry rides may well land on one that has the frame kind — which is the whole failover
     // case this unit exists for.
-    expect(isRetryableSendFailure("submission_unsupported_by_node")).toBe(true);
+    expect(isRetryableSendFailure("submission_not_authenticated")).toBe(true);
     // The transport handed the frame over and no ack came back. Storage is UNKNOWN, not refused —
     // and re-sending is safe because the id is content-derived.
     expect(isRetryableSendFailure("submission_write_timeout")).toBe(true);

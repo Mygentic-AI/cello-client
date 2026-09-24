@@ -52,9 +52,8 @@ import { extractErrorMessage } from "./error-message.js";
  *
  *   directory_unreachable / signaling_reconnecting / signaling_lost
  *       Nothing reached anybody. This is the case the unit exists for.
- *   submission_unsupported_by_node
- *       The node never decoded the frame. Nodes deploy independently per region, so the reconnect
- *       this rides may land on one that has the frame kind — which IS the failover case. It is not
+ *   submission_not_authenticated
+ *       The node answered before authentication completed, or could not decode the frame. It is not
  *       a decision about the submission; the node did not get far enough to make one.
  *   submission_write_timeout
  *       The transport handed the frame over and no ack came back. Storage is UNKNOWN, which is
@@ -80,7 +79,7 @@ const RETRY_DECISION: Readonly<Record<SubmissionSendFailure, boolean>> = {
   directory_unreachable: true,
   signaling_reconnecting: true,
   signaling_lost: true,
-  submission_unsupported_by_node: true,
+  submission_not_authenticated: true,
   submission_write_timeout: true,
   submission_refused_by_node: false,
   submission_agent_unloaded: false,
@@ -258,7 +257,7 @@ function gaveUpGuidance(reason: SubmissionGiveUpReason, last: SubmissionSendFail
     case "attempts_exhausted":
       // "ANSWERED" WAS WRONG (review L8). The only reason that normally exhausts this budget is
       // `submission_write_timeout` — where the node answered NOTHING, which is what the reason
-      // means — and `submission_unsupported_by_node`, where it answered `not_authenticated`, a
+      // means — and `submission_not_authenticated`, where it answered `not_authenticated`, a
       // frame `sendSealedSubmission` deliberately refuses to treat as an answer.
       return (
         `The daemon retried this submission until it ran out of attempts; the last attempt ended ` +
