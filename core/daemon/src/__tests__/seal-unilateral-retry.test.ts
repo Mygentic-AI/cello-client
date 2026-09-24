@@ -41,6 +41,7 @@ import * as lp from "it-length-prefixed";
 import { generateKeypair } from "@cello-protocol/crypto";
 import { createNode } from "@cello-protocol/transport";
 import { buildSealTbs } from "@cello-protocol/protocol-types";
+import { bindLegibilityToTbs } from "../seal-legibility-tbs.js";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
@@ -248,6 +249,14 @@ async function signedBilateralSeal(
   const sealedRoot = new Uint8Array(Buffer.from(rootHex, "hex"));
   const leafCount = 2;
   const closeTimestamp = TS + 2;
+  // Every certificate carries its legibility (bound into the signed bytes) and the signed leaves
+  // it was derived from; a receipt naming no party's frontier needs no leaves to back it.
+  const legibility = {
+    attests: "receipt",
+    disclaimer: "This signature attests receipt, never assent.",
+    participants: [],
+    final_message: { sender_pubkey: null, seq: null, answered: false },
+  };
   return {
     type: "session_sealed",
     session_id: SID_BYTES,
@@ -255,7 +264,9 @@ async function signedBilateralSeal(
     leaf_count: leafCount,
     close_timestamp: closeTimestamp,
     signer_pubkey: new Uint8Array(certPub),
-    frost_signature: await certKp.sign(frameSealMessage(buildSealTbs(SID_BYTES, sealedRoot, leafCount, closeTimestamp))),
+    frost_signature: await certKp.sign(frameSealMessage(bindLegibilityToTbs(buildSealTbs(SID_BYTES, sealedRoot, leafCount, closeTimestamp), legibility as never))),
+    legibility,
+    frontier_leaves: [],
   };
 }
 

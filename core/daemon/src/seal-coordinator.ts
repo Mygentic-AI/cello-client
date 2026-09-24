@@ -349,7 +349,12 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
           const leafCount = typeof frame["leaf_count"] === "number" ? frame["leaf_count"] : null;
           const ctRaw = frame["close_timestamp"];
           const closeTs = typeof ctRaw === "number" ? ctRaw : typeof ctRaw === "bigint" ? Number(ctRaw) : null;
-          if (!sessionIdBytes || !sealedRootBytes || !frostSig || !signerPubkey || leafCount === null || closeTs === null) {
+          // Every directory binds the legibility into the signed bytes and ships the signed leaves it
+          // was derived from; a certificate without either is incomplete, not an older shape.
+          const wireLegibility = frame["legibility"];
+          const hasLegibility = wireLegibility !== null && typeof wireLegibility === "object";
+          if (!sessionIdBytes || !sealedRootBytes || !frostSig || !signerPubkey || leafCount === null || closeTs === null
+            || !hasLegibility || !Array.isArray(frame["frontier_leaves"])) {
             logger.error("session.sealed.signature.invalid", { sessionId: sidHex, reason: "missing_certificate_fields" });
             return;
           }
@@ -363,10 +368,7 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
               closeTimestamp: closeTs,
               frostSignature: frostSig,
               signerPubkey,
-              legibility:
-                frame["legibility"] && typeof frame["legibility"] === "object"
-                  ? (frame["legibility"] as LegibilityForHash)
-                  : null,
+              legibility: wireLegibility as LegibilityForHash,
             },
           );
           if (!verdict.ok) {
@@ -466,10 +468,15 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
         // is readable via the seal_certificate IPC read — per-party frontiers,
         // attestation modes, and final_message.answered.
         const legibility = normalizeLegibility(frame["legibility"]);
+        if (legibility === undefined) {
+          // Signed, but not a well-formed receipt certificate: refuse it rather than record a seal
+          // whose frontiers cannot be checked.
+          logger.error("seal.certificate.frontier.unverifiable", { sessionId: sidHex, reason: "legibility_malformed" });
+          return;
+        }
         logger.info("session.sealed.received", {
           sessionId: sidHex,
           sealedRoot: rootHex,
-          hasLegibility: legibility !== undefined,
           finalMessageAnswered:
             legibility && typeof legibility === "object" && "final_message" in legibility
               ? (legibility as { final_message?: { answered?: boolean } }).final_message?.answered
@@ -478,11 +485,11 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
         // DOD-LEG-2 (SI-002): independently re-derive each party's content_frontier_seq from the
         // signed leaves the directory shipped, and REJECT the certificate if any published frontier
         // is inflated beyond what the signed leaves support. The client does NOT trust the directory
-        // for the frontier VALUE — only for transporting signed bytes it re-checks itself. With no
-        // frontier_leaves there is nothing to re-derive, which is acceptable only when no party claims
-        // a frontier — the check below refuses the other case.
+        // for the frontier VALUE — only for transporting signed bytes it re-checks itself. An empty
+        // leaf set is acceptable only when no party claims a frontier — the check below refuses the
+        // other case.
         const frontierLeavesRaw = frame["frontier_leaves"];
-        if (legibility !== undefined) {
+        {
           const rawParticipants =
             (legibility as { participants?: Array<{ pubkey?: unknown; content_frontier_seq?: unknown }> }).participants ?? [];
           // Any party claiming to have received content (frontier > 0) MUST be backed by signed leaves.

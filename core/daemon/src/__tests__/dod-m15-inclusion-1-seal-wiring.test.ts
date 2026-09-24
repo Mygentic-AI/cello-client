@@ -239,8 +239,9 @@ describe("DOD-M15-INCLUSION-1: a real session_sealed frame fills the certified l
     const signaling = fakeSignaling();
     coordinator.registerSealListeners(signaling as unknown as SignalingManager, AGENT, AGENT_PUB);
 
-    // No frontier_leaves, and no participant claiming to have received anything — otherwise the
-    // fail-closed guard above rejects the whole certificate and this path is never reached.
+    // An EMPTY frontier_leaves, and no participant claiming to have received anything — otherwise
+    // the fail-closed guard rejects the whole certificate and this path is never reached. (A frame
+    // with no frontier_leaves field at all is refused outright.)
     const legibility = {
       attests: "receipt",
       disclaimer: "This signature attests receipt, never assent.",
@@ -260,6 +261,7 @@ describe("DOD-M15-INCLUSION-1: a real session_sealed frame fills the certified l
         sessionId: SESSION_ID_BYTES, sealedRoot: sealedRootBytes, leafCount: 3, closeTimestamp, legibility: legibility as never,
       }),
       legibility,
+      frontier_leaves: [],
     });
 
     await vi.waitFor(() => expect(mgr.getCertifiedLeafSetState(AGENT, SESSION_ID)).not.toBeNull());

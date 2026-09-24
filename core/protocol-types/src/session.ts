@@ -335,8 +335,8 @@ export interface SessionSealed {
   frost_signature: Uint8Array;     // 64-byte combined FROST signature over seal TBS
   signer_pubkey: Uint8Array;       // 32-byte initiator primary_pubkey (group public key)
   close_timestamp: number;         // Unix ms
-  leaf_count?: number;             // total leaves in the sealed tree
-  legibility?: SealLegibility;     // frontiers + attestation modes + final_message
+  leaf_count: number;              // total leaves in the sealed tree (signed)
+  legibility: SealLegibility;      // frontiers + attestation modes + final_message (bound into the signed bytes)
 }
 
 // ─── Seal certificate legibility ──────────────────────────────────────────────
