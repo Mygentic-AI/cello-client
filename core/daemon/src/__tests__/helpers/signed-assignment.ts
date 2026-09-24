@@ -125,6 +125,15 @@ async function partyBinding(
   };
 }
 
+/** The fixture's stable FROST group key for an initiator — one per identity, like a real agent. */
+const FIXTURE_GROUP_KEYS = new Map<string, ReturnType<typeof generateKeypair>>();
+function fixtureGroupKey(initiatorHex: string): ReturnType<typeof generateKeypair> {
+  const k = initiatorHex.toLowerCase();
+  let kp = FIXTURE_GROUP_KEYS.get(k);
+  if (!kp) { kp = generateKeypair(); FIXTURE_GROUP_KEYS.set(k, kp); }
+  return kp;
+}
+
 export function fixtureIdentity(): FixtureIdentity {
   const kp = generateKeypair();
   const pubkeyHex = kp.toJSON()["publicKey"]!;
@@ -155,7 +164,13 @@ export interface SignedAssignmentOpts {
   initiatorSessionPeerId: string;
   counterpartySessionPeerId?: string;
   sessionTimestamp?: number;
-  /** Sign with this key instead of a fresh one — for pinned-mode tests. */
+  /**
+   * Sign with this key instead of the initiator's fixture group key. Omitted, the signer is ONE
+   * stable key per initiator — as in production, where every session a caller opens is signed under
+   * that caller's one FROST group key. (It used to be a fresh key per frame, which modelled a caller
+   * whose group key changed between sessions: two back-to-back sessions from one caller then looked
+   * like an identity change once the first one's pin landed.)
+   */
   signWith?: ReturnType<typeof generateKeypair>;
   /**
    * 017-TBS. Supply BOTH to sign and emit the 12-field layout; omit both for the 10-field one.
@@ -181,7 +196,7 @@ export interface SignedAssignmentOpts {
 export async function makeSignedAssignmentFrame(
   opts: SignedAssignmentOpts,
 ): Promise<{ frame: Record<string, unknown>; signerPubkeyHex: string }> {
-  const signer = opts.signWith ?? generateKeypair();
+  const signer = opts.signWith ?? fixtureGroupKey(Buffer.from(opts.initiatorPubkey).toString("hex"));
   const signerPubkey = await signer.getPublicKey();
   const ts = opts.sessionTimestamp ?? 1_700_000_000_000;
   const initiatorAddrs = ["/ip4/127.0.0.1/tcp/3"];

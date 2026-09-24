@@ -291,7 +291,7 @@ describe("M8B FINDING-1: unilateral seal escalation on retry close", () => {
           relay_directory_signature: new Uint8Array(64).fill(0xc3),
           relay_id: await fakeRelayPubkeyHex(),
         };
-        return { ok: true, assignment, counterpartyPrimaryHex: "11".repeat(32) };
+        return { ok: true, assignment, counterpartyPrimaryHex: "11".repeat(32), counterpartyMlDsaHex: "12".repeat(1312), counterpartyMlKemHex: "13".repeat(1184) };
       },
     };
 

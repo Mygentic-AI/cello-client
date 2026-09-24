@@ -252,7 +252,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
           signature_type: "frost",
           signer_pubkey: new Uint8Array(32),
         };
-        return { ok: true, assignment, counterpartyPrimaryHex: "11".repeat(32) };
+        return { ok: true, assignment, counterpartyPrimaryHex: "11".repeat(32), counterpartyMlDsaHex: "12".repeat(1312), counterpartyMlKemHex: "13".repeat(1184) };
       },
     };
     const { h: A, events: aEvents } = await startOne({

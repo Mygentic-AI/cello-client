@@ -672,7 +672,7 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
           // 038-KEYBIND: the real negotiator only returns this once the counterparty's own identity
           // key has signed for it; this stub skips verification entirely, as it does for every other
           // field on the assignment above.
-          counterpartyPrimaryHex: "11".repeat(32),
+          counterpartyPrimaryHex: "11".repeat(32), counterpartyMlDsaHex: "12".repeat(1312), counterpartyMlKemHex: "13".repeat(1184),
         };
       },
     };

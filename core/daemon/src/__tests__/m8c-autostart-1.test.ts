@@ -26,6 +26,7 @@ import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import { FileKeyProvider } from "@cello-protocol/crypto";
 import { DbRegistrationPersistence } from "../db-identity-store.js";
 import type { Logger, DaemonConfig, AgentInfo } from "../types.js";
+import { fixturePqIdentityRecord, registeredPqFields } from "./helpers/pq-identity.js";
 
 describe("M8C-AUTOSTART-1: use_agent auto-start + F5/F18", () => {
   let tempDir: string;
@@ -146,10 +147,13 @@ describe("M8C-AUTOSTART-1: use_agent auto-start + F5/F18", () => {
     // Create the agent (inserts its DB row) then mark it registered (reg_status = 'active').
     await client.send("cello_create_agent", { name: "reggie" });
     const db = handle.getSessionNodeManager().getDb();
-    await new DbRegistrationPersistence({ db, agentName: "reggie", logger }).persistRegistrationState({
+    const reggie = new DbRegistrationPersistence({ db, agentName: "reggie", logger });
+    const reggiePq = await fixturePqIdentityRecord("reggie");
+    await reggie.persistPqIdentity(reggiePq);
+    await reggie.persistRegistrationState({
       agentId: "reggie-agent-id",
       primaryPubkey: "aa".repeat(32),
-      mlDsaPubkey: "bb".repeat(32),
+      ...registeredPqFields(reggiePq),
       registeredAt: 1_700_000_000_000,
       keyBinding: "cc".repeat(64),
     });

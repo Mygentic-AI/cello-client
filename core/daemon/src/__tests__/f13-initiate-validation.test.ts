@@ -104,7 +104,7 @@ describe("M8B F13: initiate_session validates the counterparty endpoint before r
 
     const negotiator: SessionNegotiator = {
       async negotiate() {
-        return { ok: true, assignment: makeAssignment(alicePubkey, counterpartyPeerId, counterpartyAddrs), counterpartyPrimaryHex: "11".repeat(32) };
+        return { ok: true, assignment: makeAssignment(alicePubkey, counterpartyPeerId, counterpartyAddrs), counterpartyPrimaryHex: "11".repeat(32), counterpartyMlDsaHex: "12".repeat(1312), counterpartyMlKemHex: "13".repeat(1184) };
       },
     };
     const config: DaemonConfig = {

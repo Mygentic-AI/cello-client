@@ -191,7 +191,7 @@ describe("M8B F16: counterparty-gone surfaces on cello_receive and cello_status"
           signature_type: "frost",
           signer_pubkey: new Uint8Array(32),
         };
-        return { ok: true, assignment, counterpartyPrimaryHex: "11".repeat(32) };
+        return { ok: true, assignment, counterpartyPrimaryHex: "11".repeat(32), counterpartyMlDsaHex: "12".repeat(1312), counterpartyMlKemHex: "13".repeat(1184) };
       },
     };
     const A = await startDaemon({
