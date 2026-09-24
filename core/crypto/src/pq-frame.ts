@@ -29,6 +29,8 @@ export const PQ_CONTEXTS = [
   "cello-mldsa-pseudonym-binding-v1",
   "cello-mldsa-endorsement-v1",
   "cello-mldsa-attestation-v1",
+  // 002-PQKEYS — the four-key registration binding.
+  "cello-mldsa-key-binding-v1",
 ] as const;
 
 export type PqContext = (typeof PQ_CONTEXTS)[number];

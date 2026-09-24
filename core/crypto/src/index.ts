@@ -49,7 +49,8 @@ export {
 // 038-KEYBIND: the K_local→FROST-group-key binding. A PLAIN Ed25519 signature by the identity key
 // naming the group key, so a group key can be placed against the identity that owns it. Deliberately
 // NOT a FrostContext — see key-binding.ts.
-export { CONTEXT_KEY_BINDING, buildKeyBindingTbs, verifyKeyBinding } from "./key-binding.js";
+export { CONTEXT_KEY_BINDING, buildKeyBindingTbs, verifyKeyBinding, verifyRegisteredKeys } from "./key-binding.js";
+export type { BoundKeys, KeyBindingRefusal } from "./key-binding.js";
 
 // SESSION-004: standalone FROST verify (no signer instance needed — used by counterparty client)
 export { verifyFrostSignature } from "./frost/frost-threshold-signer.js";
