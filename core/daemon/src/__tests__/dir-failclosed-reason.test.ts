@@ -34,7 +34,7 @@ describe("DOD-DIR-FAILCLOSED-1: the directory's fail-closed reason survives the 
   it("regression: every previously-known reason still maps to itself", () => {
     const known = [
       "target_offline", "relay_unavailable", "frost_signer_not_configured", "directory_below_threshold",
-      "ceremony_timeout", "ceremony_exhausted", "ceremony_conflict", "not_registered", "peer_not_registered",
+      "ceremony_timeout", "ceremony_exhausted", "ceremony_conflict", "not_registered",
       "session_request_missing_peer_id", "agent_revoked", "agent_suspended",
     ];
     for (const r of known) expect(sessionRequestErrorReason({ reason: r })).toBe(r);

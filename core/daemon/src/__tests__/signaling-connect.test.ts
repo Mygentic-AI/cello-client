@@ -123,8 +123,8 @@ describe("createSignalingConnect — handshake (M6 path, step-6 off)", () => {
     expect(node.newStream).toHaveBeenCalledWith(PEER, "/cello/signaling/1.0.0");
     // K_local signed the challenge.
     expect(fakeKeyProvider.sign).toHaveBeenCalledTimes(1);
-    // Sent the auth response AND the peer_info_announce.
-    expect(stream.send).toHaveBeenCalledTimes(2);
+    // Sent the auth response and nothing else (there is no peer_info_announce).
+    expect(stream.send).toHaveBeenCalledTimes(1);
     // No step-6 verifier → directoryNodeId falls back to the endpoint peer ID.
     expect(result.directoryNodeId).toBe(PEER);
     expect(result.manifestVersion).toBe(0);
