@@ -178,7 +178,6 @@ export async function pullSealCertificate(
       closeTimestamp,
       frostSignature,
       signerPubkey,
-      signatureType: "frost",
       legibility: (f["legibility"] ?? null) as never,
     },
   );

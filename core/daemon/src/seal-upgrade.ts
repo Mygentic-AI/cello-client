@@ -226,12 +226,10 @@ export async function verifyUpgradeConfirmedCert(
   const closeTs = typeof tsRaw === "number" ? tsRaw : typeof tsRaw === "bigint" ? Number(tsRaw) : null;
   const presentPubkey = toU8(frame["present_pubkey"]);
   const presentSig = toU8(frame["present_signature"]);
-  const presentSigType = frame["present_signature_type"];
   const returningPubkey = toU8(frame["returning_pubkey"]);
   const returningSig = toU8(frame["returning_signature"]);
   if (!sessionId || !sealedRoot || leafCount === null || closeTs === null || !presentPubkey ||
-      !presentSig || !returningPubkey || !returningSig ||
-      (presentSigType !== "frost" && presentSigType !== "single")) {
+      !presentSig || !returningPubkey || !returningSig) {
     deps.logger.warn("session.seal.upgrade.cert.invalid", { sessionId: sessionIdHex, reason: "malformed_confirmed" });
     return { ok: false, reason: "malformed_confirmed" };
   }
@@ -267,7 +265,7 @@ export async function verifyUpgradeConfirmedCert(
   if (isPresent) {
     const presentResult = await verifyUnilateralCertificate(
       { persistence: deps.persistence, agentPubkeyHex: deps.agentPubkeyHex, logger: deps.logger },
-      { sessionId, sealedRoot, leafCount, closeTimestamp: closeTs, frostSignature: presentSig, signatureType: presentSigType },
+      { sessionId, sealedRoot, leafCount, closeTimestamp: closeTs, frostSignature: presentSig },
     );
     if (!presentResult.ok) {
       deps.logger.warn("session.seal.upgrade.cert.invalid", { sessionId: sessionIdHex, reason: `present_signature_invalid:${presentResult.reason}` });

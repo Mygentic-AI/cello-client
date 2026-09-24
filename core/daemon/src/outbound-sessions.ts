@@ -610,7 +610,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
           guidance: "The directory returned a session assignment naming a different agent as this side of the conversation. No conversation was opened and nothing you wrote was sent. This is not a local selection problem — the directory derives this side from the key your daemon authenticated with, so a mismatch means the node that answered is brokering sessions in another agent's name. Run cello_status to see which directory node answered, then retry cello_initiate_session; a different node will serve the request.",
         };
       }
-      logger.info("session.negotiate.assignment.received", { agentName, correlationId, signatureType: assignment.signature_type, signatureVerified: true });
+      logger.info("session.negotiate.assignment.received", { agentName, correlationId, signatureVerified: true });
       return {
         ok: true,
         assignment,

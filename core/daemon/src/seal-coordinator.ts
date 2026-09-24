@@ -335,14 +335,13 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
         const toU8 = (v: unknown): Uint8Array | null =>
           v instanceof Uint8Array ? v : Buffer.isBuffer(v) ? new Uint8Array(v as Buffer) : null;
 
-        // M7 legibility-TBS-binding: when THIS party is the seal's signer (the initiator, whose
-        // group key produced the FROST signature), verify the signature over the legibility-bound
-        // TBS. A tampered legibility (answered / content_frontier_seq / attestation_mode, carried
-        // unsigned on the frame) changes the hash → the signature fails → the seal is REJECTED. The
-        // non-initiator does not hold the signer's key, so it accepts (verified:false): the frame
-        // arrived over the authenticated Noise channel, and the binding lets any out-of-band holder
-        // of the initiator's primary verify an exported cert.
-        if (frame["signature_type"] === "frost") {
+        // M7 legibility-TBS-binding: EVERY session_sealed is verified — its FROST signature over the
+        // legibility-bound TBS, under a group key this party holds (its own, or the counterparty's
+        // recorded at session open). A tampered legibility (answered / content_frontier_seq /
+        // attestation_mode, carried unsigned on the frame) changes the hash → the signature fails →
+        // the seal is REJECTED. The one unverified acceptance is a counterparty the operator removed
+        // (`counterparty_key_forgotten`), logged below.
+        {
           const sessionIdBytes = toU8(frame["session_id"]);
           const sealedRootBytes = toU8(frame["sealed_root"]);
           const frostSig = toU8(frame["frost_signature"]);
@@ -364,7 +363,6 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
               closeTimestamp: closeTs,
               frostSignature: frostSig,
               signerPubkey,
-              signatureType: "frost",
               legibility:
                 frame["legibility"] && typeof frame["legibility"] === "object"
                   ? (frame["legibility"] as LegibilityForHash)
@@ -453,9 +451,9 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
                 }
               : {}),
           });
-          // F2-a: on verified:false, surface WHY (signer_key_not_held / no_frost_share / …) so this
-          // event can never be mistaken for a tolerated failed check. A real failure took the early
-          // return above (session.sealed.signature.invalid) and never reaches here.
+          // F2-a: on verified:false, surface WHY (only counterparty_key_forgotten) so this event can
+          // never be mistaken for a tolerated failed check. A real failure took the early return
+          // above (session.sealed.signature.invalid) and never reaches here.
           logger.info("session.sealed.signature.checked", {
             sessionId: sidHex,
             verified: verdict.verified,
@@ -649,9 +647,7 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
         const leafCount = typeof frame["leaf_count"] === "number" ? frame["leaf_count"] : null;
         const tsRaw = frame["close_timestamp"];
         const closeTs = typeof tsRaw === "number" ? tsRaw : typeof tsRaw === "bigint" ? Number(tsRaw) : null;
-        const sigType = frame["signature_type"];
-        if (!sessionId || !sealedRoot || !frostSig || leafCount === null || closeTs === null ||
-            (sigType !== "frost" && sigType !== "single")) {
+        if (!sessionId || !sealedRoot || !frostSig || leafCount === null || closeTs === null) {
           logger.warn("session.unilateral.certificate.invalid", { sessionId: sidHex, reason: "malformed_certificate" });
           pendingUnilateralWaiters.delete(sealKey(agentName, sidHex));
           waiter({ ok: false, reason: "malformed_certificate" });
@@ -659,16 +655,16 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
         }
         const result = await verifyUnilateralCertificate(
           { persistence: getPersistence(agentName), agentPubkeyHex, logger },
-          { sessionId, sealedRoot, leafCount, closeTimestamp: closeTs, frostSignature: frostSig, signatureType: sigType },
+          { sessionId, sealedRoot, leafCount, closeTimestamp: closeTs, frostSignature: frostSig },
         );
         pendingUnilateralWaiters.delete(sealKey(agentName, sidHex));
         if (!result.ok) {
           // SI-003: do NOT mark sealed when the certificate signature does not verify.
-          logger.warn("session.unilateral.certificate.invalid", { sessionId: sidHex, reason: result.reason, signatureType: sigType });
+          logger.warn("session.unilateral.certificate.invalid", { sessionId: sidHex, reason: result.reason });
           waiter({ ok: false, reason: `certificate_invalid:${result.reason}` });
           return;
         }
-        logger.info("session.unilateral.certificate.verified", { sessionId: sidHex, signatureType: sigType, party: "present" });
+        logger.info("session.unilateral.certificate.verified", { sessionId: sidHex, party: "present" });
 
         // M8B FINDING-3 (cascade-2): normalise + PERSIST the legibility certificate the directory
         // now ships on this frame — the SAME store the bilateral session_sealed handler writes

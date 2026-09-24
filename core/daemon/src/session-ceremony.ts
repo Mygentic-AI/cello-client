@@ -893,17 +893,10 @@ export async function sendSealFrostSignature(
 
 /**
  * SESSION-002 (DOD-SEAL-3): verify a unilateral seal certificate WITHOUT trusting the
- * channel. Rebuilds the canonical seal TBS from the cert fields and verifies the signature
+ * channel. Rebuilds the canonical seal TBS from the cert fields and verifies the FROST signature
  * against a key trusted independently of the delivering frame: the session primary_pubkey
- * (commitments[0] of this agent's FROST share) for 'frost'. A channel-swapped sealed_root
- * (or any TBS-bound field) fails this check (SI-003).
- *
- * 'single' is not a second variant this function is missing — it is a DOWNGRADE, refused by name
- * before a session exists (`assignment_signature_type_downgraded`, assignment-verify.ts, checked
- * against the directory's only producer of `signature_type`). A cert carrying it is a shape no
- * honest peer can produce, so the branch below refuses rather than verifying. Do not "finish" it
- * by adding a manifest-key path: that would make the downgrade verifiable instead of refused,
- * which is the outcome the upstream check exists to prevent.
+ * (commitments[0] of this agent's FROST share). A channel-swapped sealed_root (or any TBS-bound
+ * field) fails this check (SI-003). Every seal is FROST-signed; there is no other kind.
  */
 export async function verifyUnilateralCertificate(
   deps: { persistence: DaemonRegistrationPersistence; agentPubkeyHex: string; logger: Logger },
@@ -913,86 +906,59 @@ export async function verifyUnilateralCertificate(
     leafCount: number;
     closeTimestamp: number;
     frostSignature: Uint8Array;
-    signatureType: "frost" | "single";
   },
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
   const tbs = buildSealTbs(cert.sessionId, cert.sealedRoot, cert.leafCount, cert.closeTimestamp);
+  const own = await ownPrimary(deps);
+  if (!own.ok) return own;
+  const verifier = new FrostThresholdSigner({ threshold: 1, participants: 1 }, Buffer.from(deps.agentPubkeyHex, "hex"));
+  const valid = verifier.verifySignature(cert.frostSignature, tbs, "cello-frost-seal-v1" as FrostContext, own.primary);
+  return valid ? { ok: true } : { ok: false, reason: "signature_invalid" };
+}
 
-  if (cert.signatureType !== "frost") {
-    // 'single' is a DOWNGRADE, not an unfinished path. A pre-DKG single-key assignment is refused
-    // by name upstream (`assignment_signature_type_downgraded`, assignment-verify.ts), so a cert
-    // reaching here with one is a shape that should never arrive. Refusing is the correct end state;
-    // there is nothing to wire.
-    return { ok: false, reason: "single_key_verification_unsupported" };
-  }
-
+/** This agent's own FROST group key — commitments[0] of its active share. */
+async function ownPrimary(
+  deps: { persistence: DaemonRegistrationPersistence; agentPubkeyHex: string; logger: Logger },
+): Promise<{ ok: true; primary: Uint8Array } | { ok: false; reason: string }> {
   const share = await deps.persistence.loadActiveFrostKeyShare();
   if (!share) return { ok: false, reason: "no_frost_share" };
-
-  let primaryPubkey: Uint8Array | null = null;
   try {
     const dc = decode(Buffer.from(share.commitmentsCbor)) as unknown;
-    if (Array.isArray(dc) && dc.length > 0) {
-      const c0 = dc[0];
-      primaryPubkey = c0 instanceof Uint8Array ? c0 : Buffer.isBuffer(c0) ? new Uint8Array(c0 as Buffer) : null;
-    }
+    const c0 = Array.isArray(dc) && dc.length > 0 ? dc[0] : null;
+    const primary = c0 instanceof Uint8Array ? c0 : Buffer.isBuffer(c0) ? new Uint8Array(c0 as Buffer) : null;
+    if (!primary || primary.length !== 32) return { ok: false, reason: "no_primary_pubkey" };
+    return { ok: true, primary };
   } catch (err: unknown) {
-    deps.logger.warn("session.unilateral.certificate.share.decode.failed", {
+    deps.logger.warn("session.certificate.share.decode.failed", {
       agentPubkey: deps.agentPubkeyHex,
       detail: extractErrorMessage(err),
     });
     return { ok: false, reason: "share_decode_failed" };
   }
-  if (!primaryPubkey || primaryPubkey.length !== 32) return { ok: false, reason: "no_primary_pubkey" };
-
-  const verifier = new FrostThresholdSigner({ threshold: 1, participants: 1 }, Buffer.from(deps.agentPubkeyHex, "hex"));
-  const valid = verifier.verifySignature(cert.frostSignature, tbs, "cello-frost-seal-v1" as FrostContext, primaryPubkey);
-  return valid ? { ok: true } : { ok: false, reason: "signature_invalid" };
 }
 
 /**
- * M7 legibility-TBS-binding: verify a BILATERAL session_sealed certificate's signature over the
+ * M7 legibility-TBS-binding: verify a BILATERAL session_sealed certificate's FROST signature over the
  * legibility-bound TBS, channel-independently.
  *
- * KEY STRUCTURE (why verifiability is asymmetric TODAY): the seal's FROST signature is produced by
- * the group key (commitments[0] of the DKG share) of whichever party CLOSED THE SESSION FIRST — the
- * directory designates the sender of the first SEAL ctrl leaf as the "seal initiator" and signs
- * against that party's primary (directory-node.ts). This is NOT a fixed initiator/responder role:
- * either the session initiator or the responder can be the first closer.
+ * The seal is signed by the group key of whichever party CLOSED FIRST (the directory's "seal
+ * initiator" — either the session initiator or the responder). This party verifies against a key it
+ * holds itself: its OWN primary (from its DKG share), or the counterparty's, recorded when the
+ * session opened from a v2 key binding the verifier checked (`recordCounterpartyKeys`). A signer
+ * that is neither, or a signature that does not verify, is refused. A tampered legibility (carried
+ * unsigned on the frame) changes the hash, fails the signature, and is refused.
  *
- * A party can channel-independently verify here only against a group primary it HOLDS locally:
- *  - its OWN primary — loaded from its own DKG share (`signer_pubkey === own primary`); or
- *  - the counterparty's primary — recorded via recordCounterpartyPrimary (see below).
- * It then verifies the FROST signature over `buildSealTbs ‖ legibilityHash`. A tampered legibility
- * (answered / content_frontier_seq / attestation_mode — carried unsigned on the frame) changes the
- * hash → the signature fails → REJECT.
+ * ONE case is accepted unverified, and it is a feature, not a fallback: the operator removed the
+ * contact (`clearPinnedCounterpartyPrimary`), which deliberately forgets the counterparty's key. A
+ * seal signed by that counterparty can then no longer be checked here, and the result says so
+ * (`verified:false`, `counterparty_key_forgotten`) so no caller can present it as proof. Every
+ * other inability to verify — no share, an undecodable share — is a refusal.
  *
- * When the signer's key is NOT held locally, the party ACCEPTS (`verified:false`, with a `reason`).
- * This is sound for the LIVE path: session_sealed arrives over the daemon↔directory libp2p Noise
- * channel (authenticated + encrypted), so it is not MITM-tamperable in transit; the binding's
- * primary value is OUT-OF-BAND (any holder of the signer's primary — e.g. an arbitrator — can verify
- * an exported cert's legibility).
- *
- * SYMMETRY: both closing orders verify locally, and it takes BOTH bindings to stay that way. The
- * initiator learns the responder's primary from `participant_b_primary_pubkey` with a binding
- * signed by participant_b's own K_local, recorded by `initiate-session-handler.ts`; the responder
- * learns the initiator's from `signer_pubkey` with `participant_a_key_binding`, verified before the
- * assignment's threshold signature is checked at all and recorded by `inbound-sessions.ts`. Both
- * are refused by name when absent or invalid (`assignment-verify.ts`).
- *
- * The binding, not the key, is the load-bearing part: carrying a group key alone would let a
- * directory name one of its choosing, so a change that keeps either key and drops its binding
- * breaks verification while appearing to work.
- *
- * `signer_key_not_held` is therefore NOT the ordinary responder-first outcome. It remains reachable
- * for a session row that predates the recording, or one whose assignment never reached this path,
- * and it is the honest answer there, which is why the branch stays.
- *
- * `legibility` MUST be the AS-RECEIVED wire object (not a normalised copy) — the directory signed
- * over the canonical hash of exactly what it sent.
+ * `legibility` MUST be the AS-RECEIVED wire object — the directory signed over the canonical hash of
+ * exactly what it sent.
  */
 export async function verifyBilateralSealCertificate(
-  deps: { persistence: DaemonRegistrationPersistence; agentPubkeyHex: string; logger: Logger; counterpartyPrimaryHex?: string | null },
+  deps: { persistence: DaemonRegistrationPersistence; agentPubkeyHex: string; logger: Logger; counterpartyPrimaryHex: string | null },
   cert: {
     sessionId: Uint8Array;
     sealedRoot: Uint8Array;
@@ -1000,56 +966,20 @@ export async function verifyBilateralSealCertificate(
     closeTimestamp: number;
     frostSignature: Uint8Array;
     signerPubkey: Uint8Array;
-    signatureType: "frost" | "single";
     legibility: LegibilityForHash | null;
   },
-): Promise<{ ok: true; verified: boolean; reason?: string } | { ok: false; reason: string }> {
-  // F2-a: every verified:false branch carries a `reason` so the daemon's
-  // session.sealed.signature.checked log can never read as a silently-tolerated FAILED check.
-  // A genuinely failed check takes the { ok:false, reason:"signature_invalid" } path, which the
-  // caller REJECTS (never marks sealed). verified:false is always "no key held to verify → accepted
-  // on the authenticated Noise channel", never "a check ran and failed".
-  if (cert.signatureType !== "frost") return { ok: true, verified: false, reason: "non_frost_certificate" };
+): Promise<{ ok: true; verified: true } | { ok: true; verified: false; reason: "counterparty_key_forgotten" } | { ok: false; reason: string }> {
   if (cert.signerPubkey.length !== 32) return { ok: false, reason: "no_signer_pubkey" };
   const signerHex = Buffer.from(cert.signerPubkey).toString("hex");
-
-  const share = await deps.persistence.loadActiveFrostKeyShare();
-  if (!share) return { ok: true, verified: false, reason: "no_frost_share" }; // no share to verify with — accept (Noise-delivered)
-
-  let ownPrimary: Uint8Array | null = null;
-  try {
-    const dc = decode(Buffer.from(share.commitmentsCbor)) as unknown;
-    if (Array.isArray(dc) && dc.length > 0) {
-      const c0 = dc[0];
-      ownPrimary = c0 instanceof Uint8Array ? c0 : Buffer.isBuffer(c0) ? new Uint8Array(c0 as Buffer) : null;
-    }
-  } catch {
-    return { ok: true, verified: false, reason: "commitments_decode_failed" };
+  const own = await ownPrimary(deps);
+  if (!own.ok) return own;
+  const cpHex = deps.counterpartyPrimaryHex?.toLowerCase() ?? null;
+  if (signerHex !== Buffer.from(own.primary).toString("hex")) {
+    // Not our own key, so it must be the counterparty's — SI-003: never a key supplied only by the
+    // (untrusted) cert frame.
+    if (cpHex === null) return { ok: true, verified: false, reason: "counterparty_key_forgotten" };
+    if (signerHex !== cpHex) return { ok: false, reason: "signer_not_a_session_participant" };
   }
-  if (!ownPrimary || ownPrimary.length !== 32) return { ok: true, verified: false, reason: "own_primary_unavailable" };
-
-  // The seal is signed by the INITIATOR's primary (group) key. This party can verify against a
-  // key it holds independently: its OWN primary (when it is the initiator) or the counterparty's
-  // primary from the FROST-signed SessionAssignment (when it is the responder). SI-003: the signer
-  // must be one of these — never a key supplied only by the (untrusted) cert frame.
-  const cpHex = deps.counterpartyPrimaryHex ?? null;
-  if (signerHex === Buffer.from(ownPrimary).toString("hex")) {
-    // initiator path — verify against own primary.
-  } else if (cpHex && signerHex === cpHex.toLowerCase()) {
-    // responder path — verify against the known counterparty primary.
-  } else if (cpHex) {
-    // We know the counterparty primary and the signer is NEITHER participant → unknown signer.
-    return { ok: false, reason: "signer_not_a_session_participant" };
-  } else {
-    // We do not hold the signer's key (no counterparty primary recorded) → cannot verify; accept
-    // (the live frame arrived over the authenticated Noise channel; the binding aids out-of-band).
-    // Reachable only for a session whose assignment never carried (or never recorded) the
-    // counterparty's bound primary — a pre-038-KEYBIND row. A CURRENT session reaching here means
-    // `recordCounterpartyPrimary` did not run on either side (`initiate-session-handler.ts` for the
-    // initiator, `inbound-sessions.ts` for the responder), which is a defect, not a close order.
-    return { ok: true, verified: false, reason: "signer_key_not_held" };
-  }
-
   const tbs = bindLegibilityToTbs(buildSealTbs(cert.sessionId, cert.sealedRoot, cert.leafCount, cert.closeTimestamp), cert.legibility);
   const verifier = new FrostThresholdSigner({ threshold: 1, participants: 1 }, Buffer.from(deps.agentPubkeyHex, "hex"));
   const valid = verifier.verifySignature(cert.frostSignature, tbs, "cello-frost-seal-v1" as FrostContext, cert.signerPubkey);

@@ -454,7 +454,6 @@ export function extractInboundSessionAssignment(frame: Record<string, unknown>):
       // assignment on its side, and the handler must refuse it here too. null when absent.
       counterpartySessionPeerId: string | null;
       sessionTimestamp: number;
-      signatureType: string | null;
       relayPeerId: string;
       relayAddrs: string[];
       // DOD-FIRSTMSG-WITNESS-1: the directory's per-node relay signature. WITHOUT it the
@@ -528,7 +527,6 @@ export function extractInboundSessionAssignment(frame: Record<string, unknown>):
     counterpartySessionPeerId:
       typeof a["counterparty_session_peer_id"] === "string" ? a["counterparty_session_peer_id"] : null,
     sessionTimestamp: typeof a["session_timestamp"] === "number" ? a["session_timestamp"] : 0,
-    signatureType: typeof a["signature_type"] === "string" ? a["signature_type"] : null,
     relayPeerId,
     relayAddrs,
     // DOD-FIRSTMSG-WITNESS-1. Accept only a well-formed 64-byte Ed25519 signature: anything else
@@ -1358,18 +1356,6 @@ export function createInboundSessions(deps: InboundSessionDeps) {
          */
         sessionNodeManager.recordRefusedSession(streamAgentName, looseSessionId, REFUSAL_REASONS.SESSION_WITHOUT_ASSIGNMENT);
       }
-      return;
-    }
-
-    // L1: refuse M1 single-key assignments outright (downgrade guard). Distinct from the FROST
-    // signature verification below, and deliberately BEFORE it: this refuses the algorithm, that
-    // checks the signature.
-    if (parsed.signatureType === "single") {
-      logger.warn("session.inbound.assignment.refused", {
-        sessionId: parsed.sessionIdHex,
-        reason: "unsupported_signature_type",
-        correlationId,
-      });
       return;
     }
 

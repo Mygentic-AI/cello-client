@@ -4,14 +4,10 @@
  * SessionAssignment: shared wire type used by directory (sender), client (receiver),
  * and relay (verifier). Lives here so client can import it without touching @cello-protocol/directory.
  *
- * SessionAssignment is a discriminated union on `signature_type`, so TypeScript enforces that
- * `signer_pubkey` is present exactly when the signature is FROST:
- *   signature_type: 'frost' | 'single'
- *     - 'frost': the directory_signature field carries the 64-byte combined FROST output
- *     - 'single': legacy single-key directory signature (refused by current clients)
- *   signer_pubkey?: Uint8Array (32 bytes, present when signature_type === 'frost')
- *     - The initiator's primary_pubkey (group FROST key). Embedded so the counterparty
- *       can verify without a separate directory round-trip.
+ * Every SessionAssignment is FROST-signed: `directory_signature` carries the 64-byte combined FROST
+ * output, and `signer_pubkey` (32 bytes) is the initiator's primary_pubkey (group FROST key),
+ * embedded so the counterparty can verify without a separate directory round-trip. There is no
+ * other signature type.
  *
  * FROST TBS for session establishment (RFC 9591, domain separation per CONTEXT.md):
  *   context: "cello-frost-session-establishment-v1"
@@ -68,8 +64,12 @@ export interface RelayEndpointInfo {
   multiaddrs: string[];
 }
 
-/** Common fields shared by both SessionAssignment variants. */
-interface SessionAssignmentCommon {
+/**
+ * FROST-signed session assignment — the only kind. `signer_pubkey` is the initiator's group public
+ * key (primary_pubkey from DKG), embedded so the counterparty can verify without a directory
+ * round-trip.
+ */
+export interface SessionAssignment {
   session_id: Uint8Array;           // 16 bytes, CSPRNG
   participant_a: ParticipantInfo;
   participant_b: ParticipantInfo;
@@ -77,7 +77,8 @@ interface SessionAssignmentCommon {
   directory_endpoint: RelayEndpointInfo; // client dials directory for session_sealed events
   session_timestamp: number;        // Unix ms
   directory_pubkey: Uint8Array;     // 32-byte directory identity pubkey
-  directory_signature: Uint8Array;  // 64-byte threshold/single signature over TBS
+  directory_signature: Uint8Array;  // 64-byte combined FROST signature over TBS
+  signer_pubkey: Uint8Array;        // 32-byte FROST group public key of the initiator
   // The per-node directory signature over the relay TBS ([session_id, participant_a, participant_b,
   // session_timestamp, (initiator_peer_id, counterparty_peer_id)]). Distinct from
   // `directory_signature` (the FROST session-establishment sig authorizing the peer↔peer session):
@@ -107,16 +108,6 @@ interface SessionAssignmentCommon {
    * NOT the same key as `relay_endpoint.peer_id`, which is the relay's libp2p transport identity.
    */
   relay_id?: string;
-}
-
-/**
- * FROST-signed assignment. `signer_pubkey` is the initiator's group public key
- * (primary_pubkey from DKG / trustedDealer commitments[0]). Embedded so the
- * counterparty can verify without a directory round-trip.
- */
-export interface SessionAssignmentFrost extends SessionAssignmentCommon {
-  signature_type: "frost";
-  signer_pubkey: Uint8Array; // 32-byte FROST group public key — required for 'frost'
 
   /**
    * 038-KEYBIND, extended by M9D 002-PQKEYS — the fields that let each party PLACE the other's keys:
@@ -155,8 +146,7 @@ export interface SessionAssignmentFrost extends SessionAssignmentCommon {
 
   /**
    * `participant_b`'s 32-byte FROST group public key. Carried so the INITIATOR learns the
-   * responder's group key too — without it a responder-first seal reaches the initiator signed by a
-   * key it does not hold, and is accepted `verified:false` / `signer_key_not_held`.
+   * responder's group key too — without it the initiator could not verify a responder-first seal.
    */
   participant_b_primary_pubkey: Uint8Array;
   /** 64-byte Ed25519 signature by `participant_b`'s K_local over participant_b's v2 binding TBS. */
@@ -168,23 +158,6 @@ export interface SessionAssignmentFrost extends SessionAssignmentCommon {
   /** participant_b's 1184-byte ML-KEM-768 public key. */
   participant_b_ml_kem_pubkey: Uint8Array;
 }
-
-/**
- * Legacy single-key directory signature. Refused by current clients.
- */
-export interface SessionAssignmentSingle extends SessionAssignmentCommon {
-  signature_type: "single";
-  // signer_pubkey absent — a single-key assignment verifies against directory_pubkey
-}
-
-/**
- * Discriminated union. TypeScript enforces `signer_pubkey` is present only
- * when `signature_type === 'frost'`.
- *
- * Only 'frost' is handled. A 'single' assignment is rejected with
- * `unsupported_signature_type`.
- */
-export type SessionAssignment = SessionAssignmentFrost | SessionAssignmentSingle;
 
 // ─── Session establishment TBS builder ────────────────────────────────────────
 
@@ -415,26 +388,10 @@ export interface SessionAbandonedNotice {
 }
 
 /**
- * Legacy session_sealed frame (single-key directory signature). Refused by current clients.
- * @deprecated Use SessionSealedFrost.
+ * session_sealed frame carrying the FROST-notarized ceremony signature — the only kind of seal.
  */
-export interface SessionSealedSingle {
+export interface SessionSealed {
   type: "session_sealed";
-  signature_type: "single";
-  session_id: Uint8Array;          // 16 bytes
-  sealed_root: Uint8Array;         // 32-byte final Merkle root
-  directory_signature: Uint8Array; // 64-byte Ed25519 over canonical CBOR([session_id, sealed_root, close_timestamp])
-  close_timestamp: number;         // Unix ms
-  legibility?: SealLegibility;     // frontiers + attestation modes + final_message
-}
-
-/**
- * session_sealed frame carrying the FROST-notarized ceremony signature.
- * signature_type is 'frost' when the FROST ceremony completes.
- */
-export interface SessionSealedFrost {
-  type: "session_sealed";
-  signature_type: "frost";
   session_id: Uint8Array;          // 16 bytes
   sealed_root: Uint8Array;         // 32-byte final Merkle root
   frost_signature: Uint8Array;     // 64-byte combined FROST signature over seal TBS
@@ -443,9 +400,6 @@ export interface SessionSealedFrost {
   leaf_count?: number;             // total leaves in the sealed tree
   legibility?: SealLegibility;     // frontiers + attestation modes + final_message
 }
-
-/** Discriminated union: current senders emit SessionSealedFrost; SessionSealedSingle is the legacy wire format. */
-export type SessionSealed = SessionSealedSingle | SessionSealedFrost;
 
 // ─── Seal certificate legibility ──────────────────────────────────────────────
 //
@@ -540,7 +494,12 @@ export type SealRejectionReason =
    * DOD-M15-SEALPARTIES-1: both participants approved, and approved DIFFERENT transcripts. This is
    * the one that DOES mean "compare notes with your counterparty".
    */
-  | "seal_parties_disagree";
+  | "seal_parties_disagree"
+  /**
+   * M9D 002-PQKEYS: the refusing node holds no group key for the seal initiator, so it cannot
+   * FROST-sign. A seal is FROST-signed or not issued; another node holding the profile can seal.
+   */
+  | "seal_signer_key_unavailable";
 
 export interface SessionSealRejected {
   type: "session_seal_rejected";

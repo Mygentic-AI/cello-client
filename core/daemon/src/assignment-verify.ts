@@ -10,14 +10,12 @@
  * "did the right party say it". Keeping them apart means the second cannot be quietly skipped by a
  * caller that only wanted the first — which is how the gap existed.
  */
-// `verify` (plain Ed25519) is deliberately NOT imported: the single-key branch that used it was
-// removed with the downgrade refusal (review F1). Verifying `directory_signature` against the
-// `directory_pubkey` riding beside it in the same unsigned frame checks a key against itself, and
-// having that call available is how a future edit reintroduces the bypass.
+// `verify` (plain Ed25519) is deliberately NOT imported: verifying `directory_signature` against the
+// `directory_pubkey` riding beside it in the same unsigned frame checks a key against itself.
 import { verifyFrostSignature, verifyKeyBinding, CONTEXT_SESSION_ESTABLISHMENT } from "@cello-protocol/crypto";
 import { buildSessionEstablishmentTbs, computeGenesisPrevRoot } from "@cello-protocol/protocol-types";
 import type { KeyBindingRefusal } from "@cello-protocol/crypto";
-import type { ParsedSessionAssignment, ParsedSessionAssignmentFrost } from "./session-assignment-parser.js";
+import type { ParsedSessionAssignment } from "./session-assignment-parser.js";
 import type { DbRegistrationPersistence } from "./db-identity-store.js";
 import type { Logger } from "./types.js";
 
@@ -37,7 +35,7 @@ import type { Logger } from "./types.js";
  * `undefined` and comes back `key_binding_malformed`.
  */
 async function verifyPartyBinding(
-  a: ParsedSessionAssignmentFrost,
+  a: ParsedSessionAssignment,
   party: "a" | "b",
 ): Promise<{ ok: true; group: Uint8Array; mlDsa: Uint8Array; mlKem: Uint8Array } | { ok: false; reason: KeyBindingRefusal }> {
   const group = party === "a" ? a.signer_pubkey : a.participant_b_primary_pubkey;
@@ -61,7 +59,7 @@ async function verifyPartyBinding(
 function bindingGuidance(reason: KeyBindingRefusal, side: "counterparty" | "initiator"): string {
   const who = side === "counterparty" ? "your counterparty" : "the agent that opened this session";
   const absent =
-    `The directory's session assignment is missing part of ${who}'s key binding — the signatures that prove their keys belong to their identity. Nothing was opened and nothing was sent. Retry; a different directory node will serve it. If it repeats on every node, ${who} registered before this proof existed and must re-register.`;
+    `The directory's session assignment is missing part of ${who}'s key binding — the signatures that prove their keys belong to their identity. Nothing was opened and nothing was sent. Retry; a different directory node will serve it. If it repeats on every node, the directory is not serving complete profiles and cello status will show which node answered.`;
   switch (reason) {
     case "key_binding_missing":
     case "key_binding_pq_missing":
@@ -124,22 +122,6 @@ export async function verifyAssignmentSignature(
     assignment.relay_id,
   );
 
-  /**
-   * LOAD THE REGISTRATION BEFORE BRANCHING ON `signature_type` — review F1, and this ordering is
-   * the entire fix.
-   *
-   * `signature_type` rides in the frame and is covered by no signature. The parser reads any value
-   * that is not the string "frost" — including an ABSENT field — as "single". So while this load
-   * lived inside the frost branch, a hostile directory disabled every check below by omitting one
-   * field: it put its own freshly-minted key in `directory_pubkey`, signed a TBS naming an
-   * impostor as the counterparty, and the single-key branch verified that signature against that
-   * same key and returned ok. The anti-circularity comparison, the threshold verify and the
-   * fail-closed were all simply stepped over.
-   *
-   * Reading the registration first closes it: an agent that HAS a threshold registration knows its
-   * assignments are FROST-signed, so a non-FROST one is a downgrade attempt and is refused by
-   * name — never quietly routed to a weaker check.
-   */
   const reg = await persistence.loadRegistrationState();
   if (!reg) {
     // FAIL CLOSED. Without our own registration we cannot know whose quorum should have signed,
@@ -152,26 +134,6 @@ export async function verifyAssignmentSignature(
       ok: false,
       reason: "assignment_unverifiable_no_registration",
       guidance: "This agent has no registration on record, so the directory's session assignment cannot be checked against the key that should have signed it. Re-register with cello register-agent, then try again.",
-    };
-  }
-
-  if (assignment.signature_type !== "frost") {
-    /**
-     * THE DOWNGRADE REFUSAL. Checked against the producer, not assumed: the directory constructs
-     * `signature_type: "frost"` unconditionally at a single site (`directory-node.ts`), with no
-     * branch that can emit anything else. There is no legitimate producer of a single-key session
-     * assignment for a registered agent, so this is not a compatibility path being closed — it is
-     * a shape that only an attacker or a broken directory can send.
-     */
-    logger.error("session.assignment.signature_type_downgraded", {
-      agentName, correlationId,
-      offeredType: assignment.signature_type,
-      impact: "the assignment claimed a weaker signature type than this agent's registration can produce, which would have routed it to a check that verifies a key against itself; it was refused, and no session was established",
-    });
-    return {
-      ok: false,
-      reason: "assignment_signature_type_downgraded",
-      guidance: "The directory returned a session assignment that does not carry a threshold signature, though this agent is registered with one. Nothing was established and no message was sent. Retry the session; if it repeats, the directory you reached is not producing valid assignments and cello status will show which one that is.",
     };
   }
 
@@ -195,7 +157,7 @@ export async function verifyAssignmentSignature(
     }
     if (!verifyFrostSignature(assignment.directory_signature, tbs, CONTEXT_SESSION_ESTABLISHMENT, assignment.signer_pubkey)) {
       logger.error("session.assignment.signature_invalid", {
-        agentName, correlationId, signatureType: "frost",
+        agentName, correlationId,
         impact: "the assignment's threshold signature did not verify over its own contents; it was refused, and no session was established",
       });
       return {
@@ -314,17 +276,8 @@ export async function verifyInboundAssignment(
   | { ok: true; mode: "pinned" | "bound"; initiatorPrimary: Uint8Array; initiatorMlDsa: Uint8Array; initiatorMlKem: Uint8Array }
   | { ok: false; reason: string; detail: string }
 > {
-  if (assignment.signature_type !== "frost") {
-    return {
-      ok: false,
-      reason: "inbound_assignment_not_frost",
-      detail: `signature_type was ${String(assignment.signature_type)}; the directory produces frost for every session assignment`,
-    };
-  }
+  // The parser refuses an assignment without a 32-byte signer_pubkey.
   const signer = assignment.signer_pubkey;
-  if (!signer || signer.length !== 32) {
-    return { ok: false, reason: "inbound_assignment_no_signer", detail: "signer_pubkey missing or not 32 bytes" };
-  }
 
   /**
    * 038-KEYBIND — PLACE THE GROUP KEY BEFORE VERIFYING ANYTHING UNDER IT.

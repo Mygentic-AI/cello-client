@@ -32,7 +32,7 @@
  * is the out-of-band value, and no field on this frame can vouch for it.
  */
 
-import type { SessionAssignmentFrost, SessionAssignmentSingle } from "@cello-protocol/protocol-types";
+import type { SessionAssignment } from "@cello-protocol/protocol-types";
 
 /**
  * The per-party key fields of a FROST assignment (038-KEYBIND, M9D 002-PQKEYS). REQUIRED on the wire
@@ -46,10 +46,9 @@ export const ASSIGNMENT_KEY_FIELDS = [
 ] as const;
 type AssignmentKeyField = (typeof ASSIGNMENT_KEY_FIELDS)[number];
 
-/** A FROST assignment as parsed: every key field present-and-right-width, or `undefined`. */
-export type ParsedSessionAssignmentFrost =
-  Omit<SessionAssignmentFrost, AssignmentKeyField> & { [K in AssignmentKeyField]: Uint8Array | undefined };
-export type ParsedSessionAssignment = ParsedSessionAssignmentFrost | SessionAssignmentSingle;
+/** An assignment as parsed: every key field present-and-right-width, or `undefined`. */
+export type ParsedSessionAssignment =
+  Omit<SessionAssignment, AssignmentKeyField> & { [K in AssignmentKeyField]: Uint8Array | undefined };
 
 /** The width each key field must have; any other width parses as `undefined`. */
 const KEY_FIELD_BYTES: Record<AssignmentKeyField, number> = {
@@ -194,8 +193,6 @@ export function parseSessionAssignment(
   const directoryEndpoint = parseEndpointInfo(raw["directory_endpoint"]);
   if (!directoryEndpoint) return null;
 
-  const sigType = typeof raw["signature_type"] === "string" ? raw["signature_type"] : "single";
-
   // Session peer IDs + transport mode — undefined when absent (an older peer omits them).
   const initiatorSessionPeerId =
     typeof raw["initiator_session_peer_id"] === "string" && raw["initiator_session_peer_id"] !== ""
@@ -253,7 +250,8 @@ export function parseSessionAssignment(
     relay_id: relayId,
   };
 
-  if (sigType === "frost") {
+  {
+    // Every assignment is FROST-signed; one without the initiator's group key is malformed.
     const signerPubkey = toU8Safe(raw["signer_pubkey"]);
     if (!signerPubkey || signerPubkey.length !== 32) return null;
     /**
@@ -275,12 +273,10 @@ export function parseSessionAssignment(
     }
     return {
       ...common,
-      signature_type: "frost" as const,
       signer_pubkey: signerPubkey,
       ...keyFields,
     };
   }
-  return { ...common, signature_type: "single" as const };
 }
 
 // ─── Cross-node discovery ────────────────────

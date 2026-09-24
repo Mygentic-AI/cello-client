@@ -131,8 +131,7 @@ export type SessionNegotiationResult =
       assignment: ParsedSessionAssignment;
       /**
        * 038-KEYBIND. The COUNTERPARTY's FROST group public key, hex — the value the initiator
-       * records so a responder-first seal can be verified locally instead of accepted
-       * `signer_key_not_held`.
+       * records so a responder-first seal can be verified locally.
        *
        * IT TRAVELS AS ITS OWN FIELD RATHER THAN BEING READ OFF `assignment` at the call site, and
        * that is deliberate. The same bytes ride on the frame, but the frame carries them whether or
