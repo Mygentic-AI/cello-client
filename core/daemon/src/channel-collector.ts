@@ -70,6 +70,13 @@ export interface ChannelCollectorOptions {
   localAgentKeys: (channelHex: string) => Uint8Array[];
   /** Ask the PUBLISHER to re-deposit a range. It answers by re-depositing, never by sending posts. */
   requestRepair: (agentId: string, channelHex: string, from: number, to: number) => Promise<void>;
+  /**
+   * M16 032-NOTICES: rung ONCE per collect pass that advances `delivered_through`, with the position
+   * before and after — never when nothing advanced. The wiring turns this into the content-free
+   * `channel_posts` doorbell (count = after − before). Optional and additive: an omitted callback
+   * collects exactly as before, so nothing downstream depends on it existing.
+   */
+  onDelivered?: (agentId: string, channelHex: string, before: number, after: number) => void;
   now?: () => number;
   maxBytesPerFetch?: number;
 }
@@ -238,6 +245,9 @@ export class ChannelCollector {
     }
     if (advanced > sub.delivered_through) {
       subscriptions.setDeliveredThrough(agentId, channelHex, advanced);
+      // M16 032-NOTICES: the position moved, so posts arrived — ring the doorbell once for the whole
+      // pass. `sub.delivered_through` is the position we started from; `advanced` is the new one.
+      this.#opts.onDelivered?.(agentId, channelHex, sub.delivered_through, advanced);
     }
   }
 

@@ -74,6 +74,8 @@ interface Harness {
   relays: Map<string, Relay>;
   events: Array<{ name: string; ctx?: unknown }>;
   repairs: Array<{ from: number; to: number }>;
+  /** M16 032-NOTICES: every onDelivered ring, in order, so the doorbell's count can be asserted. */
+  delivered: Array<{ agentId: string; channelHex: string; before: number; after: number }>;
   post: (seq: number, opts?: { body?: Uint8Array; agentKp?: InMemoryKeyProvider }) => Promise<BroadcastArtifact>;
   place: (relay: string, post: BroadcastArtifact) => Promise<void>;
 }
@@ -89,6 +91,7 @@ async function harness(): Promise<Harness> {
     [RELAY_B, { posts: new Map(), receipts: new Map(), firstHeld: null, down: false, asked: 0 }],
   ]);
   const repairs: Array<{ from: number; to: number }> = [];
+  const delivered: Array<{ agentId: string; channelHex: string; before: number; after: number }> = [];
 
   const subs = new ChannelSubscriptionStore(db, logger);
   subs.upsert({
@@ -122,6 +125,7 @@ async function harness(): Promise<Harness> {
       repairs.push({ from, to });
       return Promise.resolve();
     },
+    onDelivered: (agentId, chHex, before, after) => { delivered.push({ agentId, channelHex: chHex, before, after }); },
   });
 
   async function post(seq: number, opts: { body?: Uint8Array; agentKp?: InMemoryKeyProvider } = {}): Promise<BroadcastArtifact> {
@@ -139,7 +143,7 @@ async function harness(): Promise<Harness> {
     relay.firstHeld = Math.min(...relay.posts.keys());
   }
 
-  return { collector, subs, inbox, channelKp, adminKp, channelHex, relays, events, repairs, post, place };
+  return { collector, subs, inbox, channelKp, adminKp, channelHex, relays, events, repairs, delivered, post, place };
 }
 
 describe("M16 018-PUBCOLLECT: collecting", () => {
@@ -374,5 +378,34 @@ describe("M16 018-PUBCOLLECT: collecting", () => {
     // ⚠️ TWO POSITIONS, NEVER ONE. If a fetch moved the read position, everything the daemon
     // collected while the agent was away would be silently marked as read.
     expect(sub?.processed_through, "only the agent's own read moves this").toBe(0);
+  });
+
+  // ─── M16 032-NOTICES — the doorbell fires once per collect that ADVANCES delivered_through ───
+  it("1. a collect that stores posts rings onDelivered ONCE with the count and the new position", async () => {
+    const h = await harness();
+    for (const s of [1, 2, 3]) await h.place(RELAY_A, await h.post(s));
+
+    await h.collector.collectOnce(AGENT, h.channelHex);
+    // The doorbell is what tells the agent posts arrived; without this call a member finds every
+    // post by listing by hand, which is the defect this order exists to fix. before=0, after=3, so
+    // count = after − before = 3, and it rings exactly once for the whole pass, not once per post.
+    expect(h.delivered).toEqual([{ agentId: AGENT, channelHex: h.channelHex, before: 0, after: 3 }]);
+  });
+
+  it("2. a collect that stores NOTHING rings nothing — and a repeat collect that adds nothing is silent too", async () => {
+    const h = await harness();
+
+    // Nothing on either relay: nothing advances, so no doorbell.
+    await h.collector.collectOnce(AGENT, h.channelHex);
+    expect(h.delivered, "an empty collect must not ring").toEqual([]);
+
+    // Now deliver 1-3 (one ring), then collect again with nothing new — the position does not move,
+    // so the second pass is silent. A doorbell on every tick would wake the agent for no reason.
+    for (const s of [1, 2, 3]) await h.place(RELAY_A, await h.post(s));
+    await h.collector.collectOnce(AGENT, h.channelHex);
+    await h.collector.collectOnce(AGENT, h.channelHex);
+    expect(h.delivered, "one ring for the advance, none for the no-op re-collect").toEqual(
+      [{ agentId: AGENT, channelHex: h.channelHex, before: 0, after: 3 }],
+    );
   });
 });
