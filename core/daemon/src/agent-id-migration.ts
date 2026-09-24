@@ -93,6 +93,10 @@ const REKEY_TARGETS: readonly RekeyTarget[] = [
         seal_legibility TEXT,
         sealed_root_hex TEXT,
         counterparty_primary_pubkey TEXT,
+        -- M9D 002-PQKEYS: the counterparty's verified post-quantum keys. Omitted here, the re-key
+        -- would drop them on the one boot a legacy database upgrades.
+        counterparty_ml_dsa_pubkey TEXT,
+        counterparty_ml_kem_pubkey TEXT,
         session_name TEXT,
         read_at INTEGER,
         counterparty_abandoned_at INTEGER,
