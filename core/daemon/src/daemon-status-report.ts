@@ -46,13 +46,19 @@ export interface DaemonStatusDeps {
    * fingerprint in either one reassures an operator who is on someone else's network.
    */
   enforcedConsortium: EnforcedConsortium;
+  /**
+   * M16 033-CHANNELVIEW: is this identity a broadcast channel? `cello status` is the surface the
+   * enforcer reads, so it excludes channels from `agents` and lists them under `channels` exactly
+   * as the per-connection surface does — reads the DB row live, honouring a post-boot flag.
+   */
+  isChannelAgent: (agentName: string) => boolean;
 }
 
 export function createDaemonStatusReport(deps: DaemonStatusDeps) {
   const {
     sessionNodeManager, retryQueue, agents, agentStateFor, buildInterruptedSessions,
     buildActiveSessions, directorySignalingStatus, unresolvedNodesForStatus, manifestOrigin,
-    manifestProvider, directoryHttpUrl, challengeVerifier, enforcedConsortium,
+    manifestProvider, directoryHttpUrl, challengeVerifier, enforcedConsortium, isChannelAgent,
   } = deps;
 
   async function getStatus(): Promise<DaemonStatusResponse> {
@@ -100,7 +106,9 @@ export function createDaemonStatusReport(deps: DaemonStatusDeps) {
       // the MCP surface. A load_failed agent keeps its state so a broken agent stays visible as broken.
       // (No `selected` here: this is the daemon-wide surface; selection is a per-connection concept and
       // the CLI opens an ephemeral connection that never runs cello_use_agent — see M8C-DECISIONS D24.)
-      agents: agents.map((a) => ({
+      // M16 033-CHANNELVIEW: channels are excluded here and listed under `channels` below — a
+      // load_failed agent keeps its state so a broken agent stays visible as broken.
+      agents: agents.filter((a) => !isChannelAgent(a.name)).map((a) => ({
         ...a,
         state: agentStateFor(a),
         standing_receiver_ready: sessionNodeManager.getStandingReceiverReady(a.name),
@@ -111,6 +119,11 @@ export function createDaemonStatusReport(deps: DaemonStatusDeps) {
           ? { standing_receiver_refusal: sessionNodeManager.getStandingReceiverRefusal(a.name) }
           : {}),
       })),
+      // M16 033-CHANNELVIEW: the channels this daemon administers — same registry as `agents`, name
+      // + pubkey only, so `cello status` shows test-open and proof024b as channels, not agents.
+      channels: agents
+        .filter((a) => a.state !== "load_failed" && isChannelAgent(a.name))
+        .map((a) => ({ name: a.name, pubkey: a.pubkey })),
       standing_receiver_ready: sessionNodeManager.getStandingReceiverReady(),
       retryQueueDepth: retryQueue.getTotalDepth(),
       interrupted_sessions,

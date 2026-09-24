@@ -6,7 +6,7 @@
  * state as their own.
  */
 import { countAttendance } from "./co-attendance.js";
-import type { AgentInfo, AgentState } from "./types.js";
+import type { AgentInfo, AgentState, ChannelSummary } from "./types.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
 
 export interface ConnectionAgentsDeps {
@@ -16,10 +16,16 @@ export interface ConnectionAgentsDeps {
   onlineAgents: ReadonlySet<string>;
   sessionNodeManager: SessionNodeManager;
   agentStateFor: (a: AgentInfo) => AgentState;
+  /**
+   * M16 033-CHANNELVIEW: is this identity a broadcast channel? Reads the DB row live (a channel
+   * registered after boot is honoured with no restart), so it partitions the same loaded registry
+   * into agents and channels — no separate state, no separate list to fall out of sync.
+   */
+  isChannelAgent: (agentName: string) => boolean;
 }
 
 export function createConnectionAgents(deps: ConnectionAgentsDeps) {
-  const { agents, perConnectionState, onlineAgents, sessionNodeManager, agentStateFor } = deps;
+  const { agents, perConnectionState, onlineAgents, sessionNodeManager, agentStateFor, isChannelAgent } = deps;
 
   // Build agent list from this connection's perspective
   function getAgentsForConnection(connectionId: string): AgentInfo[] {
@@ -28,6 +34,10 @@ export function createConnectionAgents(deps: ConnectionAgentsDeps) {
 
     return agents
       .filter((a) => a.state !== "load_failed")
+      // M16 033-CHANNELVIEW: channels are NOT agents. They stay loaded and online, but no agent
+      // surface (cello_status, cello_agents) may list one — an operator was reading test-open and
+      // proof024b as agents. They are listed instead by getChannelsForConnection below.
+      .filter((a) => !isChannelAgent(a.name))
       .map((a) => {
         // `state` reports READINESS only; selection is a SEPARATE `selected` flag. Never fold
         // selection into `state` — a selected agent is not at a different level of readiness than a
@@ -78,5 +88,19 @@ export function createConnectionAgents(deps: ConnectionAgentsDeps) {
       });
   }
 
-  return { getAgentsForConnection };
+  /**
+   * M16 033-CHANNELVIEW: the channels this daemon administers — the complement of the agent list
+   * above, drawn from the SAME loaded registry so the two can never disagree about an identity.
+   * Name + pubkey only: a channel is selected by nobody and driven by its administering agent, so
+   * none of the per-agent readiness/selection fields apply. A load-failed identity is omitted from
+   * both lists, exactly as the agent surface omits it.
+   */
+  function getChannelsForConnection(_connectionId: string): ChannelSummary[] {
+    return agents
+      .filter((a) => a.state !== "load_failed")
+      .filter((a) => isChannelAgent(a.name))
+      .map((a) => ({ name: a.name, pubkey: a.pubkey }));
+  }
+
+  return { getAgentsForConnection, getChannelsForConnection };
 }

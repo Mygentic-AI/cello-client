@@ -39,12 +39,18 @@ export interface StartAgentDeps {
   ) => { signaling: SignalingManager };
   autoRecoverForAgent: (agentName: string, trigger?: string) => Promise<void>;
   flushAwaitingContent: (filterAgentName?: string) => Promise<void>;
+  /**
+   * M16 033-CHANNELVIEW: is this identity a broadcast channel? A channel starts exactly like an
+   * agent (it must publish and hold keys), but NO `agent_state_changed` may ring for it — otherwise
+   * every daemon restart fires "channel test-open is now online" per channel. Reads the DB row live.
+   */
+  isChannelAgent: (agentName: string) => boolean;
 }
 
 export function createStartAgent(deps: StartAgentDeps) {
   const {
     logger, sessionNodeManager, agents, onlineAgents, explicitlyOfflineAgents, keyProviders,
-    getNotificationDispatcher, getAgentSignaling, autoRecoverForAgent, flushAwaitingContent,
+    getNotificationDispatcher, getAgentSignaling, autoRecoverForAgent, flushAwaitingContent, isChannelAgent,
   } = deps;
 
   // ─── MCP-001: cello_start_agent handler ───
@@ -163,8 +169,10 @@ export function createStartAgent(deps: StartAgentDeps) {
       standingReceiver: receiverReady ? "ready" : "starting",
       ...(startingCause !== undefined ? { standingReceiverCause: startingCause } : {}),
     });
-    // MCP-002: Broadcast agent_state_changed to ALL connections
-    getNotificationDispatcher().dispatchAgentStateChanged(name, "online", "started");
+    // MCP-002: Broadcast agent_state_changed to ALL connections — EXCEPT a channel (M16
+    // 033-CHANNELVIEW). A channel is online just like an agent, but it is not an agent and must not
+    // ring a doorbell; otherwise a restart announces every administered channel as "now online".
+    if (!isChannelAgent(name)) getNotificationDispatcher().dispatchAgentStateChanged(name, "online", "started");
     if (receiverReady) return { ok: true, standing_receiver: "ready" as const };
     return {
       ok: true,

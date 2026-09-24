@@ -203,6 +203,15 @@ export interface ScreeningStatusInfo {
   problem?: string;
 }
 
+/**
+ * M16 033-CHANNELVIEW: one broadcast channel this daemon administers, as shown on the `channels`
+ * field of a status surface. Name for display, pubkey for the identity an operator pastes.
+ */
+export interface ChannelSummary {
+  name: string;
+  pubkey?: string;
+}
+
 export interface DaemonStatusResponse {
   daemon: "running";
   /**
@@ -216,6 +225,15 @@ export interface DaemonStatusResponse {
   screening?: ScreeningStatusInfo;
   directory_signaling: DirectorySignalingState;
   agents: AgentInfo[];
+  /**
+   * M16 033-CHANNELVIEW: the broadcast channels this daemon administers, listed SEPARATELY from
+   * `agents`. A channel is an identity row with `channel = 1`; it is loaded and brought online like
+   * an agent (it must publish and hold keys), but every AGENT surface excludes it so an operator
+   * never reads a channel as an agent. Name + pubkey only — a channel is selected by nobody and
+   * driven by its administering agent, so it carries none of the per-agent readiness/selection
+   * fields. Same source as `agents` (the live registry), no new state.
+   */
+  channels: ChannelSummary[];
   // No `connections` field: an always-empty placeholder conveys nothing and reads as a mock. The
   // ConnectionInfo type stays exported as the shape connected-client visibility will populate;
   // per-connection state lives in perConnectionState.

@@ -60,7 +60,7 @@ async function withIpc<T>(socketPath: string, fn: (client: IpcClient) => Promise
  */
 export async function autoStartAllAgents(
   client: IpcClient,
-): Promise<{ started: string[]; failed: Array<{ name: string; reason: string }> }> {
+): Promise<{ started: string[]; failed: Array<{ name: string; reason: string }>; started_channels: string[] }> {
   const started: string[] = [];
   const failed: Array<{ name: string; reason: string }> = [];
   const listRes = (await client.send("cello_list_agents")) as { agents?: Array<{ name: string }> };
@@ -73,7 +73,19 @@ export async function autoStartAllAgents(
       failed.push({ name: a.name, reason: err instanceof Error ? err.message : String(err) });
     }
   }
-  return { started, failed };
+  // M16 033-CHANNELVIEW: channels are NOT agents, so cello_list_agents no longer returns them — they
+  // are listed on cello_status under `channels`. They must still be brought online (a channel
+  // publishes and holds keys), so start each here and report them under their OWN heading. A channel
+  // is started exactly like an agent; only what is SHOWN differs, and no online doorbell rings for it.
+  const started_channels: string[] = [];
+  const statusRes = (await client.send("cello_status")) as { channels?: Array<{ name: string }> };
+  for (const c of statusRes.channels ?? []) {
+    try {
+      const r = (await client.send("cello_start_agent", { name: c.name })) as { ok?: boolean };
+      if (r.ok) started_channels.push(c.name);
+    } catch { /* a channel that cannot start is simply not counted as started — never as a failed agent */ }
+  }
+  return { started, failed, started_channels };
 }
 
 export interface CommandResult {
@@ -162,9 +174,13 @@ export async function screenerLoginLine(
  * M8C-LOGINSTART-1: compose the operator-facing auto-start summary — every failed agent enumerated
  * by name + reason. Pure + exported so the enumeration string is directly testable.
  */
-export function formatLoginSummary(result: { started: string[]; failed: Array<{ name: string; reason: string }> }): string {
+export function formatLoginSummary(result: { started: string[]; failed: Array<{ name: string; reason: string }>; started_channels?: string[] }): string {
   const parts: string[] = [];
   if (result.started.length > 0) parts.push(`Started ${result.started.length} agent(s): ${result.started.join(", ")}.`);
+  // M16 033-CHANNELVIEW: channels get their own clause — an operator used to read "Started 6
+  // agent(s)" when four of the six were channels. Omitted when zero, so it never appears empty.
+  const startedChannels = result.started_channels ?? [];
+  if (startedChannels.length > 0) parts.push(`Started ${startedChannels.length} channel(s): ${startedChannels.join(", ")}.`);
   if (result.failed.length > 0) {
     parts.push(
       `${result.failed.length} agent(s) failed to start: ${result.failed.map((f) => `${f.name} (${f.reason})`).join(", ")}. ` +
@@ -176,7 +192,7 @@ export function formatLoginSummary(result: { started: string[]; failed: Array<{ 
   // needed, and not that tokens only exist for someone a cohort has admitted. That last omission
   // is the expensive one — it sent people to the Telegram operations agent to ask for something it
   // could not give them, with nothing in the product having warned them. See onboarding-guidance.ts.
-  if (result.started.length === 0 && result.failed.length === 0) parts.push(noAgentsGuidance());
+  if (result.started.length === 0 && result.failed.length === 0 && startedChannels.length === 0) parts.push(noAgentsGuidance());
   return parts.join("\n");
 }
 

@@ -121,6 +121,27 @@ describe("M8C-LOGINSTART-1 CORE: autoStartAllAgents", () => {
     expect(empty).toMatch(/cohort/i);
   });
 
+  // M16 033-CHANNELVIEW: the summary splits agents from channels. An operator used to read
+  // "Started 6 agent(s)" when four of the six were channels — this names each kind.
+  it("033: formatLoginSummary splits the started channels into their own clause", () => {
+    const s = formatLoginSummary({
+      started: ["alice"],
+      failed: [],
+      started_channels: ["test-open", "test-invite"],
+    });
+    expect(s).toContain("Started 1 agent(s): alice.");
+    expect(s).toContain("Started 2 channel(s): test-open, test-invite.");
+  });
+
+  it("033: no channels clause is printed when zero channels started", () => {
+    const s = formatLoginSummary({ started: ["alice"], failed: [], started_channels: [] });
+    expect(s).toContain("Started 1 agent(s): alice.");
+    expect(s).not.toMatch(/channel\(s\)/);
+    // An omitted started_channels is treated the same as an empty one — no channels clause.
+    const s2 = formatLoginSummary({ started: ["alice"], failed: [] });
+    expect(s2).not.toMatch(/channel\(s\)/);
+  });
+
   // F2 (reviewer): the login() boundary — exit 0 with the summary appended, against a REAL in-process
   // daemon (acquireLock points connectOrStart at it, so it CONNECTS instead of spawning the binary).
   it("F2: login() returns exit 0 and appends the auto-start summary", async () => {

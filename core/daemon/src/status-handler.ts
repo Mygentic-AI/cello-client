@@ -16,7 +16,7 @@ import { describeDirectoryAuth } from "./directory-auth-posture.js";
 import { describeConsortiumFingerprint, type EnforcedConsortium } from "./consortium-fingerprint.js";
 import { resolveDirectoryUrl } from "./directory-bootstrap.js";
 import type { IpcHandler } from "./ipc-server.js";
-import type { AgentInfo, ActiveSessionInfo, DirectorySignalingState, InterruptedSessionInfo } from "./types.js";
+import type { AgentInfo, ActiveSessionInfo, ChannelSummary, DirectorySignalingState, InterruptedSessionInfo } from "./types.js";
 import type { IDirectoryChallengeVerifier } from "@cello-protocol/transport";
 import type { ConsortiumManifest } from "@cello-protocol/protocol-types";
 
@@ -24,6 +24,11 @@ export interface StatusHandlerDeps {
   handlers: Map<string, IpcHandler>;
   /** Every agent this CONNECTION may act as — not every agent the daemon holds. */
   getAgentsForConnection: (connectionId: string) => AgentInfo[];
+  /**
+   * M16 033-CHANNELVIEW: the broadcast channels this daemon administers, listed separately from
+   * agents. Same source as `getAgentsForConnection` — the two partition one loaded registry.
+   */
+  getChannelsForConnection: (connectionId: string) => ChannelSummary[];
   directorySignalingStatus: () => DirectorySignalingState;
   /** Where the verified manifest came from, for a reader deciding how much the rest is worth. */
   manifestOrigin: ManifestOrigin;
@@ -52,9 +57,9 @@ export interface StatusHandlerDeps {
 
 export function registerStatusHandler(deps: StatusHandlerDeps): void {
   const {
-    handlers, getAgentsForConnection, directorySignalingStatus, manifestOrigin, manifestProvider,
-    directoryHttpUrl, challengeVerifier, unresolvedNodesForStatus, buildInterruptedSessions, buildActiveSessions,
-    enforcedConsortium,
+    handlers, getAgentsForConnection, getChannelsForConnection, directorySignalingStatus, manifestOrigin,
+    manifestProvider, directoryHttpUrl, challengeVerifier, unresolvedNodesForStatus, buildInterruptedSessions,
+    buildActiveSessions, enforcedConsortium,
   } = deps;
 
   handlers.set("cello_status", async (_params, connectionId) => {
@@ -93,6 +98,9 @@ export function registerStatusHandler(deps: StatusHandlerDeps): void {
         urlExplicitlyConfigured: directoryHttpUrl !== undefined || process.env["CELLO_DIRECTORY_URL"] !== undefined,
       }),
       agents: getAgentsForConnection(connectionId),
+      // M16 033-CHANNELVIEW: channels this daemon administers, listed as channels — never folded
+      // into `agents` above, and no online/offline doorbell rings for one.
+      channels: getChannelsForConnection(connectionId),
       // M-1 PULL: live MCP clients must see interrupted sessions too, exactly as
       // the daemon-wide getStatus() surfaces them.
       interrupted_sessions: buildInterruptedSessions(),

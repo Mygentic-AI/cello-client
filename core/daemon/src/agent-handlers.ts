@@ -69,6 +69,12 @@ export interface AgentHandlerDeps {
   getAgentSignaling: (agentName: string, keyProvider: KeyProvider, pubkeyHex: string) => { signaling: SignalingManager; getNode: () => CelloNode | null };
   waitForSignalingConnected: (mgr: SignalingManager, timeoutMs: number) => Promise<boolean>;
   perAgentSignaling: Map<string, unknown>;
+  /**
+   * M16 033-CHANNELVIEW: is this identity a broadcast channel? Two uses: no `agent_state_changed`
+   * (offline/removed) may ring for a channel, and `cello_use_agent` on a channel is refused — a
+   * channel is administered by an agent, never selected as one. Reads the DB row live.
+   */
+  isChannelAgent: (agentName: string) => boolean;
 }
 
 export function registerAgentHandlers(deps: AgentHandlerDeps): void {
@@ -76,7 +82,7 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
     handlers, logger, sessionNodeManager, agents, onlineAgents, explicitlyOfflineAgents, getNotificationDispatcher,
     getConnState, perConnectionState, getAgentsForConnection, startAgentInternal,
     dropAgentSignaling, stopSweepTick, awayAckSent, keyProviders, loadedAgents, getAgentSignaling,
-    waitForSignalingConnected, perAgentSignaling,
+    waitForSignalingConnected, perAgentSignaling, isChannelAgent,
   } = deps;
 
   // ─── MCP-001: cello_start_agent handler ───
@@ -219,6 +225,9 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
     }
     const wasActive = target.state !== "retired";
     const agentId = target.localAgentId;
+    // M16 033-CHANNELVIEW: captured BEFORE any retire — `isChannelAgent` filters retired rows out, so
+    // read once here or the removal doorbell guard below can no longer tell a channel from an agent.
+    const wasChannel = isChannelAgent(name);
 
     // An already-retired agent that was never registered has nothing to do — no local retire (one-way,
     // already done) and no directory revocation to push. Treat a repeat removal as agent_not_found (a
@@ -294,7 +303,8 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
       }
       // agent.removal.retired (observability): never log key material — only the name + agent_id.
       logger.info("agent.removal.retired", { agentName: name, agentId });
-      getNotificationDispatcher().dispatchAgentStateChanged(name, "offline", "removed");
+      // M16 033-CHANNELVIEW: no agent_state_changed for a channel — it was never shown as an agent.
+      if (!wasChannel) getNotificationDispatcher().dispatchAgentStateChanged(name, "offline", "removed");
     }
 
     const baseLine = wasActive
@@ -416,8 +426,9 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
       logger.info("agent.stop.sessions_interrupted", { agentName: name, count: ownSessions.length });
     }
     logger.info("agent.offline", { agentName: name, reason: "stopped" });
-    // MCP-002: Broadcast agent_state_changed to ALL connections
-    getNotificationDispatcher().dispatchAgentStateChanged(name, "offline", "stopped");
+    // MCP-002: Broadcast agent_state_changed to ALL connections — EXCEPT a channel (M16
+    // 033-CHANNELVIEW): a channel is not an agent and rings no online/offline doorbell.
+    if (!isChannelAgent(name)) getNotificationDispatcher().dispatchAgentStateChanged(name, "offline", "stopped");
 
     // Clear current agent for all connections that had this agent as current
     for (const [connId, state] of perConnectionState) {
@@ -511,6 +522,11 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
     const agent = agents.find((a) => a.name === name);
     if (!agent || agent.state === "load_failed") {
       return { ok: false, reason: "agent_not_found", guidance: `Agent '${name}' does not exist. Create it with 'cello create-agent ${name}', register it, then retry — or check names with cello_agents.` };
+    }
+    // M16 033-CHANNELVIEW: a channel is administered by an agent, never selected AS an agent. Refuse
+    // before any auto-start so nothing half-selects a channel; the guidance names what to do instead.
+    if (isChannelAgent(name)) {
+      return { ok: false, reason: "channel_not_an_agent", guidance: `'${name}' is a channel, not an agent. Select the agent that administers it; channel commands take the channel's key.` };
     }
     const connState = getConnState(connectionId);
     if (!connState) {

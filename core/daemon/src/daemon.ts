@@ -563,8 +563,8 @@ async function startDaemonHoldingLock(
   nonceDedupStore.loadFromDb();
 
   // 040-DAEMONROOT unit 12: the agent list from ONE connection's point of view → connection-agents.ts.
-  const { getAgentsForConnection } = createConnectionAgents({
-    agents, perConnectionState, onlineAgents, sessionNodeManager,
+  const { getAgentsForConnection, getChannelsForConnection } = createConnectionAgents({
+    agents, perConnectionState, onlineAgents, sessionNodeManager, isChannelAgent: channelAgentLookup(sessionNodeManager, logger), // M16 033
     // A getter: the session views are constructed below this call, and the agent list is only ever
     // built while serving a request.
     agentStateFor: (a) => agentStateFor(a),
@@ -583,7 +583,7 @@ async function startDaemonHoldingLock(
 
   // 040-DAEMONROOT unit 17: the whole-daemon status the CLI renders → daemon-status-report.ts.
   const { getStatus } = createDaemonStatusReport({
-    sessionNodeManager, retryQueue, agents, agentStateFor, buildInterruptedSessions,
+    sessionNodeManager, retryQueue, agents, agentStateFor, buildInterruptedSessions, isChannelAgent: channelAgentLookup(sessionNodeManager, logger), // M16 033
     buildActiveSessions: buildActiveSessionsWithAttendance, directorySignalingStatus, manifestOrigin,
     // Resolved at call time: the report it produces is built below this, and a status is only ever
     // rendered later. By value it would be undefined and every status would silently omit the block
@@ -615,7 +615,7 @@ async function startDaemonHoldingLock(
   // start-agent.ts.
   const { startAgentInternal } = createStartAgent({
     logger, sessionNodeManager, agents, onlineAgents, explicitlyOfflineAgents, keyProviders,
-    getAgentSignaling, autoRecoverForAgent, flushAwaitingContent,
+    getAgentSignaling, autoRecoverForAgent, flushAwaitingContent, isChannelAgent: channelAgentLookup(sessionNodeManager, logger), // M16 033
     // A GETTER: the dispatcher is built ~575 lines below and is only touched when an agent is
     // actually started, which is always later.
     getNotificationDispatcher: () => notificationDispatcher,
@@ -630,7 +630,7 @@ async function startDaemonHoldingLock(
   registerAgentHandlers({
     handlers,
     logger,
-    sessionNodeManager,
+    sessionNodeManager, isChannelAgent: channelAgentLookup(sessionNodeManager, logger), // M16 033
     agents,
     onlineAgents,
     explicitlyOfflineAgents,
@@ -782,7 +782,7 @@ async function startDaemonHoldingLock(
   // `unresolvedNodesForStatus` is a module rather than a closure because it has TWO consumers:
   // this handler and the daemon-wide getStatus() the CLI renders.
   registerStatusHandler({
-    handlers, getAgentsForConnection, directorySignalingStatus, manifestOrigin, manifestProvider,
+    handlers, getAgentsForConnection, getChannelsForConnection, directorySignalingStatus, manifestOrigin, manifestProvider,
     directoryHttpUrl, challengeVerifier, unresolvedNodesForStatus, buildInterruptedSessions, buildActiveSessions: buildActiveSessionsWithAttendance,
     enforcedConsortium,
   });

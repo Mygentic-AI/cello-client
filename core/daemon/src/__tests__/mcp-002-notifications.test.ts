@@ -773,4 +773,101 @@ describe("MCP-002: notification routing", () => {
       { agent: "alice", type: "channel_join_request", channel: CH, subscriber: SUB },
     );
   });
+
+  // ─── M16 033-CHANNELVIEW: channels are listed as channels, never as agents ───
+  //
+  // A channel is an identity row with `channel = 1`. It is loaded and started exactly like an
+  // agent (it must publish and hold keys), but every AGENT surface must exclude it, list it under
+  // `channels`, and no online/offline doorbell may ring for it. The channel flag is set live in the
+  // DB (a real channel gets it from a directory-echoed registration this repo has no harness for);
+  // `channelAgentLookup` reads the row on every call, so a post-boot flag is honoured with no restart.
+  function markChannel(name: string): void {
+    handle!.getSessionNodeManager().getDb()
+      .prepare("UPDATE agents SET channel = 1, admin_pubkey = ? WHERE agent_name = ?")
+      .run("ad".repeat(32), name);
+  }
+
+  it("033 test1: cello_status lists agents WITHOUT channels, and channels SEPARATELY with pubkey", async () => {
+    const config = await setupWithAgents("realagent", "chan");
+    handle = await startDaemon(config);
+    markChannel("chan");
+    const client = await connect(config.socketPath);
+
+    const status = await client.send("cello_status") as {
+      agents: Array<{ name: string }>;
+      channels: Array<{ name: string; pubkey?: string }>;
+    };
+    expect(status.agents.map((a) => a.name)).toEqual(["realagent"]);
+    expect(status.channels.map((c) => c.name)).toEqual(["chan"]);
+    // The channel carries its pubkey — the identity Andre pastes, never truncated away.
+    expect(typeof status.channels[0]!.pubkey).toBe("string");
+    expect((status.channels[0]!.pubkey as string).length).toBe(64);
+  });
+
+  it("033 test2: starting a CHANNEL still starts it but rings NO agent_state_changed doorbell", async () => {
+    const config = await setupWithAgents("chan");
+    handle = await startDaemon(config);
+    markChannel("chan");
+    const client = await connect(config.socketPath);
+    const notif = collectNotifications(client);
+
+    const res = await client.send("cello_start_agent", { name: "chan" }) as { ok?: boolean };
+    await waitForNotifications();
+
+    // MUST NOT CHANGE #1: the channel still starts (it publishes and holds keys).
+    expect(res.ok).toBe(true);
+    // The doorbell is silenced: no operator sees "channel chan is now online" on every restart.
+    const state = notif.filter((n) => n.notification === "agent_state_changed");
+    expect(state).toHaveLength(0);
+  });
+
+  it("033 test3: starting a REAL agent still rings the online doorbell", async () => {
+    const config = await setupWithAgents("realagent");
+    handle = await startDaemon(config);
+    const client = await connect(config.socketPath);
+    const notif = collectNotifications(client);
+
+    await client.send("cello_start_agent", { name: "realagent" });
+    await waitForNotifications();
+
+    const state = notif.filter((n) => n.notification === "agent_state_changed");
+    expect(state).toHaveLength(1);
+    expect(state[0]!.data).toMatchObject({ agentName: "realagent", state: "online", reason: "started" });
+  });
+
+  it("033 test4: cello_use_agent on a CHANNEL is refused channel_not_an_agent", async () => {
+    const config = await setupWithAgents("chan");
+    handle = await startDaemon(config);
+    markChannel("chan");
+    const client = await connect(config.socketPath);
+
+    const res = await client.send("cello_use_agent", { name: "chan" }) as {
+      ok?: boolean; reason?: string; guidance?: string;
+    };
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("channel_not_an_agent");
+    expect(res.guidance ?? "").toContain("channel");
+  });
+
+  it("033 test5: a started channel is LOADED, ONLINE and holds its key — listed under channels in cello status", async () => {
+    // The byte-level publish proof is channel-publisher.test.ts (a channel keypair publishing),
+    // which this change does not touch. Here we prove the daemon still brings a channel ONLINE and
+    // keeps its identity — the half that the surface-exclusion + doorbell guards could have broken.
+    const config = await setupWithAgents("chan");
+    handle = await startDaemon(config);
+    markChannel("chan");
+    const client = await connect(config.socketPath);
+
+    const started = await client.send("cello_start_agent", { name: "chan" }) as { ok?: boolean };
+    expect(started.ok).toBe(true);
+
+    // The daemon-wide `cello status` surface (getStatus) splits too — the surface the enforcer reads.
+    const wide = await client.send("status") as {
+      agents: Array<{ name: string }>;
+      channels: Array<{ name: string; pubkey?: string }>;
+    };
+    expect(wide.agents.map((a) => a.name)).toEqual([]);
+    expect(wide.channels.map((c) => c.name)).toEqual(["chan"]);
+    expect(typeof wide.channels[0]!.pubkey).toBe("string");
+  });
 });
