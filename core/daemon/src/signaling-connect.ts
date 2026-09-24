@@ -17,9 +17,9 @@
  * uses separate ephemeral session nodes, not this node.
  *
  * Step-5/6 directory identity verification (the consortium-manifest "directory proves
- * itself back" hardening) is OPTIONAL here: it runs only when a `challengeVerifier`
- * is supplied. M6 ran with it off (challengeVerifier = null) and connected fine; the
- * hardening layers on later without changing this path.
+ * itself back") runs whenever a verified manifest is loaded, which is every real deployment.
+ * Without a manifest (a local single-node run) there is no roster to verify against, so no
+ * `challengeVerifier` is wired — and that disarmed state is logged loudly, never passed as healthy.
  *
  * Crypto reference: agent→directory auth signs SHA-256(domain ‖ nonce ‖ pubkey) with
  * the agent's K_local Ed25519 key (RFC 8032). K_local never leaves the KeyProvider.
@@ -110,8 +110,8 @@ export interface SignalingConnectDeps {
   getAuthIdentity: () => SignalingAuthIdentity | null;
   logger: Logger;
   /**
-   * Optional directory identity verifier (consortium-manifest step-6 hardening).
-   * When absent, directory verification is skipped — the M6 backward-compat path.
+   * Directory identity verifier (consortium-manifest step 6). Wired whenever a verified manifest
+   * is loaded; absent only in a manifest-less local run, which logs that the check is disarmed.
    */
   challengeVerifier?: IDirectoryChallengeVerifier;
   /** Verified consortium manifest version, surfaced in ConnectResult. Defaults to 0 (no manifest). */
@@ -143,7 +143,7 @@ export interface SignalingConnectDeps {
    * endpoints when signaling_auth_ok carries `relay_endpoints`. Fires once per
    * successful connect (so every reconnect refreshes the set). The endpoints ride
    * the authenticated, directory-verified signaling channel — the same trust rail
-   * as session_assignment frames. Absent field (old directory) → never called.
+   * as session_assignment frames. Absent field (an empty pool) → never called.
    */
   onRelayEndpoints?: (endpoints: Array<{ peerId: string; addrs: string[] }>) => void;
   /**
@@ -152,16 +152,13 @@ export interface SignalingConnectDeps {
    * frame and the same cadence as `relay_endpoints`: every connect and every reconnect, which is
    * what keeps a short-lived token current.
    *
-   * Absent field → never called. That is the honest signal in two different situations, and the
-   * daemon cannot tell them apart from here: an older directory that does not issue tokens, or a
-   * key this directory does not know as a registered agent. Either way there is no slot.
+   * Absent field → never called; `onOnlineTokenAbsent` hears why instead.
    */
   onOnlineToken?: (token: Uint8Array) => void;
   /**
    * DOD-M15-RELAYSLOTS-1 review M1: fired instead of `onOnlineToken` when the directory issued
-   * none, carrying WHICH absence it was. `undefined` means the directory stated no reason, i.e. it
-   * predates the token — which is itself the third distinct answer and must not be folded into the
-   * other two.
+   * none, carrying WHICH absence it was. `undefined` means the directory stated no reason — every
+   * directory states one, so that is a directory defect, reported as its own answer.
    */
   onOnlineTokenAbsent?: (reason: "not_registered_here" | "issue_failed" | undefined) => void;
 }
@@ -333,8 +330,7 @@ export function createSignalingConnect(deps: SignalingConnectDeps): () => Promis
         throw new Error(`directory_auth_rejected: ${String(ackFrame["type"])}`);
       }
 
-      // ── Step 6 (optional hardening): verify the directory's identity proof ──
-      // Runs only when a challengeVerifier is configured. M6 ran without one.
+      // ── Step 6: verify the directory's identity proof (disarmed only without a manifest) ──
       let directoryNodeId = typeof ackFrame["nodeId"] === "string" ? (ackFrame["nodeId"] as string) : endpoint.peerId;
       const verifier = deps.challengeVerifier;
       if (!verifier) {
@@ -510,9 +506,9 @@ export function createSignalingConnect(deps: SignalingConnectDeps): () => Promis
               : absentReason === "issue_failed"
                 ? "this directory could not issue an online token — its own lookup or signing failed. " +
                   "That is a fault on the directory, not on this agent or on any relay."
-                : "this directory issued no online token, so no relay will let this agent hold a " +
-                  "circuit reservation and it will be reachable only over a direct connection. It " +
-                  "stated no reason, which means it predates the token.",
+                : "this directory issued no online token and stated no reason, which every directory " +
+                  "does — a directory defect. No relay will let this agent hold a circuit reservation " +
+                  "until it is fixed; this agent is reachable only over a direct connection.",
           });
         }
       }
