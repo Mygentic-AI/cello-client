@@ -154,6 +154,13 @@ export interface SessionAssignment {
   participant_b_ml_dsa_pubkey: Uint8Array;
   /** participant_b's 1184-byte ML-KEM-768 public key. */
   participant_b_ml_kem_pubkey: Uint8Array;
+  /**
+   * MONIKER-2: the initiator's outbound display name, passed through from the session_request.
+   * UNSIGNED (outside the TBS) and optional; the receiver validates it at its wire boundary.
+   */
+  moniker?: string;
+  /** DOD-PRESENT-1: trust signals that survived the directory's check (membership + active). Unsigned. */
+  trust_signals?: Array<{ hash: string; blob: Uint8Array }>;
 }
 
 // ─── Session establishment TBS builder ────────────────────────────────────────
@@ -411,6 +418,13 @@ export interface SealLegibility {
   disclaimer: string;
   participants: SealLegibilityParticipant[];
   final_message: SealLegibilityFinalMessage;
+  /**
+   * DOD-M15-UNILATERAL-1: the highest sequence the counterparty itself signed — everything at or
+   * below it is covered by both parties' signatures, everything above is the uncountersigned tail.
+   * The directory sets it on every seal; it is not bound into the seal signature, so the client
+   * derives its own boundary from its signed carry and never trusts this one.
+   */
+  countersigned_through_seq?: number;
 }
 
 export type SealRejectionReason =
