@@ -264,3 +264,57 @@ describe("daemon lifecycle: coming back is an event, and names are not truncated
     expect(content).toContain("you are now acting as Ms_Chelly");
   });
 });
+
+// ─── M16 032-NOTICES test 5 — the three channel doorbells render, carry the full key where it must
+// be pasted, and wake the agent (they are NOT housekeeping) ──────────────────────────────────────
+describe("M16 032-NOTICES: channel doorbells render and ask for an action", () => {
+  const CH = "ab".repeat(32); // a 64-hex channel key
+
+  it("5a. channel_posts names the count and the short label, and the read command carries the FULL key", () => {
+    const { content, meta } = buildChannelParams({ type: "channel_posts", channel: CH, count: 3, through: 3 }, "channel_posts");
+    expect(content).toContain("📢");
+    expect(content).toContain("3 new post(s)");
+    // The FULL key, verbatim, in the read command — the agent must be able to paste it.
+    expect(content).toContain(`cello_channel_read ${CH}`);
+    // Wakes the agent: a post arrived and it should read it, so this is NOT in the housekeeping set.
+    expect(meta.wake_action).toBe("read_inbox");
+  });
+
+  it("5b. channel_join_answer renders admitted / pending / refused, with the reason word on a refusal", () => {
+    const admitted = buildChannelParams({ type: "channel_join_answer", channel: CH, outcome: "admitted" }, "channel_join_answer");
+    expect(admitted.content).toContain("you're in");
+    expect(admitted.meta.wake_action).toBe("read_inbox");
+
+    const pending = buildChannelParams({ type: "channel_join_answer", channel: CH, outcome: "pending" }, "channel_join_answer");
+    expect(pending.content).toContain("waiting for the admin");
+    expect(pending.meta.wake_action).toBe("read_inbox");
+
+    const refused = buildChannelParams({ type: "channel_join_answer", channel: CH, outcome: "refused", reason: "ejected" }, "channel_join_answer");
+    expect(refused.content).toContain("refused your join");
+    expect(refused.content).toContain("ejected");
+    expect(refused.meta.wake_action).toBe("read_inbox");
+  });
+
+  it("5c. channel_join_request names the subscriber (shortened) and the approve/refuse verbs", () => {
+    const SUB = "cd".repeat(32);
+    const { content, meta } = buildChannelParams({ type: "channel_join_request", channel: CH, subscriber: SUB }, "channel_join_request");
+    expect(content).toContain("🙋");
+    expect(content).toContain("asked to join");
+    expect(content).toContain("cello_channel_approve");
+    expect(content).toContain("cello_channel_refuse");
+    expect(content).toContain(SUB.slice(0, 12)); // the subscriber key is shown, shortened
+    expect(meta.wake_action).toBe("read_inbox");
+  });
+
+  it("5d. an older daemon that omits fields does not crash and never emits 'undefined' or 'NaN'", () => {
+    // The shim can be newer than the daemon (CLAUDE.md forbids pinning). A frame missing its fields
+    // must still render a non-empty, clean body — never a leaked placeholder.
+    for (const type of ["channel_posts", "channel_join_answer", "channel_join_request"]) {
+      const { content } = buildChannelParams({ type }, type);
+      expect(typeof content).toBe("string");
+      expect(content.length).toBeGreaterThan(0);
+      expect(content).not.toContain("undefined");
+      expect(content).not.toContain("NaN");
+    }
+  });
+});

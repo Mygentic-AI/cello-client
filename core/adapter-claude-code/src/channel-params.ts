@@ -25,6 +25,16 @@ function shimFingerprint(pubkey: unknown): string {
 }
 
 /**
+ * A short LABEL for a hex identity (a channel key, a subscriber key) — agent NAMES are never
+ * truncated, but hex keys are, which is the shim's existing rule (the document id shortens the same
+ * way). The FULL key still travels wherever the agent must paste it, e.g. the cello_channel_read
+ * command below. The frame carries no channel moniker, so the label is always the shortened key.
+ */
+function shortKey(hex: string): string {
+  return hex.length > 12 ? `${hex.slice(0, 12)}…` : hex;
+}
+
+/**
  * MONIKER-4 AC3/AC4 — the rendered counterparty label.
  *  - whoKnown true → plain (the operator's own pet name — deliberate trust, CC-1).
  *  - whoKnown false + fingerprint → plain (derived identity, not a claim). The discriminator is
@@ -121,6 +131,32 @@ function doorbellText(type: string, data: Record<string, unknown>): string {
         `Run cello_doc_diff to see exactly what moved, then cello_doc_read before you write.`
       );
     }
+    // ─── M16 032-NOTICES — the three channel doorbells. Content-free: a count and outcome words,
+    // never a post title/body or a join note. Each asks for an action, so none is housekeeping and
+    // all default to wake_action=read_inbox. An older daemon sends none of these, so a missing field
+    // is defended (no "undefined"/"NaN" in the body), not expected.
+    case "channel_posts": {
+      const key = String(data["channel"] ?? "");
+      const raw = data["count"];
+      const count = typeof raw === "number" && Number.isFinite(raw) ? String(raw) : "some";
+      // {label} is the SHORT key; the read command carries the FULL key — the agent must paste it.
+      return `📢 CELLO — ${count} new post(s) on channel ${shortKey(key)}. Run cello_channel_read ${key} to read them.`;
+    }
+    case "channel_join_answer": {
+      const label = shortKey(String(data["channel"] ?? ""));
+      switch (String(data["outcome"] ?? "")) {
+        case "admitted":
+          return `✅ CELLO — you're in: channel ${label} admitted you. Its posts will arrive here.`;
+        case "pending":
+          return `⏳ CELLO — your request to join channel ${label} is waiting for the admin.`;
+        case "refused":
+          return `CELLO — channel ${label} refused your join (${String(data["reason"] ?? "no reason given")}).`;
+        default:
+          return `CELLO — channel ${label} answered your join.`;
+      }
+    }
+    case "channel_join_request":
+      return `🙋 CELLO — ${shortKey(String(data["subscriber"] ?? ""))} asked to join channel ${shortKey(String(data["channel"] ?? ""))}. Run cello_channel_approve or cello_channel_refuse.`;
     case "agent_state_changed":
       return `CELLO: agent ${String(data["agent"] ?? "your agent")} is now ${String(data["state"] ?? "changed")}.`;
     case "agent_current_changed":
