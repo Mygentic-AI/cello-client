@@ -275,7 +275,14 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // Unwired, the one command that brings a channel into existence would be registered by nothing:
     // the daemon would serve every channel verb EXCEPT the one that creates the channel they all
     // operate on, which is the state every order before this shipped.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(113);
+    //
+    // 113 → 114 for M16 027-JOINSEQ's `createChannelFrameSender` (channel-frame-send.ts). It is the
+    // most on-point occupant of this corpus: the daemon's inline join-frame send discarded its
+    // result and committed no leaf, so its own tree stayed one short and every later message in the
+    // session — in both directions — deadlocked behind the gap. Extracting it here makes it testable;
+    // unwired, the join exchange would send frames that vanish from this side's record exactly as
+    // before, with nothing failing.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(114);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",

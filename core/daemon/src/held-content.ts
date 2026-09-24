@@ -20,6 +20,7 @@ import type { SessionRecords } from "./session-records.js";
 import type { SessionTree, WritableSessionTreeLeafKind } from "./session-tree.js";
 import type { SentAuthorship } from "./session-node-types.js";
 import { extractErrorMessage } from "./error-message.js";
+import { channelJoinFrameType } from "@cello-protocol/protocol-types";
 
 /**
  * One piece of content held behind an ordering gap.
@@ -275,13 +276,24 @@ export class HeldContent {
         // wait for its position must come back as a document leaf, or the two sides disagree about
         // what the chain contains.
         this.#ctx.appendSessionLeaf(agentName, sessionId, entry.kind ?? "msg", entry.contentHashHex, entry.correlationId);
-        // A DOCUMENT frame takes a leaf and NO transcript row — matching what the immediate-append
-        // path does for one. Writing one would put raw CBOR into the operator's transcript as
-        // something they said, which is the same attribution failure as releasing it inbound.
+        // A DOCUMENT frame — and a channel JOIN frame (027-JOINSEQ) — takes a leaf and NO transcript
+        // row, matching what the immediate-append path does for one. Writing one would put raw CBOR
+        // into the operator's transcript as something they said, which is the same attribution
+        // failure as releasing it inbound. A join frame is placed with leaf kind "msg" (019's
+        // decision), so it is recognised by decoding the content, not by the leaf kind.
         if (entry.kind === "doc") {
           released++;
           this.#ctx.logger.info("session.content.released", {
             sessionId, sequenceNumber: nextExpected, leafKind: "doc", correlationId: entry.correlationId,
+          });
+          if (held.size === 0) { this.#ctx.heldContent.delete(key); break; }
+          continue;
+        }
+        if (channelJoinFrameType(entry.content) !== null) {
+          released++;
+          this.#ctx.logger.info("session.content.released", {
+            sessionId, sequenceNumber: nextExpected, leafKind: "msg", frame: "channel_join",
+            correlationId: entry.correlationId,
           });
           if (held.size === 0) { this.#ctx.heldContent.delete(key); break; }
           continue;
