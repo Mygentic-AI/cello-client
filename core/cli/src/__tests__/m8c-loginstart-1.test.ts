@@ -142,6 +142,65 @@ describe("M8C-LOGINSTART-1 CORE: autoStartAllAgents", () => {
     expect(s2).not.toMatch(/channel\(s\)/);
   });
 
+  // A channel-aware stub: cello_status carries the channels, cello_list_agents the agents, and
+  // cello_start_agent's outcome is forced per name — so a channel start FAILURE can be exercised.
+  function channelStubClient(opts: {
+    agents?: Record<string, { ok: boolean; reason?: string } | Error>;
+    channels?: Record<string, { ok: boolean; reason?: string } | Error>;
+  }): IpcClient {
+    const all = { ...(opts.agents ?? {}), ...(opts.channels ?? {}) };
+    return {
+      async send(method: string, params?: { name?: string }) {
+        if (method === "cello_list_agents") return { agents: Object.keys(opts.agents ?? {}).map((name) => ({ name })) };
+        if (method === "cello_status") return { channels: Object.keys(opts.channels ?? {}).map((name) => ({ name })) };
+        if (method === "cello_start_agent") {
+          const r = all[params!.name!];
+          if (r instanceof Error) throw r;
+          return r;
+        }
+        return {};
+      },
+      onNotification() { /* unused */ },
+      close() { /* unused */ },
+    } as unknown as IpcClient;
+  }
+
+  // 033 reviewer MEDIUM: a channel that fails to start must NOT be swallowed — it lands in
+  // failed_channels (name + reason), never silently dropped, and never miscounted as a failed agent.
+  it("033: a channel that fails to start is collected in failed_channels, not swallowed", async () => {
+    const client = channelStubClient({
+      agents: { alice: { ok: true } },
+      channels: {
+        "test-open": { ok: true },
+        "test-invite": { ok: false, reason: "no_relay" },
+        proof024b: new Error("Connection closed"),
+      },
+    });
+    const res = await autoStartAllAgents(client);
+    expect(res.started).toEqual(["alice"]);
+    expect(res.started_channels).toEqual(["test-open"]);
+    expect(res.failed_channels).toEqual([
+      { name: "test-invite", reason: "no_relay" },
+      { name: "proof024b", reason: "Connection closed" },
+    ]);
+    // The failure never leaks into the AGENT failure list.
+    expect(res.failed).toEqual([]);
+  });
+
+  it("033: formatLoginSummary prints the failed-channel clause with each name + reason", () => {
+    const s = formatLoginSummary({
+      started: ["alice"],
+      failed: [],
+      started_channels: ["test-open"],
+      failed_channels: [{ name: "test-invite", reason: "no_relay" }],
+    });
+    expect(s).toContain("Started 1 channel(s): test-open.");
+    expect(s).toContain("1 channel(s) failed to start: test-invite (no_relay)");
+    // Omitted when there are none.
+    const clean = formatLoginSummary({ started: ["alice"], failed: [], started_channels: ["test-open"] });
+    expect(clean).not.toMatch(/channel\(s\) failed/);
+  });
+
   // F2 (reviewer): the login() boundary — exit 0 with the summary appended, against a REAL in-process
   // daemon (acquireLock points connectOrStart at it, so it CONNECTS instead of spawning the binary).
   it("F2: login() returns exit 0 and appends the auto-start summary", async () => {
