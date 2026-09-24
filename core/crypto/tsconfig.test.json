@@ -24,6 +24,12 @@
     "src/__tests__/manifest.test.ts",
     "src/__tests__/merkle.test.ts",
     "src/__tests__/ml-dsa.test.ts",
+    "src/__tests__/ml-kem.test.ts",
+    "src/__tests__/pq-frame.test.ts",
+    "src/__tests__/pq-errors.test.ts",
+    "src/__tests__/pq-warnings.test.ts",
+    "src/__tests__/d4-single-frame.test.ts",
+    "src/__tests__/node-floor.test.ts",
     "src/__tests__/preauth-capability.test.ts"
   ]
 }

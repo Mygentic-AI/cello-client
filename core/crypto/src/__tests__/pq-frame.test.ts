@@ -29,8 +29,8 @@ async function party() {
 }
 
 async function subtleVerify(publicKey: Uint8Array, message: Uint8Array, sig: Uint8Array): Promise<boolean> {
-  const key = await webcrypto.subtle.importKey("raw-public", publicKey, { name: "ML-DSA-44" }, false, ["verify"]);
-  return webcrypto.subtle.verify({ name: "ML-DSA-44" }, key, sig, message);
+  const key = await webcrypto.subtle.importKey("raw-public", new Uint8Array(publicKey), { name: "ML-DSA-44" }, false, ["verify"]);
+  return webcrypto.subtle.verify({ name: "ML-DSA-44" }, key, new Uint8Array(sig), new Uint8Array(message));
 }
 
 describe("PQ_CONTEXTS", () => {
