@@ -770,7 +770,7 @@ export class AgentRelayClient {
   readonly #sessions = new Map<string, {
     node: CelloNode;
     onLeafDeliver: (frame: LeafDeliverFrame) => void;
-    /** The directory-signed relay assignment to present (absent for direct/legacy sessions). */
+    /** The directory-signed relay assignment to present (absent for direct sessions). */
     assignment?: RelayAssignmentCarry;
     /** True once the relay has acked this session's client_record_assignment. */
     recorded: boolean;
@@ -935,7 +935,7 @@ export class AgentRelayClient {
 
   /**
    * Present the directory-signed assignment to the relay. Idempotent
-   * (no-op once `recorded`, or when the session has no assignment — direct/persisted/legacy sessions).
+   * (no-op once `recorded`, or when the session has no assignment — direct/persisted sessions).
    * The relay reconstructs the TBS and verifies the per-node directory signature against any consortium
    * key. On success the session is recorded; the send/ack is single-in-flight (mirrors #doSubmit).
    */
@@ -2667,7 +2667,7 @@ export class AgentRelayClient {
       attempt++
     ) {
       // Force the assignment to be re-presented: we never recorded this session, so the relay
-      // genuinely does not hold it yet. A session with no assignment to present (direct/legacy)
+      // genuinely does not hold it yet. A session with no assignment to present (direct)
       // re-submits without a record — still bounded, and it surfaces the same named failure
       // rather than hanging.
       const sess = this.#sessions.get(sessionIdHex);
@@ -2818,7 +2818,7 @@ export class AgentRelayClient {
       //   - recordRejected  → TERMINAL (the relay refused the assignment as unverifiable). Retrying
       //                       cannot help and would storm the shared stream.
       //   - anything else   → the record is in flight or transiently failed. Retryable.
-      // A session with NO assignment to present (direct/legacy) is not covered here: #doRecord
+      // A session with NO assignment to present (direct) is not covered here: #doRecord
       // returns true for it, so it still submits exactly as before.
       if (sess.recordRejected) return { ok: false, reason: "relay_assignment_rejected" };
       // A TIMEOUT IS NOT "NOT READY YET". The retry below exists for a relay that has not finished

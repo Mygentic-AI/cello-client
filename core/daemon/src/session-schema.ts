@@ -410,7 +410,7 @@ export function ensureSessionSchema(
    *
    * ⚠️ AND ITS ABSENCE MEANS NOTHING. A message with no row here was very possibly delivered and
    * read: the acknowledgement may have been lost with the connection, the counterparty's daemon may
-   * have had no identity key to sign with, or their build may predate this. Any surface that reads
+   * have had no identity key to sign with. Any surface that reads
    * a missing row as evasion — a score, a status, a counter that reads as fault — is a defect.
    *
    * Keyed on agent_id, never agent_name: agent_name is a mutable display label.

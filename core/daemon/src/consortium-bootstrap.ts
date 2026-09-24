@@ -50,12 +50,12 @@ export interface ManifestGateDeps {
 export interface ManifestGateResult {
   /** True only when a manifest was loaded, verified, in-window, and not a rollback. */
   manifestVerified: boolean;
-  /** The verified manifest's version — 0 on the no-manifest back-compat path. */
+  /** The verified manifest's version — 0 on the local no-manifest path. */
   verifiedManifestVersion: number;
   /**
    * The verified node set resolved to REACHABLE directory endpoints. May be shorter than the
    * manifest's node list (a down node is skipped, not fatal — a T-of-N ceremony needs only T),
-   * and is empty on the back-compat path or when nothing resolved.
+   * and is empty on the local no-manifest path or when nothing resolved.
    */
   consortiumEndpoints: ConsortiumEndpoint[];
   /**
@@ -78,7 +78,7 @@ export interface ManifestGateResult {
    * the operator shown `counterparty_offline` → `directory_below_threshold` → `ceremony_exhausted`,
    * and an hour spent concluding the protocol was broken.
    *
-   * Empty on every path that resolved nothing to complain about — including the back-compat path,
+   * Empty on every path that resolved nothing to complain about — including the local no-manifest path,
    * where an empty list means "no sweep ran", not "all healthy". The status surface says which
    * nodes failed rather than asserting all-good, for exactly that reason.
    */
@@ -255,7 +255,7 @@ export interface ConsortiumRouting {
   /**
    * The roster for a session/seal FROST ceremony, re-resolved at ceremony time from the CURRENT
    * verified manifest. NULL (not []) when no manifest is configured — the difference is
-   * load-bearing: null means "single-node ceremony, M6/M7 back-compat"; [] means "a consortium
+   * load-bearing: null means "single-node ceremony, the local no-manifest path"; [] means "a consortium
    * whose nodes are all unreachable", which the ceremony layer must refuse.
    */
   resolveConsortiumRoster: () => Promise<ConsortiumEndpoint[] | null>;
@@ -440,7 +440,7 @@ export function createConsortiumRouting(deps: ConsortiumRoutingDeps): Consortium
 
   // CELLO-M7-CONN-001 (DOD-CONN-3): the daemon-level manifest poll — it adopts a newer manifest
   // independent of any agent identity, and so runs even with ZERO agents (the keystone it replaced
-  // could not). Off on the M6 back-compat path (no scheduler), and off without real root keys: a
+  // could not). Off on the local no-manifest path (no scheduler), and off without real root keys: a
   // poll that verifies against an empty key set verifies against nothing.
   let stopHttpManifestPoll: (() => void) | undefined;
   /**
@@ -454,7 +454,7 @@ export function createConsortiumRouting(deps: ConsortiumRoutingDeps): Consortium
    * picked up.
    *
    * ⚠️ THE DISTINCTION THAT MAKES THIS SAFE, and the reason it is not a blanket throw: **"no
-   * scheduler" is a legitimate configuration** — the M6 back-compat path deliberately runs without
+   * scheduler" is a legitimate configuration** — the local no-manifest path deliberately runs without
    * one, and failing startup there would brick a supported setup. **"Scheduler and provider are
    * wired, but the keys are empty" is a MISCONFIGURATION** — someone intended verification and
    * supplied nothing to verify with. Only the second refuses.

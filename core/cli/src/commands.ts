@@ -453,7 +453,7 @@ export async function register(
   // spine suite).
   // A pre-auth CAPABILITY (M8B-PREAUTH-CAP) is also valid here and has neither prefix: it is
   // base64url JSON, and preauth-capability.ts specifies it is "carried in the existing round-1
-  // preAuthToken string field and pasted into `cello register`". Gating on the two legacy prefixes
+  // preAuthToken string field and pasted into `cello register`". Gating on the two token prefixes
   // alone rejected the very artifact the capability design says to paste — a capability could be
   // minted, signed and accepted by every directory, and never got past the client.
   //

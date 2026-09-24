@@ -854,7 +854,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
    * asked for. close-session-handler already guards its own path this way; the auto-ack path did
    * not, and it is the path that fires FIRST whenever the counterparty closes first.
    *
-   * Unset (single-node / M6 back-compat) is fine: the initiator is reachable on its home stream.
+   * Unset (single-node, the local no-manifest path) is fine: the initiator is reachable on its home stream.
    */
   #ensureSealBroker:
     | ((agentName: string, sessionId: string) => Promise<{ stop: (reason: string) => Promise<void> } | null>)
@@ -2793,7 +2793,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
    * structure2_cbor = [seq, sender_pubkey, content_hash, sender_signature, scan_result, prev_root].
    */
   /**
-   * DOD-MSG-4 (2b) / SEC-1: decode a park envelope. Legacy/unsigned shapes still DECODE so that
+   * DOD-MSG-4 (2b) / SEC-1: decode a park envelope. Unreadable/unsigned shapes still DECODE so that
    * `recoverParkedEntry` can refuse them BY NAME (`unsigned_envelope`) — decoding is not accepting.
    * Encoding lives in park-envelope.ts and REQUIRES a sender signature (see SEC-1); it is not
    * exposed here, so no caller can seal an unsigned envelope through this class.
@@ -3290,8 +3290,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
    * relays, so its standing receiver takes reservations and becomes dialable
    * behind NAT. Sources, merged and deduped by relay peer id: the directory's
    * auth-time relay pool (freshest — first), then the persisted relay endpoints
-   * of past sessions (getAgentRelayEndpoints — covers a directory that predates
-   * the auth_ok extension).
+   * of past sessions (getAgentRelayEndpoints — covers a reconnect before auth_ok arrives).
    */
   /**
    * DOD-M15-RELAYSLOTS-1: relays this agent should skip, and until when — see the failover note in

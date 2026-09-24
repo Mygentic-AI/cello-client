@@ -65,8 +65,8 @@ export class DaemonRegistrationContext implements RegistrationContext {
     this.#signaling = opts.signaling;
     this.#getDirectoryNode = opts.getDirectoryNode;
     this.#getDirectoryEndpoint = opts.getDirectoryEndpoint;
-    // Default to null → "no consortium manifest configured" → single-node DKG (back-compat for
-    // callers/tests that don't supply a roster). null (no manifest) is distinct from [] (manifest
+    // Default to null → "no consortium manifest configured" → single-node DKG (the local path,
+    // and callers/tests that don't supply a roster). null (no manifest) is distinct from [] (manifest
     // configured but unresolved → refuse) — see RegistrationContext.getConsortiumEndpoints.
     this.#getConsortiumEndpoints = opts.getConsortiumEndpoints ?? (() => null);
     this.keyProvider = opts.keyProvider;

@@ -694,7 +694,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
       }
       // THE ARRIVING CONSENT IS THE JOIN ANSWER (SYNC-P3, the D5 replacement): an inviter's
       // pending row settles from the entry itself — the subject's own signed yes or no — so
-      // the legacy answer frame carries nothing the record does not. Settle-once semantics
+      // no separate answer frame is needed. Settle-once semantics
       // SYNC-P4 (R27/R28, review F2): the stored status is a DISPLAY PROJECTION of the derived
       // ending — recomputed on EVERY applied entry, in BOTH directions. One-way, kind-gated
       // syncing let two holders converge on the fold while holding different status columns

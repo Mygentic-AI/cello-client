@@ -20,8 +20,7 @@
  * `seamViolation` already ran when the proposal was recorded. It runs again at accept because the
  * proposer and the accepter run DIFFERENT BUILDS: a peer one version ahead can propose a value
  * this build cannot honour, and if only the proposer validated, whichever side is newer would
- * silently decide the terms for both. Re-checking at the transition is also what makes an upgrade
- * safe — a proposal recorded under an older build cannot be accepted under rules it predates.
+ * silently decide the terms for both.
  */
 
 import {

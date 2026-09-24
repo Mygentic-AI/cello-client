@@ -193,7 +193,7 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
       // in a DKG, so including one would either strand registration on a quorum-count mismatch
       // or deal a share to a share-less node. The directory computes its quorum over validators
       // too; the two sides must agree on N. Re-resolved here (ceremony time) for fresh failover
-      // coordinates. NULL when NO manifest is configured (→ single-node DKG, M6/M7 back-compat);
+      // coordinates. NULL when NO manifest is configured (→ single-node DKG, the local no-manifest path);
       // a (possibly EMPTY) array when a manifest IS configured. The null-vs-empty distinction is
       // load-bearing: an empty roster (consortium configured but unreachable) must REFUSE in
       // registration-manager, NOT downgrade to single-node (code-reviewer B1 / fallback-finder).

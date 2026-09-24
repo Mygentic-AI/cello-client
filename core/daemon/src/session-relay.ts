@@ -569,7 +569,7 @@ export class SessionRelay {
     // would have escaped both this method's catch and (before the caller's `.catch`) the process.
     let reservationRelayPeerId: string | undefined;
     try {
-      if (!relay.assignment) return; // direct/legacy/persisted-reconnect: nothing to present anywhere
+      if (!relay.assignment) return; // direct/persisted-reconnect: nothing to present anywhere
       const heldCircuitAddr = node.listenAddresses().find((a) => a.includes("/p2p-circuit"));
       if (!heldCircuitAddr) return; // no reservation held → nobody will gate a dial to us
       reservationRelayPeerId = /\/p2p\/([^/]+)\/p2p-circuit/.exec(heldCircuitAddr)?.[1];
@@ -699,7 +699,7 @@ export class SessionRelay {
     addrs: string[],
   ): Promise<void> {
     const assignment = entry.relayAssignment;
-    if (!assignment || !entry.relaySessionIdBytes) return; // direct/legacy/persisted: no credential to present
+    if (!assignment || !entry.relaySessionIdBytes) return; // direct/persisted: no credential to present
     const sessionIdHex = Buffer.from(entry.relaySessionIdBytes).toString("hex");
 
     // One presentation per distinct relay, not per address: a counterparty commonly advertises

@@ -86,7 +86,7 @@ export interface RegisterRequest {
    * M8B quorum registration: nodeIds (stable manifest labels, e.g. "us-east-1") of the consortium
    * directory nodes the client resolved / can reach right now (its live roster). The directory picks the
    * DKG quorum Q from this set ∩ its own signed manifest, requiring |Q| ≥ T = majority(N) = floor(N/2)+1.
-   * Absent on the single-node back-compat path (no manifest).
+   * Absent on the local single-node path (no manifest).
    */
   reachable_node_ids?: string[];
   /** True when this identity is a broadcast channel (publish-only; never converses).
@@ -286,9 +286,7 @@ export interface AgentProfile {
    * M16 021-WAKE: how this channel admits readers, when `channel === true`. Immutable.
    *
    * ⚠️ **OPTIONAL ON THE TYPE, AND ABSENT MEANS `open`.** `open` still requires the group key to
-   * fetch; `public` does not. So a profile written before this field existed keeps the MORE private
-   * reading, which is also exactly how the relay has been treating every channel — with no access
-   * on the identity answer it fell back to `open`, and a public channel could not exist at all.
+   * fetch; `public` does not. So an unstated access takes the MORE private reading.
    */
   channel_access?: "public" | "open" | "invite_only";
 }

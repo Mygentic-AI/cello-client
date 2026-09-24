@@ -42,7 +42,7 @@ export function createDirectoryConnect(deps: DirectoryConnectDeps) {
     // FED-OPTIONB-SETUP-001 (Option B): when the directory included the per-node relay-assignment
     // signature, carry the assignment so the client presents it to its chosen relay (replacing the
     // directory→relay dial). Built only for relay-mode assignments that carry relay_directory_signature;
-    // absent ⇒ the client skips client_record_assignment (direct/legacy/pre-M8B).
+    // absent ⇒ the client skips client_record_assignment (a direct session).
     const relayDirSig = assignment.relay_directory_signature;
     // FED-OPTIONB-SETUP-001 (fallback-finder #1/#5): a relay-mode assignment MUST carry a
     // relay_directory_signature — the directory always signs one. If it is absent or malformed (the

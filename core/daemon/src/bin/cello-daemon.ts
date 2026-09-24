@@ -179,7 +179,7 @@ async function main(): Promise<void> {
   //     directory identity auth, so a cold-boot daemon knows every directory and can fail over to a
   //     reachable one (redundancy invariant). Gated on CELLO_DIRECTORY_URL actually being a bundled
   //     node — a daemon pointed at a local/non-bundled directory (local dev, e2e spine harness) gets
-  //     the M6 backward-compat path (no roster, no step-6) instead of wrongly failing step-6.
+  //     the local no-manifest path (no roster, no step-6) instead of wrongly failing step-6.
   //   - OVERRIDE (CELLO_CONSORTIUM_MANIFEST set) — operator-supplied manifest FILE + env root keys /
   //     threshold + optional /manifest poll (the pre-FINDING-4 opt-in path).
   // When a manifest is active, the daemon verifies the directory's step-6 identity proof against the

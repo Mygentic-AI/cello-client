@@ -98,8 +98,8 @@ export class SessionQueries {
    * There are FOUR writers of `status = 'interrupted'`, not three. The fourth is
    * `destroySessionNode` → `#updateSessionStatus(…, "interrupted", "local")`, which historically
    * wrote `interrupted_by` and **no timestamp at all** — and it is the path that produced the two
-   * rows in Entry 41. It now stamps `interrupted_at` like the others, so NULL is a legacy state
-   * rather than one production keeps creating.
+   * rows in Entry 41. It now stamps `interrupted_at` like the others, so every interrupted row
+   * carries one.
    *
    * So a bare `interrupted_at <= ?` against a numeric bound is **always false** — the column has
    * TEXT affinity and the bound parameter has none, so SQLite applies TEXT affinity to the

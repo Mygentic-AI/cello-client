@@ -364,7 +364,7 @@ function toSignature64(v: unknown): Uint8Array | undefined {
  * delivery is instant while the initiator's record is a round trip.
  *
  * Mirrors `buildRelayConnectParams` (daemon.ts) on the initiator side. Returns undefined when the
- * directory issued no signature, leaving direct/legacy sessions exactly as they were.
+ * directory issued no signature, leaving direct sessions exactly as they were.
  *
  * The field mapping is load-bearing: the relay rebuilds the signed TBS from these values, so a
  * swapped participant or a dropped peer id yields an assignment it rejects as FORGED — which sets
@@ -390,10 +390,10 @@ export async function buildResponderRelayParams(
   if (!kp || !parsed.relayPeerId || parsed.relayAddrs.length === 0) return undefined;
   // DOD-FIRSTMSG-WITNESS-1 (F4): mirror the initiator's loud warning (daemon.ts:457). We only reach
   // here when the assignment carries a relay endpoint, so a missing signature is NOT the legitimate
-  // direct/legacy case — it means this session gets no relay witness of its own, which is exactly
+  // direct case — it means this session gets no relay witness of its own, which is exactly
   // the pre-fix state. Unwitnessed is an allowed sovereign-redundancy state; it must not be
   // INVISIBLE. Malformed is reported separately from absent: a wrong-length signature is a
-  // wire/version bug, not a legacy session.
+  // wire bug, not a direct session.
   if (!parsed.relayDirectorySignature) {
     logger.warn("session.relay.assignment.signature.missing", {
       agentName,

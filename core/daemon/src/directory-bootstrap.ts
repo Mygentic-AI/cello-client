@@ -570,7 +570,7 @@ export interface RosterAwareResolverOptions {
   /**
    * DECLARED consortium member peer ids, from the verified manifest. Local and free — never a
    * network probe. Absent (or empty) disables the membership check entirely, which is the M6
-   * back-compat path where there is no manifest to be a member of.
+   * local no-manifest path where there is no manifest to be a member of.
    */
   getManifestPeerIds?: () => Set<string> | null;
 }

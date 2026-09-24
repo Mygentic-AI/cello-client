@@ -16,8 +16,7 @@ export function frameValueToHex(v: unknown): string | null {
 }
 // M7-SESSION-004 (AC-005): normalise the wire `legibility` object — CBOR-decoded, so pubkeys
 // arrive as Uint8Array/Buffer — into a JSON-safe certificate with hex-encoded pubkeys. Returns
-// undefined for an absent or structurally-implausible object (pre-M7 frame, or a malformed
-// field), in which case nothing is persisted and the seal still completes. The constants
+// undefined for an absent or structurally-implausible object (a malformed field), in which case nothing is persisted and the seal still completes. The constants
 // (attests/disclaimer) and the integers/booleans are carried
 // verbatim; only the byte fields are re-encoded. The daemon never invents or alters the
 // certificate's meaning — it is the directory's derivation, surfaced.
