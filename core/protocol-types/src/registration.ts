@@ -6,7 +6,8 @@
  * Registration flow (CELLO-REG-001):
  *
  * CLIENT → DIRECTORY (on existing authenticated /cello/signaling/1.0.0 stream):
- *   1. Client generates ML-DSA-44 keypair via mlDsaKeygen() (NIST FIPS 204)
+ *   1. Client generates a 32-byte ML-DSA-44 seed via mlDsaGenerateSeed() and its provider via
+ *      mlDsaProviderFromSeed() (NIST FIPS 204; the seed is what is persisted)
  *   2. Client sends register_request { phone_stub, k_local_pubkey, ml_dsa_pubkey }
  *
  * DIRECTORY validates:
