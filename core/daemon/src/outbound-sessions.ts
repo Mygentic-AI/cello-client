@@ -471,7 +471,6 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
         target_pubkey: new Uint8Array(Buffer.from(targetHex, "hex")),
         initiator_session_peer_id: sr.peerId,
         initiator_session_addrs: sr.addrs,
-        wants_session_offer: true,
         ...(moniker !== undefined ? { moniker } : {}),
         ...(trustSignals !== undefined ? { trust_signals: trustSignals } : {}),
         // DOD-M15-UNILATERAL-1: sent ONLY when opted in. The directory reads it strictly (`=== true`)
