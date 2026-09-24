@@ -77,6 +77,15 @@ export interface ScreenContext {
    * different content (SI-002). Omitted flags default to `redact`. Outbound only.
    */
   governanceDecisions?: Record<string, GovernanceDecision>;
+  /**
+   * M16 031: KNOWN public keys (lowercase 64-hex) the DAEMON recognised in this outbound message —
+   * its own agents' and channels' keys, the sender's contacts, the channels it follows, and the
+   * session's counterparty. The daemon fills it (only it knows them) and NEVER includes private key
+   * material. Outbound only: the gateway replaces each occurrence with a letters-only placeholder
+   * before the secrets/exfil/PII stages and restores it afterwards, so a public key passes untouched
+   * while every other 64-hex token is screened exactly as today.
+   */
+  knownPublicKeys?: string[];
 }
 
 /**

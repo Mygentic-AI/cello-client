@@ -24,6 +24,8 @@ export interface WireScreenRequest {
     correlationId?: string;
     /** The agent's governance re-send decisions, keyed by flagId (M9-FEED-001 §6). Outbound only. */
     governanceDecisions?: Record<string, GovernanceDecision>;
+    /** M16 031: the known public keys (lowercase 64-hex) the daemon recognised. Outbound only. */
+    knownPublicKeys?: string[];
   };
 }
 

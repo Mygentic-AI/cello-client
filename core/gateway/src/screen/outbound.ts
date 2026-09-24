@@ -30,6 +30,11 @@ export interface OutboundVerdict {
   reason?: string;
   /** Actionable guidance for a block/warn outcome. */
   guidance?: string;
+  /**
+   * M16 031: how many KNOWN public keys were protected through the stages (0 when none). The bin
+   * logs the count (never the values) as `security.screen.outbound.known_keys`.
+   */
+  knownKeysProtected?: number;
 }
 
 export interface OutboundScreenerOptions {
@@ -54,10 +59,69 @@ export interface OutboundScreenContext {
   sessionId: string;
   /** The agent's decisions on a governance re-send, keyed by flagId (M9-FEED-001 §6). */
   governanceDecisions?: Record<string, GovernanceDecision>;
+  /**
+   * M16 031: the KNOWN public keys (lowercase 64-hex) the daemon recognised in this message — its
+   * own agents' and channels' keys, the sender's contacts, the channels it follows, and the
+   * session's counterparty. The daemon fills this (only it knows them); NEVER any private key
+   * material. Outbound only. Each occurrence is replaced with a letters-only placeholder before the
+   * stages run and restored afterwards, so a public key passes secrets/exfil/PII untouched while
+   * every other 64-hex token is screened exactly as today.
+   */
+  knownPublicKeys?: string[];
 }
 
 const TEXT_DECODER = new TextDecoder("utf-8", { fatal: false });
 const TEXT_ENCODER = new TextEncoder();
+
+/**
+ * The placeholder prefix a protected key is swapped for. LETTERS ONLY, no digits — a digit run
+ * would itself trip the phone check (the very defect this unit fixes). The suffix is a base-26
+ * letter sequence (A, B, … Z, AA, …), so `CELLOPUBKEYA`, `CELLOPUBKEYB`, …
+ */
+const PLACEHOLDER_PREFIX = "CELLOPUBKEY";
+
+/** Turn a 0-based index into a letters-only suffix: 0→A, 25→Z, 26→AA, … */
+function indexToLetters(i: number): string {
+  let n = i;
+  let out = "";
+  do {
+    out = String.fromCharCode(65 + (n % 26)) + out;
+    n = Math.floor(n / 26) - 1;
+  } while (n >= 0);
+  return out;
+}
+
+/**
+ * Replace each KNOWN public key that appears in `text` with a letters-only placeholder, returning a
+ * `restore` that puts the exact keys back. Pure and unit-tested (M16 031 test 5).
+ *
+ * Only keys that actually occur are protected. If a placeholder string we would assign is ALREADY
+ * present in the text, we protect NOTHING (restore would otherwise corrupt that pre-existing text) —
+ * the message is then screened exactly as today.
+ */
+export function protectKnownKeys(
+  text: string,
+  keys: string[],
+): { text: string; restore: (t: string) => string; count: number } {
+  const identity = { text, restore: (t: string): string => t, count: 0 };
+  const present = [...new Set(keys)].filter((k) => k.length > 0 && text.includes(k));
+  if (present.length === 0) return identity;
+
+  const mapping = present.map((key, i) => ({ key, placeholder: PLACEHOLDER_PREFIX + indexToLetters(i) }));
+  // Refuse if any placeholder already occurs — restoring it would rewrite text we did not protect.
+  if (mapping.some((m) => text.includes(m.placeholder))) return identity;
+
+  let protectedText = text;
+  for (const m of mapping) protectedText = protectedText.split(m.key).join(m.placeholder);
+  // Restore longest placeholder first, so a shorter placeholder is never matched inside a longer one.
+  const ordered = [...mapping].sort((a, b) => b.placeholder.length - a.placeholder.length);
+  const restore = (t: string): string => {
+    let out = t;
+    for (const m of ordered) out = out.split(m.placeholder).join(m.key);
+    return out;
+  };
+  return { text: protectedText, restore, count: mapping.length };
+}
 
 export class OutboundScreener {
   readonly #rateLimiter?: OutboundRateLimiter;
@@ -92,10 +156,16 @@ export class OutboundScreener {
 
     const events: GovernanceEvent[] = [];
 
+    // M16 031: protect KNOWN public keys BEFORE any stage. Each key the daemon recognised is swapped
+    // for a letters-only placeholder here and restored on the returned content, so a public key passes
+    // secrets/exfil/PII untouched while every other 64-hex token is screened exactly as today. If a
+    // placeholder string already occurs in the text, protectKnownKeys refuses and nothing is protected.
+    const protection = protectKnownKeys(TEXT_DECODER.decode(content), ctx.knownPublicKeys ?? []);
+
     // 2. Secrets (M9-OUT-001) — redact-by-default, and FIRST: a known credential gets its TYPED
     //    placeholder ([REDACTED:<rule>]) before exfil's generic high-entropy redactor would mask it
     //    as an opaque blob, so the agent is told WHAT leaked.
-    let workingText = TEXT_DECODER.decode(content);
+    let workingText = protection.text;
     const sec = redactSecrets(workingText);
     workingText = sec.text;
     for (const f of sec.findings) {
@@ -113,6 +183,7 @@ export class OutboundScreener {
         content,
         guidance: ex.events[0]?.reason,
         events: ex.events.map((e) => ({ stage: "exfil", disposition: "block" as const, category: e.category, reason: e.reason })),
+        ...(protection.count > 0 ? { knownKeysProtected: protection.count } : {}),
       };
     }
     for (const e of ex.events) {
@@ -139,10 +210,14 @@ export class OutboundScreener {
         // stay intact, since they are exactly what is awaiting a decision.
         const warnTransformed = sec.findings.length > 0 || ex.events.length > 0;
         return {
+          // Restore the protected keys before the content is rendered to the agent (placeholders
+          // must never surface). When nothing was transformed we return the original bytes, which
+          // already carry the real keys.
           disposition: "warn",
-          content: warnTransformed ? TEXT_ENCODER.encode(workingText) : content,
+          content: warnTransformed ? TEXT_ENCODER.encode(protection.restore(workingText)) : content,
           events: [...events, ...resolved.warnEvents],
           ...(resolved.guidance ? { guidance: resolved.guidance } : {}),
+          ...(protection.count > 0 ? { knownKeysProtected: protection.count } : {}),
         };
       }
       // All PII items resolved to redact/allowed → apply redactions to the worked text and send.
@@ -162,8 +237,10 @@ export class OutboundScreener {
 
     // Secrets + exfil + per-decision PII redactions are the content transforms; deliver the worked text
     // iff anything changed (block sources already short-circuited, so only redact / allow remain here).
+    // The protected keys are restored on the worked text — a known public key that survived the stages
+    // as a placeholder goes back to its real value, so the agent's send is byte-identical for that key.
     const transformed = sec.findings.length > 0 || ex.events.length > 0 || piiTransformed;
-    const outContent = transformed ? TEXT_ENCODER.encode(workingText) : content;
+    const outContent = transformed ? TEXT_ENCODER.encode(protection.restore(workingText)) : content;
     const disposition = events.some((e) => e.disposition === "redact") ? "redact" : "allow";
 
     // M2: commit a rate slot ONLY when the message will actually reach the wire (allow/redact) —
@@ -171,7 +248,7 @@ export class OutboundScreener {
     if (this.#rateLimiter && (disposition === "allow" || disposition === "redact")) {
       this.#rateLimiter.record(ctx.agentName);
     }
-    return { disposition, content: outContent, events };
+    return { disposition, content: outContent, events, ...(protection.count > 0 ? { knownKeysProtected: protection.count } : {}) };
   }
 
   /**

@@ -153,6 +153,7 @@ export class LocalSidecarGatewayClient implements SecurityGatewayClient {
         sessionId: ctx.sessionId,
         ...(ctx.correlationId !== undefined ? { correlationId: ctx.correlationId } : {}),
         ...(ctx.governanceDecisions !== undefined ? { governanceDecisions: ctx.governanceDecisions } : {}),
+        ...(ctx.knownPublicKeys !== undefined ? { knownPublicKeys: ctx.knownPublicKeys } : {}),
       },
     };
 

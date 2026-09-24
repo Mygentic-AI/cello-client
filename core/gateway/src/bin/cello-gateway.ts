@@ -202,7 +202,15 @@ async function main(): Promise<void> {
             agentName: req.agentName,
             sessionId: req.sessionId,
             ...(req.governanceDecisions !== undefined ? { governanceDecisions: req.governanceDecisions } : {}),
+            ...(req.knownPublicKeys !== undefined ? { knownPublicKeys: req.knownPublicKeys } : {}),
           });
+          // M16 031 observability: how many known public keys were protected through the stages.
+          // Count only, NEVER the key values (this is a debug line on the gateway's stderr log).
+          if (v.knownKeysProtected && v.knownKeysProtected > 0) {
+            process.stderr.write(
+              `${JSON.stringify({ level: "debug", event: "security.screen.outbound.known_keys", count: v.knownKeysProtected, ...(req.correlationId !== undefined ? { correlationId: req.correlationId } : {}) })}\n`,
+            );
+          }
           const verdict: ScreenVerdict = {
             disposition: v.disposition,
             content: v.content,

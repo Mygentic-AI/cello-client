@@ -30,6 +30,8 @@ export interface GatewayScreenFn {
     correlationId?: string;
     /** The agent's governance re-send decisions, keyed by flagId (M9-FEED-001 §6). Outbound only. */
     governanceDecisions?: Record<string, GovernanceDecision>;
+    /** M16 031: the known public keys (lowercase 64-hex) the daemon recognised. Outbound only. */
+    knownPublicKeys?: string[];
   }): ScreenVerdict | Promise<ScreenVerdict>;
 }
 
@@ -105,6 +107,7 @@ export async function createGatewayServer(opts: GatewayServerOptions): Promise<G
         sessionId: req.ctx.sessionId,
         correlationId: req.ctx.correlationId,
         ...(req.ctx.governanceDecisions !== undefined ? { governanceDecisions: req.ctx.governanceDecisions } : {}),
+        ...(req.ctx.knownPublicKeys !== undefined ? { knownPublicKeys: req.ctx.knownPublicKeys } : {}),
       });
     } catch (err) {
       // A screen-function fault is fail-closed: block, never silently allow.
