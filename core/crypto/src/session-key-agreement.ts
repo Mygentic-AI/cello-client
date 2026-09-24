@@ -422,7 +422,8 @@ export function deriveSessionSecrets(opts: {
   };
 
   const contentKey = hkdf(sha256, ikm, opts.sessionId, info(INFO_CONTENT_KEY), SESSION_KEY_BYTES);
-  // The IKM holds the ML-KEM shared secret; it must not outlive this function (D12).
+  // The IKM holds the ML-KEM shared secret and the X25519 one; neither outlives this function (D12).
   ikm.fill(0);
+  shared.fill(0);
   return { contentKey };
 }
