@@ -61,7 +61,7 @@ export function registerInitiateSessionHandler(deps: InitiateSessionDeps): {
    * strings.
    *
    * This exists because the wire names are not guessable and a wrong one fails silently-ish: the
-   * negotiator reads `target_pubkey` (falling back to `counterparty_pubkey`) and nothing else, so a
+   * negotiator reads `target_pubkey` and nothing else, so a
    * caller passing `pubkey` gets `invalid_target_pubkey` — an error that sends whoever reads it to
    * look at the PEER's key when the bug is in the caller's own field name. The same class of defect
    * already exists one seam over in the close handler (`session_id` vs `sessionId`).
@@ -189,12 +189,7 @@ export function registerInitiateSessionHandler(deps: InitiateSessionDeps): {
      * The pinned value is this daemon's own memory of an earlier session, which no directory can
      * retroactively change; that is what makes the comparison worth anything.
      */
-    const askedForHex =
-      typeof params?.target_pubkey === "string"
-        ? params.target_pubkey
-        : typeof params?.counterparty_pubkey === "string"
-          ? params.counterparty_pubkey
-          : "";
+    const askedForHex = typeof params?.target_pubkey === "string" ? params.target_pubkey : "";
     const pinnedCounterparty = askedForHex
       ? sessionNodeManager.getPinnedCounterpartyPrimary(agentName, askedForHex.toLowerCase())
       : null;
