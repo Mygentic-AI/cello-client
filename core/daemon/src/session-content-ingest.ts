@@ -19,14 +19,14 @@
 import * as lp from "it-length-prefixed";
 import { decode } from "cbor-x";
 import { decodeStructure1 } from "@cello-protocol/protocol-types";
-import { openSessionContent } from "@cello-protocol/crypto";
+import { openSessionContent, decodeSessionKeyAgreementFrame } from "@cello-protocol/crypto";
 import { CELLO_CONTENT_PROTOCOL_ID, type CelloNode } from "@cello-protocol/transport";
 import { GATEWAY_UNAVAILABLE, GOVERNANCE_TIMEOUT, type SecurityGatewayClient } from "@cello-protocol/gateway";
 import { scanFields } from "./screen-score-fields.js";
 import type { Stream } from "@libp2p/interface";
 import { contentHashFor, resolveContentHashAlg } from "./wire-content-hash.js";
 import { SALT_ADOPTION_LABEL_MAX } from "./session-salt-agreement.js";
-import { CONTENT_ENCRYPTION_INBOUND_GUIDANCE, SESSION_CONTENT_ENCRYPTION_V1 } from "./content-encryption-status.js";
+import { CONTENT_ENCRYPTION_INBOUND_GUIDANCE, CONTENT_ENCRYPTION_REASONS, SESSION_CONTENT_ENCRYPTION_V1 } from "./content-encryption-status.js";
 import { REFUSAL_KINDS } from "./refusal-reasons.js";
 import { refuseIfSessionClosed } from "./session-closed.js";
 import { triageOrphanedContent } from "./orphan-triage.js";
@@ -1800,12 +1800,9 @@ export class SessionContentIngest {
      * present-but-wrong value it would try to use.
      */
     if (frame["type"] === "session_key_agreement") {
-      const ephemeralPublic = frame["ephemeral_public"];
-      const signature = frame["ephemeral_sig"];
-      await this.#ctx.ephemerals.handleEphemeralFrame(agentName, sessionId, {
-        ...(ephemeralPublic instanceof Uint8Array ? { ephemeralPublic } : {}),
-        ...(signature instanceof Uint8Array ? { signature } : {}),
-      }, correlationId);
+      // Decoded in ONE place (decision 12): a non-Uint8Array field arrives as ABSENT and the
+      // verifier refuses it by name.
+      await this.#ctx.ephemerals.handleEphemeralFrame(agentName, sessionId, decodeSessionKeyAgreementFrame(frame), correlationId);
       return;
     }
     if (frame["type"] === "session_salt_agreement") {
@@ -1891,6 +1888,21 @@ export class SessionContentIngest {
       return;
     }
     if (encState.key === null) {
+      /**
+       * HELD, NOT REFUSED, while the post-quantum ciphertext is on its way — decision 11. The
+       * encapsulator can send the moment it has derived; this side derives one frame later. The
+       * frame is replayed through this same handler once the key exists, or refused as
+       * `pq_ciphertext_not_received` if it never does.
+       */
+      const held = this.#ctx.ephemerals.holdForPqCiphertext(
+        agentName, sessionId, contentBytes.length,
+        () => this.#handleFrame(agentName, sessionId, frame, remotePeerId),
+        () => this.#refuseInboundContent(agentName, sessionId, "pq_ciphertext_not_received", contentHash, {
+          impact: "an encrypted message arrived before your counterparty's half of the post-quantum session key, and that half never came, so the message could not be opened. Refused unread.",
+          guidance: CONTENT_ENCRYPTION_INBOUND_GUIDANCE[CONTENT_ENCRYPTION_REASONS.PQ_CIPHERTEXT_NOT_RECEIVED],
+        }, correlationId),
+      );
+      if (held) return;
       this.#refuseInboundContent(agentName, sessionId, "no_session_key", contentHash, {
         detail: encState.reason,
         impact: "an encrypted message arrived and this side has no agreed key to open it, so it was refused unread rather than shown as garbage.",

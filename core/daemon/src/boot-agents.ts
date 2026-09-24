@@ -100,6 +100,9 @@ export async function startBootAgents(deps: BootAgentsDeps) {
   // `setParkedDrainHook` is a setter.
   sessionNodeManager.setKeyProviderResolver((agentName: string) => keyProviders.get(agentName));
   const pqIdentities = buildPqIdentities(loadedAgents); // M9D 002-PQKEYS — see buildPqIdentities
+  // M9D 003-PQSESSION: the session announce is signed by the agent's ML-DSA key too. The resolver reads
+  // the live map, so an agent that registers in this run is signable as soon as register-handler adds it.
+  sessionNodeManager.setMlDsaProviderResolver((agentName: string) => pqIdentities.get(agentName)?.mlDsaProvider);
 
   // Constructed HERE, before ANY boot-time caller. autoRecoverForAgent is invoked from an agent's
   // onConnected and from the seal-upgrade content gate — both of which run long before the IPC

@@ -311,7 +311,7 @@ export class SessionLifecycle {
     // Add to active map (keyed by (agentName, sessionId) — DOD-LOOP-1)
     // 006-CRYPTO: the session's throwaway keypair is minted here, with the node, so "a session is
     // active" and "a session has a key" are the same moment. All THREE activation paths mint.
-    this.#ctx.ephemerals.mintSessionEphemeral(agentName, sessionId);
+    await this.#ctx.ephemerals.mintSessionEphemeral(agentName, sessionId);
     this.#ctx.activeNodes.set(this.#ctx.sessionKey(agentName, sessionId), {
       node,
       agentName,
@@ -455,7 +455,7 @@ export class SessionLifecycle {
     this.#ctx.standingReceivers.delete(agentName);
     // 006-CRYPTO: the hand-off path. A session promoted out of the standing receiver is as new as
     // one opened outbound, so it mints here too.
-    this.#ctx.ephemerals.mintSessionEphemeral(agentName, sessionId);
+    await this.#ctx.ephemerals.mintSessionEphemeral(agentName, sessionId);
     this.#ctx.activeNodes.set(this.#ctx.sessionKey(agentName, sessionId), {
       node,
       agentName,
@@ -1432,7 +1432,7 @@ export class SessionLifecycle {
     // holds because the interrupt path destroys the old secret when it drops the entry; until it
     // did, this call found the stale key still in the map and quietly kept it. The salt, which IS
     // persisted, is re-read from the row instead — opposite lifetimes, deliberately.
-    this.#ctx.ephemerals.mintSessionEphemeral(agentName, sessionId);
+    await this.#ctx.ephemerals.mintSessionEphemeral(agentName, sessionId);
     /**
      * AND ANNOUNCE IT — review F1, second half. Minting a fresh key achieves nothing on its own: the
      * COUNTERPARTY has to hear about it, and it is the side that did NOT restart, so it is not

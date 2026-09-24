@@ -46,7 +46,7 @@ import { STANDING_RECEIVER_AGENT_NAME } from "./types.js";
 import { SessionConnectionGater } from "./session-connection-gater.js";
 import { SessionTree, type WritableSessionTreeLeafKind } from "./session-tree.js";
 import { CELLO_CONTENT_PROTOCOL_ID, NodeAutoNatService, type CelloNode, type IAutoNatService } from "@cello-protocol/transport";
-import type { KeyProvider } from "@cello-protocol/crypto";
+import type { KeyProvider, MlDsaKeyProvider, SessionKeyAgreementFields } from "@cello-protocol/crypto";
 import { type SessionEphemeral } from "@cello-protocol/crypto";
 // `PARK_ENVELOPE_REASONS` is deliberately NOT imported here. The reason codes are compared inside
 // `park-envelope.ts` itself (`parkRefusalGuidance`) and asserted in its own test; this file only ever
@@ -459,13 +459,16 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
   markSessionLivenessForTest(agentName: string, sessionId: string, state: "alive" | "impaired" | "gone"): void { return this.#liveness.markSessionLivenessForTest(agentName, sessionId, state); }
 
   /** ─── DELEGATORS — the test seams other files call, unchanged by the split ─────────────── */
-  mintSessionEphemeralForTest(agentName: string, sessionId: string): void { return this.#ephemerals.mintSessionEphemeralForTest(agentName, sessionId); }
+  async mintSessionEphemeralForTest(agentName: string, sessionId: string): Promise<void> { return this.#ephemerals.mintSessionEphemeralForTest(agentName, sessionId); }
+  sessionEphemeralPublicsForTest(agentName: string, sessionId: string): { x25519: Uint8Array; mlKem: Uint8Array } | null { return this.#ephemerals.sessionEphemeralPublicsForTest(agentName, sessionId); }
+  setPqCiphertextHoldForTest(limits: { ms?: number; maxFrames?: number; maxBytes?: number }): void { return this.#ephemerals.setPqCiphertextHoldForTest(limits); }
+  contentEncryptionStateForTest(agentName: string, sessionId: string): ReturnType<SessionEphemerals["contentEncryptionState"]> { return this.#ephemerals.contentEncryptionState(agentName, sessionId); }
   sessionEphemeralPublicForTest(agentName: string, sessionId: string): Uint8Array | null { return this.#ephemerals.sessionEphemeralPublicForTest(agentName, sessionId); }
   setSessionEphemeralForTest(agentName: string, sessionId: string, ephemeral: SessionEphemeral): void { return this.#ephemerals.setSessionEphemeralForTest(agentName, sessionId, ephemeral); }
   setSessionContentKeyForTest(agentName: string, sessionId: string, key: Uint8Array): void { return this.#ephemerals.setSessionContentKeyForTest(agentName, sessionId, key); }
   forgetSessionContentKeyForTest(agentName: string, sessionId: string): void { return this.#ephemerals.forgetSessionContentKeyForTest(agentName, sessionId); }
-  async signOwnEphemeralForTest(agentName: string, sessionId: string): Promise<{ ephemeralPublic: Uint8Array; signature: Uint8Array } | null> { return this.#ephemerals.signOwnEphemeralForTest(agentName, sessionId); }
-  async handleEphemeralFrameForTest(agentName: string, sessionId: string, frame: { ephemeralPublic?: Uint8Array; signature?: Uint8Array }, correlationId = "test"): Promise<void> { return this.#ephemerals.handleEphemeralFrameForTest(agentName, sessionId, frame, correlationId); }
+  async signOwnEphemeralForTest(agentName: string, sessionId: string): Promise<SessionKeyAgreementFields | null> { return this.#ephemerals.signOwnEphemeralForTest(agentName, sessionId); }
+  async handleEphemeralFrameForTest(agentName: string, sessionId: string, frame: SessionKeyAgreementFields, correlationId = "test"): Promise<void> { return this.#ephemerals.handleEphemeralFrameForTest(agentName, sessionId, frame, correlationId); }
 
   /**
    * ─── DELEGATORS — the refusal-notice API other files call, unchanged by the split ──────────
@@ -759,6 +762,8 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
    * machines.
    */
   #keyProviderResolver: ((agentName: string) => KeyProvider | undefined) | null = null;
+  /** M9D 003-PQSESSION: each agent's ML-DSA provider, injected by the daemon like the key providers. */
+  #mlDsaProviderResolver: ((agentName: string) => MlDsaKeyProvider | undefined) | null = null;
   /** Test-only observer of decoded inbound content frames — see `observeInboundContentFramesForTest`. */
   #inboundFrameObserver: ((frame: Record<string, unknown>) => void) | null = null;
 
@@ -1190,6 +1195,8 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       sessionKey: (a, sid) => this.#k(a, sid),
       activeEntry: (key) => this.#activeNodes.get(key),
       keyProvider: (a) => this.#keyProviderResolver?.(a),
+      mlDsaProvider: (a) => this.#mlDsaProviderResolver?.(a),
+      counterpartyPqKeys: (a, sid) => this.#queries.counterpartyPqKeys(a, sid),
       freezeSessionForKeyRefusal: (a, sid, reason, cid) => this.#freezeSessionForKeyRefusal(a, sid, reason, cid),
     });
 
@@ -2888,6 +2895,11 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
   /** Injected by the daemon once its per-agent key providers exist. See `#keyProviderResolver`. */
   setKeyProviderResolver(resolver: (agentName: string) => KeyProvider | undefined): void {
     this.#keyProviderResolver = resolver;
+  }
+
+  /** M9D 003-PQSESSION: injected by the daemon once its per-agent post-quantum identities exist. */
+  setMlDsaProviderResolver(resolver: (agentName: string) => MlDsaKeyProvider | undefined): void {
+    this.#mlDsaProviderResolver = resolver;
   }
 
   /**

@@ -73,6 +73,11 @@ export const CONTENT_ENCRYPTION_REASONS = {
    * dropped the frame, or their daemon is not answering.
    */
   PEER_SILENT: "peer_silent",
+  /**
+   * M9D 003-PQSESSION: this side is the decapsulator and the counterparty's ML-KEM ciphertext never
+   * arrived within the hold window, so the content it had already sent was refused unread.
+   */
+  PQ_CIPHERTEXT_NOT_RECEIVED: "pq_ciphertext_not_received",
 } as const;
 
 export type ContentEncryptionReason =
@@ -114,6 +119,10 @@ export const CONTENT_ENCRYPTION_GUIDANCE: Record<ContentEncryptionReason, string
     "protocol, so this is not a version difference — either the frame was dropped between you, or " +
     "their daemon is not answering. Check they are online, then start a new session. Nothing was sent " +
     "in the open in the meantime.",
+  [CONTENT_ENCRYPTION_REASONS.PQ_CIPHERTEXT_NOT_RECEIVED]:
+    "Your counterparty's half of the post-quantum session key never arrived, so messages from them " +
+    "could not be opened. Nothing was shown. Close this session and open a new one; if it repeats, " +
+    "your counterparty's daemon is failing to complete the key exchange.",
 };
 
 /**
@@ -156,6 +165,10 @@ export const CONTENT_ENCRYPTION_INBOUND_GUIDANCE: Record<ContentEncryptionReason
     "open their message with. They are running the same protocol, so this is not a version " +
     "difference — either the frame was dropped between you, or their daemon is not answering. " +
     "Check they are online, then start a new conversation.",
+  [CONTENT_ENCRYPTION_REASONS.PQ_CIPHERTEXT_NOT_RECEIVED]:
+    "Your counterparty's half of the post-quantum session key never arrived, so messages from them " +
+    "could not be opened. Nothing was shown. Close this session and open a new one; if it repeats, " +
+    "your counterparty's daemon is failing to complete the key exchange.",
 };
 
 /**

@@ -24,8 +24,13 @@ import {
   deriveSessionSecrets,
   signSessionEphemeral,
   verifySessionEphemeral,
+  mlKemEncapsulate,
+  mlKemDecapsulate,
+  EPHEMERAL_AUTH_REFUSALS,
   type SessionEphemeral,
+  type SessionKeyAgreementFields,
   type KeyProvider,
+  type MlDsaKeyProvider,
 } from "@cello-protocol/crypto";
 import { encodeCbor } from "@cello-protocol/protocol-types";
 import { extractErrorMessage } from "./error-message.js";
@@ -53,6 +58,16 @@ export interface SessionEphemeralContext {
    * does not happen, the exchange never completes, and the session falls back to unencrypted.
    */
   keyProvider(agentName: string): KeyProvider | undefined;
+  /**
+   * M9D 003-PQSESSION: the agent's registered ML-DSA key, which signs the announce beside K_local.
+   * A function for the same reason as `keyProvider`: the daemon injects it after construction.
+   */
+  mlDsaProvider(agentName: string): MlDsaKeyProvider | undefined;
+  /**
+   * M9D 003-PQSESSION: the counterparty's post-quantum keys, verified through its v2 key binding and
+   * recorded on the session row. The ONLY key `ephemeral_pq_sig` is checked against.
+   */
+  counterpartyPqKeys(agentName: string, sessionId: string): { mlDsa: Uint8Array; mlKem: Uint8Array } | null;
   /**
    * ⚠️ THE REASON TYPE IS WIDER THAN `ContentEncryptionReason` ON PURPOSE. The freeze is reached
    * from the ephemeral AUTH refusals too, and narrowing here would have forced a cast at the call
@@ -121,6 +136,24 @@ export class SessionEphemerals {
    */
   #contentEncryptionReasons = new Map<string, ContentEncryptionReason>();
   /**
+   * M9D 003-PQSESSION: the ML-KEM ciphertext THIS side encapsulated to the counterparty's current
+   * ML-KEM key, re-sent on every announce while we are the encapsulator. Public; no zeroing needed.
+   * Cleared with the ephemeral, because a re-key recomputes the roles.
+   */
+  #ownCiphertexts = new Map<string, Uint8Array>();
+  /** Sessions where we are the decapsulator and hold the peer's half but not yet its ciphertext. */
+  #awaitingPqCiphertext = new Set<string>();
+  /**
+   * Content that arrived while `#awaitingPqCiphertext` — held, not refused as tampered, because the
+   * encapsulator can send the moment it has derived and we derive one frame later. Drained in arrival
+   * order on derivation; refused as `pq_ciphertext_not_received` on cap or timeout; dropped with the
+   * session on every destroy path.
+   */
+  #heldContent = new Map<string, { frames: Array<{ replay: () => Promise<void>; refuse: () => void }>; bytes: number; timer: ReturnType<typeof setTimeout> }>();
+  #holdLimits = { ms: 30_000, maxFrames: 64, maxBytes: 4 * 1024 * 1024 };
+  /** Test seam: sees every ML-KEM shared secret at creation, to prove it is zeroed after use. */
+  #ssPqObserver: ((ssPq: Uint8Array) => void) | null = null;
+  /**
    * DOD-M15-FRAME-1 — a proven identity failure ends the session, and says so as an OBSERVATION.
    *
    * SESSION-ENDING, NOT PER-MESSAGE. One frame that fails to verify against the expected
@@ -177,10 +210,14 @@ export class SessionEphemerals {
    * explicitly decided. The interrupt path now destroys it, so the map really is empty by the time
    * a revival reaches here and it mints fresh (Decisions Carried #5).
    */
-  mintSessionEphemeral(agentName: string, sessionId: string, correlationId?: string): void {
+  async mintSessionEphemeral(agentName: string, sessionId: string, correlationId?: string): Promise<void> {
     const key = this.#ctx.sessionKey(agentName, sessionId);
     if (this.#sessionEphemerals.has(key)) return;
-    this.#sessionEphemerals.set(key, generateSessionEphemeral());
+    const minted = await generateSessionEphemeral();
+    // Re-checked after the await: a concurrent activation may have minted first, and a second
+    // keypair mid-session is exactly what this guard exists to stop.
+    if (this.#sessionEphemerals.has(key)) { destroySessionEphemeral(minted); return; }
+    this.#sessionEphemerals.set(key, minted);
     this.#ctx.logger.debug("session.ephemeral.minted", {
       agentName, sessionId, correlationId,
       // The PUBLIC half only, and only a prefix of it. The secret must never reach a log line, and
@@ -219,8 +256,14 @@ export class SessionEphemerals {
     }
     this.#sessionContentKeyPeerHalf.delete(key);
     this.#contentEncryptionReasons.delete(key);
+    // 003-PQSESSION: the role state goes with the ephemeral it was computed from, and content held
+    // for this session's ciphertext is dropped with the session.
+    this.#ownCiphertexts.delete(key);
+    this.#awaitingPqCiphertext.delete(key);
+    this.#dropHeld(key);
     const ephemeral = this.#sessionEphemerals.get(key);
     if (!ephemeral) return;
+    // Zeroes the X25519 secret AND the ML-KEM seed (D12).
     destroySessionEphemeral(ephemeral);
     this.#sessionEphemerals.delete(key);
     this.#ctx.logger.debug("session.ephemeral.destroyed", { agentName, sessionId, correlationId });
@@ -241,10 +284,11 @@ export class SessionEphemerals {
   async handleEphemeralFrame(
     agentName: string,
     sessionId: string,
-    frame: { ephemeralPublic?: Uint8Array; signature?: Uint8Array },
+    frame: SessionKeyAgreementFields,
     correlationId?: string,
   ): Promise<void> {
-    const entry = this.#ctx.activeEntry(this.#ctx.sessionKey(agentName, sessionId));
+    const key = this.#ctx.sessionKey(agentName, sessionId);
+    const entry = this.#ctx.activeEntry(key);
     if (!entry) return;
 
     /**
@@ -254,66 +298,29 @@ export class SessionEphemerals {
      *   INITIATOR: what the OPERATOR asked for (`initiate-session-handler` takes `target_pubkey`).
      *   RESPONDER: the initiator identity the DIRECTORY attested in the offer/assignment.
      *
-     * So this binds the ephemeral to that identity, whichever it is. The attack it closes is the
-     * RELAY substituting its own key — a different actor from the directory — and that is closed in
-     * both directions. What it does NOT do is move the responder's trust off the directory; the
-     * inbound path says as much itself ("a single compromised directory still controls both frames
-     * here"), and that is a separate line.
-     *
-     * The distinction is written down rather than smoothed over because this is a public repo and
-     * the sentence it replaces — "never from anything the directory handed back" — was absolute and
-     * false on one of the two sides.
+     * The ML-DSA key is the counterparty's REGISTERED key, recorded from the assignment after its v2
+     * key binding verified (002-PQKEYS) — the only key `ephemeral_pq_sig` is checked against.
      */
     const expected = Buffer.from(entry.counterpartyPubkey, "hex");
     const sessionIdBytes = Buffer.from(sessionId, "hex");
-    const verdict = verifySessionEphemeral({
+    const verdict = await verifySessionEphemeral({
       expectedIdentityPublic: new Uint8Array(expected),
+      expectedPqPublic: this.#ctx.counterpartyPqKeys(agentName, sessionId)?.mlDsa,
       sessionId: sessionIdBytes,
       peerEphemeralPublic: frame.ephemeralPublic,
+      peerMlKemPublic: frame.mlkemPublic,
+      peerCiphertext: frame.mlkemCiphertext,
       peerSignature: frame.signature,
+      peerPqSignature: frame.pqSignature,
     });
 
     if (!verdict.ok) {
-      this.#ctx.logger.error("session.key.refused", {
-        agentName, sessionId, correlationId,
-        reason: verdict.reason,
-        detail: verdict.detail,
-        guidance:
-          "STOPPED ON PURPOSE. The session key your counterparty sent could not be tied to them, so " +
-          "this session has been stopped rather than continued in the open. The ordinary cause is a " +
-          "build mismatch; the one that matters is something in the middle of your connection " +
-          "substituting its own key so it can read what you send. Confirm with your counterparty OUT " +
-          "OF BAND — not over CELLO — before opening another session with them.",
-      });
-      // Session-ending, not per-message: one proven wrong signer is evidence about the CONNECTION,
-      // not about the frame that carried it.
-      await this.#ctx.freezeSessionForKeyRefusal(agentName, sessionId, verdict.reason, correlationId);
+      await this.#refuseKey(agentName, sessionId, verdict.reason, verdict.detail, correlationId);
       return;
     }
-
-    /**
-     * ALREADY AGREED WITH **THIS** PEER HALF — idempotence keyed on the bytes, not on presence.
-     *
-     * ⚠️ KEYING IT ON PRESENCE WAS A DEFECT, and a routine relay roll was enough to trigger it.
-     * Only the side whose witness stream closed interrupts, so only that side destroys its key and
-     * re-keys on revival. The OTHER side is never torn down — nothing else clears this map — so it
-     * saw the peer's NEW ephemeral, found a key already present, and kept the old one.
-     *
-     * Two different keys, and the damage is worse than a dead path: every message then fails GCM,
-     * and the receiving daemon reports *"the message did not decrypt — it was modified in flight, or
-     * encrypted under a different key"* and tells the operator to confirm OUT OF BAND. Nothing was
-     * modified. Two people have a security conversation about a local key skew.
-     *
-     * I MEASURED THIS TWICE AND CALLED IT A HARNESS QUIRK — the notes in `seam-4` and `m9-core-001`
-     * about seeding "before the settle" leaving the two ends on different keys are this defect,
-     * observed and worked around instead of read.
-     *
-     * So: the same half re-announced on every connect is still a no-op, and a DIFFERENT half — which
-     * only a re-keying peer sends — is adopted. The peer is identity-authenticated by the time we
-     * get here, so letting them move the key is not a new capability.
-     */
-    const peerHalfHex = Buffer.from(frame.ephemeralPublic!).toString("hex");
-    if (this.#sessionContentKeyPeerHalf.get(this.#ctx.sessionKey(agentName, sessionId)) === peerHalfHex) return;
+    const peerX25519 = frame.ephemeralPublic!;
+    const peerMlKem = frame.mlkemPublic!;
+    const peerCt = frame.mlkemCiphertext;
 
     const ownEphemeral = this.sessionEphemeralFor(agentName, sessionId);
     if (!ownEphemeral) {
@@ -325,22 +332,97 @@ export class SessionEphemerals {
       return;
     }
 
+    /**
+     * KEM ROLE — Contract 4: the side whose X25519 public sorts LOWER encapsulates to the other's
+     * ML-KEM key. Never decided by who initiated, and recomputed on every frame, because a re-key on
+     * either side can swap the order.
+     */
+    const weEncapsulate = lexLess(ownEphemeral.publicKey, peerX25519);
+    if (weEncapsulate && peerCt !== undefined) {
+      await this.#refuseKey(
+        agentName, sessionId, EPHEMERAL_AUTH_REFUSALS.PQ_ROLE_VIOLATION,
+        "the peer sent a post-quantum ciphertext, but its session key sorts higher than ours, so it is the side that must NOT encapsulate. Two ciphertexts would leave the two sides on different keys.",
+        correlationId,
+      );
+      return;
+    }
+
+    /**
+     * ALREADY AGREED WITH **THIS** PEER HALF — idempotence keyed on the WHOLE half: X25519 key, ML-KEM
+     * key and ciphertext (decision 8, D10).
+     *
+     * Keyed on the X25519 bytes alone, the encapsulator's second announce — same X25519 key, now
+     * carrying the ciphertext — was dropped as a duplicate, and the decapsulator never derived. Every
+     * message then failed GCM and was reported as *"modified in flight"* when nothing was modified.
+     *
+     * ⚠️ KEYING IT ON PRESENCE WAS THE EARLIER DEFECT, and a routine relay roll was enough to trigger
+     * it: only the side whose witness stream closed re-keyed, the other kept its old key, and every
+     * message failed GCM. So the same half re-announced on every connect is still a no-op, and a
+     * DIFFERENT half — a re-key, or the ciphertext arriving — is processed.
+     */
+    const peerHalfHex = Buffer.concat([peerX25519, peerMlKem, peerCt ?? new Uint8Array(0)]).toString("hex");
+    const prior = this.#sessionContentKeyPeerHalf.get(key);
+    if (prior === peerHalfHex) return;
+
+    if (!weEncapsulate && peerCt === undefined) {
+      // We decapsulate and the ciphertext has not come yet: record the half and wait. An older key
+      // (the peer re-keyed) is dropped, so content under the new key is HELD rather than failing GCM.
+      this.#sessionContentKeyPeerHalf.set(key, peerHalfHex);
+      this.#awaitingPqCiphertext.add(key);
+      const old = this.#sessionContentKeys.get(key);
+      if (old) { old.fill(0); this.#sessionContentKeys.delete(key); }
+      this.#ctx.logger.debug("session.key.awaiting_pq_ciphertext", { agentName, sessionId, correlationId });
+      return;
+    }
+
+    let ssPq: Uint8Array;
+    let transcript: Uint8Array;
+    let ciphertextToAnnounce: Uint8Array | undefined;
+    try {
+      if (weEncapsulate) {
+        const kem = await mlKemEncapsulate(peerMlKem);
+        ssPq = kem.sharedSecret;
+        transcript = Buffer.concat([kem.ciphertext, peerMlKem]);
+        ciphertextToAnnounce = kem.ciphertext;
+      } else {
+        ssPq = await mlKemDecapsulate(ownEphemeral.mlKemSeed, peerCt!);
+        transcript = Buffer.concat([peerCt!, ownEphemeral.mlKemPublic]);
+      }
+    } catch (err: unknown) {
+      this.#ctx.logger.error("session.key.refused", {
+        agentName, sessionId, correlationId,
+        reason: weEncapsulate ? "pq_encaps_failed" : "pq_decaps_failed",
+        detail: extractErrorMessage(err),
+        errorName: (err as { name?: string } | null)?.name,
+        errorCode: (err as { code?: string } | null)?.code,
+      });
+      await this.#ctx.freezeSessionForKeyRefusal(agentName, sessionId, weEncapsulate ? "pq_encaps_failed" : "pq_decaps_failed", correlationId);
+      return;
+    }
+    this.#ssPqObserver?.(ssPq);
+
     try {
       const secrets = deriveSessionSecrets({
         ownEphemeralSecret: ownEphemeral.secretKey,
-        peerEphemeralPublic: frame.ephemeralPublic!,
+        peerEphemeralPublic: peerX25519,
         sessionId: sessionIdBytes,
+        extraSharedSecret: ssPq,
+        pqTranscript: transcript,
       });
-      const prior = this.#sessionContentKeyPeerHalf.get(this.#ctx.sessionKey(agentName, sessionId));
-      this.#sessionContentKeys.set(this.#ctx.sessionKey(agentName, sessionId), secrets.contentKey);
-      this.#sessionContentKeyPeerHalf.set(this.#ctx.sessionKey(agentName, sessionId), peerHalfHex);
-      this.#contentEncryptionReasons.delete(this.#ctx.sessionKey(agentName, sessionId));
+      const old = this.#sessionContentKeys.get(key);
+      if (old) old.fill(0);
+      this.#sessionContentKeys.set(key, secrets.contentKey);
+      this.#sessionContentKeyPeerHalf.set(key, peerHalfHex);
+      this.#contentEncryptionReasons.delete(key);
+      this.#awaitingPqCiphertext.delete(key);
+      if (ciphertextToAnnounce) this.#ownCiphertexts.set(key, ciphertextToAnnounce);
       this.#ctx.logger.info("session.key.agreed", {
         agentName, sessionId, correlationId,
+        role: weEncapsulate ? "encapsulator" : "decapsulator",
         // A RE-KEY is a different event from a first agreement and an operator correlating two
         // daemons needs to tell them apart: a re-key means the other side restarted.
-        rekey: prior !== undefined && prior !== peerHalfHex,
-        impact: "message bodies on this session are now encrypted by CELLO under a key both sides agreed and neither sent, and which is destroyed when the session ends",
+        rekey: old !== undefined,
+        impact: "message bodies on this session are now encrypted by CELLO under a hybrid X25519 + ML-KEM-768 key both sides agreed and neither sent, and which is destroyed when the session ends",
       });
     } catch (err: unknown) {
       // The primitive owns every rule about the peer's half — a degenerate point, a non-canonical
@@ -348,17 +430,49 @@ export class SessionEphemerals {
       // destroy the only explanation that exists at the only moment anyone reads it.
       this.#ctx.logger.error("session.key.refused", {
         agentName, sessionId, correlationId, reason: "derivation_failed",
-        // Review F1: the ternary above this line SILENTLY DESTROYED the wording the comment says
-        // it is here to preserve — `deriveSessionSecrets` throws from `@cello-protocol/crypto`,
-        // the cross-realm case where a throw is not `instanceof Error`, so the operator read
-        // `[object Object]` at the one moment the primitive's explanation existed. Higher stakes
-        // than the announce path this unit was opened for: this branch FREEZES the session.
         detail: extractErrorMessage(err),
         errorName: (err as { name?: string } | null)?.name,
         errorCode: (err as { code?: string } | null)?.code,
       });
       await this.#ctx.freezeSessionForKeyRefusal(agentName, sessionId, "derivation_failed", correlationId);
+      return;
+    } finally {
+      // D12: the ML-KEM shared secret never outlives the function that produced it.
+      ssPq.fill(0);
     }
+
+    if (ciphertextToAnnounce) {
+      // The encapsulator re-announces so the peer can derive; the frame now carries the ciphertext.
+      await this.sendEphemeralFrame(agentName, sessionId, correlationId);
+    }
+    await this.#drainHeld(agentName, sessionId, correlationId);
+  }
+
+  /**
+   * A PROVEN KEY FAILURE ENDS THE SESSION — logged at error with its reason, then frozen.
+   *
+   * 🚨 NOT A DEGRADATION TO UNENCRYPTED. An unsigned or wrongly-signed key is what a relay
+   * substituting its own looks like, and carrying on in the open would hand it the plaintext.
+   * `ephemeral_pq_peer_keys_unknown` is the exception in WORDING only: it is a fault on this
+   * machine, so its guidance never blames the counterparty.
+   */
+  async #refuseKey(agentName: string, sessionId: string, reason: string, detail: string, correlationId?: string): Promise<void> {
+    const localFault = reason === EPHEMERAL_AUTH_REFUSALS.PQ_PEER_KEYS_UNKNOWN;
+    this.#ctx.logger.error("session.key.refused", {
+      agentName, sessionId, correlationId, reason, detail,
+      guidance: localFault
+        ? "STOPPED ON PURPOSE, and the fault is on THIS machine: it holds no verified post-quantum key " +
+          "for your counterparty, which should have been recorded from the session assignment. Your " +
+          "counterparty did nothing wrong. Report this as a CELLO defect with the log lines above."
+        : "STOPPED ON PURPOSE. The session key your counterparty sent could not be tied to them, so " +
+          "this session has been stopped rather than continued in the open. The ordinary cause is a " +
+          "build mismatch; the one that matters is something in the middle of your connection " +
+          "substituting its own key so it can read what you send. Confirm with your counterparty OUT " +
+          "OF BAND — not over CELLO — before opening another session with them.",
+    });
+    // Session-ending, not per-message: one proven wrong signer is evidence about the CONNECTION,
+    // not about the frame that carried it.
+    await this.#ctx.freezeSessionForKeyRefusal(agentName, sessionId, reason, correlationId);
   }
   /**
    * The agreed content key for a session, or `null` with the reason there is none.
@@ -434,16 +548,35 @@ export class SessionEphemerals {
       return;
     }
 
+    const mlDsa = this.#ctx.mlDsaProvider(agentName);
+    if (!mlDsa) {
+      // Same shape as `no_identity_key`: a LOCAL fault, named as one, so the operator whose machine
+      // cannot sign is not told their counterparty misbehaved.
+      this.#ctx.logger.error("session.key.announce.failed", {
+        agentName, sessionId, correlationId, reason: "no_pq_identity",
+        impact: "this machine has no post-quantum identity key for the agent, so it cannot sign its half of the session key; no session it opens can agree a key and the counterparty is not involved",
+        guidance: CONTENT_ENCRYPTION_GUIDANCE[CONTENT_ENCRYPTION_REASONS.NO_LOCAL_IDENTITY],
+      });
+      this.noteContentEncryptionReason(agentName, sessionId, CONTENT_ENCRYPTION_REASONS.NO_LOCAL_IDENTITY);
+      return;
+    }
+
     let stream: Awaited<ReturnType<typeof entry.node.newStream>> | null = null;
     try {
       const sessionIdBytes = Buffer.from(sessionId, "hex");
-      const signature = await signSessionEphemeral(signer, sessionIdBytes, ephemeral.publicKey);
+      // Decision 2: the ciphertext rides every announce while we are the encapsulator for the peer's
+      // current ML-KEM key; the decapsulator's announces never carry one.
+      const ct = this.#ownCiphertexts.get(this.#ctx.sessionKey(agentName, sessionId));
+      const { sig, pqSig } = await signSessionEphemeral(signer, mlDsa, sessionIdBytes, ephemeral.publicKey, ephemeral.mlKemPublic, ct);
       stream = await entry.node.newStream(entry.counterpartySessionPeerId, CELLO_CONTENT_PROTOCOL_ID);
       stream.send(lp.encode.single(encodeCbor({
         type: "session_key_agreement",
         session_id: sessionId,
         ephemeral_public: ephemeral.publicKey,
-        ephemeral_sig: signature,
+        mlkem_public: ephemeral.mlKemPublic,
+        ...(ct ? { mlkem_ciphertext: ct } : {}),
+        ephemeral_sig: sig,
+        ephemeral_pq_sig: pqSig,
       }) as Uint8Array).subarray());
       await stream.close();
       this.#ctx.logger.debug("session.key.announced", {
@@ -556,8 +689,8 @@ export class SessionEphemerals {
    * make. The reader returns the public half ONLY: a seam that could hand out the secret is a way
    * for the secret to leave this object, which is the one thing the whole unit is about.
    */
-  mintSessionEphemeralForTest(agentName: string, sessionId: string): void {
-    this.mintSessionEphemeral(agentName, sessionId);
+  async mintSessionEphemeralForTest(agentName: string, sessionId: string): Promise<void> {
+    await this.mintSessionEphemeral(agentName, sessionId);
   }
   sessionEphemeralPublicForTest(agentName: string, sessionId: string): Uint8Array | null {
     const e = this.sessionEphemeralFor(agentName, sessionId);
@@ -619,12 +752,34 @@ export class SessionEphemerals {
   async signOwnEphemeralForTest(
     agentName: string,
     sessionId: string,
-  ): Promise<{ ephemeralPublic: Uint8Array; signature: Uint8Array } | null> {
+  ): Promise<SessionKeyAgreementFields | null> {
     const eph = this.sessionEphemeralFor(agentName, sessionId);
     const signer = this.#ctx.keyProvider(agentName);
-    if (!eph || !signer) return null;
-    const signature = await signSessionEphemeral(signer, Buffer.from(sessionId, "hex"), eph.publicKey);
-    return { ephemeralPublic: Uint8Array.from(eph.publicKey), signature };
+    const mlDsa = this.#ctx.mlDsaProvider(agentName);
+    if (!eph || !signer || !mlDsa) return null;
+    // The v2 frame, both signatures, through the production builder (decision 15).
+    const ct = this.#ownCiphertexts.get(this.#ctx.sessionKey(agentName, sessionId));
+    const { sig, pqSig } = await signSessionEphemeral(signer, mlDsa, Buffer.from(sessionId, "hex"), eph.publicKey, eph.mlKemPublic, ct);
+    return {
+      ephemeralPublic: Uint8Array.from(eph.publicKey),
+      mlkemPublic: Uint8Array.from(eph.mlKemPublic),
+      ...(ct ? { mlkemCiphertext: Uint8Array.from(ct) } : {}),
+      signature: sig,
+      pqSignature: pqSig,
+    };
+  }
+  /** Test seam: this side's PUBLIC halves — X25519 and ML-KEM. Never a secret. */
+  sessionEphemeralPublicsForTest(agentName: string, sessionId: string): { x25519: Uint8Array; mlKem: Uint8Array } | null {
+    const e = this.sessionEphemeralFor(agentName, sessionId);
+    return e ? { x25519: Uint8Array.from(e.publicKey), mlKem: Uint8Array.from(e.mlKemPublic) } : null;
+  }
+  /** Test seam: see each ML-KEM shared secret when it is produced, to prove it is zeroed after use (D12). */
+  observeSsPqForTest(cb: (ssPq: Uint8Array) => void): void {
+    this.#ssPqObserver = cb;
+  }
+  /** Test seam: shorten the hold window (or caps) for content awaiting the post-quantum ciphertext. */
+  setPqCiphertextHoldForTest(limits: { ms?: number; maxFrames?: number; maxBytes?: number }): void {
+    this.#holdLimits = { ...this.#holdLimits, ...limits };
   }
   /**
    * Test seam: deliver a peer's signed ephemeral, exactly as the content-stream decoder does.
@@ -637,7 +792,7 @@ export class SessionEphemerals {
   async handleEphemeralFrameForTest(
     agentName: string,
     sessionId: string,
-    frame: { ephemeralPublic?: Uint8Array; signature?: Uint8Array },
+    frame: SessionKeyAgreementFields,
     correlationId = "test",
   ): Promise<void> {
     await this.handleEphemeralFrame(agentName, sessionId, frame, correlationId);
@@ -652,7 +807,94 @@ export class SessionEphemerals {
    * survives the shutdown in memory for as long as the process does.
    */
   destroyAll(): void {
+    // Zeroes every X25519 secret AND every ML-KEM seed (D12).
     for (const ephemeral of this.#sessionEphemerals.values()) destroySessionEphemeral(ephemeral);
     this.#sessionEphemerals.clear();
+    for (const k of [...this.#heldContent.keys()]) this.#dropHeld(k);
+    this.#ownCiphertexts.clear();
+    this.#awaitingPqCiphertext.clear();
   }
+
+  /** Drop a session's held content without refusing it — the session itself is going away. */
+  #dropHeld(key: string): void {
+    const held = this.#heldContent.get(key);
+    if (!held) return;
+    clearTimeout(held.timer);
+    this.#heldContent.delete(key);
+  }
+
+  /**
+   * HOLD a content frame that arrived before the post-quantum ciphertext — decision 11.
+   *
+   * Returns `false` when this session is NOT waiting for a ciphertext, so the caller refuses as it
+   * always has. Otherwise the frame is queued (cap 64 frames or 4 MiB, 30 s from the first) and
+   * `replay` runs it through the normal path once the key is derived. On cap or timeout every held
+   * frame's `refuse` runs, which refuses it as `pq_ciphertext_not_received`.
+   */
+  holdForPqCiphertext(
+    agentName: string,
+    sessionId: string,
+    sizeBytes: number,
+    replay: () => Promise<void>,
+    refuse: () => void,
+  ): boolean {
+    const key = this.#ctx.sessionKey(agentName, sessionId);
+    if (!this.#awaitingPqCiphertext.has(key)) return false;
+    let held = this.#heldContent.get(key);
+    if (!held) {
+      const timer = setTimeout(() => this.#refuseHeld(agentName, sessionId, "timeout"), this.#holdLimits.ms);
+      if (typeof timer.unref === "function") timer.unref();
+      held = { frames: [], bytes: 0, timer };
+      this.#heldContent.set(key, held);
+    }
+    held.frames.push({ replay, refuse });
+    held.bytes += sizeBytes;
+    if (held.frames.length > this.#holdLimits.maxFrames || held.bytes > this.#holdLimits.maxBytes) {
+      this.#refuseHeld(agentName, sessionId, "cap");
+    }
+    return true;
+  }
+
+  #refuseHeld(agentName: string, sessionId: string, cause: "timeout" | "cap"): void {
+    const key = this.#ctx.sessionKey(agentName, sessionId);
+    const held = this.#heldContent.get(key);
+    if (!held) return;
+    clearTimeout(held.timer);
+    this.#heldContent.delete(key);
+    this.#ctx.logger.warn("session.key.pq_ciphertext_timeout", {
+      agentName, sessionId, cause, heldFrames: held.frames.length, heldBytes: held.bytes,
+      impact: "the counterparty's post-quantum ciphertext never arrived, so the messages it had already sent could not be opened and were refused unread",
+      guidance: CONTENT_ENCRYPTION_GUIDANCE[CONTENT_ENCRYPTION_REASONS.PQ_CIPHERTEXT_NOT_RECEIVED],
+    });
+    this.noteContentEncryptionReason(agentName, sessionId, CONTENT_ENCRYPTION_REASONS.PQ_CIPHERTEXT_NOT_RECEIVED);
+    for (const f of held.frames) f.refuse();
+  }
+
+  /** Replay held content in arrival order through the normal decrypt path, now that a key exists. */
+  async #drainHeld(agentName: string, sessionId: string, correlationId?: string): Promise<void> {
+    const key = this.#ctx.sessionKey(agentName, sessionId);
+    const held = this.#heldContent.get(key);
+    if (!held) return;
+    clearTimeout(held.timer);
+    this.#heldContent.delete(key);
+    for (const f of held.frames) {
+      try {
+        await f.replay();
+      } catch (err: unknown) {
+        this.#ctx.logger.error("session.key.held_content.replay_failed", {
+          agentName, sessionId, correlationId, error: extractErrorMessage(err),
+        });
+      }
+    }
+  }
+}
+
+/** Byte-wise order, shorter-is-lower on a shared prefix — the same rule the key derivation sorts by. */
+function lexLess(a: Uint8Array, b: Uint8Array): boolean {
+  for (let i = 0; i < Math.min(a.length, b.length); i++) {
+    const x = a[i] as number;
+    const y = b[i] as number;
+    if (x !== y) return x < y;
+  }
+  return a.length < b.length;
 }
