@@ -1,7 +1,7 @@
 /**
  * @cello-protocol/crypto — ML-DSA-44 (NIST FIPS 204), on native node:crypto Web Crypto (Node ≥ 24.7).
  *
- * Contract 1 of M9D. Replaces the @oqs/liboqs-js WASM provider. The persisted secret is the 32-byte
+ * Contract 1 of M9D. Replaces the old WASM provider. The persisted secret is the 32-byte
  * FIPS 204 seed ξ — not the 2,560-byte expanded key — and the public key is derived from it
  * deterministically. There is no reader for the old expanded format: an identity stored that way is
  * a load failure, and every identity is re-registered when M9D rolls.
