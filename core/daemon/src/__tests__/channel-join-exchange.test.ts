@@ -400,6 +400,10 @@ describe("M16 019 Part B — the join exchange", () => {
     const pendingNotices = fa.notices.filter((n) => n.event === "channel.join.pending");
     expect(pendingNotices).toHaveLength(1);
     expect(pendingNotices[0].subscriber).toBe(fa.subscriberHex);
+    // A REPEAT of the same request is answered pending_approval again but must NOT ring the admin a
+    // second time — otherwise a subscriber could page an admin on every retry (032 review F2).
+    await fa.exchange.onAdminFrame("s1", fa.subscriberHex, request);
+    expect(fa.notices.filter((n) => n.event === "channel.join.pending"), "a repeat request re-rang the admin").toHaveLength(1);
 
     // (b) SUBSCRIBER side, ADMITTED: an acceptance stored → onJoinAnswer "admitted", no reason.
     const fo = await fixture("open");
