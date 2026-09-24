@@ -41,10 +41,10 @@ function makeGenesisPrevRoot(): Uint8Array {
 
 const TIMESTAMP = 1700000000000;
 
-// ─── AC-004: buildSessionEstablishmentTbs with 10 fields ─────────────────────
+// ─── AC-004: buildSessionEstablishmentTbs ───────────────────────
 
 describe("WIRE-001 AC-004: buildSessionEstablishmentTbs — M7 extended TBS", () => {
-  it("AC-004: 10-field TBS includes session peer IDs, addrs, and transport mode", () => {
+  it("AC-004: the TBS includes session peer IDs, addrs, and transport mode", () => {
     const result = buildSessionEstablishmentTbs(
       makeSessionId(),
       makePubA(),
@@ -55,7 +55,7 @@ describe("WIRE-001 AC-004: buildSessionEstablishmentTbs — M7 extended TBS", ()
       ["/ip4/127.0.0.1/tcp/9000"],
       "12D3KooWCounterpartyPeerId",
       ["/ip4/127.0.0.1/tcp/9001"],
-      "relay",
+      "relay", false, "", "",
     );
     expect(result).toBeInstanceOf(Uint8Array);
     expect(result.length).toBeGreaterThan(0);
@@ -102,7 +102,7 @@ describe("WIRE-001 AC-004: buildSessionEstablishmentTbs — M7 extended TBS", ()
       addrsA,
       "12D3KooWCounterparty",
       ["/ip4/127.0.0.1/tcp/9001"],
-      "direct",
+      "direct", false, "", "",
     );
     const tbs2 = buildSessionEstablishmentTbs(
       makeSessionId(),
@@ -114,7 +114,7 @@ describe("WIRE-001 AC-004: buildSessionEstablishmentTbs — M7 extended TBS", ()
       addrsB, // reversed order
       "12D3KooWCounterparty",
       ["/ip4/127.0.0.1/tcp/9001"],
-      "direct",
+      "direct", false, "", "",
     );
 
     expect(Buffer.from(tbs1).toString("hex")).toBe(Buffer.from(tbs2).toString("hex"));
@@ -128,13 +128,13 @@ describe("WIRE-001 AC-004: buildSessionEstablishmentTbs — M7 extended TBS", ()
       makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
       "12D3KooWInit", ["/ip4/127.0.0.1/tcp/9000"],
       "12D3KooWCounterparty", counterpartyAddrsA,
-      "relay",
+      "relay", false, "", "",
     );
     const tbs2 = buildSessionEstablishmentTbs(
       makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
       "12D3KooWInit", ["/ip4/127.0.0.1/tcp/9000"],
       "12D3KooWCounterparty", counterpartyAddrsB,
-      "relay",
+      "relay", false, "", "",
     );
 
     expect(Buffer.from(tbs1).toString("hex")).toBe(Buffer.from(tbs2).toString("hex"));
@@ -145,33 +145,16 @@ describe("WIRE-001 AC-004: buildSessionEstablishmentTbs — M7 extended TBS", ()
       makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
       "12D3KooWInit", ["/ip4/127.0.0.1/tcp/9000"],
       "12D3KooWCounterparty", ["/ip4/127.0.0.1/tcp/9001"],
-      "direct",
+      "direct", false, "", "",
     );
     const tbs2 = buildSessionEstablishmentTbs(
       makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
       "12D3KooWInit", ["/ip4/127.0.0.1/tcp/9000"],
       "12D3KooWCounterparty", ["/ip4/127.0.0.1/tcp/9001"],
-      "relay",
+      "relay", false, "", "",
     );
 
     expect(Buffer.from(tbs1).toString("hex")).not.toBe(Buffer.from(tbs2).toString("hex"));
-  });
-
-  it("backward compat: omitting new params produces legacy 5-field TBS", () => {
-    const tbsLegacy = buildSessionEstablishmentTbs(
-      makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
-    );
-    const tbs10 = buildSessionEstablishmentTbs(
-      makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
-      "12D3KooWInit", ["/ip4/127.0.0.1/tcp/9000"],
-      "12D3KooWCounterparty", ["/ip4/127.0.0.1/tcp/9001"],
-      "relay",
-    );
-
-    // The 10-field TBS must differ from the 5-field TBS
-    expect(Buffer.from(tbsLegacy).toString("hex")).not.toBe(Buffer.from(tbs10).toString("hex"));
-    expect(tbsLegacy.length).toBeGreaterThan(0);
-    expect(tbs10.length).toBeGreaterThan(tbsLegacy.length);
   });
 
   it("empty addrs array is canonically sorted (no crash)", () => {
@@ -179,7 +162,7 @@ describe("WIRE-001 AC-004: buildSessionEstablishmentTbs — M7 extended TBS", ()
       makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
       "12D3KooWInit", [],
       "12D3KooWCounterparty", [],
-      "direct",
+      "direct", false, "", "",
     );
     expect(result).toBeInstanceOf(Uint8Array);
     expect(result.length).toBeGreaterThan(0);
@@ -241,7 +224,7 @@ describe("WIRE-001 AC-001: SessionAssignment type completeness", () => {
   });
 });
 
-// ─── 017-TBS: the 12-field layout ────────────────────────────────────────────
+// ─── 017-TBS ──────────────────────────────────────────────
 
 /**
  * Two fields join the signed bytes, batched because a TBS change is bilateral and the cost is
@@ -250,39 +233,23 @@ describe("WIRE-001 AC-001: SessionAssignment type completeness", () => {
  * relay verifies the old one's receipts, and the directory's signature is the only trustworthy
  * source for who the old one was — a relay knows no other relay's identity.
  */
-describe("017-TBS: 12-field layout", () => {
+describe("017-TBS: high_stakes and prior_relay_id are signed", () => {
   const M7: [string, string[], string, string[], "direct" | "relay"] = [
     "12D3KooWInit", ["/ip4/127.0.0.1/tcp/9000"],
     "12D3KooWCounterparty", ["/ip4/127.0.0.1/tcp/9001"],
     "relay",
   ];
 
-  it("emits 12 fields whenever the M7 fields are present, on a FRESH session", () => {
-    // high_stakes false and prior_relay_id "" are VALUES, not absences. A fresh session is the
-    // normal path and must still reach the long layout — anything else hands the next reader two
-    // possible layouts for one session shape.
-    const twelve = buildSessionEstablishmentTbs(
-      makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
-      ...M7, false, "",
-    );
-    const ten = buildSessionEstablishmentTbs(
-      makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
-      ...M7,
-    );
-    expect(twelve.length).toBeGreaterThan(ten.length);
-    expect(Buffer.from(twelve).equals(Buffer.from(ten))).toBe(false);
-  });
-
   it("high_stakes changes the signed bytes", () => {
     // The defect this closes: the flag rides the initiator's request and was never forwarded, so
     // the counterparty was held to a longer floor and a mandatory-evidence bar it never saw.
     const off = buildSessionEstablishmentTbs(
       makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
-      ...M7, false, "",
+      ...M7, false, "", "",
     );
     const on = buildSessionEstablishmentTbs(
       makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
-      ...M7, true, "",
+      ...M7, true, "", "",
     );
     expect(Buffer.from(off).equals(Buffer.from(on))).toBe(false);
   });
@@ -290,11 +257,11 @@ describe("017-TBS: 12-field layout", () => {
   it("prior_relay_id changes the signed bytes", () => {
     const fresh = buildSessionEstablishmentTbs(
       makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
-      ...M7, false, "",
+      ...M7, false, "", "",
     );
     const resume = buildSessionEstablishmentTbs(
       makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
-      ...M7, false, "a".repeat(64),
+      ...M7, false, "a".repeat(64), "",
     );
     expect(Buffer.from(fresh).equals(Buffer.from(resume))).toBe(false);
   });
@@ -304,11 +271,11 @@ describe("017-TBS: 12-field layout", () => {
     // would accept receipts from a relay the directory never named.
     const one = buildSessionEstablishmentTbs(
       makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
-      ...M7, false, "a".repeat(64),
+      ...M7, false, "a".repeat(64), "",
     );
     const two = buildSessionEstablishmentTbs(
       makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
-      ...M7, false, "b".repeat(64),
+      ...M7, false, "b".repeat(64), "",
     );
     expect(Buffer.from(one).equals(Buffer.from(two))).toBe(false);
   });
@@ -316,40 +283,15 @@ describe("017-TBS: 12-field layout", () => {
   it("is deterministic — same inputs, same bytes", () => {
     const a = buildSessionEstablishmentTbs(
       makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
-      ...M7, true, "a".repeat(64),
+      ...M7, true, "a".repeat(64), "",
     );
     const b = buildSessionEstablishmentTbs(
       makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
-      ...M7, true, "a".repeat(64),
+      ...M7, true, "a".repeat(64), "",
     );
     expect(Buffer.from(a).equals(Buffer.from(b))).toBe(true);
   });
 
-  it("the two legacy layouts are untouched", () => {
-    // Byte-pinned, not merely "still shorter": a change to either legacy path breaks every
-    // assignment already signed under it, and length alone would not notice a reordering.
-    const five = buildSessionEstablishmentTbs(
-      makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
-    );
-    expect(Buffer.from(five).toString("hex")).toBe(
-      "8550111111111111111111111111111111115820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-      + "5820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-      + "5820cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc1b0000018bcfe56800",
-    );
-
-    const ten = buildSessionEstablishmentTbs(
-      makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
-      ...M7,
-    );
-    expect(Buffer.from(ten).toString("hex")).toBe(
-      "8a50111111111111111111111111111111115820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-      + "5820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-      + "5820cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc1b0000018bcfe56800"
-      + "6c313244334b6f6f57496e6974781b5b222f6970342f3132372e302e302e312f7463702f39303030225d"
-      + "74313244334b6f6f57436f756e7465727061727479781b5b222f6970342f3132372e302e302e312f7463702f39303031225d"
-      + "6572656c6179",
-    );
-  });
 });
 
 // ─── 069-ORDERPROOF: the 13-field layout — the relay joins the signed bytes ───
@@ -364,25 +306,12 @@ describe("017-TBS: 12-field layout", () => {
  * direct session and 64 hex on a relayed one, so the arity turns on whether the caller supplies
  * it and never on what it contains.
  */
-describe("069-ORDERPROOF: 13-field layout", () => {
+describe("069-ORDERPROOF: relay_id is signed", () => {
   const M7: [string, string[], string, string[], "direct" | "relay"] = [
     "12D3KooWInit", ["/ip4/127.0.0.1/tcp/9000"],
     "12D3KooWCounterparty", ["/ip4/127.0.0.1/tcp/9001"],
     "relay",
   ];
-
-  it("emits 13 fields whenever relay_id is supplied, including the DIRECT session's empty value", () => {
-    const thirteen = buildSessionEstablishmentTbs(
-      makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
-      ...M7, false, "", "",
-    );
-    const twelve = buildSessionEstablishmentTbs(
-      makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
-      ...M7, false, "",
-    );
-    expect(thirteen.length).toBeGreaterThan(twelve.length);
-    expect(Buffer.from(thirteen).equals(Buffer.from(twelve))).toBe(false);
-  });
 
   it("a DIFFERENT relay produces different bytes — this is the whole point of the field", () => {
     // Without it, a directory's signature naming relay A would carry over to relay B, and a

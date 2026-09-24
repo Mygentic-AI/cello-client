@@ -258,8 +258,6 @@ export function sessionRequestErrorReason(frame: Record<string, unknown>): strin
     "ceremony_conflict",
     "not_registered",
     "peer_not_registered",
-    "no_connection",
-    "connection_id_required",
     "session_request_missing_peer_id",
     "agent_revoked", // the target (or initiator) agent is revoked
     "agent_suspended", // the target/initiator is PAUSED (reversible suspend)

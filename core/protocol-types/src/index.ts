@@ -181,8 +181,6 @@ export type {
   ConnectionRecord,
   PendingConnectionRequest,
   ClientConnectionRecord,
-  SessionRequestM3,
-  SessionRequestM3ErrorReason,
 } from "./connection-request.js";
 
 export type {

@@ -211,7 +211,7 @@ describe("Seam 4: full daemon-IPC two-daemon local orchestration", () => {
       await clientA.send("ipc.connect", { clientType: "test" });
       expect(((await clientA.send("cello_start_agent", { name: "alice" })) as Record<string, unknown>).ok).toBe(true);
       expect(((await clientA.send("cello_use_agent", { name: "alice" })) as Record<string, unknown>).ok).toBe(true);
-      const initRes = await clientA.send("cello_initiate_session", { counterparty_pubkey: bobPubkey }) as Record<string, unknown>;
+      const initRes = await clientA.send("cello_initiate_session", { target_pubkey: bobPubkey }) as Record<string, unknown>;
       expect(initRes.ok).toBe(true);
       expect(initRes.sessionId).toBe(SID_HEX);
 

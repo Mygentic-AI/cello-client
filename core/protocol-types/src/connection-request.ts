@@ -74,13 +74,6 @@
  *   If no final response arrives within connectionTimeoutMs (default 300_000ms),
  *   cello_request_connection returns { result: 'timeout' }.
  *
- * SESSION-006 — session_request connection gate:
- *   client.initiateSession() checks local #connections map first.
- *   If no connection → return { error: { reason: 'no_connection', target_pubkey } }.
- *   session_request frame gains required connection_id field.
- *   Directory verifies connection_id matches active connection between initiator + target.
- *   Reject with no_connection or connection_id_required before any FROST ceremony.
- *
  * Crypto refs:
  *   ML-DSA-44 package signatures: NIST FIPS 204
  *   SHA-256 for connection_id entropy mix (if needed): FIPS 180-4
@@ -289,22 +282,3 @@ export interface ClientConnectionRecord {
   profile_unchecked?: boolean;
 }
 
-// ─── SESSION-006: updated session_request ────────────────────────────────────
-
-/**
- * M3 session_request wire type — gains required connection_id field.
- * Defined here so protocol-types owns the canonical wire schema.
- */
-export interface SessionRequestM3 {
-  type: "session_request";
-  /** Hex-encoded 32-byte K_local pubkey of the desired counterparty */
-  target_pubkey: Uint8Array;
-  /** Hex-encoded 16-byte connection ID — REQUIRED in M3 */
-  connection_id: string;
-}
-
-// ─── SESSION-006 error reasons ────────────────────────────────────────────────
-
-export type SessionRequestM3ErrorReason =
-  | "no_connection"           // no active connection between initiator and target
-  | "connection_id_required"; // session_request missing connection_id field (M2 legacy frame)

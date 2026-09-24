@@ -242,16 +242,9 @@ export function registerInitiateSessionHandler(deps: InitiateSessionDeps): {
     // THROUGH N_A. Tracked as the dialer/session-node reconciliation; this seam only
     // establishes that initiate creates the session-core session.
     // The initiator's session row must record WHO this session is with, so an interrupted
-    // initiator session surfaces its counterparty at next login (DOD-INT-1). The public
-    // tool param is `target_pubkey` (the counterparty's K_local) — the same field the
-    // negotiator reads above; `counterparty_pubkey` is the legacy fallback. Reading only
-    // the legacy field stored an EMPTY counterparty on every initiator session.
-    const counterpartyPubkey =
-      typeof params?.target_pubkey === "string"
-        ? params.target_pubkey
-        : typeof params?.counterparty_pubkey === "string"
-          ? params.counterparty_pubkey
-          : "";
+    // initiator session surfaces its counterparty at next login (DOD-INT-1). The tool param is
+    // `target_pubkey` (the counterparty's K_local) — the same field the negotiator reads above.
+    const counterpartyPubkey = typeof params?.target_pubkey === "string" ? params.target_pubkey : "";
     const counterpartyPeerId = assignment.counterparty_session_peer_id ?? "";
     // M7 DOD-SPINE-6 / MSG-001-3b: relay witness params from the FROST-signed assignment
     // + this agent's K_local. N_A connects to the relay and submits message-leaf hashes.
