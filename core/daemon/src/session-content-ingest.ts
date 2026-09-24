@@ -1666,6 +1666,557 @@ export class SessionContentIngest {
     this.#ctx.refusals.noteRefusedOnDirectPath(agentName, sessionId, contentHash);
   }
 
+  /**
+   * One decoded frame from a content stream. Split out of `#handleContentStream` (M9D 003-PQSESSION) so
+   * a content frame that arrives before the post-quantum ciphertext can be HELD and handled again, in
+   * arrival order, once the key is agreed — without a stream to read from.
+   */
+  async #handleFrame(agentName: string, sessionId: string, frame: Record<string, unknown>, remotePeerId?: string): Promise<void> {
+    const correlationId = typeof frame["correlation_id"] === "string" ? frame["correlation_id"] : undefined;
+    const frameType = typeof frame["type"] === "string" ? frame["type"] : "(absent)";
+
+    /**
+     * DOD-M15-FRAME-1 — ONE GATE, BEFORE THE DISPATCH, FOR EVERY FRAME ON THIS PROTOCOL.
+     *
+     * A stranger could dial an agent's standing receiver (it admitted everyone until DOD-M15-ASSIGN-1), hold
+     * the connection open through promotion — libp2p's gater runs only at connection
+     * establishment, so narrowing it does not evict anyone already attached — and then speak the
+     * content protocol the moment it activated. The frame was ingested, leafed, transcribed, and
+     * attributed to the legitimate counterparty, because attribution is read from local session
+     * state rather than from anything the frame proved.
+     *
+     * DELIBERATELY SHARED RATHER THAN COPIED INTO EACH BRANCH. `session_abandoned_notice` already
+     * had both checks, correct and complete, twenty lines below — and the other two frame types
+     * did not. Copying the pattern a third and fourth time would fix today's three and leave the
+     * fifth frame type, added later by someone who did not read this comment, unguarded again.
+     * Placing it above the dispatch makes the guard the DEFAULT: a new frame type is protected by
+     * construction and has to opt OUT visibly rather than opt in silently.
+     *
+     * Verified safe for all three current types by enumeration, not assumption — `content_frame`
+     * (:5169), `session_abandoned_notice` (:6663) and `content_delivery_ack` (:7439) are the only
+     * senders on `CELLO_CONTENT_PROTOCOL_ID`, and all three put `session_id` in the frame.
+     *
+     * MISSING, MALFORMED AND MISMATCHED TAKE ONE PATH. An attacker evading a mismatch check does
+     * not send a wrong value — it sends no value, and a guard that only fires on a present-and-
+     * wrong field is a guard that is trivially skipped. That is exactly what the old
+     * `content_frame` check did: `typeof x === "string" && x !== sessionId`.
+     */
+    const expectedPeer = this.#ctx.activeNodes.get(this.#ctx.sessionKey(agentName, sessionId))?.counterpartySessionPeerId;
+    if (!remotePeerId || !expectedPeer || remotePeerId !== expectedPeer) {
+      // Loud in the LOG — there is no caller to answer on an inbound stream, so this is the whole
+      // surface. Neutral wording: this is an observation, not a verdict about intent. The same
+      // signal comes from a real impersonation attempt and from our own fallback paths
+      // mishandling a reconnect, and nothing here can tell them apart.
+      this.#ctx.logger.warn("session.content.peer_mismatch", {
+        agentName, sessionId, frameType,
+        remotePeerId: remotePeerId ?? "(absent)", expected: expectedPeer ?? "(unknown)",
+        impact: "a frame arrived on this session's content protocol from a peer that is not its counterparty; it was refused — not ingested, not attributed, not recorded — and the peer was disconnected",
+      });
+      /**
+       * PEER-ENDING, NOT SESSION-ENDING — and the difference is a deliberate deviation from the
+       * DoD clause (review F2).
+       *
+       * The clause says the refusal is session-ending. Applied HERE that would be a worse hole
+       * than the one it closes: a pre-positioned stranger could kill any session on the machine
+       * with a single frame, trading an injection hole for a denial-of-service hole. The
+       * session-ending response belongs where the evidence is about the SESSION's counterparty —
+       * `#freezeOnIdentityFailure`, reached when a party that IS the peer we dialled signs with a
+       * key that is not theirs.
+       *
+       * Here the evidence is about the PEER: they are not party to this session at all. So the
+       * connection goes and the session is untouched. Without this the stranger stayed attached
+       * for the life of the session and the gate re-refused each frame forever — and the eviction
+       * sweep's own fallback ("the frame gate still refuses anything this peer sends") only closes
+       * the loop if the frame gate does something about the connection.
+       *
+       * Fire-and-forget: a hang-up that fails must not turn a successful refusal into a thrown
+       * handler, and the refusal above has already done the load-bearing work.
+       */
+      if (remotePeerId) {
+        const entry = this.#ctx.activeNodes.get(this.#ctx.sessionKey(agentName, sessionId));
+        void entry?.node.hangUp(remotePeerId).catch((err: unknown) => {
+          this.#ctx.logger.debug("session.content.peer_mismatch.hangup_failed", {
+            sessionId, peerId: remotePeerId, error: extractErrorMessage(err),
+          });
+        });
+      }
+      return;
+    }
+    const claimedSessionId = frame["session_id"];
+    if (typeof claimedSessionId !== "string" || claimedSessionId !== sessionId) {
+      this.#ctx.logger.warn("session.content.session_mismatch", {
+        agentName, sessionId, frameType,
+        claimedSessionId: typeof claimedSessionId === "string" ? claimedSessionId : "(absent)",
+        impact: "the frame does not name the session whose stream it arrived on; it was refused rather than routed, because the authenticated stream is the better authority for where content belongs",
+      });
+      return;
+    }
+
+    // CELLO-M7-MSG-001 (AC-001/AC-002): a `persisted` delivery ACK arriving on the
+    // same /cello/content/1.0.0 protocol resolves the sender's awaiting-ACK timer.
+    // The protocol acts on `persisted` ONLY — any other level leaves the timer armed.
+    if (frame["type"] === "content_delivery_ack") {
+      const ackHash = frame["content_hash"];
+      const level = frame["level"];
+      if (ackHash instanceof Uint8Array && level === "persisted") {
+        onDeliveryAck(this.#ctx, (a, sid, h) => this.#send.resolveAwaitingAck(a, sid, h), agentName, sessionId, ackHash, frame["ack_sig"], correlationId);
+      }
+      return;
+    }
+
+    // DOD-M12B-ABANDON-NOTIFY-1: the counterparty force-abandoned. Handled here, on the same
+    // authenticated stream the delivery acknowledgement rides, and AFTER the session-id check
+    // below cannot be skipped — the frame names its session and the handler is bound to one.
+    if (frame["type"] === "session_abandoned_notice") {
+      // DOD-M15-FRAME-1: the peer and session checks that used to live here now run above, for
+      // EVERY frame type, unchanged in substance — this branch was where they were written first
+      // and correctly, and it is the reference the shared gate was lifted from. Its comment is
+      // preserved there, including the reason the transport being authenticated is not enough.
+      // Left as a bare dispatch on purpose: a second copy of a guard is a second thing to keep in
+      // step, and the one that drifts is the one nobody is reading.
+      void this.#ctx.retireOnCounterpartyAbandon(agentName, sessionId, correlationId);
+      return;
+    }
+
+    /**
+     * DOD-M15-SEALWIRE-1 bullet 6 (part A) — the salt agreement.
+     *
+     * Placed BELOW the shared peer/session gate deliberately, which is the whole reason that gate
+     * was lifted above the dispatch: a new frame type is protected by construction rather than
+     * having to remember to opt in. A stranger's salt frame is refused before it reaches here, so
+     * nothing about this session's salt can be steered by a peer that is not its counterparty.
+     *
+     * The fields are read defensively into the frame shape rather than cast: an inbound value is
+     * whatever a peer chose to encode, and `onPeerSaltFrame` refuses both-fields and neither-field
+     * by name — so a non-Uint8Array in either slot must arrive at that function as ABSENT, not as
+     * a present-but-wrong value it would then try to use.
+     */
+    /**
+     * 007-CRYPTO — the peer's SIGNED ephemeral.
+     *
+     * Fields are read defensively rather than cast, exactly like the salt frame below: an inbound
+     * value is whatever a peer chose to encode, and `verifySessionEphemeral` refuses a missing or
+     * wrong-width one BY NAME — so a non-`Uint8Array` must arrive there as ABSENT rather than as a
+     * present-but-wrong value it would try to use.
+     */
+    if (frame["type"] === "session_key_agreement") {
+      const ephemeralPublic = frame["ephemeral_public"];
+      const signature = frame["ephemeral_sig"];
+      await this.#ctx.ephemerals.handleEphemeralFrame(agentName, sessionId, {
+        ...(ephemeralPublic instanceof Uint8Array ? { ephemeralPublic } : {}),
+        ...(signature instanceof Uint8Array ? { signature } : {}),
+      }, correlationId);
+      return;
+    }
+    if (frame["type"] === "session_salt_agreement") {
+      const contribution = frame["contribution"];
+      const fingerprint = frame["fingerprint"];
+      const adoptionClosed = frame["adoption_closed"];
+      await this.#ctx.salts.handleSaltFrame(agentName, sessionId, {
+        ...(contribution instanceof Uint8Array ? { contribution } : {}),
+        ...(fingerprint instanceof Uint8Array ? { fingerprint } : {}),
+        // A non-string stays ABSENT rather than being coerced, exactly like the other two: the
+        // decision function refuses a shape it cannot read, and must never be handed a `"42"`.
+        //
+        // TRUNCATED AT THE BOUNDARY — 006-CRYPTO finding 6. Every label CELLO sends is under
+        // twenty characters, and this one is chosen entirely by the peer. Cutting it here means
+        // no unbounded peer string is stored, logged or rendered anywhere downstream; the
+        // rendering that keeps it out of our own sentences is `renderPeerAdoptionLabel`.
+        ...(typeof adoptionClosed === "string" && adoptionClosed.length > 0
+          ? { adoptionClosed: adoptionClosed.slice(0, SALT_ADOPTION_LABEL_MAX) }
+          : {}),
+      }, correlationId);
+      return;
+    }
+
+    if (frame["type"] !== "content_frame") {
+      // LOGGED, not silently dropped. This handler is bound to one session, and a frame it does
+      // not understand arriving on that stream is either a peer speaking a newer protocol or a
+      // bug on our side — both worth a line, and neither distinguishable from "nothing arrived"
+      // when the return is silent.
+      this.#ctx.logger.warn("session.content.frame_unknown_type", {
+        sessionId,
+        type: typeof frame["type"] === "string" ? String(frame["type"]) : "(absent)",
+      });
+      return;
+    }
+    // DOD-M15-FRAME-1: the session-id check moved to the shared gate above, and its `&&` became
+    // `||` on the way. It read `typeof x === "string" && x !== sessionId` — firing only when the
+    // field was PRESENT and wrong, so omitting it passed. Its own sibling twenty lines up already
+    // refused absence, with a comment saying treating a missing field as agreement is how a guard
+    // stops guarding. Same file, same switch, opposite conclusion.
+    // Review F4: hand the DECODED frame to a test observer before anything consumes it. Absent in
+    // production — the field is null unless a test installs one.
+    this.#ctx.inboundFrameObserver?.(frame as Record<string, unknown>);
+    const contentBytes = frame["content_bytes"];
+    const contentHash = frame["content_hash"];
+    if (!(contentBytes instanceof Uint8Array) || !(contentHash instanceof Uint8Array)) {
+      // Same reasoning as the unknown type above: a malformed frame that vanishes without a trace
+      // is indistinguishable, from the operator's side, from a counterparty who never sent
+      // anything.
+      this.#ctx.logger.warn("session.content.frame_malformed", {
+        sessionId,
+        hasContent: contentBytes instanceof Uint8Array,
+        hasHash: contentHash instanceof Uint8Array,
+      });
+      return;
+    }
+    /**
+     * 🚨 DECRYPT BEFORE ANYTHING ELSE READS THE BODY — `DOD-M15-EPHEMERAL-AUTH-1`.
+     *
+     * `content_hash` is over the PLAINTEXT, so the hash check, the transcript, the seal and the
+     * salted hash all keep meaning exactly what they mean today — but only if the body is put back
+     * before any of them run.
+     *
+     * ⚠️ ABSENT IS NOT A PASS. A frame with no `content_encryption` is refused rather than read as
+     * plaintext. There is no unencrypted sender to be compatible with, and treating a missing
+     * marker as "this one is in the clear" is precisely the downgrade an attacker asks for: strip
+     * one field and the receiver reads the body raw. Missing and unknown take the same path as a
+     * failed decrypt, for the reason that runs through this whole unit — a check lenient about an
+     * absent proof is a check that gets skipped.
+     */
+    const declaredEncryption = frame["content_encryption"];
+    const encState = this.#ctx.ephemerals.contentEncryptionState(agentName, sessionId);
+    let plaintextBody: Uint8Array;
+    if (declaredEncryption !== SESSION_CONTENT_ENCRYPTION_V1) {
+      this.#refuseInboundContent(agentName, sessionId, "content_encryption_absent_or_unknown", contentHash, {
+        declared: typeof declaredEncryption === "string" ? declaredEncryption : "(absent)",
+        impact: "the frame did not say it was encrypted under this session's key, so it was refused unread — nothing was shown and this copy was not kept.",
+        guidance:
+          "STOPPED ON PURPOSE. A message arrived that was not encrypted under this session's key. " +
+          "This build never sends one, so either something between you rewrote the frame, or your " +
+          "counterparty is running something that is not CELLO. Confirm with them OUT OF BAND " +
+          "before opening another session.",
+      }, correlationId);
+      return;
+    }
+    if (encState.key === null) {
+      this.#refuseInboundContent(agentName, sessionId, "no_session_key", contentHash, {
+        detail: encState.reason,
+        impact: "an encrypted message arrived and this side has no agreed key to open it, so it was refused unread rather than shown as garbage.",
+        // Review F6: the RECEIVE-side wording. The send-side table explains what became of a
+        // message this operator sent, which is the wrong direction entirely for a message they
+        // cannot open.
+        guidance: CONTENT_ENCRYPTION_INBOUND_GUIDANCE[encState.reason],
+      }, correlationId);
+      return;
+    }
+    const opened = openSessionContent(encState.key, contentBytes);
+    if (opened === null) {
+      // GCM's tag is the only thing separating "not for us" from "modified in flight", and this
+      // side must not branch on which — that would be branching on attacker-controlled input.
+      this.#refuseInboundContent(agentName, sessionId, "decrypt_failed", contentHash, {
+        impact: "the message did not decrypt under this session's agreed key — it was modified in flight, or it was encrypted under a different key. Refused unread.",
+        guidance:
+          "STOPPED ON PURPOSE. Nothing was shown and this copy was not kept. A message that fails " +
+          "this check has either been altered on its way to you or was not encrypted for this " +
+          "session. Confirm with your counterparty OUT OF BAND, then start a new session.",
+      }, correlationId);
+      return;
+    }
+    plaintextBody = opened;
+    /**
+     * ─── THE CONVERSATION IS OVER, AND THAT OUTRANKS EVERY QUESTION BELOW IT ──────────────────
+     * `DOD-M15-CLOSEDSESSION-1`.
+     *
+     * Placed HERE — after the decrypt, before the authorship claim — for two reasons, and both
+     * are load-bearing:
+     *
+     *  - AFTER the decrypt, because refusing retains the bytes, and the bytes worth retaining are
+     *    the message. Refusing a line earlier would quarantine ciphertext nobody can read.
+     *  - BEFORE the authorship claim, because that is what was answering. A message composed
+     *    after the seal acknowledges content our frozen record does not hold, so
+     *    `verifyAuthorshipClaim` returned `ack_hash_unknown_content` and the status was never
+     *    consulted at all. Measured live on session `9d253bce…`.
+     *
+     * ⚠️ THIS IS A REORDER, NOT A REMOVAL. The acknowledgement check still runs, and still
+     * refuses, for every session that is not closed — which is the state it exists for. What it
+     * no longer does is describe a hash where the situation is that there is nothing left to
+     * acknowledge.
+     *
+     * The peer gate above has already established this frame came from THIS session's
+     * counterparty peer, and the session key opened it. So nothing is attributed on the strength
+     * of an unverified signature: the quarantine row records the counterparty from local session
+     * state, exactly as the park route's refusal does.
+     */
+    if (refuseIfSessionClosed(this.#ctx, agentName, sessionId, plaintextBody, Buffer.from(contentHash).toString("hex"), correlationId).refused) {
+      /**
+       * ⚠️ ONE SIGNAL IS DELIBERATELY GIVEN UP, AND IT IS NAMED RATHER THAN LOST — review F4. A
+       * frame signed by a key that is NOT the counterparty's used to reach
+       * `session.content.authorship.refuted` here. The FREEZE it triggers is moot on a session
+       * that is already terminal, and verifying a signature purely to log it is work an attacker
+       * can ask for by volume — so what survives is whether a proof was carried at all. The bytes
+       * are retained either way, so the signature is still there to be examined.
+       */
+      this.#ctx.logger.info("session.content.closed.frame_proof", {
+        agentName, sessionId, correlationId,
+        hasStructure1: frame["structure1_cbor"] instanceof Uint8Array,
+        hasSenderSignature: frame["sender_signature"] instanceof Uint8Array,
+        impact: "the message was refused because this conversation is closed, so its authorship proof was NOT verified and no identity verdict was reached about it. The bytes are retained and readable.",
+      });
+      return;
+    }
+    // DOD-MSG-4 (self-ordering content frame): if the frame carries the relay's signed ordering
+    // record, verify the sender signature and record the canonical sequence FROM THE FRAME, BEFORE
+    // ingest — so the strict-in-order gate has the position without waiting on the separate
+    // leaf_deliver witness (removes the content-before-witness race).
+    //
+    // DOD-M15-FRAME-1 — POSITION MAY BE SOFT; IDENTITY MAY NOT. The old comment here read "A
+    // bad/absent record is non-fatal: the content still ingests", and it was accurate: a
+    // signature that failed to verify, and a signature by a key that is NOT this session's
+    // counterparty, both returned null and the content was ingested and attributed anyway. An
+    // ABSENT record stays soft — that is the documented relay-degraded path and refusing it would
+    // make the relay a precondition for reading mail. A record that is PRESENT and REFUTED is a
+    // different fact, and it is now refused.
+    const s1Cbor = frame["structure1_cbor"];
+    const s2Cbor = frame["structure2_cbor"];
+    /**
+     * `DOD-M15-AUTHORSHIP-ABSENT-1` — the sender's own signature, carried BESIDE the bytes it
+     * signs, exactly as `hash_submit` has always carried it. This field is why identity no longer
+     * depends on the relay: it arrives whether or not a relay witnessed the message.
+     */
+    const senderSig = frame["sender_signature"];
+    let framedSeq: number | null = null;
+    /**
+     * DOD-M15-SEALWIRE-1 bullet 5. Set ONLY when the ordering record verified — the signature
+     * checked against the pubkey inside the sender's own signed bytes AND the signer matched this
+     * session's counterparty. It is deliberately NOT set on the two soft paths below (no record
+     * supplied; decode failed), because on those the author is attested by local session state
+     * and the transcript row must say so rather than imply a proof it does not have.
+     */
+    let verifiedAuthorship: { senderPubkey: Uint8Array; senderSig: Uint8Array } | undefined;
+    /**
+     * 024-ORPHANTRIAGE: the signer when the signature verified but there was no counterparty to
+     * match it against. Its ONLY consumer is the orphan branch inside ingest — everywhere else a
+     * session record exists, so this stays `undefined` and nothing reads it.
+     */
+    let verifiedSignerUnmatched: Uint8Array | undefined;
+    /**
+     * ─── NO PASSPORT, NO ENTRY — `DOD-M15-AUTHORSHIP-ABSENT-1` ───────────────────────────────
+     *
+     * ⚠️ **THIS COMMENT USED TO SAY THE OPPOSITE, AND THE SENTENCE IT REPLACES IS THE DEFECT.**
+     * It read: *"it means the per-message signer check is **opt-in for the sender** — a party that
+     * passed the peer gate and wants to avoid the comparison simply omits the proof."* That was an
+     * accurate description of the code, which is why it is rewritten here rather than deleted: it
+     * is the sentence a reader with a coding agent finds, and it must now describe what the code
+     * does. A frame that supplies nothing checkable is REFUSED. Omitting the proof buys the sender
+     * nothing except a message that does not arrive.
+     *
+     * The old reasoning was sound as far as it went — the signature was only ever DELIVERED inside
+     * the relay's Structure 2, so refusing on its absence would have made the relay a precondition
+     * for reading mail. It stopped one field short: the signature travels beside the bytes it
+     * signs now, on every content frame, so identity no longer needs the relay and position still
+     * does not require identity.
+     *
+     * ⚠️ REFUSED, NOT FROZEN. A frozen session is only cleared by opening a new one, and an
+     * absent proof is a stripped or malformed frame, not evidence about their key. The freeze is
+     * for a proof that FAILED (below, and in `#recordFrameOrdering`) — a positive fact
+     * about their key.
+     */
+    if (!(s1Cbor instanceof Uint8Array) || !(senderSig instanceof Uint8Array)) {
+      this.#ctx.refusals.refuseUnprovenAuthorship(agentName, sessionId, "authorship_proof_absent", contentHash, {
+        // WHICH half is missing, so an investigator does not have to guess.
+        hasStructure1: s1Cbor instanceof Uint8Array,
+        hasSenderSignature: senderSig instanceof Uint8Array,
+      }, correlationId);
+      return;
+    }
+    const authorship = this.#ctx.authorship.verifyAuthorshipClaim(agentName, sessionId, s1Cbor, senderSig, contentHash);
+    if (authorship.verdict === "refuted") {
+      /**
+       * THE FORENSIC LINE, BEFORE THE FREEZE. `session.content.identity.frozen` records that a
+       * session was stopped; this records WHICH check stopped it and on WHICH proof — the frame's
+       * own signature, not the relay's copy of it. The two used to be the same event because there
+       * was only one place a signer was checked; there are two now, and an investigation that
+       * cannot tell them apart is looking at the wrong half of the wire.
+       */
+      this.#ctx.logger.warn("session.content.authorship.refuted", {
+        agentName, sessionId, correlationId, reason: authorship.reason,
+        impact: "a message arrived with a proof of authorship that FAILED — it does not verify, or it is signed by a key that is not this session's counterparty. Nothing was ingested and the session is being frozen.",
+      });
+      await this.#ctx.freezeOnIdentityFailure(agentName, sessionId, authorship.reason, correlationId);
+      return;
+    }
+    if (authorship.verdict === "unusable") {
+      // A replayed claim gets its own name on BOTH surfaces, not just in the log context: it is
+      // the one `unusable` cause that may be adversarial, and it is the one the operator can act
+      // on. The others are a peer whose build or bytes we could not read.
+      /**
+       * 033-ACKEMIT — AND THE THREE ACKNOWLEDGEMENT CAUSES GET THEIR OWN SURFACE REASON, for the
+       * same argument that gave the replay one: `authorship_proof_unusable` tells the operator the
+       * proof was "unreadable, or signed over different content", and for these it is neither.
+       * The proof is perfect; what it CLAIMS TO HAVE SEEN is wrong. Filing them under the generic
+       * name would send someone to audit a decoder, and would spend the operator's attention
+       * asking their counterparty about a version number that is not the question.
+       */
+      this.#ctx.refusals.refuseUnprovenAuthorship(
+        agentName, sessionId,
+        authorship.reason === AUTHORSHIP_SESSION_MISMATCH
+          ? "authorship_wrong_conversation"
+          /**
+           * `DOD-M15-SELFCHAIN-1` — its own name on the surface the operator reads, not only in a
+           * log field. See the sentences in `#refuseUnprovenAuthorship`.
+           */
+          : authorship.reason === AUTHORSHIP_SELF_CHAIN_MISMATCH
+            ? AUTHORSHIP_SELF_CHAIN_MISMATCH
+          : ACK_HASH_REASONS.has(authorship.reason)
+            /**
+             * ⚠️ THE SPECIFIC CAUSE, NOT THE CLASS — review F5, and the diff's own comment on
+             * `ACK_HASH_REASONS` had already said why: "the operator's next move differs for
+             * each." It then collapsed all three into ONE surface reason carrying ONE sentence,
+             * so the three names survived only in a log field nobody reads. For an absent
+             * acknowledgement the shared impact was flatly false — there is no part that "does
+             * not match", because there is no part — and for the other two the shared guidance
+             * sent the reader to ask about a build version that cannot be the cause.
+             */
+            ? (authorship.reason as AckHashReason)
+            : "authorship_proof_unusable",
+        contentHash, { detail: authorship.reason }, correlationId,
+      );
+      /**
+       * ─── AND THE SESSION FREEZES, EVENTUALLY — `DOD-M15-SELFCHAIN-1` + `-GAP-1` ──────────────
+       *
+       * ⚠️ ONLY THIS ONE OF THE `unusable` CAUSES FREEZES. The acknowledgement causes say the
+       * sender is wrong about what WE said, which a drifted record produces honestly. This one
+       * says they are wrong about what THEY said, so continuing writes a disputed order into the
+       * receipt. The freeze is what makes the refusal an ESCALATION rather than a dropped frame.
+       *
+       * ⚠️ **BUT IT IS NO LONGER IMMEDIATE.** "A party cannot be honestly mistaken about what
+       * they said" is false on the relay path — a message routinely arrives before its own
+       * predecessor, which is still in the mailbox. The decision, the grace and its log line live
+       * with the gap state, in `AuthorshipVerifier.noteSelfChainGapAndShouldFreeze`.
+       */
+      if (authorship.reason === AUTHORSHIP_SELF_CHAIN_MISMATCH
+        && this.#ctx.authorship.noteSelfChainGapAndShouldFreeze(agentName, sessionId, correlationId)) {
+        await this.#ctx.freezeOnIdentityFailure(agentName, sessionId, authorship.reason, correlationId);
+      }
+      return;
+    }
+    if (authorship.verdict === "verified") {
+      verifiedAuthorship = { senderPubkey: authorship.senderPubkey, senderSig: authorship.senderSig };
+    } else {
+      verifiedSignerUnmatched = authorship.senderPubkey;
+    }
+    if (s2Cbor instanceof Uint8Array) {
+      const ordering = this.#ctx.refusals.recordFrameOrdering(agentName, sessionId, s1Cbor, s2Cbor, contentHash, correlationId);
+      if (ordering.fatal) {
+        await this.#ctx.freezeOnIdentityFailure(agentName, sessionId, ordering.fatal.reason, correlationId);
+        return;
+      }
+      framedSeq = ordering.seq;
+    } else {
+      /**
+       * POSITION IS THE ONLY THING THAT CAN BE ABSENT NOW, and this event is about position.
+       *
+       * It fires on the relay-degraded path, where the sender had no witnessed record to stamp
+       * on. The message is ingested — its author is proven, above, by the frame's own signature —
+       * and only its place in the canonical sequence falls back to the witness stream. Refusing
+       * here would make the relay a precondition for reading mail, which is the thing this unit
+       * was careful NOT to do.
+       */
+      this.#ctx.logger.info("session.content.ordering.absent", {
+        agentName, sessionId, correlationId,
+        impact: "this frame carried no relay ordering record, so its POSITION in the canonical sequence is not known from the frame and falls back to the witness stream. Its AUTHOR was verified from the frame's own signature.",
+      });
+    }
+    // AC-001: carry the sender's correlationId from the frame into the receive
+    // path so both sides log the same flow id (never re-minted on receipt).
+    /**
+     * DOD-M15-SEALWIRE-1 part B1 — the algorithm the sender named, taken from the FRAME.
+     *
+     * Read as `unknown` and passed through verbatim, deliberately: `resolveContentHashAlg` is the
+     * one place that decides what a value means, and it refuses an absent, non-string or
+     * unreadable name by name. Coercing here would turn a malformed frame into a tamper report.
+     */
+    const declaredAlg = frame["content_hash_alg"];
+    const ingest = await this.ingestReceivedContent(
+      // THE DECRYPTED body — everything downstream (the hash cross-check, the leaf, the transcript,
+      // the delivery buffer) works on plaintext, exactly as it did before this layer existed.
+      agentName, sessionId, plaintextBody, contentHash, correlationId, framedSeq ?? undefined,
+      declaredAlg === undefined ? undefined : (declaredAlg as string | null),
+      verifiedAuthorship,
+      verifiedSignerUnmatched,
+    );
+    // AC-001: after the content is durably ingested AND its hash cross-check
+    // succeeds, emit an unsigned `persisted` delivery ACK back to the sender. A
+    // rejected ingest (tamper / not-active) produces NO ACK, so the sender's TTF
+    // path can park / recover.
+    // DOD-MSG-4: a HELD (out-of-order) frame is NOT yet a durable leaf, so it is NOT
+    // acknowledged `persisted` — the sender's TTF→park backstop then guarantees the
+    // missing-earlier message is fetchable, and dedup absorbs the redundant copy.
+    if (ingest.ok && !ingest.held) {
+      /**
+       * ─── THE SELF CHAIN ADVANCES INSIDE `ingestReceivedContent`, NOT HERE — `DOD-M15-SELFCHAIN-1`
+       *
+       * It was called here, and this is the live content-frame path only: a message recovered from
+       * the relay mailbox never reached it. It moved down into the ingest's durable-append point,
+       * which every route ends at — see the comment there for what that cost live.
+       *
+       * The reason it is not inside `#noteAcknowledgeable` still stands and is why it did not move
+       * there: the acknowledgement is a (POSITION, content) pair needing the relay's number, so on
+       * a session the relay never witnessed it is never written, while the self link needs no
+       * position at all — it is one party's hash chain over their own messages.
+       */
+      /**
+       * 033-ACKEMIT review F1 — ACKNOWLEDGE WHAT ARRIVED, HERE, not when the relay gets round to
+       * delivering its copy back to us.
+       *
+       * Placed after a successful, non-held ingest deliberately: a HELD frame is not yet a durable
+       * leaf and is not acknowledged `persisted` either, so claiming to have seen it would put a
+       * position in our signed claim that our own record does not yet hold.
+       *
+       * `framedSeq` is the relay's canonical position taken from the sender's own signed ordering
+       * record and verified before it got here. When it is absent the message arrived with no
+       * ordering record — the withheld-submit case — and there is no position to acknowledge,
+       * whatever we hold of the content. That limit is structural to a (position, content) pair
+       * and it is what the carried-leaf follow-on closes.
+       */
+      if (framedSeq !== null) {
+        this.noteAcknowledgeable(agentName, sessionId, framedSeq, contentHash);
+      } else {
+        /**
+         * ─── WITNESS WHAT THEY DID NOT — 034-CARRYLEAF, and this is the line that closes
+         * `DOD-M15-WITHHOLD-SEAL-1` ────────────────────────────────────────────────────────────
+         *
+         * No ordering record means the sender never asked the relay to witness this message. Two
+         * things look identical from here: their relay was briefly unreachable, or they are
+         * withholding it on purpose so it cannot appear in the receipt. **We do not need to tell
+         * those apart, and that is the point** — the same action repairs both, and it costs the
+         * honest case nothing.
+         *
+         * We hold their signature over their own bytes. So we hand it to the relay ourselves.
+         */
+        /**
+         * ─── THE KIND COMES OFF THE FRAME, AND A FRAME WITHOUT ONE IS REFUSED ─────────────────
+         *
+         * A leaf kind selects a HASH DOMAIN — documents and rejection envelopes ride this same
+         * frame — so witnessing under a guessed domain would put a wrong statement in the
+         * canonical record.
+         *
+         * ⚠️ **THIS USED TO DECLINE TO WITNESS AND DELIVER THE MESSAGE ANYWAY, "because a peer
+         * too old to send the field should be left alone". THAT SENTENCE WAS INHERITED, NOT
+         * DERIVED, AND IT LEFT THE WHOLE ATTACK OPEN.** CELLO is alpha with no users; there is no
+         * older peer to protect. What the leniency actually bought was an opt-out: emit the shape
+         * a 2026-09-04 build emitted, and your message is delivered AND cannot be witnessed —
+         * which is precisely the withholding this line exists to stop, reachable by anyone
+         * willing to modify their client.
+         *
+         * So it is refused. Missing, malformed and mismatched take one path (§5), and a peer that
+         * cannot say which domain its own leaf belongs to has supplied an unusable proof.
+         */
+        const framedKind = frame["leaf_kind"];
+        if (typeof framedKind !== "number") {
+          this.#ctx.refusals.refuseUnprovenAuthorship(agentName, sessionId, "authorship_proof_unusable", contentHash, {
+            detail: "leaf_kind_absent",
+          }, correlationId);
+          return;
+        }
+        void this.witnessReceivedLeaf(agentName, sessionId, contentHash, s1Cbor, senderSig, framedKind, correlationId);
+      }
+      void sendDeliveryAck(this.#ctx, agentName, sessionId, contentHash, correlationId);
+    }
+  }
+
   async #handleContentStream(agentName: string, sessionId: string, stream: Stream, remotePeerId?: string): Promise<void> {
     // CLOSING THIS STREAM IS WHAT KEEPS THE SESSION ALIVE PAST ITS 33RD MESSAGE.
     //
@@ -1692,549 +2243,7 @@ export class SessionContentIngest {
         : Buffer.isBuffer(result.value) ? new Uint8Array(result.value as Buffer)
         : (result.value as { slice(): Uint8Array }).slice();
       const frame = decode(bytes) as Record<string, unknown>;
-      const correlationId = typeof frame["correlation_id"] === "string" ? frame["correlation_id"] : undefined;
-      const frameType = typeof frame["type"] === "string" ? frame["type"] : "(absent)";
-
-      /**
-       * DOD-M15-FRAME-1 — ONE GATE, BEFORE THE DISPATCH, FOR EVERY FRAME ON THIS PROTOCOL.
-       *
-       * A stranger could dial an agent's standing receiver (it admitted everyone until DOD-M15-ASSIGN-1), hold
-       * the connection open through promotion — libp2p's gater runs only at connection
-       * establishment, so narrowing it does not evict anyone already attached — and then speak the
-       * content protocol the moment it activated. The frame was ingested, leafed, transcribed, and
-       * attributed to the legitimate counterparty, because attribution is read from local session
-       * state rather than from anything the frame proved.
-       *
-       * DELIBERATELY SHARED RATHER THAN COPIED INTO EACH BRANCH. `session_abandoned_notice` already
-       * had both checks, correct and complete, twenty lines below — and the other two frame types
-       * did not. Copying the pattern a third and fourth time would fix today's three and leave the
-       * fifth frame type, added later by someone who did not read this comment, unguarded again.
-       * Placing it above the dispatch makes the guard the DEFAULT: a new frame type is protected by
-       * construction and has to opt OUT visibly rather than opt in silently.
-       *
-       * Verified safe for all three current types by enumeration, not assumption — `content_frame`
-       * (:5169), `session_abandoned_notice` (:6663) and `content_delivery_ack` (:7439) are the only
-       * senders on `CELLO_CONTENT_PROTOCOL_ID`, and all three put `session_id` in the frame.
-       *
-       * MISSING, MALFORMED AND MISMATCHED TAKE ONE PATH. An attacker evading a mismatch check does
-       * not send a wrong value — it sends no value, and a guard that only fires on a present-and-
-       * wrong field is a guard that is trivially skipped. That is exactly what the old
-       * `content_frame` check did: `typeof x === "string" && x !== sessionId`.
-       */
-      const expectedPeer = this.#ctx.activeNodes.get(this.#ctx.sessionKey(agentName, sessionId))?.counterpartySessionPeerId;
-      if (!remotePeerId || !expectedPeer || remotePeerId !== expectedPeer) {
-        // Loud in the LOG — there is no caller to answer on an inbound stream, so this is the whole
-        // surface. Neutral wording: this is an observation, not a verdict about intent. The same
-        // signal comes from a real impersonation attempt and from our own fallback paths
-        // mishandling a reconnect, and nothing here can tell them apart.
-        this.#ctx.logger.warn("session.content.peer_mismatch", {
-          agentName, sessionId, frameType,
-          remotePeerId: remotePeerId ?? "(absent)", expected: expectedPeer ?? "(unknown)",
-          impact: "a frame arrived on this session's content protocol from a peer that is not its counterparty; it was refused — not ingested, not attributed, not recorded — and the peer was disconnected",
-        });
-        /**
-         * PEER-ENDING, NOT SESSION-ENDING — and the difference is a deliberate deviation from the
-         * DoD clause (review F2).
-         *
-         * The clause says the refusal is session-ending. Applied HERE that would be a worse hole
-         * than the one it closes: a pre-positioned stranger could kill any session on the machine
-         * with a single frame, trading an injection hole for a denial-of-service hole. The
-         * session-ending response belongs where the evidence is about the SESSION's counterparty —
-         * `#freezeOnIdentityFailure`, reached when a party that IS the peer we dialled signs with a
-         * key that is not theirs.
-         *
-         * Here the evidence is about the PEER: they are not party to this session at all. So the
-         * connection goes and the session is untouched. Without this the stranger stayed attached
-         * for the life of the session and the gate re-refused each frame forever — and the eviction
-         * sweep's own fallback ("the frame gate still refuses anything this peer sends") only closes
-         * the loop if the frame gate does something about the connection.
-         *
-         * Fire-and-forget: a hang-up that fails must not turn a successful refusal into a thrown
-         * handler, and the refusal above has already done the load-bearing work.
-         */
-        if (remotePeerId) {
-          const entry = this.#ctx.activeNodes.get(this.#ctx.sessionKey(agentName, sessionId));
-          void entry?.node.hangUp(remotePeerId).catch((err: unknown) => {
-            this.#ctx.logger.debug("session.content.peer_mismatch.hangup_failed", {
-              sessionId, peerId: remotePeerId, error: extractErrorMessage(err),
-            });
-          });
-        }
-        return;
-      }
-      const claimedSessionId = frame["session_id"];
-      if (typeof claimedSessionId !== "string" || claimedSessionId !== sessionId) {
-        this.#ctx.logger.warn("session.content.session_mismatch", {
-          agentName, sessionId, frameType,
-          claimedSessionId: typeof claimedSessionId === "string" ? claimedSessionId : "(absent)",
-          impact: "the frame does not name the session whose stream it arrived on; it was refused rather than routed, because the authenticated stream is the better authority for where content belongs",
-        });
-        return;
-      }
-
-      // CELLO-M7-MSG-001 (AC-001/AC-002): a `persisted` delivery ACK arriving on the
-      // same /cello/content/1.0.0 protocol resolves the sender's awaiting-ACK timer.
-      // The protocol acts on `persisted` ONLY — any other level leaves the timer armed.
-      if (frame["type"] === "content_delivery_ack") {
-        const ackHash = frame["content_hash"];
-        const level = frame["level"];
-        if (ackHash instanceof Uint8Array && level === "persisted") {
-          onDeliveryAck(this.#ctx, (a, sid, h) => this.#send.resolveAwaitingAck(a, sid, h), agentName, sessionId, ackHash, frame["ack_sig"], correlationId);
-        }
-        return;
-      }
-
-      // DOD-M12B-ABANDON-NOTIFY-1: the counterparty force-abandoned. Handled here, on the same
-      // authenticated stream the delivery acknowledgement rides, and AFTER the session-id check
-      // below cannot be skipped — the frame names its session and the handler is bound to one.
-      if (frame["type"] === "session_abandoned_notice") {
-        // DOD-M15-FRAME-1: the peer and session checks that used to live here now run above, for
-        // EVERY frame type, unchanged in substance — this branch was where they were written first
-        // and correctly, and it is the reference the shared gate was lifted from. Its comment is
-        // preserved there, including the reason the transport being authenticated is not enough.
-        // Left as a bare dispatch on purpose: a second copy of a guard is a second thing to keep in
-        // step, and the one that drifts is the one nobody is reading.
-        void this.#ctx.retireOnCounterpartyAbandon(agentName, sessionId, correlationId);
-        return;
-      }
-
-      /**
-       * DOD-M15-SEALWIRE-1 bullet 6 (part A) — the salt agreement.
-       *
-       * Placed BELOW the shared peer/session gate deliberately, which is the whole reason that gate
-       * was lifted above the dispatch: a new frame type is protected by construction rather than
-       * having to remember to opt in. A stranger's salt frame is refused before it reaches here, so
-       * nothing about this session's salt can be steered by a peer that is not its counterparty.
-       *
-       * The fields are read defensively into the frame shape rather than cast: an inbound value is
-       * whatever a peer chose to encode, and `onPeerSaltFrame` refuses both-fields and neither-field
-       * by name — so a non-Uint8Array in either slot must arrive at that function as ABSENT, not as
-       * a present-but-wrong value it would then try to use.
-       */
-      /**
-       * 007-CRYPTO — the peer's SIGNED ephemeral.
-       *
-       * Fields are read defensively rather than cast, exactly like the salt frame below: an inbound
-       * value is whatever a peer chose to encode, and `verifySessionEphemeral` refuses a missing or
-       * wrong-width one BY NAME — so a non-`Uint8Array` must arrive there as ABSENT rather than as a
-       * present-but-wrong value it would try to use.
-       */
-      if (frame["type"] === "session_key_agreement") {
-        const ephemeralPublic = frame["ephemeral_public"];
-        const signature = frame["ephemeral_sig"];
-        await this.#ctx.ephemerals.handleEphemeralFrame(agentName, sessionId, {
-          ...(ephemeralPublic instanceof Uint8Array ? { ephemeralPublic } : {}),
-          ...(signature instanceof Uint8Array ? { signature } : {}),
-        }, correlationId);
-        return;
-      }
-      if (frame["type"] === "session_salt_agreement") {
-        const contribution = frame["contribution"];
-        const fingerprint = frame["fingerprint"];
-        const adoptionClosed = frame["adoption_closed"];
-        await this.#ctx.salts.handleSaltFrame(agentName, sessionId, {
-          ...(contribution instanceof Uint8Array ? { contribution } : {}),
-          ...(fingerprint instanceof Uint8Array ? { fingerprint } : {}),
-          // A non-string stays ABSENT rather than being coerced, exactly like the other two: the
-          // decision function refuses a shape it cannot read, and must never be handed a `"42"`.
-          //
-          // TRUNCATED AT THE BOUNDARY — 006-CRYPTO finding 6. Every label CELLO sends is under
-          // twenty characters, and this one is chosen entirely by the peer. Cutting it here means
-          // no unbounded peer string is stored, logged or rendered anywhere downstream; the
-          // rendering that keeps it out of our own sentences is `renderPeerAdoptionLabel`.
-          ...(typeof adoptionClosed === "string" && adoptionClosed.length > 0
-            ? { adoptionClosed: adoptionClosed.slice(0, SALT_ADOPTION_LABEL_MAX) }
-            : {}),
-        }, correlationId);
-        return;
-      }
-
-      if (frame["type"] !== "content_frame") {
-        // LOGGED, not silently dropped. This handler is bound to one session, and a frame it does
-        // not understand arriving on that stream is either a peer speaking a newer protocol or a
-        // bug on our side — both worth a line, and neither distinguishable from "nothing arrived"
-        // when the return is silent.
-        this.#ctx.logger.warn("session.content.frame_unknown_type", {
-          sessionId,
-          type: typeof frame["type"] === "string" ? String(frame["type"]) : "(absent)",
-        });
-        return;
-      }
-      // DOD-M15-FRAME-1: the session-id check moved to the shared gate above, and its `&&` became
-      // `||` on the way. It read `typeof x === "string" && x !== sessionId` — firing only when the
-      // field was PRESENT and wrong, so omitting it passed. Its own sibling twenty lines up already
-      // refused absence, with a comment saying treating a missing field as agreement is how a guard
-      // stops guarding. Same file, same switch, opposite conclusion.
-      // Review F4: hand the DECODED frame to a test observer before anything consumes it. Absent in
-      // production — the field is null unless a test installs one.
-      this.#ctx.inboundFrameObserver?.(frame as Record<string, unknown>);
-      const contentBytes = frame["content_bytes"];
-      const contentHash = frame["content_hash"];
-      if (!(contentBytes instanceof Uint8Array) || !(contentHash instanceof Uint8Array)) {
-        // Same reasoning as the unknown type above: a malformed frame that vanishes without a trace
-        // is indistinguishable, from the operator's side, from a counterparty who never sent
-        // anything.
-        this.#ctx.logger.warn("session.content.frame_malformed", {
-          sessionId,
-          hasContent: contentBytes instanceof Uint8Array,
-          hasHash: contentHash instanceof Uint8Array,
-        });
-        return;
-      }
-      /**
-       * 🚨 DECRYPT BEFORE ANYTHING ELSE READS THE BODY — `DOD-M15-EPHEMERAL-AUTH-1`.
-       *
-       * `content_hash` is over the PLAINTEXT, so the hash check, the transcript, the seal and the
-       * salted hash all keep meaning exactly what they mean today — but only if the body is put back
-       * before any of them run.
-       *
-       * ⚠️ ABSENT IS NOT A PASS. A frame with no `content_encryption` is refused rather than read as
-       * plaintext. There is no unencrypted sender to be compatible with, and treating a missing
-       * marker as "this one is in the clear" is precisely the downgrade an attacker asks for: strip
-       * one field and the receiver reads the body raw. Missing and unknown take the same path as a
-       * failed decrypt, for the reason that runs through this whole unit — a check lenient about an
-       * absent proof is a check that gets skipped.
-       */
-      const declaredEncryption = frame["content_encryption"];
-      const encState = this.#ctx.ephemerals.contentEncryptionState(agentName, sessionId);
-      let plaintextBody: Uint8Array;
-      if (declaredEncryption !== SESSION_CONTENT_ENCRYPTION_V1) {
-        this.#refuseInboundContent(agentName, sessionId, "content_encryption_absent_or_unknown", contentHash, {
-          declared: typeof declaredEncryption === "string" ? declaredEncryption : "(absent)",
-          impact: "the frame did not say it was encrypted under this session's key, so it was refused unread — nothing was shown and this copy was not kept.",
-          guidance:
-            "STOPPED ON PURPOSE. A message arrived that was not encrypted under this session's key. " +
-            "This build never sends one, so either something between you rewrote the frame, or your " +
-            "counterparty is running something that is not CELLO. Confirm with them OUT OF BAND " +
-            "before opening another session.",
-        }, correlationId);
-        return;
-      }
-      if (encState.key === null) {
-        this.#refuseInboundContent(agentName, sessionId, "no_session_key", contentHash, {
-          detail: encState.reason,
-          impact: "an encrypted message arrived and this side has no agreed key to open it, so it was refused unread rather than shown as garbage.",
-          // Review F6: the RECEIVE-side wording. The send-side table explains what became of a
-          // message this operator sent, which is the wrong direction entirely for a message they
-          // cannot open.
-          guidance: CONTENT_ENCRYPTION_INBOUND_GUIDANCE[encState.reason],
-        }, correlationId);
-        return;
-      }
-      const opened = openSessionContent(encState.key, contentBytes);
-      if (opened === null) {
-        // GCM's tag is the only thing separating "not for us" from "modified in flight", and this
-        // side must not branch on which — that would be branching on attacker-controlled input.
-        this.#refuseInboundContent(agentName, sessionId, "decrypt_failed", contentHash, {
-          impact: "the message did not decrypt under this session's agreed key — it was modified in flight, or it was encrypted under a different key. Refused unread.",
-          guidance:
-            "STOPPED ON PURPOSE. Nothing was shown and this copy was not kept. A message that fails " +
-            "this check has either been altered on its way to you or was not encrypted for this " +
-            "session. Confirm with your counterparty OUT OF BAND, then start a new session.",
-        }, correlationId);
-        return;
-      }
-      plaintextBody = opened;
-      /**
-       * ─── THE CONVERSATION IS OVER, AND THAT OUTRANKS EVERY QUESTION BELOW IT ──────────────────
-       * `DOD-M15-CLOSEDSESSION-1`.
-       *
-       * Placed HERE — after the decrypt, before the authorship claim — for two reasons, and both
-       * are load-bearing:
-       *
-       *  - AFTER the decrypt, because refusing retains the bytes, and the bytes worth retaining are
-       *    the message. Refusing a line earlier would quarantine ciphertext nobody can read.
-       *  - BEFORE the authorship claim, because that is what was answering. A message composed
-       *    after the seal acknowledges content our frozen record does not hold, so
-       *    `verifyAuthorshipClaim` returned `ack_hash_unknown_content` and the status was never
-       *    consulted at all. Measured live on session `9d253bce…`.
-       *
-       * ⚠️ THIS IS A REORDER, NOT A REMOVAL. The acknowledgement check still runs, and still
-       * refuses, for every session that is not closed — which is the state it exists for. What it
-       * no longer does is describe a hash where the situation is that there is nothing left to
-       * acknowledge.
-       *
-       * The peer gate above has already established this frame came from THIS session's
-       * counterparty peer, and the session key opened it. So nothing is attributed on the strength
-       * of an unverified signature: the quarantine row records the counterparty from local session
-       * state, exactly as the park route's refusal does.
-       */
-      if (refuseIfSessionClosed(this.#ctx, agentName, sessionId, plaintextBody, Buffer.from(contentHash).toString("hex"), correlationId).refused) {
-        /**
-         * ⚠️ ONE SIGNAL IS DELIBERATELY GIVEN UP, AND IT IS NAMED RATHER THAN LOST — review F4. A
-         * frame signed by a key that is NOT the counterparty's used to reach
-         * `session.content.authorship.refuted` here. The FREEZE it triggers is moot on a session
-         * that is already terminal, and verifying a signature purely to log it is work an attacker
-         * can ask for by volume — so what survives is whether a proof was carried at all. The bytes
-         * are retained either way, so the signature is still there to be examined.
-         */
-        this.#ctx.logger.info("session.content.closed.frame_proof", {
-          agentName, sessionId, correlationId,
-          hasStructure1: frame["structure1_cbor"] instanceof Uint8Array,
-          hasSenderSignature: frame["sender_signature"] instanceof Uint8Array,
-          impact: "the message was refused because this conversation is closed, so its authorship proof was NOT verified and no identity verdict was reached about it. The bytes are retained and readable.",
-        });
-        return;
-      }
-      // DOD-MSG-4 (self-ordering content frame): if the frame carries the relay's signed ordering
-      // record, verify the sender signature and record the canonical sequence FROM THE FRAME, BEFORE
-      // ingest — so the strict-in-order gate has the position without waiting on the separate
-      // leaf_deliver witness (removes the content-before-witness race).
-      //
-      // DOD-M15-FRAME-1 — POSITION MAY BE SOFT; IDENTITY MAY NOT. The old comment here read "A
-      // bad/absent record is non-fatal: the content still ingests", and it was accurate: a
-      // signature that failed to verify, and a signature by a key that is NOT this session's
-      // counterparty, both returned null and the content was ingested and attributed anyway. An
-      // ABSENT record stays soft — that is the documented relay-degraded path and refusing it would
-      // make the relay a precondition for reading mail. A record that is PRESENT and REFUTED is a
-      // different fact, and it is now refused.
-      const s1Cbor = frame["structure1_cbor"];
-      const s2Cbor = frame["structure2_cbor"];
-      /**
-       * `DOD-M15-AUTHORSHIP-ABSENT-1` — the sender's own signature, carried BESIDE the bytes it
-       * signs, exactly as `hash_submit` has always carried it. This field is why identity no longer
-       * depends on the relay: it arrives whether or not a relay witnessed the message.
-       */
-      const senderSig = frame["sender_signature"];
-      let framedSeq: number | null = null;
-      /**
-       * DOD-M15-SEALWIRE-1 bullet 5. Set ONLY when the ordering record verified — the signature
-       * checked against the pubkey inside the sender's own signed bytes AND the signer matched this
-       * session's counterparty. It is deliberately NOT set on the two soft paths below (no record
-       * supplied; decode failed), because on those the author is attested by local session state
-       * and the transcript row must say so rather than imply a proof it does not have.
-       */
-      let verifiedAuthorship: { senderPubkey: Uint8Array; senderSig: Uint8Array } | undefined;
-      /**
-       * 024-ORPHANTRIAGE: the signer when the signature verified but there was no counterparty to
-       * match it against. Its ONLY consumer is the orphan branch inside ingest — everywhere else a
-       * session record exists, so this stays `undefined` and nothing reads it.
-       */
-      let verifiedSignerUnmatched: Uint8Array | undefined;
-      /**
-       * ─── NO PASSPORT, NO ENTRY — `DOD-M15-AUTHORSHIP-ABSENT-1` ───────────────────────────────
-       *
-       * ⚠️ **THIS COMMENT USED TO SAY THE OPPOSITE, AND THE SENTENCE IT REPLACES IS THE DEFECT.**
-       * It read: *"it means the per-message signer check is **opt-in for the sender** — a party that
-       * passed the peer gate and wants to avoid the comparison simply omits the proof."* That was an
-       * accurate description of the code, which is why it is rewritten here rather than deleted: it
-       * is the sentence a reader with a coding agent finds, and it must now describe what the code
-       * does. A frame that supplies nothing checkable is REFUSED. Omitting the proof buys the sender
-       * nothing except a message that does not arrive.
-       *
-       * The old reasoning was sound as far as it went — the signature was only ever DELIVERED inside
-       * the relay's Structure 2, so refusing on its absence would have made the relay a precondition
-       * for reading mail. It stopped one field short: the signature travels beside the bytes it
-       * signs now, on every content frame, so identity no longer needs the relay and position still
-       * does not require identity.
-       *
-       * ⚠️ REFUSED, NOT FROZEN. A frozen session is only cleared by opening a new one, and an
-       * absent proof is a stripped or malformed frame, not evidence about their key. The freeze is
-       * for a proof that FAILED (below, and in `#recordFrameOrdering`) — a positive fact
-       * about their key.
-       */
-      if (!(s1Cbor instanceof Uint8Array) || !(senderSig instanceof Uint8Array)) {
-        this.#ctx.refusals.refuseUnprovenAuthorship(agentName, sessionId, "authorship_proof_absent", contentHash, {
-          // WHICH half is missing, so an investigator does not have to guess.
-          hasStructure1: s1Cbor instanceof Uint8Array,
-          hasSenderSignature: senderSig instanceof Uint8Array,
-        }, correlationId);
-        return;
-      }
-      const authorship = this.#ctx.authorship.verifyAuthorshipClaim(agentName, sessionId, s1Cbor, senderSig, contentHash);
-      if (authorship.verdict === "refuted") {
-        /**
-         * THE FORENSIC LINE, BEFORE THE FREEZE. `session.content.identity.frozen` records that a
-         * session was stopped; this records WHICH check stopped it and on WHICH proof — the frame's
-         * own signature, not the relay's copy of it. The two used to be the same event because there
-         * was only one place a signer was checked; there are two now, and an investigation that
-         * cannot tell them apart is looking at the wrong half of the wire.
-         */
-        this.#ctx.logger.warn("session.content.authorship.refuted", {
-          agentName, sessionId, correlationId, reason: authorship.reason,
-          impact: "a message arrived with a proof of authorship that FAILED — it does not verify, or it is signed by a key that is not this session's counterparty. Nothing was ingested and the session is being frozen.",
-        });
-        await this.#ctx.freezeOnIdentityFailure(agentName, sessionId, authorship.reason, correlationId);
-        return;
-      }
-      if (authorship.verdict === "unusable") {
-        // A replayed claim gets its own name on BOTH surfaces, not just in the log context: it is
-        // the one `unusable` cause that may be adversarial, and it is the one the operator can act
-        // on. The others are a peer whose build or bytes we could not read.
-        /**
-         * 033-ACKEMIT — AND THE THREE ACKNOWLEDGEMENT CAUSES GET THEIR OWN SURFACE REASON, for the
-         * same argument that gave the replay one: `authorship_proof_unusable` tells the operator the
-         * proof was "unreadable, or signed over different content", and for these it is neither.
-         * The proof is perfect; what it CLAIMS TO HAVE SEEN is wrong. Filing them under the generic
-         * name would send someone to audit a decoder, and would spend the operator's attention
-         * asking their counterparty about a version number that is not the question.
-         */
-        this.#ctx.refusals.refuseUnprovenAuthorship(
-          agentName, sessionId,
-          authorship.reason === AUTHORSHIP_SESSION_MISMATCH
-            ? "authorship_wrong_conversation"
-            /**
-             * `DOD-M15-SELFCHAIN-1` — its own name on the surface the operator reads, not only in a
-             * log field. See the sentences in `#refuseUnprovenAuthorship`.
-             */
-            : authorship.reason === AUTHORSHIP_SELF_CHAIN_MISMATCH
-              ? AUTHORSHIP_SELF_CHAIN_MISMATCH
-            : ACK_HASH_REASONS.has(authorship.reason)
-              /**
-               * ⚠️ THE SPECIFIC CAUSE, NOT THE CLASS — review F5, and the diff's own comment on
-               * `ACK_HASH_REASONS` had already said why: "the operator's next move differs for
-               * each." It then collapsed all three into ONE surface reason carrying ONE sentence,
-               * so the three names survived only in a log field nobody reads. For an absent
-               * acknowledgement the shared impact was flatly false — there is no part that "does
-               * not match", because there is no part — and for the other two the shared guidance
-               * sent the reader to ask about a build version that cannot be the cause.
-               */
-              ? (authorship.reason as AckHashReason)
-              : "authorship_proof_unusable",
-          contentHash, { detail: authorship.reason }, correlationId,
-        );
-        /**
-         * ─── AND THE SESSION FREEZES, EVENTUALLY — `DOD-M15-SELFCHAIN-1` + `-GAP-1` ──────────────
-         *
-         * ⚠️ ONLY THIS ONE OF THE `unusable` CAUSES FREEZES. The acknowledgement causes say the
-         * sender is wrong about what WE said, which a drifted record produces honestly. This one
-         * says they are wrong about what THEY said, so continuing writes a disputed order into the
-         * receipt. The freeze is what makes the refusal an ESCALATION rather than a dropped frame.
-         *
-         * ⚠️ **BUT IT IS NO LONGER IMMEDIATE.** "A party cannot be honestly mistaken about what
-         * they said" is false on the relay path — a message routinely arrives before its own
-         * predecessor, which is still in the mailbox. The decision, the grace and its log line live
-         * with the gap state, in `AuthorshipVerifier.noteSelfChainGapAndShouldFreeze`.
-         */
-        if (authorship.reason === AUTHORSHIP_SELF_CHAIN_MISMATCH
-          && this.#ctx.authorship.noteSelfChainGapAndShouldFreeze(agentName, sessionId, correlationId)) {
-          await this.#ctx.freezeOnIdentityFailure(agentName, sessionId, authorship.reason, correlationId);
-        }
-        return;
-      }
-      if (authorship.verdict === "verified") {
-        verifiedAuthorship = { senderPubkey: authorship.senderPubkey, senderSig: authorship.senderSig };
-      } else {
-        verifiedSignerUnmatched = authorship.senderPubkey;
-      }
-      if (s2Cbor instanceof Uint8Array) {
-        const ordering = this.#ctx.refusals.recordFrameOrdering(agentName, sessionId, s1Cbor, s2Cbor, contentHash, correlationId);
-        if (ordering.fatal) {
-          await this.#ctx.freezeOnIdentityFailure(agentName, sessionId, ordering.fatal.reason, correlationId);
-          return;
-        }
-        framedSeq = ordering.seq;
-      } else {
-        /**
-         * POSITION IS THE ONLY THING THAT CAN BE ABSENT NOW, and this event is about position.
-         *
-         * It fires on the relay-degraded path, where the sender had no witnessed record to stamp
-         * on. The message is ingested — its author is proven, above, by the frame's own signature —
-         * and only its place in the canonical sequence falls back to the witness stream. Refusing
-         * here would make the relay a precondition for reading mail, which is the thing this unit
-         * was careful NOT to do.
-         */
-        this.#ctx.logger.info("session.content.ordering.absent", {
-          agentName, sessionId, correlationId,
-          impact: "this frame carried no relay ordering record, so its POSITION in the canonical sequence is not known from the frame and falls back to the witness stream. Its AUTHOR was verified from the frame's own signature.",
-        });
-      }
-      // AC-001: carry the sender's correlationId from the frame into the receive
-      // path so both sides log the same flow id (never re-minted on receipt).
-      /**
-       * DOD-M15-SEALWIRE-1 part B1 — the algorithm the sender named, taken from the FRAME.
-       *
-       * Read as `unknown` and passed through verbatim, deliberately: `resolveContentHashAlg` is the
-       * one place that decides what a value means, and it refuses an absent, non-string or
-       * unreadable name by name. Coercing here would turn a malformed frame into a tamper report.
-       */
-      const declaredAlg = frame["content_hash_alg"];
-      const ingest = await this.ingestReceivedContent(
-        // THE DECRYPTED body — everything downstream (the hash cross-check, the leaf, the transcript,
-        // the delivery buffer) works on plaintext, exactly as it did before this layer existed.
-        agentName, sessionId, plaintextBody, contentHash, correlationId, framedSeq ?? undefined,
-        declaredAlg === undefined ? undefined : (declaredAlg as string | null),
-        verifiedAuthorship,
-        verifiedSignerUnmatched,
-      );
-      // AC-001: after the content is durably ingested AND its hash cross-check
-      // succeeds, emit an unsigned `persisted` delivery ACK back to the sender. A
-      // rejected ingest (tamper / not-active) produces NO ACK, so the sender's TTF
-      // path can park / recover.
-      // DOD-MSG-4: a HELD (out-of-order) frame is NOT yet a durable leaf, so it is NOT
-      // acknowledged `persisted` — the sender's TTF→park backstop then guarantees the
-      // missing-earlier message is fetchable, and dedup absorbs the redundant copy.
-      if (ingest.ok && !ingest.held) {
-        /**
-         * ─── THE SELF CHAIN ADVANCES INSIDE `ingestReceivedContent`, NOT HERE — `DOD-M15-SELFCHAIN-1`
-         *
-         * It was called here, and this is the live content-frame path only: a message recovered from
-         * the relay mailbox never reached it. It moved down into the ingest's durable-append point,
-         * which every route ends at — see the comment there for what that cost live.
-         *
-         * The reason it is not inside `#noteAcknowledgeable` still stands and is why it did not move
-         * there: the acknowledgement is a (POSITION, content) pair needing the relay's number, so on
-         * a session the relay never witnessed it is never written, while the self link needs no
-         * position at all — it is one party's hash chain over their own messages.
-         */
-        /**
-         * 033-ACKEMIT review F1 — ACKNOWLEDGE WHAT ARRIVED, HERE, not when the relay gets round to
-         * delivering its copy back to us.
-         *
-         * Placed after a successful, non-held ingest deliberately: a HELD frame is not yet a durable
-         * leaf and is not acknowledged `persisted` either, so claiming to have seen it would put a
-         * position in our signed claim that our own record does not yet hold.
-         *
-         * `framedSeq` is the relay's canonical position taken from the sender's own signed ordering
-         * record and verified before it got here. When it is absent the message arrived with no
-         * ordering record — the withheld-submit case — and there is no position to acknowledge,
-         * whatever we hold of the content. That limit is structural to a (position, content) pair
-         * and it is what the carried-leaf follow-on closes.
-         */
-        if (framedSeq !== null) {
-          this.noteAcknowledgeable(agentName, sessionId, framedSeq, contentHash);
-        } else {
-          /**
-           * ─── WITNESS WHAT THEY DID NOT — 034-CARRYLEAF, and this is the line that closes
-           * `DOD-M15-WITHHOLD-SEAL-1` ────────────────────────────────────────────────────────────
-           *
-           * No ordering record means the sender never asked the relay to witness this message. Two
-           * things look identical from here: their relay was briefly unreachable, or they are
-           * withholding it on purpose so it cannot appear in the receipt. **We do not need to tell
-           * those apart, and that is the point** — the same action repairs both, and it costs the
-           * honest case nothing.
-           *
-           * We hold their signature over their own bytes. So we hand it to the relay ourselves.
-           */
-          /**
-           * ─── THE KIND COMES OFF THE FRAME, AND A FRAME WITHOUT ONE IS REFUSED ─────────────────
-           *
-           * A leaf kind selects a HASH DOMAIN — documents and rejection envelopes ride this same
-           * frame — so witnessing under a guessed domain would put a wrong statement in the
-           * canonical record.
-           *
-           * ⚠️ **THIS USED TO DECLINE TO WITNESS AND DELIVER THE MESSAGE ANYWAY, "because a peer
-           * too old to send the field should be left alone". THAT SENTENCE WAS INHERITED, NOT
-           * DERIVED, AND IT LEFT THE WHOLE ATTACK OPEN.** CELLO is alpha with no users; there is no
-           * older peer to protect. What the leniency actually bought was an opt-out: emit the shape
-           * a 2026-09-04 build emitted, and your message is delivered AND cannot be witnessed —
-           * which is precisely the withholding this line exists to stop, reachable by anyone
-           * willing to modify their client.
-           *
-           * So it is refused. Missing, malformed and mismatched take one path (§5), and a peer that
-           * cannot say which domain its own leaf belongs to has supplied an unusable proof.
-           */
-          const framedKind = frame["leaf_kind"];
-          if (typeof framedKind !== "number") {
-            this.#ctx.refusals.refuseUnprovenAuthorship(agentName, sessionId, "authorship_proof_unusable", contentHash, {
-              detail: "leaf_kind_absent",
-            }, correlationId);
-            return;
-          }
-          void this.witnessReceivedLeaf(agentName, sessionId, contentHash, s1Cbor, senderSig, framedKind, correlationId);
-        }
-        void sendDeliveryAck(this.#ctx, agentName, sessionId, contentHash, correlationId);
-      }
+      await this.#handleFrame(agentName, sessionId, frame, remotePeerId);
     } catch (err: unknown) {
       this.#ctx.logger.warn("session.content.stream.read.failed", {
         sessionId,
