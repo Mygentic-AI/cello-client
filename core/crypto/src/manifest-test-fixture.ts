@@ -37,9 +37,9 @@ export type TestConsortiumNode = {
   region: string;
   provider: "aws" | "gcp" | "azure";
   endpoint: string;
-  /** M12 role split — optional; absent ⇒ validator (canonical body omits absent fields). */
+  /** M12 role split. Defaults to "validator" here — the verifier requires one. */
   role?: "validator" | "replica";
-  /** M12 anti-entropy dial identity — optional. */
+  /** libp2p PeerId. Defaults to a per-nodeId test value here — the verifier requires one. */
   peerId?: string;
 };
 
@@ -72,7 +72,11 @@ export function makeTestManifest(
      * anyway — which is the reason this default only ever needs to mean "in window".
      */
     expires: opts?.expires ?? "2099-01-01T00:00:00Z",
-    nodes: nodes as readonly Record<string, unknown>[],
+    nodes: nodes.map((n) => ({
+      ...n,
+      role: n.role ?? "validator",
+      peerId: n.peerId ?? `12D3KooWTest${n.nodeId}`,
+    })) as readonly Record<string, unknown>[],
     signatures: [],
   };
 

@@ -543,9 +543,9 @@ describe("mapEndpointToBootstrapBase", () => {
 
 describe("manifestNodesToEndpoints", () => {
   const NODES = [
-    { nodeId: "node-0", pubkey: "a".repeat(64), region: "us-east-1", provider: "aws", endpoint: "http://127.0.0.1:5001" },
-    { nodeId: "node-1", pubkey: "b".repeat(64), region: "eu-central-1", provider: "gcp", endpoint: "http://127.0.0.1:5002" },
-    { nodeId: "node-2", pubkey: "c".repeat(64), region: "ap-northeast-1", provider: "azure", endpoint: "http://127.0.0.1:5003" },
+    { nodeId: "node-0", pubkey: "a".repeat(64), region: "us-east-1", provider: "aws", endpoint: "http://127.0.0.1:5001", role: "validator", peerId: "PEER5001" },
+    { nodeId: "node-1", pubkey: "b".repeat(64), region: "eu-central-1", provider: "gcp", endpoint: "http://127.0.0.1:5002", role: "validator", peerId: "PEER5002" },
+    { nodeId: "node-2", pubkey: "c".repeat(64), region: "ap-northeast-1", provider: "azure", endpoint: "http://127.0.0.1:5003", role: "validator", peerId: "PEER5003" },
   ];
 
   /** A fetch that returns a distinct, port-keyed multiaddr for each node's /bootstrap. */
@@ -572,7 +572,7 @@ describe("manifestNodesToEndpoints", () => {
     // with a different one, the signed roster and the live response disagree about who this node is —
     // which is what a redirected or substituted /bootstrap looks like. Before this the declared value
     // was decorative: the client dialled whatever the probe returned.
-    const declared = [{ ...NODES[0], peerId: "PEER5001" }, { ...NODES[1], peerId: "SOMEONE-ELSE" }];
+    const declared = [NODES[0], { ...NODES[1], peerId: "SOMEONE-ELSE" }];
     const errors: Array<{ event: string; detail: Record<string, unknown> }> = [];
     const logger = {
       ...silentLogger,
@@ -590,13 +590,6 @@ describe("manifestNodesToEndpoints", () => {
     expect(mismatch, "the refusal must name its cause, not be a silent skip").toBeDefined();
     expect(mismatch?.detail["declaredPeerId"]).toBe("SOMEONE-ELSE");
     expect(mismatch?.detail["probePeerId"]).toBe("PEER5002");
-  });
-
-  it("tolerates a node that declares NO peer id — pre-field manifests must still resolve", async () => {
-    // Treating "not declared" as "mismatch" would strand every node in a manifest written before the
-    // field existed, turning a hardening measure into an outage.
-    const eps = await manifestNodesToEndpoints(NODES, { fetchFn: portKeyedFetch(), logger: silentLogger });
-    expect(eps).toHaveLength(3);
   });
 
   it("is availability-aware: a node whose /bootstrap fails is SKIPPED, the rest still resolve", async () => {

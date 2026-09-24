@@ -462,11 +462,8 @@ export async function manifestNodesToEndpoints(
       // returned and the signature covered a field nobody read. Step-6 still authenticates the
       // directory by challenge, so this is defence in depth at the DIAL layer — it declines to open a
       // connection to the wrong peer at all, instead of opening one and rejecting it a round later.
-      //
-      // Absent `peerId` is tolerated: manifests written before the field existed carry none, and
-      // treating "not declared" as "mismatch" would strand every node in them.
       const declaredPeerId = node.peerId;
-      if (declaredPeerId && declaredPeerId !== peerId) {
+      if (declaredPeerId !== peerId) {
         opts.logger.error("directory.consortium.node.peer_id_mismatch", {
           nodeId: node.nodeId,
           declaredPeerId,

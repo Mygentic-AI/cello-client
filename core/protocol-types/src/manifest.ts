@@ -27,27 +27,18 @@ export interface ConsortiumNode {
   region: string;
   provider: "aws" | "gcp" | "azure";
   endpoint: string;
+  /** M12 role split. Required; `verifyManifest` rejects a node without one. */
+  role: NodeRole;
   /**
-   * M12 role split. Absent ⇒ `validator` — every manifest written before the split has no
-   * `role` field, and every node in one was a validator, so the default preserves those
-   * manifests byte-for-byte (canonical body omits absent fields) AND semantically.
+   * libp2p PeerId — needed by directory↔directory anti-entropy to dial a peer (M12), and checked
+   * by the client against the node's /bootstrap probe. Required, inside the signed body.
    */
-  role?: NodeRole;
-  /**
-   * libp2p PeerId, needed by directory↔directory anti-entropy to dial a peer (M12). Absent in
-   * pre-M12 manifests; PeerIds lived only in unsigned SSM before the split. Optional so those
-   * manifests still verify.
-   */
-  peerId?: string;
+  peerId: string;
 }
 
 /**
- * The effective role of a node — the single defaulting rule, used everywhere.
- * A node with no explicit `role` is a validator, and — since `role` is untrusted at runtime
- * despite the type — anything that is not exactly "replica" is a validator. This matches the
- * crypto verify-boundary count (`!== "replica"`) exactly; a manifest that reached a consumer
- * has already passed `verifyManifest`, which rejects any role outside {validator, replica}, so
- * the only values that survive here are the two valid ones.
+ * The role of a node. A manifest that reached a consumer has already passed `verifyManifest`,
+ * which rejects a node whose role is not exactly "validator" or "replica".
  */
 export function nodeRole(node: ConsortiumNode): NodeRole {
   return (node.role as unknown) === "replica" ? "replica" : "validator";

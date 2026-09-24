@@ -51,9 +51,9 @@ const TEST_OFFICER_PUBKEYS = TEST_OFFICER_SEEDS.map((seed) =>
 
 function makeNodes(): TestConsortiumNode[] {
   return [
-    { nodeId: "node-us-east-1", pubkey: "a".repeat(64), region: "us-east-1", provider: "aws", endpoint: "https://us.example.com" },
-    { nodeId: "node-eu-central-1", pubkey: "b".repeat(64), region: "eu-central-1", provider: "gcp", endpoint: "https://eu.example.com" },
-    { nodeId: "node-ap-northeast-1", pubkey: "c".repeat(64), region: "ap-northeast-1", provider: "azure", endpoint: "https://ap.example.com" },
+    { nodeId: "node-us-east-1", pubkey: "a".repeat(64), region: "us-east-1", provider: "aws", endpoint: "https://us.example.com", role: "validator", peerId: "12D3KooWUs" },
+    { nodeId: "node-eu-central-1", pubkey: "b".repeat(64), region: "eu-central-1", provider: "gcp", endpoint: "https://eu.example.com", role: "validator", peerId: "12D3KooWEu" },
+    { nodeId: "node-ap-northeast-1", pubkey: "c".repeat(64), region: "ap-northeast-1", provider: "azure", endpoint: "https://ap.example.com", role: "validator", peerId: "12D3KooWAp" },
   ];
 }
 
@@ -504,34 +504,49 @@ describe("AC-012: makeTestManifest produces valid manifests", () => {
 // ─── M12 ROLE-MANIFEST-1: role-bearing manifests + replica-only rejection ─────
 
 describe("M12 ROLE-MANIFEST-1: verifyManifest and node roles", () => {
-  it("a pre-M12 (role-less) manifest still verifies unchanged — backward compat", () => {
+  it("rejects a node with NO role — the verifier requires one", () => {
     const manifest = makeTestManifest(makeNodes());
-    const result = verifyManifest(manifest, TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD);
-    expect(result.ok).toBe(true);
+    const unsigned = { ...manifest, nodes: manifest.nodes.map((n, i) => {
+      if (i !== 1) return n;
+      const { role: _r, ...rest } = n as Record<string, unknown>;
+      return rest;
+    }) };
+    const result = verifyManifest(unsigned, TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.detail).toContain("unknown role");
   });
 
-  it("GOLDEN: a role-less manifest canonicalizes to fixed bytes with NO role key (byte-level compat)", () => {
-    // Pins canonicalManifestBody so any future change to it — which would silently invalidate
-    // every previously-signed manifest — goes red. Proves absent optional fields (role/peerId)
-    // never enter the signed bytes, so pre-M12 manifests are byte-for-byte identical.
+  it("rejects a node with NO peerId — the client checks it against the /bootstrap probe", () => {
+    const manifest = makeTestManifest(makeNodes());
+    const stripped = { ...manifest, nodes: manifest.nodes.map((n, i) => {
+      if (i !== 0) return n;
+      const { peerId: _p, ...rest } = n as Record<string, unknown>;
+      return rest;
+    }) };
+    const result = verifyManifest(stripped, TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.detail).toContain("no peerId");
+  });
+
+  it("GOLDEN: a node canonicalizes to fixed bytes with role and peerId inside the signed body", () => {
+    // Pins canonicalManifestBody so any change to it — which would silently invalidate every
+    // signed manifest — goes red.
     const manifest = {
       version: 1,
       not_before: "2026-01-01T00:00:00Z",
       expires: "2027-01-01T00:00:00Z",
       nodes: [
-        { nodeId: "n1", pubkey: "a".repeat(64), region: "us-east-1", provider: "aws", endpoint: "https://a" },
+        { nodeId: "n1", pubkey: "a".repeat(64), region: "us-east-1", provider: "aws", endpoint: "https://a", role: "validator", peerId: "12D3KooWN1" },
       ],
       signatures: [],
     };
     const golden =
       '{"expires":"2027-01-01T00:00:00Z",' +
-      '"nodes":[{"endpoint":"https://a","nodeId":"n1","provider":"aws","pubkey":"' +
+      '"nodes":[{"endpoint":"https://a","nodeId":"n1","peerId":"12D3KooWN1","provider":"aws","pubkey":"' +
       "a".repeat(64) +
-      '","region":"us-east-1"}],' +
+      '","region":"us-east-1","role":"validator"}],' +
       '"not_before":"2026-01-01T00:00:00Z","version":1}';
     expect(new TextDecoder().decode(canonicalManifestBody(manifest))).toBe(golden);
-    expect(golden).not.toContain("role");
-    expect(golden).not.toContain("peerId");
   });
 
   it("rejects a node with an unknown role string (closes the domain — F1)", () => {
