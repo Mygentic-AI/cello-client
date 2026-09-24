@@ -134,12 +134,13 @@ describe("agent-loader (PERSIST-002 — DB-backed)", () => {
 
     const result = await loadAgents(db, logger);
 
+    // FIRST: no replacement key was minted — the property decision 8 exists for.
+    expect(mlDsaGenerateSeed, "the loader must never mint an ML-DSA seed").not.toHaveBeenCalled();
+    expect(mlKemGenerateSeed, "the loader must never mint an ML-KEM seed").not.toHaveBeenCalled();
     expect(result.loaded.map((a) => a.name)).not.toContain("alice");
     expect(result.failed).toEqual([{ name: "alice", error: reason, remedy: PQ_LOAD_REMEDY }]);
     const logged = logEvents.find((e) => e.event === "agent.load.failed");
     expect(logged?.context).toMatchObject({ agentName: "alice", error: reason, remedy: PQ_LOAD_REMEDY });
-    expect(mlDsaGenerateSeed, "the loader must never mint an ML-DSA seed").not.toHaveBeenCalled();
-    expect(mlKemGenerateSeed, "the loader must never mint an ML-KEM seed").not.toHaveBeenCalled();
   });
 
   it("a REGISTERED row with both seeds loads with the ML-DSA provider for exactly that seed", async () => {
