@@ -342,10 +342,10 @@ export type SubmitResult =
       sequence_number: number;
       // The signed ordering record for THIS leaf, so the sender can stamp it into the content frame.
       // structure1_cbor is the sender-signed bytes (built locally); structure2_cbor is the relay's
-      // committed record (from hash_submit_ack). Both undefined against an OLD relay that does not
-      // return structure2_cbor.
+      // committed record (from hash_submit_ack, which always carries it — an ack without one is
+      // refused as malformed).
       structure1_cbor?: Uint8Array;
-      structure2_cbor?: Uint8Array;
+      structure2_cbor: Uint8Array;
       /**
        * DOD-M15-SEALWIRE-1 bullet 5, SENT half — OUR signature over `structure1_cbor`.
        *
@@ -376,7 +376,7 @@ export type SubmitResult =
        * `DOD-M15-TERMINAL-REASON-1`'s F6, where `detail` exists specifically to carry the
        * DIRECTORY's refusal cause out from behind a `seal_refused`.
        *
-       * Optional, because an older relay sends none.
+       * Present when the relay has a cause to name.
        */
       detail?: string;
       /**
@@ -1267,7 +1267,7 @@ export class AgentRelayClient {
            * malformed one look the same from outside. The cause is named in the log line above.
            */
           ? { ok: false, reason: "relay_ack_unverified" }
-          : seq >= 0
+          : seq >= 0 && structure2Cbor !== undefined
             ? { ok: true, sequence_number: seq, structure1_cbor: structure1Cbor, structure2_cbor: structure2Cbor, sender_signature: senderSignature }
             : { ok: false, reason: "relay_ack_malformed" },
       );
@@ -2630,8 +2630,6 @@ export class AgentRelayClient {
    * sender's own volume is going on, which the operator should hear about.
    */
   static readonly #RATE_LIMITED_ATTEMPTS = 3;
-  /** Used only when the relay names no window (an older relay, or a malformed value). */
-  static readonly #RATE_LIMITED_FALLBACK_MS = 5_000;
   /**
    * Ceiling on a single wait, so a relay reporting an implausible window cannot park a send
    * indefinitely — a hostile or misconfigured relay must not be able to stall a sender by
@@ -2705,11 +2703,13 @@ export class AgentRelayClient {
       attempt < AgentRelayClient.#RATE_LIMITED_ATTEMPTS
         && !result.ok
         && result.reason === "rate_limited"
+        // The relay always names its window; a refusal without one is malformed and is returned.
+        && result.retry_after_ms !== undefined
         && !this.#closed;
       attempt++
     ) {
       const waitMs = Math.min(
-        result.retry_after_ms !== undefined ? result.retry_after_ms : AgentRelayClient.#RATE_LIMITED_FALLBACK_MS,
+        result.retry_after_ms,
         AgentRelayClient.#RATE_LIMITED_MAX_WAIT_MS,
       );
       this.#logger.info("session.relay.submit.throttled", {

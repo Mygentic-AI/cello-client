@@ -698,10 +698,10 @@ export class SessionSeal {
          * bounded so a message that never arrives cannot hold the close; past the bound this falls
          * through to the ordinary failure handling below.
          */
-        if (!result.ok && result.reason === "seal_stale") {
+        // The relay names the position it awaits; without one the refusal is malformed and falls through.
+        if (!result.ok && result.reason === "seal_stale" && "awaited_seq" in result && result.awaited_seq !== undefined) {
           const deadline = Date.now() + SEAL_STALE_WAIT_MS;
-          // Wait for the position the relay named; an older relay names none, so any advance will do.
-          const needed = ("awaited_seq" in result && result.awaited_seq !== undefined) ? result.awaited_seq : seenBefore + 1;
+          const needed = result.awaited_seq;
           while ((entry.relayClient.lastSeenAck(relaySidHex)?.seq ?? 0) < needed && Date.now() < deadline) {
             await new Promise<void>((r) => { const t = setTimeout(r, 20); t.unref?.(); });
           }

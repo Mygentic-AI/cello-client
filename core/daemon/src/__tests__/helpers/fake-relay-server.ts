@@ -21,7 +21,7 @@ import { Encoder, decode } from "cbor-x";
 import * as lp from "it-length-prefixed";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
-import { fakeRelayAttestation, fakeRelayPubkeyHex } from "../relay-client-fake.js";
+import { fakeRelayAttestation, fakeRelayPubkeyHex, fakeStructure2ForSubmit } from "../relay-client-fake.js";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
@@ -117,6 +117,7 @@ export function makeFakeRelayServer(opts: FakeRelayOpts = {}) {
                   type: "hash_submit_ack",
                   sequence_number: leaf.sequenceNumber,
                   ...(await attest(frame["session_id"], contentHash, leaf.sequenceNumber)),
+                  structure2_cbor: fakeStructure2ForSubmit(frame, leaf.sequenceNumber),
                 });
                 continue;
               }
@@ -126,7 +127,7 @@ export function makeFakeRelayServer(opts: FakeRelayOpts = {}) {
               // existed when the relay committed the position, not the one after the client reacts.
               opts.onLeaf?.(leaf);
               const attestation = await attest(frame["session_id"], contentHash, leaf.sequenceNumber);
-              push({ type: "hash_submit_ack", sequence_number: leaf.sequenceNumber, ...attestation });
+              push({ type: "hash_submit_ack", sequence_number: leaf.sequenceNumber, ...attestation, structure2_cbor: fakeStructure2ForSubmit(frame, leaf.sequenceNumber) });
               if (opts.broadcastLeaves) {
                 // The witness, to everyone on the session — the submitter included, exactly as the
                 // real relay echoes it. Whether a leaf is one's own is decided by the CLIENT from

@@ -39,7 +39,7 @@ import { describe, it, expect } from "vitest";
 import { generateKeypair } from "@cello-protocol/crypto";
 import { decodeStructure1 } from "@cello-protocol/protocol-types";
 import { AgentRelayClient, LEAF_KIND_MSG } from "../session-relay-client.js";
-import { makeFakeRelay, tick, noopLogger, fakeRelayAnchor, fakeRelayAttestation } from "./relay-client-fake.js";
+import { makeFakeRelay, tick, noopLogger, fakeRelayAnchor, fakeRelayAttestation, fakeStructure2ForSubmit } from "./relay-client-fake.js";
 
 /**
  * The session's starting point. A recognisable fill rather than zeros: an all-zero value is what an
@@ -88,6 +88,7 @@ async function connected(): Promise<{
       type: "hash_submit_ack",
       sequence_number: seq,
       ...(await fakeRelayAttestation(SID, contentHash, seq)),
+      structure2_cbor: fakeStructure2ForSubmit(relay.sentFrames.filter((f) => f["type"] === "hash_submit").at(-1)!, seq),
     });
     return (await p) as { ok: boolean };
   };
@@ -203,7 +204,10 @@ describe("DOD-M15-SELFCHAIN-1: what this agent signs as its own self link", () =
 
     const p2 = client.submitMessageHash(relay.node, SID, first, LEAF_KIND_MSG);
     await tick();
-    relay.push({ type: "hash_submit_ack", sequence_number: 1, ...(await fakeRelayAttestation(SID, first, 1)) });
+    relay.push({
+      type: "hash_submit_ack", sequence_number: 1, ...(await fakeRelayAttestation(SID, first, 1)),
+      structure2_cbor: fakeStructure2ForSubmit(relay.sentFrames.filter((f) => f["type"] === "hash_submit").at(-1)!, 1),
+    });
     expect((await p2).ok).toBe(true);
 
     const submits = relay.sentFrames.filter((f) => f["type"] === "hash_submit");
@@ -242,7 +246,10 @@ describe("DOD-M15-SELFCHAIN-1: what this agent signs as its own self link", () =
     await tick();
     relay.push({ type: "relay_auth_ok" });
     await tick();
-    relay.push({ type: "hash_submit_ack", sequence_number: 1, ...(await fakeRelayAttestation(SID, warmupHash, 1)) });
+    relay.push({
+      type: "hash_submit_ack", sequence_number: 1, ...(await fakeRelayAttestation(SID, warmupHash, 1)),
+      structure2_cbor: fakeStructure2ForSubmit(relay.sentFrames.filter((f) => f["type"] === "hash_submit").at(-1)!, 1),
+    });
     expect((await warmup).ok).toBe(true);
     const framesBefore = relay.sentFrames.filter((f) => f["type"] === "hash_submit").length;
 

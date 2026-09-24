@@ -14,6 +14,7 @@ import { createHash } from "node:crypto";
 import { Encoder, decode } from "cbor-x";
 import * as lp from "it-length-prefixed";
 import { generateKeypair, buildRelayAckTbs } from "@cello-protocol/crypto";
+import { decodeStructure1, buildStructure2, encodeStructure2 } from "@cello-protocol/protocol-types";
 import type { Logger } from "../types.js";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
@@ -63,6 +64,7 @@ export async function pushAck(
     type: "hash_submit_ack",
     sequence_number: sequenceNumber,
     ...(await fakeRelayAttestation(sessionId, contentHash, sequenceNumber)),
+    ...(last ? { structure2_cbor: fakeStructure2ForSubmit(last, sequenceNumber) } : {}),
     ...over,
   });
 }
@@ -188,4 +190,23 @@ export async function fakeRelayAttestation(
     timestamp,
     running_root,
   };
+}
+
+/**
+ * The relay's committed ordering record (Structure 2) for a `hash_submit` frame, as the real relay
+ * builds it: the sender's key and content hash out of the submitted Structure 1, the sender's
+ * signature from the frame, and a fixed previous root. Every real `hash_submit_ack` carries one.
+ */
+export function fakeStructure2ForSubmit(frame: Record<string, unknown>, sequenceNumber: number): Uint8Array {
+  const s1 = frame["structure1_cbor"];
+  const sig = frame["sender_signature"];
+  const decoded = s1 instanceof Uint8Array ? decodeStructure1(s1) : null;
+  if (!decoded?.ok || !(sig instanceof Uint8Array)) {
+    throw new Error("fakeStructure2ForSubmit: the frame carries no decodable structure1_cbor / sender_signature");
+  }
+  const built = buildStructure2(
+    sequenceNumber, decoded.fields.senderPubkey, decoded.fields.contentHash, sig, new Uint8Array(32).fill(0x5e),
+  );
+  if (!built.ok) throw new Error(`fakeStructure2ForSubmit: ${built.error.message}`);
+  return encodeStructure2(built.structure2);
 }

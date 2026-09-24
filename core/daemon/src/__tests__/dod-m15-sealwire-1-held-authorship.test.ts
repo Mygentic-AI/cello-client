@@ -68,7 +68,7 @@ import { Encoder, decode } from "cbor-x";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
 import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
-import { fakeRelayAttestation } from "./relay-client-fake.js";
+import { fakeRelayAttestation, fakeStructure2ForSubmit } from "./relay-client-fake.js";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
 /** The peer id `two-connection-fixture` configures when `relay: true`. */
@@ -121,6 +121,7 @@ function makeAckingRelay(startSeq: number) {
                 type: "hash_submit_ack",
                 sequence_number: n,
                 ...(await fakeRelayAttestation(sidBytes, contentHash, n)),
+                structure2_cbor: fakeStructure2ForSubmit(frame, n),
               });
             }
           }

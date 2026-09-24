@@ -61,6 +61,7 @@ import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
 import { startTwoConnectionFixture, msgLeafHash, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
 import { sentAuthorship } from "../session-content-handlers.js";
+import { fakeStructure2ForSubmit } from "./relay-client-fake.js";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
 /** The peer id `two-connection-fixture` configures when `relay: true`. */
@@ -93,7 +94,10 @@ function makeAckingRelay() {
             const u8 = chunk instanceof Uint8Array ? chunk : (chunk as { subarray(): Uint8Array }).subarray();
             const frame = decode(u8) as Record<string, unknown>;
             if (frame["type"] === "relay_auth_response") push({ type: "relay_auth_ok" });
-            else if (frame["type"] === "hash_submit") push({ type: "hash_submit_ack", sequence_number: ++seq });
+            else if (frame["type"] === "hash_submit") {
+              const n = ++seq;
+              push({ type: "hash_submit_ack", sequence_number: n, structure2_cbor: fakeStructure2ForSubmit(frame, n) });
+            }
           }
         })();
       },

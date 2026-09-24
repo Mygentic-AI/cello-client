@@ -74,11 +74,11 @@ describe("seal_stale: a close signed before a filed message is re-signed once it
           }
           return closeClaims.at(-1)! >= 6 ? undefined : { reason: "seal_stale", awaited_seq: 6 };
         }
-        if (ctrlSubmits > 1) return opts.messageLands ? undefined : "seal_stale";
+        if (ctrlSubmits > 1) return opts.messageLands ? undefined : { reason: "seal_stale", awaited_seq: 5 };
         // The other side's message is in the relay's log but not yet in our record. When the test
         // lets it land, our acknowledgement moves a moment later, as ingest would move it.
         if (opts.messageLands) setTimeout(() => relayClientRef?.noteReceivedLeaf(SID_HEX, 5, new Uint8Array(32).fill(0x42)), 100);
-        return "seal_stale";
+        return { reason: "seal_stale", awaited_seq: 5 };
       },
     });
     const node = new FakeRelayAwareNode(relay);

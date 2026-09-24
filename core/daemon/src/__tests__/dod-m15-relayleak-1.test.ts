@@ -98,7 +98,7 @@ function makeFakeRelayClient(): FakeRelayClient {
      * normal path had never been tried. Returning a successful submit makes these tests cover the
      * case that actually happens: a submit that COMPLETES, and a client that must be released after.
      */
-    submitLeaf() { submits += 1; return Promise.resolve({ ok: true as const, sequence_number: 1 }); },
+    submitLeaf() { submits += 1; return Promise.resolve({ ok: true as const, sequence_number: 1, structure2_cbor: new Uint8Array(0) }); },
     // Read by submitSealLeaf to tell whether a `seal_stale` retry can proceed.
     lastSeenAck() { return undefined; },
     close() { (fake as { closed: number }).closed += 1; },

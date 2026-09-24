@@ -52,7 +52,7 @@ import type { SessionNegotiator } from "../transport-selector.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
 import type { SessionAssignment } from "@cello-protocol/protocol-types";
 import { registerFixtureSigner } from "./helpers/signed-assignment.js";
-import { fakeRelayAttestation, fakeRelayPubkeyHex } from "./relay-client-fake.js";
+import { fakeRelayAttestation, fakeRelayPubkeyHex, fakeStructure2ForSubmit } from "./relay-client-fake.js";
 import { provisionAgentIdentity } from "../testing.js";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
@@ -120,6 +120,7 @@ function makeFakeRelayServer() {
                 type: "hash_submit_ack",
                 sequence_number: n,
                 ...(await fakeRelayAttestation(sidBytes, contentHash, n)),
+                structure2_cbor: fakeStructure2ForSubmit(frame, n),
               });
             }
           }
