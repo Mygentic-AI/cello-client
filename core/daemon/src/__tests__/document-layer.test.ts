@@ -20,6 +20,7 @@ import {
 } from "@cello-protocol/protocol-types";
 import { createDocumentLayer, agentPublicKeyFromId } from "../document-layer.js";
 import type { Logger } from "../types.js";
+import { genesisDocumentId, recordGenesis } from "./helpers/document-genesis.js";
 
 /**
  * AGENT is the daemon's agent NAME — what the session content path carries. OWNER is the stable
@@ -34,7 +35,8 @@ const OWNER = "dd".repeat(32);
 const OTHER_AGENT = "someone-else";
 const OTHER_OWNER = "ee".repeat(32);
 const PEER = "peer-agent";
-const DOC = "cc".repeat(32);
+/** The document PEER proposed to OWNER — its genesis makes PEER a participant. */
+const DOC = genesisDocumentId(PEER, OWNER);
 const PEER_CLIENT = 4242;
 
 function recordingLogger(): { logger: Logger; events: Array<{ event: string; fields: Record<string, unknown> }> } {
@@ -81,6 +83,7 @@ async function newFixture(opts: { knowPeerKey?: boolean } = {}) {
     documentId: DOC, ownerAgentId: OWNER, peerAgentId: PEER, documentType: "markdown",
     properties: {}, status: "active", createdAtMs: 1,
   });
+  recordGenesis(layer.handshake, OWNER, PEER, OWNER);
 
   const signedEnvelope = async (over: Partial<DocumentUpdateEnvelope> = {}) => {
     const base: DocumentUpdateEnvelope = {
@@ -159,6 +162,7 @@ describe("document layer — a REAL signature is verified end to end", () => {
       documentId: DOC, ownerAgentId: OWNER, peerAgentId: PEER, documentType: "markdown",
       properties: {}, status: "active", createdAtMs: 1,
     });
+    recordGenesis(layer.handshake, OWNER, PEER, OWNER);
     const f = await newFixture();
     const env = await f.signedEnvelope();
 

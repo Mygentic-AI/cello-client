@@ -25,7 +25,12 @@ import {
   DOCUMENT_FEATURE_VERSION,
   ASSURANCE_TIER_V1,
   TOPOLOGY_DEFAULT,
+  documentAmendmentHash,
+  buildDocumentMultisigTbs,
+  encodeDocumentAmendment,
   type DocumentProposalEnvelope,
+  type DocumentAmendmentBody,
+  type DocumentAmendmentEnvelope,
 } from "@cello-protocol/protocol-types";
 import { createDocumentLayer, agentPublicKeyFromId } from "../document-layer.js";
 import { DocumentPublish } from "../document-publish.js";
@@ -67,7 +72,8 @@ async function makeParty(name: string, clientId: number) {
   });
 
   const publish = new DocumentPublish({
-    governanceFrontierFor: () => [],
+    // Production names the envelope's governance frontier, so it carries the peer's consent.
+    governanceFrontierFor: (o, d) => layer.governanceFrontierFor(o, d) ?? [],
     // The two-party arrangement `openDocument` proposed: the row's peer.
     holdersFor: (o, d) => {
       const doc = layer.store.getDocument(o, d);
@@ -117,6 +123,38 @@ async function openDocument(a: Awaited<ReturnType<typeof makeParty>>, b: Awaited
   a.layer.handshake.recordOutgoing(a.id, proposal, 1);
   expect(b.layer.handshake.recordProposal(b.id, encodeDocumentProposal(proposal), 1)).toMatchObject({ state: "pending" });
   expect(b.layer.handshake.accept(b.id, DOC, 2).ok).toBe(true);
+  // B's CONSENT entry — the invited peer becomes a participant only through its own signed consent
+  // (R21/R22), authored exactly as the accept handler does, and held by both sides.
+  const body: DocumentAmendmentBody = {
+    document_id: DOC,
+    kind: "consent",
+    subject_agent_id: b.id,
+    property_change: { key: "consents_to", value: `${ASSURANCE_TIER_V1}/${DOCUMENT_FEATURE_VERSION}` },
+    state_hash: null,
+    authored_at_ms: 2,
+    author_agent_id: b.id,
+    author_seq: 1,
+    parents: [],
+  };
+  const entryHash = documentAmendmentHash(body);
+  const consent: DocumentAmendmentEnvelope = {
+    body,
+    collection: {
+      document_id: DOC,
+      subject_kind: "document_amendment",
+      subject_hash: entryHash,
+      required_signers: [b.id],
+      signatures: [{
+        signer_agent_id: b.id,
+        signature: await b.sign(buildDocumentMultisigTbs({
+          document_id: DOC, subject_kind: "document_amendment", subject_hash: entryHash, required_signers: [b.id],
+        })),
+      }],
+    },
+  };
+  const consentBytes = new Uint8Array(encodeDocumentAmendment(consent));
+  b.layer.amendments.append(b.id, DOC, consentBytes, 2);
+  a.layer.amendments.append(a.id, DOC, consentBytes, 2);
   for (const [self, peer] of [
     [a, b],
     [b, a],
