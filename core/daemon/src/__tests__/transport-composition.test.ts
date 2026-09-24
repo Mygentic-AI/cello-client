@@ -27,9 +27,9 @@ import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import { resolveCelloEnv, createTransportSelector } from "../transport-composition.js";
 import type { SessionNegotiator } from "../transport-selector.js";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig } from "../types.js";
 import type { SessionAssignment } from "@cello-protocol/protocol-types";
+import { provisionAgentIdentity } from "../testing.js";
 
 describe("AC-010: composition root wires transport adapters by CELLO_ENV", () => {
   let tempDir: string;
@@ -81,7 +81,7 @@ describe("AC-010: composition root wires transport adapters by CELLO_ENV", () =>
   async function setupAgent(name: string): Promise<void> {
     const agentsDir = join(tempDir, "agents", name);
     await mkdir(agentsDir, { recursive: true });
-    await FileKeyProvider.load(join(agentsDir, "key"));
+    await provisionAgentIdentity(tempDir, name);
   }
 
   function makeAssignment(transportMode: "direct" | "relay"): SessionAssignment {

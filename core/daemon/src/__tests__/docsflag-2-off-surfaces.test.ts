@@ -35,11 +35,11 @@ import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import { DOCUMENTS_FLAG_ENV } from "../document-flag.js";
 import type { Logger, DaemonConfig } from "../types.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 /** Every document verb, spelled out — the list the clause is about. */
 const DOC_VERBS = [
@@ -98,7 +98,7 @@ describe("074-DOCSFLAG clauses 2/5/6/9 — the daemon's three document surfaces,
 
   async function config(): Promise<DaemonConfig> {
     await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
-    await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+    await provisionAgentIdentity(tempDir, "alice");
     return {
       securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,

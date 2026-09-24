@@ -94,14 +94,6 @@ function onlyTouchesAgentsTable(window: string): boolean {
   return tables.length > 0 && tables.every((t) => t === "agents");
 }
 
-/**
- * The ONE file-level exemption, and it is the migration that created the column this rule protects.
- *
- * `agent-id-migration.ts` backfills `agent_id` onto the session tables by joining them to `agents`
- * ON `agent_name`. That join is the entire point of it: before it ran, the name was the only key
- * there was. It can only be written the way the rule forbids, and it runs once.
- */
-const EXEMPT_FILES = new Set(["agent-id-migration.ts"]);
 
 describe("DOD-AGENT-ID-JOINKEY-1 AC3 — agent_name never scopes a session-table query", () => {
   it("the scan covers the data-access files (it has teeth)", () => {
@@ -118,7 +110,6 @@ describe("DOD-AGENT-ID-JOINKEY-1 AC3 — agent_name never scopes a session-table
   it("no PRIMARY KEY / WHERE / JOIN / ON CONFLICT / INSERT scopes on agent_name", () => {
     const offenders: string[] = [];
     for (const file of DATA_ACCESS_FILES) {
-      if (EXEMPT_FILES.has(file.split("/").pop()!)) continue;
       const code = stripComments(readFileSync(file, "utf8"));
       // Look at each SQL-ish line; skip the sanctioned agents-table lookups.
       const codeLines = code.split("\n");
@@ -148,7 +139,6 @@ describe("DOD-AGENT-ID-JOINKEY-1 AC3 — agent_name never scopes a session-table
     // wraps is not missed by the per-line pass above.
     const offenders: string[] = [];
     for (const file of DATA_ACCESS_FILES) {
-      if (EXEMPT_FILES.has(file.split("/").pop()!)) continue;
       const code = stripComments(readFileSync(file, "utf8"));
       const m = code.match(/PRIMARY\s+KEY\s*\([^)]*\bagent_name\b[^)]*\)/gi);
       if (m) offenders.push(`${file.slice(HERE.length + 1)}: ${m.join(" ; ")}`);

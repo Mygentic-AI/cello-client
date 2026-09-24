@@ -25,7 +25,6 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
@@ -37,6 +36,7 @@ import {
   type OrderedLeaf,
 } from "./helpers/fake-relay-server.js";
 import { fakeRelayAnchor } from "./relay-client-fake.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 // The RELAY session id is 16 bytes — `decodeSealPayload` refuses any other length, and a 32-byte
 // one makes every seal submit fail as `seal_payload_invalid` long before anything under test runs.
@@ -94,7 +94,7 @@ describe("DOD-M15-SEALPRECOND-1 Done When 1: the signed root covers every messag
 
     await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
     // `load` mints the key when the file is absent — the same call the daemon's own boot makes.
-    await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+    await provisionAgentIdentity(tempDir, "alice");
     handle = await startDaemon({
       celloDir: tempDir,
       socketPath: join(tempDir, "d.sock"),
@@ -114,7 +114,7 @@ describe("DOD-M15-SEALPRECOND-1 Done When 1: the signed root covers every messag
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
     snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
 
-    const kp = await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+    const kp = await provisionAgentIdentity(tempDir, "alice");
     const { AgentRelayClient } = await import("../session-relay-client.js");
     const relayClient = new AgentRelayClient({
       relayPeerId: FAKE_RELAY_PEER_ID,

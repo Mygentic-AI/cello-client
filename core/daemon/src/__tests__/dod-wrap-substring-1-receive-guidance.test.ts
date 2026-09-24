@@ -29,11 +29,11 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import type { Logger } from "../types.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 const SID64 = (a: string) => a.repeat(64).slice(0, 64);
 
@@ -62,7 +62,7 @@ describe("DOD-WRAP-SUBSTRING-1: the close signal is read at the END, not found a
   async function guidanceFor(sessionSeed: string, text: string): Promise<string | undefined> {
     if (!handle) {
       await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
-      await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+      await provisionAgentIdentity(tempDir, "alice");
       handle = await startDaemon({
         securityGateway: new PassthroughGatewayClient(),
         celloDir: tempDir, socketPath: join(tempDir, "daemon.sock"), lockFilePath: join(tempDir, "daemon.lock"),

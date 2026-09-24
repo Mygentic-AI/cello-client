@@ -48,7 +48,7 @@ import { seedAgents } from "./helpers/seed-agents.js";
 import type { DaemonDatabase } from "../sqlcipher-db.js";
 import { Encoder } from "cbor-x";
 import * as lp from "it-length-prefixed";
-import { FileKeyProvider, generateKeypair, verify as ed25519Verify } from "@cello-protocol/crypto";
+import { generateKeypair, verify as ed25519Verify } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { SessionNodeManager } from "../session-node-manager.js";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
@@ -59,6 +59,7 @@ import type { ConnectResult, SignalingStream } from "@cello-protocol/transport";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
+import { provisionAgentIdentity } from "../testing.js";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -608,7 +609,7 @@ describe("SESSION-001: cello_close_session error codes", () => {
   async function makeAgentDir(agentName: string): Promise<void> {
     const agentDir = join(tempDir, "agents", agentName);
     await mkdir(agentDir, { recursive: true });
-    await FileKeyProvider.load(join(agentDir, "key"));
+    await provisionAgentIdentity(tempDir, name);
   }
 
   async function startTestDaemon(): Promise<Awaited<ReturnType<typeof startDaemon>>> {
@@ -752,7 +753,7 @@ describe("SESSION-001: AC-011 seal_in_progress guard", () => {
     // Create an agent directory so the daemon recognises it
     const agentDir = join(tempDir, "agents", "alice");
     await mkdir(agentDir, { recursive: true });
-    await FileKeyProvider.load(join(agentDir, "key"));
+    await provisionAgentIdentity(tempDir, name);
 
     // Fake signalingConnect: the stream's send() hangs forever (never resolves) so
     // handleSealInterruptedFlow is stuck awaiting sendRaw() — keeping the sessionId
@@ -861,7 +862,7 @@ describe("SESSION-001: SI-002 tampered leaf signature rejected", () => {
     // Create agent dir
     const agentDir = join(tempDir, "agents", "alice");
     await mkdir(agentDir, { recursive: true });
-    await FileKeyProvider.load(join(agentDir, "key"));
+    await provisionAgentIdentity(tempDir, name);
 
     // Generate a real Ed25519 keypair so the counterparty_pubkey is a real 32-byte pubkey.
     // The tampered leaf will use the correct signerPubkey but a zeroed signature —
@@ -1344,7 +1345,7 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
   async function makeAgent(name: string): Promise<string> {
     const agentDir = join(tempDir, "agents", name);
     await mkdir(agentDir, { recursive: true });
-    const kp = await FileKeyProvider.load(join(agentDir, "key"));
+    const kp = await provisionAgentIdentity(tempDir, name);
     return Buffer.from(await kp.getPublicKey()).toString("hex");
   }
 

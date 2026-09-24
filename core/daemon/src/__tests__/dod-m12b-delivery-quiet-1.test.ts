@@ -36,9 +36,9 @@ import { tmpdir } from "node:os";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig } from "../types.js";
 import { createDeliveryOpenRegistry, DELIVERY_OPEN_STALE_MS } from "../delivery-open-registry.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 const SID64 = (a: string) => a.repeat(64).slice(0, 64);
 const PEER = "cd".repeat(32);
@@ -122,7 +122,7 @@ describe("DOD-M12B-DELIVERY-QUIET-1: creation does not ring when delivery caused
   async function setup(...names: string[]): Promise<DaemonConfig> {
     for (const name of names) {
       await mkdir(join(tempDir, "agents", name), { recursive: true });
-      await FileKeyProvider.load(join(tempDir, "agents", name, "key"));
+      await provisionAgentIdentity(tempDir, name);
     }
     return {
       securityGateway: new PassthroughGatewayClient(),

@@ -32,8 +32,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger } from "../types.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 interface TranscriptRow {
   direction: string;
@@ -62,7 +62,7 @@ describe("DOD-M15-SEALWIRE-1 bullet 5 — the transcript records HOW a message i
 
   async function startWithAgent(name: string): Promise<DaemonHandle> {
     await mkdir(join(tempDir, "agents", name), { recursive: true });
-    await FileKeyProvider.load(join(tempDir, "agents", name, "key"));
+    await provisionAgentIdentity(tempDir, name);
     handle = await startDaemon({
       securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,

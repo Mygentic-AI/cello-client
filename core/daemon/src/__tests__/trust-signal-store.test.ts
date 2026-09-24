@@ -16,10 +16,6 @@
  *                            Consent scoping IS genuinely per-agent here, so agent_id is NOT NULL
  *                            and the row hangs off a contact row by composite FK. This is where the
  *                            M8 scaffold's `agent_id = null` defect (investigation §9) dies.
- *
- * The M8 scaffold table (`trust_signals`) is deliberately still standing — M10-D18: the DROP travels
- * with the BACKFILL (DOD-MINT-INTERNAL-1), so the drop and its replacement land together and no gate
- * is red in between.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -30,8 +26,6 @@ import { seedAgentKeys } from "./helpers/seed-agents.js";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager, type ISessionNodeFactory, type SessionNodeConfig } from "../session-node-manager.js";
 import { TrustSignalStore, ensureTrustSignalSchema, type WalletSignalInput } from "../trust-signal-store.js";
-import { ensureIdentitySchema } from "../db-identity-store.js";
-import { withForeignKeysOff } from "../sqlcipher-db.js";
 import { hashTrustSignalEnvelope as hashTrustSignalEnvelopeFn } from "@cello-protocol/protocol-types";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Logger } from "../types.js";
@@ -557,7 +551,7 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
     });
   });
 
-  describe("migration integrity", () => {
+  describe("schema", () => {
     it("is idempotent — running the schema twice changes nothing and throws nothing", () => {
       expect(() => {
         ensureTrustSignalSchema(db, silent);
@@ -566,167 +560,6 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
       store.putWalletSignal(envelope());
       ensureTrustSignalSchema(db, silent);
       expect(store.getWalletSignal(HASH("a"))).not.toBeNull(); // data survived
-    });
-
-    it("fresh schema == migrated schema (the DoD clause)", async () => {
-      // The failure this catches: an ALTER path that adds a column the CREATE path forgot, so fresh
-      // installs and upgraded installs silently diverge — and only one of them is ever tested.
-      const dir2 = await mkdtemp(join(tmpdir(), "dod-store-client-1-fresh-"));
-      try {
-        const p2 = join(dir2, "sessions.db");
-        const mgr2 = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: silent, dbPath: p2 });
-        await mgr2.initialize();
-        const fresh = mgr2.getDb();
-        ensureTrustSignalSchema(fresh, silent); // applied again, exactly as an upgrade would
-
-        // Compare the actual DDL, not just the column list. `PRAGMA table_info` reports names, types
-        // and NOT NULL — it says NOTHING about the FOREIGN KEY, the PRIMARY KEY, or the indexes. A
-        // migrated database that had lost the FK entirely would have sailed through a table_info
-        // comparison, which is precisely the constraint this whole unit is built on.
-        const ddl = (d: DaemonDatabase, t: string): string =>
-          ((d.prepare("SELECT sql FROM sqlite_master WHERE name = ?").get(t) as { sql: string }).sql)
-            .replace(/\s+/g, " ").trim();
-
-        for (const t of ["wallet_trust_signals", "contact_trust_signals"]) {
-          expect(ddl(fresh, t), t).toEqual(ddl(db, t));
-        }
-        // ...and the FK is actually in there, in both.
-        expect(ddl(fresh, "contact_trust_signals")).toMatch(/FOREIGN KEY.*REFERENCES contacts/i);
-        expect(ddl(db, "contact_trust_signals")).toMatch(/FOREIGN KEY.*REFERENCES contacts/i);
-        await mgr2.stop?.();
-      } finally {
-        await rm(dir2, { recursive: true, force: true });
-      }
-    });
-
-    it("a `contacts` TABLE REBUILD does not cascade-wipe the received signals (the armed landmine)", () => {
-      // THE BUG THIS EXISTS TO PREVENT, and it is a data-loss bug, not a correctness one.
-      //
-      // With PRAGMA foreign_keys = ON (M10-D19), SQLite treats `DROP TABLE contacts` as an implicit
-      // DELETE — which fires ON DELETE CASCADE and SILENTLY empties contact_trust_signals. The
-      // rebuild's own row-count guards do not notice: they count `contacts`, not its children. And
-      // `contacts` is one of the seven tables agent-id-migration.ts rebuilds with exactly this
-      // create-copy-drop-rename recipe.
-      //
-      // Worse, the intuitive mitigation is a no-op: `PRAGMA foreign_keys = OFF` is SILENTLY IGNORED
-      // inside a transaction, and every rebuild here runs inside one BEGIN...COMMIT. So a migration
-      // that "disabled" foreign keys would look correct and cascade anyway.
-      //
-      // This test drives the real recipe through the real helper. If someone rebuilds `contacts`
-      // without withForeignKeysOff, every received trust signal on every agent disappears at next
-      // boot and nothing logs it — this is the only thing that will catch that.
-      mgr.addContact("alice", HASH("e"), undefined, "accepted");
-      store.putReceivedSignal({ agentId: alice, contactPubkey: HASH("e"), verifiedAt: 1, verdict: "active", ...envelope() });
-      expect(store.listReceived({ agentId: alice, contactPubkey: HASH("e") })).toHaveLength(1);
-
-      withForeignKeysOff(db, silent, () => {
-        db.exec("BEGIN");
-        db.exec("CREATE TABLE contacts_rebuild (agent_id TEXT NOT NULL, pubkey TEXT NOT NULL, added_at INTEGER NOT NULL, moniker TEXT, PRIMARY KEY (agent_id, pubkey))");
-        db.exec("INSERT INTO contacts_rebuild (agent_id, pubkey, added_at, moniker) SELECT agent_id, pubkey, added_at, moniker FROM contacts");
-        db.exec("DROP TABLE contacts");
-        db.exec("ALTER TABLE contacts_rebuild RENAME TO contacts");
-        db.exec("COMMIT");
-      });
-
-      // The signal SURVIVED the parent's rebuild.
-      expect(store.listReceived({ agentId: alice, contactPubkey: HASH("e") })).toHaveLength(1);
-      // ...and the FK still points at a real `contacts`, not at a renamed ghost.
-      expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
-    });
-
-    it("withForeignKeysOff REFUSES to run inside a transaction, where the pragma is a silent no-op", () => {
-      // The failure is silent by nature, so the helper must verify the toggle took effect rather than
-      // assume it. Called inside a BEGIN, `PRAGMA foreign_keys = OFF` is ignored and FKs stay live —
-      // so it must refuse loudly rather than proceed and cascade.
-      db.exec("BEGIN");
-      try {
-        expect(() => withForeignKeysOff(db, silent, () => undefined)).toThrow(/NO-OP inside a transaction|did not take effect/i);
-      } finally {
-        db.exec("ROLLBACK");
-      }
-    });
-
-    it("the M8 scaffold table is GONE — MINT-INTERNAL-1 dropped it together with its replacement (M10-D18)", () => {
-      // THE FORCING FUNCTION. This is DOD-MINT-INTERNAL-1's own test-clause: it was the mirror-image guard
-      // that used to assert the scaffold still STOOD (to catch a PREMATURE drop across the four units
-      // between STORE-CLIENT-1 and here). Now MINT-INTERNAL-1 has landed — the M8 delivery arm is
-      // re-pointed onto TrustSignalStore.deliverWalletSignal (inbound-sessions), the writer + reader are
-      // retired, and `ensureIdentitySchema` drops the table — so it must be ABSENT. Its absence proves the
-      // drop travelled WITH the replacement, never before it, and the M8 `agent_id = null` defect is gone.
-      const row = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='trust_signals'").get();
-      expect(row, "M10-D18: the M8 `trust_signals` scaffold must be dropped once its M10 replacement is live").toBeUndefined();
-    });
-
-    it("DROPs a POPULATED M8 trust_signals table without error — the real client-migration case (review F1)", () => {
-      // The fresh-DB assertion above proves a NEW DB has no table, but the load-bearing claim is that an
-      // EXISTING operator DB still holding M8 rows migrates cleanly (client-side, unrecoverable if it
-      // throws or corrupts). Reconstruct that DB — the M8 CREATE + a row — then re-run schema-ensure as a
-      // daemon restart would, and assert the drop fires without throwing and touches nothing else.
-      db.exec(
-        `CREATE TABLE IF NOT EXISTS trust_signals (
-           signal_hash TEXT PRIMARY KEY, agent_id TEXT, signal_kind TEXT NOT NULL,
-           payload BLOB NOT NULL, received_at INTEGER NOT NULL )`,
-      );
-      db.prepare(
-        `INSERT INTO trust_signals (signal_hash, agent_id, signal_kind, payload, received_at) VALUES (?, ?, ?, ?, ?)`,
-      ).run("a".repeat(64), null, "webauthn", Buffer.from([1, 2, 3]), 1_700_000_000_000);
-      expect(
-        db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='trust_signals'").get(),
-        "precondition: the populated M8 table exists",
-      ).toBeDefined();
-      const before = db.prepare("SELECT COUNT(*) AS n FROM agents").get() as { n: number };
-
-      expect(() => ensureIdentitySchema(db)).not.toThrow();
-
-      expect(
-        db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='trust_signals'").get(),
-        "the populated M8 table is dropped on schema-ensure",
-      ).toBeUndefined();
-      // The migration is surgical: it drops ONLY the scaffold, leaving every other table intact.
-      expect(db.prepare("SELECT COUNT(*) AS n FROM agents").get()).toMatchObject({ n: before.n });
-    });
-  });
-
-  describe("the same_operator migration verifies rather than assumes (review F4)", () => {
-    it("is a silent no-op when the column already exists", () => {
-      // Idempotence: ensureTrustSignalSchema runs on every daemon start, so the second call must not
-      // throw. This is the case the bare catch was written for, and it still has to hold.
-      expect(() => ensureTrustSignalSchema(db, silent)).not.toThrow();
-      expect(() => ensureTrustSignalSchema(db, silent)).not.toThrow();
-      for (const table of ["wallet_trust_signals", "contact_trust_signals"]) {
-        const cols = (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((c) => c.name);
-        expect(cols, `${table} has the column`).toContain("same_operator");
-      }
-    });
-
-    it("THROWS when the ALTER fails and the column is genuinely absent", () => {
-      // The failure the bare swallow hid. Any non-duplicate cause — SQLITE_BUSY from a second daemon
-      // on the same DB, READONLY, FULL — used to be swallowed, after which putReceivedSignal throws
-      // "no column named same_operator", is caught upstream as a WARN, and the daemon runs with
-      // sessions forming normally while NO presented signal is ever stored.
-      //
-      // Simulated by making the ALTER fail on a table that has no such column: a stand-in table is
-      // created, then `prepare` is stubbed so the ALTER path errors and the PRAGMA reports the truth.
-      const probe = { ...db } as unknown as typeof db;
-      const realPrepare = db.prepare.bind(db);
-      let alterAttempted = false;
-      (probe as unknown as { exec: (sql: string) => void }).exec = (sql: string) => {
-        if (sql.includes("ADD COLUMN same_operator")) {
-          alterAttempted = true;
-          throw new Error("database is locked");
-        }
-        db.exec(sql);
-      };
-      (probe as unknown as { prepare: typeof realPrepare }).prepare = ((sql: string) => {
-        if (sql.startsWith("PRAGMA table_info")) {
-          // Report the column as absent — i.e. the ALTER really did not take effect.
-          return { all: () => [{ name: "signal_hash" }] } as unknown as ReturnType<typeof realPrepare>;
-        }
-        return realPrepare(sql);
-      }) as typeof realPrepare;
-
-      expect(() => ensureTrustSignalSchema(probe, silent)).toThrow(/same_operator/);
-      expect(alterAttempted, "the ALTER was actually attempted").toBe(true);
     });
   });
 

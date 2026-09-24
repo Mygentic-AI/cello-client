@@ -19,11 +19,11 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, INBOUND_SESSION_TTL_MS } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import type { DaemonConfig } from "../types.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 describe("M8C-TTL-1: session-request TTL", () => {
   let tempDir: string;
@@ -46,7 +46,7 @@ describe("M8C-TTL-1: session-request TTL", () => {
   async function makeAgentDir(name: string): Promise<void> {
     const dir = join(tempDir, "agents", name);
     await mkdir(dir, { recursive: true });
-    await FileKeyProvider.load(join(dir, "key"));
+    await provisionAgentIdentity(tempDir, name);
   }
 
   async function start(): Promise<Awaited<ReturnType<typeof startDaemon>>> {

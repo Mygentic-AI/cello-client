@@ -32,7 +32,6 @@ import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager, type ISessionNodeFactory, type SessionNodeConfig } from "../session-node-manager.js";
 import { TrustSignalStore, ensureTrustSignalSchema, type WalletSignalInput } from "../trust-signal-store.js";
 import { hashTrustSignalEnvelope, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
-import { migrateWalletAddConsentState } from "../consent-migration.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Logger } from "../types.js";
 import type { DaemonDatabase } from "../sqlcipher-db.js";
@@ -91,87 +90,20 @@ describe("DOD-END-ACCEPT-1 — consent state", () => {
   const present = (): string[] =>
     store.listAllActive({ presentingAgentPubkeyHex: alicePubkey }).map((s) => s.signalHash);
 
-  describe("the migration", () => {
-    it("is NULLABLE in both fresh and migrated schemas — SQLite forces it, so parity wins", () => {
-      // SQLite cannot ADD COLUMN with NOT NULL and no DEFAULT, so a migrated DB can only ever be
-      // nullable. A stricter fresh DDL would diverge, and the divergence would appear only on fresh
-      // installs — every new operator. Nullability is safe because the PREDICATE enforces
-      // presentability, not the constraint.
+  describe("the column", () => {
+    it("is NOT NULL — every insert names a state, so there is no unset row to guess about", () => {
       const cols = db.prepare("PRAGMA table_info(wallet_trust_signals)").all() as Array<{ name: string; notnull: number }>;
-      expect(cols.find((c) => c.name === "consent_state")!.notnull).toBe(0);
+      expect(cols.find((c) => c.name === "consent_state")!.notnull).toBe(1);
     });
 
-    it("adds the column with NO DEFAULT — the backfill needs a real discriminator", () => {
-      const cols = db.prepare("PRAGMA table_info(wallet_trust_signals)").all() as Array<{ name: string; dflt_value: string | null }>;
-      const consent = cols.find((c) => c.name === "consent_state");
-      expect(consent, "consent_state column must exist").toBeDefined();
-      // With a DEFAULT, every existing row gets a value the instant the column is created, so the
-      // one-time backfill matches NOTHING — the exact trap contacts-tier-migration documents.
-      expect(consent!.dflt_value).toBeNull();
-    });
-
-    it("BACKFILLS a LEGACY database's rows to accepted — they are all portal-issued", () => {
-      // Simulates the real migration case: a wallet that predates the column entirely. Defaulting
-      // those rows to 'pending' would silently make every phone/email signal already in every wallet
-      // unpresentable — a data-loss-shaped bug that raises no error.
-      // A genuine legacy shape: neither consent column present.
-      db.exec("ALTER TABLE wallet_trust_signals DROP COLUMN consent_state");
-      db.exec("ALTER TABLE wallet_trust_signals DROP COLUMN consent_notified_at");
-      db.prepare(
-        `INSERT INTO wallet_trust_signals
-           (signal_hash, subject_kind, subject, issuer_kind, issuer_pubkey, type, schema_version,
-            payload, issued_at, expires_at, supersedes_hash, status, received_at, default_present)
-         VALUES (?, 'agent', ?, 'portal', 'aabb', 'phone', 1, ?, 1, NULL, NULL, 'active', 1, 1)`,
-      ).run(HASH("1"), alicePubkey, Buffer.from([1]));
-
-      migrateWalletAddConsentState(db, silent);
-
-      const rows = db.prepare("SELECT consent_state FROM wallet_trust_signals").all() as Array<{ consent_state: string | null }>;
-      expect(rows.length).toBe(1);
-      expect(rows[0].consent_state).toBe("accepted");
-      expect(present()).toContain(HASH("1"));
-    });
-
-    it("THE BIRTH GATE: once the column exists, the migration NEVER re-backfills", () => {
-      // This is the clobber protection stated directly. The one-time step is tied to the column being
-      // CREATED, not to a NULL that could reappear later — so a row deliberately set to something
-      // else (or to NULL by a stray write) is never "repaired" into presentability behind the
-      // operator's back.
-      store.putWalletSignal(envelope({ signalHash: HASH("9"), subject: alicePubkey, issuerKind: "agent" }));
-      db.prepare("UPDATE wallet_trust_signals SET consent_state = NULL WHERE signal_hash = ?").run(HASH("9"));
-
-      migrateWalletAddConsentState(db, silent);
-
-      const got = db.prepare("SELECT consent_state FROM wallet_trust_signals WHERE signal_hash = ?").get(HASH("9")) as { consent_state: string | null };
-      expect(got.consent_state).toBeNull();   // untouched — NOT promoted to accepted
-      expect(present()).not.toContain(HASH("9"));  // and unpresentable, fail-closed
-    });
-
-    it("IS IDEMPOTENT — a second run is a no-op, not a re-backfill", () => {
-      expect(() => migrateWalletAddConsentState(db, silent)).not.toThrow();
-      expect(() => migrateWalletAddConsentState(db, silent)).not.toThrow();
-    });
-
-    it("🚨 A REFUSED SIGNAL SURVIVES A RESTART — the clobber this file exists to prevent", () => {
-      // The failure: an unconditional backfill inside ensureTrustSignalSchema flips a REFUSED
-      // endorsement back to `accepted` on the next daemon start, silently, and it becomes
-      // presentable. Tie the one-time step to COLUMN BIRTH, not to NULL-ness, and it cannot happen.
+    it("🚨 A REFUSED SIGNAL SURVIVES A RESTART — schema ensure never re-judges a decision", () => {
       store.putWalletSignal(envelope({ signalHash: HASH("2"), subject: alicePubkey, issuerKind: "agent" }));
       store.setConsentState(HASH("2"), "refused");
 
-      // Every path a restart runs.
       ensureTrustSignalSchema(db, silent);
-      migrateWalletAddConsentState(db, silent);
 
       expect(store.getWalletSignal(HASH("2"))!.consentState).toBe("refused");
       expect(present()).not.toContain(HASH("2"));
-    });
-
-    it("fresh == migrated: a brand-new database has the column too", () => {
-      // CREATE_WALLET_SQL must carry it, or a fresh install and a migrated one diverge — and the
-      // divergence only shows up on the fresh one, which is every new operator.
-      const cols = (db.prepare("PRAGMA table_info(wallet_trust_signals)").all() as Array<{ name: string }>).map((c) => c.name);
-      expect(cols).toContain("consent_state");
     });
   });
 
@@ -207,8 +139,6 @@ describe("DOD-END-ACCEPT-1 — consent state", () => {
         db.prepare("UPDATE wallet_trust_signals SET consent_state = ? WHERE signal_hash = ?").run(bogus, HASH("6"));
         expect(present(), `consent_state=${JSON.stringify(bogus)}`).not.toContain(HASH("6"));
       }
-      db.prepare("UPDATE wallet_trust_signals SET consent_state = NULL WHERE signal_hash = ?").run(HASH("6"));
-      expect(present(), "consent_state=NULL").not.toContain(HASH("6"));
     });
 
     it("the filter is in the SQL, so `include` cannot route around it", () => {
@@ -339,29 +269,5 @@ describe("DOD-END-ACCEPT-1 — consent state", () => {
       store.setConsentState(HASH("4"), "refused");
       expect(store.listPresentable({ agentPubkeyHex: alicePubkey, accountId: "acct-x" })).toEqual([]);
     });
-  });
-
-  it("a PARTIALLY migrated database (one column, not the other) migrates instead of crashing", () => {
-    // Self-inflicted boot failure, caught by the suite: both columns were added under ONE birth gate
-    // keyed on consent_state, so a DB holding consent_state but missing consent_notified_at hit
-    // `duplicate column name`, the migration rethrew, and the daemon refused to start. Each column is
-    // gated independently now — and the backfill stays tied to consent_state's birth, so rows that
-    // already carry a decision are not re-judged.
-    store.putWalletSignal(envelope({ signalHash: HASH("e"), subject: alicePubkey, issuerKind: "agent" }));
-    store.setConsentState(HASH("e"), "refused");
-    db.exec("ALTER TABLE wallet_trust_signals DROP COLUMN consent_notified_at");
-
-    expect(() => migrateWalletAddConsentState(db, silent)).not.toThrow();
-
-    // THE PAIRED POSITIVE, and it is the assertion that was missing. The two negatives below are
-    // satisfied by the migration returning early and doing NOTHING — which is exactly what it did:
-    // the outer gate keyed on `consent_state` alone, so every UPGRADED database (the real production
-    // shape) skipped the new column entirely while fresh installs got it. The test passed
-    // byte-identically on the parent commit. A negative is only as good as the positive beside it.
-    const cols = (db.prepare("PRAGMA table_info(wallet_trust_signals)").all() as Array<{ name: string }>)
-      .map((c) => c.name);
-    expect(cols, "the column the migration exists to add").toContain("consent_notified_at");
-
-    expect(store.getWalletSignal(HASH("e"))!.consentState).toBe("refused");  // NOT re-backfilled
   });
 });

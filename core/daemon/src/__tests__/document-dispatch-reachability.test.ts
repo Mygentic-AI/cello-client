@@ -22,7 +22,7 @@ import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Buffer } from "node:buffer";
-import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
+import { generateKeypair } from "@cello-protocol/crypto";
 import { createNode } from "@cello-protocol/transport";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
@@ -31,6 +31,7 @@ import { DUAL_SURFACE_VERBS } from "../vocabulary.js";
 import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
+import { provisionAgentIdentity } from "../testing.js";
 
 function makeLogger(): Logger {
   return { debug() {}, info() {}, warn() {}, error() {} };
@@ -76,7 +77,7 @@ describe("the document verbs answer over the daemon socket", () => {
     await mkdir(dir, { recursive: true });
     const agentDir = join(dir, "agents", "alice");
     await mkdir(agentDir, { recursive: true });
-    const kp = await FileKeyProvider.load(join(agentDir, "key"));
+    const kp = await provisionAgentIdentity(dir, "alice");
     const pubkey = Buffer.from(await kp.getPublicKey()).toString("hex");
 
     const config: DaemonConfig = {

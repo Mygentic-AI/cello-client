@@ -26,7 +26,7 @@ import { decodeCbor } from "@cello-protocol/protocol-types";
 import type { SignalSubjectKind, SubmissionOp, ConsortiumManifest } from "@cello-protocol/protocol-types";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { SignalingManager } from "@cello-protocol/transport";
-import { CONSENT_ACCEPTED } from "./consent-migration.js";
+import { CONSENT_ACCEPTED } from "./trust-signal-store.js";
 import { revocabilityOf } from "./signal-revocability.js";
 import { composeSealedSubmission, fetchSubmissionResults, sendSealedSubmission } from "./signal-submission.js";
 import { DEFAULT_RETRY_WINDOW_MS, isRetryableSendFailure } from "./submission-retry.js";

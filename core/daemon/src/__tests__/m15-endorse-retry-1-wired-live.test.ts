@@ -19,7 +19,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { FileKeyProvider, InMemoryKeyProvider } from "@cello-protocol/crypto";
+import { InMemoryKeyProvider } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { randomBytes } from "node:crypto";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
@@ -28,6 +28,7 @@ import type { Logger, DaemonConfig } from "../types.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { Stream } from "@libp2p/interface";
+import { provisionAgentIdentity } from "../testing.js";
 
 const DAY = 24 * 60 * 60 * 1000;
 const wait = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -115,7 +116,7 @@ describe("DOD-M15-ENDORSE-RETRY-1 — over a live daemon", () => {
   async function makeAgentDir(name: string): Promise<string> {
     const d = join(dir, "agents", name);
     await mkdir(d, { recursive: true });
-    const kp = await FileKeyProvider.load(join(d, "key"));
+    const kp = await provisionAgentIdentity(dir, name);
     return Buffer.from(await kp.getPublicKey()).toString("hex");
   }
 

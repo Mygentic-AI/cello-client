@@ -28,7 +28,7 @@ import { REFUSAL_REASONS, NOT_ACCEPTING_CALLER_GUIDANCE, type RefusalReason, typ
 import { WIRE_REASON_RE } from "./counterparty-refusal.js";
 import { parseSessionAssignment } from "./session-assignment-parser.js";
 import { extractOfferedMoniker } from "./session-assignment-parser.js";
-import { TIER } from "./contacts-tier-migration.js";
+import { TIER } from "./contact-tier.js";
 import type { RelayConnectParams } from "./session-node-manager.js";
 import type { RelayAssignmentCarry } from "./session-relay-client.js";
 import { extractErrorMessage } from "./error-message.js";

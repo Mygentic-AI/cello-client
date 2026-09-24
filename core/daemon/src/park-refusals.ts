@@ -343,20 +343,6 @@ export function refusalRecurrence(
   total: number,
   firstAt: number,
   lastAt: number,
-  /**
-   * Is `total` an exact count or a FLOOR? — review M5.
-   *
-   * A row seeded at upgrade takes its total from a notice's `count`, which resets on dismissal, so
-   * both the count and the span are lower bounds. The drain five lines away already reports a
-   * seeded row as `timesTotalAtLeast` for exactly this reason, and this sentence was asserting the
-   * same number as a figure right beside it — *"the original lie with the new name on it"*, which
-   * is the phrase `DOD-M15-REFUSALTERMINAL-1` used about the defect it removed.
-   *
-   * On the daemon this unit was written for the row IS seeded: the inbox reported
-   * `times_total_at_least: 731`, so the very first thing an unqualified sentence would have shipped
-   * is "it has fired 731 times" next to a field saying "at least".
-   */
-  seeded: boolean,
 ): string | null {
   if (!Number.isFinite(total) || total < 3) return null;
   const span = lastAt - firstAt;
@@ -379,14 +365,10 @@ export function refusalRecurrence(
    *
    * What is left is arithmetic over two stored timestamps and a count, which is all the row has.
    */
-  const count = seeded ? `at least ${total} times` : `${total} times`;
   return (
-    `RECORDED ${count.toUpperCase()} on this conversation, about once every ` +
+    `RECORDED ${total} TIMES on this conversation, about once every ` +
     `${humanizeInterval(everyMs)} across ${humanizeInterval(span)} — so read the number as ONE ` +
-    `recurring refusal being counted, not as that many separate problems to work through` +
-    (seeded
-      ? ". The count began when this daemon was upgraded and dismissals are not counted, so the true figure may be far higher."
-      : ".")
+    `recurring refusal being counted, not as that many separate problems to work through.`
   );
 }
 

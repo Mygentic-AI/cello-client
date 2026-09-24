@@ -71,22 +71,6 @@ export class SessionSealLeafStore {
     this.#db = db;
     this.#logger = logger;
     this.#db.exec(CREATE_SQL);
-    this.#migrateRunningRoot();
-  }
-
-  /**
-   * 069-ORDERPROOF: add `relay_running_root` to a table created before this order. `CREATE TABLE IF
-   * NOT EXISTS` leaves an existing table untouched, so without this an upgraded daemon would write
-   * to a column that is not there. Idempotent, additive and nullable — no row is rewritten and no
-   * existing evidence is invalidated.
-   */
-  #migrateRunningRoot(): void {
-    const cols = new Set(
-      (this.#db.prepare(`PRAGMA table_info(session_seal_leaves)`).all() as Array<{ name: string }>).map((c) => c.name),
-    );
-    if (!cols.has("relay_running_root")) {
-      this.#db.exec(`ALTER TABLE session_seal_leaves ADD COLUMN relay_running_root TEXT`);
-    }
   }
 
   /**

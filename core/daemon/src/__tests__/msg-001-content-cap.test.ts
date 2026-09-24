@@ -21,7 +21,6 @@ import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { MAX_CONTENT_BYTES, IT_LENGTH_PREFIX_DEFAULT_MAX } from "@cello-protocol/protocol-types";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
@@ -29,6 +28,7 @@ import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
+import { provisionAgentIdentity } from "../testing.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 
@@ -86,7 +86,7 @@ describe("MSG-001: content size cap (send side, daemon)", () => {
   async function makeAgentDir(name: string): Promise<void> {
     const dir = join(tempDir, "agents", name);
     await mkdir(dir, { recursive: true });
-    await FileKeyProvider.load(join(dir, "key"));
+    await provisionAgentIdentity(tempDir, name);
   }
 
   async function start(logger: Logger, node: CelloNode): Promise<Awaited<ReturnType<typeof startDaemon>>> {

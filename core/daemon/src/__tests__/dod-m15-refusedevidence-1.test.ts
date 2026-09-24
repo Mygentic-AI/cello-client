@@ -31,13 +31,14 @@ import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash, randomBytes } from "node:crypto";
-import { FileKeyProvider, generateKeypair, verify } from "@cello-protocol/crypto";
+import { generateKeypair, verify } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { frameQuarantinedPayload } from "../quarantine-framing.js";
 import type { Logger } from "../types.js";
 import type { SecurityGatewayClient, ScreenContext, ScreenVerdict, GatewayMode } from "@cello-protocol/gateway";
 import { connectToDaemon } from "../ipc-client.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 /** The screening seam's own interface, supplying a TERMINAL block — the verdict that leafs the
  *  content hash, acknowledges the sender, and never hands the message to the agent. */
@@ -77,7 +78,7 @@ describe("DOD-M15-REFUSEDEVIDENCE-1 — a refused message is kept, flagged, and 
 
   async function start(gateway: SecurityGatewayClient = new PassthroughGatewayClient()): Promise<DaemonHandle> {
     await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
-    await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+    await provisionAgentIdentity(tempDir, "alice");
     handle = await startDaemon({
       securityGateway: gateway,
       celloDir: tempDir,

@@ -19,9 +19,9 @@ import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
 import { readLock } from "../lock-file.js";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import { isAgentRunning } from "../agent-state.js";
 import type { Logger, DaemonConfig, DaemonStatusResponse } from "../types.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 describe("daemon", () => {
   let tempDir: string;
@@ -121,7 +121,7 @@ describe("daemon", () => {
     // Create an agent directory with a valid key
     const agentsDir = join(tempDir, "agents");
     await mkdir(join(agentsDir, "test-agent"), { recursive: true });
-    const keyProvider = await FileKeyProvider.load(join(agentsDir, "test-agent", "key"));
+    const keyProvider = await provisionAgentIdentity(tempDir, "test-agent");
     const pubkey = Buffer.from(await keyProvider.getPublicKey()).toString("hex");
 
     handle = await startDaemon(makeConfig());
@@ -138,7 +138,7 @@ describe("daemon", () => {
   it("CC-8: getStatus reports an ONLINE agent as state 'online' (CLI/MCP status parity)", async () => {
     const agentsDir = join(tempDir, "agents");
     await mkdir(join(agentsDir, "on-agent"), { recursive: true });
-    await FileKeyProvider.load(join(agentsDir, "on-agent", "key"));
+    await provisionAgentIdentity(tempDir, "on-agent");
 
     const config = makeConfig();
     handle = await startDaemon(config);
@@ -168,8 +168,8 @@ describe("daemon", () => {
     const agentsDir = join(tempDir, "agents");
     await mkdir(join(agentsDir, "a1"), { recursive: true });
     await mkdir(join(agentsDir, "a2"), { recursive: true });
-    await FileKeyProvider.load(join(agentsDir, "a1", "key"));
-    await FileKeyProvider.load(join(agentsDir, "a2", "key"));
+    await provisionAgentIdentity(tempDir, "a1");
+    await provisionAgentIdentity(tempDir, "a2");
 
     handle = await startDaemon(makeConfig());
 
@@ -189,7 +189,7 @@ describe("daemon", () => {
   it("IPC status method returns the same as getStatus()", async () => {
     const agentsDir = join(tempDir, "agents");
     await mkdir(join(agentsDir, "ipc-agent"), { recursive: true });
-    await FileKeyProvider.load(join(agentsDir, "ipc-agent", "key"));
+    await provisionAgentIdentity(tempDir, "ipc-agent");
 
     const config = makeConfig();
     handle = await startDaemon(config);

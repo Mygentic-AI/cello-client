@@ -14,8 +14,8 @@ import { tmpdir } from "node:os";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig } from "../types.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 describe("M8C-SINCESEQ-1: transcript-only and document-leaf reads", () => {
   let tempDir: string;
@@ -41,7 +41,7 @@ describe("M8C-SINCESEQ-1: transcript-only and document-leaf reads", () => {
   async function setupWithAgents(...names: string[]): Promise<DaemonConfig> {
     for (const name of names) {
       await mkdir(join(tempDir, "agents", name), { recursive: true });
-      await FileKeyProvider.load(join(tempDir, "agents", name, "key"));
+      await provisionAgentIdentity(tempDir, name);
     }
     return {
       securityGateway: new PassthroughGatewayClient(),

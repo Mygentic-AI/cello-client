@@ -103,118 +103,14 @@ const CREATE_AGENTS_SQL = `
 const CREATE_ACTIVE_NAME_INDEX_SQL =
   "CREATE UNIQUE INDEX IF NOT EXISTS agents_active_name ON agents(agent_name) WHERE state != 'retired'";
 
-// The columns of the legacy `agents` table (agent_name PK, no agent_id), in order. Used to copy rows
-// verbatim during the one-time re-key rebuild.
-const PRE_REKEY_COLUMNS = [
-  "agent_name",
-  "k_local_seed",
-  "k_local_pubkey",
-  "state",
-  "ml_dsa_pubkey",
-  "ml_dsa_secret",
-  "ml_dsa_algorithm",
-  "frost_epoch_id",
-  "frost_primary_pubkey",
-  "frost_identifier",
-  "frost_signing_share",
-  "frost_threshold",
-  "frost_participants",
-  "frost_commitments",
-  "frost_verifying_shares",
-  "frost_dkg_method",
-  "reg_agent_id",
-  "reg_primary_pubkey",
-  "reg_ml_dsa_pubkey",
-  "reg_registered_at",
-  "reg_status",
-  "link_agent_id",
-  "link_pre_auth_token",
-  "link_linked_at",
-  "created_at",
-  "updated_at",
-] as const;
-
 /**
- * One-time re-key of a legacy `agents` table (PRIMARY KEY agent_name, no agent_id) to the stable
- * agent_id shape. Rebuilds the table, backfilling a fresh agent_id per existing row. Runs at most once
- * — `ensureIdentitySchema` guards it behind a column-presence check — and is wrapped in a transaction
- * so a crash mid-rebuild leaves the original table intact. Works on node:sqlite (in-memory test
- * handles) and SQLCipher alike.
- */
-function rebuildAgentsToAgentIdPk(db: DaemonDatabase): void {
-  const cols = PRE_REKEY_COLUMNS.join(", ");
-  db.exec("BEGIN");
-  try {
-    db.exec("ALTER TABLE agents RENAME TO agents_pre_rekey");
-    db.exec(CREATE_AGENTS_SQL);
-    db.exec(
-      `INSERT INTO agents (agent_id, ${cols})
-       SELECT lower(hex(randomblob(16))), ${cols} FROM agents_pre_rekey`,
-    );
-    db.exec("DROP TABLE agents_pre_rekey");
-    db.exec("COMMIT");
-  } catch (err) {
-    try { db.exec("ROLLBACK"); } catch { /* the failing statement may have already aborted the txn */ }
-    throw err;
-  }
-}
-
-/**
- * Idempotent schema for the identity store. Called once at daemon init AND defensively by each
+ * Schema for the identity store. Called once at daemon init AND defensively by each
  * DbRegistrationPersistence constructor, so the store works whether or not the composition root has
- * run its own ensure. Creates the table on a fresh DB, re-keys a legacy table to the stable agent_id
- * shape once, and (always) ensures the active-name partial unique index.
+ * run its own ensure.
  */
 export function ensureIdentitySchema(db: DaemonDatabase): void {
-  const cols = db.prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>;
-  if (cols.length === 0) {
-    db.exec(CREATE_AGENTS_SQL);
-  } else if (!cols.some((c) => c.name === "agent_id")) {
-    // A legacy table exists (agent_name PK). Re-key it once to the stable agent_id shape.
-    rebuildAgentsToAgentIdPk(db);
-  } else {
-    // Additive columns on an existing agent_id table (fresh/rebuilt tables already have them via
-    // CREATE_AGENTS_SQL). SQLite has no ADD COLUMN IF NOT EXISTS, so each is PRAGMA-guarded — and
-    // each guard is an INDEPENDENT `if`: a table missing several must receive every ALTER.
-    if (!cols.some((c) => c.name === "frost_directory_node_ids")) {
-      // Nullable → agents predating quorum DKG keep the full-roster fallback; no data touched.
-      db.exec("ALTER TABLE agents ADD COLUMN frost_directory_node_ids TEXT");
-    }
-    if (!cols.some((c) => c.name === "moniker")) {
-      // Outbound-name override. Nullable → existing agents keep the agent-name default.
-      db.exec("ALTER TABLE agents ADD COLUMN moniker TEXT");
-    }
-    if (!cols.some((c) => c.name === "reg_key_binding")) {
-      // 038-KEYBIND. Nullable, because an operator's existing row cannot grow a signature by a
-      // migration — the value is minted by the daemon holding the seed, on the next registration.
-      //
-      // A null here has no local consequence and nothing detects it: this column is written and
-      // read by nothing yet (see `RegistrationStateRecord.keyBinding`). What makes a pre-038 agent
-      // unusable is the DIRECTORY-side profile having no binding, which both clients refuse an
-      // assignment over — and the remedy for that is the same re-registration that fills this in.
-      db.exec("ALTER TABLE agents ADD COLUMN reg_key_binding TEXT");
-    }
-    if (!cols.some((c) => c.name === "channel")) {
-      // M16: every existing row is an ordinary agent — channels did not exist before this column.
-      db.exec("ALTER TABLE agents ADD COLUMN channel INTEGER NOT NULL DEFAULT 0");
-    }
-    if (!cols.some((c) => c.name === "admin_pubkey")) {
-      db.exec("ALTER TABLE agents ADD COLUMN admin_pubkey TEXT NOT NULL DEFAULT ''");
-    }
-    // M9D 002-PQKEYS. Nullable in SQLite; presence is enforced where it matters — `loadAgents`
-    // refuses a REGISTERED row missing either seed, and registration refuses to start without both.
-    for (const col of ["ml_kem_seed BLOB", "ml_kem_pubkey TEXT", "reg_ml_kem_pubkey TEXT", "reg_key_binding_pq TEXT"]) {
-      if (!cols.some((c) => c.name === col.split(" ")[0])) db.exec(`ALTER TABLE agents ADD COLUMN ${col}`);
-    }
-  }
+  db.exec(CREATE_AGENTS_SQL);
   db.exec(CREATE_ACTIVE_NAME_INDEX_SQL);
-  // M10-D18: DROP the M8 `trust_signals` scaffold. It held canonical-JSON records keyed by a RAW hash;
-  // M10 wallet signals are canonical CBOR envelopes in `wallet_trust_signals` (TrustSignalStore),
-  // re-derived via deliverWalletSignal. The M8 shape can't migrate (different hash + format) and is
-  // re-mintable (D1), so the scaffold is dropped, not converted. IF EXISTS + no FK children → safe and
-  // idempotent on both fresh and existing operator DBs. This is the forcing-function drop that MINT-
-  // INTERNAL-1 owes; a test asserts the table is GONE.
-  db.exec("DROP TABLE IF EXISTS trust_signals");
 }
 
 const toBuf = (b: Uint8Array): Buffer => Buffer.from(b);
@@ -253,11 +149,6 @@ export class DbIdentityStore {
     this.#logger = logger;
     ensureIdentitySchema(db);
   }
-
-  // M10-D18: `storeTrustSignal` / `getTrustSignal` (the M8 `trust_signals` writer + reader) are RETIRED.
-  // A received wallet signal is now a canonical CBOR envelope, re-verified and stored in
-  // `wallet_trust_signals` by `TrustSignalStore.deliverWalletSignal` (inbound-sessions). The M8 table is
-  // dropped in `ensureIdentitySchema` above.
 
   /** True if an ACTIVE (non-retired) agent row with this name exists — the create-collision check. */
   hasActiveAgent(agentName: string): boolean {

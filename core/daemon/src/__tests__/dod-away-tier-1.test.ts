@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import { seedAgents } from "./helpers/seed-agents.js";
-import { TIER } from "../contacts-tier-migration.js";
+import { TIER } from "../contact-tier.js";
 import { awayTierSettingKey, AWAY_DEFAULT_KEY } from "../agent-settings-keys.js";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager, type ISessionNodeFactory, type SessionNodeConfig } from "../session-node-manager.js";

@@ -32,7 +32,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID, createHash } from "node:crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
-import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
+import { generateKeypair } from "@cello-protocol/crypto";
 import { createNode } from "@cello-protocol/transport";
 import type { CelloNode } from "@cello-protocol/transport";
 import { SessionNodeManager } from "../session-node-manager.js";
@@ -44,6 +44,7 @@ import { sealParkEnvelope } from "../park-envelope.js";
 import { startParkRelay } from "./helpers/park-relay.js";
 import type { DaemonConfig, Logger } from "../types.js";
 import { seedAgents } from "./helpers/seed-agents.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 
@@ -515,7 +516,7 @@ describe("C: the daemon composition root wires the drain to the standing receive
   it("C1: a standing-receiver rebuild inside a RUNNING daemon drains the mailbox, and the failure names its cause", async () => {
     const relay = await startHopRelay();
     await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
-    await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+    await provisionAgentIdentity(tempDir, "alice");
 
     handle = await startDaemon(makeConfig());
     const manager = handle.getSessionNodeManager();

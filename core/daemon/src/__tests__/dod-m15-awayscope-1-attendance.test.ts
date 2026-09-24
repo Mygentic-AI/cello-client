@@ -24,7 +24,6 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
@@ -33,6 +32,7 @@ import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-man
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
 import type { AgentRelayClient, LivenessAnswer } from "../session-relay-client.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 class FakeNode implements Partial<CelloNode> {
   readonly #peerId = `fake-${Math.random().toString(36).slice(2)}`;
@@ -110,7 +110,7 @@ describe("DOD-M15-AWAYSCOPE-1: the daemon announces its own attendance, and neve
 
   async function setup() {
     await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
-    await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+    await provisionAgentIdentity(tempDir, "alice");
     const config: DaemonConfig = {
       securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir, socketPath: join(tempDir, "daemon.sock"), lockFilePath: join(tempDir, "daemon.lock"),

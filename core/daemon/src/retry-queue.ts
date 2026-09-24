@@ -132,10 +132,6 @@ export class RetryQueue {
     this.#db = db;
     this.#logger = logger;
 
-    // Create table + index if not exists (inline migration — not Flyway).
-    // ORDERING CONSTRAINT: migrateSessionTablesToAgentId (run by SessionNodeManager.initialize) MUST
-    // execute BEFORE this constructor, so the table here either does not exist (fresh DB, created
-    // below) or already carries agent_id. Do not reorder.
     this.#db.exec(`
       CREATE TABLE IF NOT EXISTS retry_queue (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -158,35 +154,6 @@ export class RetryQueue {
         content_hash_alg TEXT
       )
     `);
-    // Idempotent add for databases created before M12-P12. SQLite has no ADD COLUMN IF NOT EXISTS,
-    // so the duplicate-column error is the expected no-op on an already-migrated DB; any OTHER
-    // error is a real failure and must not be swallowed.
-    /**
-     * 🚨 A COLUMN ADDED HERE NEEDS A SECOND ENTRY, in `agent-id-migration.ts`'s `retry_queue`
-     * `createSql`. That rebuild copies the INTERSECTION of the old and new column lists, so a column
-     * this loop adds and that DDL omits is DROPPED on the one boot where a legacy database migrates
-     * — and then re-added EMPTY by this very loop, which is what makes it silent.
-     *
-     * It has happened: `structure1_cbor` and `structure2_cbor` were missing from that DDL from the
-     * day they were added until `DOD-M15-SEALWIRE-1` part B2b found it.
-     */
-    for (const col of [
-      { name: "structure1_cbor", type: "BLOB" },
-      { name: "structure2_cbor", type: "BLOB" },
-      { name: "structure1_sig", type: "BLOB" },
-      { name: "leaf_kind", type: "INTEGER" },
-      // DOD-M15-SEALWIRE-1 part B2b: which content-hash algorithm this queued message was hashed
-      // under. The crash-backstop park producer has no other source for it — the frame is gone by
-      // the time it runs — and re-parking under the wrong one gets the message refused.
-      { name: "content_hash_alg", type: "TEXT" },
-    ]) {
-      try {
-        this.#db.exec(`ALTER TABLE retry_queue ADD COLUMN ${col.name} ${col.type}`);
-      } catch (err: unknown) {
-        const msg = extractErrorMessage(err);
-        if (!/duplicate column name/i.test(msg)) throw err;
-      }
-    }
     this.#db.exec(`
       CREATE INDEX IF NOT EXISTS retry_queue_by_session_position
         ON retry_queue(session_id, position ASC)

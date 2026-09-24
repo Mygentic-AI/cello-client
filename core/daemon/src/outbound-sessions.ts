@@ -30,7 +30,7 @@ import { createSignalingConnect } from "./signaling-connect.js";
 import type { IDirectoryChallengeVerifier } from "@cello-protocol/transport";
 import { wireSessionCeremonyHandler, wireSealCeremonyHandler } from "./session-ceremony.js";
 import { TrustSignalStore } from "./trust-signal-store.js";
-import { TIER } from "./contacts-tier-migration.js";
+import { TIER } from "./contact-tier.js";
 import { encodeTrustSignalEnvelope, hashTrustSignalEnvelope } from "@cello-protocol/protocol-types";
 import { extractErrorMessage } from "./error-message.js";
 

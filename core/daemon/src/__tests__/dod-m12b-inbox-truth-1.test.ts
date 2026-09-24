@@ -38,8 +38,8 @@ import { tmpdir } from "node:os";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle, INBOUND_SESSION_TTL_MS } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig } from "../types.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 const SID64 = (a: string) => a.repeat(64).slice(0, 64);
 
@@ -76,7 +76,7 @@ describe("DOD-M12B-INBOX-TRUTH-1: the inbox does not report accepted sessions as
   async function setupWithAgents(...names: string[]): Promise<DaemonConfig> {
     for (const name of names) {
       await mkdir(join(tempDir, "agents", name), { recursive: true });
-      await FileKeyProvider.load(join(tempDir, "agents", name, "key"));
+      await provisionAgentIdentity(tempDir, name);
     }
     return {
       securityGateway: new PassthroughGatewayClient(),

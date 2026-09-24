@@ -24,11 +24,11 @@ import { tmpdir } from "node:os";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig } from "../types.js";
 // These assert the agent is RUNNING, not which rung it landed on — the rung depends on attendance
 // and on whether a directory is reachable, neither of which these tests are about.
 import { isAgentRunning } from "../agent-state.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 describe("MCP-001: agent lifecycle and per-connection state", () => {
   let tempDir: string;
@@ -77,7 +77,7 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     const agentsDir = join(tempDir, "agents");
     for (const name of agentNames) {
       await mkdir(join(agentsDir, name), { recursive: true });
-      await FileKeyProvider.load(join(agentsDir, name, "key"));
+      await provisionAgentIdentity(tempDir, name);
     }
     return makeConfig();
   }

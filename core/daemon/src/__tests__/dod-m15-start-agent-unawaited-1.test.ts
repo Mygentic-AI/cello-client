@@ -31,7 +31,6 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
@@ -39,6 +38,7 @@ import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
+import { provisionAgentIdentity } from "../testing.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 
@@ -94,7 +94,7 @@ describe("DOD-M15-START-AGENT-UNAWAITED-1: cello_start_agent reports standing-re
   async function makeAgentDir(name: string): Promise<void> {
     const dir = join(tempDir, "agents", name);
     await mkdir(dir, { recursive: true });
-    await FileKeyProvider.load(join(dir, "key"));
+    await provisionAgentIdentity(tempDir, name);
   }
 
   async function start(logger: Logger, node: CelloNode) {

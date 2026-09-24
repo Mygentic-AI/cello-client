@@ -42,7 +42,6 @@ import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import {
   encodeDocumentUpdateEnvelope,
   DOCUMENT_UPDATE_ENCODING_V1,
@@ -53,6 +52,7 @@ import { DOCUMENTS_FLAG_ENV } from "../document-flag.js";
 import { isDocumentFrame } from "../document-frame-router.js";
 import type { Logger, DaemonConfig } from "../types.js";
 import { createHash } from "node:crypto";
+import { provisionAgentIdentity } from "../testing.js";
 
 /** A real document update envelope, encoded the way a peer puts it on the wire. */
 function documentFrameBytes(): Uint8Array {
@@ -103,7 +103,7 @@ describe("074-DOCSFLAG — an inbound document frame with the layer OFF", () => 
     if (flag === "on") process.env[DOCUMENTS_FLAG_ENV] = "1";
     else delete process.env[DOCUMENTS_FLAG_ENV];
     await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
-    await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+    await provisionAgentIdentity(tempDir, "alice");
     const push = (level: string) => (event: string, fields?: Record<string, unknown>) =>
       events.push({ level, event, fields: fields ?? {} });
     const logger = {

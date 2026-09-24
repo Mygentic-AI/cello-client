@@ -13,7 +13,7 @@
  * Everything is moved verbatim, comments included. The prose is the asset: much of it records why a
  * bound has the value it has, or a defect that came back once already.
  */
-import { TIER, DEFAULT_TIER_BOUNDS } from "./contacts-tier-migration.js";
+import { TIER, DEFAULT_TIER_BOUNDS } from "./contact-tier.js";
 import type { RefusalKind } from "./refusal-reasons.js";
 import { SessionConnectionGater } from "./session-connection-gater.js";
 import { NodeAutoNatService, type CelloNode } from "@cello-protocol/transport";
@@ -803,21 +803,8 @@ export interface RefusalNotice {
    * OMITTED, never guessed, when the notice is served from the in-memory fallback — that path
    * exists precisely because the database write failed, so no durable total was ever written, and
    * reporting the smaller number twice would put the original lie back with two names on it.
-   *
-   * MUTUALLY EXCLUSIVE with `timesTotalAtLeast`: a figure and a floor are different claims and
-   * must not share a name.
    */
   timesTotal?: number;
-  /**
-   * A LOWER BOUND on the lifetime count, for a row SEEDED at upgrade from a notice that already
-   * existed — review F1c.
-   *
-   * The seed is that notice's `count`, which is refusals since the last dismissal, so the true
-   * figure is at least this and may be far more: on the machine this unit was written for, the
-   * notice read 58 and the log held 232,056 refusal events. Reporting 58 as `timesTotal` would be
-   * the original defect with the new name on it. "At least 58" is true; "58" is not.
-   */
-  timesTotalAtLeast?: number;
   /**
    * `041-PARKSTUCK` — that this refusal REPEATS, and roughly how often, in a sentence.
    *

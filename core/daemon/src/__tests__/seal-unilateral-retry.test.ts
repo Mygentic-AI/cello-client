@@ -38,7 +38,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Encoder, decode } from "cbor-x";
 import * as lp from "it-length-prefixed";
-import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
+import { generateKeypair } from "@cello-protocol/crypto";
 import { createNode } from "@cello-protocol/transport";
 import { buildSealTbs } from "@cello-protocol/protocol-types";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
@@ -53,6 +53,7 @@ import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/
 import type { SessionAssignment } from "@cello-protocol/protocol-types";
 import { registerFixtureSigner } from "./helpers/signed-assignment.js";
 import { fakeRelayAttestation, fakeRelayPubkeyHex } from "./relay-client-fake.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
@@ -287,7 +288,7 @@ describe("M8B FINDING-1: unilateral seal escalation on retry close", () => {
   async function makeAgent(celloDir: string, name: string): Promise<string> {
     const dir = join(celloDir, "agents", name);
     await mkdir(dir, { recursive: true });
-    const kp = await FileKeyProvider.load(join(dir, "key"));
+    const kp = await provisionAgentIdentity(celloDir, name);
     const hex = Buffer.from(await kp.getPublicKey()).toString("hex");
     // 038-KEYBIND: a REAL agent, so the assignment fixture can sign a key binding as it.
     registerFixtureSigner(hex, kp);

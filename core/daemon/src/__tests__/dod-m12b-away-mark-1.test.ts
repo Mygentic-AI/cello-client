@@ -38,7 +38,6 @@ import { tmpdir } from "node:os";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig } from "../types.js";
 import {
   AWAY_AUTO_REPLY_TEXTS,
@@ -47,6 +46,7 @@ import {
   isAutoReplyMarked,
   markAsAutoReply,
 } from "../away-detection.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 const SID64 = (a: string) => a.repeat(64).slice(0, 64);
 
@@ -134,7 +134,7 @@ describe("DOD-M12B-AWAY-MARK-1: the receiving side is told, and is never silence
   async function setup(...names: string[]): Promise<DaemonConfig> {
     for (const name of names) {
       await mkdir(join(tempDir, "agents", name), { recursive: true });
-      await FileKeyProvider.load(join(tempDir, "agents", name, "key"));
+      await provisionAgentIdentity(tempDir, name);
     }
     return {
       securityGateway: new PassthroughGatewayClient(),
@@ -249,7 +249,7 @@ describe("DOD-M12B-AWAY-MARK-1: the LIVE receive exit, not just the batch one", 
 
   it("a marked message delivered LIVE carries auto_reply and its guidance", async () => {
     await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
-    await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+    await provisionAgentIdentity(tempDir, "alice");
     handle = await startDaemon({
       securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir, socketPath: join(tempDir, "daemon.sock"), lockFilePath: join(tempDir, "daemon.lock"),
@@ -284,7 +284,7 @@ describe("DOD-M12B-AWAY-MARK-1: the LIVE receive exit, not just the batch one", 
     // un-upgraded peer sends unmarked away replies. Telling the reader otherwise hands it an
     // authoritative false negative it did not have before the fix.
     await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
-    await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+    await provisionAgentIdentity(tempDir, "alice");
     handle = await startDaemon({
       securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir, socketPath: join(tempDir, "daemon.sock"), lockFilePath: join(tempDir, "daemon.lock"),

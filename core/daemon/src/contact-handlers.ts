@@ -17,7 +17,7 @@ import type { IpcHandler } from "./ipc-server.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { Logger } from "./types.js";
 import { whoLabel } from "./who-label.js";
-import { isKnownTierValue, TIER } from "./contacts-tier-migration.js";
+import { isKnownTierValue, TIER } from "./contact-tier.js";
 import {
   isValidSettingKey,
   allSettingKeys,

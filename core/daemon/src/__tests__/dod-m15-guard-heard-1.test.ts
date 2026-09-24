@@ -40,7 +40,7 @@ import { fileURLToPath } from "node:url";
 import { registerNotificationHandlers, type NotificationHandlerDeps } from "../notification-handlers.js";
 import { REFUSAL_REASONS, REFUSAL_GUIDANCE, type RefusalReason } from "../refusal-reasons.js";
 import { createInboundSessions, type InboundSessionDeps } from "../inbound-sessions.js";
-import { TIER } from "../contacts-tier-migration.js";
+import { TIER } from "../contact-tier.js";
 import type { IpcHandler } from "../ipc-server.js";
 import type { Logger } from "../types.js";
 

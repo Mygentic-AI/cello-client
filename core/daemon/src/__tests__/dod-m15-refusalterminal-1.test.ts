@@ -37,8 +37,8 @@ import type { GatewayMode, ScreenContext, ScreenVerdict, SecurityGatewayClient }
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { MAX_TERMINAL_REFUSALS_PER_SESSION, TERMINAL_REFUSAL_REASONS } from "../session-node-manager.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig } from "../types.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 /** The leaf hash the receiver recomputes: sha256(0x00 ‖ content). Mirrors `daemon-004-tree`. */
 function msgLeafHash(content: Uint8Array): Uint8Array {
@@ -89,7 +89,7 @@ describe("DOD-M15-REFUSALTERMINAL-1", () => {
 
   async function config(gateway?: SecurityGatewayClient): Promise<DaemonConfig> {
     await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
-    await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+    await provisionAgentIdentity(tempDir, "alice");
     return {
       securityGateway: gateway ?? new PassthroughGatewayClient(),
       celloDir: tempDir,
@@ -146,7 +146,7 @@ describe("DOD-M15-REFUSALTERMINAL-1", () => {
 
   type Refusal = {
     session_id: string; reason: string; kind: string; impact: string; guidance: string;
-    times_since_dismissed: number; times_total?: number; times_total_at_least?: number; repeat?: boolean;
+    times_since_dismissed: number; times_total?: number; repeat?: boolean;
   };
 
   /** Longer than the grace window, so a scheduled fetch has had every chance to fire. */
@@ -331,103 +331,6 @@ describe("DOD-M15-REFUSALTERMINAL-1", () => {
     // THE WHOLE DEFECT IN TWO ASSERTIONS: the small number is what the operator used to see alone.
     expect(after.times_since_dismissed).toBe(1);
     expect(after.times_total).toBe(4);
-  });
-
-  it("UPGRADE: a daemon whose totals table predates `seeded` still starts, and seeds a FLOOR", async () => {
-    /**
-     * Review F1b + F1c, and this is the case that would have bricked the machine the unit was
-     * written for. `CREATE TABLE IF NOT EXISTS` is a no-op against a table that already exists, so
-     * a database created by the previous commit has `content_refusal_totals` WITHOUT `seeded` — and
-     * the backfill names that column. The throw comes out of schema init: the daemon does not open.
-     *
-     * The fixture is the shape that BREAKS, built by hand rather than by a neighbouring path: the
-     * pre-upgrade table, plus a notice that already has a count, exactly as an operator's disk does.
-     */
-    await boot();
-    const db = handle!.getSessionNodeManager().getDb()!;
-    const agentId = (db.prepare("SELECT agent_id FROM agents WHERE agent_name = ?").get("alice") as { agent_id: string }).agent_id;
-    // Rebuild the PRE-UPGRADE shape: drop the column by dropping and recreating without it.
-    db.exec("DROP TABLE content_refusal_totals");
-    db.exec(`CREATE TABLE content_refusal_totals (
-      agent_id TEXT NOT NULL, session_id TEXT NOT NULL, reason TEXT NOT NULL,
-      total INTEGER NOT NULL, first_at INTEGER NOT NULL, last_at INTEGER NOT NULL,
-      PRIMARY KEY (agent_id, session_id, reason))`);
-    // A notice that already carries a count — the live one read 58.
-    const now = Date.now();
-    db.prepare(
-      `INSERT OR REPLACE INTO content_refusal_notices
-         (agent_id, session_id, reason, kind, impact, guidance, count, first_at, last_at)
-       VALUES (?, ?, 'session_committed', 'refused', 'i', 'g', 58, ?, ?)`,
-    ).run(agentId, "s-upgraded", now, now);
-
-    await handle!.stop("test_upgrade");
-    handle = null;
-
-    // THE ASSERTION: the new daemon opens at all. Before the ALTER TABLE it threw out of schema
-    // init with "table content_refusal_totals has no column named seeded".
-    await boot();
-    const client = await connect();
-    const after = ((await inbox(client))["refusals"] as Refusal[])
-      .find((r) => r.session_id === "s-upgraded")!;
-    expect(after.times_since_dismissed).toBe(58);
-    // A FLOOR, not a figure, and under a name that cannot be read as one. On the live machine the
-    // notice said 58 while the log held 232,056 refusal events; 58 is true only as "at least".
-    expect(after.times_total, "an upgraded row must NOT claim an exact total").toBeUndefined();
-    expect(after.times_total_at_least).toBe(58);
-  });
-
-  it("UPGRADE: a total SMALLER than its own since-dismissed count is repaired to a floor", async () => {
-    /**
-     * **Found on the live daemon, not by review.** After the first patched build ran, the inbox read
-     * `times_since_dismissed: 78, times_total: 12` — an "exact" lifetime figure smaller than the
-     * number beside it. The totals table shipped one commit before `seeded`, so its rows default to
-     * 0 and claim to be exact, and `INSERT OR IGNORE` only fills rows that are ABSENT, so the
-     * backfill never touched them.
-     *
-     * `count` resets on dismissal and `total` does not, so `total >= count` holds in healthy
-     * operation. `count > total` means this row did not start at the beginning — a floor, not a
-     * figure. This is also the repair for a totals write that failed while the notice's succeeded.
-     */
-    await boot();
-    const db = handle!.getSessionNodeManager().getDb()!;
-    const agentId = (db.prepare("SELECT agent_id FROM agents WHERE agent_name = ?").get("alice") as { agent_id: string }).agent_id;
-    const now = Date.now();
-    db.prepare(
-      `INSERT OR REPLACE INTO content_refusal_notices
-         (agent_id, session_id, reason, kind, impact, guidance, count, first_at, last_at)
-       VALUES (?, ?, 'session_committed', 'refused', 'i', 'g', 78, ?, ?)`,
-    ).run(agentId, "s-late", now, now);
-    // A totals row that started counting LATE and, crucially, claims to be exact.
-    db.prepare(
-      `INSERT OR REPLACE INTO content_refusal_totals
-         (agent_id, session_id, reason, total, first_at, last_at, seeded)
-       VALUES (?, ?, 'session_committed', 12, ?, ?, 0)`,
-    ).run(agentId, "s-late", now, now);
-
-    await handle!.stop("test_repair");
-    handle = null;
-    await boot();
-
-    const client = await connect();
-    const r = ((await inbox(client))["refusals"] as Refusal[]).find((x) => x.session_id === "s-late")!;
-    expect(r.times_since_dismissed).toBe(78);
-    // THE DEFECT IN ONE ASSERTION: 12 was reported as an exact lifetime total beside 78.
-    expect(r.times_total, "a partial tally must not be presented as a figure").toBeUndefined();
-    expect(r.times_total_at_least).toBe(78);
-  });
-
-  it("a counted row reports an exact total, never a floor", async () => {
-    // The other half of F1c: the two fields are mutually exclusive, so a row counted from its first
-    // refusal must not arrive wearing the hedge.
-    await boot();
-    insertSessionRow("s-closed", "sealed");
-    const client = await connect();
-    await handle!.getSessionNodeManager()
-      .ingestReceivedContent("alice", "s-closed", new TextEncoder().encode("too late"), msgLeafHash(new TextEncoder().encode("too late")));
-
-    const r = ((await inbox(client))["refusals"] as Refusal[]).find((x) => x.reason === "session_committed")!;
-    expect(r.times_total).toBe(1);
-    expect(r.times_total_at_least).toBeUndefined();
   });
 
   it("the guidance says which number is which, and never calls the smaller one a lifetime", async () => {

@@ -27,7 +27,6 @@ import { tmpdir } from "node:os";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import {
   PARK_REFUSAL_REASONS,
   PARK_REFUSAL_NOTICE,
@@ -36,6 +35,7 @@ import {
   type ParkRefusalReason,
 } from "../park-refusals.js";
 import type { Logger, DaemonConfig } from "../types.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 const SRC = join(dirname(fileURLToPath(import.meta.url)), "..");
 const ALL_PARK_REASONS = Object.values(PARK_REFUSAL_REASONS) as ParkRefusalReason[];
@@ -236,30 +236,11 @@ describe("DOD-M15-INBOXCAUSE-1: a refusal that LOOPS says so, with its cadence",
   it("★ 731 refusals over 64 hours reads as one recurring refusal every 5 minutes", () => {
     // The exact figures from the live daemon. `731` beside nothing is read as 731 things going
     // wrong; the row already held the span that says otherwise and nothing divided by it.
-    const r = refusalRecurrence(731, 0, 64 * 3600 * 1000, false)!;
+    const r = refusalRecurrence(731, 0, 64 * 3600 * 1000)!;
     expect(r).toContain("731 TIMES");
     expect(r).toContain("about once every 5 minutes");
     expect(r).toContain("3 days");
     expect(r, "and it must say the count is one refusal recurring").toContain("ONE recurring refusal");
-  });
-
-  it("★ a SEEDED row is reported as a FLOOR, never as a figure", () => {
-    /**
-     * Review M5. A row seeded at upgrade takes its total from a notice's `count`, which resets on
-     * dismissal — so both the count and the span are lower bounds. The drain reports such a row as
-     * `times_total_at_least` five lines from where this sentence is built, and the first version
-     * asserted the same number as an exact figure right beside it.
-     *
-     * On the daemon this unit was written for the row IS seeded: the inbox reported
-     * `times_total_at_least: 731`.
-     */
-    const seeded = refusalRecurrence(731, 0, 64 * 3600 * 1000, true)!;
-    expect(seeded).toContain("AT LEAST 731 TIMES");
-    expect(seeded, "and it must say why the figure is a floor").toContain("may be far higher");
-
-    const exact = refusalRecurrence(731, 0, 64 * 3600 * 1000, false)!;
-    expect(exact, "an unseeded row is an exact count and must not hedge").not.toContain("AT LEAST");
-    expect(exact).not.toContain("may be far higher");
   });
 
   it("★ it does not claim the refusals are one message, nor that the loop will continue", () => {
@@ -276,7 +257,7 @@ describe("DOD-M15-INBOXCAUSE-1: a refusal that LOOPS says so, with its cadence",
      * the cause is dealt with" prints long after a cause is resolved — including on the released
      * message whose impact in the SAME row says it is gone and will stop being reported.
      */
-    const r = refusalRecurrence(731, 0, 64 * 3600 * 1000, true)!;
+    const r = refusalRecurrence(731, 0, 64 * 3600 * 1000)!;
     expect(r, "a reason can fire for several different messages — the row cannot tell them apart").not.toContain("SEPARATE EVENTS");
     expect(r, "a durable notice must not promise the future").not.toContain("will keep firing");
   });
@@ -287,9 +268,9 @@ describe("DOD-M15-INBOXCAUSE-1: a refusal that LOOPS says so, with its cadence",
      * the clock rather than of the behaviour. Absent is the honest answer for both — the same rule
      * `timesTotal` follows when there is no durable row.
      */
-    expect(refusalRecurrence(2, 0, 60_000, false), "two refusals cannot establish a rate").toBeNull();
-    expect(refusalRecurrence(50, 1000, 1000, false), "a zero span divides into nonsense").toBeNull();
-    expect(refusalRecurrence(50, 2000, 1000, false), "a negative span is a broken row, not a fast loop").toBeNull();
+    expect(refusalRecurrence(2, 0, 60_000), "two refusals cannot establish a rate").toBeNull();
+    expect(refusalRecurrence(50, 1000, 1000), "a zero span divides into nonsense").toBeNull();
+    expect(refusalRecurrence(50, 2000, 1000), "a negative span is a broken row, not a fast loop").toBeNull();
   });
 });
 
@@ -325,7 +306,7 @@ describe("DOD-M15-INBOXCAUSE-1: every park refusal reason has a path to cello_in
 
   async function boot(): Promise<DaemonHandle> {
     await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
-    await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+    await provisionAgentIdentity(tempDir, "alice");
     const config: DaemonConfig = {
       securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,

@@ -19,7 +19,7 @@ import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
-import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
+import { generateKeypair } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { RetryQueue } from "../retry-queue.js";
@@ -28,6 +28,7 @@ import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
+import { provisionAgentIdentity } from "../testing.js";
 
 function msgLeafHash(content: Uint8Array): Uint8Array {
   return new Uint8Array(createHash("sha256").update(new Uint8Array([0x00])).update(content).digest());
@@ -81,7 +82,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
   async function makeAgentDir(name: string): Promise<void> {
     const dir = join(tempDir, "agents", name);
     await mkdir(dir, { recursive: true });
-    await FileKeyProvider.load(join(dir, "key"));
+    await provisionAgentIdentity(tempDir, name);
   }
 
   const captured: Array<{ event: string; context: Record<string, unknown> }> = [];

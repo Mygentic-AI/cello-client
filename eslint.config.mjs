@@ -247,18 +247,6 @@ export default [
     rules: { "no-restricted-syntax": ["error", ...SENDRAW_SELECTORS] },
   },
   {
-    // KNOWN DEBT — the only production file still importing node:sqlite. Do not add to this list;
-    // it only ever shrinks. When it is empty, delete this block; the debt is paid.
-    //   - daemon/identity-migration.ts : reads a legacy PLAINTEXT db to migrate it into SQLCipher.
-    //       SQLCipher can open plaintext directly, so this is convertible with no migration risk.
-    // (The two gateway stores left this list on 2026-07-29 — DOD-M9B-STORE-1 gave core/gateway its
-    // own SQLCipher opener, keyed by the daemon's key file, so neither store can write plaintext.)
-    files: [
-      "core/daemon/src/identity-migration.ts",
-    ],
-    rules: { "no-restricted-imports": "off" },
-  },
-  {
     // ─── GRANDFATHERED SIZE — TWO ENTRIES, AND BOTH ONLY EVER SHRINK ───────────────────────────
     //
     // Same contract as the KNOWN DEBT list above: a visible allowlist, no second mechanism, and a

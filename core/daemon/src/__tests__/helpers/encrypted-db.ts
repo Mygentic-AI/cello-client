@@ -7,6 +7,7 @@
  * same `DaemonDatabase` varargs surface the production code uses — a drop-in for the old direct open.
  */
 
+import { existsSync, readFileSync } from "node:fs";
 import {
   resolveDbKey,
   openEncryptedDatabase,
@@ -20,6 +21,17 @@ import {
  *   - pre-seed: the DB does not exist yet → generate the key file + create the encrypted DB, so a
  *     later SessionNodeManager.initialize() opens the SAME encrypted DB with the SAME key.
  */
+/**
+ * True when the file at `dbPath` is an UNENCRYPTED SQLite database. A plaintext file begins with
+ * "SQLite format 3\0"; SQLCipher encrypts the header too, so an encrypted file never matches. Used
+ * to prove the daemon's database is encrypted at rest.
+ */
+export function isPlaintextSqliteFile(dbPath: string): boolean {
+  if (!existsSync(dbPath)) return false;
+  const magic = Buffer.from("SQLite format 3\0", "latin1");
+  return readFileSync(dbPath).subarray(0, magic.length).equals(magic);
+}
+
 export function openTestDb(dbPath: string): DaemonDatabase {
   const key = resolveDbKey(dbPath, dbKeyPathFor(dbPath));
   return openEncryptedDatabase(dbPath, key);

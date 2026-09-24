@@ -20,7 +20,7 @@
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { FileKeyProvider, msgLeafHash, generateKeypair } from "@cello-protocol/crypto";
+import { msgLeafHash, generateKeypair } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../../daemon.js";
 import { DbRegistrationPersistence } from "../../db-identity-store.js";
@@ -32,6 +32,7 @@ import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
 import { fakeRelayAnchor } from "../relay-client-fake.js";
 import { fixturePqIdentityRecord, registeredPqFields } from "./pq-identity.js";
+import { provisionAgentIdentity } from "../../testing.js";
 
 /** A libp2p node that goes nowhere. The daemon-side bookkeeping under test never dials. */
 export class FakeNode implements Partial<CelloNode> {
@@ -223,7 +224,7 @@ export async function startTwoConnectionFixture(
   for (const name of opts.agents ?? ["alice"]) {
     const dir = join(tempDir, "agents", name);
     await mkdir(dir, { recursive: true });
-    await FileKeyProvider.load(join(dir, "key"));
+    await provisionAgentIdentity(tempDir, name);
   }
 
   const socketPath = join(tempDir, "daemon.sock");

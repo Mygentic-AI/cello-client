@@ -23,10 +23,10 @@ import { tmpdir } from "node:os";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import { DbRegistrationPersistence } from "../db-identity-store.js";
 import type { Logger, DaemonConfig, AgentInfo } from "../types.js";
 import { fixturePqIdentityRecord, registeredPqFields } from "./helpers/pq-identity.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 describe("M8C-AUTOSTART-1: use_agent auto-start + F5/F18", () => {
   let tempDir: string;
@@ -64,7 +64,7 @@ describe("M8C-AUTOSTART-1: use_agent auto-start + F5/F18", () => {
   async function setupWithAgents(...names: string[]): Promise<DaemonConfig> {
     for (const name of names) {
       await mkdir(join(tempDir, "agents", name), { recursive: true });
-      await FileKeyProvider.load(join(tempDir, "agents", name, "key"));
+      await provisionAgentIdentity(tempDir, name);
     }
     return makeConfig();
   }

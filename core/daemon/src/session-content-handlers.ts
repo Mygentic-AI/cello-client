@@ -16,7 +16,7 @@
 import { randomUUID } from "node:crypto";
 import { LEAF_KIND_MSG } from "./session-relay-client.js";
 import { MAX_CONTENT_BYTES } from "@cello-protocol/protocol-types";
-import { TIER } from "./contacts-tier-migration.js";
+import { TIER } from "./contact-tier.js";
 import { GATEWAY_UNAVAILABLE, GOVERNANCE_TIMEOUT, type SecurityGatewayClient } from "@cello-protocol/gateway";
 import type { IpcHandler } from "./ipc-server.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
@@ -98,7 +98,7 @@ function refusalsField(
    */
   refusals?: Array<{
     reason: string; kind: RefusalKind; impact: string; guidance: string;
-    times_since_dismissed: number; times_total?: number; times_total_at_least?: number;
+    times_since_dismissed: number; times_total?: number;
     recurrence?: string; repeat?: boolean;
   }>;
   refusal_guidance?: string;
@@ -126,7 +126,6 @@ function refusalsField(
       reason: r.reason, kind: r.kind, impact: r.impact, guidance: r.guidance,
       times_since_dismissed: r.timesSinceDismissed,
       ...(r.timesTotal === undefined ? {} : { times_total: r.timesTotal }),
-      ...(r.timesTotalAtLeast === undefined ? {} : { times_total_at_least: r.timesTotalAtLeast }),
       // `041-PARKSTUCK`: the cadence beside the count, so a loop is not read as a crowd.
       ...(r.recurrence === undefined ? {} : { recurrence: r.recurrence }),
       ...(r.repeat === true ? { repeat: true } : {}),

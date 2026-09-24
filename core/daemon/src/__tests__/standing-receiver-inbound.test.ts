@@ -18,7 +18,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
+import { generateKeypair } from "@cello-protocol/crypto";
 import { createNode } from "@cello-protocol/transport";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
@@ -27,6 +27,7 @@ import { makeSignedAssignmentFrame, fixtureIdentity } from "./helpers/signed-ass
 import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
+import { provisionAgentIdentity } from "../testing.js";
 
 function makeLogger(): Logger {
   return { debug() {}, info() {}, warn() {}, error() {} };
@@ -82,7 +83,7 @@ describe("M8B F14 (daemon): inbound accept path ensures the standing receiver; d
     const dirB = join(tempDir, "B");
     const agentDir = join(dirB, "agents", "bob");
     await mkdir(agentDir, { recursive: true });
-    const bobKp = await FileKeyProvider.load(join(agentDir, "key"));
+    const bobKp = await provisionAgentIdentity(dirB, "bob");
     const bobPubkey = Buffer.from(await bobKp.getPublicKey()).toString("hex");
 
     const injectB: { inject?: (frame: unknown) => void } = {};

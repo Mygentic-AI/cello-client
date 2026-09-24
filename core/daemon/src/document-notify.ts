@@ -95,9 +95,6 @@ const CREATE_READ_MARKS_SQL = `
   );
 `;
 
-/** Born on an existing table. See `PEER_DECISION_COLUMNS` in document-handshake.ts for the pattern. */
-const READ_MARK_COLUMNS = ["ALTER TABLE document_read_marks ADD COLUMN my_text TEXT"];
-
 /**
  * The types `cello_doc_diff` renders — DERIVED from the one registry, never listed here.
  *
@@ -157,15 +154,6 @@ export class DocumentNotifications {
     this.#store.rawDb.exec(CREATE_NOTICES_SQL);
     this.#store.rawDb.exec(CREATE_READ_MARKS_SQL);
     this.#store.rawDb.exec(CREATE_WATCHES_SQL);
-    for (const sql of READ_MARK_COLUMNS) {
-      // Birth-gated so a daemon that already holds read marks gains the column instead of losing
-      // them. A failure here is either "already present" — the ordinary case — or a locked
-      // database, and the latter surfaces loudly on the very next SELECT rather than degrading.
-      const has = (
-        this.#store.rawDb.prepare("PRAGMA table_info(document_read_marks)").all() as Array<{ name: string }>
-      ).some((c) => c.name === "my_text");
-      if (!has) this.#store.rawDb.exec(sql);
-    }
   }
 
   /**

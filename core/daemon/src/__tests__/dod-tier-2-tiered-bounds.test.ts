@@ -18,7 +18,7 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import { seedAgents } from "./helpers/seed-agents.js";
-import { TIER, DEFAULT_TIER_BOUNDS, tierBoundsFor } from "../contacts-tier-migration.js";
+import { TIER, DEFAULT_TIER_BOUNDS, tierBoundsFor } from "../contact-tier.js";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import {
   SessionNodeManager,

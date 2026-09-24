@@ -15,7 +15,7 @@
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
 import { normalizeContactPubkey } from "./contact-pubkey-case.js";
-import { TIER, normalizeTier, isKnownTierValue, tierBoundsFor } from "./contacts-tier-migration.js";
+import { TIER, normalizeTier, isKnownTierValue, tierBoundsFor } from "./contact-tier.js";
 import { boundSettingKey, settableTierName, isValidSettingKey, notAcceptingSettingKey, type SettableTierName } from "./agent-settings-keys.js";
 import { MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
 import { type TranscriptEntry, UNREAD_RECEIVED_WHERE, TERMINAL_STATUSES } from "./session-node-types.js";

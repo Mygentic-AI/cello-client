@@ -17,7 +17,7 @@ import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger, SessionRecord } from "./types.js";
 import { extractErrorMessage } from "./error-message.js";
 import { SessionTree, sessionTreeLeafKindFromDb, type WritableSessionTreeLeafKind } from "./session-tree.js";
-import { TIER } from "./contacts-tier-migration.js";
+import { TIER } from "./contact-tier.js";
 import {
   type QuarantinedRecord,
   CAP_COUNTS,

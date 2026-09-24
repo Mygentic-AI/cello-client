@@ -14,7 +14,7 @@ import type { SessionNodeManager, RelayConnectParams } from "./session-node-mana
 import type { Logger } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
 import { selectAdvertisedAddress, type ITransportSelector, type SessionNegotiator } from "./transport-selector.js";
-import { TIER } from "./contacts-tier-migration.js";
+import { TIER } from "./contact-tier.js";
 import { relayOnlyState, dialableAddrs } from "./relay-only.js";
 import type { ParsedSessionAssignment } from "./session-assignment-parser.js";
 import type { IAutoNatService } from "@cello-protocol/transport";

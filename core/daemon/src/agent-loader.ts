@@ -2,8 +2,7 @@
  * Agent identity loader for the CELLO daemon.
  *
  * Agents are enumerated from the encrypted `agents` table — ONE loading path. There is no flat-file
- * fallback: on-disk key files are imported into the `agents` table by the one-time migration
- * (identity-migration.ts) before this loader runs.
+ * fallback and no import of old key files.
  *
  * Each agent's K_local Ed25519 seed is stored as a BLOB column; the loader builds a sign-only
  * InMemoryKeyProvider from it (the private scalar never leaves the provider — only signatures and

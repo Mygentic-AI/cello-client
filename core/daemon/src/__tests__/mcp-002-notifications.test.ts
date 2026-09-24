@@ -26,8 +26,8 @@ import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import { NotificationDispatcher } from "../notification-dispatcher.js";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig, IpcNotification } from "../types.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 describe("MCP-002: notification routing", () => {
   let tempDir: string;
@@ -78,7 +78,7 @@ describe("MCP-002: notification routing", () => {
     const agentsDir = join(tempDir, "agents");
     for (const name of agentNames) {
       await mkdir(join(agentsDir, name), { recursive: true });
-      await FileKeyProvider.load(join(agentsDir, name, "key"));
+      await provisionAgentIdentity(tempDir, name);
     }
     return makeConfig();
   }

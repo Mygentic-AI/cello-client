@@ -13,7 +13,6 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
@@ -23,6 +22,7 @@ import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/
 import { makeFakeRelayServer, FakeRelayAwareNode, FAKE_RELAY_PEER_ID, FAKE_RELAY_ADDR } from "./helpers/fake-relay-server.js";
 import { fakeRelayAnchor } from "./relay-client-fake.js";
 import { decodeStructure1 } from "@cello-protocol/protocol-types";
+import { provisionAgentIdentity } from "../testing.js";
 
 const SID_BYTES = Uint8Array.from(Array.from({ length: 16 }, (_, i) => i + 0x51 & 0xff));
 const SID_HEX = Buffer.from(SID_BYTES).toString("hex");
@@ -83,7 +83,7 @@ describe("seal_stale: a close signed before a filed message is re-signed once it
     });
     const node = new FakeRelayAwareNode(relay);
     await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
-    await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+    await provisionAgentIdentity(tempDir, "alice");
     handle = await startDaemon({
       celloDir: tempDir, socketPath: join(tempDir, "d.sock"), lockFilePath: join(tempDir, "d.lock"),
       maxConnections: 8, version: "test", logger,
@@ -94,7 +94,7 @@ describe("seal_stale: a close signed before a filed message is re-signed once it
     snm.setSessionGenesisForTest("alice", SID_HEX, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
     snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
-    const kp = await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+    const kp = await provisionAgentIdentity(tempDir, "alice");
     const { AgentRelayClient } = await import("../session-relay-client.js");
     const relayClient = new AgentRelayClient({
       relayPeerId: FAKE_RELAY_PEER_ID, relayAddrs: [FAKE_RELAY_ADDR], keyProvider: kp,

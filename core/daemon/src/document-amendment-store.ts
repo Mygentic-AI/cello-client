@@ -33,41 +33,9 @@ import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
 
 /**
- * The PRE-PIVOT table, epoch-keyed. Still created because `DocumentStore` execs this too and the
- * pre-pivot readers live until P4 deletes them (SYNC-D2); the entry store neither reads nor
- * writes it. Rows predating the pivot stay untouched — old-shape bytes are not decodable by the
- * v2 codec and are not migrated (no compatibility owed; essentially no documents exist).
+ * Shared with `DocumentStore`: its membership walk and epoch read consume `document_entries`, so
+ * the table must exist whichever module constructs first. Keep both consumers on THIS string.
  */
-/**
- * Shared with `DocumentStore` (the :352 shared-definition precedent): its membership walk and
- * epoch read consume `document_entries`, so the tables must exist whichever module constructs
- * first. Keep both consumers on THIS string.
- */
-/**
- * D7 — the epoch spine is deleted. A database born before that carries a NOT NULL `epoch_id`
- * with no default, which would refuse every insert from this build. Dropped in place (SQLite
- * ≥3.35 / SQLCipher 4.5); a fresh database never has it.
- */
-type ColumnDropper = { exec(sql: string): void; prepare(sql: string): { all(...a: unknown[]): unknown[] } };
-
-/**
- * Drop columns a previous milestone left behind, birth-gated: only what the table actually still
- * has is touched, so this is safe on a database created yesterday and on one created before the
- * column existed. Dead schema is not free — it is the design a future author reads and rebuilds.
- */
-export function dropLegacyColumns(db: ColumnDropper, table: string, columns: readonly string[]): void {
-  const held = new Set(
-    (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: string }>).map((c) => c.name),
-  );
-  for (const column of columns) {
-    if (held.has(column)) db.exec(`ALTER TABLE ${table} DROP COLUMN ${column}`);
-  }
-}
-
-export function dropLegacyEpochColumn(db: ColumnDropper, table: string): void {
-  dropLegacyColumns(db, table, ["epoch_id"]);
-}
-
 export const DOCUMENT_ENTRIES_CREATE_SQL = `
   CREATE TABLE IF NOT EXISTS document_entries (
     owner_agent_id  TEXT    NOT NULL,
@@ -138,12 +106,7 @@ export class DocumentAmendmentStore {
   constructor(db: DaemonDatabase, logger: Logger) {
     this.#db = db;
     this.#logger = logger;
-    // D7/D9 residue sweep (review F5/F6): the epoch-keyed legacy table and the withdrawals
-    // table have no reader or writer left — never born on a fresh database, dropped in place
-    // on one that predates the pivot.
-    this.#db.exec(`DROP TABLE IF EXISTS document_amendments`);
     this.#db.exec(DOCUMENT_ENTRIES_CREATE_SQL);
-    dropLegacyEpochColumn(this.#db, "document_entries");
   }
 
   /**

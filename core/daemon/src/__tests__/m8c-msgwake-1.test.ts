@@ -20,8 +20,8 @@ import { createHash } from "node:crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig, IpcNotification } from "../types.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 describe("M8C-MSGWAKE-1: cello_message doorbell on inbound content", () => {
   let tempDir: string;
@@ -47,7 +47,7 @@ describe("M8C-MSGWAKE-1: cello_message doorbell on inbound content", () => {
   async function setupWithAgents(...names: string[]): Promise<DaemonConfig> {
     for (const name of names) {
       await mkdir(join(tempDir, "agents", name), { recursive: true });
-      await FileKeyProvider.load(join(tempDir, "agents", name, "key"));
+      await provisionAgentIdentity(tempDir, name);
     }
     return {
       securityGateway: new PassthroughGatewayClient(),

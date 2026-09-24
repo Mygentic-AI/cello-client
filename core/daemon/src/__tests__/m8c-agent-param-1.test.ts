@@ -21,9 +21,9 @@ import { tmpdir } from "node:os";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig } from "../types.js";
 import type { SessionNegotiator } from "../transport-selector.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 /**
  * The ten handlers, with the minimum params each needs to get PAST its own validation, and the
@@ -76,7 +76,7 @@ describe("DOD-AGENT-PARAM-1: the agent selector is `agent`, on all ten handlers"
   async function startWithTwoAgents(): Promise<IpcClient> {
     for (const name of ["alice", "bob"]) {
       await mkdir(join(tempDir, "agents", name), { recursive: true });
-      await FileKeyProvider.load(join(tempDir, "agents", name, "key"));
+      await provisionAgentIdentity(tempDir, name);
     }
     const negotiator: SessionNegotiator = {
       negotiate: async ({ agentName }) => {

@@ -31,9 +31,9 @@ import { mkdir } from "node:fs/promises";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig } from "../types.js";
 import type { ParkResult, AwaitingContentEntry } from "../retry-queue.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 describe("CELLO-M7-MSG-001 daemon startup flush of un-acked content", () => {
   let tempDir: string;
@@ -82,7 +82,7 @@ describe("CELLO-M7-MSG-001 daemon startup flush of un-acked content", () => {
     // has an agent by the time content is awaiting ACK; a flat-file agent + the one-time migration
     // that runs inside startDaemon gives this daemon a real `agents` row for "alice" to resolve.
     await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
-    await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+    await provisionAgentIdentity(tempDir, "alice");
 
     // ── Run 1: a sender enqueues un-acked content (TTF fired) but crashes before park ──
     handle = await startDaemon(makeConfig());
@@ -154,7 +154,7 @@ describe("CELLO-M7-MSG-001 daemon startup flush of un-acked content", () => {
     // DOD-AGENT-ID-JOINKEY-1: same as AC-004 — enqueue_awaiting_content/mark_content_acked need a
     // resolvable owning agent.
     await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
-    await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+    await provisionAgentIdentity(tempDir, "alice");
 
     handle = await startDaemon(makeConfig());
     const socketPath = join(tempDir, "daemon.sock");
@@ -200,7 +200,7 @@ describe("CELLO-M7-MSG-001 daemon startup flush of un-acked content", () => {
   it("AC-005/DOD-LOOP-1: the native startup flush re-parks a session's un-acked content when its OWNING agent comes online", async () => {
     // alice must be a loadable agent (cello_start_agent loads from celloDir/agents).
     await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
-    await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+    await provisionAgentIdentity(tempDir, "alice");
 
     handle = await startDaemon(makeConfig()); // native path — no injected contentParkFn
     const snm = handle.getSessionNodeManager();

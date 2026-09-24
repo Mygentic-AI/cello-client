@@ -43,7 +43,7 @@ import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
-import { FileKeyProvider, generateKeypair, verify as ed25519Verify, docLeafHash, rejectLeafHash } from "@cello-protocol/crypto";
+import { generateKeypair, verify as ed25519Verify, docLeafHash, rejectLeafHash } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
@@ -54,6 +54,7 @@ import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-man
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
 import { registerFixtureSigner } from "./helpers/signed-assignment.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 
@@ -205,7 +206,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
   async function makeAgentDir(name: string): Promise<string> {
     const dir = join(tempDir, "agents", name);
     await mkdir(dir, { recursive: true });
-    const kp = await FileKeyProvider.load(join(dir, "key"));
+    const kp = await provisionAgentIdentity(tempDir, name);
     const hex = Buffer.from(await kp.getPublicKey()).toString("hex");
     // 038-KEYBIND: a REAL agent, so the assignment fixture can sign a key binding as it.
     registerFixtureSigner(hex, kp);

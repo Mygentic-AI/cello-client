@@ -33,7 +33,6 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { seedAgents } from "./helpers/seed-agents.js";
 import type { DaemonDatabase } from "../sqlcipher-db.js";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
@@ -41,6 +40,7 @@ import { startDaemon } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Logger, DaemonConfig, DaemonHandle } from "../types.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -189,7 +189,7 @@ describe("cello_list_sessions: MCP handler", () => {
   async function setupAgent(name: string): Promise<void> {
     const agentDir = join(tempDir, "agents", name);
     await mkdir(agentDir, { recursive: true });
-    await FileKeyProvider.load(join(agentDir, "key"));
+    await provisionAgentIdentity(tempDir, name);
   }
 
   function makeConfig(): DaemonConfig {

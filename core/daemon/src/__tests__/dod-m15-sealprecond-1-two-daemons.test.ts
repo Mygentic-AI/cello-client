@@ -27,7 +27,6 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
@@ -36,6 +35,7 @@ import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-man
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
 import { makeFakeRelayServer, FakeRelayAwareNode, FAKE_RELAY_PEER_ID, FAKE_RELAY_ADDR } from "./helpers/fake-relay-server.js";
 import { fakeRelayAnchor } from "./relay-client-fake.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 const SID_BYTES = Uint8Array.from(Array.from({ length: 16 }, (_, i) => i + 0xa1 & 0xff));
 const SID_HEX = Buffer.from(SID_BYTES).toString("hex");
@@ -74,7 +74,7 @@ describe("DOD-M15-SEALPRECOND-1: the counterparty's chain must not be left one l
     const dir = await mkdtemp(join(tmpdir(), `cello-sealprecond-${name}-`));
     dirs.push(dir);
     await mkdir(join(dir, "agents", name), { recursive: true });
-    const kp = await FileKeyProvider.load(join(dir, "agents", name, "key"));
+    const kp = await provisionAgentIdentity(dir, name);
     const handle = await startDaemon({
       celloDir: dir,
       socketPath: join(dir, "d.sock"),

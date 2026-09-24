@@ -32,7 +32,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import { seedAgents } from "./helpers/seed-agents.js";
-import { TIER, DEFAULT_TIER_BOUNDS } from "../contacts-tier-migration.js";
+import { TIER, DEFAULT_TIER_BOUNDS } from "../contact-tier.js";
 import {
   boundSettingKey, notAcceptingSettingKey, isBoundKey, validateSettingValue,
 } from "../agent-settings-keys.js";

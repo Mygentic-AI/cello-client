@@ -33,11 +33,7 @@
 
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
-import {
-  DOCUMENT_ENTRIES_CREATE_SQL,
-  dropLegacyEpochColumn,
-  dropLegacyColumns,
-} from "./document-amendment-store.js";
+import { DOCUMENT_ENTRIES_CREATE_SQL } from "./document-amendment-store.js";
 
 /** Lifecycle states a document can hold (§3.5). `stalled` is DOD-DOC-REJECT-1's terminal state. */
 export type DocumentStatus = "active" | "closed" | "killed" | "stalled";
@@ -314,48 +310,10 @@ export class DocumentStore {
     this.#db = db;
     this.#logger = logger;
     this.#db.exec(CREATE_DOCUMENTS_SQL);
-    // SYNC-G1 birth-gated column (the consent-migration precedent): a database created before
-    // the causal-anchor column exists gains it here, defaulted to the empty frontier — CREATE
-    // IF NOT EXISTS cannot add columns, and a client-side migration that fails is unrecoverable
-    // on an operator machine, so the ALTER is guarded by the actual table shape.
-    const envelopeColumns = this.#db
-      .prepare(`PRAGMA table_info(document_envelopes)`)
-      .all() as Array<{ name: string }>;
-    if (
-      envelopeColumns.length > 0 &&
-      !envelopeColumns.some((c) => c.name === "governance_parents")
-    ) {
-      this.#db.exec(
-        `ALTER TABLE document_envelopes ADD COLUMN governance_parents TEXT NOT NULL DEFAULT '[]'`,
-      );
-    }
-    // M14B / DOD-MP-AMEND-1 — the amendments table this store READS (currentDocumentEpoch);
-    // DocumentAmendmentStore owns writes. Shared definition, whichever constructs first wins.
-    this.#db.exec(`DROP TABLE IF EXISTS document_amendments`);
     this.#db.exec(DOCUMENT_ENTRIES_CREATE_SQL);
-    dropLegacyEpochColumn(this.#db, "document_entries");
     this.#db.exec(CREATE_ENVELOPES_SQL);
-    dropLegacyEpochColumn(this.#db, "document_envelopes");
-    // SYNC-AC3 residue. P4 deleted the delivery worker and its ledgers but left DELIVERY-1's
-    // bookkeeping columns standing on the envelope log — no writer, no reader, and exactly the
-    // per-recipient DEBT the pivot exists to abolish ("X still owes Y this envelope"). Dead
-    // columns are not harmless here: the next author to see `next_attempt_at` in the schema
-    // reasonably concludes retry state belongs on the row and rebuilds the machine. Dropped on
-    // open, birth-gated like the epoch column beside it.
-    dropLegacyColumns(this.#db, "document_envelopes", [
-      "delivered_at", "acked_at", "abandoned_at", "attempts", "next_attempt_at",
-    ]);
     this.#db.exec(CREATE_QUARANTINE_SQL);
-    // SYNC-R35, birth-gated like the epoch drops: a database born earlier lacks the column.
-    {
-      const cols = this.#db.prepare(`PRAGMA table_info(document_quarantine)`).all() as Array<{ name?: string }>;
-      if (!cols.some((c) => c.name === "rejection_wire")) {
-        this.#db.exec(`ALTER TABLE document_quarantine ADD COLUMN rejection_wire BLOB`);
-      }
-    }
     this.#db.exec(CREATE_REJECTIONS_RECEIVED_SQL);
-    // D9 residue sweep (review F5): withdrawals have no reader or writer left.
-    this.#db.exec(`DROP TABLE IF EXISTS document_withdrawals`);
     // SYNC-P5 (spec §9): the per-party DISPLAY CACHE — last successful exchange and the
     // position that party last claimed. Non-authoritative by construction: no correctness
     // decision reads it (R44); it exists so `cello_doc_list` can say in_sync|behind|unseen

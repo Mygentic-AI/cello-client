@@ -38,9 +38,17 @@
 
 import { verifyTrustSignalHash, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
-import { migrateWalletAddConsentState, CONSENT_ACCEPTED, type ConsentState } from "./consent-migration.js";
 import type { Logger } from "./types.js";
-import { extractErrorMessage } from "./error-message.js";
+
+/**
+ * The consent states. Anything not in this set — including a value with stray whitespace or case —
+ * is UNPRESENTABLE (§5a: absent is not fine). The presentability predicate tests for exactly
+ * `accepted` rather than for the absence of a bad state, so an unrecognised value fails closed.
+ */
+export type ConsentState = "pending" | "accepted" | "refused";
+
+/** Present-tense truth for the reader: this is what gates presentation. */
+export const CONSENT_ACCEPTED = "accepted";
 
 /** Status lives OUTSIDE the hash — it is mutable after minting, which is exactly why it is not in
  *  the preimage. If it were hashed, revoking a signal would change its hash and the directory could
@@ -195,17 +203,10 @@ const CREATE_WALLET_SQL = `
     ${ENVELOPE_COLUMNS},
     received_at     INTEGER NOT NULL,
     default_present INTEGER NOT NULL DEFAULT 1,
-    -- M10B-D14r2 — NULLABLE, and that is forced rather than chosen: SQLite cannot ADD COLUMN with
-    -- NOT NULL and no DEFAULT, so a MIGRATED database can only ever have a nullable column. Making
-    -- the fresh DDL stricter would give fresh installs a different schema from migrated ones, and
-    -- the divergence would surface only on fresh installs — i.e. on every new operator, which is the
-    -- worst possible audience for it. The repo's "fresh == migrated" convention wins.
-    --
-    -- Nullability costs nothing here because presentability is enforced by the PREDICATE, which tests
-    -- for exactly 'accepted' rather than for the absence of a bad value. NULL, '', 'ACCEPTED' and any
-    -- future state all fail closed by construction (§5a), so the column constraint was never what was
-    -- protecting the invariant.
-    consent_state   TEXT,
+    -- M10B-D14r2 — written on every insert: 'pending' for issuer_kind agent, 'accepted' otherwise.
+    -- Presentability is still enforced by the PREDICATE, which tests for exactly 'accepted', so ''
+    -- or 'ACCEPTED' or any future state fails closed by construction (§5a).
+    consent_state   TEXT NOT NULL,
     -- DOD-END-PENDING-1 — when the operator was TOLD about this pending decision. NULL = not yet
     -- told. Separate from consent_state because the item and the notification have different
     -- lifetimes: the decision persists until made, the nag stops once seen.
@@ -281,61 +282,6 @@ export function ensureTrustSignalSchema(db: DaemonDatabase, _logger: Logger): vo
   // Presentation reads by subject; nothing reads by `type`, and nothing may (INV-ZERO-BUMP — an
   // index predicated on a type VALUE is a per-type construct in the schema).
   db.exec("CREATE INDEX IF NOT EXISTS idx_wallet_signals_subject ON wallet_trust_signals (subject_kind, subject)");
-  // Additive migration: add default_present if the table already exists without it.
-  try {
-    db.exec("ALTER TABLE wallet_trust_signals ADD COLUMN default_present INTEGER NOT NULL DEFAULT 1");
-  } catch {
-    // Column already exists — safe to ignore.
-  }
-  // M10B / DOD-END-COUNT-1 — additive on BOTH tables, for databases created before the slot existed.
-  //
-  // WITHOUT THESE THE UPGRADE PATH IS BROKEN, not merely incomplete: the fresh DDL above gained the
-  // column, so a NEW operator works while an EXISTING one — anyone whose wallet predates it — hits
-  // "table has no column named same_operator" on the first insert and cannot receive or present any
-  // signal at all. Adding a column to the CREATE and stopping there is the classic client-side
-  // migration miss, and it is invisible in CI because every test database is fresh.
-  //
-  // `NOT NULL DEFAULT 0` is legal for ALTER (SQLite only refuses NOT NULL with NO default), so the
-  // migrated schema is identical to the fresh one — the repo's "fresh == migrated" rule holds here,
-  // unlike `consent_state` below where it could not.
-  for (const table of ["wallet_trust_signals", "contact_trust_signals"]) {
-    try {
-      db.exec(`ALTER TABLE ${table} ADD COLUMN same_operator INTEGER NOT NULL DEFAULT 0`);
-    } catch (err) {
-      // VERIFY, DO NOT ASSUME, THE FAILURE WAS "already exists".
-      //
-      // A bare swallow here rests on the assumption that duplicate-column is the ONLY way this can
-      // fail. It is not: `sqlcipher-db.ts` sets no `busy_timeout`, so SQLITE_BUSY returns immediately
-      // — and "two daemons on one DB" is a named real condition in this project, not a hypothetical.
-      // SQLITE_READONLY and SQLITE_FULL swallow identically.
-      //
-      // What that costs: the ALTER silently does not run, then `putReceivedSignal` throws "table has
-      // no column named same_operator", which is caught upstream as a WARN — so the session forms
-      // normally and NO presented signal is ever stored. On the wallet side it surfaces as a delivery
-      // rejection with no ACK, and the directory re-delivers forever. A migration that fails silently
-      // is indistinguishable from one that worked until something much later looks wrong.
-      //
-      // So re-read the schema and rethrow if the column is genuinely absent. The idempotent case
-      // stays silent; every other cause becomes loud. This mirrors `migrateWalletAddConsentState`
-      // below, which checks `PRAGMA table_info` for exactly this reason.
-      const cols = (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>)
-        .map((c) => c.name);
-      if (!cols.includes("same_operator")) {
-        throw new Error(
-          `failed to add same_operator to ${table} and the column is still absent — the daemon cannot ` +
-          `store or present trust signals in this state: ${extractErrorMessage(err)}`,
-        );
-      }
-      // Present: the ALTER was a genuine no-op. No backfill is needed either — 0 (not co-owned) is
-      // correct for every pre-existing row, because no signal minted before the slot existed could
-      // have carried the flag.
-    }
-  }
-  // M10B-D14r2 — DELIBERATELY OUTSIDE the try/catch above. That swallow is safe for an idempotent
-  // ALTER whose only expected failure is "already exists"; it is NOT safe for a migration with a
-  // one-time backfill, where a swallowed failure leaves the daemon running against a schema it
-  // believes gates consent and does not. This one is birth-gated and rethrows.
-  migrateWalletAddConsentState(db, _logger);
 }
 
 const toBuf = (b: Uint8Array): Buffer => Buffer.from(b);

@@ -17,7 +17,6 @@ import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
@@ -27,6 +26,7 @@ import type { TelegramBotClient, TelegramUpdate } from "../telegram-bot-client.j
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
 import { makeSignedAssignmentFrame, fixtureIdentity } from "./helpers/signed-assignment.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 function msgLeafHash(content: Uint8Array): Uint8Array {
   return new Uint8Array(createHash("sha256").update(new Uint8Array([0x00])).update(content).digest());
@@ -109,7 +109,7 @@ describe("M8C-TGDOOR-1: Telegram doorbell", () => {
   async function makeAgentDir(name: string): Promise<void> {
     const dir = join(tempDir, "agents", name);
     await mkdir(dir, { recursive: true });
-    await FileKeyProvider.load(join(dir, "key"));
+    await provisionAgentIdentity(tempDir, "bob");
   }
 
   async function start(withBot: boolean, signalingConnect?: () => Promise<ConnectResult>): Promise<Awaited<ReturnType<typeof startDaemon>>> {
@@ -226,7 +226,7 @@ describe("M8C-TGDOOR-1: Telegram doorbell", () => {
     const bobPubkey = await (async () => {
       const dir = join(tempDir, "agents", "bob");
       await mkdir(dir, { recursive: true });
-      const kp = await FileKeyProvider.load(join(dir, "key"));
+      const kp = await provisionAgentIdentity(tempDir, "bob");
       return Buffer.from(await kp.getPublicKey()).toString("hex");
     })();
     const injectRef: { inject?: (frame: unknown) => void } = {};

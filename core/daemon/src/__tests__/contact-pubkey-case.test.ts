@@ -10,13 +10,6 @@
  * choice never applies. **And a key blocked in one spelling is unblocked in the other.**
  *
  * Nothing errors and nothing logs. Found by review while ruling on `024-ORPHANTRIAGE`.
- *
- * ─── Both halves are tested, because either alone leaves the bug ───────────────────────────────
- *
- * Normalizing the accessors fixes new rows and strands old ones — a mixed-case row already on disk
- * becomes unreachable rather than merely wrong, taking its block with it. So the fold migration is
- * tested against a POPULATED pre-migration database, which is the project rule for any client-side
- * migration: the operator's machine is where these fail, and a fresh database cannot catch it.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -25,10 +18,10 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
-import { FileKeyProvider } from "@cello-protocol/crypto";
-import { TIER } from "../contacts-tier-migration.js";
+import { TIER } from "../contact-tier.js";
 import { normalizeContactPubkey } from "../contact-pubkey-case.js";
 import type { Logger, DaemonConfig } from "../types.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 /** Mixed case on purpose, and it differs at both ends so a prefix cannot stand in for the whole. */
 const MIXED = "9C1f4E77" + "b3".repeat(24) + "0D5a72E8";
@@ -59,7 +52,7 @@ describe("A contact's public key is one identity, whatever case it was pasted in
 
   async function config(): Promise<DaemonConfig> {
     await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
-    await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+    await provisionAgentIdentity(tempDir, "alice");
     return {
       securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
@@ -69,12 +62,6 @@ describe("A contact's public key is one identity, whatever case it was pasted in
       version: "0.0.1-test",
       logger,
     };
-  }
-
-  function agentId(): string {
-    return (handle!.getSessionNodeManager().getDb()!
-      .prepare("SELECT agent_id FROM agents WHERE agent_name = ? AND state != 'retired'")
-      .get("alice") as { agent_id: string }).agent_id;
   }
 
   it("normalizeContactPubkey lowercases, and is idempotent", () => {
@@ -138,69 +125,5 @@ describe("A contact's public key is one identity, whatever case it was pasted in
     mgr.setContactSignalPref("alice", MIXED, "aa".repeat(32), false);
     expect(mgr.getContactSignalPrefs("alice", LOWER).get("aa".repeat(32)))
       .toBe(false);
-  });
-
-  // ─── The migration, against a POPULATED pre-migration database ───────────────────────────────
-
-  it("A MIXED-CASE ROW ALREADY ON DISK IS FOLDED, not stranded", async () => {
-    /**
-     * Normalizing the accessors alone would make this row UNREACHABLE — worse than the bug it fixes,
-     * because the block and the away message go with it. The row is written the way the old build
-     * wrote it: straight into the table, verbatim.
-     */
-    handle = await startDaemon(await config());
-    const db = handle.getSessionNodeManager().getDb()!;
-    db.prepare("INSERT INTO contacts (agent_id, pubkey, added_at, tier, moniker) VALUES (?, ?, ?, ?, ?)")
-      .run(agentId(), MIXED, Date.now(), TIER.WHITELISTED, "Bob");
-    await handle.stop("test_reopen");
-
-    // Same directory, same SQLCipher file, a fresh open — which is when the fold runs.
-    handle = await startDaemon(await config());
-    const mgr = handle.getSessionNodeManager();
-    expect(mgr.getTier("alice", LOWER), "the legacy row is reachable again").toBe(TIER.WHITELISTED);
-    expect(mgr.getContactMoniker("alice", LOWER)).toBe("Bob");
-    expect(mgr.listContacts("alice")[0]!.pubkey).toBe(LOWER);
-    expect(
-      logged.filter((l) => l.event === "contacts.pubkey.case.folded").length,
-      "and it says so — a silent data migration is one nobody can audit afterwards",
-    ).toBe(1);
-  });
-
-  it("WHEN BOTH SPELLINGS EXIST, THE MORE RESTRICTIVE SETTING SURVIVES THE MERGE", async () => {
-    /**
-     * ⚠️ **THE FAILURE DIRECTION IS THE WHOLE DESIGN.** Two spellings are two halves of one
-     * relationship, and merging them by taking either at random can silently UNBLOCK a key the
-     * operator blocked. The operator can loosen a setting afterwards; they cannot recover from a
-     * permission they never knew had been widened.
-     */
-    handle = await startDaemon(await config());
-    const db = handle.getSessionNodeManager().getDb()!;
-    const id = agentId();
-    db.prepare("INSERT INTO contacts (agent_id, pubkey, added_at, tier, moniker) VALUES (?, ?, ?, ?, ?)")
-      .run(id, LOWER, Date.now(), TIER.WHITELISTED, "Bob");
-    db.prepare("INSERT INTO contacts (agent_id, pubkey, added_at, tier, moniker) VALUES (?, ?, ?, ?, ?)")
-      .run(id, MIXED, Date.now(), TIER.BLOCKED, null);
-    await handle.stop("test_reopen");
-
-    handle = await startDaemon(await config());
-    const mgr = handle.getSessionNodeManager();
-    expect(mgr.listContacts("alice").length, "two halves become one contact").toBe(1);
-    expect(mgr.getTier("alice", LOWER), "and the BLOCK survives, not the whitelist").toBe(TIER.BLOCKED);
-    const folded = logged.find((l) => l.event === "contacts.pubkey.case.folded")!;
-    expect(folded.ctx["duplicatesMerged"]).toBe(1);
-    expect(folded.ctx["tiersTightened"]).toBe(1);
-  });
-
-  it("A CLEAN DATABASE IS SILENT — this runs at every open", async () => {
-    handle = await startDaemon(await config());
-    handle.getSessionNodeManager().addContact("alice", LOWER, "Bob", null, TIER.KNOWN);
-    await handle.stop("test_reopen");
-    logged = [];
-    handle = await startDaemon(await config());
-    expect(
-      logged.filter((l) => l.event === "contacts.pubkey.case.folded").length,
-      "a line per boot saying nothing happened is how a log stops being read",
-    ).toBe(0);
-    expect(handle.getSessionNodeManager().getTier("alice", LOWER)).toBe(TIER.KNOWN);
   });
 });

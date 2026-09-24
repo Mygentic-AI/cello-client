@@ -25,10 +25,9 @@ import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
-import { TIER } from "../contacts-tier-migration.js";
+import { TIER } from "../contact-tier.js";
 import type { SecurityGatewayClient, ScreenContext, ScreenVerdict } from "@cello-protocol/gateway";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import type { Logger, DaemonConfig } from "../types.js";
@@ -39,6 +38,7 @@ import { markAsAutoReply } from "../away-detection.js";
 // one for a two-daemon test and moved it to a helper rather than writing a second.
 import { FakeNode } from "./helpers/fake-relay-server.js";
 import { makeSignedAssignmentFrame, registerFixtureSigner, fixtureIdentity } from "./helpers/signed-assignment.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 function makeLogger(): { logger: Logger; events: LogEvent[] } {
@@ -101,7 +101,7 @@ describe("M8C-AWAY-1: away response", () => {
   async function makeAgentDir(name: string): Promise<string> {
     const dir = join(tempDir, "agents", name);
     await mkdir(dir, { recursive: true });
-    const kp = await FileKeyProvider.load(join(dir, "key"));
+    const kp = await provisionAgentIdentity(tempDir, name);
     const hex = Buffer.from(await kp.getPublicKey()).toString("hex");
     // 038-KEYBIND: a REAL agent, so the assignment fixture can sign a key binding as it.
     registerFixtureSigner(hex, kp);

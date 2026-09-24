@@ -27,8 +27,8 @@ import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig } from "../types.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 // Workspace-root-relative paths (this file is core/daemon/src/__tests__/). Spawn the BUILT shim
 // with plain `node` (fast, deterministic) rather than tsx-from-source — tsx cold-compiles the shim
@@ -84,7 +84,7 @@ describe("M8C-WAKE-1: real daemon → real shim → notifications/claude/channel
     };
     const aliceDir = join(tempDir, "agents", "alice");
     await mkdir(aliceDir, { recursive: true });
-    await FileKeyProvider.load(join(aliceDir, "key"));
+    await provisionAgentIdentity(tempDir, "alice");
     handle = await startDaemon(config);
 
     // ─── real shim binary over stdio (built dist, plain node) ───

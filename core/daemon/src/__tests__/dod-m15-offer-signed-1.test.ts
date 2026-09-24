@@ -39,7 +39,7 @@
 import { describe, it, expect } from "vitest";
 import { generateKeypair } from "@cello-protocol/crypto";
 import { createInboundSessions, type InboundSessionDeps } from "../inbound-sessions.js";
-import { TIER } from "../contacts-tier-migration.js";
+import { TIER } from "../contact-tier.js";
 import { makeSignedAssignmentFrame, fixtureIdentity } from "./helpers/signed-assignment.js";
 import type { Logger } from "../types.js";
 

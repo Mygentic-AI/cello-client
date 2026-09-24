@@ -34,9 +34,9 @@ import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { REFUSAL_KINDS } from "../refusal-reasons.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig } from "../types.js";
 import { createHash } from "node:crypto";
+import { provisionAgentIdentity } from "../testing.js";
 
 /** The leaf hash the receiver recomputes: sha256(0x00 ‖ content). Mirrors `daemon-004-tree`. */
 function msgLeafHash(content: Uint8Array): Uint8Array {
@@ -65,7 +65,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
 
   async function start(): Promise<DaemonHandle> {
     await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
-    await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+    await provisionAgentIdentity(tempDir, "alice");
     handle = await startDaemon({
       securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
@@ -407,7 +407,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the refusal reaches cello_receive
 
   async function setup(name: string): Promise<DaemonConfig> {
     await mkdir(join(tempDir, "agents", name), { recursive: true });
-    await FileKeyProvider.load(join(tempDir, "agents", name, "key"));
+    await provisionAgentIdentity(tempDir, name);
     return {
       securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
@@ -485,7 +485,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the refusal reaches cello_receive
     expect(refusals[0]!, "the drain's internal camelCase must not reach an MCP response")
       .not.toHaveProperty("timesSinceDismissed");
     // And the sentence, from the one shared constant — a second copy is a second thing to keep true.
-    expect(String(res["refusal_guidance"])).toContain("times_total_at_least");
+    expect(String(res["refusal_guidance"])).toContain("times_total");
     expect(String(res["refusal_guidance"])).toContain("cello_dismiss");
   });
 

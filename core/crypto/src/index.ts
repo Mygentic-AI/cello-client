@@ -1,5 +1,5 @@
 export type { KeyProvider, PublicKey, Signature, KeyFileCorruptError } from "./types.js";
-export { InMemoryKeyProvider, FileKeyProvider, generateKeypair, generateKLocalSeed, decodeKeyFileSeed, verify } from "./ed25519.js";
+export { InMemoryKeyProvider, FileKeyProvider, generateKeypair, generateKLocalSeed, verify } from "./ed25519.js";
 // M9D 001-PQPRIM: ML-DSA-44 and ML-KEM-768 on native node:crypto (Contract 1), and the Contract 2
 // frame — `signMlDsa`/`verifyMlDsa` are the only route to an ML-DSA signature. The provider's raw
 // `sign` and the frame builder are deliberately not reachable from here.

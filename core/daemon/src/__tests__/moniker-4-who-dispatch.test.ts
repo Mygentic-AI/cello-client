@@ -13,7 +13,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
+import { generateKeypair } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
@@ -23,6 +23,7 @@ import type { Logger, DaemonConfig, IpcNotification } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
+import { provisionAgentIdentity } from "../testing.js";
 
 function silentLogger(): Logger {
   return { debug() {}, info() {}, warn() {}, error() {} };
@@ -129,7 +130,7 @@ describe("MONIKER-4 AC2 e2e — the created doorbell carries the resolved who", 
   async function startHarness(): Promise<{ inject: (f: unknown) => void; client: IpcClient; bobPubkey: string; notifications: IpcNotification[] }> {
     const dir = join(tempDir, "agents", "bob");
     await mkdir(dir, { recursive: true });
-    const kp = await FileKeyProvider.load(join(dir, "key"));
+    const kp = await provisionAgentIdentity(tempDir, "bob");
     const bobPubkey = Buffer.from(await kp.getPublicKey()).toString("hex");
     const injectRef: { inject?: (frame: unknown) => void } = {};
     const config: DaemonConfig = {

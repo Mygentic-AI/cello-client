@@ -24,7 +24,7 @@ import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
 import type { RefusalKind } from "./refusal-reasons.js";
 import { REFUSAL_KINDS } from "./refusal-reasons.js";
-import { TIER, normalizeTier } from "./contacts-tier-migration.js";
+import { TIER, normalizeTier } from "./contact-tier.js";
 import { extractErrorMessage } from "./error-message.js";
 import { normalizeContactPubkey } from "./contact-pubkey-case.js";
 import type { OrphanEvidence } from "./orphan-triage.js";

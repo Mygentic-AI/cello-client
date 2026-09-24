@@ -18,7 +18,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
+import { generateKeypair } from "@cello-protocol/crypto";
 import { createNode } from "@cello-protocol/transport";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
@@ -28,6 +28,7 @@ import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-man
 import type { SessionNegotiator } from "../transport-selector.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
 import type { SessionAssignment } from "@cello-protocol/protocol-types";
+import { provisionAgentIdentity } from "../testing.js";
 
 function makeLogger(): Logger {
   return { debug() {}, info() {}, warn() {}, error() {} };
@@ -99,7 +100,7 @@ describe("M8B F13: initiate_session validates the counterparty endpoint before r
     const dirA = join(tempDir, "A");
     const agentDir = join(dirA, "agents", "alice");
     await mkdir(agentDir, { recursive: true });
-    const kp = await FileKeyProvider.load(join(agentDir, "key"));
+    const kp = await provisionAgentIdentity(dirA, "alice");
     const alicePubkey = Buffer.from(await kp.getPublicKey()).toString("hex");
 
     const negotiator: SessionNegotiator = {

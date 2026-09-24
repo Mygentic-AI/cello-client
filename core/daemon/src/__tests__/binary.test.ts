@@ -11,7 +11,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtemp, rm, mkdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { FileKeyProvider } from "@cello-protocol/crypto";
+import { provisionAgentIdentity } from "../testing.js";
 
 describe("daemon binary (AC-011)", () => {
   let tempDir: string;
@@ -36,7 +36,7 @@ describe("daemon binary (AC-011)", () => {
     // Create an agent directory with a valid key
     const agentsDir = join(tempDir, "agents");
     await mkdir(join(agentsDir, "binary-test-agent"), { recursive: true });
-    await FileKeyProvider.load(join(agentsDir, "binary-test-agent", "key"));
+    await provisionAgentIdentity(tempDir, "binary-test-agent");
 
     const daemonBin = join(import.meta.dirname, "../bin/cello-daemon.ts");
     const socketPath = join(tempDir, "daemon.sock");

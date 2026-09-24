@@ -1,9 +1,7 @@
 /**
  * CELLO-M7-DAEMON-001 / PERSIST-002 (AC-007) — Agent loader tests.
  *
- * The loader now enumerates agents from the encrypted `agents` table — ONE path. The legacy
- * `~/.cello/key` "default" fallback and the per-agent `agents/<name>/key` file read are gone (a
- * pre-story key file is imported into the table by identity-migration.ts before the loader runs).
+ * The loader enumerates agents from the encrypted `agents` table — ONE path, no key files.
  *
  * ACs tested:
  * - Loads agent identities (K_local seed → sign-only InMemoryKeyProvider) from the `agents` table.

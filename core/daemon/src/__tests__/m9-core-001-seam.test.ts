@@ -30,7 +30,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
-import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
+import { generateKeypair } from "@cello-protocol/crypto";
 import { createNode } from "@cello-protocol/transport";
 import { spawnGatewaySidecar, LocalSidecarGatewayClient, GatewayConfigStore, GatewayRecordStore, type SpawnedGateway, type SecurityGatewayClient, type ScreenVerdict, type ScreenContext } from "@cello-protocol/gateway";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
@@ -43,6 +43,7 @@ import type { SessionNegotiator } from "../transport-selector.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
 import type { SessionAssignment } from "@cello-protocol/protocol-types";
 import { extractErrorMessage } from "../error-message.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 /** cello_receive returns a `messages` array; null when nothing was delivered. */
 function recvText(r: Record<string, unknown> | undefined): string | null {
@@ -118,7 +119,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
   async function makeAgent(celloDir: string, name: string): Promise<string> {
     const dir = join(celloDir, "agents", name);
     await mkdir(dir, { recursive: true });
-    const kp = await FileKeyProvider.load(join(dir, "key"));
+    const kp = await provisionAgentIdentity(celloDir, name);
     const hex = Buffer.from(await kp.getPublicKey()).toString("hex");
     // 038-KEYBIND: a REAL agent, so the assignment fixture can sign a key binding as it.
     registerFixtureSigner(hex, kp);

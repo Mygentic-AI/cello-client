@@ -248,8 +248,7 @@ const CREATE_RELAY_RECEIPTS_SQL = `
     relay_timestamp  INTEGER NOT NULL,
     signature_hex    TEXT    NOT NULL,
     stored_at        INTEGER NOT NULL,
-    -- 069-ORDERPROOF: the running root the relay signed alongside the position (nullable — rows
-    -- written before this order have none, and they stay readable and sealable exactly as they are).
+    -- 069-ORDERPROOF: the running root the relay signed alongside the position.
     running_root_hex TEXT,
     -- FED-OPTIONB-SEAL-001: per-leaf carry bytes for the unilateral-seal offline rebuild (nullable).
     structure2_cbor  BLOB,
@@ -267,33 +266,6 @@ export class RelayReceiptStore {
     this.#db = db;
     this.#logger = logger;
     this.#db.exec(CREATE_RELAY_RECEIPTS_SQL);
-    this.#migrateSealCarryColumns();
-  }
-
-  /**
-   * FED-OPTIONB-SEAL-001: add the per-leaf carry columns to a relay_ack_receipts table created before the
-   * seal-carry feature (CREATE TABLE IF NOT EXISTS leaves an existing table untouched). Idempotent + safe:
-   * each column is added only if absent (checked via PRAGMA table_info), and all three are NULLABLE so the
-   * ALTER never rewrites or invalidates existing rows. Pre-migration receipts simply have no carry bytes
-   * (getSealLeaves omits them). No data is read/destroyed — pure additive schema evolution.
-   */
-  #migrateSealCarryColumns(): void {
-    const cols = new Set(
-      (this.#db.prepare(`PRAGMA table_info(relay_ack_receipts)`).all() as Array<{ name: string }>).map((c) => c.name),
-    );
-    for (const [name, decl] of [
-      ["structure2_cbor", "BLOB"],
-      ["structure1_cbor", "BLOB"],
-      ["leaf_kind", "INTEGER"],
-      // 069-ORDERPROOF. NULLABLE, like the three above: a session that predates this order keeps
-      // every receipt it already holds, opens, reads and seals unchanged, and simply has no root
-      // recorded for those positions.
-      ["running_root_hex", "TEXT"],
-    ] as const) {
-      if (!cols.has(name)) {
-        this.#db.exec(`ALTER TABLE relay_ack_receipts ADD COLUMN ${name} ${decl}`);
-      }
-    }
   }
 
   /**

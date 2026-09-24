@@ -36,7 +36,6 @@ import {
 } from "@cello-protocol/protocol-types";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
-import { addColumnIfMissing } from "./column-birth.js";
 
 /**
  * Verify a proposal's signature against the agent that claims to have made it.
@@ -51,14 +50,6 @@ export type ProposalSignatureVerifier = (
   signature: Uint8Array,
 ) => boolean;
 
-/**
- * NOTE FOR THE NEXT COLUMN. `CREATE TABLE IF NOT EXISTS` is correct only while no daemon has ever
- * created this table — true today, since it is new in an unreleased milestone. The moment any dev
- * or staging DB holds it, adding a column here returns silently and that column never appears on
- * an upgraded database while fresh installs get it. That divergence has already shipped once in
- * this repo (see `consent-migration.ts`). Any future column needs a `PRAGMA table_info` birth-gated
- * ALTER under `BEGIN IMMEDIATE`, following that file.
- */
 const CREATE_PROPOSALS_SQL = `
   CREATE TABLE IF NOT EXISTS document_proposals (
     owner_agent_id  TEXT    NOT NULL,
@@ -75,32 +66,19 @@ const CREATE_PROPOSALS_SQL = `
     refusal_reason  TEXT,
     created_at      INTEGER NOT NULL,
     decided_at      INTEGER,
+    -- The PEER's answer to a proposal WE authored (the document_proposal_ack frame). Distinct from
+    -- consent_state, which is OUR decision about THEIR proposal: one column for both directions
+    -- makes "we accepted" and "they accepted" indistinguishable.
+    peer_accepted   INTEGER,
+    peer_reason     TEXT,
+    peer_decided_at INTEGER,
+    -- Did our offer actually leave? Without it, a null peer_accepted meant both "they have not
+    -- decided" and "they were never asked".
+    proposal_sent_at INTEGER,
     PRIMARY KEY (owner_agent_id, document_id),
     CHECK (consent_state <> 'refused' OR refusal_reason IS NOT NULL)
   );
 `;
-
-/**
- * COLUMN BIRTH for the peer's answer to a proposal WE authored (the `document_proposal_ack` frame).
- *
- * Separate from the CREATE because a daemon that already holds proposals must gain the columns
- * without losing them. `ALTER TABLE ... ADD COLUMN` throws on a re-run, which is why each is
- * wrapped rather than guarded by a version number nobody maintains.
- *
- * Distinct from `consent_state`, which is OUR decision about THEIR proposal. Overloading one column
- * for both directions is how "we accepted" and "they accepted" become indistinguishable — and the
- * operator surface exists precisely to tell those apart.
- */
-const PEER_DECISION_COLUMNS = [
-  { column: "peer_accepted", sql: "ALTER TABLE document_proposals ADD COLUMN peer_accepted INTEGER" },
-  { column: "peer_reason", sql: "ALTER TABLE document_proposals ADD COLUMN peer_reason TEXT" },
-  { column: "peer_decided_at", sql: "ALTER TABLE document_proposals ADD COLUMN peer_decided_at INTEGER" },
-  // DID OUR OFFER ACTUALLY LEAVE? Nothing durable recorded it, so `peerAccepted: null` meant both
-  // "they have not decided" and "they were never asked" — and the shipped skill told the operator
-  // to WAIT, which is wrong for the second. The only place the send outcome ever appeared was the
-  // transient response to the propose call itself.
-  { column: "proposal_sent_at", sql: "ALTER TABLE document_proposals ADD COLUMN proposal_sent_at INTEGER" },
-];
 
 export interface DocumentProposalRecord {
   documentId: string;
@@ -130,9 +108,6 @@ export class DocumentHandshake {
     this.#logger = logger;
     this.#verify = verify;
     this.#db.exec(CREATE_PROPOSALS_SQL);
-    for (const { column, sql } of PEER_DECISION_COLUMNS) {
-      addColumnIfMissing(this.#db, this.#logger, { table: "document_proposals", column, sql });
-    }
   }
 
   /**

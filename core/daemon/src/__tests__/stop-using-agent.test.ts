@@ -31,8 +31,8 @@ import { tmpdir } from "node:os";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig } from "../types.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 interface AgentList { agents: Array<{ name: string; state: string; selected?: boolean; standing_receiver_ready?: boolean }> }
 
@@ -66,7 +66,7 @@ describe("DOD-RELEASE-1: cello_stop_using_agent", () => {
     const agentsDir = join(tempDir, "agents");
     for (const name of agentNames) {
       await mkdir(join(agentsDir, name), { recursive: true });
-      await FileKeyProvider.load(join(agentsDir, name, "key"));
+      await provisionAgentIdentity(tempDir, name);
     }
     return {
       securityGateway: new PassthroughGatewayClient(),

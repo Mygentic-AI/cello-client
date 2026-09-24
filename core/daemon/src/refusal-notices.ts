@@ -20,7 +20,7 @@ import type { SessionQueries } from "./session-queries.js";
 import { REFUSAL_KINDS, type RefusalKind } from "./refusal-reasons.js";
 import { refusalRecurrence } from "./park-refusals.js";
 import { extractErrorMessage } from "./error-message.js";
-import { TIER } from "./contacts-tier-migration.js";
+import { TIER } from "./contact-tier.js";
 import {
   type RefusalNotice,
   MAX_REFUSALS_PER_READ,
@@ -108,7 +108,7 @@ export class RefusalNotices {
           ? this.#db
               .prepare(
                 `SELECT n.session_id, n.reason, n.kind, n.impact, n.guidance, n.count, r.seen_count,
-                        t.total AS lifetime_total, t.seeded AS lifetime_seeded,
+                        t.total AS lifetime_total,
                         t.first_at AS lifetime_first_at, t.last_at AS lifetime_last_at
                    FROM content_refusal_notices n
                    LEFT JOIN content_refusal_reads r
@@ -125,7 +125,7 @@ export class RefusalNotices {
           : this.#db
               .prepare(
                 `SELECT n.session_id, n.reason, n.kind, n.impact, n.guidance, n.count, r.seen_count,
-                        t.total AS lifetime_total, t.seeded AS lifetime_seeded,
+                        t.total AS lifetime_total,
                         t.first_at AS lifetime_first_at, t.last_at AS lifetime_last_at
                    FROM content_refusal_notices n
                    LEFT JOIN content_refusal_reads r
@@ -142,7 +142,7 @@ export class RefusalNotices {
       ) as Array<{
         session_id: string; reason: string; kind: string; impact: string;
         guidance: string; count: number; seen_count: number | null;
-        lifetime_total: number | null; lifetime_seeded: number | null;
+        lifetime_total: number | null;
         lifetime_first_at: number | null; lifetime_last_at: number | null;
       }>;
       if (rows.length > MAX_REFUSALS_PER_READ) { truncated = true; rows.length = MAX_REFUSALS_PER_READ; }
@@ -177,39 +177,24 @@ export class RefusalNotices {
           guidance: row.guidance,
           timesSinceDismissed: row.count,
           /**
-           * DOD-M15-REFUSALTERMINAL-1 — three states, and they are three different claims.
-           *
-           * A counted total is a FIGURE. A seeded row is a FLOOR, and says so by using a different
-           * field name (review F1c). `null` means no totals row at all, which after the upgrade
-           * backfill can only happen when the notice write itself failed — reported as ABSENT
-           * rather than as the smaller number, because substituting it is the defect this unit
-           * exists to remove.
+           * DOD-M15-REFUSALTERMINAL-1 — `null` means no totals row, which happens only when the
+           * notice write itself failed. Reported as ABSENT rather than as the smaller number,
+           * because substituting it is the defect this unit exists to remove.
            */
-          ...(row.lifetime_total === null
-            ? {}
-            : row.lifetime_seeded === 1
-              ? { timesTotalAtLeast: row.lifetime_total }
-              : { timesTotal: row.lifetime_total }),
+          ...(row.lifetime_total === null ? {} : { timesTotal: row.lifetime_total }),
           /**
            * `041-PARKSTUCK` Unit 2, property 2 — A LOOP SAYS THAT IT IS ONE.
            *
-           * `times_total_at_least: 731` with nothing beside it reads as 731 things going wrong.
-           * The row knows better: it holds the first and last time this reason fired, so the
-           * cadence is a division rather than a guess. Absent when the row cannot support the
-           * claim — see `refusalRecurrence`.
+           * `times_total: 731` with nothing beside it reads as 731 things going wrong. The row
+           * knows better: it holds the first and last time this reason fired, so the cadence is a
+           * division rather than a guess. Absent when the row cannot support the claim — see
+           * `refusalRecurrence`.
            */
           ...(() => {
             const r =
               row.lifetime_total === null || row.lifetime_first_at === null || row.lifetime_last_at === null
                 ? null
-                : refusalRecurrence(
-                    row.lifetime_total,
-                    row.lifetime_first_at,
-                    row.lifetime_last_at,
-                    // Review M5: the SAME flag the two fields above branch on. Reading it here is
-                    // what stops the sentence asserting a figure the row records as a floor.
-                    row.lifetime_seeded === 1,
-                  );
+                : refusalRecurrence(row.lifetime_total, row.lifetime_first_at, row.lifetime_last_at);
             return r === null ? {} : { recurrence: r };
           })(),
           ...(firstTime ? {} : { repeat: true }),
@@ -333,8 +318,8 @@ export class RefusalNotices {
        * without, one of them blaming a disk fault. Before this unit a single statement made that
        * state impossible; the second statement is what created it.
        *
-       * `ROLLBACK` is best-effort because SQLite may have aborted the transaction already — the
-       * same shape `agent-id-migration.ts` uses — and it must never mask the original error.
+       * `ROLLBACK` is best-effort because SQLite may have aborted the transaction already, and it
+       * must never mask the original error.
        */
       this.#db.exec("BEGIN");
       try {
@@ -360,13 +345,9 @@ export class RefusalNotices {
        */
       this.#db
         .prepare(
-          // `seeded` stays whatever the row already has. A row seeded at upgrade remains a LOWER
-          // BOUND for the life of that (session, reason) — counting forward from an incomplete
-          // figure does not recover the refusals dismissal already erased, and clearing the flag
-          // would turn "at least 58" into a claimed total of 59.
           `INSERT INTO content_refusal_totals
-             (agent_id, session_id, reason, total, first_at, last_at, seeded)
-           VALUES (?, ?, ?, 1, ?, ?, 0)
+             (agent_id, session_id, reason, total, first_at, last_at)
+           VALUES (?, ?, ?, 1, ?, ?)
            ON CONFLICT(agent_id, session_id, reason) DO UPDATE SET
              total = total + 1, last_at = excluded.last_at`,
         )

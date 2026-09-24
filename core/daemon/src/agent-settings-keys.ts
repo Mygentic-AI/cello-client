@@ -15,7 +15,7 @@
  * refused before any reply). So the settable tiers are unknown / known / whitelisted / vip.
  */
 
-import { TIER } from "./contacts-tier-migration.js";
+import { TIER } from "./contact-tier.js";
 import { RELAY_ONLY_KEY } from "./relay-only.js";
 
 /** The tiers whose bounds and away texts are settable (BLOCKED is fixed, never overridable). */

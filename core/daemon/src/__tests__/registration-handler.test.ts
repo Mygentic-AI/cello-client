@@ -18,8 +18,8 @@ import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { registerRegisterHandler } from "../register-handler.js";
 import { connectToDaemon } from "../ipc-client.js";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig } from "../types.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 describe("cello_register single-flight guard", () => {
   let tempDir: string;
@@ -42,7 +42,7 @@ describe("cello_register single-flight guard", () => {
   it("rejects a concurrent registration with registration_already_in_progress", async () => {
     const agentsDir = join(tempDir, "agents");
     await mkdir(join(agentsDir, "alice"), { recursive: true });
-    await FileKeyProvider.load(join(agentsDir, "alice", "key"));
+    await provisionAgentIdentity(tempDir, "alice");
 
     // Block directory endpoint resolution so the first registration claims the
     // single-flight slot and parks there while the second call arrives.
@@ -87,7 +87,7 @@ describe("cello_register single-flight guard", () => {
   it("returns missing_preauth_token when the token is absent", async () => {
     const agentsDir = join(tempDir, "agents");
     await mkdir(join(agentsDir, "alice"), { recursive: true });
-    await FileKeyProvider.load(join(agentsDir, "alice", "key"));
+    await provisionAgentIdentity(tempDir, "alice");
     const config: DaemonConfig = {
     securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,

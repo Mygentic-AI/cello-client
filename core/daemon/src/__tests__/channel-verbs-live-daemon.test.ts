@@ -21,10 +21,10 @@ import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import type { Logger, DaemonConfig } from "../types.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 const RELAY_A = "/dns4/relay-a.example/tcp/443/tls/ws";
 const RELAY_B = "/dns4/relay-b.example/tcp/443/tls/ws";
@@ -42,7 +42,7 @@ describe("M16 018-PUBCOLLECT: the channel verbs on a live daemon", () => {
 
   async function config(): Promise<DaemonConfig> {
     await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
-    const kp = await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+    const kp = await provisionAgentIdentity(tempDir, "alice");
     alicePubkeyHex = Buffer.from(await kp.getPublicKey()).toString("hex");
     return {
       securityGateway: new PassthroughGatewayClient(),

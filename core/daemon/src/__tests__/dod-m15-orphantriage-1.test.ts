@@ -36,8 +36,7 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
-import { FileKeyProvider } from "@cello-protocol/crypto";
-import { TIER } from "../contacts-tier-migration.js";
+import { TIER } from "../contact-tier.js";
 import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
 import { encodeCbor, encodeStructure1 } from "@cello-protocol/protocol-types";
 import { generateKeypair, sealSessionContent } from "@cello-protocol/crypto";
@@ -53,6 +52,7 @@ import {
   type OrphanEvidence,
 } from "../orphan-triage.js";
 import { retentionSentence } from "../quarantine-framing.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 /** The leaf hash the receiver recomputes: sha256(0x00 ‖ content). Mirrors `daemon-004-tree`. */
 function msgLeafHash(content: Uint8Array): Uint8Array {
@@ -259,7 +259,7 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the orphan branch derives its own signals",
 
   async function config(): Promise<DaemonConfig> {
     await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
-    await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+    await provisionAgentIdentity(tempDir, "alice");
     return {
       securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,

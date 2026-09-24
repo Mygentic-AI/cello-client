@@ -1,38 +1,25 @@
 /**
  * CELLO Daemon — THE SESSION DATABASE SCHEMA
  *
- * Split out of `session-node-manager.ts` by 037-SESSIONCORE. Every CREATE TABLE and every additive
- * ALTER TABLE the daemon's session store needs, in the order they must run.
+ * Split out of `session-node-manager.ts` by 037-SESSIONCORE. Every CREATE TABLE the daemon's
+ * session store needs, each in its final shape.
  *
- * Moved verbatim, comments included — and in this file the comments carry more than usual. Several
- * columns exist because of a specific defect, and the prose beside them is the only record of which
- * one: the transcript's `attribution` column is NOT NULL precisely so that a row without authorship
- * proof cannot look like a row that has one, and the `⚠️` blocks on `sender_sig` correct two earlier
- * sentences that sent auditors looking for Structure-2 bytes that do not exist on a relay-degraded
- * message.
+ * Several columns exist because of a specific defect, and the prose beside them is the only record
+ * of which one: the transcript's `attribution` column is NOT NULL precisely so that a row without
+ * authorship proof cannot look like a row that has one.
  *
- * ⚠️ THIS IS CLIENT-SIDE MIGRATION CODE AND IT RUNS ON OPERATORS' MACHINES. A migration that fails
- * here is not a failed deploy that can be rolled back — it is a daemon that will not start on
- * somebody's laptop, with their key shares and transcript inside the database it could not open.
- * Additive columns only; never rewrite an applied statement, and never reorder the list.
+ * NO MIGRATIONS (M9D purge). CELLO is alpha and every daemon starts from a fresh CELLO home at the
+ * M9D roll, so there is no older database to upgrade. A column change is an edit to its CREATE.
  */
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
-import { addColumnIfMissing } from "./column-birth.js";
-import { migrateSessionTablesToAgentId } from "./agent-id-migration.js";
-import { migrateContactsAddTierMetadata } from "./contacts-tier-migration.js";
-import { migrateCborBlobsToCanonical } from "./cbor-blob-migration.js";
-import { foldContactPubkeyCase } from "./contact-pubkey-case.js";
 import { ensureTrustSignalSchema } from "./trust-signal-store.js";
-import { extractErrorMessage } from "./error-message.js";
 
 /**
- * Create every session-store table and apply every additive migration.
+ * Create every session-store table.
  *
- * `loadDivergedFromDb` is a CALLBACK rather than an import: the divergence memo is rehydrated part
- * way through this sequence — after the agent-id migration that gives it rows to read — and the
- * store that owns it lives elsewhere. Passing it keeps the ordering visible here, where the reason
- * for it is, instead of leaving a second caller to remember it.
+ * `loadDivergedFromDb` is a CALLBACK rather than an import: the store that owns the divergence memo
+ * lives elsewhere, and it must run after `sessions` exists.
  */
 export function ensureSessionSchema(
   db: DaemonDatabase,
@@ -47,168 +34,59 @@ export function ensureSessionSchema(
       status TEXT NOT NULL,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
+      message_count INTEGER NOT NULL DEFAULT 0,
+      interrupted_at TEXT,
+      -- Decisions Carried #8: the session salt, agreed once at open from both sides' random
+      -- contributions. Not a key. Persisted because a restart that minted a fresh one would split
+      -- the transcript at the crash, every earlier leaf unverifiable.
+      content_salt BLOB,
+      -- DOD-M15-FREEZE-STATUS-1: when and why #freezeOnIdentityFailure fired. Written BEFORE
+      -- destroySessionNode, which writes the revivable 'interrupted' status. NULL = never frozen.
+      frozen_at INTEGER,
+      frozen_reason TEXT,
+      -- MSG-001-3b: the relay endpoint, so the crash-backstop flush can deposit un-acked content
+      -- after a restart. relay_addrs is a JSON array of multiaddr strings.
+      relay_peer_id TEXT,
+      relay_addrs TEXT,
+      -- 033-ACKEMIT: the genesis prev_root. It depends on the session timestamp, which arrives only
+      -- on the signed assignment; a session restored after a restart has no assignment in hand.
+      genesis_prev_root BLOB,
+      -- 069-ORDERPROOF: the ack-signing pubkey of the relay the directory assigned. NULL for a
+      -- direct session, which has no relay.
+      relay_anchor_hex TEXT,
+      -- M7-SESSION-004: the seal certificate's legibility object (JSON) and sealed root. NULL until sealed.
+      seal_legibility TEXT,
+      sealed_root_hex TEXT,
+      -- The counterparty's FROST primary, ML-DSA-44 and ML-KEM-768 public keys (hex), recorded
+      -- together and only after their v2 key binding verified (M9D 002-PQKEYS). Read through
+      -- counterpartyPqKeys, never directly.
+      counterparty_primary_pubkey TEXT,
+      counterparty_ml_dsa_pubkey TEXT,
+      counterparty_ml_kem_pubkey TEXT,
+      -- DOD-SESSION-NAME-1: the operator's own label. Local and cosmetic; never on the wire, in the
+      -- transcript or in the seal. NULL means unnamed — never auto-generate one.
+      session_name TEXT,
+      -- DOD-SEALED-INBOX-1: epoch-ms set by cello_dismiss. Local housekeeping only.
+      read_at INTEGER,
+      -- DOD-M12B-ABANDON-NOTIFY-1: when the counterparty said they force-abandoned. Not a status:
+      -- the session stays sealable.
+      counterparty_abandoned_at INTEGER,
+      -- DOD-CAP-SELF-HEAL-1: 'counterparty' or 'local'. Only the counterparty's counts against the
+      -- acceptance bound.
+      interrupted_by TEXT,
+      -- DOD-M12B-RESTART-SEAL-1: when automatic sealing gave up, and why, so a restart does not
+      -- re-run the whole budget against a hopeless session.
+      restart_seal_gave_up_at INTEGER,
+      restart_seal_gave_up_reason TEXT,
+      -- DOD-M15-DIVERGE-DURABLE-1: when the tree and the relay's counter provably parted. Durable
+      -- because "not diverged" and "forgotten" both read false.
+      diverged_at INTEGER,
       -- DOD-LOOP-1: composite key so two of the operator's agents can hold both ends of the
-      -- SAME session_id on ONE daemon (the loopback case). A bare session_id PK would reject
-      -- the second end's row.
-      -- DOD-AGENT-ID-JOINKEY-1: keyed on the STABLE agent_id, never the mutable, reuse-freed
-      -- agent_name. The display name lives on the agents table and is joined in for reads.
+      -- SAME session_id on ONE daemon (the loopback case).
+      -- DOD-AGENT-ID-JOINKEY-1: keyed on the STABLE agent_id, never the mutable agent_name.
       PRIMARY KEY (agent_id, session_id)
     )
   `);
-
-  // M7-SESSION-001: idempotent schema extension — add message_count and interrupted_at
-  // columns if they do not exist. ALTER TABLE IF NOT EXISTS COLUMN is not supported by
-  // older SQLite; we use a try/catch per column as the idempotent approach.
-  for (const ddl of [
-    "ALTER TABLE sessions ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE sessions ADD COLUMN interrupted_at TEXT",
-    /**
-     * Decisions Carried #8 — THE SESSION SALT, persisted.
-     *
-     * Agreed once at session open from BOTH sides' random contributions, and unchanged for the
-     * life of the session. It is NOT a key: it decrypts nothing, and it is what lets this
-     * operator's own transcript stay verifiable — the content hash is recomputed from stored
-     * plaintext on the receive path and again for any later check, and salted it is underivable
-     * without this value.
-     *
-     * PERSISTED because the alternative is silent corruption. ⚠️ FUTURE TENSE, deliberately
-     * (review F10): NOTHING WRITES OR READS THIS COLUMN YET. `DOD-M15-SEALWIRE-1` will add the
-     * contribution exchange and the lookup — "does this session already have a salt? yes → use it,
-     * no → agree one" — and without the column that lookup would fail after a restart, mint a
-     * fresh salt, and split the transcript at the crash: every leaf before it unverifiable, with
-     * nothing saying so. The column lands now because it must exist before the code that needs it.
-     *
-     * NULL for every session opened before this column existed; those keep the unsalted hash.
-     */
-    "ALTER TABLE sessions ADD COLUMN content_salt BLOB",
-    /**
-     * DOD-M15-FREEZE-STATUS-1 — carried here for the OTHER LANE (`CELLO_Support`), agreed in
-     * session `e3adcaa7…`. Two lanes must not both edit this file (§2e, one file two branches), so
-     * the columns land in one migration and every line of behaviour stays on their side. Nothing
-     * in this lane reads or writes them.
-     *
-     *   `frozen_at`     epoch-ms when `#freezeOnIdentityFailure` fired. NULL = never frozen.
-     *   `frozen_reason` the `reason` already passed to that method. NULL iff `frozen_at` is NULL.
-     *
-     * ⚠️ THE WRITE MUST LAND BEFORE `destroySessionNode`, NOT AFTER — FRAME-1 review F1's
-     * ordering, and the reason the in-memory `#frozenSessions.add` already sits before the
-     * teardown. `destroySessionNode` writes `interrupted`, which is the REVIVABLE status, so a
-     * durable mark landing after it lets a read race the teardown and revive the session out from
-     * under the freeze — the disk reproducing the bug the memory mark was moved early to fix.
-     *
-     * Why it earns a slot rather than waiting: `#frozenSessions` is memory-only today, so a
-     * restart UN-FREEZES a session that was frozen because a party signed with a key that was not
-     * the counterparty's. The next read revives it and re-admits that peer, while the log still
-     * says the session will not be revived.
-     */
-    "ALTER TABLE sessions ADD COLUMN frozen_at INTEGER",
-    "ALTER TABLE sessions ADD COLUMN frozen_reason TEXT",
-    // MSG-001-3b (MSG-2 startup-flush): persist the session's relay endpoint so the
-    // crash-backstop flush can deposit un-acked content after a restart, when the
-    // in-memory entry is gone. relay_addrs is a JSON array of multiaddr strings.
-    "ALTER TABLE sessions ADD COLUMN relay_peer_id TEXT",
-    "ALTER TABLE sessions ADD COLUMN relay_addrs TEXT",
-    // M7-SESSION-004 (AC-005): persist the seal certificate's legibility object with the
-    // sealed record so it survives a daemon restart and is readable on the cert-read surface
-    // (cello_get_sealed_receipt). JSON string with hex-encoded pubkeys; NULL until sealed.
-    // Inline idempotent migration (NOT Flyway — this is the client-side SQLite, AC-011).
-    /**
-     * 033-ACKEMIT — THE SESSION'S GENESIS PREV_ROOT, and it is persisted for ONE reason: a
-     * restart.
-     *
-     * It is a pure function of the two participant keys, the session id and the SESSION
-     * TIMESTAMP — and the timestamp arrives on the directory-signed relay assignment and lives
-     * nowhere else. A session restored from this table after a daemon restart re-registers with
-     * no assignment in hand, so without this column the daemon could not say what the first
-     * message of that session acknowledges, and every send on it would be refused rather than
-     * signed. Deriving is still preferred where the assignment IS in memory; this is what makes
-     * the derivation survive the process.
-     *
-     * NULL for every session opened before this column existed. Those sessions acknowledge
-     * nothing until the counterparty has sent something — they claim position 0 with no hash,
-     * which asserts nothing rather than asserting a position they cannot back — and from the
-     * first leaf they receive they acknowledge content like any other session.
-     */
-    "ALTER TABLE sessions ADD COLUMN genesis_prev_root BLOB",
-    /**
-     * 069-ORDERPROOF — the ack-signing pubkey (hex) of the relay the DIRECTORY assigned to this
-     * session, from `relay_id` inside the FROST-signed assignment.
-     *
-     * It is here for the same reason `genesis_prev_root` is: a session restored after a restart
-     * re-registers with NO assignment in hand, and the seal path registers with none either. The
-     * anchor lives nowhere else, and without it every submit on a revived session — and every seal
-     * leaf — is refused for want of something to check the relay's attestation against.
-     *
-     * NULL for every session opened before this column existed, and for direct sessions, which have
-     * no relay. Those sessions simply hold no ordering attestations; they read and seal as before.
-     */
-    "ALTER TABLE sessions ADD COLUMN relay_anchor_hex TEXT",
-    "ALTER TABLE sessions ADD COLUMN seal_legibility TEXT",
-    "ALTER TABLE sessions ADD COLUMN sealed_root_hex TEXT",
-    // M7 legibility-TBS-binding (responder verify): the counterparty's FROST primary (group)
-    // pubkey, taken from the FROST-signed SessionAssignment's signer_pubkey. The responder uses
-    // it to VERIFY the bilateral seal signature locally (the seal is signed by the initiator's
-    // primary), not just accept it. NULL when this party initiated (it uses its own primary).
-    "ALTER TABLE sessions ADD COLUMN counterparty_primary_pubkey TEXT",
-    // M9D 002-PQKEYS: the counterparty's ML-DSA-44 and ML-KEM-768 public keys (hex), recorded in the
-    // same call as the primary and only after the counterparty's v2 key binding verified. Orders 003,
-    // 005, 006 and 009 read them through `counterpartyPqKeys`, never directly.
-    "ALTER TABLE sessions ADD COLUMN counterparty_ml_dsa_pubkey TEXT",
-    "ALTER TABLE sessions ADD COLUMN counterparty_ml_kem_pubkey TEXT",
-    // DOD-SESSION-NAME-1: the operator's own human-readable label for this session. LOCAL AND
-    // COSMETIC — it is never sent to the relay or directory, never in a wire frame, never in the
-    // transcript, never in the seal or a Merkle leaf, and the counterparty never sees it. It
-    // cannot influence protocol behaviour.
-    // NULL MEANS SOMETHING: a session closed through an agent usually carries a name, so an
-    // unnamed closed session is a hint it did not close cleanly. Never auto-generate a default —
-    // a fabricated name destroys that signal.
-    "ALTER TABLE sessions ADD COLUMN session_name TEXT",
-    // DOD-SEALED-INBOX-1: local-only housekeeping flag — epoch-ms timestamp set by cello_dismiss.
-    // Never propagated, never part of the seal ceremony or hash chain. A dismissed terminal
-    // session is excluded from cello_inbox's ended_unread section. Distinct from the read
-    // watermark: this records "operator acknowledged via dismiss", not "operator received via
-    // cello_receive". NULL = not yet dismissed.
-    "ALTER TABLE sessions ADD COLUMN read_at INTEGER",
-    // DOD-M12B-ABANDON-NOTIFY-1: epoch-ms when the counterparty told us they force-abandoned.
-    // Deliberately NOT a status — the session stays sealable, so the operator can still take a
-    // unilateral receipt. It stops this side calling them, nothing more.
-    "ALTER TABLE sessions ADD COLUMN counterparty_abandoned_at INTEGER",
-    // DOD-CAP-SELF-HEAL-1: WHO caused this session to be interrupted — 'counterparty' when their
-    // stream dropped, 'local' when OUR daemon stopped or started. Only theirs counts against the
-    // acceptance bound. Without this the bound is all-time rather than concurrent: every restart
-    // flips every live session to `interrupted`, nothing ever resolves them, and a pair of agents
-    // that has talked three times can never talk again. NULL means "not recorded" and is treated
-    // as the counterparty's, because the safe default for an anti-abuse bound is to count it.
-    "ALTER TABLE sessions ADD COLUMN interrupted_by TEXT",
-    // DOD-M12B-RESTART-SEAL-1: when automatic sealing exhausted this session, and why. Durable
-    // because the resolver's attempt budget is in memory — without it a machine that restarts
-    // several times a day re-runs the whole budget against a hopeless session on every boot.
-    "ALTER TABLE sessions ADD COLUMN restart_seal_gave_up_at INTEGER",
-    "ALTER TABLE sessions ADD COLUMN restart_seal_gave_up_reason TEXT",
-    // DOD-M15-DIVERGE-DURABLE-1: epoch-ms when this session's tree and the relay's counter
-    // provably parted, so it can never seal bilaterally. NULL = not diverged.
-    //
-    // DURABLE, and the reason is that the read site cannot tell "not diverged" from "forgotten":
-    // both are false and both read READY. `#diverged` was in memory, so a restart turned a
-    // session that provably cannot seal into one the gate was happy to close.
-    //
-    // NOT the trade `frontier-mismatch.ts` makes on purpose. A frontier mismatch is re-detected
-    // by the very next close, so losing it costs a recomputation. Divergence is re-detected only
-    // by the next send that gets an ack behind the frontier — which on a finished conversation
-    // never comes. Losing it costs a WRONG ANSWER.
-    "ALTER TABLE sessions ADD COLUMN diverged_at INTEGER",
-  ]) {
-    try {
-      db.exec(ddl);
-    } catch (err: unknown) {
-      // Only swallow the idempotent "duplicate column name" case (the column
-      // already exists from a prior init). Any other failure — disk full,
-      // SQLITE_LOCKED, corruption — must propagate, otherwise the daemon would
-      // run without these columns and later silently read undefined.
-      const msg = extractErrorMessage(err);
-      if (!msg.includes("duplicate column name")) throw err;
-    }
-  }
 
   // M12-P18: sessions this agent REFUSED (abuse cap etc.). DURABLE and separate from the in-memory
   // refusedSessionRequests inbox list, for one reason: content parked for a refused session arrives
@@ -431,28 +309,6 @@ export function ensureSessionSchema(
     )
   `);
 
-  // DOD-M12B-INDEX-1: `CREATE TABLE IF NOT EXISTS` is a NO-OP against a table that already
-  // exists, so a database created between DOD-M12B-STRAND-1 and this change has `held_content`
-  // WITHOUT `origin`. On those every insert throws and every restore throws — holds go back to
-  // memory-only, silently at the surface, and that now includes our own sent messages, which
-  // nobody else holds a copy of. Loud in the log is not the same as visible.
-  try {
-    db.exec("ALTER TABLE held_content ADD COLUMN origin TEXT NOT NULL DEFAULT 'received'");
-  } catch (err: unknown) {
-    const msg = extractErrorMessage(err);
-    if (!/duplicate column name/i.test(msg)) throw err;
-  }
-  // DOD-M12B-INDEX-1: and the LEAF KIND. `#releaseHeld` used to append every held frame as "msg",
-  // so a document leaf that had to wait for its position came back as a conversation message —
-  // the distinction survived the immediate append and was destroyed by the hold, unrecoverably
-  // after a restart.
-  try {
-    db.exec("ALTER TABLE held_content ADD COLUMN leaf_kind TEXT NOT NULL DEFAULT 'msg'");
-  } catch (err: unknown) {
-    const msg = extractErrorMessage(err);
-    if (!/duplicate column name/i.test(msg)) throw err;
-  }
-
   // DOD-LOG-1 (PERSIST-LOG-001) / PERSIST-002 (AC-010): the durable, ENCRYPTED-at-rest readable
   // transcript. Each row is keyed by the canonical leaf `sequence`, so it JOINS to
   // session_tree_leaves(leaf_index) — a stored message is provably behind a committed hash-chain
@@ -513,12 +369,13 @@ export function ensureSessionSchema(
       sender_pubkey TEXT,             -- from INSIDE the sender's signed bytes; NULL unless verified
       sender_sig BLOB,                -- the VERIFIED sender signature over structure1_cbor (see above); NULL unless verified
       attribution TEXT NOT NULL DEFAULT 'local_session_state',  -- verified_signature | self_authored | local_session_state
+      quarantine_reason TEXT,         -- DOD-M15-REFUSEDEVIDENCE-1; see below
       PRIMARY KEY (agent_id, session_id, sequence, direction)
     )
   `);
 
   /**
-   * DOD-M15-REFUSEDEVIDENCE-1 — the refusal reason on a QUARANTINED row.
+   * DOD-M15-REFUSEDEVIDENCE-1 — `quarantine_reason`, the refusal reason on a QUARANTINED row.
    *
    * `direction` takes a third value, `'quarantined'`: a message that was received and REFUSED. It
    * is stored the same way a delivered one is — plaintext blob, sender key, sender signature,
@@ -538,16 +395,6 @@ export function ensureSessionSchema(
    * `'quarantined'` is not `'sent'` — so a verified frame lands `verified_signature` and an
    * unverified one `local_session_state`, which is the distinction the column exists for.
    */
-  // Through `addColumnIfMissing`, not a hand-rolled try/catch — review F7. A bare `ADD COLUMN`
-  // wrapped in a duplicate-name test had already been written twice in this codebase, which is
-  // why the helper exists; a third copy rethrows correctly but emits no `db.column_birth.failed`,
-  // so a failure on a fresh operator's database would name neither the table nor the column. That
-  // is exactly the case — the FIRST run on a new machine — the helper was extracted for.
-  addColumnIfMissing(db, logger, {
-    table: "transcript",
-    column: "quarantine_reason",
-    sql: "ALTER TABLE transcript ADD COLUMN quarantine_reason TEXT",
-  });
 
   /**
    * DOD-M15-DELIVERYACK-1 — the counterparty's SIGNATURE saying their machine received a message.
@@ -650,12 +497,18 @@ export function ensureSessionSchema(
       agent_id TEXT NOT NULL,
       pubkey TEXT NOT NULL,
       added_at INTEGER NOT NULL,
+      -- MONIKER-3 AC1: the receiver's own pet name for a pubkey — the top tier of whoLabel.
+      moniker TEXT,
+      -- DOD-TIER-1: reachability tier (TIER in contact-tier.ts; NULL reads as UNKNOWN via
+      -- normalizeTier), how the relationship began, the last self-declared name the peer offered
+      -- (rename detection), and a per-contact away message.
+      tier INTEGER,
+      provenance TEXT,
+      last_offered_moniker TEXT,
+      away_message TEXT,
       PRIMARY KEY (agent_id, pubkey)
     )
   `);
-  // MONIKER-3 AC1: the receiver's own pet name for a pubkey — the top tier of whoLabel.
-  // SQLite has no ADD COLUMN IF NOT EXISTS, so the ALTER is PRAGMA-guarded to stay
-  // idempotent; existing rows → NULL, no data loss.
   // M10B / DOD-END-SURFACE-1 — per-counterparty presentation choice.
   //
   // `default_present` on the signal answers "show this by default"; this answers "show THIS signal
@@ -676,73 +529,8 @@ export function ensureSessionSchema(
       PRIMARY KEY (agent_id, contact_pubkey, signal_hash)
     )
   `);
-  /**
-   * DOD-M15-SEALWIRE-1 bullet 5: authorship columns on an EXISTING transcript.
-   *
-   * BEFORE `migrateSessionTablesToAgentId` — the rebuild copies the intersection of old and new
-   * columns, so a column added after it would be dropped on the upgrade boot and re-added empty.
-   * These have their second entry in that migration's pinned DDL; `DOD-M15-MIGRATION-GUARD-1`
-   * fails the build if the two ever disagree.
-   *
-   * `addColumnIfMissing` rather than a bare try/catch: it swallows ONLY `duplicate column name`
-   * and rethrows anything else, so broken DDL cannot be mistaken for "already applied".
-   */
-  // Written as three LITERAL statements rather than a loop over a column array. A loop needs its
-  // own parser in the guard (as retry_queue does); literals are read by the guard's generic one,
-  // so these are replayed automatically and cannot fall outside it.
-  addColumnIfMissing(db, logger, {
-    table: "transcript", column: "sender_pubkey",
-    sql: "ALTER TABLE transcript ADD COLUMN sender_pubkey TEXT",
-  });
-  addColumnIfMissing(db, logger, {
-    table: "transcript", column: "sender_sig",
-    sql: "ALTER TABLE transcript ADD COLUMN sender_sig BLOB",
-  });
-  addColumnIfMissing(db, logger, {
-    table: "transcript", column: "attribution",
-    sql: "ALTER TABLE transcript ADD COLUMN attribution TEXT NOT NULL DEFAULT 'local_session_state'",
-  });
-
-  const contactCols = db.prepare("PRAGMA table_info(contacts)").all() as Array<{ name: string }>;
-  if (!contactCols.some((c) => c.name === "moniker")) {
-    db.exec("ALTER TABLE contacts ADD COLUMN moniker TEXT");
-  }
-
-  // DOD-AGENT-ID-JOINKEY-1: finish REMOVE-001. Re-key the seven child tables from the mutable,
-  // reuse-freed `agent_name` to the stable `agent_id`, in ONE transaction. Runs AFTER every
-  // CREATE/ALTER above, so an existing table has its full historical column set before it is
-  // rebuilt, and BEFORE any read below touches it. A no-op once the tables carry `agent_id`.
-  //
-  // `retry_queue` (the seventh) is created later, by RetryQueue's constructor. On an existing
-  // database it already exists here and is re-keyed in the same transaction; on a fresh one it is
-  // absent, is skipped, and RetryQueue then creates it directly in the re-keyed shape.
-  migrateSessionTablesToAgentId(db, logger);
-
-  /**
-   * DOD-M15-DIVERGE-DURABLE-1: rehydrate the divergence set from `sessions.diverged_at`.
-   *
-   * AFTER `migrateSessionTablesToAgentId`, not with the column migrations that create the field.
-   * The query joins `sessions.agent_id` to `agents`, and on a database written before REMOVE-001
-   * that column does not exist until this migration adds it — placing the load earlier failed
-   * with `no such column: s.agent_id` on exactly those legacy databases, which are the ones a
-   * restart matters most for.
-   */
+  // DOD-M15-DIVERGE-DURABLE-1: rehydrate the divergence set from `sessions.diverged_at`.
   loadDivergedFromDb();
-
-  // DOD-TIER-1 (address-book Step 1): give `contacts` its tier metadata (tier / provenance /
-  // last_offered_moniker / away_message). Pure ADD COLUMN, no rebuild — so it runs AFTER the
-  // agent-id re-key above (it never needs to appear in that migration's pinned DDL) and BEFORE any
-  // read below. Idempotent, no column DEFAULT, grandfathers existing contacts to WHITELISTED once.
-  migrateContactsAddTierMetadata(db, logger);
-
-  // §1.1: normalize frost_commitments / frost_verifying_shares to ONE CBOR encoding. Registration
-  // wrote them with the shared encoder; the refresh path wrote them with cbor-x's bare `encode`,
-  // so an agent's share blobs changed format the first time it ran `cello_refresh_shares` and both
-  // formats are on disk. Both producers now use encodeCbor; this rewrites what is already stored.
-  // Idempotent (a canonical blob re-encodes to itself and is skipped) and per-row fail-safe (an
-  // undecodable share is LEFT ALONE, never dropped — losing key material is worse than an old
-  // encoding cbor-x still reads).
-  migrateCborBlobsToCanonical(db, logger);
 
   // M8C-TGDOOR-1: daemon-wide Telegram settings (bot token + allowlisted operator chat). A
   // NEW dedicated table — NOT folded into the parked M9-CFG-001 config store, because a bot
@@ -773,21 +561,6 @@ export function ensureSessionSchema(
       PRIMARY KEY (agent_id, pubkey)
     )
   `);
-
-  /**
-   * A PUBLIC KEY IS BYTES; ITS HEX CASE IS NOT PART OF ITS IDENTITY.
-   *
-   * ⚠️ **PLACED HERE FOR TWO ORDERING REASONS, and getting either wrong is a crash at boot.** It
-   * touches all three contact-keyed tables, so it runs after the LAST of them exists
-   * (`contact_rename_notices`, directly above); and the merge it performs on a collision keeps the
-   * more restrictive TIER, which it cannot read until `migrateContactsAddTierMetadata` has added
-   * that column.
-   *
-   * Normalizing the accessors alone would be worse than the bug for anyone who already has a
-   * mixed-case row: the row becomes UNREACHABLE rather than merely wrong, taking its block, its
-   * away message and its pet name with it. Idempotent and silent on a clean database.
-   */
-  foldContactPubkeyCase(db, logger);
 
   // DOD-M15-NO-SILENT-REFUSAL-1: refusal notices — one per (agent, session, reason). Written every
   // time an inbound message is refused; read by cello_receive and by the cello_inbox pull. Modelled
@@ -837,80 +610,8 @@ export function ensureSessionSchema(
       total INTEGER NOT NULL,
       first_at INTEGER NOT NULL,
       last_at INTEGER NOT NULL,
-      -- 1 when this row was SEEDED from an existing notice at upgrade rather than counted from
-      -- the first refusal. Its total is then a LOWER BOUND, not a figure, and the drain reports
-      -- it under a different field name so a reader cannot mistake one for the other.
-      seeded INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (agent_id, session_id, reason)
     )
-  `);
-  /**
-   * ⚠️ **THE BACKFILL, and without it this unit ships the original lie with the new name on it.**
-   *
-   * Review finding 1. A new table is created EMPTY. Every daemon that already has refusal notices
-   * — including the one that produced this incident, whose notice sat at 58 — would report
-   * `times_since_dismissed: 59` beside a `times_total` of **1**, on the very field the guidance
-   * tells an operator to judge severity by. Smaller than the number it exists to dwarf.
-   *
-   * `count` is the best figure available at upgrade and it is a LOWER BOUND: dismissals before
-   * this build deleted history nothing can recover. So the row is marked `seeded` and reported as
-   * "at least", never as a total. A lower bound is a true statement; `total = 1` is not.
-   *
-   * `INSERT OR IGNORE` makes it idempotent and self-healing — it fills only rows that do not
-   * exist, so a real counted total is never overwritten by a seeded one, and running it at every
-   * boot costs one indexed scan of a table bounded by (sessions × reasons).
-   */
-  /**
-   * ⚠️ **AND `CREATE TABLE IF NOT EXISTS` IS A NO-OP AGAINST A TABLE THAT ALREADY EXISTS** —
-   * review F1b, and it is the same hazard `DOD-M12B-INDEX-1` records for `held_content.origin`
-   * three hundred lines above.
-   *
-   * The table shipped one commit earlier WITHOUT `seeded`, and that build ran on a real daemon to
-   * take this unit's live measurement. On that machine the `CREATE` does nothing, the backfill
-   * below names a column that is not there, and the throw comes out of schema init — **the daemon
-   * does not open at all.** The one machine that most needs the backfill is the one it would have
-   * bricked.
-   */
-  try {
-    db.exec("ALTER TABLE content_refusal_totals ADD COLUMN seeded INTEGER NOT NULL DEFAULT 0");
-  } catch (err: unknown) {
-    const msg = extractErrorMessage(err);
-    if (!/duplicate column name/i.test(msg)) throw err;
-  }
-  db.exec(`
-    INSERT OR IGNORE INTO content_refusal_totals
-      (agent_id, session_id, reason, total, first_at, last_at, seeded)
-    SELECT agent_id, session_id, reason, count, first_at, last_at, 1
-      FROM content_refusal_notices
-  `);
-  /**
-   * ⚠️ **THE INVARIANT: a lifetime total can never be SMALLER than a since-dismissal count.**
-   * Caught on the live daemon, not by review — the inbox read
-   * `times_since_dismissed: 78, times_total: 12`.
-   *
-   * `INSERT OR IGNORE` above only fills rows that are ABSENT. A row that already exists but began
-   * counting AFTER the notice did — the totals table shipped one commit before `seeded`, so its
-   * rows default to 0 and claim to be exact — is left alone, and then presents a partial tally as
-   * a lifetime figure. Smaller than the number beside it, which is the tell.
-   *
-   * `count` resets on dismissal and `total` does not, so in healthy operation `total >= count`
-   * always. `count > total` therefore means one thing only: this row's total did not start at the
-   * beginning. Repaired to the best floor available and marked `seeded`, because that is what it
-   * is. Runs at every boot — it is also the repair for a totals write that failed while the
-   * notice's succeeded.
-   */
-  db.exec(`
-    UPDATE content_refusal_totals
-       SET total = (SELECT n.count FROM content_refusal_notices n
-                     WHERE n.agent_id = content_refusal_totals.agent_id
-                       AND n.session_id = content_refusal_totals.session_id
-                       AND n.reason = content_refusal_totals.reason),
-           seeded = 1
-     WHERE EXISTS (SELECT 1 FROM content_refusal_notices n
-                    WHERE n.agent_id = content_refusal_totals.agent_id
-                      AND n.session_id = content_refusal_totals.session_id
-                      AND n.reason = content_refusal_totals.reason
-                      AND n.count > content_refusal_totals.total)
   `);
   /**
    * DOD-M15-REFUSALTERMINAL-1 — content this agent will never accept, so the daemon stops going
@@ -966,8 +667,7 @@ export function ensureSessionSchema(
 
   // M10 / DOD-STORE-CLIENT-1: the two trust-signal tables (wallet + received). Created HERE and
   // deliberately last: `contact_trust_signals` carries a composite FK to `contacts(agent_id,
-  // pubkey)`, so its parent must exist and must already have been through the agent-id re-key
-  // above. SQLite resolves an FK's parent at DML time, not DDL time — so getting this order wrong
+  // pubkey)`, so its parent must exist. SQLite resolves an FK's parent at DML time, not DDL time — so getting this order wrong
   // would not fail here, it would fail on the first insert, which is a far worse place to find out.
   ensureTrustSignalSchema(db, logger);
 

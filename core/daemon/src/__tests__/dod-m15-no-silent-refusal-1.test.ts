@@ -35,8 +35,8 @@ import type { GatewayMode, ScreenContext, ScreenVerdict, SecurityGatewayClient }
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { REFUSAL_KINDS } from "../refusal-reasons.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig } from "../types.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 /** The leaf hash the receiver recomputes: sha256(0x00 ‖ content). Mirrors `daemon-004-tree`. */
 function msgLeafHash(content: Uint8Array): Uint8Array {
@@ -94,7 +94,7 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
 
   async function config(gateway?: SecurityGatewayClient): Promise<DaemonConfig> {
     await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
-    await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+    await provisionAgentIdentity(tempDir, "alice");
     return {
       securityGateway: gateway ?? new PassthroughGatewayClient(),
       celloDir: tempDir,

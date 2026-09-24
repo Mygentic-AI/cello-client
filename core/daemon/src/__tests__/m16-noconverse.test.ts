@@ -15,7 +15,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import { mkdtemp, mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
+import { generateKeypair } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import type { CelloNode, ConnectResult, SignalingStream } from "@cello-protocol/transport";
 import { startTwoConnectionFixture, FakeNode, FixedFactory, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
@@ -24,11 +24,12 @@ import { wireSessionOfferHandler } from "../session-ceremony.js";
 import { startDaemon } from "../daemon.js";
 import { DbRegistrationPersistence } from "../db-identity-store.js";
 import { REFUSAL_GUIDANCE, REFUSAL_REASONS } from "../refusal-reasons.js";
-import { TIER } from "../contacts-tier-migration.js";
+import { TIER } from "../contact-tier.js";
 import { makeSignedAssignmentFrame, fixtureIdentity, registerFixtureSigner } from "./helpers/signed-assignment.js";
 import type { SessionNegotiator } from "../transport-selector.js";
 import type { DaemonConfig, Logger } from "../types.js";
 import { fixturePqIdentityRecord, registeredPqFields } from "./helpers/pq-identity.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 // ─── Outbound ──────────────────────────────────────────────────────────────────────────────────
 
@@ -390,7 +391,7 @@ describe("M16 006-NOCONVERSE: a real daemon refuses an inbound session to its ch
     for (const name of ["chan", "bob"]) {
       const dir = join(tempDir, "agents", name);
       await mkdir(dir, { recursive: true });
-      const kp = await FileKeyProvider.load(join(dir, "key"));
+      const kp = await provisionAgentIdentity(tempDir, name);
       const hex = Buffer.from(await kp.getPublicKey()).toString("hex");
       registerFixtureSigner(hex, kp);
       pubkeys.set(name, hex);

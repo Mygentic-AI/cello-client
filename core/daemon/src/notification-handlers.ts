@@ -16,7 +16,7 @@ import type { Logger } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
 import type { InboundSessionEvent, ExpiredSessionRequest, RefusedSessionRequest } from "./inbound-sessions.js";
 import { resolveNamedAgent } from "./resolve-named-agent.js";
-import { TIER } from "./contacts-tier-migration.js";
+import { TIER } from "./contact-tier.js";
 import { screeningSessionNotice } from "./screening-status.js";
 import type { AgentInfo } from "./types.js";
 import { extractErrorMessage } from "./error-message.js";
@@ -272,9 +272,6 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
          */
         times_since_dismissed: r.timesSinceDismissed,
         ...(r.timesTotal === undefined ? {} : { times_total: r.timesTotal }),
-        // A FLOOR, not a figure — a row seeded at upgrade from a notice that already existed. It
-        // gets its own field name so it cannot be read as a count (review F1c).
-        ...(r.timesTotalAtLeast === undefined ? {} : { times_total_at_least: r.timesTotalAtLeast }),
         // `041-PARKSTUCK`: the cadence beside the count, so a loop is not read as a crowd.
         ...(r.recurrence === undefined ? {} : { recurrence: r.recurrence }),
         ...(r.repeat === true ? { repeat: true } : {}),

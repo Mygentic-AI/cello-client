@@ -10,8 +10,8 @@
  * Why an adapter: node:sqlite's `DatabaseSync` uses varargs (`stmt.run(a, b, c)`); @signalapp's
  * better-sqlite3-style API takes an array (`stmt.run([a, b, c])`). The `DaemonDatabase` /
  * `DaemonStatement` interfaces expose the varargs surface — node:sqlite's `DatabaseSync` structurally
- * satisfies them too (used for in-memory test handles and for reading a legacy plaintext DB during
- * migration), and `SqlcipherDatabase` implements them by forwarding varargs as an array.
+ * satisfies them too (used for in-memory test handles), and `SqlcipherDatabase` implements them by
+ * forwarding varargs as an array.
  *
  * Key custody: the SQLCipher key is a standalone random 32-byte 0600 key file beside the DB. It is
  * NOT derived from K_local — that is a chicken-and-egg, since K_local itself lives inside the DB. It
@@ -28,11 +28,9 @@
  */
 
 import { createRequire } from "node:module";
-import type { Logger } from "./types.js";
 import {
   existsSync,
   readFileSync,
-  readSync,
   openSync,
   writeSync,
   fsyncSync,
@@ -142,31 +140,6 @@ class SqlcipherDatabase implements DaemonDatabase {
   }
 }
 
-// ─── The raw SQLite magic — used to distinguish a plaintext DB from an encrypted one ──
-// A plaintext SQLite file begins with "SQLite format 3\0". A SQLCipher database encrypts the
-// header too, so its first bytes are ciphertext and never match. The migration path uses this to
-// detect a legacy plaintext DB that must be migrated.
-const SQLITE_MAGIC = Buffer.concat([Buffer.from("SQLite format 3", "latin1"), Buffer.from([0x00])]);
-
-/** True when the file at `dbPath` exists and is an UNENCRYPTED node:sqlite database. */
-export function isPlaintextSqliteFile(dbPath: string): boolean {
-  if (!existsSync(dbPath)) return false;
-  const head = Buffer.alloc(SQLITE_MAGIC.length);
-  try {
-    const fd = openSync(dbPath, "r");
-    try {
-      // Read exactly the header bytes — never slurp the whole (possibly very large) DB into RAM.
-      const bytesRead = readSync(fd, head, 0, SQLITE_MAGIC.length, 0);
-      if (bytesRead < SQLITE_MAGIC.length) return false;
-    } finally {
-      closeSync(fd);
-    }
-  } catch {
-    return false;
-  }
-  return head.equals(SQLITE_MAGIC);
-}
-
 // ─── Key custody ─────────────────────────────────────────────────────────────────
 
 /**
@@ -176,8 +149,7 @@ export function isPlaintextSqliteFile(dbPath: string): boolean {
  *   key present                      → load it (must be 32 bytes).
  *   key absent + DB absent           → generate + persist (0600), proceed (fresh install).
  *   key absent + DB present          → THROW db_encryption_key_mismatch (never overwrite an
- *                                      existing DB with a new key — that would be data loss; and
- *                                      a legacy PLAINTEXT DB must be migrated first, not opened).
+ *                                      existing DB with a new key — that would be data loss).
  */
 export function resolveDbKey(dbPath: string, keyPath: string): Uint8Array {
   if (existsSync(keyPath)) {
@@ -371,62 +343,6 @@ export function openEncryptedDatabase(
   }
 
   return new SqlcipherDatabase(inner);
-}
-
-/**
- * Run a table REBUILD (the create-copy-drop-rename recipe) with foreign keys safely disabled.
- *
- * THE TRAP THIS EXISTS TO CLOSE. With `PRAGMA foreign_keys = ON` (M10-D19), SQLite treats
- * `DROP TABLE parent` as an implicit `DELETE FROM parent` — which **fires `ON DELETE CASCADE` and
- * silently empties every child table**. No error. No log. The rebuild's own row-count guards count
- * the table being rebuilt, not its children, so they pass. Measured:
- *
- *     children before rebuild: 1
- *     PRAGMA foreign_keys = OFF  (inside BEGIN)  -> still reports 1   <-- A SILENT NO-OP
- *     DROP TABLE contacts                        -> children: 0       <-- cascade fired
- *
- * And the obvious mitigation does not work: **`PRAGMA foreign_keys` is a no-op inside a
- * transaction.** SQLite ignores it and says nothing. Since every rebuild in this codebase runs
- * inside one `BEGIN…COMMIT` (agent-id-migration.ts rebuilds seven tables, `contacts` among them),
- * a rebuild that "disabled" FKs in the usual place would still cascade.
- *
- * So the pragma must be toggled OUTSIDE the transaction, which is what this helper enforces — and it
- * VERIFIES the toggle took effect rather than assuming it, because the failure is silent by nature.
- * On the way out it re-enables FKs and runs `PRAGMA foreign_key_check`: a rebuild that left a
- * dangling reference (e.g. `ALTER TABLE parent RENAME` rewrites children's FK clauses to point at
- * the renamed table) is a loud failure here rather than a mystery on some later insert.
- */
-export function withForeignKeysOff<T>(db: DaemonDatabase, logger: Logger | undefined, fn: () => T): T {
-  db.exec("PRAGMA foreign_keys = OFF");
-
-  // Verify. If we are inside a transaction the pragma was silently ignored, and proceeding would
-  // cascade-delete children on the first DROP. Refuse — do not rebuild with FKs live.
-  const off = db.prepare("PRAGMA foreign_keys").get() as { foreign_keys?: number } | undefined;
-  if (off?.foreign_keys !== 0) {
-    throw new Error(
-      "table rebuild refused: PRAGMA foreign_keys = OFF did not take effect (still " +
-      `${String(off?.foreign_keys)}). PRAGMA foreign_keys is a NO-OP inside a transaction — this ` +
-      "helper must be called OUTSIDE any BEGIN. Rebuilding with FKs live makes DROP TABLE <parent> " +
-      "cascade-delete every child row, silently.",
-    );
-  }
-
-  try {
-    return fn();
-  } finally {
-    db.exec("PRAGMA foreign_keys = ON");
-    const violations = db.prepare("PRAGMA foreign_key_check").all() as unknown[];
-    if (violations.length > 0) {
-      // The rebuild left dangling references. Loud — an FK that points at a table that no longer
-      // exists (or a renamed one) fails on some unrelated insert much later, naming the wrong
-      // subsystem entirely.
-      logger?.error("persist.db.rebuild.fk_violation", { violations: violations.length });
-      throw new Error(
-        `table rebuild left ${violations.length} foreign-key violation(s) — PRAGMA foreign_key_check ` +
-        "is non-empty. The rebuilt table's children now reference a parent that is missing or renamed.",
-      );
-    }
-  }
 }
 
 /**

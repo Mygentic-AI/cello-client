@@ -17,7 +17,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtemp, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FileKeyProvider } from "@cello-protocol/crypto";
+import { provisionAgentIdentity } from "../../testing.js";
 
 /**
  * A real daemon is expensive to start: a fresh node process, tsx transpiling the whole daemon (6k+
@@ -48,7 +48,7 @@ export async function makeCelloDir(prefix = "cello-singleton-"): Promise<string>
   const dir = await mkdtemp(join(tmpdir(), prefix));
   const agentDir = join(dir, "agents", "singleton-test-agent");
   await mkdir(agentDir, { recursive: true });
-  await FileKeyProvider.load(join(agentDir, "key"));
+  await provisionAgentIdentity(dir, "singleton-test-agent");
   return dir;
 }
 

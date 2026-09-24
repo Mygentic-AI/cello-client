@@ -22,8 +22,8 @@ import { tmpdir } from "node:os";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig, SessionListEntry } from "../types.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 describe("DOD-SESSION-NAME-1: naming a session", () => {
   let tempDir: string;
@@ -58,7 +58,7 @@ describe("DOD-SESSION-NAME-1: naming a session", () => {
   /** One agent, online and selected, holding one session row (`active`). */
   async function setup(): Promise<IpcClient> {
     await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
-    await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+    await provisionAgentIdentity(tempDir, "alice");
     const config: DaemonConfig = {
     securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,

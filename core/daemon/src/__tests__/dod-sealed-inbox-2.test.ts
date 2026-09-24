@@ -32,11 +32,11 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { FileKeyProvider } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import type { DaemonConfig } from "../types.js";
+import { provisionAgentIdentity } from "../testing.js";
 
 /** The four statuses `getEndedUnread` returns. Exactly one of them is notarized. */
 const TERMINAL_STATUSES = ["sealed", "abandoned", "interrupted", "seal_interrupted_pending"] as const;
@@ -80,7 +80,7 @@ describe("DOD-SEALED-INBOX-2: the inbox must not claim a session is notarized wh
   async function makeAgentDir(name: string): Promise<void> {
     const dir = join(tempDir, "agents", name);
     await mkdir(dir, { recursive: true });
-    await FileKeyProvider.load(join(dir, "key"));
+    await provisionAgentIdentity(tempDir, name);
   }
 
   async function start(): Promise<Awaited<ReturnType<typeof startDaemon>>> {

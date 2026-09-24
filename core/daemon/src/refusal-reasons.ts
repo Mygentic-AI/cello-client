@@ -81,9 +81,7 @@ export const REFUSAL_COUNT_GUIDANCE =
   "THE TWO COUNTS MEAN DIFFERENT THINGS. `times_since_dismissed` counts only the refusals since " +
   "the operator last ran cello_dismiss on that conversation — dismissing clears the notice, never " +
   "the cause — so it can be small while the real figure is enormous. Judge severity by the " +
-  "lifetime one instead, which arrives as ONE of these two: `times_total` is an exact count from " +
-  "the first refusal; `times_total_at_least` is a FLOOR, for a conversation whose tally began when " +
-  "this daemon was upgraded, and the true figure may be far higher. If NEITHER is present, this " +
+  "lifetime one instead: `times_total` is an exact count from the first refusal. If it is absent, this " +
   "notice could not be written to disk (see session.refusal.persist.failed) and its scale is " +
   "unknown — in that case do not read the smaller number as the total.";
 

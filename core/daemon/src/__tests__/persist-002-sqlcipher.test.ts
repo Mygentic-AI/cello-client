@@ -33,8 +33,8 @@ import {
   resolveDbKey,
   dbKeyPathFor,
   DbEncryptionError,
-  isPlaintextSqliteFile,
 } from "../sqlcipher-db.js";
+import { isPlaintextSqliteFile } from "./helpers/encrypted-db.js";
 import { seedAgents } from "./helpers/seed-agents.js";
 
 function makeLogger(): Logger {
