@@ -164,26 +164,6 @@ export type {
 } from "./revocation.js";
 
 export type {
-  ConnectionRequest,
-  ConnectionRequestInbound,
-  ConnectionResponse,
-  ConnectionResponseVerdict,
-  ConnectionEstablished,
-  ConnectionRejected,
-  ConnectionInsufficient,
-  ConnectionRequestError,
-  ConnectionRequestErrorReason,
-  DisclosureRequest,
-  DisclosureRequestItem,
-  DisclosureRequestInbound,
-  DisclosureResponse,
-  DisclosureResponseInbound,
-  ConnectionRecord,
-  PendingConnectionRequest,
-  ClientConnectionRecord,
-} from "./connection-request.js";
-
-export type {
   DkgRound1Broadcast,
   DkgRound2Share,
   FrostDkgRound1Request,
