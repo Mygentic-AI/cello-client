@@ -31,6 +31,8 @@ export const PQ_CONTEXTS = [
   "cello-mldsa-attestation-v1",
   // 002-PQKEYS — the four-key registration binding.
   "cello-mldsa-key-binding-v1",
+  // 003-PQSESSION — the session-ephemeral announce.
+  "cello-mldsa-session-ephemeral-v1",
 ] as const;
 
 export type PqContext = (typeof PQ_CONTEXTS)[number];

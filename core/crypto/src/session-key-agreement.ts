@@ -18,12 +18,12 @@
  *     1. sk = random X25519 secret                                  # RFC 7748
  *        pk = X25519 base * sk
  *
- *   deriveSessionSecrets(ownSk, peerPk, sessionId, extra?):
+ *   deriveSessionSecrets(ownSk, peerPk, sessionId, ssPq, transcript):   # M9D: both PQ inputs required
  *     1. shared = X25519(ownSk, peerPk)                             # EPHEMERAL-ephemeral ECDH
  *     2. REFUSE if shared is all-zero                               # RFC 7748 §6.1
- *     3. ikm   = shared || extra?                                   # the PQ hook
+ *     3. ikm   = shared || ssPq                                     # ML-KEM-768 secret, 32 bytes
  *     4. bind  = sort(ownPk, peerPk)                                # canonical, role-independent
- *     5. key   = HKDF-SHA256(ikm, salt=sessionId, info="cello/session/v1/content-key" || bind, 32)
+ *     5. key   = HKDF-SHA256(ikm, salt=sessionId, info="cello/session/v1/content-key" || bind || ct || pk_kem, 32)
  *
  *   THERE IS NO SECOND OUTPUT. This block used to specify a `csalt` derived from the same secret;
  *   the salt is agreed INDEPENDENTLY in `session-salt.ts` (Decisions Carried #8). Re-deriving it
@@ -135,10 +135,19 @@
 import { x25519 } from "@noble/curves/ed25519.js";
 import { hkdf } from "@noble/hashes/hkdf.js";
 import { sha256 } from "@noble/hashes/sha2.js";
+import {
+  mlKemGenerateSeed,
+  mlKemKeypairFromSeed,
+  ML_KEM_CIPHERTEXT_BYTES,
+  ML_KEM_PUBLIC_KEY_BYTES,
+  ML_KEM_SHARED_SECRET_BYTES,
+} from "./ml-kem.js";
 
 /** X25519 keys and the derived outputs are all 32 bytes. */
 const X25519_KEY_BYTES = 32;
 export const SESSION_KEY_BYTES = 32;
+/** M9D 003-PQSESSION (Contract 4): `ct ‖ encapsulatee_mlkem_public`, exactly. */
+export const SESSION_PQ_TRANSCRIPT_BYTES = ML_KEM_CIPHERTEXT_BYTES + ML_KEM_PUBLIC_KEY_BYTES;
 
 const ENC = new TextEncoder();
 /**
@@ -158,6 +167,14 @@ export interface SessionEphemeral {
   secretKey: Uint8Array;
   /** X25519 public, sent to the peer in the session handshake. */
   publicKey: Uint8Array;
+  /**
+   * M9D 003-PQSESSION: this session's ML-KEM-768 seed. Fresh per session, never reused, and it dies
+   * with the X25519 secret — `destroySessionEphemeral` zeroes both. It is NOT zeroed after one
+   * decapsulation: a peer that re-keys sends a new ciphertext under this unchanged key.
+   */
+  mlKemSeed: Uint8Array;
+  /** The ML-KEM-768 public key derived from `mlKemSeed`, announced beside the X25519 public. */
+  mlKemPublic: Uint8Array;
 }
 
 export interface SessionSecrets {
@@ -177,9 +194,11 @@ export interface SessionSecrets {
  * Fresh every session, deliberately. Reusing one across sessions would collapse to static-static and
  * void the forward secrecy that `design-problems` already claims as structural.
  */
-export function generateSessionEphemeral(): SessionEphemeral {
+export async function generateSessionEphemeral(): Promise<SessionEphemeral> {
   const secretKey = x25519.utils.randomSecretKey();
-  return { secretKey, publicKey: x25519.getPublicKey(secretKey) };
+  const mlKemSeed = mlKemGenerateSeed();
+  const { publicKey: mlKemPublic } = await mlKemKeypairFromSeed(mlKemSeed);
+  return { secretKey, publicKey: x25519.getPublicKey(secretKey), mlKemSeed, mlKemPublic };
 }
 
 /**
@@ -197,6 +216,8 @@ export function generateSessionEphemeral(): SessionEphemeral {
  */
 export function destroySessionEphemeral(e: SessionEphemeral): void {
   e.secretKey.fill(0);
+  // D12: the ML-KEM seed dies wherever the X25519 secret does.
+  e.mlKemSeed.fill(0);
 }
 
 /** Constant-time-ish all-zero check. Not secret-dependent branching — the input is already known bad. */
@@ -222,15 +243,11 @@ export function deriveSessionSecrets(opts: {
   /** The session this agreement is for. Bound in as the HKDF salt. */
   sessionId: Uint8Array;
   /**
-   * THE PQ HOOK — additional agreed secret, mixed into the IKM.
-   *
-   * Present from day one, before there is a PQ contribution to put in it, because retrofitting it
-   * later is a wire change and a rewrite rather than an addition. Hybrid PQ becomes: run a KEM,
-   * pass its shared secret here. Any length — an ML-KEM secret is 32 bytes but a hybrid may
-   * concatenate more than one contribution, and fixing the length would force the rewrite this
-   * parameter exists to avoid.
+   * THE ML-KEM-768 SHARED SECRET — M9D 003-PQSESSION (Contract 4), mixed into the IKM after the
+   * X25519 secret. REQUIRED and exactly 32 bytes: an optional PQ input is a downgrade path, because
+   * a caller that omits it silently gets an X25519-only key a quantum computer can later recover.
    */
-  extraSharedSecret?: Uint8Array;
+  extraSharedSecret: Uint8Array;
   /**
    * THE PQ TRANSCRIPT — review F8, and it is added NOW precisely because it cannot be added later.
    *
@@ -244,13 +261,25 @@ export function deriveSessionSecrets(opts: {
    * A caller doing the obvious thing — passing only the ML-KEM shared secret — would get a hybrid
    * whose ciphertext and public key are unbound. This parameter is where `ct_pq ‖ pk_pq` goes.
    *
-   * It is empty today and that is the point: the DoD line's whole justification for building the
-   * hook before there is anything to put in it is that hybrid PQ must be *"an addition, not a
-   * rewrite."* Added after a wire format exists, this is a wire change — the exact rewrite the hook
-   * was meant to avoid.
+   * M9D 003-PQSESSION: REQUIRED, exactly `ct(1088) ‖ encapsulatee_mlkem_public(1184)` = 2,272 bytes.
    */
-  pqTranscript?: Uint8Array;
+  pqTranscript: Uint8Array;
 }): SessionSecrets {
+  if (!(opts.extraSharedSecret instanceof Uint8Array) || opts.extraSharedSecret.length !== ML_KEM_SHARED_SECRET_BYTES) {
+    throw new Error(
+      `KEYAGREE: the ML-KEM shared secret must be exactly ${ML_KEM_SHARED_SECRET_BYTES} bytes, got ` +
+      `${opts.extraSharedSecret instanceof Uint8Array ? opts.extraSharedSecret.length : "none"}. A content ` +
+      "key without it is X25519-only, which a quantum computer can recover from a recording. This is a " +
+      "local defect, not something the peer did.",
+    );
+  }
+  if (!(opts.pqTranscript instanceof Uint8Array) || opts.pqTranscript.length !== SESSION_PQ_TRANSCRIPT_BYTES) {
+    throw new Error(
+      `KEYAGREE: the PQ transcript must be exactly ${SESSION_PQ_TRANSCRIPT_BYTES} bytes ` +
+      `(ct ‖ encapsulatee ML-KEM public), got ${opts.pqTranscript instanceof Uint8Array ? opts.pqTranscript.length : "none"}. ` +
+      "Without it the KEM's ciphertext and public key are unbound from the key. This is a local defect.",
+    );
+  }
   if (opts.peerEphemeralPublic.length !== X25519_KEY_BYTES) {
     throw new Error(
       `KEYAGREE: peer ephemeral public key must be ${X25519_KEY_BYTES} bytes, got ${opts.peerEphemeralPublic.length}. ` +
@@ -375,23 +404,25 @@ export function deriveSessionSecrets(opts: {
     ? [ownPublic, opts.peerEphemeralPublic]
     : [opts.peerEphemeralPublic, ownPublic];
 
-  const extra = opts.extraSharedSecret ?? new Uint8Array(0);
+  const extra = opts.extraSharedSecret;
   const ikm = new Uint8Array(shared.length + extra.length);
   ikm.set(shared, 0);
   ikm.set(extra, shared.length);
 
-  const transcript = opts.pqTranscript ?? new Uint8Array(0);
+  const transcript = opts.pqTranscript;
   const info = (label: Uint8Array): Uint8Array => {
     const out = new Uint8Array(label.length + first.length + second.length + transcript.length);
     out.set(label, 0);
     out.set(first, label.length);
     out.set(second, label.length + first.length);
-    // TRAILING, so the label remains recoverable as info[0 : len-64-|transcript|] for a caller that
-    // knows the transcript length. It is empty today; when a hybrid fills it, both sides supply the
-    // same bytes or they diverge — which is the safe direction.
+    // TRAILING and fixed-width, so the info stays unambiguous: both sides supply the same bytes or
+    // they diverge — which is the safe direction.
     out.set(transcript, label.length + first.length + second.length);
     return out;
   };
 
-  return { contentKey: hkdf(sha256, ikm, opts.sessionId, info(INFO_CONTENT_KEY), SESSION_KEY_BYTES) };
+  const contentKey = hkdf(sha256, ikm, opts.sessionId, info(INFO_CONTENT_KEY), SESSION_KEY_BYTES);
+  // The IKM holds the ML-KEM shared secret; it must not outlive this function (D12).
+  ikm.fill(0);
+  return { contentKey };
 }

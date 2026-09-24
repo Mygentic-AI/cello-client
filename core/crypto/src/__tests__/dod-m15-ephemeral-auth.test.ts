@@ -27,130 +27,86 @@ import {
   SESSION_CONTENT_SEAL_OVERHEAD_BYTES,
 } from "../session-content-seal.js";
 import { generateSessionEphemeral } from "../session-key-agreement.js";
+import { mlDsaGenerateSeed, mlDsaProviderFromSeed } from "../ml-dsa.js";
 
 const SID = new Uint8Array(16).fill(0x21);
 
 async function alice() {
   const kp = new InMemoryKeyProvider(new Uint8Array(randomBytes(32)));
-  return { kp, pub: await kp.getPublicKey() };
+  const mlDsa = await mlDsaProviderFromSeed(mlDsaGenerateSeed());
+  return { kp, mlDsa, pub: await kp.getPublicKey(), pqPub: await mlDsa.getPublicKey() };
 }
 
 describe("EPHEMERAL-AUTH: a signed key verifies, and only against the right identity", () => {
+  /** A v2 announce (M9D 003-PQSESSION) and the verify call for it; each case overrides one field. */
+  async function signed(signerA: Awaited<ReturnType<typeof alice>>, sid: Uint8Array = SID) {
+    const eph = await generateSessionEphemeral();
+    const { sig, pqSig } = await signSessionEphemeral(signerA.kp, signerA.mlDsa, sid, eph.publicKey, eph.mlKemPublic);
+    return { eph, sig, pqSig };
+  }
+  function check(expected: Awaited<ReturnType<typeof alice>>, over: Record<string, unknown>) {
+    return verifySessionEphemeral({
+      expectedIdentityPublic: expected.pub, expectedPqPublic: expected.pqPub, sessionId: SID,
+      peerEphemeralPublic: undefined, peerMlKemPublic: undefined, peerCiphertext: undefined,
+      peerSignature: undefined, peerPqSignature: undefined,
+      ...over,
+    } as Parameters<typeof verifySessionEphemeral>[0]);
+  }
+
   it("★ a key signed by the counterparty VERIFIES", async () => {
     const a = await alice();
-    const eph = generateSessionEphemeral();
-    const sig = await signSessionEphemeral(a.kp, SID, eph.publicKey);
-
-    expect(
-      verifySessionEphemeral({
-        expectedIdentityPublic: a.pub, sessionId: SID,
-        peerEphemeralPublic: eph.publicKey, peerSignature: sig,
-      }),
-    ).toEqual({ ok: true });
+    const { eph, sig, pqSig } = await signed(a);
+    expect(await check(a, { peerEphemeralPublic: eph.publicKey, peerMlKemPublic: eph.mlKemPublic, peerSignature: sig, peerPqSignature: pqSig }))
+      .toEqual({ ok: true });
   });
 
   it("★★ a key signed by SOMEONE ELSE is refused — this is the relay substituting its own", async () => {
-    /**
-     * The whole attack in one assertion. The relay holds a perfectly valid identity key of its own
-     * and can sign anything with it; what it cannot do is produce a signature that verifies against
-     * the counterparty's key. Note the signature here is VALID — it just is not theirs.
-     */
+    // The relay's signatures are VALID — they just are not the counterparty's.
     const a = await alice();
     const relay = await alice();
-    const eph = generateSessionEphemeral();
-    const relaySig = await signSessionEphemeral(relay.kp, SID, eph.publicKey);
-
-    const res = verifySessionEphemeral({
-      expectedIdentityPublic: a.pub, sessionId: SID,
-      peerEphemeralPublic: eph.publicKey, peerSignature: relaySig,
-    });
-    expect(res.ok, "a key signed by anyone at all was accepted — the substitution succeeds").toBe(false);
+    const { eph, sig, pqSig } = await signed(relay);
+    const res = await check(a, { peerEphemeralPublic: eph.publicKey, peerMlKemPublic: eph.mlKemPublic, peerSignature: sig, peerPqSignature: pqSig });
     expect(res.ok === false && res.reason).toBe(EPHEMERAL_AUTH_REFUSALS.SIGNATURE_MISMATCH);
   });
 
   it("★★ a MISSING signature takes the same hard-fail path as a wrong one", async () => {
-    /**
-     * The loophole, and the reason the three refusals share an outcome. An attacker evading a
-     * mismatch check does not forge a signature — it sends none, and hopes "we could not tell" is
-     * treated more gently than "we proved it wrong".
-     *
-     * ⚠️ THIS GUARD CANNOT BE DELETED, and that is stronger than this test. Attempting the mutation
-     * — removing the `=== undefined` branch — does not compile: `peerSignature` is optional, so
-     * every line below narrows on it and TypeScript refuses three ways. The type system enforces the
-     * check's EXISTENCE; this test enforces that it refuses rather than, say, returning ok.
-     */
     const a = await alice();
-    const eph = generateSessionEphemeral();
-    const res = verifySessionEphemeral({
-      expectedIdentityPublic: a.pub, sessionId: SID,
-      peerEphemeralPublic: eph.publicKey, peerSignature: undefined,
-    });
-    expect(res.ok, "an unsigned key was accepted; a relay would simply never sign").toBe(false);
+    const { eph, pqSig } = await signed(a);
+    const res = await check(a, { peerEphemeralPublic: eph.publicKey, peerMlKemPublic: eph.mlKemPublic, peerPqSignature: pqSig });
     expect(res.ok === false && res.reason).toBe(EPHEMERAL_AUTH_REFUSALS.SIGNATURE_MISSING);
   });
 
   it("★ a MALFORMED signature or key is refused rather than padded", async () => {
     const a = await alice();
-    const eph = generateSessionEphemeral();
-    const short = verifySessionEphemeral({
-      expectedIdentityPublic: a.pub, sessionId: SID,
-      peerEphemeralPublic: eph.publicKey, peerSignature: new Uint8Array(32),
-    });
+    const { eph, sig, pqSig } = await signed(a);
+    const short = await check(a, { peerEphemeralPublic: eph.publicKey, peerMlKemPublic: eph.mlKemPublic, peerSignature: new Uint8Array(32), peerPqSignature: pqSig });
     expect(short.ok === false && short.reason).toBe(EPHEMERAL_AUTH_REFUSALS.MALFORMED);
-
-    const shortKey = verifySessionEphemeral({
-      expectedIdentityPublic: a.pub, sessionId: SID,
-      peerEphemeralPublic: new Uint8Array(16), peerSignature: new Uint8Array(64),
-    });
+    const shortKey = await check(a, { peerEphemeralPublic: new Uint8Array(16), peerMlKemPublic: eph.mlKemPublic, peerSignature: sig, peerPqSignature: pqSig });
     expect(shortKey.ok === false && shortKey.reason).toBe(EPHEMERAL_AUTH_REFUSALS.MALFORMED);
   });
 
   it("★★ a signature from ANOTHER SESSION does not verify — replay is bound out", async () => {
-    /**
-     * Without the session id in the signed message, a signed ephemeral captured from one session
-     * replays into another between the same two agents: the signature verifies, both sides derive,
-     * and whoever replayed it already knows the secret from the session they harvested.
-     */
     const a = await alice();
-    const eph = generateSessionEphemeral();
-    const sigForOtherSession = await signSessionEphemeral(a.kp, new Uint8Array(16).fill(0x99), eph.publicKey);
-
-    const res = verifySessionEphemeral({
-      expectedIdentityPublic: a.pub, sessionId: SID,
-      peerEphemeralPublic: eph.publicKey, peerSignature: sigForOtherSession,
-    });
+    const { eph, sig, pqSig } = await signed(a, new Uint8Array(16).fill(0x99));
+    const res = await check(a, { peerEphemeralPublic: eph.publicKey, peerMlKemPublic: eph.mlKemPublic, peerSignature: sig, peerPqSignature: pqSig });
     expect(res.ok, "a signature from a different session verified here — it can be replayed").toBe(false);
   });
 
   it("★★ a signature over a DIFFERENT ephemeral does not verify — the key itself is bound", async () => {
     const a = await alice();
-    const signed = generateSessionEphemeral();
-    const substituted = generateSessionEphemeral();
-    const sig = await signSessionEphemeral(a.kp, SID, signed.publicKey);
-
-    const res = verifySessionEphemeral({
-      expectedIdentityPublic: a.pub, sessionId: SID,
-      peerEphemeralPublic: substituted.publicKey, peerSignature: sig,
-    });
+    const { eph, sig, pqSig } = await signed(a);
+    const substituted = await generateSessionEphemeral();
+    const res = await check(a, { peerEphemeralPublic: substituted.publicKey, peerMlKemPublic: eph.mlKemPublic, peerSignature: sig, peerPqSignature: pqSig });
     expect(res.ok, "the signature covered a different key, so it proves nothing about this one").toBe(false);
   });
 
   it("★ the signed message is LENGTH-PREFIXED, so it cannot be re-split", () => {
-    /**
-     * `label ‖ sessionId ‖ ephemeral` with two variable fields lets a crafted pair produce identical
-     * bytes from different inputs — the signature would then cover something other than it appears
-     * to. Asserted as bytes: a behavioural test cannot distinguish two concatenations.
-     */
-    const a = ephemeralSigningMessage(new Uint8Array([1, 2, 3]), new Uint8Array(32).fill(9));
-    const b = ephemeralSigningMessage(new Uint8Array([1, 2]), new Uint8Array([3, ...new Uint8Array(32).fill(9)]));
-    expect(
-      Buffer.from(a).toString("hex"),
-      "two different (sessionId, ephemeral) pairs produced the same signed bytes",
-    ).not.toBe(Buffer.from(b).toString("hex"));
-
-    // And the length really is in there, big-endian, right after the label.
-    const msg = ephemeralSigningMessage(new Uint8Array(16).fill(7), new Uint8Array(32).fill(8));
-    const label = new TextEncoder().encode("cello/session/v1/ephemeral");
+    const kem = new Uint8Array(1184).fill(4);
+    const a = ephemeralSigningMessage(new Uint8Array([1, 2, 3]), new Uint8Array(32).fill(9), kem);
+    const b = ephemeralSigningMessage(new Uint8Array([1, 2]), new Uint8Array([3, ...new Uint8Array(31).fill(9)]), new Uint8Array([9, ...kem]));
+    expect(Buffer.from(a).toString("hex"), "two different field splits produced the same signed bytes").not.toBe(Buffer.from(b).toString("hex"));
+    const msg = ephemeralSigningMessage(new Uint8Array(16).fill(7), new Uint8Array(32).fill(8), kem);
+    const label = new TextEncoder().encode("cello/session/v2/ephemeral");
     expect([...msg.subarray(label.length, label.length + 4)]).toEqual([0, 0, 0, 16]);
   });
 });

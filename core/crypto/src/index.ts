@@ -105,6 +105,7 @@ export {
   destroySessionEphemeral,
   deriveSessionSecrets,
   SESSION_KEY_BYTES,
+  SESSION_PQ_TRANSCRIPT_BYTES,
   type SessionEphemeral,
   type SessionSecrets,
 } from "./session-key-agreement.js";
@@ -116,6 +117,7 @@ export {
 // a long-term identity key and deliberately has no forward secrecy.
 export {
   ephemeralSigningMessage,
+  decodeSessionKeyAgreementFrame,
   signSessionEphemeral,
   verifySessionEphemeral,
   EPHEMERAL_AUTH_REFUSALS,
@@ -123,6 +125,7 @@ export {
   EPHEMERAL_PUBLIC_BYTES,
   type EphemeralAuthRefusal,
   type EphemeralAuthResult,
+  type SessionKeyAgreementFields,
 } from "./session-ephemeral-auth.js";
 
 // DOD-M15-DELIVERYACK-1: the recipient SIGNS that its machine received a given content hash in a

@@ -53,17 +53,29 @@ import { hkdf } from "@noble/hashes/hkdf.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import {
   generateSessionEphemeral,
-  deriveSessionSecrets,
+  deriveSessionSecrets as deriveHybrid,
   SESSION_KEY_BYTES,
+  SESSION_PQ_TRANSCRIPT_BYTES,
 } from "../session-key-agreement.js";
+
+/**
+ * M9D 003-PQSESSION: both PQ inputs are required. The properties in this file are about the X25519
+ * half and the HKDF binding, so every call gets the same fixed ML-KEM secret and transcript unless a
+ * case names its own. 003 test 2 (`session-key-agreement.test.ts`) pins that omitting them throws.
+ */
+const EXTRA = new Uint8Array(32).fill(0x44);
+const TRANSCRIPT = new Uint8Array(SESSION_PQ_TRANSCRIPT_BYTES).fill(0x55);
+function deriveSessionSecrets(o: { ownEphemeralSecret: Uint8Array; peerEphemeralPublic: Uint8Array; sessionId: Uint8Array; extraSharedSecret?: Uint8Array; pqTranscript?: Uint8Array }) {
+  return deriveHybrid({ ...o, extraSharedSecret: o.extraSharedSecret ?? EXTRA, pqTranscript: o.pqTranscript ?? TRANSCRIPT });
+}
 
 const SESSION_ID = new Uint8Array(16).fill(7);
 
 /** A full two-sided handshake, as the two daemons would run it. */
-function handshake(opts: { sessionId?: Uint8Array; extraA?: Uint8Array; extraB?: Uint8Array } = {}) {
+async function handshake(opts: { sessionId?: Uint8Array; extraA?: Uint8Array; extraB?: Uint8Array } = {}) {
   const sid = opts.sessionId ?? SESSION_ID;
-  const a = generateSessionEphemeral();
-  const b = generateSessionEphemeral();
+  const a = await generateSessionEphemeral();
+  const b = await generateSessionEphemeral();
   return {
     a,
     b,
@@ -83,26 +95,26 @@ function handshake(opts: { sessionId?: Uint8Array; extraA?: Uint8Array; extraB?:
 }
 
 describe("DOD-M15-KEYAGREE-1: both sides agree, and nobody else can", () => {
-  it("★ the two sides derive the SAME key from opposite halves", () => {
-    const { fromA, fromB } = handshake();
+  it("★ the two sides derive the SAME key from opposite halves", async () => {
+    const { fromA, fromB } = await handshake();
     expect(Buffer.from(fromA.contentKey)).toEqual(Buffer.from(fromB.contentKey));
   });
 
-  it("★ the derivation is ORDER-INDEPENDENT — neither side needs to know who initiated", () => {
+  it("★ the derivation is ORDER-INDEPENDENT — neither side needs to know who initiated", async () => {
     /**
      * Both public keys are bound into the derivation in a canonical (sorted) order. Binding them by
      * ROLE would work only if both sides agreed on who the initiator was — and the two daemons reach
      * this point from different code paths, so a role disagreement would produce two different keys
      * and a conversation that fails to decrypt with no explanation.
      */
-    const a = generateSessionEphemeral();
-    const b = generateSessionEphemeral();
+    const a = await generateSessionEphemeral();
+    const b = await generateSessionEphemeral();
     const one = deriveSessionSecrets({ ownEphemeralSecret: a.secretKey, peerEphemeralPublic: b.publicKey, sessionId: SESSION_ID });
     const two = deriveSessionSecrets({ ownEphemeralSecret: b.secretKey, peerEphemeralPublic: a.publicKey, sessionId: SESSION_ID });
     expect(Buffer.from(one.contentKey)).toEqual(Buffer.from(two.contentKey));
   });
 
-  it("★ this agreement produces ONE output — the salt is not derived here", () => {
+  it("★ this agreement produces ONE output — the salt is not derived here", async () => {
     /**
      * Decisions Carried #8. The salt used to be a second HKDF output of this function, and that
      * coupling tied "must be forgotten" (the key, destroyed at close) to "must be kept forever" (the
@@ -112,16 +124,16 @@ describe("DOD-M15-KEYAGREE-1: both sides agree, and nobody else can", () => {
      * Asserted rather than left to the header, so a future reader who adds a second output has to
      * delete a test that says why it was removed.
      */
-    const { fromA } = handshake();
+    const { fromA } = await handshake();
     expect(Object.keys(fromA)).toEqual(["contentKey"]);
     expect(fromA.contentKey).toHaveLength(32);
     expect(SESSION_KEY_BYTES).toBe(32);
   });
 
-  it("★ a THIRD party with both public keys cannot derive it — this is the whole point", () => {
-    const a = generateSessionEphemeral();
-    const b = generateSessionEphemeral();
-    const eve = generateSessionEphemeral();
+  it("★ a THIRD party with both public keys cannot derive it — this is the whole point", async () => {
+    const a = await generateSessionEphemeral();
+    const b = await generateSessionEphemeral();
+    const eve = await generateSessionEphemeral();
     const real = deriveSessionSecrets({ ownEphemeralSecret: a.secretKey, peerEphemeralPublic: b.publicKey, sessionId: SESSION_ID });
     const guess = deriveSessionSecrets({ ownEphemeralSecret: eve.secretKey, peerEphemeralPublic: b.publicKey, sessionId: SESSION_ID });
     expect(Buffer.from(real.contentKey)).not.toEqual(Buffer.from(guess.contentKey));
@@ -129,41 +141,41 @@ describe("DOD-M15-KEYAGREE-1: both sides agree, and nobody else can", () => {
 });
 
 describe("DOD-M15-KEYAGREE-1: forward secrecy is structural, not aspirational", () => {
-  it("★ every session mints FRESH ephemerals — two handshakes never share a key", () => {
+  it("★ every session mints FRESH ephemerals — two handshakes never share a key", async () => {
     /**
      * Counterbalance 1. If this ever returned a stable keypair, the derived key would be the same
      * key forever and an identity-key compromise would open every past conversation — strictly worse
      * than the libp2p Noise session this replaces.
      */
-    const first = handshake();
-    const second = handshake();
+    const first = await handshake();
+    const second = await handshake();
     expect(Buffer.from(first.a.publicKey)).not.toEqual(Buffer.from(second.a.publicKey));
     expect(Buffer.from(first.fromA.contentKey)).not.toEqual(Buffer.from(second.fromA.contentKey));
   });
 
-  it("★ the same peers in a DIFFERENT session derive a different key", () => {
+  it("★ the same peers in a DIFFERENT session derive a different key", async () => {
     // The session id is bound into the derivation, so even a catastrophic ephemeral reuse cannot
     // make two sessions share a key.
-    const a = generateSessionEphemeral();
-    const b = generateSessionEphemeral();
+    const a = await generateSessionEphemeral();
+    const b = await generateSessionEphemeral();
     const s1 = deriveSessionSecrets({ ownEphemeralSecret: a.secretKey, peerEphemeralPublic: b.publicKey, sessionId: new Uint8Array(16).fill(1) });
     const s2 = deriveSessionSecrets({ ownEphemeralSecret: a.secretKey, peerEphemeralPublic: b.publicKey, sessionId: new Uint8Array(16).fill(2) });
     expect(Buffer.from(s1.contentKey)).not.toEqual(Buffer.from(s2.contentKey));
   });
 });
 
-describe("DOD-M15-KEYAGREE-1: the PQ hook exists and WORKS on day one", () => {
-  it("★ an extra shared secret changes the derived key", () => {
+describe("DOD-M15-KEYAGREE-1: the PQ secret is bound, not decorative", () => {
+  it("★ an extra shared secret changes the derived key", async () => {
     /**
      * Counterbalance 3, and the line is blunt about it: *"Omitting the hook defeats the entire
      * reason for the work."* A parameter that is accepted and ignored is worse than none, because it
      * reads as done. Hybrid PQ must be "mix a second agreed secret into the same derivation" — an
      * addition, not a rewrite.
      */
-    const a = generateSessionEphemeral();
-    const b = generateSessionEphemeral();
+    const a = await generateSessionEphemeral();
+    const b = await generateSessionEphemeral();
     const base = { ownEphemeralSecret: a.secretKey, peerEphemeralPublic: b.publicKey, sessionId: SESSION_ID };
-    const plain = deriveSessionSecrets(base);
+    const plain = deriveSessionSecrets({ ...base, extraSharedSecret: new Uint8Array(32).fill(8) });
     const hybrid = deriveSessionSecrets({ ...base, extraSharedSecret: new Uint8Array(32).fill(9) });
     expect(
       Buffer.from(plain.contentKey),
@@ -171,35 +183,25 @@ describe("DOD-M15-KEYAGREE-1: the PQ hook exists and WORKS on day one", () => {
     ).not.toEqual(Buffer.from(hybrid.contentKey));
   });
 
-  it("★ both sides supplying the SAME extra secret still agree", () => {
+  it("★ both sides supplying the SAME extra secret still agree", async () => {
     const extra = new Uint8Array(32).fill(3);
-    const { fromA, fromB } = handshake({ extraA: extra, extraB: extra });
+    const { fromA, fromB } = await handshake({ extraA: extra, extraB: extra });
     expect(Buffer.from(fromA.contentKey)).toEqual(Buffer.from(fromB.contentKey));
   });
 
-  it("★ a MISMATCHED extra secret yields different keys — it is bound, not decorative", () => {
+  it("★ a MISMATCHED extra secret yields different keys — it is bound, not decorative", async () => {
     /**
      * The direction that matters for a future hybrid: if one side runs a PQ KEM and the other does
      * not, they must NOT silently agree on a classical-only key. They diverge, and the session fails
      * to decrypt — which is the safe failure.
      */
-    const { fromA, fromB } = handshake({ extraA: new Uint8Array(32).fill(3), extraB: new Uint8Array(32).fill(4) });
+    const { fromA, fromB } = await handshake({ extraA: new Uint8Array(32).fill(3), extraB: new Uint8Array(32).fill(4) });
     expect(Buffer.from(fromA.contentKey)).not.toEqual(Buffer.from(fromB.contentKey));
-  });
-
-  it("an extra secret of ANY length is accepted — a KEM output is not 32 bytes", () => {
-    // ML-KEM-768 shared secrets are 32 bytes, but a hybrid may concatenate more than one
-    // contribution. Fixing the length here would force a rewrite for the exact case the hook exists
-    // for.
-    const a = generateSessionEphemeral();
-    const b = generateSessionEphemeral();
-    const base = { ownEphemeralSecret: a.secretKey, peerEphemeralPublic: b.publicKey, sessionId: SESSION_ID };
-    expect(() => deriveSessionSecrets({ ...base, extraSharedSecret: new Uint8Array(1088).fill(1) })).not.toThrow();
   });
 });
 
 describe("DOD-M15-KEYAGREE-1: a degenerate agreement FAILS CLOSED", () => {
-  it("★ an all-zero shared secret is REFUSED, not derived from", () => {
+  it("★ an all-zero shared secret is REFUSED, not derived from", async () => {
     /**
      * Counterbalance 2, and the one that would be silent. X25519 against a small-order point yields
      * an all-zero shared secret — both sides then derive the same key, encryption appears to work,
@@ -216,7 +218,7 @@ describe("DOD-M15-KEYAGREE-1: a degenerate agreement FAILS CLOSED", () => {
      * `@noble` ever stopped rejecting, the backstop would take over and this test would still pass;
      * if BOTH stopped, it goes red, which is the case that matters.
      */
-    const a = generateSessionEphemeral();
+    const a = await generateSessionEphemeral();
     expect(
       () => deriveSessionSecrets({
         ownEphemeralSecret: a.secretKey,
@@ -228,8 +230,8 @@ describe("DOD-M15-KEYAGREE-1: a degenerate agreement FAILS CLOSED", () => {
     ).toThrow(/degenerate|zero|small.order|invalid/i);
   });
 
-  it("★ a wrong-length peer key is refused rather than padded", () => {
-    const a = generateSessionEphemeral();
+  it("★ a wrong-length peer key is refused rather than padded", async () => {
+    const a = await generateSessionEphemeral();
     expect(() => deriveSessionSecrets({
       ownEphemeralSecret: a.secretKey,
       peerEphemeralPublic: new Uint8Array(16).fill(2),
@@ -237,9 +239,9 @@ describe("DOD-M15-KEYAGREE-1: a degenerate agreement FAILS CLOSED", () => {
     })).toThrow(/32|length/i);
   });
 
-  it("★ an empty session id is refused — the binding must be real", () => {
-    const a = generateSessionEphemeral();
-    const b = generateSessionEphemeral();
+  it("★ an empty session id is refused — the binding must be real", async () => {
+    const a = await generateSessionEphemeral();
+    const b = await generateSessionEphemeral();
     expect(() => deriveSessionSecrets({
       ownEphemeralSecret: a.secretKey,
       peerEphemeralPublic: b.publicKey,
@@ -247,10 +249,10 @@ describe("DOD-M15-KEYAGREE-1: a degenerate agreement FAILS CLOSED", () => {
     })).toThrow(/session/i);
   });
 
-  it("the ephemeral public key really is the X25519 public of the secret", () => {
+  it("the ephemeral public key really is the X25519 public of the secret", async () => {
     // Guards against a generator that returns unrelated halves — which would make both sides derive
     // different keys and look like a network fault.
-    const e = generateSessionEphemeral();
+    const e = await generateSessionEphemeral();
     expect(Buffer.from(x25519.getPublicKey(e.secretKey))).toEqual(Buffer.from(e.publicKey));
   });
 });
@@ -274,9 +276,9 @@ describe("DOD-M15-KEYAGREE-1: the derivation itself is pinned, byte for byte", (
    * the module header, and checks the module agrees:
    *
    *     shared = X25519(ownSk, peerPk)
-   *     ikm    = shared || extra
+   *     ikm    = shared || ssPq
    *     bind   = sorted(ownPk, peerPk)
-   *     out    = HKDF-SHA256(ikm, salt=sessionId, info=label || bind, 32)
+   *     out    = HKDF-SHA256(ikm, salt=sessionId, info=label || bind || transcript, 32)
    *
    * If the module and this arithmetic disagree, one of them is wrong and the diff says which.
    */
@@ -291,7 +293,7 @@ describe("DOD-M15-KEYAGREE-1: the derivation itself is pinned, byte for byte", (
   ) {
     const shared = x25519.getSharedSecret(ownSk, peerPk);
     const ownPk = x25519.getPublicKey(ownSk);
-    const e = extra ?? new Uint8Array(0);
+    const e = extra ?? EXTRA;
     const ikm = new Uint8Array(shared.length + e.length);
     ikm.set(shared, 0);
     ikm.set(e, shared.length);
@@ -302,7 +304,7 @@ describe("DOD-M15-KEYAGREE-1: the derivation itself is pinned, byte for byte", (
     const enc = new TextEncoder();
     // The transcript is TRAILING, after both public keys — the position the module's header claims
     // and, until this parameter existed, the one thing here that pinned nothing.
-    const t = transcript ?? new Uint8Array(0);
+    const t = transcript ?? TRANSCRIPT;
     const withBind = (label: string) => {
       const l = enc.encode(label);
       const out = new Uint8Array(l.length + 64 + t.length);
@@ -318,7 +320,7 @@ describe("DOD-M15-KEYAGREE-1: the derivation itself is pinned, byte for byte", (
   const SK_B = new Uint8Array(32).fill(0x22);
   const SID = new Uint8Array(16).fill(0x33);
 
-  it("★ contentKey matches the construction recomputed from the spec", () => {
+  it("★ contentKey matches the construction recomputed from the spec", async () => {
     const pkB = x25519.getPublicKey(SK_B);
     const got = deriveSessionSecrets({ ownEphemeralSecret: SK_A, peerEphemeralPublic: pkB, sessionId: SID });
     const want = expected(SK_A, pkB, SID);
@@ -330,16 +332,16 @@ describe("DOD-M15-KEYAGREE-1: the derivation itself is pinned, byte for byte", (
     ).toBe(Buffer.from(want.contentKey).toString("hex"));
   });
 
-  it("★ the PQ extra secret is mixed in exactly as the spec says", () => {
+  it("★ the PQ extra secret is mixed in exactly as the spec says", async () => {
     const pkB = x25519.getPublicKey(SK_B);
-    const extra = new Uint8Array(48).fill(0x44);
+    const extra = new Uint8Array(32).fill(0x46);
     const got = deriveSessionSecrets({ ownEphemeralSecret: SK_A, peerEphemeralPublic: pkB, sessionId: SID, extraSharedSecret: extra });
     expect(Buffer.from(got.contentKey).toString("hex")).toBe(
       Buffer.from(expected(SK_A, pkB, SID, extra).contentKey).toString("hex"),
     );
   });
 
-  it("★ the PQ TRANSCRIPT's POSITION is pinned — trailing in the info, not in the IKM", () => {
+  it("★ the PQ TRANSCRIPT's POSITION is pinned — trailing in the info, not in the IKM", async () => {
     /**
      * REVIEW MEASURED THIS: the transcript's position was pinned by nothing at all, and its position
      * is the entire reason the parameter was added before there is a hybrid to use it.
@@ -359,7 +361,7 @@ describe("DOD-M15-KEYAGREE-1: the derivation itself is pinned, byte for byte", (
      * position is the wire change this parameter was added to avoid.
      */
     const pkB = x25519.getPublicKey(SK_B);
-    const transcript = new Uint8Array(72).fill(0x55);
+    const transcript = new Uint8Array(SESSION_PQ_TRANSCRIPT_BYTES).fill(0x57);
     const got = deriveSessionSecrets({
       ownEphemeralSecret: SK_A, peerEphemeralPublic: pkB, sessionId: SID, pqTranscript: transcript,
     });
@@ -369,16 +371,17 @@ describe("DOD-M15-KEYAGREE-1: the derivation itself is pinned, byte for byte", (
     ).toBe(Buffer.from(expected(SK_A, pkB, SID, undefined, transcript).contentKey).toString("hex"));
   });
 
-  it("★ and the two measured mutants are explicitly NOT what this produces", () => {
+  it("★ and the two measured mutants are explicitly NOT what this produces", async () => {
     // Pinned by name, exactly as the salt module pins the XOR combiner, so neither can come back
     // quietly. Both were green across every other assertion in this file.
     const pkB = x25519.getPublicKey(SK_B);
-    const transcript = new Uint8Array(72).fill(0x55);
+    const transcript = new Uint8Array(SESSION_PQ_TRANSCRIPT_BYTES).fill(0x57);
     const got = deriveSessionSecrets({
       ownEphemeralSecret: SK_A, peerEphemeralPublic: pkB, sessionId: SID, pqTranscript: transcript,
     });
 
-    const shared = x25519.getSharedSecret(SK_A, pkB);
+    // The genuine IKM is `shared ‖ ssPq`; each mutant keeps it, so only the transcript position differs.
+    const shared = new Uint8Array([...x25519.getSharedSecret(SK_A, pkB), ...EXTRA]);
     const ownPk = x25519.getPublicKey(SK_A);
     const [first, second] = Buffer.compare(Buffer.from(ownPk), Buffer.from(pkB)) < 0
       ? [ownPk, pkB] : [pkB, ownPk];
@@ -410,12 +413,12 @@ describe("DOD-M15-KEYAGREE-1: the derivation itself is pinned, byte for byte", (
     ).not.toEqual(Buffer.from(hkdf(sha256, ikmWithTranscript, SID, infoNoTranscript, 32)));
   });
 
-  it("★ the extra secret and the transcript are pinned TOGETHER — one goes in the IKM, one in the info", () => {
+  it("★ the extra secret and the transcript are pinned TOGETHER — one goes in the IKM, one in the info", async () => {
     // Each is pinned alone above; this fixes them relative to each other, so a swap of the two
     // parameters cannot pass by satisfying both single-value cases.
     const pkB = x25519.getPublicKey(SK_B);
-    const extra = new Uint8Array(48).fill(0x44);
-    const transcript = new Uint8Array(72).fill(0x55);
+    const extra = new Uint8Array(32).fill(0x46);
+    const transcript = new Uint8Array(SESSION_PQ_TRANSCRIPT_BYTES).fill(0x57);
     const got = deriveSessionSecrets({
       ownEphemeralSecret: SK_A, peerEphemeralPublic: pkB, sessionId: SID,
       extraSharedSecret: extra, pqTranscript: transcript,
@@ -425,7 +428,7 @@ describe("DOD-M15-KEYAGREE-1: the derivation itself is pinned, byte for byte", (
     );
   });
 
-  it("★ the outputs are 32 bytes — asserted as a LITERAL, not the module's own constant", () => {
+  it("★ the outputs are 32 bytes — asserted as a LITERAL, not the module's own constant", async () => {
     /**
      * The previous length assertion used `SESSION_KEY_BYTES`, so truncating both outputs to 16 and
      * moving the constant with them passed. A self-referential assertion cannot fail.
@@ -446,7 +449,7 @@ describe("DOD-M15-KEYAGREE-1: the findings the review found in the code", () => 
      * property of the old one being gone.
      */
     const { destroySessionEphemeral } = await import("../session-key-agreement.js");
-    const e = generateSessionEphemeral();
+    const e = await generateSessionEphemeral();
     expect(e.secretKey.some((b) => b !== 0), "PRECONDITION: a real secret to destroy").toBe(true);
     destroySessionEphemeral(e);
     expect(
@@ -455,15 +458,15 @@ describe("DOD-M15-KEYAGREE-1: the findings the review found in the code", () => 
     ).toBe(true);
   });
 
-  it("★ F10: a non-canonical peer key (bit 255 set) is REFUSED, not silently masked", () => {
+  it("★ F10: a non-canonical peer key (bit 255 set) is REFUSED, not silently masked", async () => {
     /**
      * A one-bit attack with no diagnosis. X25519 masks bit 255 (RFC 7748 §5), so the agreement still
      * succeeds — but the raw bytes are bound into the derivation, so a relay flipping that bit makes
      * the two sides derive different keys and the session never decrypts, with nothing explaining
      * why. Exactly the failure the sorted binding exists to prevent, for one flipped bit.
      */
-    const a = generateSessionEphemeral();
-    const b = generateSessionEphemeral();
+    const a = await generateSessionEphemeral();
+    const b = await generateSessionEphemeral();
     const tampered = Uint8Array.from(b.publicKey);
     tampered[31] = (tampered[31] as number) | 0x80;
 
@@ -480,8 +483,8 @@ describe("DOD-M15-KEYAGREE-1: the findings the review found in the code", () => 
     })).toThrow(/non-canonical|bit 255/i);
   });
 
-  it("★ F10b: a reflected key — the peer echoing our own public — is refused", () => {
-    const a = generateSessionEphemeral();
+  it("★ F10b: a reflected key — the peer echoing our own public — is refused", async () => {
+    const a = await generateSessionEphemeral();
     expect(() => deriveSessionSecrets({
       ownEphemeralSecret: a.secretKey,
       peerEphemeralPublic: a.publicKey,
@@ -489,13 +492,13 @@ describe("DOD-M15-KEYAGREE-1: the findings the review found in the code", () => 
     })).toThrow(/reflection|identical/i);
   });
 
-  it("★ F7: the LIVE degenerate path names CELLO's cause, not the library's", () => {
+  it("★ F7: the LIVE degenerate path names CELLO's cause, not the library's", async () => {
     /**
      * `@noble` throws "invalid private or public key received" — naming neither CELLO, nor which of
      * the two keys, nor what to do. The message that named the cause properly was on the branch
      * documented as unreachable, so in production the operator got the library's string.
      */
-    const a = generateSessionEphemeral();
+    const a = await generateSessionEphemeral();
     let msg = "";
     try {
       deriveSessionSecrets({ ownEphemeralSecret: a.secretKey, peerEphemeralPublic: new Uint8Array(32), sessionId: SESSION_ID });
@@ -504,26 +507,27 @@ describe("DOD-M15-KEYAGREE-1: the findings the review found in the code", () => 
     expect(msg, "and the upstream cause must survive").toMatch(/small-order|RFC 7748/i);
   });
 
-  it("★ F11: a wrong-length OWN secret says it is a local defect", () => {
+  it("★ F11: a wrong-length OWN secret says it is a local defect", async () => {
+    const peer = await generateSessionEphemeral();
     expect(() => deriveSessionSecrets({
       ownEphemeralSecret: new Uint8Array(31),
-      peerEphemeralPublic: generateSessionEphemeral().publicKey,
+      peerEphemeralPublic: peer.publicKey,
       sessionId: SESSION_ID,
     })).toThrow(/own ephemeral secret|local defect/i);
   });
 
-  it("★ F8: the PQ transcript is bound, so a hybrid can carry the KEM's public material", () => {
+  it("★ F8: the PQ transcript is bound, so a hybrid can carry the KEM's public material", async () => {
     /**
      * `extraSharedSecret` alone is not a complete hybrid combiner: X-Wing binds the KEM ciphertext
      * and public key too, and the current analysis says that is necessary rather than optional. This
-     * parameter is where `ct_pq || pk_pq` goes — added now, while there are no callers and no wire
-     * format, because adding it later is the wire change the hook exists to avoid.
+     * parameter is where `ct_pq || pk_pq` goes (M9D 003-PQSESSION: required, 2,272 bytes).
+
      */
-    const a = generateSessionEphemeral();
-    const b = generateSessionEphemeral();
+    const a = await generateSessionEphemeral();
+    const b = await generateSessionEphemeral();
     const base = { ownEphemeralSecret: a.secretKey, peerEphemeralPublic: b.publicKey, sessionId: SESSION_ID };
     const plain = deriveSessionSecrets(base);
-    const bound = deriveSessionSecrets({ ...base, pqTranscript: new Uint8Array(64).fill(0xab) });
+    const bound = deriveSessionSecrets({ ...base, pqTranscript: new Uint8Array(SESSION_PQ_TRANSCRIPT_BYTES).fill(0xab) });
     expect(
       Buffer.from(plain.contentKey),
       "the transcript was accepted and ignored, which is the same defect as an ignored extra secret",
@@ -532,7 +536,7 @@ describe("DOD-M15-KEYAGREE-1: the findings the review found in the code", () => 
     // And a MISMATCH must diverge, not silently agree — same safe direction as the extra secret.
     const fromB = deriveSessionSecrets({
       ownEphemeralSecret: b.secretKey, peerEphemeralPublic: a.publicKey, sessionId: SESSION_ID,
-      pqTranscript: new Uint8Array(64).fill(0xcd),
+      pqTranscript: new Uint8Array(SESSION_PQ_TRANSCRIPT_BYTES).fill(0xcd),
     });
     expect(Buffer.from(bound.contentKey)).not.toEqual(Buffer.from(fromB.contentKey));
   });
