@@ -311,7 +311,7 @@ export async function verifyInboundAssignment(
   assignment: ParsedSessionAssignment,
   expectedSignerHex: string | null,
 ): Promise<
-  | { ok: true; mode: "pinned" | "bound"; initiatorMlDsa: Uint8Array; initiatorMlKem: Uint8Array }
+  | { ok: true; mode: "pinned" | "bound"; initiatorPrimary: Uint8Array; initiatorMlDsa: Uint8Array; initiatorMlKem: Uint8Array }
   | { ok: false; reason: string; detail: string }
 > {
   if (assignment.signature_type !== "frost") {
@@ -407,6 +407,7 @@ export async function verifyInboundAssignment(
   return {
     ok: true,
     mode: expectedSignerHex !== null ? "pinned" : "bound",
+    initiatorPrimary: new Uint8Array(boundGroupKey),
     initiatorMlDsa: bound.mlDsa,
     initiatorMlKem: bound.mlKem,
   };

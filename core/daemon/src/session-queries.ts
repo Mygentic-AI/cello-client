@@ -1089,15 +1089,25 @@ export class SessionQueries {
    * verified, so they are recorded together or not at all.
    */
   recordCounterpartyKeys(agentName: string, sessionId: string, keys: { primaryHex: string; mlDsaHex: string; mlKemHex: string }): void {
-    if (!this.#db) return;
-    this.#db
+    // Throws rather than skipping: every later order encrypts and verifies to these keys through
+    // `counterpartyPqKeys`, so a write that silently did not happen would surface there, far from
+    // its cause, as "no keys for this session".
+    if (!this.#db) throw new Error(`counterparty_keys_not_recorded: no session database (session ${sessionId})`);
+    const r = this.#db
       .prepare("UPDATE sessions SET counterparty_primary_pubkey = ?, counterparty_ml_dsa_pubkey = ?, counterparty_ml_kem_pubkey = ?, updated_at = ? WHERE agent_id = ? AND session_id = ?")
       .run(keys.primaryHex, keys.mlDsaHex, keys.mlKemHex, Date.now(), this.#ctx.requireAgentId(agentName), sessionId);
+    if (r.changes !== 1) throw new Error(`counterparty_keys_not_recorded: no session row for ${sessionId}`);
+    // The one trace that a session holds its counterparty's verified keys — the live run's
+    // evidence, and the first place to look when a later order finds none.
+    this.#ctx.logger.info("session.counterparty_keys.recorded", {
+      agentName, sessionId,
+      primaryShort: keys.primaryHex.slice(0, 16), mlDsaShort: keys.mlDsaHex.slice(0, 16), mlKemShort: keys.mlKemHex.slice(0, 16),
+    });
   }
 
   /**
    * M9D 002-PQKEYS — THE reader for a session counterparty's post-quantum keys. Bytes, not hex.
-   * `null` when the row has neither (a session recorded before this order, or no such session).
+   * `null` when there is no such session, or its row holds no keys.
    * Orders 003, 005, 006 and 009 read these keys only through here.
    */
   counterpartyPqKeys(agentName: string, sessionId: string): { mlDsa: Uint8Array; mlKem: Uint8Array } | null {

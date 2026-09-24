@@ -455,7 +455,6 @@ export function extractInboundSessionAssignment(frame: Record<string, unknown>):
       counterpartySessionPeerId: string | null;
       sessionTimestamp: number;
       signatureType: string | null;
-      signerPubkeyHex: string | null;
       relayPeerId: string;
       relayAddrs: string[];
       // DOD-FIRSTMSG-WITNESS-1: the directory's per-node relay signature. WITHOUT it the
@@ -530,11 +529,6 @@ export function extractInboundSessionAssignment(frame: Record<string, unknown>):
       typeof a["counterparty_session_peer_id"] === "string" ? a["counterparty_session_peer_id"] : null,
     sessionTimestamp: typeof a["session_timestamp"] === "number" ? a["session_timestamp"] : 0,
     signatureType: typeof a["signature_type"] === "string" ? a["signature_type"] : null,
-    // M7 legibility-TBS-binding (responder verify): the FROST-signed assignment embeds the
-    // initiator's primary (group) pubkey as `signer_pubkey` — the key that signs the seal.
-    // The responder stores it so it can verify the bilateral seal signature locally, not just
-    // accept it (session.ts: "embedded so the counterparty can verify").
-    signerPubkeyHex: a["signer_pubkey"] !== undefined ? frameValueToHex(a["signer_pubkey"]) : null,
     relayPeerId,
     relayAddrs,
     // DOD-FIRSTMSG-WITNESS-1. Accept only a well-formed 64-byte Ed25519 signature: anything else
@@ -795,11 +789,12 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     correlationId: string,
     verification: "pinned" | "first_contact",
     /**
-     * M9D 002-PQKEYS: the initiator's post-quantum keys, hex, as `verifyInboundAssignment` PROVED
-     * them through the initiator's v2 binding. Passed in rather than read off the frame, so the only
-     * keys that can be recorded for a counterparty are ones a binding verified.
+     * M9D 002-PQKEYS: the initiator's group key and post-quantum keys, hex, as
+     * `verifyInboundAssignment` PROVED them through the initiator's v2 binding. Passed in rather than
+     * read off the frame, so the only keys that can be recorded for a counterparty are ones a
+     * binding verified.
      */
-    initiatorPqKeys: { mlDsaHex: string; mlKemHex: string },
+    initiatorKeys: { primaryHex: string; mlDsaHex: string; mlKemHex: string },
   ): Promise<void> {
     // M12-P16: refuse BEFORE anything else — in particular before ensureStandingReceiverForAgent,
     // whose first line would resurrect the receiver this agent was just relieved of.
@@ -1060,15 +1055,10 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         return;
       }
       // M7 legibility-TBS-binding (responder verify): store the initiator's primary (the seal
-      // signer, carried as signer_pubkey on the FROST-signed assignment) so the bilateral seal
-      // signature can be verified locally rather than accepted on faith.
-      if (parsed.signerPubkeyHex) {
-        sessionNodeManager.recordCounterpartyKeys(agentName, parsed.sessionIdHex, {
-          primaryHex: parsed.signerPubkeyHex,
-          mlDsaHex: initiatorPqKeys.mlDsaHex,
-          mlKemHex: initiatorPqKeys.mlKemHex,
-        });
-      }
+      // signer) so the bilateral seal signature can be verified locally rather than accepted on
+      // faith — with its post-quantum keys, all as the verifier proved them. Unconditional: the
+      // verifier refuses an assignment without a signer, so there is no case to skip.
+      sessionNodeManager.recordCounterpartyKeys(agentName, parsed.sessionIdHex, initiatorKeys);
 
       // H1: genesis_prev_root is the canonical two-party genesis value — the SAME value
       // baked into the FROST-signed session-establishment TBS and derived by the initiator
@@ -1801,6 +1791,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     const agentName = localAgent.name;
     inboundAcceptChain = inboundAcceptChain
       .then(() => acceptInboundAssignment(parsed, agentName, correlationId, verification, {
+        primaryHex: Buffer.from(verdict.initiatorPrimary).toString("hex"),
         mlDsaHex: Buffer.from(verdict.initiatorMlDsa).toString("hex"),
         mlKemHex: Buffer.from(verdict.initiatorMlKem).toString("hex"),
       }))
