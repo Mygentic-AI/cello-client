@@ -73,8 +73,7 @@ export function reachabilityFromDiscovery(outcome: DiscoveryOutcome): Reachabili
       throw new DiscoveryUnavailableError("malformed_reply", "");
 
     case "timeout":
-      // No reply in the window — an old directory, or a slow or dropped reply on a new one. Either
-      // way we learned nothing about the peer.
+      // No reply in the window — a slow or dropped reply. We learned nothing about the peer.
       throw new DiscoveryUnavailableError("timeout", "");
 
     case "send_failed":

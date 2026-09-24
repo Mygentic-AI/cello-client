@@ -315,7 +315,7 @@ function discoveryHarness(opts: {
     ],
     // The home-stream attempt fails the way the real one does after a restart; the retry (which
     // only happens once a broker connection is open) succeeds.
-    handleSealInterruptedFlow: async (_s: string, _r: unknown, _c: string, _m: string, via?: unknown) => {
+    handleSealInterruptedFlow: async (_s: string, _r: unknown, _c: string, via?: unknown) => {
       sealAttempts += 1;
       // WHICH STREAM the flow was told to use — null means the agent's home stream.
       sentVia.push(via ?? null);

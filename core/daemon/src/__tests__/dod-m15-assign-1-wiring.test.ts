@@ -195,14 +195,6 @@ describe("DOD-M15-ASSIGN-1 (a) wiring: the DAEMON refuses an assignment it canno
       params: { target_pubkey: Buffer.from(pubB).toString("hex") },
     } as never);
 
-    // PIN THE ROUTE (review N2). Without this, a future change that breaks discovery sends the test
-    // quietly back through the legacy exhausted-fallback path — still passing, still 19 seconds,
-    // and no longer testing what an initiator actually does.
-    expect(
-      events.find((e) => e.event === "session.discovery.unsupported_fallback"),
-      "this must reach the verifier by the production same-node route, not the legacy fallback",
-    ).toBeUndefined();
-
     expect(result.ok, "the daemon must refuse an assignment signed by a key that is not its own quorum").toBe(false);
     expect(result.ok === false && result.reason).toBe("assignment_signer_not_this_agent");
     // The refusal is recorded where an operator would look, not only returned to the caller.

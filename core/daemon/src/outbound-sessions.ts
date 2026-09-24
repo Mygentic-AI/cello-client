@@ -184,8 +184,8 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
   /**
    * Issue a discovery_lookup on `signaling` and await the 3-state answer (bounded). Distinguishes,
    * for the caller's retry logic and truthful error surface:
-   *  - send_failed (home stream down — TRANSPORT, never "old directory"),
-   *  - timeout (no reply — old directory OR a slow/dropped reply on a new one; retry, fall back last),
+   *  - send_failed (home stream down — TRANSPORT),
+   *  - timeout (no reply — a slow or dropped reply; retried, then reported as a directory fault),
    *  - error (directory DB fault — retryable, a DIRECTORY fault, not the counterparty being offline),
    *  - malformed (a reply that didn't parse — protocol anomaly, retryable, surfaced distinctly),
    *  - result (the 3-state answer).
@@ -210,8 +210,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
         target_pubkey: new Uint8Array(Buffer.from(targetHex, "hex")),
       });
       if (!sent.ok) {
-        // The home stream is down — cannot look up (and today's local-only fallback would fail the
-        // same way). Surface the real transport reason, not an "old directory" misdiagnosis.
+        // The home stream is down — cannot look up. Surface the real transport reason.
         return { kind: "send_failed", reason: sent.reason ?? "signaling_unavailable" };
       }
       let timer!: ReturnType<typeof setTimeout>;
@@ -989,21 +988,19 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
         for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
           const disc: DiscoveryOutcome = await runDiscoveryLookup(signaling, targetHex, 5_000, ctx.correlationId);
 
-          // TRANSPORT: the home stream is down — retry (it may reconnect); local-only fallback would
-          // fail the same way. Exhausted → the TRUTHFUL transport reason, never a false "offline".
+          // TRANSPORT: the home stream is down — retry (it may reconnect). Exhausted → the TRUTHFUL
+          // transport reason, never a false "offline".
           if (disc.kind === "send_failed") {
             logger.warn("session.discovery.send_failed", { agentName: ctx.agentName, attempt, reason: disc.reason, correlationId: ctx.correlationId });
             if (attempt < MAX_ATTEMPTS) { await sleepMs(backoffs[attempt - 1]); continue; }
             return { ok: false, reason: "directory_unreachable", guidance: "The home directory stream is not connected, so the counterparty's location could not be looked up. Check cello status (directory_signaling), then retry." + rosterShortfallNote() };
           }
-          // NO REPLY: an old directory (predates discovery) OR a slow/dropped reply on a new one. Retry;
-          // fall back to local-only behavior ONLY as a last resort (after the retries), so that a
-          // single dropped reply does not misroute a reachable cross-node peer to the home node.
+          // NO REPLY: a slow or dropped reply. Every directory answers discovery, so after the retries
+          // this is a DIRECTORY fault — never a guess that the peer is on the home node.
           if (disc.kind === "timeout") {
             logger.warn("session.discovery.no_reply", { agentName: ctx.agentName, attempt, correlationId: ctx.correlationId });
             if (attempt < MAX_ATTEMPTS) { await sleepMs(backoffs[attempt - 1]); continue; }
-            logger.info("session.discovery.unsupported_fallback", { agentName: ctx.agentName, correlationId: ctx.correlationId });
-            return await runSessionRequestOverSignaling(signaling, targetHex, sr, ctx.correlationId, { agentName: ctx.agentName, ownPubkeyHex: agentRec.pubkey }, signalFilter, highStakes);
+            return { ok: false, reason: "directory_unreachable", guidance: "The directory did not answer the counterparty-location lookup after several attempts. Retry shortly; if it persists, check cello status (directory_signaling)." + rosterShortfallNote() };
           }
           // DIRECTORY-SIDE lookup fault (DB error / malformed reply): RETRYABLE — but a DIRECTORY fault,
           // reported truthfully as directory_unreachable, NEVER as the counterparty being offline.

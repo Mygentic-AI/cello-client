@@ -18,11 +18,10 @@ export type DiscoveryOutcome =
   | { kind: "error"; reason: string }
   // A reply arrived but did not parse (protocol/version anomaly) — retryable, surfaced distinctly.
   | { kind: "malformed" }
-  // No reply within the window. Could be an old directory (predates discovery) OR a slow/dropped reply
-  // on a new one — so it is RETRIED, and only falls back to today's local-only behavior as a last resort.
+  // No reply within the window — a slow or dropped reply. RETRIED, then reported as a directory fault.
   | { kind: "timeout" }
   // Could not even send the lookup — the home signaling stream is down (reconnecting/lost). A TRANSPORT
-  // failure, never an "old directory" — and the local-only fallback would fail the same way.
+  // failure.
   | { kind: "send_failed"; reason: string };
 
 export type ResultAction =
