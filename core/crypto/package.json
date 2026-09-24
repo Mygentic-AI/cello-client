@@ -4,7 +4,7 @@
   "private": false,
   "type": "module",
   "engines": {
-    "node": ">=24"
+    "node": ">=24.7"
   },
   "publishConfig": {
     "access": "public"
@@ -34,13 +34,13 @@
     "package.json"
   ],
   "scripts": {
+    "preinstall": "node -e \"var v=process.versions.node.split('.').map(Number);if(v[0]<24||(v[0]===24&&v[1]<7)){console.error('@cello-protocol/crypto needs Node >= 24.7 (ML-KEM and ML-DSA are built into node:crypto from 24.7). You have '+process.version+'.');process.exit(1)}\"",
     "typecheck": "tsc --build",
     "test": "vitest run"
   },
   "dependencies": {
     "@noble/curves": "2.4.0",
-    "@noble/hashes": "2.4.0",
-    "@oqs/liboqs-js": "^0.15.1"
+    "@noble/hashes": "2.4.0"
   },
   "devDependencies": {
     "@claude-flow/testing": "3.0.0-alpha.6",

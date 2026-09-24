@@ -3,7 +3,7 @@
   "version": "0.0.3",
   "private": true,
   "engines": {
-    "node": ">=24"
+    "node": ">=24.7"
   },
   "scripts": {
     "prebuild": "./scripts/nosync-build-output.sh",
@@ -23,7 +23,6 @@
     "onlyBuiltDependencies": [
       "@journeyapps/sqlcipher",
       "@signalapp/sqlcipher",
-      "@oqs/liboqs-js",
       "agentdb",
       "argon2",
       "better-sqlite3",

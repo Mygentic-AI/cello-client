@@ -188,6 +188,14 @@ export default [
             "CELLO uses SQLCipher, never node:sqlite — it stores PLAINTEXT and emits an " +
             "ExperimentalWarning. Use openEncryptedDatabase()/openEncryptedDatabaseAtPath() from " +
             "core/daemon/src/sqlcipher-db.ts. Tests may use it for in-memory fixtures.",
+        }, {
+          // M9D 001-PQPRIM: ML-KEM and ML-DSA are native node:crypto from Node 24.7. The WASM library
+          // this replaced must not come back quietly — every ML-DSA signature goes through
+          // signMlDsa/verifyMlDsa in @cello-protocol/crypto.
+          name: "@oqs/liboqs-js",
+          message:
+            "ML-KEM/ML-DSA are native node:crypto (Node >= 24.7). Use @cello-protocol/crypto: " +
+            "mlKem* for the KEM and signMlDsa/verifyMlDsa (the Contract 2 frame) for signatures.",
         }],
       }],
       // DOD-SENDRAW-1: the signaling seam's sendRaw NEVER throws — it catches internally and
