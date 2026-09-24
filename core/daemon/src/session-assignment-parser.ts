@@ -76,71 +76,21 @@ function parseStringArray(v: unknown): string[] | null {
 }
 
 /**
- * A dead field that arrived PRESENT-BUT-MALFORMED — `DOD-M15-DEAD-WIRE-FIELD-1` review F3.
- *
- * Tolerating these is right (nothing reads them, no signature covers them), but discarding the fact
- * silently is not: this parse is the ONLY place in the system where evidence that a directory is
- * emitting junk in them can exist, because no signature covers them and no consumer sees them.
- *
- * ABSENT is deliberately NOT reported. Once the bilateral half removes the field, absent is the
- * designed normal case, and a signal that fires on the normal case is not a signal.
+ * A participant is its K_local pubkey and nothing else. The directory's `peer_id` / `multiaddrs` on a
+ * participant were read by nothing and covered by no signature (`DOD-M15-DEAD-WIRE-FIELD-1`), so
+ * they are no longer part of the type; any that still arrive are ignored.
  */
-export type ToleratedField = "participant.multiaddrs" | "participant.peer_id";
-
-function parseParticipantInfo(
-  raw: unknown,
-  onTolerated?: (field: ToleratedField) => void,
-): import("@cello-protocol/protocol-types").ParticipantInfo | null {
+function parseParticipantInfo(raw: unknown): import("@cello-protocol/protocol-types").ParticipantInfo | null {
   if (typeof raw !== "object" || raw === null) return null;
-  const r = raw as Record<string, unknown>;
-  const pubkey = toU8Safe(r["pubkey"]);
+  const pubkey = toU8Safe((raw as Record<string, unknown>)["pubkey"]);
   if (!pubkey || pubkey.length !== 32) return null;
-  /**
-   * `peer_id` IS TOLERATED TOO, and it is the WORSE of the two.
-   *
-   * Same three properties as `multiaddrs` below — unread (the only reads anywhere are the
-   * directory's own encoder), covered by no signature, and it refused the entire assignment. But
-   * the killing value is not a bug's output, it is a DEFAULT the directory writes on purpose:
-   * `directory-node.ts:2049` seeds `{ peer_id: "", multiaddrs: [] }` on auth, and `:3867` uses the
-   * same object when the peer-info map misses. `:4120` copies whichever it got into
-   * `participant_a/b`, and nothing gates it — the only announce requirement checks the INITIATOR,
-   * never the TARGET.
-   *
-   * So an agent whose peer-info announce is late or absent could not be talked to at all: the
-   * directory FROST-signs a valid assignment, both clients parse it, both refuse over an empty
-   * string neither one reads, and the operator is told the assignment was "missing or malformed"
-   * when it was neither.
-   */
-  if (r["peer_id"] !== undefined && typeof r["peer_id"] !== "string") onTolerated?.("participant.peer_id");
-  const peerId = typeof r["peer_id"] === "string" ? r["peer_id"] : "";
-  /**
-   * `multiaddrs` IS TOLERATED, NOT VALIDATED — `DOD-M15-DEAD-WIRE-FIELD-1`.
-   *
-   * It has been permanently `[]` on every session assignment since the directory-facing node
-   * stopped listening. The directory stores it and SIGNS NOTHING over it — neither the session nor
-   * the relay TBS includes it — and the only read of a parsed participant takes `.pubkey`.
-   *
-   * Rejecting the WHOLE assignment when it was malformed therefore ended a conversation over a
-   * value that cannot affect anything and that no signature protects: a checked-then-ignored, and
-   * the refusing half is the one that costs. Absent or malformed now yields `[]`, which is what it
-   * always is in practice.
-   *
-   * ⚠️ NOT the same field on `parseEndpointInfo` below. Those multiaddrs belong to the RELAY and
-   * DIRECTORY endpoints and are DIALED — a malformed one is a session that cannot connect, worth
-   * refusing at the boundary rather than discovering at dial time. Identical name, adjacent
-   * function, one dead and one load-bearing.
-   *
-   * Removing the field from the wire is bilateral and rides with the other pending wire changes so
-   * the two repos move once; accepting its ABSENCE here is what makes this client already
-   * compatible when that lands.
-   */
-  if (r["multiaddrs"] !== undefined && parseStringArray(r["multiaddrs"]) === null) {
-    onTolerated?.("participant.multiaddrs");
-  }
-  const multiaddrs = parseStringArray(r["multiaddrs"]) ?? [];
-  return { pubkey, peer_id: peerId, multiaddrs };
+  return { pubkey };
 }
 
+/**
+ * The RELAY and DIRECTORY endpoints, whose multiaddrs ARE dialed — a malformed one is a session
+ * that cannot connect, refused at the boundary rather than discovered at dial time.
+ */
 function parseEndpointInfo(raw: unknown): import("@cello-protocol/protocol-types").RelayEndpointInfo | null {
   if (typeof raw !== "object" || raw === null) return null;
   const r = raw as Record<string, unknown>;
@@ -157,12 +107,6 @@ function parseEndpointInfo(raw: unknown): import("@cello-protocol/protocol-types
  */
 export function parseSessionAssignment(
   raw: Record<string, unknown>,
-  /**
-   * Called for each dead field that arrived PRESENT-BUT-MALFORMED. Optional so the parser keeps no
-   * logger dependency — it is a pure shape-validator, as its header says. Callers that have a
-   * logger (the inbound and outbound session paths) pass one; the rest are unaffected.
-   */
-  onTolerated?: (field: ToleratedField) => void,
 ): ParsedSessionAssignment | null {
   const sessionId = toU8Safe(raw["session_id"]);
   if (!sessionId || sessionId.length !== 16) return null;
@@ -173,8 +117,7 @@ export function parseSessionAssignment(
   const dirSig = toU8Safe(raw["directory_signature"]);
   if (!dirSig || dirSig.length !== 64) return null;
 
-  // The per-node directory signature over the relay TBS. Optional — absent on older assignments and on
-  // direct-mode sessions. When present it must be a valid 64-byte sig; a malformed value is dropped to
+  // The per-node directory signature over the relay TBS. Absent on direct-mode sessions. When present it must be a valid 64-byte sig; a malformed value is dropped to
   // undefined (the session then has no relay assignment to present, which surfaces as a relay-witness
   // gap, not a hard failure).
   const relayDirSigRaw = toU8Safe(raw["relay_directory_signature"]);
@@ -184,9 +127,9 @@ export function parseSessionAssignment(
   const sessionTimestamp = typeof tsRaw === "number" ? tsRaw : typeof tsRaw === "bigint" ? Number(tsRaw) : null;
   if (sessionTimestamp === null) return null;
 
-  const participantA = parseParticipantInfo(raw["participant_a"], onTolerated);
+  const participantA = parseParticipantInfo(raw["participant_a"]);
   if (!participantA) return null;
-  const participantB = parseParticipantInfo(raw["participant_b"], onTolerated);
+  const participantB = parseParticipantInfo(raw["participant_b"]);
   if (!participantB) return null;
   const relayEndpoint = parseEndpointInfo(raw["relay_endpoint"]);
   if (!relayEndpoint) return null;

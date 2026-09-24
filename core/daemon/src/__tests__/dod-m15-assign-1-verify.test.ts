@@ -71,19 +71,19 @@ async function makeAssignment(opts: {
   announceKey?: Uint8Array;
   counterpartyPeerId?: string;
   tamperAfterSigning?: boolean;
-  /** 017-TBS: supply BOTH for the 12-field layout; omit both for the 10-field one. */
+  /** 017-TBS: default false / "" — a fresh, ordinary session. */
   highStakes?: boolean;
   priorRelayId?: string;
 }): Promise<SessionAssignment> {
   const signerPub = opts.announceKey ?? (await opts.signWith.getPublicKey());
   const PUB_B = await RESPONDER.getPublicKey();
   const counterpartyPeerId = opts.counterpartyPeerId ?? "12D3KooWCounterparty";
-  // 017-TBS: present ONLY when the caller asks, so every existing fixture keeps signing 10 fields.
-  const twelve = opts.highStakes !== undefined && opts.priorRelayId !== undefined;
+  const highStakes = opts.highStakes ?? false;
+  const priorRelayId = opts.priorRelayId ?? "";
   const base = {
     session_id: SESSION_ID,
-    participant_a: { pubkey: PUB_A, peer_id: "12D3KooWA", multiaddrs: [] as string[] },
-    participant_b: { pubkey: PUB_B, peer_id: "12D3KooWB", multiaddrs: [] as string[] },
+    participant_a: { pubkey: PUB_A },
+    participant_b: { pubkey: PUB_B },
     relay_endpoint: { peer_id: "12D3KooWRelay", multiaddrs: ["/ip4/127.0.0.1/tcp/1"] },
     directory_endpoint: { peer_id: "12D3KooWDir", multiaddrs: ["/ip4/127.0.0.1/tcp/2"] },
     session_timestamp: TS,
@@ -93,15 +93,16 @@ async function makeAssignment(opts: {
     counterparty_session_peer_id: counterpartyPeerId,
     counterparty_session_addrs: ["/ip4/127.0.0.1/tcp/4"],
     transport_mode: "relay" as const,
-    ...(twelve ? { high_stakes: opts.highStakes, prior_relay_id: opts.priorRelayId } : {}),
+    high_stakes: highStakes,
+    prior_relay_id: priorRelayId,
+    relay_id: "",
   };
   const genesis = computeGenesisPrevRoot(PUB_A, PUB_B, SESSION_ID, TS);
   const tbs = buildSessionEstablishmentTbs(
     SESSION_ID, PUB_A, PUB_B, genesis, TS,
     base.initiator_session_peer_id, base.initiator_session_addrs,
     base.counterparty_session_peer_id, base.counterparty_session_addrs, base.transport_mode,
-    // Forwarded as-is including undefined — the builder chooses its layout on arity.
-    opts.highStakes, opts.priorRelayId,
+    highStakes, priorRelayId, "",
   );
   // The FROST context framing the directory signs under.
   const enc = new TextEncoder().encode(CONTEXT_SESSION_ESTABLISHMENT);
@@ -148,26 +149,21 @@ describe("DOD-M15-ASSIGN-1: a session assignment is verified before anything dia
   });
 
   /**
-   * 017-TBS — the verifier's half of the 12-field layout.
-   *
-   * These are the only tests that exercise the two new arguments at the verifier's call sites.
-   * Without them the sign and verify halves both stayed on 10 fields, agreed with each other, and
-   * proved nothing: dropping the arguments from `verifyAssignmentSignature` left every existing
-   * test green. The signature is what makes this real — the fixture SIGNS 12 fields, so a verifier
-   * that rebuilds 10 cannot produce a matching signature no matter what else is right.
+   * 017-TBS — `high_stakes` and `prior_relay_id` at the verifier's call sites. The fixture SIGNS
+   * them, so a verifier that drops or alters either cannot produce a matching signature.
    */
-  it("ACCEPTS a 12-field assignment — a FRESH session, where both new values are the falsy ones", async () => {
+  it("ACCEPTS an assignment — a FRESH session, where both new values are the falsy ones", async () => {
     // The common case and the one most likely to break: false and "" are the values a truthiness
-    // bug anywhere in the chain turns into "absent", which silently selects the 10-field layout.
+    // bug anywhere in the chain turns into "absent".
     const kp = generateKeypair();
     const hex = Buffer.from(await kp.getPublicKey()).toString("hex");
     const asg = await makeAssignment({ signWith: kp, highStakes: false, priorRelayId: "" });
 
     const r = await verifyAssignmentSignature(asg, persistenceWith(hex), silent, "alice", "corr");
-    expect(r.ok, "a fresh 12-field assignment is the normal path — refusing it breaks every session").toBe(true);
+    expect(r.ok, "a fresh assignment is the normal path — refusing it breaks every session").toBe(true);
   });
 
-  it("ACCEPTS a 12-field assignment on a RESUME, naming the prior relay", async () => {
+  it("ACCEPTS an assignment on a RESUME, naming the prior relay", async () => {
     const kp = generateKeypair();
     const hex = Buffer.from(await kp.getPublicKey()).toString("hex");
     const asg = await makeAssignment({ signWith: kp, highStakes: true, priorRelayId: "a".repeat(64) });
@@ -176,7 +172,7 @@ describe("DOD-M15-ASSIGN-1: a session assignment is verified before anything dia
     expect(r.ok).toBe(true);
   });
 
-  it("REFUSES a 12-field assignment whose prior relay was swapped after signing", async () => {
+  it("REFUSES an assignment whose prior relay was swapped after signing", async () => {
     // The binding that matters. prior_relay_id decides which relay's receipts the NEW relay will
     // trust, so if it were outside the signature a tampering party could redirect that trust to a
     // relay the directory never named. Tampered after signing, which is the shape a compromised
@@ -190,7 +186,7 @@ describe("DOD-M15-ASSIGN-1: a session assignment is verified before anything dia
     expect(r.ok, "prior_relay_id is inside the signed bytes — swapping it must not verify").toBe(false);
   });
 
-  it("REFUSES a 12-field assignment whose high_stakes was flipped after signing", async () => {
+  it("REFUSES an assignment whose high_stakes was flipped after signing", async () => {
     // Same binding, the other field: flipping the tier off would put the counterparty back on the
     // short delivery floor the initiator did not ask for.
     const kp = generateKeypair();

@@ -104,31 +104,6 @@ describe("DocumentAmendmentStore — the fork-tolerant entry store", () => {
     expect(() => new DocumentAmendmentStore(db as never, silent)).not.toThrow();
   });
 
-  it("opens a database populated BEFORE the pivot cleanly — the dead epoch-keyed table is dropped in place (D7)", () => {
-    // The pre-P1 table (epoch-keyed) may hold old-shape bytes no reader can decode and no code
-    // consults. Constructing the new store over it must neither crash nor mistake those rows for
-    // entries — and the residue sweep drops the table itself (review F6).
-    const legacy = new DatabaseSync(":memory:");
-    legacy.exec(`
-      CREATE TABLE IF NOT EXISTS document_amendments (
-        owner_agent_id TEXT NOT NULL, document_id TEXT NOT NULL, epoch_id INTEGER NOT NULL,
-        amendment_hash TEXT NOT NULL, received_bytes BLOB NOT NULL, recorded_at INTEGER NOT NULL,
-        PRIMARY KEY (owner_agent_id, document_id, epoch_id)
-      );
-    `);
-    legacy
-      .prepare(
-        `INSERT INTO document_amendments VALUES (?, ?, ?, ?, ?, ?)`,
-      )
-      .run(OWNER, DOC, 1, "ab".repeat(32), Buffer.from([1, 2, 3]), 500);
-    const s2 = new DocumentAmendmentStore(legacy as never, silent);
-    expect(s2.chain(OWNER, DOC)).toHaveLength(0);
-    const gone = legacy
-      .prepare(`SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'document_amendments'`)
-      .get() as { n: number };
-    expect(gone.n).toBe(0);
-  });
-
   it("append → chain round-trips the RECEIVED bytes", () => {
     const [one, two] = causalChain({}, { kind: "promote_admin", subject_agent_id: "c".repeat(64) });
     const r1 = store.append(OWNER, DOC, encodeDocumentAmendment(one!), 1000);

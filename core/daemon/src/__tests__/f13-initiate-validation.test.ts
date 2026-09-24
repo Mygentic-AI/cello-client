@@ -63,8 +63,8 @@ const TS = 1_700_000_000_000;
 function makeAssignment(alicePubkeyHex: string, counterpartyPeerId: string, counterpartyAddrs: string[]): SessionAssignment {
   return {
     session_id: SID_BYTES,
-    participant_a: { pubkey: Buffer.from(alicePubkeyHex, "hex"), peer_id: "", multiaddrs: [] },
-    participant_b: { pubkey: new Uint8Array(32).fill(9), peer_id: counterpartyPeerId, multiaddrs: counterpartyAddrs },
+    participant_a: { pubkey: Buffer.from(alicePubkeyHex, "hex") },
+    participant_b: { pubkey: new Uint8Array(32).fill(9) },
     relay_endpoint: { peer_id: "", multiaddrs: [] },
     directory_endpoint: { peer_id: "", multiaddrs: [] },
     session_timestamp: TS,

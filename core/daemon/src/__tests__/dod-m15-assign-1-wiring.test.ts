@@ -55,7 +55,7 @@ async function assignmentFrame(opts: {
   const genesis = computeGenesisPrevRoot(opts.pubA, opts.pubB, SESSION_ID, TS);
   const tbs = buildSessionEstablishmentTbs(
     SESSION_ID, opts.pubA, opts.pubB, genesis, TS,
-    initiatorPeerId, initiatorAddrs, opts.counterpartyPeerId, counterpartyAddrs, "relay",
+    initiatorPeerId, initiatorAddrs, opts.counterpartyPeerId, counterpartyAddrs, "relay", false, "", "",
   );
   const enc = new TextEncoder().encode(CONTEXT_SESSION_ESTABLISHMENT);
   const framed = new Uint8Array(enc.length + 1 + tbs.length);
@@ -66,8 +66,8 @@ async function assignmentFrame(opts: {
     type: "session_assignment",
     assignment: {
       session_id: SESSION_ID,
-      participant_a: { pubkey: opts.pubA, peer_id: "12D3KooWA", multiaddrs: [] },
-      participant_b: { pubkey: opts.pubB, peer_id: "12D3KooWB", multiaddrs: [] },
+      participant_a: { pubkey: opts.pubA },
+      participant_b: { pubkey: opts.pubB },
       relay_endpoint: { peer_id: "12D3KooWRelay", multiaddrs: ["/ip4/127.0.0.1/tcp/1"] },
       directory_endpoint: { peer_id: "12D3KooWDir", multiaddrs: ["/ip4/127.0.0.1/tcp/2"] },
       session_timestamp: TS,
@@ -80,6 +80,9 @@ async function assignmentFrame(opts: {
       counterparty_session_peer_id: opts.counterpartyPeerId,
       counterparty_session_addrs: counterpartyAddrs,
       transport_mode: "relay",
+      high_stakes: false,
+      prior_relay_id: "",
+      relay_id: "",
     },
   };
 }

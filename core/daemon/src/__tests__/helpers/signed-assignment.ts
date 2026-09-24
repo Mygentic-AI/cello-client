@@ -276,8 +276,8 @@ export async function makeSignedAssignmentFrame(
       type: "session_assignment",
       assignment: {
         session_id: opts.sessionId,
-        participant_a: { pubkey: initiatorPubkey, peer_id: "12D3KooWA", multiaddrs: [] },
-        participant_b: { pubkey: opts.responderPubkey, peer_id: "12D3KooWB", multiaddrs: [] },
+        participant_a: { pubkey: initiatorPubkey },
+        participant_b: { pubkey: opts.responderPubkey },
         relay_endpoint: { peer_id: "12D3KooWRelay", multiaddrs: ["/ip4/127.0.0.1/tcp/1"] },
         directory_endpoint: { peer_id: "12D3KooWDir", multiaddrs: ["/ip4/127.0.0.1/tcp/2"] },
         session_timestamp: ts,

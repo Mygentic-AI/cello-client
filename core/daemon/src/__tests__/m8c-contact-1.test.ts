@@ -655,8 +655,8 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
           ok: true,
           assignment: {
             session_id: SID_BYTES,
-            participant_a: { pubkey: Buffer.alloc(32), peer_id: "", multiaddrs: [] },
-            participant_b: { pubkey: Buffer.from(targetPubkey, "hex"), peer_id: "", multiaddrs: [] },
+            participant_a: { pubkey: Buffer.alloc(32) },
+            participant_b: { pubkey: Buffer.from(targetPubkey, "hex") },
             relay_endpoint: { peer_id: "", multiaddrs: [] },
             directory_endpoint: { peer_id: "", multiaddrs: [] },
             session_timestamp: TS,

@@ -192,8 +192,8 @@ describe("WIRE-001 AC-001: SessionAssignment type completeness", () => {
   it("AC-001: SessionAssignmentFrost can be constructed with all M7 fields (compile-time check)", () => {
     const assignment: SessionAssignmentFrost = {
       session_id: makeSessionId(),
-      participant_a: { pubkey: makePubA(), peer_id: "12D3KooWA", multiaddrs: ["/ip4/127.0.0.1/tcp/4001"] },
-      participant_b: { pubkey: makePubB(), peer_id: "12D3KooWB", multiaddrs: ["/ip4/127.0.0.1/tcp/4002"] },
+      participant_a: { pubkey: makePubA() },
+      participant_b: { pubkey: makePubB() },
       relay_endpoint: { peer_id: "12D3KooWRelay", multiaddrs: ["/ip4/127.0.0.1/tcp/5000"] },
       directory_endpoint: { peer_id: "12D3KooWDir", multiaddrs: ["/ip4/127.0.0.1/tcp/6000"] },
       session_timestamp: TIMESTAMP,
@@ -218,8 +218,8 @@ describe("WIRE-001 AC-001: SessionAssignment type completeness", () => {
   it("AC-001: SessionAssignment union type works with discriminated union", () => {
     const assignment: SessionAssignment = {
       session_id: makeSessionId(),
-      participant_a: { pubkey: makePubA(), peer_id: "12D3KooWA", multiaddrs: [] },
-      participant_b: { pubkey: makePubB(), peer_id: "12D3KooWB", multiaddrs: [] },
+      participant_a: { pubkey: makePubA() },
+      participant_b: { pubkey: makePubB() },
       relay_endpoint: { peer_id: "r1", multiaddrs: [] },
       directory_endpoint: { peer_id: "d1", multiaddrs: [] },
       session_timestamp: TIMESTAMP,

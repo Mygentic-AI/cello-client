@@ -38,12 +38,6 @@
  * session where we only sent away traffic") was tried and reverted: it also disabled closing the
  * inbox on a real caller who ignores the instruction, which is the behaviour this file exists for.
  *
- * ⚠️ `isOwnAwayAutoReply`, NOT the marker alone. The marker only catches a marker-aware peer; the
- * recogniser's LEGACY branch also catches this daemon's older default wording, which is what an
- * un-upgraded CELLO agent still sends. Two away agents on mixed versions sealing a conversation
- * nobody had is `DOD-AWAY-MUTUAL-SEAL-1`, and it became reachable again the moment this file could
- * seal. Its documented limit stands: an old peer with a CONFIGURED away message is unmatched.
- *
  * ⚠️ THE MARKER IS TEXT, SO IT IS ADVISORY — say it rather than imply a rule. It is a token at the
  * front of the message body, not a signed frame field, so any caller who types it is never counted
  * and never closed on. What that buys them is the PRE-FIX behaviour: the session stays open until
@@ -57,7 +51,7 @@ import type { Logger, SessionRecord } from "./types.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { ActiveSealResult } from "./seal-flows.js";
 import type { SealCompletion, UnilateralResult } from "./seal-coordinator.js";
-import { markAsAutoReply, isOwnAwayAutoReply } from "./away-detection.js";
+import { markAsAutoReply, isAutoReplyMarked } from "./away-detection.js";
 import { isLocalCredentialRefusal, LEAF_KIND_MSG } from "./session-relay-client.js";
 import { sentAuthorship } from "./session-content-handlers.js";
 import { escalateToUnilateralSeal as runUnilateralEscalation, UNILATERAL_SEAL_TIMEOUT_MS } from "./seal-escalation.js";
@@ -122,14 +116,14 @@ export function createAwayInboxOneshot(deps: AwayInboxOneshotDeps): {
       if (m.direction === "sent") {
         // ANYTHING of ours that is not the greeting means a human spoke here. See `weSpoke` at the
         // call site: it is the line between an answering machine and a conversation.
-        if (!isOwnAwayAutoReply(m.text)) weSpoke = true;
+        if (!isAutoReplyMarked(m.text)) weSpoke = true;
         continue;
       }
       if (m.direction !== "received") continue;
       // `latest` is the last thing they sent WHATEVER it was, because the auto-reply case is a
       // decision this makes (never answer a machine), not one it can make by never seeing it.
       latest = m.text;
-      if (isOwnAwayAutoReply(m.text)) continue;
+      if (isAutoReplyMarked(m.text)) continue;
       theirCount += 1;
     }
     return { theirCount, latest, weSpoke };
@@ -189,7 +183,7 @@ export function createAwayInboxOneshot(deps: AwayInboxOneshotDeps): {
     }
     // THE ARRIVAL ITSELF IS A MACHINE'S: never answered, never counted, and checked before the
     // count so two away agents cannot reach the seal below by trading greetings.
-    if (isOwnAwayAutoReply(latest)) {
+    if (isAutoReplyMarked(latest)) {
       logger.info("session.away.mutual.skipped", {
         agentName, sessionId,
         impact: "no one-shot close — two away agents must not notarize a conversation nobody had",

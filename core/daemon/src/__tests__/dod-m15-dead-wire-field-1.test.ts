@@ -1,203 +1,70 @@
 /**
- * DOD-M15-DEAD-WIRE-FIELD-1 (client half) — a field nobody reads cannot kill a session.
+ * DOD-M15-DEAD-WIRE-FIELD-1 — a participant is its pubkey, and nothing else can refuse a session.
  *
- * ─── The checked-then-ignored ──────────────────────────────────────────────────────────────────
+ * The directory used to put `peer_id` and `multiaddrs` on each participant. Nothing read them and no
+ * signature covered them, yet a malformed or empty one refused the whole assignment — so an agent
+ * whose peer-info announce was late could not be talked to at all. They are no longer part of
+ * `ParticipantInfo`; any that still arrive are ignored.
  *
- * `participant_a/b.multiaddrs` has been permanently `[]` on every session assignment since the
- * directory-facing node stopped listening. The directory stores it and **signs nothing over it** —
- * neither the session nor the relay TBS includes it. The client parses it and drops it: the only
- * read of a parsed assignment's participants takes `.pubkey`.
- *
- * And the parser REJECTED THE WHOLE ASSIGNMENT if that array was malformed. So a value with no
- * consumers, covered by no signature, could refuse a session outright — a directory bug, a CBOR
- * quirk or a future field-type change would end a conversation over something nothing acts on.
- *
- * ─── What this half does, and what it deliberately leaves ──────────────────────────────────────
- *
- * Removing the field from the wire is BILATERAL and belongs with the other pending wire changes
- * (`DOD-M15-SUBMIT-ID-1`'s 7-element Structure 1, `DOD-M15-TERMINAL-REASON-1`'s reasons) so the two
- * repos move once. That is carried.
- *
- * Making the client stop REFUSING over it is unilateral, backward-compatible, and closes the
- * checked-then-ignored today.
- *
- * ─── The distinction that matters, and the reason for the second test ──────────────────────────
- *
- * `parseEndpointInfo` reads the same-named field for the RELAY and DIRECTORY endpoints — and those
- * multiaddrs ARE dialed. Loosening both would be the easy mistake: identical field name, adjacent
- * functions, one dead and one load-bearing. The relay endpoint must stay strict, and the second test
- * is what holds that line.
+ * `parseEndpointInfo` reads identically-named fields on the RELAY and DIRECTORY endpoints, and those
+ * ARE dialed, so they stay strict. Same field name, adjacent function, one dead and one
+ * load-bearing: the relay tests below hold that line.
  */
 
 import { describe, it, expect } from "vitest";
-import { parseSessionAssignment, type ToleratedField } from "../session-assignment-parser.js";
+import { parseSessionAssignment } from "../session-assignment-parser.js";
 
-/** A well-formed assignment, with the pieces a test wants to corrupt exposed. */
-function assignment(overrides: {
-  participantMultiaddrs?: unknown;
-  relayMultiaddrs?: unknown;
-} = {}): Record<string, unknown> {
-  const participant = (pub: number) => ({
-    pubkey: new Uint8Array(32).fill(pub),
-    peer_id: `12D3KooWParticipant${pub}`,
-    multiaddrs: "participantMultiaddrs" in overrides ? overrides.participantMultiaddrs : [],
-  });
+function assignment(participantExtras: Record<string, unknown> = {}): Record<string, unknown> {
+  const participant = (pub: number) => ({ pubkey: new Uint8Array(32).fill(pub), ...participantExtras });
   return {
     session_id: new Uint8Array(16).fill(1),
     participant_a: participant(0xaa),
     participant_b: participant(0xbb),
-    relay_endpoint: {
-      peer_id: "12D3KooWRelay",
-      multiaddrs: "relayMultiaddrs" in overrides ? overrides.relayMultiaddrs : ["/ip4/127.0.0.1/tcp/1"],
-    },
+    relay_endpoint: { peer_id: "12D3KooWRelay", multiaddrs: ["/ip4/127.0.0.1/tcp/1"] },
     directory_endpoint: { peer_id: "12D3KooWDir", multiaddrs: ["/ip4/127.0.0.1/tcp/2"] },
     session_timestamp: 1_700_000_000_000,
     directory_pubkey: new Uint8Array(32).fill(0xdd),
     directory_signature: new Uint8Array(64).fill(0xee),
-    signature_type: "frost",
     signer_pubkey: new Uint8Array(32).fill(0xcc),
     initiator_session_peer_id: "12D3KooWInitiator",
     initiator_session_addrs: ["/ip4/127.0.0.1/tcp/3"],
     counterparty_session_peer_id: "12D3KooWReceiver",
     counterparty_session_addrs: ["/ip4/127.0.0.1/tcp/4"],
     transport_mode: "relay",
+    high_stakes: false,
+    prior_relay_id: "",
+    relay_id: "",
   };
 }
 
-describe("DOD-M15-DEAD-WIRE-FIELD-1: a field with no consumers cannot refuse a session", () => {
-  it("the well-formed case still parses — the control", () => {
-    expect(parseSessionAssignment(assignment())).not.toBeNull();
-  });
-
-  it("★ a MALFORMED participant multiaddrs no longer refuses the whole assignment", () => {
-    /**
-     * Nothing reads it and no signature covers it, so refusing over it ends a conversation for a
-     * value that cannot affect anything. Numbers in place of strings is the shape a field-type
-     * change or a CBOR quirk actually produces.
-     */
-    const parsed = parseSessionAssignment(assignment({ participantMultiaddrs: [1, 2, 3] }));
-    expect(
-      parsed,
-      "A session was refused over `participant.multiaddrs` — a field that is permanently empty, " +
-        "covered by no signature, and read by nothing (the only read of a parsed participant takes " +
-        "`.pubkey`).",
-    ).not.toBeNull();
-    // THE OUTCOME, not its shadow (hollow-test Q4). `not.toBeNull()` alone passed a mutation that
-    // returned the malformed value verbatim AND one that FABRICATED an address — both measured
-    // green by review. `[]` is what the comment promises, so `[]` is what gets asserted.
-    expect(parsed!.participant_a.multiaddrs).toEqual([]);
-  });
-
-  it("an ABSENT participant multiaddrs parses too", () => {
-    // The shape the bilateral half will produce once the field leaves the wire. Accepting it now
-    // means the client is already compatible when the directory stops sending it.
-    const a = assignment();
-    delete (a["participant_a"] as Record<string, unknown>)["multiaddrs"];
-    const parsed = parseSessionAssignment(a);
+describe("DOD-M15-DEAD-WIRE-FIELD-1: a participant is its pubkey", () => {
+  it("a participant carrying only its pubkey parses — the control", () => {
+    const parsed = parseSessionAssignment(assignment());
     expect(parsed).not.toBeNull();
-    expect(parsed!.participant_a.multiaddrs).toEqual([]);
+    expect(Object.keys(parsed!.participant_a)).toEqual(["pubkey"]);
   });
 
-  it("★ an EMPTY participant peer_id no longer refuses the whole assignment", () => {
-    /**
-     * THE SAME DEFECT, ONE LINE ABOVE — and strictly worse, because the directory PRODUCES the
-     * killing value from two explicit defaults rather than needing a bug to generate it:
-     *
-     *   `directory-node.ts:2049`  on AUTH, seeds `#peerInfo[pubkey] = { peer_id: "", multiaddrs: [] }`
-     *   `directory-node.ts:3867`  `?? { peer_id: "", multiaddrs: [] }` when the map misses
-     *
-     * and `:4120` copies whichever it got straight into `participant_a/b`. Nothing gates it: the
-     * only announce requirement checks the INITIATOR announced — the TARGET never has to.
-     *
-     * So: agent B authenticates, its peer-info announce is late or never sent, A opens a session,
-     * the directory FROST-signs a perfectly valid assignment and pushes it to both sides — and both
-     * clients refuse it over an empty string in a field neither one reads. Two healthy agents, a
-     * valid threshold signature, conversation dead.
-     *
-     * `peer_id` satisfies every clause of this DoD line: unread (the only reads are the directory's
-     * own encoder), covered by no signature, and it refused the whole assignment.
-     */
-    const a = assignment();
-    (a["participant_b"] as Record<string, unknown>)["peer_id"] = "";
-    const parsed = parseSessionAssignment(a);
-    expect(
-      parsed,
-      "A valid, FROST-signed assignment was refused because the directory defaulted a peer_id to " +
-        "the empty string — a field nothing reads and no signature covers. Both agents are healthy " +
-        "and the conversation dies.",
-    ).not.toBeNull();
-    expect(parsed!.participant_b.peer_id).toBe("");
+  it("★ junk in the old participant fields cannot refuse the assignment, and is not carried", () => {
+    const parsed = parseSessionAssignment(assignment({ peer_id: "", multiaddrs: [1, 2, 3] }));
+    expect(parsed, "fields nothing reads must not be able to end a conversation").not.toBeNull();
+    expect(Object.keys(parsed!.participant_a)).toEqual(["pubkey"]);
   });
 
-  it("a MISSING participant peer_id parses too, and yields the empty string", () => {
-    // Same disposition for absent as for empty — there is no third meaning for a value nobody reads.
+  it("a participant is still rejected for its pubkey — the one value that IS read", () => {
     const a = assignment();
-    delete (a["participant_a"] as Record<string, unknown>)["peer_id"];
-    const parsed = parseSessionAssignment(a);
-    expect(parsed).not.toBeNull();
-    expect(parsed!.participant_a.peer_id).toBe("");
+    (a["participant_a"] as Record<string, unknown>)["pubkey"] = new Uint8Array(8);
+    expect(parseSessionAssignment(a), "a short pubkey must still refuse").toBeNull();
   });
 
   it("the RELAY endpoint's peer_id stays STRICT — it is dialed", () => {
-    // The same line as for multiaddrs: the relay's peer id is what a session is dialed at, so an
-    // empty one is a session that cannot connect and is worth refusing at the boundary.
     const a = assignment();
     (a["relay_endpoint"] as Record<string, unknown>)["peer_id"] = "";
     expect(parseSessionAssignment(a), "an empty RELAY peer_id must still refuse").toBeNull();
   });
 
   it("the RELAY endpoint's multiaddrs stays STRICT — those are dialed", () => {
-    /**
-     * The line this must not cross. `parseEndpointInfo` reads an identically-named field on the
-     * relay and directory endpoints, and those addresses ARE dialed — a malformed one is a session
-     * that cannot connect, which is worth refusing loudly at the boundary rather than discovering
-     * at dial time.
-     *
-     * Same field name, adjacent function, one dead and one load-bearing: loosening both is the easy
-     * mistake, and this is what stops it.
-     */
-    expect(
-      parseSessionAssignment(assignment({ relayMultiaddrs: [1, 2, 3] })),
-      "a malformed RELAY multiaddr must still refuse — it is dialed, unlike the participant field",
-    ).toBeNull();
-  });
-
-  it("a participant is still rejected for the things that ARE read", () => {
-    // Tolerance is scoped to the dead field. `pubkey` is the one value a parsed participant is read
-    // for, so it stays strict — otherwise this change would trade a harmless refusal for a real one.
     const a = assignment();
-    (a["participant_a"] as Record<string, unknown>)["pubkey"] = new Uint8Array(8);
-    expect(parseSessionAssignment(a), "a short pubkey must still refuse").toBeNull();
-  });
-
-  it("a MALFORMED dead field is REPORTED — tolerating it is not the same as discarding the fact", () => {
-    /**
-     * Review F3. This parse is the ONLY place in the system where evidence that a directory is
-     * emitting junk in these fields can exist: no signature covers them, and no consumer sees them.
-     * `?? []` was destroying that silently.
-     */
-    const seen: ToleratedField[] = [];
-    const parsed = parseSessionAssignment(
-      assignment({ participantMultiaddrs: [1, 2, 3] }),
-      (f) => seen.push(f),
-    );
-    expect(parsed).not.toBeNull();
-    expect(seen, "a malformed dead field must be reported, not silently dropped")
-      .toContain("participant.multiaddrs");
-  });
-
-  it("an ABSENT dead field is NOT reported — that is the designed normal case", () => {
-    /**
-     * The direction that matters, and the counterexample to the test above. Once the bilateral half
-     * removes the field, ABSENT is what every well-formed assignment looks like. Warning on it would
-     * fire on every session forever — a signal that fires on the normal case is not a signal, and it
-     * would train the operator to ignore the one that is real.
-     */
-    const a = assignment();
-    delete (a["participant_a"] as Record<string, unknown>)["multiaddrs"];
-    delete (a["participant_a"] as Record<string, unknown>)["peer_id"];
-    const seen: ToleratedField[] = [];
-    expect(parseSessionAssignment(a, (f) => seen.push(f))).not.toBeNull();
-    expect(seen, "absence is the designed normal case and must stay silent").toEqual([]);
+    (a["relay_endpoint"] as Record<string, unknown>)["multiaddrs"] = [1, 2, 3];
+    expect(parseSessionAssignment(a), "a malformed RELAY multiaddr must still refuse").toBeNull();
   });
 });

@@ -34,56 +34,41 @@
  * ignored the one-shot instruction. Machine-to-machine away traffic ends the exchange quietly
  * instead of minting a seal.
  *
- * Matched on the EXACT text, never a substring: a human who happens to quote the away message should
- * be answered normally, and a loose match would silence real messages. The texts are this daemon's
- * own constants, so a foreign implementation's away text will not match — and it also will not be
- * ping-ponging with ours, because the loop needs both sides running this logic.
+ * Recognised by the `[[AUTO-REPLY]]` marker at the FRONT of the text (DOD-M12B-AWAY-MARK-1), applied
+ * at the single send choke point — so a configured away message carries it too. Anchored, never a
+ * substring: a human who merely mentions the marker or the word "away" is answered normally.
  */
 
 import { describe, it, expect } from "vitest";
-import { isOwnAwayAutoReply, AWAY_AUTO_REPLY_TEXTS, AWAY_AUTO_REPLY_MARKER } from "../away-detection.js";
-
-const ONE_SHOT = "Agent is currently away. Your message has been received and will be read when the operator returns. This inbox accepts one message per visit — please close the session now (send with signal: wrap) instead of sending more.";
-const OFFER = "Alice is currently away. Leave a message (send with signal: wrap to close) and it will be read when they return.";
+import { isAutoReplyMarked, markAsAutoReply, AWAY_AUTO_REPLY_TEXTS, AWAY_AUTO_REPLY_MARKER } from "../away-detection.js";
 
 describe("an away responder recognises another away responder", () => {
-  it("recognises the one-shot away acknowledgement", () => {
-    expect(isOwnAwayAutoReply(ONE_SHOT)).toBe(true);
+  it("recognises every away text this daemon sends — the offer for any agent, and the stranger reply", () => {
+    expect(isAutoReplyMarked(AWAY_AUTO_REPLY_TEXTS.offerFor("Alice"))).toBe(true);
+    expect(isAutoReplyMarked(AWAY_AUTO_REPLY_TEXTS.offerFor("Miss_Chelly"))).toBe(true);
+    expect(isAutoReplyMarked(AWAY_AUTO_REPLY_TEXTS.stranger)).toBe(true);
   });
 
-  it("recognises the per-agent away offer, whatever the agent is called", () => {
-    // The offer text is built per agent, so the check cannot be a fixed-string equality on one name.
-    expect(isOwnAwayAutoReply(OFFER)).toBe(true);
-    expect(isOwnAwayAutoReply("Miss_Chelly is currently away. Leave a message (send with signal: wrap to close) and it will be read when they return.")).toBe(true);
+  it("recognises an operator's CONFIGURED away message once it is marked at the send choke point", () => {
+    expect(isAutoReplyMarked(markAsAutoReply("Back Monday — leave a note."))).toBe(true);
   });
 
-  it("does NOT match a human message that merely mentions being away", () => {
-    // The guard against over-matching. Silencing a real message is a worse failure than the one
-    // being fixed: the operator would never learn it arrived.
+  it("does NOT match a human message that merely mentions being away, or the marker mid-text", () => {
+    // Silencing a real message is a worse failure than the one being fixed: the operator would
+    // never learn it arrived.
     for (const human of [
       "I am currently away from my desk, can we talk tomorrow?",
       "away",
       "Are you away? Leave a message and I will read it when I return.",
+      `Did you mean to send ${AWAY_AUTO_REPLY_MARKER}?`,
       "",
     ]) {
-      expect(isOwnAwayAutoReply(human), `'${human.slice(0, 40)}' must be treated as a real message`).toBe(false);
+      expect(isAutoReplyMarked(human), `'${human.slice(0, 40)}' must be treated as a real message`).toBe(false);
     }
   });
 
-  it("exposes the texts it matches, so the check cannot drift from what is actually sent", () => {
-    // Both the detector and the sender read this list. A second hardcoded copy is how a reworded
-    // away message would silently stop being recognised, and the loop would come back.
-    //
-    // DOD-M12B-AWAY-MARK-1: what this daemon SENDS now carries the marker; ONE_SHOT and OFFER above
-    // are the pre-marker bodies, kept verbatim because the two tests at the top of this file assert
-    // an un-upgraded peer's away reply is still recognised. Both facts are pinned here at once —
-    // the sent text is the marker plus the unchanged body, so neither the wording nor the marker
-    // can drift away from the detector without failing.
-    expect(AWAY_AUTO_REPLY_TEXTS.offerFor("Alice")).toBe(`${AWAY_AUTO_REPLY_MARKER} ${OFFER}`);
-    // DOD-M15-AWAYSCOPE-1 stopped SENDING the one-shot body — it was only ever sent into an
-    // already-accepted session — so there is no sent text left to compare `ONE_SHOT` against. It is
-    // now purely a RECOGNISER for an un-upgraded peer, and that is what is pinned instead: the
-    // detector must still match the exact pre-marker bytes an older build puts on the wire.
-    expect(isOwnAwayAutoReply(ONE_SHOT), "an un-upgraded peer's one-shot must still be recognised").toBe(true);
+  it("marking is idempotent — a default text is not double-marked", () => {
+    const once = AWAY_AUTO_REPLY_TEXTS.stranger;
+    expect(markAsAutoReply(once)).toBe(once);
   });
 });

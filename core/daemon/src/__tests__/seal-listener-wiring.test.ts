@@ -116,9 +116,16 @@ describe("the seal listener set is a BUNDLE — a stream cannot be wired with on
 
     coordinator.registerSealListeners(signaling as unknown as SignalingManager, AGENT, PUBKEY);
 
-    // session_sealed → the sealed listener tears the session node down.
+    // session_sealed → the sealed listener RECEIVED it: an uncertified frame is refused by name, and
+    // the refusal is the proof the handler is wired. Nothing is torn down on an unverified seal.
     signaling.deliver({ type: "session_sealed", session_id: SESSION, sealed_root: "c".repeat(64) });
-    await vi.waitFor(() => expect(store.destroySessionNode).toHaveBeenCalled());
+    await vi.waitFor(() =>
+      expect(logger.error).toHaveBeenCalledWith(
+        "session.sealed.signature.invalid",
+        expect.objectContaining({ sessionId: SESSION, reason: "missing_certificate_fields" }),
+      ),
+    );
+    expect(store.destroySessionNode).not.toHaveBeenCalled();
 
     // seal_upgrade_rejected → the upgrade listener logs it with its reason (never swallowed).
     signaling.deliver({ type: "seal_upgrade_rejected", session_id: SESSION, reason: "already_bilateral" });

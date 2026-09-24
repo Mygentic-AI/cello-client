@@ -19,7 +19,7 @@ import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle, type DaemonConfig } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import { openEncryptedDatabaseAtPath } from "../sqlcipher-db.js";
-import { DbIdentityStore, ensureIdentitySchema } from "../db-identity-store.js";
+import { DbIdentityStore } from "../db-identity-store.js";
 import type { Logger } from "../types.js";
 
 function makeLogger(): Logger {

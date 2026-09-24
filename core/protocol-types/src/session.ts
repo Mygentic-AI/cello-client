@@ -55,8 +55,6 @@ import { encodeCbor } from "./cbor.js";
 
 export interface ParticipantInfo {
   pubkey: Uint8Array;    // 32-byte K_local pubkey
-  peer_id: string;       // libp2p Peer ID string
-  multiaddrs: string[];  // dialing multiaddrs
 }
 
 export interface RelayEndpointInfo {

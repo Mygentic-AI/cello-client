@@ -240,8 +240,8 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       async negotiate() {
         const assignment: SessionAssignment = {
           session_id: SID_BYTES,
-          participant_a: { pubkey: Buffer.from(alicePubkey, "hex"), peer_id: "", multiaddrs: [] },
-          participant_b: { pubkey: Buffer.from(bobPubkey, "hex"), peer_id: bInfo!.peerId, multiaddrs: bInfo!.addrs },
+          participant_a: { pubkey: Buffer.from(alicePubkey, "hex") },
+          participant_b: { pubkey: Buffer.from(bobPubkey, "hex") },
           relay_endpoint: { peer_id: "", multiaddrs: [] },
           directory_endpoint: { peer_id: "", multiaddrs: [] },
           session_timestamp: TS,

@@ -63,7 +63,7 @@ async function frameFor(opts: {
     SESSION_ID, initiatorPub, RESPONDER_PUB, genesis, TS,
     "12D3KooWInitiator", ["/ip4/127.0.0.1/tcp/3"],
     counterpartyPeerId, ["/ip4/127.0.0.1/tcp/4"],
-    "relay", false, "",
+    "relay", false, "", "",
   );
   const ctx = new TextEncoder().encode(CONTEXT_SESSION_ESTABLISHMENT);
   const framed = new Uint8Array(ctx.length + 1 + tbs.length);
@@ -79,8 +79,8 @@ async function frameFor(opts: {
 
   return {
     session_id: SESSION_ID,
-    participant_a: { pubkey: initiatorPub, peer_id: "12D3KooWA", multiaddrs: [] },
-    participant_b: { pubkey: RESPONDER_PUB, peer_id: "12D3KooWB", multiaddrs: [] },
+    participant_a: { pubkey: initiatorPub },
+    participant_b: { pubkey: RESPONDER_PUB },
     relay_endpoint: { peer_id: "12D3KooWRelay", multiaddrs: ["/ip4/127.0.0.1/tcp/1"] },
     directory_endpoint: { peer_id: "12D3KooWDir", multiaddrs: ["/ip4/127.0.0.1/tcp/2"] },
     session_timestamp: TS,
@@ -96,6 +96,7 @@ async function frameFor(opts: {
     transport_mode: "relay",
     high_stakes: false,
     prior_relay_id: "",
+    relay_id: "",
     participant_a_ml_dsa_pubkey: pq.mlDsaPubkey,
     participant_a_ml_kem_pubkey: pq.mlKemPubkey,
     ...(opts.omitBinding ? {} : { participant_a_key_binding: binding, participant_a_key_binding_pq: bindingPq }),

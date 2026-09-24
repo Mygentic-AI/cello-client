@@ -311,8 +311,8 @@ describe("M8B FINDING-1: unilateral seal escalation on retry close", () => {
       async negotiate() {
         const assignment: SessionAssignment = {
           session_id: SID_BYTES,
-          participant_a: { pubkey: Buffer.from(alicePubkey, "hex"), peer_id: "", multiaddrs: [] },
-          participant_b: { pubkey: new Uint8Array(32).fill(9), peer_id: "dead-counterparty", multiaddrs: [] },
+          participant_a: { pubkey: Buffer.from(alicePubkey, "hex") },
+          participant_b: { pubkey: new Uint8Array(32).fill(9) },
           relay_endpoint: { peer_id: FAKE_RELAY_PEER_ID, multiaddrs: [FAKE_RELAY_ADDR] },
           directory_endpoint: { peer_id: "", multiaddrs: [] },
           session_timestamp: TS,

@@ -95,8 +95,8 @@ function fakeDialer(opts: FakeDialerOpts = {}): { dialer: TransportDialer; calls
 function makeAssignment(overrides: Partial<SessionAssignment> = {}): SessionAssignment {
   const base = {
     session_id: new Uint8Array(16).fill(7),
-    participant_a: { pubkey: new Uint8Array(32).fill(1), peer_id: "12D3KooWA", multiaddrs: [] },
-    participant_b: { pubkey: new Uint8Array(32).fill(2), peer_id: "12D3KooWB", multiaddrs: [] },
+    participant_a: { pubkey: new Uint8Array(32).fill(1) },
+    participant_b: { pubkey: new Uint8Array(32).fill(2) },
     relay_endpoint: { peer_id: "12D3KooWRelay", multiaddrs: ["/ip4/198.51.100.9/tcp/4001"] },
     directory_endpoint: { peer_id: "12D3KooWDir", multiaddrs: ["/ip4/203.0.113.1/tcp/4001"] },
     session_timestamp: 1_700_000_000_000,

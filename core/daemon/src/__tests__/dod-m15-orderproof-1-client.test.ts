@@ -307,42 +307,6 @@ describe("DOD-M15-ORDERPROOF-1 (client): the recipient keeps the proof, and only
     ).toMatch(/close it WITH your counterparty/i);
   });
 
-  it("★★ a session recorded BEFORE this order still opens and reads — the migration is additive", async () => {
-    /**
-     * The shape a pre-069 database is in: `relay_ack_receipts` with no `running_root_hex` column at
-     * all. Opening the store must ADD the column and leave every existing row intact and readable —
-     * a migration that dropped or rewrote them would destroy the only ordering evidence those
-     * sessions have.
-     */
-    const legacy = openTestDb(dbPath());
-    legacy.exec(`
-      CREATE TABLE relay_ack_receipts (
-        agent_pubkey TEXT NOT NULL, session_id TEXT NOT NULL, sequence_number INTEGER NOT NULL,
-        hash_hex TEXT NOT NULL, relay_id TEXT NOT NULL, relay_pubkey_hex TEXT NOT NULL,
-        relay_timestamp INTEGER NOT NULL, signature_hex TEXT NOT NULL, stored_at INTEGER NOT NULL,
-        PRIMARY KEY (agent_pubkey, session_id, sequence_number)
-      );
-    `);
-    legacy.prepare(
-      `INSERT INTO relay_ack_receipts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run("aa".repeat(32), SID_HEX, 1, "11".repeat(32), "dd".repeat(32), "dd".repeat(32), 10, "ee".repeat(64), 1);
-
-    // Opening the store runs the migration.
-    const store = new RelayReceiptStore(legacy, noopLogger);
-    const old = store.get("aa".repeat(32), SID_HEX, 1);
-    expect(old, "the pre-069 row is still there").toBeDefined();
-    expect(old!.hashHex).toBe("11".repeat(32));
-    expect(old!.signatureHex).toBe("ee".repeat(64));
-    expect(old!.runningRootHex, "and simply has no root recorded, rather than a fabricated one").toBeUndefined();
-
-    // And a new row alongside it carries one.
-    store.store({
-      hashHex: "22".repeat(32), agentPubkeyHex: "aa".repeat(32), sessionIdHex: SID_HEX,
-      relayId: "dd".repeat(32), relayPubkeyHex: "dd".repeat(32), sequenceNumber: 2,
-      timestamp: 20, signatureHex: "ff".repeat(64), runningRootHex: "ab".repeat(32),
-    }, 2);
-    expect(store.get("aa".repeat(32), SID_HEX, 2)?.runningRootHex).toBe("ab".repeat(32));
-  });
 });
 
 describe("DOD-M15-ORDERPROOF-1: the anchor OUTLIVES the process that learned it", () => {

@@ -27,20 +27,10 @@
  * 3. An unknown type does not silently receive a default extension. It cannot be admitted anyway
  *    (`isSupportedDocumentType`), and a default here is what let `yaml` create a real signed
  *    peer-accepted document with no file.
- *
- * ── AND THE MIGRATION, WHICH IS THE PART THAT COULD LOSE WORK ────────────────────────────────────
- *
- * `text` and `plaintext` documents that already exist live at `<id>.md`. Changing the extension
- * points the daemon at `<id>.txt`, which does not exist.
- *
- * The CONTENT is safe either way — it lives in the CRDT, and materialize would rewrite it at the new
- * path. What is NOT safe is anything the agent typed into the old file and had not published yet:
- * that exists only in those bytes, and leaving them at a path nothing reads again is losing work
- * silently, which is the one failure this milestone keeps finding. So the old file is carried over.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, writeFile, mkdir, readdir } from "node:fs/promises";
+import { mkdtemp, rm, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { DocumentEngine } from "../document-engine.js";
@@ -95,64 +85,5 @@ describe("the extension follows the document type", () => {
     const projections = await readdir(join(workspace, ".cello", AGENT));
     expect(projections).toContain(`${DOC}.txt.projection`);
     expect(projections).not.toContain(`${DOC}.md.projection`);
-  });
-});
-
-describe("a document that already lives at the old .md path is carried over, not stranded", () => {
-  /** The world as it was: file AND projection written under the old everything-is-.md rule. */
-  async function seedLegacy(content: string, projection: string): Promise<void> {
-    await mkdir(join(workspace, AGENT), { recursive: true });
-    await mkdir(join(workspace, ".cello", AGENT), { recursive: true });
-    await writeFile(join(workspace, AGENT, `${DOC}.md`), content, "utf8");
-    await writeFile(join(workspace, ".cello", AGENT, `${DOC}.md.projection`), projection, "utf8");
-  }
-
-  it("an unpublished edit in the old file is PUBLISHED rather than stranded", async () => {
-    // The verb that matters. `materialize` overwrites the file by contract, so it is not where work
-    // is rescued — `publish` is, because it diffs whatever the agent left on disk. If the migration
-    // did not move the file, publish would read an absent path and refuse; if it moved the file but
-    // not the projection, publish would refuse `document_file_missing` with no recorded baseline.
-    const wp = newWritePath();
-    const doc = wp.engine.createDocument("published line\n");
-    await seedLegacy("published line\nan unpublished edit\n", "published line\n");
-
-    const update = await wp.publish(AGENT, DOC, "text", doc);
-
-    expect(update, "nothing was published — the agent's edit is still only in the old file").not.toBeNull();
-    expect(doc.getText("content").toString()).toContain("an unpublished edit");
-  });
-
-  it("moves the file and its projection together, and leaves neither behind", async () => {
-    const wp = newWritePath();
-    const doc = wp.engine.createDocument("published line\n");
-    await seedLegacy("published line\n", "published line\n");
-
-    await wp.publish(AGENT, DOC, "text", doc);
-
-    expect(await readdir(join(workspace, AGENT))).toEqual([`${DOC}.txt`]);
-    expect(await readdir(join(workspace, ".cello", AGENT))).toEqual([`${DOC}.txt.projection`]);
-  });
-
-  it("does not touch a markdown document, whose extension did not change", async () => {
-    const wp = newWritePath();
-    const doc = wp.engine.createDocument("# Title\n");
-    await wp.materialize(AGENT, DOC, "markdown", doc);
-    expect(await readdir(join(workspace, AGENT))).toEqual([`${DOC}.md`]);
-  });
-
-  it("never prefers the old file when one already exists at the NEW path", async () => {
-    // Both present means the new one is the live document and the old one is a leftover. Preferring
-    // the old file would replay stale content over current work — the reverse of the bug being fixed.
-    const wp = newWritePath();
-    const doc = wp.engine.createDocument("current\n");
-    await seedLegacy("STALE LEFTOVER\n", "STALE LEFTOVER\n");
-    await writeFile(join(workspace, AGENT, `${DOC}.txt`), "current\nlive edit\n", "utf8");
-    await mkdir(join(workspace, ".cello", AGENT), { recursive: true });
-    await writeFile(join(workspace, ".cello", AGENT, `${DOC}.txt.projection`), "current\n", "utf8");
-
-    await wp.publish(AGENT, DOC, "text", doc);
-
-    expect(doc.getText("content").toString()).toContain("live edit");
-    expect(doc.getText("content").toString()).not.toContain("STALE LEFTOVER");
   });
 });

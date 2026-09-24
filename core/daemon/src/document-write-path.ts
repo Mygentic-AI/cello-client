@@ -22,7 +22,7 @@
  * intent. Measured, so the projection is written to disk beside the document and read back.
  */
 
-import { mkdir, readFile, writeFile, rename, access, rm } from "node:fs/promises";
+import { mkdir, readFile, writeFile, rename } from "node:fs/promises";
 import { join } from "node:path";
 import * as Y from "yjs";
 import type { DocumentEngine } from "./document-engine.js";
@@ -47,16 +47,6 @@ export { extensionForDocumentType, isSupportedDocumentType } from "./document-ty
 
 /** The types `propose`/`accept` will admit — derived from the registry, never a second list. */
 export const SUPPORTED_DOCUMENT_TYPES: ReadonlySet<string> = new Set(admittedDocumentTypes());
-
-/**
- * The extension every type was materialized under before the registry existed.
- *
- * Documents created then are on operators' disks right now. The CONTENT of one is never at risk —
- * it lives in the CRDT and would be rewritten at the new path. What is at risk is whatever the
- * agent typed into the old file and has NOT published: those bytes exist nowhere else, and leaving
- * them at a path nothing reads again loses work silently.
- */
-const LEGACY_EXTENSION = "md";
 
 /** Ids are hex identities, never names, and they become path components. */
 const ID_PATTERN = /^[0-9a-f]{64}$/;
@@ -125,58 +115,9 @@ export class DocumentWritePath {
     return extension;
   }
 
-  /**
-   * Move a document created under the old everything-is-`.md` rule onto its typed path.
-   *
-   * The file and its projection move TOGETHER. Moving only the file leaves publish with no recorded
-   * baseline (`document_file_missing`); moving only the projection leaves it diffing an absent file.
-   *
-   * A file already at the new path wins: both present means the new one is the live document and
-   * the old one is a leftover, so preferring the old file would replay stale content over current
-   * work — the reverse of the bug this fixes. The leftover is removed so a later run cannot find it.
-   */
-  async #migrateLegacyPath(agentId: string, documentId: string, documentType: string): Promise<void> {
-    const extension = this.#extension(documentType);
-    if (extension === LEGACY_EXTENSION) return;
-
-    const pairs: Array<[string, string]> = [
-      [
-        join(this.#root, agentId, `${documentId}.${LEGACY_EXTENSION}`),
-        join(this.#root, agentId, `${documentId}.${extension}`),
-      ],
-      [
-        join(this.#root, ".cello", agentId, `${documentId}.${LEGACY_EXTENSION}.projection`),
-        this.#projectionPath(agentId, documentId, documentType),
-      ],
-    ];
-
-    let moved = false;
-    for (const [from, to] of pairs) {
-      try {
-        await access(from);
-      } catch {
-        continue; // nothing there — the ordinary case for every document created since.
-      }
-      try {
-        await access(to);
-        await rm(from, { force: true }); // the new path is live; this is a leftover.
-        continue;
-      } catch {
-        // no file at the new path — the legacy one IS the document.
-      }
-      await rename(from, to);
-      moved = true;
-    }
-
-    if (moved) {
-      this.#logger.info("document.file.migrated", { documentId, documentType, extension });
-    }
-  }
-
   /** Write the document's projection to disk and record it as the diff baseline. */
   async materialize(agentId: string, documentId: string, documentType: string, doc: Y.Doc): Promise<string> {
     this.#assertSupported(documentType);
-    await this.#migrateLegacyPath(agentId, documentId, documentType);
     const path = this.filePath(agentId, documentId, documentType);
     const content = this.#project(doc, documentType);
     await this.#writeAtomic(agentId, path, content);
@@ -194,7 +135,6 @@ export class DocumentWritePath {
    */
   async publish(agentId: string, documentId: string, documentType: string, doc: Y.Doc): Promise<Uint8Array | null> {
     this.#assertSupported(documentType);
-    await this.#migrateLegacyPath(agentId, documentId, documentType);
     const path = this.filePath(agentId, documentId, documentType);
     const onDisk = await this.#readOrRefuse(path, documentId);
     const projection = await this.#loadProjection(agentId, documentId, documentType);
@@ -244,7 +184,6 @@ export class DocumentWritePath {
     incoming: Uint8Array,
   ): Promise<AdmitResult> {
     this.#assertSupported(documentType);
-    await this.#migrateLegacyPath(agentId, documentId, documentType);
     const path = this.filePath(agentId, documentId, documentType);
 
     // 1. FOLD unpublished local edits in as local operations.

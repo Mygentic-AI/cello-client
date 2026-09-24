@@ -279,7 +279,11 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // 113 → 114 for M9D 002-PQKEYS's `buildPqIdentities` (agent-loader.ts): each registered agent's
     // post-quantum identity. Unwired, it would be silent in this corpus's way — every agent would
     // load, and nothing could sign or decrypt post-quantum until something asked and found nothing.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(114);
+    //
+    // 114 → 109 for the M9D migration purge: five database-migration functions were deleted along
+    // with the old on-disk formats they upgraded (identity, agent-id re-key, consent, CBOR blobs,
+    // contacts tier). A deliberate drop, not a lost sweep.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(109);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",
