@@ -348,6 +348,10 @@ export function sessionRequestErrorReason(frame: Record<string, unknown>): strin
     // M16: the directory could not check whether a side is a channel, and refused rather than broker
     // unchecked. Its own reason, so a database fault is never reported as "that is a channel".
     "channel_check_failed",
+    // M9D 002-PQKEYS: a profile lacks a post-quantum key or binding on the node that answered —
+    // replication has not delivered it yet. Collapsed to `directory_unreachable`, the operator would
+    // be sent to debug their network for a row that has not reached one node.
+    "counterparty_keys_unavailable",
   ]);
   return typeof reason === "string" && known.has(reason) ? reason : "directory_unreachable";
 }
@@ -363,6 +367,9 @@ export function sessionRequestErrorGuidance(reason: string): string {
   }
   if (reason === "channel_check_failed") {
     return "The directory refused the session request (channel_check_failed): it could not check whether either side is a broadcast channel, and does not broker a session it could not check. Retry; if it repeats, the directory node is failing to read its own records.";
+  }
+  if (reason === "counterparty_keys_unavailable") {
+    return "The directory refused the session request (counterparty_keys_unavailable): the node that answered does not yet hold one side's post-quantum keys, so it could not give each side the other's. This usually means a recent registration has not replicated to that node. Nothing was opened. Retry in a moment; another directory node may serve it.";
   }
   return `The directory refused the session request (${reason}). Ensure the counterparty is registered and online.`;
 }
