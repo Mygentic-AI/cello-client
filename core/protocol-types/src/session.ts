@@ -11,7 +11,7 @@
  *
  * FROST TBS for session establishment (RFC 9591, domain separation per CONTEXT.md):
  *   context: "cello-frost-session-establishment-v1"
- *   tbs: canonical CBOR([session_id, agent_A_pubkey, agent_B_pubkey, genesis_prev_root, timestamp])
+ *   tbs: canonical CBOR of the 13-field statement — see buildSessionEstablishmentTbs
  *   framing: <context>\0<tbs_cbor>
  *   Note: signer_pubkey is NOT in the TBS — it is derived from DKG and embedded in the frame.
  *
@@ -84,18 +84,17 @@ export interface SessionAssignment {
   // `directory_signature` (the FROST session-establishment sig authorizing the peer↔peer session):
   // this authorizes the RELAY ASSIGNMENT. The client carries it to its chosen relay (a
   // `client_record_assignment` frame), which verifies it against any consortium directory pubkey.
-  // Absent on legacy assignments and on direct-mode sessions (no relay), hence optional.
+  // Absent on direct-mode sessions (no relay), hence optional.
   relay_directory_signature?: Uint8Array; // 64-byte per-node directory sig over the relay TBS
-  // Session-layer transport peer IDs and mode (optional — absent on legacy assignments)
-  initiator_session_peer_id?: string;       // libp2p session node Peer ID of initiator
-  initiator_session_addrs?: string[];       // multiaddrs of initiator's session node
-  counterparty_session_peer_id?: string;    // libp2p session node Peer ID of counterparty
-  counterparty_session_addrs?: string[];    // multiaddrs of counterparty's session node
-  transport_mode?: 'direct' | 'relay';      // whether session uses direct P2P or relay-mediated transport
-  // 017-TBS — both inside the directory-signed TBS, both always sent by a current directory.
-  // `false` and `""` are VALUES here, not absences: absent means a directory predating this layout.
-  high_stakes?: boolean;    // the session's tier, forwarded so the TARGET can see what it is held to
-  prior_relay_id?: string;  // on a resume, the relay that witnessed up to the handover; "" when fresh
+  // Session-layer transport peer IDs and mode — required, and all inside the signed TBS.
+  initiator_session_peer_id: string;       // libp2p session node Peer ID of initiator
+  initiator_session_addrs: string[];       // multiaddrs of initiator's session node
+  counterparty_session_peer_id: string;    // libp2p session node Peer ID of counterparty
+  counterparty_session_addrs: string[];    // multiaddrs of counterparty's session node
+  transport_mode: 'direct' | 'relay';      // whether session uses direct P2P or relay-mediated transport
+  // 017-TBS — both inside the directory-signed TBS. `false` and `""` are VALUES, not absences.
+  high_stakes: boolean;    // the session's tier, forwarded so the TARGET can see what it is held to
+  prior_relay_id: string;  // on a resume, the relay that witnessed up to the handover; "" when fresh
   /**
    * 069-ORDERPROOF — the assigned relay's ACK-SIGNING pubkey, hex. `""` on a direct session.
    *
@@ -107,7 +106,7 @@ export interface SessionAssignment {
    *
    * NOT the same key as `relay_endpoint.peer_id`, which is the relay's libp2p transport identity.
    */
-  relay_id?: string;
+  relay_id: string;
 
   /**
    * 038-KEYBIND, extended by M9D 002-PQKEYS — the fields that let each party PLACE the other's keys:
@@ -162,35 +161,29 @@ export interface SessionAssignment {
 // ─── Session establishment TBS builder ────────────────────────────────────────
 
 /**
- * Build the FROST to-be-signed bytes for session establishment.
+ * Build the FROST to-be-signed bytes for session establishment — ONE layout, 13 fields, all
+ * required.
  *
- * Exported from protocol-types so BOTH the directory (signer) and the client
- * (verifier) use identical canonical CBOR encoding. Any drift would silently
- * break verification.
+ * Exported from protocol-types so BOTH the directory (signer) and the client (verifier) use
+ * identical canonical CBOR encoding. Any drift would silently break verification.
  *
- * Legacy (M1–M6) TBS = canonical CBOR([session_id, pubA, pubB, genesis_prev_root, timestamp])
- * M7+ TBS = canonical CBOR([session_id, pubA, pubB, genesis_prev_root, timestamp,
+ * TBS = canonical CBOR([session_id, pubA, pubB, genesis_prev_root, timestamp,
  *   initiatorSessionPeerId, JSON.stringify(initiatorSessionAddrs.slice().sort()),
  *   counterpartySessionPeerId, JSON.stringify(counterpartySessionAddrs.slice().sort()),
- *   transportMode])
+ *   transportMode, highStakes, priorRelayId, relayId])
+ *
+ * Every field is an always-present VALUE: `highStakes` false is an answer, `priorRelayId` is "" on a
+ * fresh session, `relayId` is "" on a direct one. The shorter 5/10/12-field layouts for directories
+ * and clients that predated each field are gone (M9D purge) — an assignment missing a field is
+ * malformed, never verified under a smaller statement.
  *
  * Per CONTEXT.md: tagUint8Array: false. Timestamp encoded as BigInt when > 0xffffffff.
  * Address arrays are sorted and JSON-stringified for canonical ordering.
  *
- * @param sessionId - 16-byte session identifier
- * @param pubA - 32-byte K_local pubkey of participant A
- * @param pubB - 32-byte K_local pubkey of participant B
- * @param genesisPrevRoot - 32-byte genesis prev_root (output of computeGenesisPrevRoot)
- * @param timestamp - session_timestamp in Unix milliseconds
- * @param initiatorSessionPeerId - M7: session node Peer ID of initiator (optional for backward compat)
- * @param initiatorSessionAddrs - M7: multiaddrs of initiator session node (optional for backward compat)
- * @param counterpartySessionPeerId - M7: session node Peer ID of counterparty (optional for backward compat)
- * @param counterpartySessionAddrs - M7: multiaddrs of counterparty session node (optional for backward compat)
- * @param transportMode - M7: 'direct' or 'relay' (optional for backward compat)
- * @param highStakes - 017-TBS: the session's high-stakes tier, forwarded so the TARGET can see it
- * @param priorRelayId - 017-TBS: on a resume, the relay that witnessed up to the handover; "" fresh
- * @param relayId - 069-ORDERPROOF: the assigned relay's ack-signing pubkey (hex); "" when direct
- * @returns canonical CBOR bytes of the TBS array
+ * `relayId` (069-ORDERPROOF) is the assigned relay's ACK-SIGNING pubkey — the key its ordering
+ * attestations verify under; `relay_endpoint.peer_id` is a different key and sits outside these
+ * bytes. `highStakes` and `priorRelayId` (017-TBS) are here so the TARGET sees the tier it is held to
+ * and a new relay learns who witnessed the conversation before, from the directory's signature.
  */
 export function buildSessionEstablishmentTbs(
   sessionId: Uint8Array,
@@ -198,83 +191,30 @@ export function buildSessionEstablishmentTbs(
   pubB: Uint8Array,
   genesisPrevRoot: Uint8Array,
   timestamp: number | bigint,
-  initiatorSessionPeerId?: string,
-  initiatorSessionAddrs?: string[],
-  counterpartySessionPeerId?: string,
-  counterpartySessionAddrs?: string[],
-  transportMode?: 'direct' | 'relay',
-  highStakes?: boolean,
-  priorRelayId?: string,
-  relayId?: string,
+  initiatorSessionPeerId: string,
+  initiatorSessionAddrs: string[],
+  counterpartySessionPeerId: string,
+  counterpartySessionAddrs: string[],
+  transportMode: 'direct' | 'relay',
+  highStakes: boolean,
+  priorRelayId: string,
+  relayId: string,
 ): Uint8Array {
   const tsEncoded = typeof timestamp === "bigint" || timestamp > 0xffffffff ? BigInt(timestamp) : timestamp;
-
-  // M7+: when all new fields are provided, encode all 10 fields
-  if (
-    initiatorSessionPeerId !== undefined &&
-    initiatorSessionAddrs !== undefined &&
-    counterpartySessionPeerId !== undefined &&
-    counterpartySessionAddrs !== undefined &&
-    transportMode !== undefined
-  ) {
-    const m7 = [
-      sessionId,
-      pubA,
-      pubB,
-      genesisPrevRoot,
-      tsEncoded,
-      initiatorSessionPeerId,
-      JSON.stringify(initiatorSessionAddrs.slice().sort()),
-      counterpartySessionPeerId,
-      JSON.stringify(counterpartySessionAddrs.slice().sort()),
-      transportMode,
-    ];
-
-    /**
-     * 017-TBS: the 12-field layout, and it is the NORMAL path — not a resume-only variant.
-     *
-     * Both new fields are always-present VALUES: `high_stakes` is a boolean where `false` is a real
-     * answer, and `priorRelayId` is `""` on a fresh session and a 64-hex relay id on a resume. So
-     * the arity turns on whether the CALLER supplies them, never on what they contain. Making it
-     * turn on `priorRelayId !== ""` would give a fresh session two possible layouts and leave the
-     * next reader resolving which one a signature was over at runtime.
-     *
-     * `high_stakes` is here because the target was being held to the high-stakes floor and its
-     * mandatory-evidence bar without ever being told: the flag rode the initiator's request and
-     * was not forwarded. `prior_relay_id` is here because a relay knows no other relay's identity,
-     * so when a conversation moves relays the new one can only learn who witnessed it before from
-     * the directory's signature — never from the client.
-     */
-    if (highStakes !== undefined && priorRelayId !== undefined) {
-      /**
-       * 069-ORDERPROOF: the 13-field layout, and it is now the normal path.
-       *
-       * `relayId` is the assigned relay's ACK-SIGNING pubkey, hex — the key its ordering
-       * attestations verify under. It is here because it was nowhere else: `relay_endpoint` carries
-       * a libp2p peer id, which is a different key, and it sits outside these bytes anyway. Without
-       * it a participant has nothing to check a relay's attestation against but the key the relay
-       * put in the frame, which is a signature checked against something its own signer controls.
-       *
-       * An always-present VALUE like `priorRelayId`: `""` on a direct session (there is no relay),
-       * 64 hex on a relayed one. The arity turns on whether the caller supplies it, never on what
-       * it contains — otherwise a direct session would have two possible layouts.
-       */
-      if (relayId !== undefined) {
-        return encodeCbor([...m7, highStakes, priorRelayId, relayId]) as Uint8Array;
-      }
-      return encodeCbor([...m7, highStakes, priorRelayId]) as Uint8Array;
-    }
-
-    return encodeCbor(m7) as Uint8Array;
-  }
-
-  // Legacy (M1–M6): encode only the original 5 fields
   return encodeCbor([
     sessionId,
     pubA,
     pubB,
     genesisPrevRoot,
     tsEncoded,
+    initiatorSessionPeerId,
+    JSON.stringify(initiatorSessionAddrs.slice().sort()),
+    counterpartySessionPeerId,
+    JSON.stringify(counterpartySessionAddrs.slice().sort()),
+    transportMode,
+    highStakes,
+    priorRelayId,
+    relayId,
   ]) as Uint8Array;
 }
 

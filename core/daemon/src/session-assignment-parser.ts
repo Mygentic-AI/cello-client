@@ -193,42 +193,31 @@ export function parseSessionAssignment(
   const directoryEndpoint = parseEndpointInfo(raw["directory_endpoint"]);
   if (!directoryEndpoint) return null;
 
-  // Session peer IDs + transport mode — undefined when absent (an older peer omits them).
-  const initiatorSessionPeerId =
-    typeof raw["initiator_session_peer_id"] === "string" && raw["initiator_session_peer_id"] !== ""
-      ? raw["initiator_session_peer_id"]
-      : undefined;
-  const initiatorSessionAddrs = parseStringArray(raw["initiator_session_addrs"]) ?? undefined;
-  const counterpartySessionPeerId =
-    typeof raw["counterparty_session_peer_id"] === "string" && raw["counterparty_session_peer_id"] !== ""
-      ? raw["counterparty_session_peer_id"]
-      : undefined;
-  const counterpartySessionAddrs = parseStringArray(raw["counterparty_session_addrs"]) ?? undefined;
+  // Session peer IDs, transport mode and the three 017-TBS / 069-ORDERPROOF values are all inside
+  // the directory-signed 13-field statement, and a directory always sends them. Any one missing, or
+  // of the wrong type, makes the assignment malformed — there is no shorter statement to verify.
+  //
+  // The TYPE is the test, never truthiness: `high_stakes: false`, `prior_relay_id: ""` (fresh session)
+  // and `relay_id: ""` (direct session) are ANSWERS. The session peer ids must be non-empty: the
+  // directory refuses to sign an assignment whose counterparty never accepted the offer.
+  const initiatorSessionPeerId = raw["initiator_session_peer_id"];
+  const initiatorSessionAddrs = parseStringArray(raw["initiator_session_addrs"]);
+  const counterpartySessionPeerId = raw["counterparty_session_peer_id"];
+  const counterpartySessionAddrs = parseStringArray(raw["counterparty_session_addrs"]);
   const transportModeRaw = raw["transport_mode"];
-  const transportMode: "direct" | "relay" | undefined =
-    transportModeRaw === "direct" ? "direct" : transportModeRaw === "relay" ? "relay" : undefined;
-
-  /**
-   * 017-TBS. These two are read DIFFERENTLY from the peer ids above, and the difference is the
-   * whole reason the verifier can reconstruct the right layout.
-   *
-   * A peer id of `""` means "the directory never learned this endpoint", so it becomes `undefined`
-   * and both sides drop to the short layout. These two are not like that: `high_stakes: false` and
-   * `prior_relay_id: ""` are ANSWERS — "not high stakes" and "this is a fresh session, no prior
-   * relay". Mapping either to `undefined` would silently take the verifier to the 10-field layout
-   * while the directory signed 12, and every fresh non-high-stakes session — the common case —
-   * would fail to verify.
-   *
-   * So the test is the TYPE, never truthiness: `typeof === "boolean"` admits `false`, and
-   * `typeof === "string"` admits `""`. `undefined` here means only one thing — the field was
-   * genuinely absent, i.e. a directory that predates this layout.
-   */
-  const highStakes = typeof raw["high_stakes"] === "boolean" ? raw["high_stakes"] : undefined;
-  const priorRelayId = typeof raw["prior_relay_id"] === "string" ? raw["prior_relay_id"] : undefined;
-  // 069-ORDERPROOF: read the same way and for the same reason — `""` is the ANSWER "this session
-  // has no relay", not an absence. Mapping it to `undefined` would take the verifier to the
-  // 12-field layout while the directory signed 13, and every direct session would fail to verify.
-  const relayId = typeof raw["relay_id"] === "string" ? raw["relay_id"] : undefined;
+  const transportMode: "direct" | "relay" | null =
+    transportModeRaw === "direct" || transportModeRaw === "relay" ? transportModeRaw : null;
+  const highStakes = raw["high_stakes"];
+  const priorRelayId = raw["prior_relay_id"];
+  const relayId = raw["relay_id"];
+  if (
+    typeof initiatorSessionPeerId !== "string" || initiatorSessionPeerId === "" || !initiatorSessionAddrs ||
+    typeof counterpartySessionPeerId !== "string" || counterpartySessionPeerId === "" || !counterpartySessionAddrs ||
+    transportMode === null ||
+    typeof highStakes !== "boolean" || typeof priorRelayId !== "string" || typeof relayId !== "string"
+  ) {
+    return null;
+  }
 
   const common = {
     session_id: sessionId,

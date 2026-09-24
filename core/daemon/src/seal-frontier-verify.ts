@@ -117,8 +117,8 @@ export interface UnilateralFrontierCheck {
    *  - verified:           leaves present, no CLIENT-VERIFIABLE ('live') frontier exceeded its leaves.
    *  - corrected:          leaves present, one or more 'live' frontiers were inflated and overridden
    *                        DOWN to the re-derived value (see `corrections`).
-   *  - directory_attested: no frontier_leaves shipped (an older directory) — the cert stays
-   *                        directory-attested. No correction possible.
+   *  - directory_attested: no frontier_leaves shipped (a directory defect — every directory ships
+   *                        them to the present party) — the cert stays directory-attested.
    *  - leaves_invalid:     frontier_leaves are forged / cross-session (reDeriveFrontiers failed) — a
    *                        tamper signal; persist the directory-attested frontiers, log loudly. NEVER
    *                        rejected: the unilateral dedup guard makes rejection an unrecoverable

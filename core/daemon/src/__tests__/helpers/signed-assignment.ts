@@ -172,13 +172,10 @@ export interface SignedAssignmentOpts {
    * like an identity change once the first one's pin landed.)
    */
   signWith?: ReturnType<typeof generateKeypair>;
-  /**
-   * 017-TBS. Supply BOTH to sign and emit the 12-field layout; omit both for the 10-field one.
-   * Defaulting them here would be wrong: an assignment that omits them is what an older directory
-   * sends, and the existing fixtures are entitled to keep testing that shape.
-   */
+  /** 017-TBS / 069-ORDERPROOF values of the 13-field statement. Defaults: false, "", "". */
   highStakes?: boolean;
   priorRelayId?: string;
+  relayId?: string;
   /** 038-KEYBIND: send NO key binding — the absent-proof refusal. */
   omitKeyBinding?: boolean;
   /** 038-KEYBIND: sign the binding with a DIFFERENT key — the failed-proof refusal. */
@@ -202,6 +199,9 @@ export async function makeSignedAssignmentFrame(
   const initiatorAddrs = ["/ip4/127.0.0.1/tcp/3"];
   const counterpartyPeerId = opts.counterpartySessionPeerId ?? "12D3KooWReceiver";
   const counterpartyAddrs = ["/ip4/127.0.0.1/tcp/4"];
+  const highStakes = opts.highStakes ?? false;
+  const priorRelayId = opts.priorRelayId ?? "";
+  const relayId = opts.relayId ?? "";
 
   // RECOMPUTED, exactly as both the directory and the verifier do: `genesis_prev_root` is not on
   // the wire, so a fixture that invented one would produce a frame that cannot verify anywhere.
@@ -218,10 +218,9 @@ export async function makeSignedAssignmentFrame(
     counterpartyPeerId,
     counterpartyAddrs,
     "relay",
-    // Passed through as-is, INCLUDING undefined: the builder picks its layout on arity, so
-    // forwarding a default here would silently sign 12 fields for a fixture asking for 10.
-    opts.highStakes,
-    opts.priorRelayId,
+    highStakes,
+    priorRelayId,
+    relayId,
   );
 
   // The FROST context framing the directory signs under: context bytes, a 0x00 separator, then TBS.
@@ -290,10 +289,9 @@ export async function makeSignedAssignmentFrame(
         counterparty_session_peer_id: counterpartyPeerId,
         counterparty_session_addrs: counterpartyAddrs,
         transport_mode: "relay",
-        // Only present when signed over — a frame carrying a field the TBS does not cover would
-        // let the verifier rebuild a layout the signature was never taken over.
-        ...(opts.highStakes !== undefined ? { high_stakes: opts.highStakes } : {}),
-        ...(opts.priorRelayId !== undefined ? { prior_relay_id: opts.priorRelayId } : {}),
+        high_stakes: highStakes,
+        prior_relay_id: priorRelayId,
+        relay_id: relayId,
         // 038-KEYBIND. Omitted only when a fixture is deliberately testing the absent-binding
         // refusal — the production directory always sends it.
         // M9D 002-PQKEYS: participant_a's PQ keys always ride; the binding pair unless omitted.

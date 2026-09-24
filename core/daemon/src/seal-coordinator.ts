@@ -478,8 +478,9 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
         // DOD-LEG-2 (SI-002): independently re-derive each party's content_frontier_seq from the
         // signed leaves the directory shipped, and REJECT the certificate if any published frontier
         // is inflated beyond what the signed leaves support. The client does NOT trust the directory
-        // for the frontier VALUE — only for transporting signed bytes it re-checks itself. When no
-        // frontier_leaves are present (a pre-LEG-2 directory), the guard is skipped (backward-compat).
+        // for the frontier VALUE — only for transporting signed bytes it re-checks itself. With no
+        // frontier_leaves there is nothing to re-derive, which is acceptable only when no party claims
+        // a frontier — the check below refuses the other case.
         const frontierLeavesRaw = frame["frontier_leaves"];
         if (legibility !== undefined) {
           const rawParticipants =
@@ -683,9 +684,10 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
         // so the re-derived value is truth). We OVERRIDE, never reject — the unilateral seal has a
         // directory-side dedup guard that makes a client rejection unrecoverable (a retry close is
         // silently ignored → no receipt ever, worse than FINDING-3; cascade-2 reviewer Critical 2). The
-        // absent party's frontier stays directory-attested (its remainder is not re-derivable here). No
-        // frontier_leaves (pre-FINDING-5 directory) → the cert stays directory-attested (FINDING-3).
-        // A receipt is ALWAYS persisted; the close never dead-ends here.
+        // absent party's frontier stays directory-attested (its remainder is not re-derivable here). A
+        // confirm frame WITHOUT frontier_leaves is a directory defect (every directory ships them to the
+        // present party): logged as an error, and the cert stays directory-attested rather than
+        // rejected. A receipt is ALWAYS persisted; the close never dead-ends here.
         if (legibility !== undefined) {
           const rawParticipants =
             (legibility as { participants?: Array<{ pubkey?: unknown; content_frontier_seq?: unknown; attestation_mode?: unknown }> }).participants ?? [];
@@ -745,13 +747,14 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
               path: "unilateral",
             });
           } else {
-            // directory_attested: no frontier_leaves shipped (pre-FINDING-5 directory). Frontiers stay
-            // DIRECTORY-attested (already marked per-participant) — visible/auditable, never silently
-            // presented as client-verified.
-            logger.warn("seal.certificate.frontier.directory_attested", {
+            // directory_attested: the confirm frame carried no frontier_leaves — a directory defect.
+            // Frontiers stay DIRECTORY-attested (already marked per-participant) — visible/auditable,
+            // never silently presented as client-verified.
+            logger.error("seal.certificate.frontier.directory_attested", {
               sessionId: sidHex,
               reason: "no_frontier_leaves",
               path: "unilateral",
+              impact: "the present party's frontier could not be re-derived; it is recorded as the directory's word",
             });
           }
         }
@@ -778,8 +781,9 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
           }
           keepCertifiedLeafSet({ logger, sessionNodeManager }, agentName, sidHex, frame, rootHex, "unilateral");
         } else {
-          // The seal is valid, but no receipt is retrievable — a directory that predates cascade-2.
-          logger.warn("session.unilateral.receipt.absent", { sessionId: sidHex, reason: "no_legibility_on_frame" });
+          // The seal is valid, but the confirm frame carried no legibility — a directory defect (every
+          // directory attaches it), so no receipt is retrievable for this seal.
+          logger.error("session.unilateral.receipt.absent", { sessionId: sidHex, reason: "no_legibility_on_frame" });
         }
         // THE WAITER IS ANSWERED FIRST. `markSealed` is SYNCHRONOUS and reaches `#requireAgentId`,
         // which throws for a retired agent or a closed database — and a throw here would escape
