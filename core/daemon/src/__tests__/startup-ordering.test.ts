@@ -301,7 +301,14 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // refuse every member fetch of a non-public channel with `not_a_member` — every suite green, no
     // post ever delivered. It is called from channel-publish-wiring.ts as the collector's fetchAuth,
     // so it lands in `checked`, not EXEMPT.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(117);
+    //
+    // 117 → 118 for M16 031-KEYSASKEYS's `createKnownPublicKeysIn` (known-public-keys.ts). Unwired it
+    // is silent in this corpus's own way: the send path would pass no known keys, so a channel key or
+    // any public key would go on being redacted as a `generic-api-key` secret — exactly the behaviour
+    // this order removes, with every suite green. It is called from daemon.ts as the content handlers'
+    // `knownPublicKeys`, so it lands in `checked`, not EXEMPT. (`knownPublicKeysDepsFromDaemon` is not
+    // a WIRING-verb export, so it is not discovered — it is the deps builder the factory consumes.)
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(118);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",
