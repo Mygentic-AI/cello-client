@@ -848,9 +848,9 @@ export interface AwaitingAckEntry {
   correlationId?: string;
   structure1Cbor?: Uint8Array;
   structure2Cbor?: Uint8Array;
-  contentHashAlg?: string;
+  contentHashAlg: string;
   structure1Signature?: Uint8Array;
-  leafKind?: number;
+  leafKind: number;
   /**
    * DOD-M15-DELIVERYACK-1: has a REFUSED acknowledgement for this message already been logged loudly?
    *

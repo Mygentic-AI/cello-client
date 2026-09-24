@@ -164,110 +164,42 @@ export function decodeParkedDeliveryAck(content: Uint8Array): ParkedDeliveryAck 
   return { sessionIdHex, contentHash, ackSig };
 }
 
-/** Current envelope version. v1 (unsigned) is decodable but NEVER acceptable — see authenticate(). */
-export const PARK_ENVELOPE_VERSION = 2;
-
 /**
- * v3 — a v2 envelope plus the CONTENT-HASH ALGORITHM (`DOD-M15-SEALWIRE-1` part B2a).
+ * THE park envelope version — there is one shape (M9D purge):
  *
- * ⚠️ EMITTED ONLY WHEN THE ALGORITHM IS NOT THE DEFAULT, and that is the whole compatibility story.
- * Every envelope this build produces today is still v2, because nothing salts — so no current peer
- * sees a version it cannot read.
+ *   [4, content, structure1Cbor|null, structure2Cbor|null, senderPubkey, parkSig,
+ *    contentHashAlg, structure1Signature|null, leafKind]
  *
- * 🚨 AND THE GATE IS A PUBLISHING FACT, NOT A STRUCTURAL ONE — review B2a F6 corrected this. The
- * header used to claim *"a salted envelope can only be addressed to a peer that completed the salt
- * agreement, and a build able to do that necessarily contains this decoder."* **False as stated:**
- * the salt agreement landed several commits before this decoder, so any build cut from that interval
- * has the agreement and not the decoder. On such a peer a v3 envelope matches no decode branch,
- * falls through to the bare-content v1 shape, and `authenticateParkedEntry` refuses it as
- * `unsigned_envelope` — the ATTACKER shape — the entry is never confirm-deleted, and it re-pulls
- * forever. Exactly the failure this unit exists to prevent.
- *
- * What is true, and checkable: **no published build has the salt agreement without this decoder** —
- * nothing in that interval is tagged. Part B2b must therefore gate salting on a real peer-capability
- * signal rather than inferring capability from "they completed the salt agreement".
+ * The number stays 4 so an envelope from before the purge — which is only ever test mail, the fleet
+ * is wiped at the roll — cannot be mistaken for this one. Any other shape decodes as UNREADABLE and
+ * is refused as `unsigned_envelope`: it carries nothing this build can authenticate.
  *
  * Why the algorithm is NOT in the signed statement: `parkSig` covers `(session_id, recipient_pubkey,
- * content_hash)` — the HASH, not the name of the function that produced it. Adding the name would
- * change `buildParkContentTbs`, a cross-repo type, for no security gain. An attacker who flips the
+ * content_hash)` — the HASH, not the name of the function that produced it. An attacker who flips the
  * name cannot make altered content verify, because the recomputed hash must still equal the SIGNED
  * one; a flip can only turn an acceptance into a REFUSAL. `dod-m15-park-envelope-alg.test.ts` pins
  * that, because "only a refusal" is a claim rather than a hope.
+ *
+ * `structure1Signature` (034-CARRYLEAF review F1) is the sender's signature over `structure1Cbor`.
+ * Without it, a withheld message that arrives by mailbox cannot be witnessed by its recipient. It is
+ * null only where there is no ordering claim to sign (the direct-retry enqueue, content never
+ * framed); park recovery refuses an envelope with neither a relay ordering record nor a signed claim.
  */
-export const PARK_ENVELOPE_VERSION_ALG = 3;
-
-/**
- * v4 — a v3 envelope plus THE SENDER'S SIGNATURE OVER `structure1Cbor` (034-CARRYLEAF review F1).
- *
- * ⚠️ **WITHOUT IT, A WITHHELD MESSAGE THAT ARRIVES BY MAILBOX CANNOT BE WITNESSED, and the
- * withholding attack stays open on that route.**
- *
- * The direct path closed it: a message arriving with no relay ordering record is witnessed by its
- * RECIPIENT, using the author's own signature carried beside the bytes it signs. The mailbox route
- * had no such field — this envelope carried `structure1Cbor` and no signature over it, because
- * `parkSig` covers `(session_id, recipient_pubkey, content_hash)`, a different statement. So the
- * recipient held the author's words and nothing the relay would accept as proof of them, and a
- * counterparty who parked instead of hand-delivering still truncated the record.
- *
- * The algorithm rides at index 6 exactly as on v3 and is ALWAYS present here, so the shape is a
- * clean superset rather than a second optional tail nobody can parse positionally.
- *
- * **This is the emit half only.** A v2 or v3 envelope is still accepted — refusing one would destroy
- * store-and-forward mail already sitting in every relay mailbox, which is the failure
- * `SIGNED_ENVELOPE_VERSIONS` exists to prevent. Requiring v4 is a later step, once nothing in the
- * field emits the older shapes; until then this route is closed against a stock client and open to
- * one that deliberately strips the field.
- */
-export const PARK_ENVELOPE_VERSION_S1SIG = 4;
-
-/** The message leaf domain — the default a v4 envelope names when its caller does not. */
-const LEAF_KIND_MSG_DOMAIN = 0x00;
-
-/**
- * The versions that carry a sender signature and may therefore be authenticated.
- *
- * A SET, not a single constant, and the difference is mail loss. `authenticateParkedEntry` refused
- * anything whose version was not the one `PARK_ENVELOPE_VERSION` names — so bumping that constant to
- * 3 would have turned every v2 envelope sitting in every relay mailbox into `unsigned_envelope`:
- * store-and-forward mail destroyed, and reported as an attack.
- */
-const SIGNED_ENVELOPE_VERSIONS = new Set<number>([
-  PARK_ENVELOPE_VERSION,
-  PARK_ENVELOPE_VERSION_ALG,
-  PARK_ENVELOPE_VERSION_S1SIG,
-]);
-
-/**
- * ⚠️ **REFUSING EVERY NON-v4 ENVELOPE WAS TRIED HERE AND IS THE WRONG RULE — recorded so it is not
- * tried again.**
- *
- * The compatibility argument for keeping v2/v3 IS void: CELLO is alpha with no users, and there is
- * no mail anywhere predating this build. But the version is not what matters, and refusing on it
- * broke thirty-three tests for a reason worth keeping: **v2 is also what this build emits for its
- * own paths that have no ordering claim to sign** — the direct-retry enqueue, and any park of
- * content that was never witnessed and never framed.
- *
- * The property that actually matters is whether a recovered message can EVER enter a receipt, and
- * that is decided by what the envelope carries, not by its version number. The rule therefore lives
- * at park recovery (`session-node-manager`), where both halves are visible: an envelope with no
- * relay ordering record AND no signature over its ordering claim is refused, because it is a
- * message that is readable and permanently unnotarizable — which is the withholding attack's whole
- * shape on this route.
- */
+export const PARK_ENVELOPE_VERSION = 4;
 
 export interface ParkEnvelope {
-  /** 1 = legacy/unsigned (bare content or the pre-SEC-1 shape). 2 = signed. */
+  /** `PARK_ENVELOPE_VERSION`, or 0 for anything this build cannot read (refused as unsigned). */
   version: number;
   content: Uint8Array;
   /** DOD-MSG-4 ordering record — optional; absent on the crash-backstop path. */
   structure1Cbor?: Uint8Array;
   structure2Cbor?: Uint8Array;
-  /** SEC-1 — the sender's identity key. Present only on v2. */
+  /** SEC-1 — the sender's identity key. */
   senderPubkey?: Uint8Array;
-  /** SEC-1 — Ed25519 over buildParkContentTbs(...). Present on v2, v3 and v4. */
+  /** SEC-1 — Ed25519 over buildParkContentTbs(...). */
   parkSig?: Uint8Array;
   /**
-   * 034-CARRYLEAF — the sender's Ed25519 signature over `structure1Cbor`. Present only on v4.
+   * 034-CARRYLEAF — the sender's Ed25519 signature over `structure1Cbor`, when there is one.
    *
    * DISTINCT FROM `parkSig`, which signs `(session_id, recipient_pubkey, content_hash)`. This one
    * signs the ordering claim itself, which is the only form the relay will accept when the recipient
@@ -275,17 +207,12 @@ export interface ParkEnvelope {
    */
   structure1Signature?: Uint8Array;
   /**
-   * The algorithm the sender used for `content_hash`. Present only on v3.
-   *
-   * ABSENT rather than defaulted to `"sha256"`, deliberately: `resolveContentHashAlg` reads absent as
-   * "a peer that predates the field", and that is the only value meaning legacy. Filling in the
-   * literal here would work today while erasing the distinction between "they said sha256" and "they
-   * said nothing" — the same collapse B1's empty-string case exists to prevent.
+   * The algorithm the sender used for `content_hash`. A non-string decodes as ABSENT, and
+   * `resolveContentHashAlg` refuses an absent name — it is never coerced to a default.
    */
   contentHashAlg?: string;
   /**
-   * 034-CARRYLEAF — the leaf DOMAIN this content belongs to (0x00 msg, 0x04 doc, …). Present only
-   * on v4.
+   * 034-CARRYLEAF — the leaf DOMAIN this content belongs to (0x00 msg, 0x04 doc, …).
    *
    * A leaf kind selects a hash domain, and documents ride this same envelope. Witnessing a recovered
    * leaf under a guessed domain would put a wrong statement in the canonical record, so a recipient
@@ -353,9 +280,9 @@ export class ParkEnvelopeError extends Error {
 }
 
 /**
- * SEC-1: encode a SIGNED park envelope. `senderPubkey` and `parkSig` are REQUIRED — the type system
- * is the enforcement point, so no call site can construct an unsigned envelope by omission (the
- * exact drift that made this a downgrade attack: verification existed, but was opt-in).
+ * SEC-1: encode a SIGNED park envelope. `senderPubkey`, `parkSig`, the algorithm and the leaf kind
+ * are REQUIRED — the type system is the enforcement point, so no call site can construct an unsigned
+ * or unlabelled envelope by omission.
  */
 export function encodeParkEnvelope(args: {
   content: Uint8Array;
@@ -363,78 +290,45 @@ export function encodeParkEnvelope(args: {
   parkSig: Uint8Array;
   structure1Cbor?: Uint8Array;
   structure2Cbor?: Uint8Array;
-  /** Omit, or pass the default, to emit a v2 envelope every current peer can read. */
-  contentHashAlg?: string;
+  /** The algorithm behind the signed content hash. */
+  contentHashAlg: string;
   /**
-   * 034-CARRYLEAF — the sender's signature over `structure1Cbor`, which promotes the envelope to v4.
-   *
-   * It is what lets the RECIPIENT witness this leaf when the sender did not: the relay accepts a
-   * counter-submit only against the author's own signature over their own ordering claim, and
-   * `parkSig` signs a different statement.
+   * 034-CARRYLEAF — the sender's signature over `structure1Cbor`. It is what lets the RECIPIENT
+   * witness this leaf when the sender did not: the relay accepts a counter-submit only against the
+   * author's own signature over their own ordering claim, and `parkSig` signs a different statement.
+   * Ignored without `structure1Cbor`: a signature with no claim to check it against is not evidence.
    */
   structure1Signature?: Uint8Array;
-  /** The leaf domain, carried on v4 so a recovered leaf is never witnessed under a guessed one. */
-  leafKind?: number;
+  /** The leaf domain, so a recovered leaf is never witnessed under a guessed one. */
+  leafKind: number;
 }): Uint8Array {
-  const base = [
+  /**
+   * REFUSE TO EMIT A NAME WE CANNOT READ OURSELVES — the producer-side mirror of what
+   * `contentHashFor` already does. Without it a caller can seal an envelope every peer refuses —
+   * including this build — with no signal at the sender at all: the message parks, is pulled, is
+   * refused, is kept, and repeats. A throw here is a developer error at the moment it is made.
+   */
+  if (!isKnownContentHashAlg(args.contentHashAlg)) {
+    throw new ParkEnvelopeError(
+      PARK_ENVELOPE_REASONS.ALG_UNREADABLE,
+      args.contentHashAlg,
+      `PARK ENVELOPE: refusing to seal an entry naming content-hash algorithm "${args.contentHashAlg}", which ` +
+      "this build cannot itself reproduce. The recipient would refuse it and keep re-pulling it forever, " +
+      "and nothing at the sender would say why.",
+    );
+  }
+  const signedClaim = args.structure1Signature && args.structure1Cbor ? args.structure1Signature : null;
+  return encodeCbor([
+    PARK_ENVELOPE_VERSION,
     args.content,
     args.structure1Cbor ?? null,
     args.structure2Cbor ?? null,
     args.senderPubkey,
     args.parkSig,
-  ];
-  /**
-   * The DEFAULT algorithm stays on v2 even when named explicitly. A caller that starts passing the
-   * algorithm through would otherwise push every envelope to a version older peers cannot read,
-   * without anyone having decided to.
-   *
-   * ABSENT is `undefined`/`null` ONLY, never "falsy" — review B2a F4. `!args.contentHashAlg` also
-   * caught the EMPTY STRING, which is the collapse `resolveContentHashAlg` documents as forbidden
-   * and which this file's own `contentHashAlg` doc cites B1 for. A caller whose variable is `""`
-   * would have emitted a v2 envelope labelled sha256-by-absence, and the recipient would report a
-   * tamper on a message nobody touched.
-   */
-  const alg = args.contentHashAlg;
-  /**
-   * v4 WHEN THE ORDERING CLAIM IS SIGNED — 034-CARRYLEAF. Checked before the algorithm branches,
-   * because v4 always carries the algorithm slot and a v2/v3 decision would drop the signature.
-   * Both fields must be present: a signature with no claim to check it against is not evidence.
-   */
-  if (args.structure1Signature && args.structure1Cbor) {
-    const named = alg === undefined || alg === null ? CONTENT_HASH_ALGS.SHA256 : alg;
-    if (!isKnownContentHashAlg(named)) {
-      throw new ParkEnvelopeError(
-        PARK_ENVELOPE_REASONS.ALG_UNREADABLE,
-        named,
-        `PARK ENVELOPE: refusing to seal an entry naming content-hash algorithm "${named}", which ` +
-        "this build cannot itself reproduce.",
-      );
-    }
-    return encodeCbor([
-      PARK_ENVELOPE_VERSION_S1SIG, ...base, named, args.structure1Signature, args.leafKind ?? LEAF_KIND_MSG_DOMAIN,
-    ]) as Uint8Array;
-  }
-  if (alg === undefined || alg === null || alg === CONTENT_HASH_ALGS.SHA256) {
-    return encodeCbor([PARK_ENVELOPE_VERSION, ...base]) as Uint8Array;
-  }
-  /**
-   * REFUSE TO EMIT A NAME WE CANNOT READ OURSELVES — the producer-side mirror of what
-   * `contentHashFor` already does, and it costs nothing to have.
-   *
-   * Without it a caller can seal an envelope every peer refuses — including this build — with no
-   * signal at the sender at all: the message parks, is pulled, is refused, is kept, and repeats.
-   * A throw here is a developer error at the moment it is made, rather than a silent mail loop.
-   */
-  if (!isKnownContentHashAlg(alg)) {
-    throw new ParkEnvelopeError(
-      PARK_ENVELOPE_REASONS.ALG_UNREADABLE,
-      alg,
-      `PARK ENVELOPE: refusing to seal an entry naming content-hash algorithm "${alg}", which this ` +
-      "build cannot itself reproduce. The recipient would refuse it and keep re-pulling it forever, " +
-      "and nothing at the sender would say why.",
-    );
-  }
-  return encodeCbor([PARK_ENVELOPE_VERSION_ALG, ...base, alg]) as Uint8Array;
+    args.contentHashAlg,
+    signedClaim,
+    args.leafKind,
+  ]) as Uint8Array;
 }
 
 /**
@@ -457,15 +351,12 @@ export async function sealParkEnvelope(args: {
   content: Uint8Array;
   structure1Cbor?: Uint8Array;
   structure2Cbor?: Uint8Array;
-  /**
-   * 034-CARRYLEAF — the sender's signature over `structure1Cbor`. Passing it promotes the envelope
-   * to v4 and is what lets the RECIPIENT witness this leaf if the sender never does.
-   */
+  /** 034-CARRYLEAF — the sender's signature over `structure1Cbor`, when there is one. */
   structure1Signature?: Uint8Array;
-  /** The leaf domain, carried on v4 so a recovered leaf is never witnessed under a guessed one. */
-  leafKind?: number;
-  /** The algorithm behind `contentHash`. Omit for the default; see `PARK_ENVELOPE_VERSION_ALG`. */
-  contentHashAlg?: string;
+  /** The leaf domain, so a recovered leaf is never witnessed under a guessed one. */
+  leafKind: number;
+  /** The algorithm behind `contentHash`. */
+  contentHashAlg: string;
 }): Promise<Uint8Array> {
   const senderPubkey = await args.signer.getPublicKey();
   const parkSig = await args.signer.sign(
@@ -487,42 +378,14 @@ export async function sealParkEnvelope(args: {
 }
 
 /**
- * Decode a park envelope. Legacy shapes (the pre-SEC-1 4-element v1 array, and raw non-CBOR bare
- * content) still DECODE — deliberately, so `authenticate` can reject them with a precise reason
- * rather than the caller seeing an opaque parse failure. Decoding is not accepting.
+ * Decode a park envelope. Anything that is not the one current shape decodes as version 0 — still
+ * returned, so `authenticateParkedEntry` refuses it by name rather than the caller seeing an opaque
+ * parse failure. Decoding is not accepting.
  */
 export function decodeParkEnvelope(plaintext: Uint8Array): ParkEnvelope {
   try {
     const arr = cborDecode(plaintext) as unknown[];
-    // v3 first: a v2 envelope plus the content-hash algorithm as a 7th element.
-    // v4 FIRST — longest shape first, so a v4 array can never be read as a shorter one.
-    if (Array.isArray(arr) && arr.length === 9 && arr[0] === PARK_ENVELOPE_VERSION_S1SIG && arr[1] instanceof Uint8Array) {
-      return {
-        version: PARK_ENVELOPE_VERSION_S1SIG,
-        content: arr[1],
-        structure1Cbor: arr[2] instanceof Uint8Array ? arr[2] : undefined,
-        structure2Cbor: arr[3] instanceof Uint8Array ? arr[3] : undefined,
-        senderPubkey: arr[4] instanceof Uint8Array ? arr[4] : undefined,
-        parkSig: arr[5] instanceof Uint8Array ? arr[5] : undefined,
-        contentHashAlg: typeof arr[6] === "string" ? arr[6] : undefined,
-        structure1Signature: arr[7] instanceof Uint8Array ? arr[7] : undefined,
-        leafKind: typeof arr[8] === "number" ? arr[8] : undefined,
-      };
-    }
-    if (Array.isArray(arr) && arr.length === 7 && arr[0] === PARK_ENVELOPE_VERSION_ALG && arr[1] instanceof Uint8Array) {
-      return {
-        version: PARK_ENVELOPE_VERSION_ALG,
-        content: arr[1],
-        structure1Cbor: arr[2] instanceof Uint8Array ? arr[2] : undefined,
-        structure2Cbor: arr[3] instanceof Uint8Array ? arr[3] : undefined,
-        senderPubkey: arr[4] instanceof Uint8Array ? arr[4] : undefined,
-        parkSig: arr[5] instanceof Uint8Array ? arr[5] : undefined,
-        // A non-string here stays ABSENT rather than being coerced. `resolveContentHashAlg` refuses
-        // a name it cannot read; it must never be handed a `"42"` that looks like one.
-        contentHashAlg: typeof arr[6] === "string" ? arr[6] : undefined,
-      };
-    }
-    if (Array.isArray(arr) && arr.length === 6 && arr[0] === PARK_ENVELOPE_VERSION && arr[1] instanceof Uint8Array) {
+    if (Array.isArray(arr) && arr.length === 9 && arr[0] === PARK_ENVELOPE_VERSION && arr[1] instanceof Uint8Array) {
       return {
         version: PARK_ENVELOPE_VERSION,
         content: arr[1],
@@ -530,21 +393,16 @@ export function decodeParkEnvelope(plaintext: Uint8Array): ParkEnvelope {
         structure2Cbor: arr[3] instanceof Uint8Array ? arr[3] : undefined,
         senderPubkey: arr[4] instanceof Uint8Array ? arr[4] : undefined,
         parkSig: arr[5] instanceof Uint8Array ? arr[5] : undefined,
-      };
-    }
-    // Pre-SEC-1 v1 envelope: [1, content, s1|null, s2|null]. Decoded so it can be REFUSED by name.
-    if (Array.isArray(arr) && arr.length === 4 && arr[0] === 1 && arr[1] instanceof Uint8Array) {
-      return {
-        version: 1,
-        content: arr[1],
-        structure1Cbor: arr[2] instanceof Uint8Array ? arr[2] : undefined,
-        structure2Cbor: arr[3] instanceof Uint8Array ? arr[3] : undefined,
+        // A non-string stays ABSENT rather than being coerced; `resolveContentHashAlg` refuses it.
+        contentHashAlg: typeof arr[6] === "string" ? arr[6] : undefined,
+        structure1Signature: arr[7] instanceof Uint8Array ? arr[7] : undefined,
+        leafKind: typeof arr[8] === "number" ? arr[8] : undefined,
       };
     }
   } catch {
-    /* not an envelope — fall through to raw bare content */
+    /* not CBOR — unreadable */
   }
-  return { version: 1, content: plaintext };
+  return { version: 0, content: plaintext };
 }
 
 /**
@@ -565,9 +423,8 @@ export function authenticateParkedEntry(args: {
 }): ParkAuthVerdict {
   const { env, sessionIdHex, recipientPubkey, contentHash, counterpartyPubkeyHex } = args;
 
-  // 1. Unsigned (v1 envelope, or raw bare content) — the shape an attacker sends, and the shape the
-  //    pre-SEC-1 daemon ingested without a single check. Refused outright.
-  if (!SIGNED_ENVELOPE_VERSIONS.has(env.version) || !env.senderPubkey || !env.parkSig) {
+  // 1. Unreadable or unsigned — the shape an attacker sends. Refused outright.
+  if (env.version !== PARK_ENVELOPE_VERSION || !env.senderPubkey || !env.parkSig) {
     return { ok: false, reason: "unsigned_envelope" };
   }
 

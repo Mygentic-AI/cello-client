@@ -150,7 +150,7 @@ export class SessionContentIngest {
     sessionId: string,
     content: Uint8Array,
     contentHash: Uint8Array,
-    correlationId?: string,
+    correlationId: string | undefined,
     /**
      * DOD-FRONTIER-STRAND-1 AC1: the relay-assigned canonical position for THIS message, taken from
      * the verified ordering record by the caller. Passed EXPLICITLY rather than recovered from
@@ -158,16 +158,14 @@ export class SessionContentIngest {
      * collapse in it before dedup is ever consulted, which is the whole defect. Absent when the
      * session has no relay witness (relay-degraded): see the announced fallback below.
      */
-    canonicalSeqIn?: number,
+    canonicalSeqIn: number | undefined,
     /**
-     * DOD-M15-SEALWIRE-1 part B1 — the algorithm the SENDER named on the frame, verbatim.
-     *
-     * `undefined` means the frame carried no name, which is a peer that predates the field and is
-     * the one case we may safely assume `sha256` for. It is threaded through rather than read off
-     * the session, because whether a hash is salted is a fact about the FRAME and its sender, never
-     * about what this side happens to hold.
+     * DOD-M15-SEALWIRE-1 part B1 — the algorithm the SENDER named on the frame, verbatim. REQUIRED
+     * as an argument; an absent value (`undefined`/`null`) is a frame that named none, and is refused
+     * like any unreadable name. It is threaded through rather than read off the session, because
+     * whether a hash is salted is a fact about the FRAME and its sender.
      */
-    contentHashAlgIn?: string | null,
+    contentHashAlgIn: string | null | undefined,
     /**
      * DOD-M15-SEALWIRE-1 bullet 5: the VERIFIED authorship proof for this message, when the caller
      * has one. The caller is the only place that has it — `#verifyAuthorshipClaim` verifies the
@@ -308,7 +306,7 @@ export class SessionContentIngest {
      */
     const algResolved = resolveContentHashAlg(contentHashAlgIn);
     if (!algResolved.ok) {
-      // A NAME WE CANNOT READ. Not a legacy peer — an unreadable one. There is no value to compare
+      // A NAME WE CANNOT READ, or none at all. There is no value to compare
       // against, so `content_hash_mismatch` here would be an exit-point label standing in for
       // "their build is newer than ours" (Invariant 2). Refused by its own name instead.
       this.#ctx.markContentUnverifiable(agentName, sessionId, "unverifiable");
@@ -2148,9 +2146,8 @@ export class SessionContentIngest {
        * DOD-M15-SEALWIRE-1 part B1 — the algorithm the sender named, taken from the FRAME.
        *
        * Read as `unknown` and passed through verbatim, deliberately: `resolveContentHashAlg` is the
-       * one place that decides what a value means, and it distinguishes ABSENT (a peer predating
-       * the field — verify as `sha256`) from a non-string or an unreadable name (refuse by name).
-       * Coercing here would collapse that distinction and turn a version skew into a tamper report.
+       * one place that decides what a value means, and it refuses an absent, non-string or
+       * unreadable name by name. Coercing here would turn a malformed frame into a tamper report.
        */
       const declaredAlg = frame["content_hash_alg"];
       const ingest = await this.ingestReceivedContent(

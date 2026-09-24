@@ -722,6 +722,7 @@ describe("034-CARRYLEAF — the MAILBOX route carries what the recipient needs t
       structure1Cbor: claim,
       structure1Signature: claimSig,
       leafKind: 0x04,
+      contentHashAlg: "sha256",
     });
     const env = decodeParkEnvelope(bytes);
 
@@ -753,6 +754,8 @@ describe("034-CARRYLEAF — the MAILBOX route carries what the recipient needs t
       senderPubkey: new Uint8Array(32).fill(0x22),
       parkSig: new Uint8Array(64).fill(0x11),
       structure1Cbor: new Uint8Array([0xa1]),
+      contentHashAlg: "sha256",
+      leafKind: 0,
     }));
     expect(env.version).toBe(2);
     expect(env.structure1Signature, "and it carries no signature to be confused for one").toBeUndefined();

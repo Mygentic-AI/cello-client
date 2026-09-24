@@ -279,7 +279,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
 
     const content = new TextEncoder().encode(SECRET);
     const wrongHash = msgLeafHash(new TextEncoder().encode("not what was sent"));
-    const res = await mgr.ingestReceivedContent("alice", sid, content, wrongHash);
+    const res = await mgr.ingestReceivedContent("alice", sid, content, wrongHash, undefined, undefined, "sha256");
     expect(res.ok, "the tampered message must be refused, not ingested").toBe(false);
 
     const notices = mgr.takeContentRefusals("alice", sid, "op");

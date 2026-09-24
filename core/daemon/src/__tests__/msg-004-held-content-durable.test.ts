@@ -100,7 +100,7 @@ describe("DOD-M12B-STRAND-1: verified content that cannot yet be delivered is du
 
       // The relay witnessed seq 2 for m2. It arrives first, so it is held behind the gap at 0..1.
       mgr.recordWitnessedSequence(AGENT, sid, hx(h2), 2);
-      const r2 = await mgr.ingestReceivedContent(AGENT, sid, c2, h2, "corr-1");
+      const r2 = await mgr.ingestReceivedContent(AGENT, sid, c2, h2, "corr-1", undefined, "sha256");
       expect(r2.ok).toBe(true);
       expect(first.events.some((e) => e.event === "session.content.held")).toBe(true);
       expect(mgr.getSessionTree(AGENT, sid).size()).toBe(0);
@@ -128,11 +128,11 @@ describe("DOD-M12B-STRAND-1: verified content that cannot yet be delivered is du
 
     // The gap fills from the relay mailbox, exactly as it would in production.
     mgr2.recordWitnessedSequence(AGENT, sid, hx(h0), 0);
-    await mgr2.ingestReceivedContent(AGENT, sid, c0, h0, "corr-2");
+    await mgr2.ingestReceivedContent(AGENT, sid, c0, h0, "corr-2", undefined, "sha256");
     expect(mgr2.getSessionTree(AGENT, sid).size(), "seq 2 is still held behind the gap at seq 1").toBe(1);
 
     mgr2.recordWitnessedSequence(AGENT, sid, hx(h1), 1);
-    await mgr2.ingestReceivedContent(AGENT, sid, c1, h1, "corr-2");
+    await mgr2.ingestReceivedContent(AGENT, sid, c1, h1, "corr-2", undefined, "sha256");
 
     // The survivor lands at its OWN canonical position — leaf index 2, not "next free slot".
     // A restart that re-appended it anywhere else would change the root the seal signs over.
@@ -164,7 +164,7 @@ describe("DOD-M12B-STRAND-1: verified content that cannot yet be delivered is du
       await seedAgents(mgr.getDb(), [AGENT]);
       await mgr.createSessionNode(sid, AGENT, "bobpubkey", "bob-peer-id", "corr-1");
       mgr.recordWitnessedSequence(AGENT, sid, hx(h1), 1);
-      await mgr.ingestReceivedContent(AGENT, sid, c1, h1, "corr-1");
+      await mgr.ingestReceivedContent(AGENT, sid, c1, h1, "corr-1", undefined, "sha256");
       expect(mgr.sealReadiness(AGENT, sid).ready, "a session with a gap is not sealable").toBe(false);
       await mgr.gracefulShutdown();
     }
@@ -192,7 +192,7 @@ describe("DOD-M12B-STRAND-1: verified content that cannot yet be delivered is du
     await seedAgents(mgr.getDb(), [AGENT]);
     await mgr.createSessionNode(sid, AGENT, "bobpubkey", "bob-peer-id", "corr-1");
     mgr.recordWitnessedSequence(AGENT, sid, hx(h1), 1);
-    await mgr.ingestReceivedContent(AGENT, sid, c1, h1, "corr-1");
+    await mgr.ingestReceivedContent(AGENT, sid, c1, h1, "corr-1", undefined, "sha256");
 
     // Ending the session moves the held frame to the annex and deletes its durable row. Teardown
     // then finds it still in the in-memory map, counts held_content, gets zero — and, before this
@@ -229,9 +229,9 @@ describe("DOD-M12B-STRAND-1: verified content that cannot yet be delivered is du
       // Hold p1 at seq 1, then fill seq 0 so p1 is released and lands at index 1 — after which the
       // tree genuinely holds that content at that position.
       mgr.recordWitnessedSequence(AGENT, sid, hx(h1), 1);
-      await mgr.ingestReceivedContent(AGENT, sid, c1, h1, "corr-1");
+      await mgr.ingestReceivedContent(AGENT, sid, c1, h1, "corr-1", undefined, "sha256");
       mgr.recordWitnessedSequence(AGENT, sid, hx(h0), 0);
-      await mgr.ingestReceivedContent(AGENT, sid, c0, h0, "corr-1");
+      await mgr.ingestReceivedContent(AGENT, sid, c0, h0, "corr-1", undefined, "sha256");
       expect(mgr.getSessionTree(AGENT, sid).size()).toBe(2);
       // Put the row back by hand: a real daemon reaches this state by crashing between the append
       // and the delete, and that window is exactly what the restore must be safe against.
@@ -246,7 +246,7 @@ describe("DOD-M12B-STRAND-1: verified content that cannot yet be delivered is du
     const mgr2 = await makeManager(second.logger, dbPath);
     await mgr2.createSessionNode(sid, AGENT, "bobpubkey", "bob-peer-id", "corr-2");
     const next = new TextEncoder().encode("p2");
-    await mgr2.ingestReceivedContent(AGENT, sid, next, msgLeafHash(next), "corr-2");
+    await mgr2.ingestReceivedContent(AGENT, sid, next, msgLeafHash(next), "corr-2", undefined, "sha256");
     expect(mgr2.getSessionTree(AGENT, sid).size(), "the duplicate must not re-append").toBe(3);
     const restored = second.events.find((e) => e.event === "session.content.held.restored");
     expect(restored).toBeDefined();
@@ -266,7 +266,7 @@ describe("DOD-M12B-STRAND-1: verified content that cannot yet be delivered is du
       await seedAgents(mgr.getDb(), [AGENT]);
       await mgr.createSessionNode(sid, AGENT, "bobpubkey", "bob-peer-id", "corr-1");
       mgr.recordWitnessedSequence(AGENT, sid, hx(heldHash), 1);
-      await mgr.ingestReceivedContent(AGENT, sid, held, heldHash, "corr-1");
+      await mgr.ingestReceivedContent(AGENT, sid, held, heldHash, "corr-1", undefined, "sha256");
       // The tree grows past position 1 with OTHER content. The relay's sequence space and this
       // tree's leaf-index space drift — the relay counts ctrl leaves the tree never appends — so
       // "canonical_seq < frontier" is true here for a frame the tree has never held. Judging on the
@@ -280,7 +280,7 @@ describe("DOD-M12B-STRAND-1: verified content that cannot yet be delivered is du
     const mgr2 = await makeManager(second.logger, dbPath);
     await mgr2.createSessionNode(sid, AGENT, "bobpubkey", "bob-peer-id", "corr-2");
     const next = new TextEncoder().encode("p9");
-    await mgr2.ingestReceivedContent(AGENT, sid, next, msgLeafHash(next), "corr-2");
+    await mgr2.ingestReceivedContent(AGENT, sid, next, msgLeafHash(next), "corr-2", undefined, "sha256");
 
     const drift = second.events.find((e) => e.event === "session.content.held.position_drifted");
     expect(drift, "a frame that cannot join the chain must be named, not counted as tidy-up").toBeDefined();
@@ -313,7 +313,7 @@ describe("DOD-M12B-STRAND-1: verified content that cannot yet be delivered is du
       await seedAgents(mgr.getDb(), [AGENT]);
       await mgr.createSessionNode(sid, AGENT, "bobpubkey", "bob-peer-id", "corr-1");
       mgr.recordWitnessedSequence(AGENT, sid, hx(rawHash), 1);
-      await mgr.ingestReceivedContent(AGENT, sid, raw, rawHash, "corr-1");
+      await mgr.ingestReceivedContent(AGENT, sid, raw, rawHash, "corr-1", undefined, "sha256");
       await mgr.gracefulShutdown();
     }
 
@@ -321,7 +321,7 @@ describe("DOD-M12B-STRAND-1: verified content that cannot yet be delivered is du
     const mgr2 = await makeManager(second.logger, dbPath);
     await mgr2.createSessionNode(sid, AGENT, "bobpubkey", "bob-peer-id", "corr-2");
     mgr2.recordWitnessedSequence(AGENT, sid, hx(h0), 0);
-    await mgr2.ingestReceivedContent(AGENT, sid, c0, h0, "corr-2");
+    await mgr2.ingestReceivedContent(AGENT, sid, c0, h0, "corr-2", undefined, "sha256");
     expect(mgr2.getSessionTree(AGENT, sid).size()).toBe(2);
     // The leaf binds the hash of the RAW bytes — if the restore had lost them, the released leaf
     // would bind the screened copy's hash instead and the two parties' roots would part.
@@ -341,9 +341,9 @@ describe("DOD-M12B-STRAND-1: verified content that cannot yet be delivered is du
       await seedAgents(mgr.getDb(), [AGENT]);
       await mgr.createSessionNode(sid, AGENT, "bobpubkey", "bob-peer-id", "corr-1");
       mgr.recordWitnessedSequence(AGENT, sid, hx(h1), 1);
-      await mgr.ingestReceivedContent(AGENT, sid, c1, h1, "corr-1");
+      await mgr.ingestReceivedContent(AGENT, sid, c1, h1, "corr-1", undefined, "sha256");
       mgr.recordWitnessedSequence(AGENT, sid, hx(h0), 0);
-      await mgr.ingestReceivedContent(AGENT, sid, c0, h0, "corr-1");
+      await mgr.ingestReceivedContent(AGENT, sid, c0, h0, "corr-1", undefined, "sha256");
       expect(mgr.getSessionTree(AGENT, sid).size(), "both landed, nothing is held").toBe(2);
       // ASSERT ON THE STORE, IN THIS PROCESS. Asserting only that the restarted tree looks right
       // proves nothing about the row: the second manager never reads a row that is behind its

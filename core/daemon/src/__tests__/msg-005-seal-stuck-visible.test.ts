@@ -52,14 +52,14 @@ describe("DOD-M12B-SEAL-STUCK-1: a session that cannot seal is visible without p
     snm.recordWitnessedSequence("alice", STUCK, Buffer.from(msgLeafHash(held1)).toString("hex"), 1);
     snm.recordWitnessedSequence("alice", STUCK, Buffer.from(msgLeafHash(held2)).toString("hex"), 2);
     snm.recordWitnessedSequence("alice", STUCK, Buffer.from(msgLeafHash(never)).toString("hex"), 3);
-    await snm.ingestReceivedContent("alice", STUCK, held1, msgLeafHash(held1), "corr");
-    await snm.ingestReceivedContent("alice", STUCK, held2, msgLeafHash(held2), "corr");
+    await snm.ingestReceivedContent("alice", STUCK, held1, msgLeafHash(held1), "corr", undefined, "sha256");
+    await snm.ingestReceivedContent("alice", STUCK, held2, msgLeafHash(held2), "corr", undefined, "sha256");
     expect(snm.sealReadiness("alice", STUCK).ready, "the fixture must actually be stuck").toBe(false);
 
     // The healthy session: an ordinary in-order message, witnessed and appended.
     const ok = new TextEncoder().encode("ordinary");
     snm.recordWitnessedSequence("alice", HEALTHY, Buffer.from(msgLeafHash(ok)).toString("hex"), 0);
-    await snm.ingestReceivedContent("alice", HEALTHY, ok, msgLeafHash(ok), "corr");
+    await snm.ingestReceivedContent("alice", HEALTHY, ok, msgLeafHash(ok), "corr", undefined, "sha256");
     expect(snm.sealReadiness("alice", HEALTHY).ready).toBe(true);
 
     const rows = (await statusOf(fx)).active_sessions;
@@ -91,7 +91,7 @@ describe("DOD-M12B-SEAL-STUCK-1: a session that cannot seal is visible without p
 
     const held = new TextEncoder().encode("held behind a gap");
     snm.recordWitnessedSequence("alice", STUCK, Buffer.from(msgLeafHash(held)).toString("hex"), 1);
-    await snm.ingestReceivedContent("alice", STUCK, held, msgLeafHash(held), "corr");
+    await snm.ingestReceivedContent("alice", STUCK, held, msgLeafHash(held), "corr", undefined, "sha256");
     // Give it a message so it survives the resumable-only filter, then interrupt it.
     snm.getDb()
       .prepare("UPDATE sessions SET status = 'interrupted', message_count = 1 WHERE session_id = ?")
@@ -135,7 +135,7 @@ describe("DOD-M12B-SEAL-STUCK-1: a session that cannot seal is visible without p
 
     const held = new TextEncoder().encode("waiting its turn");
     snm.recordWitnessedSequence("alice", STUCK, Buffer.from(msgLeafHash(held)).toString("hex"), 1);
-    await snm.ingestReceivedContent("alice", STUCK, held, msgLeafHash(held), "corr");
+    await snm.ingestReceivedContent("alice", STUCK, held, msgLeafHash(held), "corr", undefined, "sha256");
     const before = snm.getSessionTree("alice", STUCK).size();
 
     await statusOf(fx);
@@ -159,7 +159,7 @@ describe("DOD-M12B-SEAL-STUCK-1: a session that cannot seal is visible without p
 
     const held = new TextEncoder().encode("received, verified, never delivered");
     snm.recordWitnessedSequence("alice", STUCK, Buffer.from(msgLeafHash(held)).toString("hex"), 1);
-    await snm.ingestReceivedContent("alice", STUCK, held, msgLeafHash(held), "corr");
+    await snm.ingestReceivedContent("alice", STUCK, held, msgLeafHash(held), "corr", undefined, "sha256");
 
     await snm.abandonSession("alice", STUCK);
 

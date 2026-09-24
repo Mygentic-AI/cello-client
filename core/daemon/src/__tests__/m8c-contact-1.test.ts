@@ -369,7 +369,7 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
 
     // The stranger, still unknown, now says something on the session they just opened.
     const m1 = new TextEncoder().encode("from the stranger");
-    await snm.ingestReceivedContent("bob", SID_HEX, m1, msgLeafHash(m1), "c1");
+    await snm.ingestReceivedContent("bob", SID_HEX, m1, msgLeafHash(m1), "c1", undefined, "sha256");
     await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     /**
@@ -486,7 +486,7 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     injectRef.inject!(await assignmentFrame(callerPubkey, bobPubkey));
     await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
     const m1 = new TextEncoder().encode("from a known contact");
-    await snm.ingestReceivedContent("bob", SID_HEX, m1, msgLeafHash(m1), "c1");
+    await snm.ingestReceivedContent("bob", SID_HEX, m1, msgLeafHash(m1), "c1", undefined, "sha256");
     await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     const sent = snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent");
@@ -523,7 +523,7 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     injectRef.inject!(await assignmentFrame(callerPubkey, bobPubkey));
     await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
     const m1 = new TextEncoder().encode("from a known contact");
-    await snm.ingestReceivedContent("bob", SID_HEX, m1, msgLeafHash(m1), "c1");
+    await snm.ingestReceivedContent("bob", SID_HEX, m1, msgLeafHash(m1), "c1", undefined, "sha256");
     await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     const sent = snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent");
@@ -570,10 +570,10 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     const m1 = new TextEncoder().encode("first");
-    await snm.ingestReceivedContent("bob", SID_HEX, m1, msgLeafHash(m1), "c1");
+    await snm.ingestReceivedContent("bob", SID_HEX, m1, msgLeafHash(m1), "c1", undefined, "sha256");
     await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
     const m2 = new TextEncoder().encode("second, ignoring the one-shot rule");
-    await snm.ingestReceivedContent("bob", SID_HEX, m2, msgLeafHash(m2), "c2");
+    await snm.ingestReceivedContent("bob", SID_HEX, m2, msgLeafHash(m2), "c2", undefined, "sha256");
     await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     // The visit ends on their FIRST message, so the second one arrives at a session already closing

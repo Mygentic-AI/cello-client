@@ -160,7 +160,7 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     snm.recordTranscriptMessage("alice", SID, leafIndex, "received", bigChunk, "seed");
 
     const small = new TextEncoder().encode("this tips it over");
-    const res = await snm.ingestReceivedContent("alice", SID, small, msgLeafHash(small), "corr-2");
+    const res = await snm.ingestReceivedContent("alice", SID, small, msgLeafHash(small), "corr-2", undefined, "sha256");
     expect(res).toMatchObject({ ok: false, reason: "session_size_limit_exceeded" });
   });
 
@@ -185,7 +185,7 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     snm.recordTranscriptMessage("alice", SID, leafIndex, "received", bigChunk, "seed");
 
     const small = new TextEncoder().encode("still fine — 25 MB + this is under KNOWN's 100 MB");
-    const res = await snm.ingestReceivedContent("alice", SID, small, msgLeafHash(small), "corr-2");
+    const res = await snm.ingestReceivedContent("alice", SID, small, msgLeafHash(small), "corr-2", undefined, "sha256");
     expect(res.ok).toBe(true); // 25 MB + small < 100 MB (KNOWN) — would be refused at UNKNOWN's 25 MB
   });
 
@@ -643,7 +643,7 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     // the direct-append path (nextExpected is 0 for a brand-new session).
     snm.recordWitnessedSequence("alice", SID, hashHex, 5);
 
-    const res = await snm.ingestReceivedContent("alice", SID, bigChunk, msgLeafHash(bigChunk), "corr-2");
+    const res = await snm.ingestReceivedContent("alice", SID, bigChunk, msgLeafHash(bigChunk), "corr-2", undefined, "sha256");
     expect(res).toMatchObject({ ok: false, reason: "session_size_limit_exceeded" });
 
     // Confirm nothing was silently held either — a later legitimate in-order message must not

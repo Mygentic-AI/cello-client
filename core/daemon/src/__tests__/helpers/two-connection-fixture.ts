@@ -380,7 +380,7 @@ export async function startTwoConnectionFixture(
     },
     async ingestReceived(agent, sessionId, text, correlationId = "fixture-inbound") {
       const bytes = new TextEncoder().encode(text);
-      return handle.getSessionNodeManager().ingestReceivedContent(agent, sessionId, bytes, msgLeafHash(bytes), correlationId);
+      return handle.getSessionNodeManager().ingestReceivedContent(agent, sessionId, bytes, msgLeafHash(bytes), correlationId, undefined, "sha256");
     },
     markSealInFlightForTest(agent, sessionId) {
       handle.markSealInFlightForTest(agent, sessionId);

@@ -56,13 +56,13 @@ describe("DOD-FRONTIER-STRAND-1 AC1: identical messages at different relay posit
   it("D1 (control): a REDELIVERY — same hash, same position — still dedups to ONE leaf", async () => {
     await fx.createSession(SID, "alice");
 
-    const first = await fx.snm.ingestReceivedContent("alice", SID, AWAY, msgLeafHash(AWAY), "corr-1", 0);
+    const first = await fx.snm.ingestReceivedContent("alice", SID, AWAY, msgLeafHash(AWAY), "corr-1", 0, "sha256");
     expect(first).toMatchObject({ ok: true, leafIndex: 0 });
     expect(fx.snm.getSessionTree("alice", SID).size()).toBe(1);
 
     // The SAME message arriving again at the SAME relay position — direct delivery plus the
     // park backstop, or a replay. This must NOT become a second leaf.
-    const again = await fx.snm.ingestReceivedContent("alice", SID, AWAY, msgLeafHash(AWAY), "corr-1b", 0);
+    const again = await fx.snm.ingestReceivedContent("alice", SID, AWAY, msgLeafHash(AWAY), "corr-1b", 0, "sha256");
     expect(again).toMatchObject({ ok: true, leafIndex: 0, appendedCount: 0 });
     expect(fx.snm.getSessionTree("alice", SID).size(), "a redelivery must not inflate the tree").toBe(1);
   });
@@ -71,13 +71,13 @@ describe("DOD-FRONTIER-STRAND-1 AC1: identical messages at different relay posit
     await fx.createSession(SID, "alice");
 
     // The away responder fires once...
-    const one = await fx.snm.ingestReceivedContent("alice", SID, AWAY, msgLeafHash(AWAY), "corr-a", 0);
+    const one = await fx.snm.ingestReceivedContent("alice", SID, AWAY, msgLeafHash(AWAY), "corr-a", 0, "sha256");
     expect(one).toMatchObject({ ok: true, leafIndex: 0 });
 
     // ...and again, byte-for-byte identical, but the relay gave it its OWN position. Under the
     // content-hash rule this was silently dropped, the counterparty appended it, and the two
     // frontiers disagreed forever.
-    const two = await fx.snm.ingestReceivedContent("alice", SID, AWAY, msgLeafHash(AWAY), "corr-b", 1);
+    const two = await fx.snm.ingestReceivedContent("alice", SID, AWAY, msgLeafHash(AWAY), "corr-b", 1, "sha256");
     expect(two).toMatchObject({ ok: true, leafIndex: 1 });
     expect((two as { appendedCount?: number }).appendedCount ?? 1).toBeGreaterThan(0);
 
@@ -89,14 +89,14 @@ describe("DOD-FRONTIER-STRAND-1 AC1: identical messages at different relay posit
 
   it("D3: a redelivery of the SECOND one still dedups — position, not arrival order", async () => {
     await fx.createSession(SID, "alice");
-    await fx.snm.ingestReceivedContent("alice", SID, AWAY, msgLeafHash(AWAY), "corr-a", 0);
-    await fx.snm.ingestReceivedContent("alice", SID, AWAY, msgLeafHash(AWAY), "corr-b", 1);
+    await fx.snm.ingestReceivedContent("alice", SID, AWAY, msgLeafHash(AWAY), "corr-a", 0, "sha256");
+    await fx.snm.ingestReceivedContent("alice", SID, AWAY, msgLeafHash(AWAY), "corr-b", 1, "sha256");
     expect(fx.snm.getSessionTree("alice", SID).size()).toBe(2);
 
     // Position 1 arriving twice is a redelivery of THAT message, even though an identical leaf also
     // sits at position 0. Keying on the hash alone cannot tell these apart; keying on the position
     // can, and this is the clause that proves the fix is not just "append everything".
-    const dup = await fx.snm.ingestReceivedContent("alice", SID, AWAY, msgLeafHash(AWAY), "corr-b2", 1);
+    const dup = await fx.snm.ingestReceivedContent("alice", SID, AWAY, msgLeafHash(AWAY), "corr-b2", 1, "sha256");
     expect(dup).toMatchObject({ ok: true, leafIndex: 1, appendedCount: 0 });
     expect(fx.snm.getSessionTree("alice", SID).size()).toBe(2);
   });
@@ -114,8 +114,8 @@ describe("DOD-FRONTIER-STRAND-1 AC1: identical messages at different relay posit
     // of this clause asserted the opposite, and was wrong.)
     await fx.createSession(SID, "alice"); // createSessionNode attaches NO relay client
 
-    await fx.snm.ingestReceivedContent("alice", SID, AWAY, msgLeafHash(AWAY), "corr-x");
-    const second = await fx.snm.ingestReceivedContent("alice", SID, AWAY, msgLeafHash(AWAY), "corr-y");
+    await fx.snm.ingestReceivedContent("alice", SID, AWAY, msgLeafHash(AWAY), "corr-x", undefined, "sha256");
+    const second = await fx.snm.ingestReceivedContent("alice", SID, AWAY, msgLeafHash(AWAY), "corr-y", undefined, "sha256");
     expect(second).toMatchObject({ ok: true, appendedCount: 0 });
     expect(fx.snm.getSessionTree("alice", SID).size()).toBe(1);
 
@@ -145,17 +145,17 @@ describe("DOD-FRONTIER-STRAND-1 AC1: identical messages at different relay posit
 
     // Leaf 0: an UNWITNESSED message (its relay submit failed) — the drift producer.
     const first = new TextEncoder().encode("first message, relay submit failed");
-    await fx.snm.ingestReceivedContent("alice", SID, first, msgLeafHash(first), "corr-d1");
+    await fx.snm.ingestReceivedContent("alice", SID, first, msgLeafHash(first), "corr-d1", undefined, "sha256");
     expect(fx.snm.getSessionTree("alice", SID).size()).toBe(1);
 
     // Leaf 1: a WITNESSED message which the relay numbered 0 — the tree is now one ahead.
     const second = new TextEncoder().encode("second message, witnessed at relay position 0");
-    await fx.snm.ingestReceivedContent("alice", SID, second, msgLeafHash(second), "corr-d2", 0);
+    await fx.snm.ingestReceivedContent("alice", SID, second, msgLeafHash(second), "corr-d2", 0, "sha256");
     expect(fx.snm.getSessionTree("alice", SID).size()).toBe(2);
 
     // ...and now the SAME message is redelivered (direct delivery plus the park backstop both
     // landing is a designed path). It carries the same relay position, 0.
-    const redelivered = await fx.snm.ingestReceivedContent("alice", SID, second, msgLeafHash(second), "corr-d3", 0);
+    const redelivered = await fx.snm.ingestReceivedContent("alice", SID, second, msgLeafHash(second), "corr-d3", 0, "sha256");
     expect(redelivered).toMatchObject({ ok: true, appendedCount: 0 });
     expect(
       fx.snm.getSessionTree("alice", SID).size(),

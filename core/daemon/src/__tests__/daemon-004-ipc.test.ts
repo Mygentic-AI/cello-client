@@ -295,7 +295,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     // Buffer one inbound message so cello_receive has something to return.
     const inbound = new TextEncoder().encode("from-bob");
-    await snm.ingestReceivedContent("alice", SID, inbound, msgLeafHash(inbound));
+    await snm.ingestReceivedContent("alice", SID, inbound, msgLeafHash(inbound), undefined, undefined, "sha256");
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     try {
@@ -396,7 +396,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     const content = new TextEncoder().encode("from-bob");
-    await snm.ingestReceivedContent("alice", SID, content, msgLeafHash(content));
+    await snm.ingestReceivedContent("alice", SID, content, msgLeafHash(content), undefined, undefined, "sha256");
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     try {
@@ -747,7 +747,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
       // Buffer is empty when the receive begins; content lands ~40ms later.
       const content = new TextEncoder().encode("delayed-hello");
       const recvPromise = client.send("cello_receive", { session_id: SID, timeout_ms: 2000 }) as Promise<Record<string, unknown>>;
-      setTimeout(() => { void snm.ingestReceivedContent("alice", SID, content, msgLeafHash(content)); }, 40);
+      setTimeout(() => { void snm.ingestReceivedContent("alice", SID, content, msgLeafHash(content), undefined, undefined, "sha256"); }, 40);
 
       const res = await recvPromise;
       expect(res.ok).toBe(true);
@@ -818,7 +818,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
 
     // One inbound message is buffered but NEVER read (mirrors the live final-message race).
     const inbound = new TextEncoder().encode("unread-final-message");
-    await snm.ingestReceivedContent("alice", SID, inbound, msgLeafHash(inbound));
+    await snm.ingestReceivedContent("alice", SID, inbound, msgLeafHash(inbound), undefined, undefined, "sha256");
 
     // Seal teardown evicts the unread buffer.
     await snm.destroySessionNode("alice", SID, "sealed");
@@ -868,7 +868,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     await snm.abandonSession("alice", SID);
 
     const late = new TextEncoder().encode("[[STANDBY EST:15m]] still waiting on you");
-    const res = await snm.ingestReceivedContent("alice", SID, late, msgLeafHash(late));
+    const res = await snm.ingestReceivedContent("alice", SID, late, msgLeafHash(late), undefined, undefined, "sha256");
 
     expect(res.ok).toBe(false);
     // The refusal must carry the REAL status, not just an exit-point label, or the content-park
@@ -901,7 +901,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
 
     const inbound = new TextEncoder().encode("[[STANDBY EST:15m]] hold for my next message");
-    await snm.ingestReceivedContent("alice", SID, inbound, msgLeafHash(inbound));
+    await snm.ingestReceivedContent("alice", SID, inbound, msgLeafHash(inbound), undefined, undefined, "sha256");
     await snm.destroySessionNode("alice", SID, "sealed");
 
     // The restart is the whole point: same celloDir, so the sealed row persists and the marker does not.

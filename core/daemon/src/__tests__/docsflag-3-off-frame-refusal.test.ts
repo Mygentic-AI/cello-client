@@ -142,7 +142,7 @@ describe("074-DOCSFLAG — an inbound document frame with the layer OFF", () => 
     mgr.setSessionGenesisForTest("alice", sessionId, new Uint8Array(32).fill(0x9c));
     await mgr.createSessionNode(sessionId, "alice", "bobpubkey", "bob-peer-id", correlationId);
     return mgr.ingestReceivedContent(
-      "alice", sessionId, frame, contentHash(frame), correlationId,
+      "alice", sessionId, frame, contentHash(frame), correlationId, undefined, "sha256"
     );
   }
 

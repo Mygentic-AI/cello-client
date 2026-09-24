@@ -322,7 +322,7 @@ describe("DOD-M15-SEALWIRE-1 bullet 5 — a real send stores a real proof", () =
     // Close the gap at slot 0. A just-appended leaf unblocks held arrivals whose turn is now next,
     // which is what runs `#releaseHeld` — the only path that writes a held SENT message's row.
     const theirs = new TextEncoder().encode("theirs, at slot zero");
-    await fx.snm.ingestReceivedContent("alice", SID, theirs, msgLeafHash(theirs), "corr-recv", 0);
+    await fx.snm.ingestReceivedContent("alice", SID, theirs, msgLeafHash(theirs), "corr-recv", 0, "sha256");
 
     const rows = sentRows("alice", SID);
     expect(rows.length, "the held message must now be in the transcript — the gap closed").toBe(1);
@@ -365,7 +365,7 @@ describe("DOD-M15-SEALWIRE-1 bullet 5 — a real send stores a real proof", () =
     fx.snm.placeOwnLeaf("alice", SID, Buffer.from(msgLeafHash(mine)).toString("hex"), mine, 1, "corr-held", "msg", undefined);
 
     const theirs = new TextEncoder().encode("theirs, at slot zero");
-    await fx.snm.ingestReceivedContent("alice", SID, theirs, msgLeafHash(theirs), "corr-recv", 0);
+    await fx.snm.ingestReceivedContent("alice", SID, theirs, msgLeafHash(theirs), "corr-recv", 0, "sha256");
 
     const rows = sentRows("alice", SID);
     expect(rows.length, "the held message is still released — no proof is not a reason to lose it").toBe(1);

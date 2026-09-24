@@ -58,6 +58,8 @@ describe("M12-P17: the post-seal annex", () => {
       recipientPubkey: await recipient.getPublicKey(),
       contentHash,
       content,
+      contentHashAlg: "sha256",
+      leafKind: 0,
     });
     const unsealed = await recipient.openContentSeal!(ciphertext);
     expect(unsealed).not.toBeNull();

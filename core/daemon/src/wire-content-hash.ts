@@ -32,32 +32,16 @@ import { saltedContentHash } from "@cello-protocol/crypto";
  * it is holding — and gets `content_hash_mismatch` on every frame, which is the exact
  * silent-discard failure this module's header says cost two real daemons.
  *
- * Hence a NAME on the wire, and three cases that must stay apart (Decisions Carried #15):
+ * Hence a NAME on the wire, and every frame and park envelope carries one (Decisions Carried #15):
  *
- *   ABSENT            → `sha256`. A peer that predates the field. We know what it computed.
  *   NAMED and KNOWN   → verify under that name.
- *   NAMED and UNKNOWN → **refuse.** Not a legacy peer — an unreadable one. There is no correct hash
- *                       to compare against, and falling back to `sha256` would compare two
- *                       unrelated values and report a TAMPER for a version skew.
- *
- * ⚠️ RECEIVER FIRST — the ROLLOUT ORDER, which is still the rule. Every peer must be able to
- * understand a salted frame before any peer sends one. Reversed, the first upgraded sender breaks
- * every conversation it has with a peer that has not upgraded.
- *
- * > **⛔ THIS PARAGRAPH USED TO END "`no sender salts yet`", AND THAT IS NO LONGER TRUE.** It was
- * > written during part B1, when the receiver had been taught to read the name and nothing produced
- * > a salted one. **B2b-2 flipped it: a session holding an agreed salt now hashes under
- * > `HMAC_SALT_V1`.** The sentence is rewritten rather than deleted because it is exactly the shape
- * > `DOD-M15-CLAIM-COMMENTS-1` exists to catch — a comment asserting a property the code no longer
- * > has — and deleting it would remove the evidence that someone reasoned from it.
- * >
- * > It was still being read as current on 2026-08-24: a spine test's park deposit declared `sha256`
- * > on this comment's authority, the recipient recomputed under the name it was given, and the
- * > mismatch surfaced as `content_hash_mismatch` — **a tamper verdict on a message nobody touched**,
- * > which is precisely the failure the ALGORITHM-TRAVELS-WITH-THE-HASH rule above exists to prevent.
+ *   NAMED and UNKNOWN → **refuse.** There is no correct hash to compare against, and falling back to
+ *                       `sha256` would compare two unrelated values and report a TAMPER.
+ *   ABSENT            → **refuse**, the same way. Every sender names it; an absent name is a
+ *                       malformed frame, never a default.
  */
 export const CONTENT_HASH_ALGS = {
-  /** `sha256(0x00 ‖ content)` — what every build before the salt computes, and the absent-field default. */
+  /** `sha256(0x00 ‖ content)` — a session that holds no agreed salt. */
   SHA256: "sha256",
   /** `hmac-sha256(salt, 0x00 ‖ content)` — Decision #9. HMAC, never `sha256(salt ‖ content)`. */
   HMAC_SALT_V1: "hmac-sha256-salt-v1",
@@ -73,16 +57,13 @@ export function isKnownContentHashAlg(alg: string): alg is ContentHashAlg {
 }
 
 /**
- * What a frame says it used, or a refusal naming the value.
- *
- * ABSENT is deliberately `undefined`/`null` ONLY — not "falsy". An empty string is a peer that sent
- * a name we cannot read, not a peer that sent no name, and folding the two together would verify a
- * malformed frame as legacy instead of telling its sender the frame is unreadable.
+ * What a frame says it used, or a refusal naming the value. ABSENT is refused like any other name
+ * this build cannot read — it is never read as a default.
  */
 export function resolveContentHashAlg(
   raw: string | null | undefined,
 ): { ok: true; alg: ContentHashAlg } | { ok: false; value: string } {
-  if (raw === undefined || raw === null) return { ok: true, alg: CONTENT_HASH_ALGS.SHA256 };
+  if (raw === undefined || raw === null) return { ok: false, value: "(absent)" };
   if (typeof raw !== "string" || !isKnownContentHashAlg(raw)) {
     return { ok: false, value: typeof raw === "string" ? raw : `(${typeof raw})` };
   }

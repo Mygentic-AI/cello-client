@@ -135,7 +135,7 @@ describe("DOD-M15-REFUSEDEVIDENCE-1 — a refused message is kept, flagged, and 
     const orphanSid = "cd".repeat(32);
     const content = new TextEncoder().encode("a probe at a session that does not exist");
 
-    const res = await snm.ingestReceivedContent("alice", orphanSid, content, msgLeafHash(content), "corr-o");
+    const res = await snm.ingestReceivedContent("alice", orphanSid, content, msgLeafHash(content), "corr-o", undefined, "sha256");
     expect(res).toMatchObject({ ok: false, reason: "session_orphaned" });
 
     const kept = snm.readQuarantined("alice", orphanSid);
@@ -146,7 +146,7 @@ describe("DOD-M15-REFUSEDEVIDENCE-1 — a refused message is kept, flagged, and 
       "a refusal with no chain position takes a negative sequence, which cannot collide with a leaf",
     ).toBeLessThan(0);
     // Two of them must not collide either.
-    await snm.ingestReceivedContent("alice", orphanSid, new TextEncoder().encode("and again"), msgLeafHash(new TextEncoder().encode("and again")), "corr-o2");
+    await snm.ingestReceivedContent("alice", orphanSid, new TextEncoder().encode("and again"), msgLeafHash(new TextEncoder().encode("and again")), "corr-o2", undefined, "sha256");
     const both = snm.readQuarantined("alice", orphanSid);
     expect(both.length, "a second orphaned refusal is a second row, not an overwrite").toBe(2);
     expect(new Set(both.map((q) => q.sequence)).size).toBe(2);
@@ -158,7 +158,7 @@ describe("DOD-M15-REFUSEDEVIDENCE-1 — a refused message is kept, flagged, and 
     const snm = (await start()).getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "ff".repeat(32), "peer-1", "corr");
     const content = new TextEncoder().encode(ATTACK);
-    await snm.ingestReceivedContent("alice", SID, content, msgLeafHash(new TextEncoder().encode("other")), "corr-1");
+    await snm.ingestReceivedContent("alice", SID, content, msgLeafHash(new TextEncoder().encode("other")), "corr-1", undefined, "sha256");
     expect(snm.readQuarantined("alice", SID).length, "precondition: it really was retained").toBe(1);
 
     expect(
@@ -178,7 +178,7 @@ describe("DOD-M15-REFUSEDEVIDENCE-1 — a refused message is kept, flagged, and 
     const snm = (await start()).getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "ff".repeat(32), "peer-1", "corr");
     const content = new TextEncoder().encode(ATTACK);
-    await snm.ingestReceivedContent("alice", SID, content, msgLeafHash(new TextEncoder().encode("other")), "corr-1");
+    await snm.ingestReceivedContent("alice", SID, content, msgLeafHash(new TextEncoder().encode("other")), "corr-1", undefined, "sha256");
 
     const { messages } = snm.readTranscript("alice", SID);
     const entry = messages.find((m) => m.direction === "quarantined");
@@ -202,7 +202,7 @@ describe("DOD-M15-REFUSEDEVIDENCE-1 — a refused message is kept, flagged, and 
     const snm = handleRef.getSessionNodeManager();
     const sid = "9a".repeat(32);
     const content = new TextEncoder().encode("a probe at an id nobody opened");
-    await snm.ingestReceivedContent("alice", sid, content, msgLeafHash(content), "corr-p");
+    await snm.ingestReceivedContent("alice", sid, content, msgLeafHash(content), "corr-p", undefined, "sha256");
     expect(snm.readQuarantined("alice", sid).length, "precondition: the probe was retained").toBe(1);
 
     /**
@@ -302,7 +302,7 @@ describe("DOD-M15-REFUSEDEVIDENCE-1 — a refused message is kept, flagged, and 
     snm.recordWitnessedSequence("alice", SID, Buffer.from(hash).toString("hex"), 0);
     expect(snm.sealReadiness("alice", SID).missingLeaves, "precondition: the witness is outstanding").toBe(1);
 
-    const res = await snm.ingestReceivedContent("alice", SID, content, hash, "corr-1", 0);
+    const res = await snm.ingestReceivedContent("alice", SID, content, hash, "corr-1", 0, "sha256");
     expect(res, "the block still leafs and acks — it does not fail").toMatchObject({ ok: true, screenedOut: true });
     expect(snm.getSessionTree("alice", SID).size(), "and the leaf IS committed").toBe(1);
 
@@ -323,7 +323,7 @@ describe("DOD-M15-REFUSEDEVIDENCE-1 — a refused message is kept, flagged, and 
 
     // Six of the seven retaining exits refuse WITHOUT acking, which is precisely what makes the
     // sender's daemon redeliver — the park drain measures that loop at ~120 repeats per message.
-    for (let i = 0; i < 5; i++) await snm.ingestReceivedContent("alice", SID, content, wrong, `corr-${i}`);
+    for (let i = 0; i < 5; i++) await snm.ingestReceivedContent("alice", SID, content, wrong, `corr-${i}`, undefined, "sha256");
 
     const kept = snm.readQuarantined("alice", SID);
     expect(
@@ -342,10 +342,10 @@ describe("DOD-M15-REFUSEDEVIDENCE-1 — a refused message is kept, flagged, and 
     const sid2 = "ef".repeat(32);
     const content = new TextEncoder().encode(ATTACK);
     // No session at all → session_orphaned.
-    await snm.ingestReceivedContent("alice", sid2, content, msgLeafHash(content), "c1");
+    await snm.ingestReceivedContent("alice", sid2, content, msgLeafHash(content), "c1", undefined, "sha256");
     // Now the session exists and the same bytes fail the hash cross-check instead.
     await snm.createSessionNode(sid2, "alice", "ff".repeat(32), "peer-1", "corr");
-    await snm.ingestReceivedContent("alice", sid2, content, msgLeafHash(new TextEncoder().encode("x")), "c2");
+    await snm.ingestReceivedContent("alice", sid2, content, msgLeafHash(new TextEncoder().encode("x")), "c2", undefined, "sha256");
 
     const reasons = snm.readQuarantined("alice", sid2).map((q) => q.reason).sort();
     expect(reasons, "dedup is keyed on (reason, bytes), not bytes alone").toEqual(["content_hash_mismatch", "session_orphaned"]);
@@ -360,14 +360,14 @@ describe("DOD-M15-REFUSEDEVIDENCE-1 — a refused message is kept, flagged, and 
     snm.recordTranscriptMessage("alice", SID, leafIndex, "received", new Uint8Array(cap - 8), "seed");
 
     const content = new TextEncoder().encode(ATTACK);
-    await snm.ingestReceivedContent("alice", SID, content, msgLeafHash(new TextEncoder().encode("other")), "c1");
+    await snm.ingestReceivedContent("alice", SID, content, msgLeafHash(new TextEncoder().encode("other")), "c1", undefined, "sha256");
     expect(snm.readQuarantined("alice", SID).length, "precondition: nothing could be retained").toBe(0);
 
     // The tampered frame's own notice does not claim retention, so the property is checked on the
     // one that does — an orphaned refusal, whose guidance names the artifact to report.
     const sid3 = "1a".repeat(32);
     snm.recordTranscriptMessage("alice", sid3, 0, "received", new Uint8Array(cap - 8), "seed3");
-    await snm.ingestReceivedContent("alice", sid3, content, msgLeafHash(content), "c2");
+    await snm.ingestReceivedContent("alice", sid3, content, msgLeafHash(content), "c2", undefined, "sha256");
     expect(snm.readQuarantined("alice", sid3).length, "precondition: this one could not be retained either").toBe(0);
     const [notice] = snm.takeContentRefusals("alice", sid3, "op");
     expect(notice?.reason).toBe("session_orphaned");
@@ -390,7 +390,7 @@ describe("DOD-M15-REFUSEDEVIDENCE-1 — a refused message is kept, flagged, and 
     snm.recordWitnessedSequence("alice", SID, Buffer.from(msgLeafHash(first)).toString("hex"), 0);
     // Leaf 1: blocked, so it has a quarantined row and no deliverable one.
     const blocked = new TextEncoder().encode(ATTACK);
-    await snm.ingestReceivedContent("alice", SID, blocked, msgLeafHash(blocked), "c-blocked", 0);
+    await snm.ingestReceivedContent("alice", SID, blocked, msgLeafHash(blocked), "c-blocked", 0, "sha256");
     // Leaf 2 would be the next real message; seed it directly as a delivered row at sequence 1.
     snm.recordTranscriptMessage("alice", SID, 1, "received", new TextEncoder().encode("the one after"), "seed");
 
@@ -428,11 +428,11 @@ describe("DOD-M15-REFUSEDEVIDENCE-1 — a refused message is kept, flagged, and 
 
     // One refused message just under the cap. It is RETAINED — and those bytes are now spent.
     const big = randomBytes(cap - 64);
-    await snm.ingestReceivedContent("alice", SID, big, msgLeafHash(new TextEncoder().encode("nope")), "corr-1");
+    await snm.ingestReceivedContent("alice", SID, big, msgLeafHash(new TextEncoder().encode("nope")), "corr-1", undefined, "sha256");
     expect(snm.readQuarantined("alice", SID).length, "precondition: the big one was retained").toBe(1);
 
     const next = new TextEncoder().encode("x".repeat(256));
-    const res = await snm.ingestReceivedContent("alice", SID, next, msgLeafHash(next), "corr-2");
+    const res = await snm.ingestReceivedContent("alice", SID, next, msgLeafHash(next), "corr-2", undefined, "sha256");
     expect(
       res,
       "the cap must SEE the quarantined bytes — otherwise a counterparty who can get messages " +

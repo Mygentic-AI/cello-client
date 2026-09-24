@@ -401,7 +401,7 @@ describe("M8C-AWAY-1: away response", () => {
 
     // Step 2: the caller leaves its message. The daemon answers nothing into the accepted session.
     const wrapContent = new TextEncoder().encode("leaving my message [[WRAP]]");
-    await snm.ingestReceivedContent("bob", SID_HEX, wrapContent, msgLeafHash(wrapContent), "wrap-corr");
+    await snm.ingestReceivedContent("bob", SID_HEX, wrapContent, msgLeafHash(wrapContent), "wrap-corr", undefined, "sha256");
     await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     const { messages } = snm.readTranscript("bob", SID_HEX);

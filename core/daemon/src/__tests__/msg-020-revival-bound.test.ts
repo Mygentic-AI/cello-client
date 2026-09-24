@@ -186,7 +186,7 @@ describe("DOD-M12B-REVIVAL-BOUND-1: an unrevivable session reaches a terminal st
     // it proved the guard fires on a MALFORMED call, which is not the claim. The real signature is
     // (agentName, sessionId, content, contentHash, correlationId?, canonicalSeq?).
     const content = new TextEncoder().encode("a message from a peer that should not be accepted");
-    const ingest = await fx.snm.ingestReceivedContent("alice", sid, content, wireContentHash(content));
+    const ingest = await fx.snm.ingestReceivedContent("alice", sid, content, wireContentHash(content), undefined, undefined, "sha256");
     expect(
       (ingest as { ok: boolean; reason?: string }).reason,
       "this is the whole point of the line — a reprogrammed peer must not be able to write here",
@@ -209,7 +209,7 @@ describe("DOD-M12B-REVIVAL-BOUND-1: an unrevivable session reaches a terminal st
 
     // The peer now does the only thing it can do: send. This moves `updated_at` forward.
     const content = new TextEncoder().encode("keep-alive from a peer that wants the door held open");
-    await fx.snm.ingestReceivedContent("alice", sid, content, wireContentHash(content));
+    await fx.snm.ingestReceivedContent("alice", sid, content, wireContentHash(content), undefined, undefined, "sha256");
     const moved = fx.snm.getDb().prepare("SELECT updated_at FROM sessions WHERE session_id = ?").get(sid) as { updated_at: number };
     expect(moved.updated_at, "the premise of the attack — the peer really can move this column").toBeGreaterThan(t0);
 

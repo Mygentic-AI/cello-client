@@ -565,7 +565,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
    */
   injectParkFault(count: number, cause?: string): number { return this.#park.injectParkFault(count, cause); }
   getParkFaultRemaining(): number { return this.#park.getParkFaultRemaining(); }
-  setContentParkHook(fn: (args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; structure1Signature?: Uint8Array; leafKind?: number; contentHashAlg: string | undefined }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string; retryAfterMs?: number }>): void { return this.#park.setContentParkHook(fn); }
+  setContentParkHook(fn: (args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; structure1Signature?: Uint8Array; leafKind: number; contentHashAlg: string }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string; retryAfterMs?: number }>): void { return this.#park.setContentParkHook(fn); }
   setParkedDrainHook(fn: (agentName: string, reason: ParkedDrainReason) => void): void { return this.#park.setParkedDrainHook(fn); }
   recoverOwnSealCtrlLeafForTest(agentName: string, sessionId: string): { reportedRootHex: string; sequenceNumber: number } | "none" | "unknown" { return this.#park.recoverOwnSealCtrlLeafForTest(agentName, sessionId); }
   async recoverParkedEntry(agentName: string, sessionId: string, recipientPubkey: Uint8Array, unsealed: Uint8Array, contentHash: Uint8Array, correlationId?: string): ReturnType<ParkRecovery["recoverParkedEntry"]> { return this.#park.recoverParkedEntry(agentName, sessionId, recipientPubkey, unsealed, contentHash, correlationId); }
@@ -956,7 +956,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
   // Injected after construction because RetryQueue is built later in daemon.ts.
   #onSessionTerminal: ((sessionId: string, terminalStatus: "sealed" | "abandoned") => void) | null = null;
   #onAwaitingPersisted: ((agentName: string, sessionId: string, contentHashHex: string) => void) | null = null;
-  #onAwaitingTtf: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string, structure1Signature?: Uint8Array, leafKind?: number) => void) | null = null;
+  #onAwaitingTtf: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor: Uint8Array | undefined, structure2Cbor: Uint8Array | undefined, contentHashAlg: string, structure1Signature: Uint8Array | undefined, leafKind: number) => void) | null = null;
   // M12-P12 verification: force the next N park deposits to be REFUSED, so the failure this unit
   // fixes can be produced on demand instead of waited for. The real failure is a race — the deposit
   // is refused only in the seconds-long window while the sender's standing receiver rebuilds — and
@@ -1013,7 +1013,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
   // M12-P13 (review HIGH-1): returns whether the content is ACTUALLY queued. `false` means the
   // queue dropped it (today: the content-derived dedupe key collided), and the caller must then not
   // claim durability — nor commit the leaf that claim now authorises.
-  #onParkFailed: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string, structure1Signature?: Uint8Array, leafKind?: number) => boolean) | null = null;
+  #onParkFailed: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor: Uint8Array | undefined, structure2Cbor: Uint8Array | undefined, contentHashAlg: string, structure1Signature: Uint8Array | undefined, leafKind: number) => boolean) | null = null;
 
   constructor(opts: {
     factory: ISessionNodeFactory;
@@ -1532,8 +1532,8 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
    */
   setAwaitingAckHooks(hooks: {
     onPersisted?: (agentName: string, sessionId: string, contentHashHex: string) => void;
-    onTtf?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string, structure1Signature?: Uint8Array, leafKind?: number) => void;
-    onParkFailed?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string, structure1Signature?: Uint8Array, leafKind?: number) => boolean;
+    onTtf?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor: Uint8Array | undefined, structure2Cbor: Uint8Array | undefined, contentHashAlg: string, structure1Signature: Uint8Array | undefined, leafKind: number) => void;
+    onParkFailed?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor: Uint8Array | undefined, structure2Cbor: Uint8Array | undefined, contentHashAlg: string, structure1Signature: Uint8Array | undefined, leafKind: number) => boolean;
   }): void {
     this.#onAwaitingPersisted = hooks.onPersisted ?? null;
     this.#onAwaitingTtf = hooks.onTtf ?? null;
@@ -2780,8 +2780,9 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     // Fire-and-forget: unlike sendContent's live caller, nothing here is awaiting an IPC response
     // to shape (the TTF timer fires long after cello_send already returned) — the deposit's own
     // success/failure logging inside #parkContent is the only observability this path needs.
-    // B2b-1 review F2 — the THIRD `#parkContent` caller, and the one that was left unthreaded.
-    void this.#park.parkContent(agentName, sessionId, hashHex, entry.content, entry.structure1Cbor, entry.structure2Cbor, entry.contentHashAlg);
+    // Carries the author's signed claim and leaf kind too: without them the envelope reaches the
+    // recipient in a shape it cannot witness, re-opening the withholding hole on the mailbox route.
+    void this.#park.parkContent(agentName, sessionId, hashHex, entry.content, entry.structure1Cbor, entry.structure2Cbor, entry.contentHashAlg, entry.structure1Signature, entry.leafKind);
   }
 
   /**

@@ -171,7 +171,7 @@ describe("DOD-M15-AWAYSCOPE-1: an unattended agent says nothing into a session i
     const snm = await seedActiveSession(h, SID_HEX);
 
     const hi = new TextEncoder().encode("here is the answer you asked for [[OVER]]");
-    await snm.ingestReceivedContent("alice", SID_HEX, hi, msgLeafHash(hi), "c1");
+    await snm.ingestReceivedContent("alice", SID_HEX, hi, msgLeafHash(hi), "c1", undefined, "sha256");
     await wait(80);
 
     expect(snm.getSessionTree("alice", SID_HEX).size(), "the inbound message alone").toBe(1);
@@ -194,7 +194,7 @@ describe("DOD-M15-AWAYSCOPE-1: an unattended agent says nothing into a session i
 
     for (const [i, body] of ["first [[OVER]]", "second [[OVER]]", "third [[OVER]]"].entries()) {
       const bytes = new TextEncoder().encode(body);
-      await snm.ingestReceivedContent("alice", SID_HEX, bytes, msgLeafHash(bytes), `c${i}`);
+      await snm.ingestReceivedContent("alice", SID_HEX, bytes, msgLeafHash(bytes), `c${i}`, undefined, "sha256");
       await wait(60);
     }
 
@@ -232,7 +232,7 @@ describe("DOD-M15-AWAYSCOPE-1: an unattended agent says nothing into a session i
     const snm = await seedActiveSession(h, SID_HEX);
 
     const theirGreeting = new TextEncoder().encode(AWAY_AUTO_REPLY_TEXTS.offerFor("bob"));
-    await snm.ingestReceivedContent("alice", SID_HEX, theirGreeting, msgLeafHash(theirGreeting), "c1");
+    await snm.ingestReceivedContent("alice", SID_HEX, theirGreeting, msgLeafHash(theirGreeting), "c1", undefined, "sha256");
     await wait(80);
 
     expect(snm.getSessionTree("alice", SID_HEX).size()).toBe(1);

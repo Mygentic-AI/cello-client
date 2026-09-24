@@ -123,7 +123,7 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
     const gw = new CountingGateway("block");
     const mgr = await setup(gw);
     const content = enc("recovered-from-park");
-    const res = await mgr.ingestReceivedContent("alice", SID, content, msgLeafHash(content));
+    const res = await mgr.ingestReceivedContent("alice", SID, content, msgLeafHash(content), undefined, undefined, "sha256");
     expect(res.ok).toBe(false);
     expect((res as { reason: string }).reason).toBe("test_block");
     expect(gw.inbound).toBe(1); // the funnel screened it
@@ -140,7 +140,7 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
     const c2 = enc("out-of-order-2");
     const h2 = msgLeafHash(c2);
     mgr.recordWitnessedSequence("alice", SID, hx(h2), 2);
-    const res = await mgr.ingestReceivedContent("alice", SID, c2, h2);
+    const res = await mgr.ingestReceivedContent("alice", SID, c2, h2, undefined, undefined, "sha256");
     expect(res.ok).toBe(false);
     expect(gw.inbound).toBe(1);
     expect(mgr.getSessionTree("alice", SID).size()).toBe(0);
@@ -159,9 +159,9 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
     mgr.recordWitnessedSequence("alice", SID, hx(h1), 1);
     mgr.recordWitnessedSequence("alice", SID, hx(h2), 2);
 
-    await mgr.ingestReceivedContent("alice", SID, c2, h2); // held (seq 2 ahead of 0)
-    await mgr.ingestReceivedContent("alice", SID, c0, h0); // appends leaf 0
-    await mgr.ingestReceivedContent("alice", SID, c1, h1); // appends leaf 1, releases held c2 → leaf 2
+    await mgr.ingestReceivedContent("alice", SID, c2, h2, undefined, undefined, "sha256"); // held (seq 2 ahead of 0)
+    await mgr.ingestReceivedContent("alice", SID, c0, h0, undefined, undefined, "sha256"); // appends leaf 0
+    await mgr.ingestReceivedContent("alice", SID, c1, h1, undefined, undefined, "sha256"); // appends leaf 1, releases held c2 → leaf 2
 
     expect(mgr.getSessionTree("alice", SID).size()).toBe(3);
     expect(gw.inbound).toBe(3);
@@ -178,8 +178,8 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
     const content = enc("dup-race");
     const hash = msgLeafHash(content);
     const [r1, r2] = await Promise.all([
-      mgr.ingestReceivedContent("alice", SID, content, hash),
-      mgr.ingestReceivedContent("alice", SID, content, hash),
+      mgr.ingestReceivedContent("alice", SID, content, hash, undefined, undefined, "sha256"),
+      mgr.ingestReceivedContent("alice", SID, content, hash, undefined, undefined, "sha256"),
     ]);
     expect(r1.ok).toBe(true);
     expect(r2.ok).toBe(true);
@@ -204,8 +204,8 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
     const hashA = msgLeafHash(contentA);
     const hashB = msgLeafHash(contentB);
     const [r1, r2] = await Promise.all([
-      mgr.ingestReceivedContent("alice", SID, contentA, hashA),
-      mgr.ingestReceivedContent("alice", SID, contentB, hashB),
+      mgr.ingestReceivedContent("alice", SID, contentA, hashA, undefined, undefined, "sha256"),
+      mgr.ingestReceivedContent("alice", SID, contentB, hashB, undefined, undefined, "sha256"),
     ]);
     const accepted = [r1, r2].filter((r) => r.ok).length;
     const rejected = [r1, r2].filter((r) => !r.ok && (r as { reason: string }).reason === "session_size_limit_exceeded").length;
@@ -250,7 +250,7 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
       const { mgr, events } = await setupCapturing();
       // Deliberately NO createSessionNode — the session does not exist for alice.
       const content = enc("reply into the void");
-      const res = await mgr.ingestReceivedContent("alice", SID, content, msgLeafHash(content), "corr-orphan");
+      const res = await mgr.ingestReceivedContent("alice", SID, content, msgLeafHash(content), "corr-orphan", undefined, "sha256");
 
       // AC1: refused, with a distinct reason.
       expect(res.ok).toBe(false);
@@ -296,7 +296,7 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
       agreeSessionGenesis(SID, [{ mgr, agentName: "alice" }]);
       await mgr.createSessionNode(SID, "alice", "bobpubkey", "bob-peer-id", "corr-2");
       const content = enc("attributed message");
-      const res = await mgr.ingestReceivedContent("alice", SID, content, msgLeafHash(content), "corr-2");
+      const res = await mgr.ingestReceivedContent("alice", SID, content, msgLeafHash(content), "corr-2", undefined, "sha256");
       expect(res.ok).toBe(true);
       expect(receivedCount(mgr, "alice", SID)).toBe(1);
       /**
@@ -349,7 +349,7 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
     const frame = enc("stand-in-document-frame-bytes");
     // The ingest cross-check is over the CONTENT, not the leaf kind — the kind is decided further
     // down, by the router. Same hash a message would carry.
-    const res = await mgr.ingestReceivedContent("alice", SID, frame, msgLeafHash(frame));
+    const res = await mgr.ingestReceivedContent("alice", SID, frame, msgLeafHash(frame), undefined, undefined, "sha256");
     expect(res.ok).toBe(true);
     expect(gw.inbound).toBe(0); // the gateway was never consulted
     expect(routed).toBe(1); // the document layer got the frame
@@ -365,7 +365,7 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
       () => false, // classify: not a document
     );
     const content = enc("ordinary message");
-    const res = await mgr.ingestReceivedContent("alice", SID, content, msgLeafHash(content));
+    const res = await mgr.ingestReceivedContent("alice", SID, content, msgLeafHash(content), undefined, undefined, "sha256");
     expect(res.ok).toBe(false);
     expect((res as { reason: string }).reason).toBe("test_block");
     expect(gw.inbound).toBe(1);
@@ -375,7 +375,7 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
     const gw = new CountingGateway("allow");
     const mgr = await setup(gw);
     const content = enc("any bytes at all");
-    await mgr.ingestReceivedContent("alice", SID, content, msgLeafHash(content));
+    await mgr.ingestReceivedContent("alice", SID, content, msgLeafHash(content), undefined, undefined, "sha256");
     expect(gw.inbound).toBe(1);
   });
 });

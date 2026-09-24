@@ -143,7 +143,7 @@ describe("DOD-TIER-BOUNDS-SETTINGS — resolveTierBound + the override in effect
     mgr.setSetting("alice", boundSettingKey("known", "max_bytes"), "10"); // tiny override
     await mgr.createSessionNode(SID, "alice", known, "peer", "corr");
     const over = new Uint8Array(20); // 20 > 10 → refused at the OVERRIDE (default 100 MB would accept)
-    const res = await mgr.ingestReceivedContent("alice", SID, over, msgLeafHash(over), "c1");
+    const res = await mgr.ingestReceivedContent("alice", SID, over, msgLeafHash(over), "c1", undefined, "sha256");
     expect(res).toMatchObject({ ok: false, reason: "session_size_limit_exceeded" });
   });
 });

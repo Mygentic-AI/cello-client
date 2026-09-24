@@ -345,7 +345,7 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     await mgr.createSessionNode("s-screen", "alice", "bb".repeat(32), "bob-peer-id", "corr-screen");
 
     const content = new TextEncoder().encode(ATTACK);
-    const res = await mgr.ingestReceivedContent("alice", "s-screen", content, msgLeafHash(content));
+    const res = await mgr.ingestReceivedContent("alice", "s-screen", content, msgLeafHash(content), undefined, undefined, "sha256");
     expect(res.ok, "a terminal block still leafs and acks — it does not fail").toBe(true);
 
     const [notice] = mgr.takeContentRefusals("alice", "s-screen", "op");
@@ -388,7 +388,7 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     await mgr.createSessionNode("s-transient", "alice", "bb".repeat(32), "bob-peer-id", "corr-transient");
 
     const content = new TextEncoder().encode("an ordinary message");
-    const res = await mgr.ingestReceivedContent("alice", "s-transient", content, msgLeafHash(content));
+    const res = await mgr.ingestReceivedContent("alice", "s-transient", content, msgLeafHash(content), undefined, undefined, "sha256");
     expect(res.ok).toBe(false);
 
     const [notice] = mgr.takeContentRefusals("alice", "s-transient", "op");
@@ -409,7 +409,7 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     insertSessionRow("s-closed", "abandoned");
 
     const content = new TextEncoder().encode("too late");
-    const res = await mgr.ingestReceivedContent("alice", "s-closed", content, msgLeafHash(content));
+    const res = await mgr.ingestReceivedContent("alice", "s-closed", content, msgLeafHash(content), undefined, undefined, "sha256");
     expect(res.ok).toBe(false);
     expect((res as { reason: string }).reason).toBe("session_committed");
 
@@ -429,7 +429,7 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     const mgr = handle.getSessionNodeManager();
 
     const content = new TextEncoder().encode("for a session that is not here");
-    const res = await mgr.ingestReceivedContent("alice", "s-nowhere", content, msgLeafHash(content));
+    const res = await mgr.ingestReceivedContent("alice", "s-nowhere", content, msgLeafHash(content), undefined, undefined, "sha256");
     expect((res as { reason: string }).reason).toBe("session_orphaned");
 
     const [notice] = mgr.takeContentRefusals("alice", "s-nowhere", "op");
@@ -452,7 +452,7 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     const cap = mgr.resolveTierBound("alice", 1, "max_bytes");
     const content = new Uint8Array(cap + 1);
 
-    const res = await mgr.ingestReceivedContent("alice", "s-cap", content, msgLeafHash(content));
+    const res = await mgr.ingestReceivedContent("alice", "s-cap", content, msgLeafHash(content), undefined, undefined, "sha256");
     expect((res as { reason: string }).reason).toBe("session_size_limit_exceeded");
 
     const [notice] = mgr.takeContentRefusals("alice", "s-cap", "op");
@@ -482,7 +482,7 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     insertSessionRow("s-anon", "active", "");
 
     const content = new TextEncoder().encode("from nobody in particular");
-    const res = await mgr.ingestReceivedContent("alice", "s-anon", content, msgLeafHash(content));
+    const res = await mgr.ingestReceivedContent("alice", "s-anon", content, msgLeafHash(content), undefined, undefined, "sha256");
     expect((res as { reason: string }).reason).toBe("sender_unresolved");
 
     const [notice] = mgr.takeContentRefusals("alice", "s-anon", "op");

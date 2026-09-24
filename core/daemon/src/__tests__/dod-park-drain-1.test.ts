@@ -753,6 +753,8 @@ describe("E: the claim itself — a message parked mid-run reaches a RUNNING dae
         recipientPubkey: recipientPub,
         contentHash: hash,
         content,
+        contentHashAlg: "sha256",
+        leafKind: 0,
       });
       const deposit = await new ContentParkClient({ relayPeerId: relay.peerId, relayAddrs: [relay.addr], logger }).deposit(
         sender,

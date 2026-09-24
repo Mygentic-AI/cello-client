@@ -49,6 +49,8 @@ describe("M12-P18: the drain sweeps refused-session content, and only that", () 
     const contentHash = new Uint8Array(createHash("sha256").update(new Uint8Array([0x00])).update(content).digest());
     const ciphertext = await sealParkEnvelope({
       signer: sender, sessionIdHex: SID, recipientPubkey: await recipient.getPublicKey(), contentHash,
+      contentHashAlg: "sha256",
+      leafKind: 0,
     });
 
     const sessionNodeManager = {

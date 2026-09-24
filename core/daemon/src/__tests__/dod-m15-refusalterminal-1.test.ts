@@ -176,7 +176,7 @@ describe("DOD-M15-REFUSALTERMINAL-1", () => {
     // The relay tells us the leaf exists. The backstop arms a fetch for it.
     mgr.recordWitnessedSequence("alice", "s-closed", hashHex, 4);
     // The bytes then arrive and are refused, before the grace window expires.
-    const res = await mgr.ingestReceivedContent("alice", "s-closed", content, msgLeafHash(content));
+    const res = await mgr.ingestReceivedContent("alice", "s-closed", content, msgLeafHash(content), undefined, undefined, "sha256");
     expect((res as { reason: string }).reason).toBe("session_committed");
 
     await settle(500);
@@ -203,7 +203,7 @@ describe("DOD-M15-REFUSALTERMINAL-1", () => {
     const hashHex = Buffer.from(msgLeafHash(content)).toString("hex");
     const mgr = handle!.getSessionNodeManager();
 
-    await mgr.ingestReceivedContent("alice", "s-closed", content, msgLeafHash(content));
+    await mgr.ingestReceivedContent("alice", "s-closed", content, msgLeafHash(content), undefined, undefined, "sha256");
     drains.length = 0;
 
     // The relay redelivers the same leaf. In production this happened ~20 times a minute.
@@ -225,7 +225,7 @@ describe("DOD-M15-REFUSALTERMINAL-1", () => {
     const content = new TextEncoder().encode("too late");
     const hashHex = Buffer.from(msgLeafHash(content)).toString("hex");
     await handle!.getSessionNodeManager()
-      .ingestReceivedContent("alice", "s-closed", content, msgLeafHash(content));
+      .ingestReceivedContent("alice", "s-closed", content, msgLeafHash(content), undefined, undefined, "sha256");
 
     await handle!.stop("test_restart");
     handle = null;
@@ -262,7 +262,7 @@ describe("DOD-M15-REFUSALTERMINAL-1", () => {
     const hashHex = Buffer.from(msgLeafHash(content)).toString("hex");
     const mgr = handle!.getSessionNodeManager();
 
-    const res = await mgr.ingestReceivedContent("alice", "s-live", content, msgLeafHash(content));
+    const res = await mgr.ingestReceivedContent("alice", "s-live", content, msgLeafHash(content), undefined, undefined, "sha256");
     expect((res as { reason: string }).reason).toBe("gateway_unavailable");
     drains.length = 0;
 
@@ -292,7 +292,7 @@ describe("DOD-M15-REFUSALTERMINAL-1", () => {
     const claimed = msgLeafHash(new TextEncoder().encode("something else entirely"));
     const mgr = handle!.getSessionNodeManager();
 
-    const res = await mgr.ingestReceivedContent("alice", "s-live", content, claimed);
+    const res = await mgr.ingestReceivedContent("alice", "s-live", content, claimed, undefined, undefined, "sha256");
     expect((res as { reason: string }).reason).toBe("content_hash_mismatch");
     drains.length = 0;
 
@@ -314,7 +314,7 @@ describe("DOD-M15-REFUSALTERMINAL-1", () => {
 
     for (let i = 0; i < 3; i++) {
       const content = new TextEncoder().encode(`refused ${i}`);
-      await mgr.ingestReceivedContent("alice", "s-closed", content, msgLeafHash(content));
+      await mgr.ingestReceivedContent("alice", "s-closed", content, msgLeafHash(content), undefined, undefined, "sha256");
     }
     const first = ((await inbox(client))["refusals"] as Refusal[])
       .find((r) => r.reason === "session_committed")!;
@@ -324,7 +324,7 @@ describe("DOD-M15-REFUSALTERMINAL-1", () => {
     await client.send("cello_dismiss", { session_id: "s-closed", agent: "alice" });
 
     const content = new TextEncoder().encode("refused again");
-    await mgr.ingestReceivedContent("alice", "s-closed", content, msgLeafHash(content));
+    await mgr.ingestReceivedContent("alice", "s-closed", content, msgLeafHash(content), undefined, undefined, "sha256");
 
     const after = ((await inbox(client))["refusals"] as Refusal[])
       .find((r) => r.reason === "session_committed")!;
@@ -339,7 +339,7 @@ describe("DOD-M15-REFUSALTERMINAL-1", () => {
     const client = await connect();
     const content = new TextEncoder().encode("too late");
     await handle!.getSessionNodeManager()
-      .ingestReceivedContent("alice", "s-closed", content, msgLeafHash(content));
+      .ingestReceivedContent("alice", "s-closed", content, msgLeafHash(content), undefined, undefined, "sha256");
 
     const guidance = String((await inbox(client))["refusals_guidance"]);
     expect(guidance).toContain("times_since_dismissed");
@@ -364,7 +364,7 @@ describe("DOD-M15-REFUSALTERMINAL-1", () => {
     const mgr = handle!.getSessionNodeManager();
 
     for (let i = 0; i < 3; i++) {
-      await mgr.ingestReceivedContent("alice", "s-closed", content, msgLeafHash(content));
+      await mgr.ingestReceivedContent("alice", "s-closed", content, msgLeafHash(content), undefined, undefined, "sha256");
     }
     expect(logged.filter((l) => l.event === "session.content.terminal_refusal")).toHaveLength(1);
   });
@@ -391,7 +391,7 @@ describe("DOD-M15-REFUSALTERMINAL-1", () => {
       insert.run(agentId, "s-closed", i.toString(16).padStart(64, "0"), 1000 + i);
     }
     const content = new TextEncoder().encode("one over the cap");
-    await mgr.ingestReceivedContent("alice", "s-closed", content, msgLeafHash(content));
+    await mgr.ingestReceivedContent("alice", "s-closed", content, msgLeafHash(content), undefined, undefined, "sha256");
 
     const rows = db
       .prepare("SELECT COUNT(*) AS n FROM terminal_content_refusals WHERE agent_id = ? AND session_id = ?")
@@ -417,7 +417,7 @@ describe("DOD-M15-REFUSALTERMINAL-1", () => {
     const content = new TextEncoder().encode(ATTACK);
     const mgr = handle!.getSessionNodeManager();
     mgr.recordWitnessedSequence("alice", "s-closed", Buffer.from(msgLeafHash(content)).toString("hex"), 4);
-    await mgr.ingestReceivedContent("alice", "s-closed", content, msgLeafHash(content));
+    await mgr.ingestReceivedContent("alice", "s-closed", content, msgLeafHash(content), undefined, undefined, "sha256");
     await settle();
 
     const everything = JSON.stringify(logged) + JSON.stringify(await inbox(client));

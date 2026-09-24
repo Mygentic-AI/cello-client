@@ -158,6 +158,8 @@ describe("M12-P17: annex screening — the branch that deletes", () => {
     const contentHash = new Uint8Array(createHash("sha256").update(new Uint8Array([0x00])).update(content).digest());
     const ciphertext = await sealParkEnvelope({
       signer: sender, sessionIdHex: SID, recipientPubkey: await recipient.getPublicKey(), contentHash, content,
+      contentHashAlg: "sha256",
+      leafKind: 0,
     });
     return { ciphertext, contentHashHex: Buffer.from(contentHash).toString("hex"), recipient, content };
   }
@@ -182,6 +184,7 @@ describe("M12-P17: annex screening — the branch that deletes", () => {
     const ciphertext = await sealParkEnvelope({
       signer: sender, sessionIdHex: SID, recipientPubkey: await recipient.getPublicKey(),
       contentHash, content, contentHashAlg: alg,
+      leafKind: 0,
     });
     return { ciphertext, contentHashHex: Buffer.from(contentHash).toString("hex"), recipient, content, salt };
   }

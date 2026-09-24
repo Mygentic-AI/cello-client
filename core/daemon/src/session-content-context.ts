@@ -128,9 +128,11 @@ export interface SessionContentPipelineContext {
         sessionId: string,
         contentHashHex: string,
         content: Uint8Array,
-        structure1Cbor?: Uint8Array,
-        structure2Cbor?: Uint8Array,
-        contentHashAlg?: string,
+        structure1Cbor: Uint8Array | undefined,
+        structure2Cbor: Uint8Array | undefined,
+        contentHashAlg: string,
+        structure1Signature: Uint8Array | undefined,
+        leafKind: number,
       ) => boolean)
     | null;
   readonly onContentArrived: ((agentName: string, sessionId: string, senderPubkey: string) => void) | null;

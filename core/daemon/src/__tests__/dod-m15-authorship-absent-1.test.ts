@@ -452,6 +452,8 @@ describe("DOD-M15-AUTHORSHIP-ABSENT-1 — the refusal does NOT hold, and the ope
     //    sender's park backstop deposits it.
     const sealed = await sealParkEnvelope({
       signer: sender, sessionIdHex: SID, recipientPubkey: recipientPub, content: BODY, contentHash,
+      contentHashAlg: "sha256",
+      leafKind: 0,
     });
     const plaintext = await recipient.openContentSeal!(sealed);
     const recovered = await fx.snm.recoverParkedEntry("alice", SID, recipientPub, plaintext!, contentHash, "corr");
@@ -485,6 +487,8 @@ describe("DOD-M15-AUTHORSHIP-ABSENT-1 — the refusal does NOT hold, and the ope
 
     const sealed = await sealParkEnvelope({
       signer: sender, sessionIdHex: SID, recipientPubkey: recipientPub, content: BODY, contentHash,
+      contentHashAlg: "sha256",
+      leafKind: 0,
     });
     const plaintext = await recipient.openContentSeal!(sealed);
     expect((await fx.snm.recoverParkedEntry("alice", SID, recipientPub, plaintext!, contentHash, "corr")).ok).toBe(true);

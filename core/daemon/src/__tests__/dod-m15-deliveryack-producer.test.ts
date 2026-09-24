@@ -157,6 +157,8 @@ describe("DELIVERYACK/producer: an acknowledgement with nowhere to go goes to th
       content: body,
       senderPubkey: new Uint8Array(Buffer.from(bobPubHex, "hex")),
       parkSig: await bob.sign(buildParkContentTbs(SID, alicePub, contentHash)),
+      contentHashAlg: "sha256",
+      leafKind: 0,
     });
     const deliverFromMailbox = (): Promise<unknown> =>
       mgr.recoverParkedEntry("alice", SID, alicePub, envelope, contentHash, "corr");
@@ -177,6 +179,8 @@ describe("DELIVERYACK/producer: an acknowledgement with nowhere to go goes to th
           content: payload,
           senderPubkey: new Uint8Array(Buffer.from(bobPubHex, "hex")),
           parkSig: await bob.sign(buildParkContentTbs(SID, alicePub, slot)),
+          contentHashAlg: "sha256",
+          leafKind: 0,
         }),
         slot,
       };

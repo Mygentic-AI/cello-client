@@ -23,6 +23,7 @@ import type { InboundRefusals } from "./inbound-refusals.js";
 import { type ParkedDrainReason, type ParkAttempt, type ActiveSessionEntry, MAX_REFUSED_PARKED_ENTRIES } from "./session-node-types.js";
 import { ParkEnvelopeError, type ParkAuthFailure } from "./park-envelope.js";
 import { extractErrorMessage } from "./error-message.js";
+import { CONTENT_HASH_ALGS } from "./wire-content-hash.js";
 
 /** What park recovery needs from the manager, stated explicitly rather than handed `this`. */
 export interface ParkContext {
@@ -53,9 +54,9 @@ export interface ParkContext {
     sessionId: string,
     content: Uint8Array,
     contentHash: Uint8Array,
-    correlationId?: string,
-    recoveredSeq?: number,
-    contentHashAlgIn?: string | null,
+    correlationId: string | undefined,
+    recoveredSeq: number | undefined,
+    contentHashAlgIn: string | null | undefined,
   ): Promise<{ ok: true; leafIndex: number; sequenceNumber: number; held?: boolean; appendedCount?: number; screenedOut?: boolean } | { ok: false; reason: string; retained?: boolean }>;
   witnessReceivedLeaf(
     agentName: string,
@@ -101,7 +102,7 @@ export class ParkRecovery {
   #parkFaultRemaining = 0;
   #parkFaultCause = "standing_receiver_creating";
   #contentParkHook:
-    | ((args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; structure1Signature?: Uint8Array; leafKind?: number; contentHashAlg: string | undefined }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string; retryAfterMs?: number }>)
+    | ((args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; structure1Signature?: Uint8Array; leafKind: number; contentHashAlg: string }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string; retryAfterMs?: number }>)
     | null = null;
   /** DOD-PARK-DRAIN-1: the composition root's parked-mailbox drain — see setParkedDrainHook. */
   #parkedDrainHook: ((agentName: string, reason: ParkedDrainReason) => void) | null = null;
@@ -145,7 +146,7 @@ export class ParkRecovery {
    * caller only enqueues on an honest {ok:false}).
    */
   setContentParkHook(
-    fn: (args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; structure1Signature?: Uint8Array; leafKind?: number; contentHashAlg: string | undefined }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string; retryAfterMs?: number }>,
+    fn: (args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; structure1Signature?: Uint8Array; leafKind: number; contentHashAlg: string }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string; retryAfterMs?: number }>,
   ): void {
     this.#contentParkHook = fn;
   }
@@ -201,16 +202,11 @@ export class ParkRecovery {
    * result — the deposit itself and its logging are unchanged either way.
    */
   /**
-   * `contentHashAlg` is `string | undefined`, NOT optional — B2b-1 review F4's shape, applied to the
-   * last place it was missing.
-   *
-   * Optional, dropping it at a call site was neither a typecheck error nor a test failure, because
-   * absent silently means `sha256` and that is the only value in play today. Measured: the
-   * direct-dial-fail route's mutant SURVIVED the whole daemon suite. Requiring the argument — even
-   * when its value is `undefined` — forces each of the three callers to state what this message was
-   * hashed under, so a new fourth caller cannot omit it by accident.
+   * `contentHashAlg` and the leaf kind are REQUIRED: every caller states what this message was hashed
+   * under and which leaf domain it belongs to, so a new caller cannot omit either by accident — an
+   * absent name is refused at the recipient, never read as `sha256`.
    */
-  async parkContent(agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor: Uint8Array | undefined, structure2Cbor: Uint8Array | undefined, contentHashAlg: string | undefined, structure1Signature?: Uint8Array, parkLeafKind?: number): Promise<ParkAttempt> {
+  async parkContent(agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor: Uint8Array | undefined, structure2Cbor: Uint8Array | undefined, contentHashAlg: string, structure1Signature: Uint8Array | undefined, parkLeafKind: number): Promise<ParkAttempt> {
     // Fault injection FIRST, so it reproduces the real shape: the refusal happens at the same point
     // the live hook refuses (before any deposit), with the same event and the same `cause`.
     if (this.#parkFaultRemaining > 0) {
@@ -347,7 +343,11 @@ export class ParkRecovery {
         relayAddrs: relay.relayAddrs,
         contentHashHex: slotHashHex,
         content: payload,
-        contentHashAlg: undefined,
+        // Neither label is read for an acknowledgement: recovery recognises the tag and returns
+        // before any content-hash check or leaf append. They are stated because the envelope has
+        // one shape, not because they describe the payload.
+        contentHashAlg: CONTENT_HASH_ALGS.SHA256,
+        leafKind: 0x00,
       });
       if (!result.ok) return { outcome: "refused", cause: result.cause ?? result.reason };
       return { outcome: "parked" };
@@ -720,7 +720,7 @@ export class ParkRecovery {
         agentName, sessionId, correlationId,
         contentHash: contentHashHex,
         priorDeclaredAlg,
-        recoveredAlg: env.contentHashAlg ?? "(absent → sha256)",
+        recoveredAlg: env.contentHashAlg ?? "(absent)",
         impact: "THIS EXACT MESSAGE was refused on the direct path because it named an algorithm this build cannot read, and the same content has now been accepted via the relay park under an algorithm this build CAN read. The refusal did not hold: the message was delivered by the other route.",
       });
     }

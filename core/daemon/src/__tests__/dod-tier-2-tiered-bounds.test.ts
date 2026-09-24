@@ -225,7 +225,7 @@ describe("DOD-TIER-2 — per-tier byte cap on received content (AC2)", () => {
     const { leafIndex } = mgr.appendSessionLeaf("alice", SID, "msg", "aa".repeat(32), "seed");
     mgr.recordTranscriptMessage("alice", SID, leafIndex, "received", big, "seed");
     const tip = new TextEncoder().encode("this tips past 25 MB");
-    const unknownRes = await mgr.ingestReceivedContent("alice", SID, tip, msgLeafHash(tip), "corr-2");
+    const unknownRes = await mgr.ingestReceivedContent("alice", SID, tip, msgLeafHash(tip), "corr-2", undefined, "sha256");
     expect(unknownRes).toMatchObject({ ok: false, reason: "session_size_limit_exceeded" });
 
     // Same 25 MB prior, KNOWN-tier contact: 25 MB + tip is well under KNOWN's 100 MB cap → accepted.
@@ -237,7 +237,7 @@ describe("DOD-TIER-2 — per-tier byte cap on received content (AC2)", () => {
     const { leafIndex: li2 } = mgr.appendSessionLeaf("alice", SID2, "msg", "bb".repeat(32), "seed2");
     mgr.recordTranscriptMessage("alice", SID2, li2, "received", big2, "seed2");
     const tip2 = new TextEncoder().encode("still fine for a KNOWN contact");
-    const knownRes = await mgr.ingestReceivedContent("alice", SID2, tip2, msgLeafHash(tip2), "corr-3");
+    const knownRes = await mgr.ingestReceivedContent("alice", SID2, tip2, msgLeafHash(tip2), "corr-3", undefined, "sha256");
     expect(knownRes.ok).toBe(true);
   });
 
@@ -253,7 +253,7 @@ describe("DOD-TIER-2 — per-tier byte cap on received content (AC2)", () => {
     const { leafIndex } = mgr.appendSessionLeaf("alice", SID3, "msg", "cc".repeat(32), "seed3");
     mgr.recordTranscriptMessage("alice", SID3, leafIndex, "received", huge, "seed3");
     const tip = new TextEncoder().encode("this pushes past the 100 MB KNOWN cap");
-    const res = await mgr.ingestReceivedContent("alice", SID3, tip, msgLeafHash(tip), "corr-4");
+    const res = await mgr.ingestReceivedContent("alice", SID3, tip, msgLeafHash(tip), "corr-4", undefined, "sha256");
     expect(res).toMatchObject({ ok: false, reason: "session_size_limit_exceeded" });
   });
 });

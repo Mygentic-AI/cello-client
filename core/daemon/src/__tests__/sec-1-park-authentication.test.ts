@@ -192,6 +192,8 @@ describe("SEC-1: relay-park content authentication (fail-closed)", () => {
         structure2Cbor: rec.structure2Cbor,
         senderPubkey: counterpartyPub,
         parkSig,
+        contentHashAlg: "sha256",
+        leafKind: 0,
       }), hash);
     };
 
@@ -265,6 +267,8 @@ describe("SEC-1: relay-park content authentication (fail-closed)", () => {
       content: forged,
       senderPubkey: attackerPub,
       parkSig: sig,
+      contentHashAlg: "sha256",
+      leafKind: 0,
     });
 
     const res = await mgr.recoverParkedEntry(AGENT, sid, victimPub, plaintext, forgedHash);
@@ -282,7 +286,7 @@ describe("SEC-1: relay-park content authentication (fail-closed)", () => {
 
     const sig = await signPark(counterparty, { contentHash: hash });
     sig[0] ^= 0xff; // flip a bit
-    const plaintext = encodeParkEnvelope({ content, senderPubkey: counterpartyPub, parkSig: sig });
+    const plaintext = encodeParkEnvelope({ content, senderPubkey: counterpartyPub, parkSig: sig, contentHashAlg: "sha256", leafKind: 0 });
 
     const res = await mgr.recoverParkedEntry(AGENT, sid, victimPub, plaintext, hash);
 
@@ -301,7 +305,7 @@ describe("SEC-1: relay-park content authentication (fail-closed)", () => {
     const hash = msgLeafHash(content);
 
     const sig = await signPark(counterparty, { sessionIdHex: "a".repeat(64), contentHash: hash });
-    const plaintext = encodeParkEnvelope({ content, senderPubkey: counterpartyPub, parkSig: sig });
+    const plaintext = encodeParkEnvelope({ content, senderPubkey: counterpartyPub, parkSig: sig, contentHashAlg: "sha256", leafKind: 0 });
 
     const res = await mgr.recoverParkedEntry(AGENT, sid, victimPub, plaintext, hash);
     expect(res.ok).toBe(false);
@@ -316,7 +320,7 @@ describe("SEC-1: relay-park content authentication (fail-closed)", () => {
 
     const other = generateKeypair();
     const sig = await signPark(counterparty, { recipientPubkey: await other.getPublicKey(), contentHash: hash });
-    const plaintext = encodeParkEnvelope({ content, senderPubkey: counterpartyPub, parkSig: sig });
+    const plaintext = encodeParkEnvelope({ content, senderPubkey: counterpartyPub, parkSig: sig, contentHashAlg: "sha256", leafKind: 0 });
 
     const res = await mgr.recoverParkedEntry(AGENT, sid, victimPub, plaintext, hash);
     expect(res.ok).toBe(false);
@@ -331,7 +335,7 @@ describe("SEC-1: relay-park content authentication (fail-closed)", () => {
 
     // Signature legitimately covers `real`; the attacker ships `swapped` under it.
     const sig = await signPark(counterparty, { contentHash: msgLeafHash(real) });
-    const plaintext = encodeParkEnvelope({ content: swapped, senderPubkey: counterpartyPub, parkSig: sig });
+    const plaintext = encodeParkEnvelope({ content: swapped, senderPubkey: counterpartyPub, parkSig: sig, contentHashAlg: "sha256", leafKind: 0 });
 
     const res = await mgr.recoverParkedEntry(AGENT, sid, victimPub, plaintext, msgLeafHash(swapped));
     expect(res.ok).toBe(false);
@@ -347,7 +351,7 @@ describe("SEC-1: relay-park content authentication (fail-closed)", () => {
     const hash = msgLeafHash(content);
 
     const sig = await signPark(counterparty, { contentHash: hash });
-    const plaintext = encodeParkEnvelope({ content, senderPubkey: counterpartyPub, parkSig: sig });
+    const plaintext = encodeParkEnvelope({ content, senderPubkey: counterpartyPub, parkSig: sig, contentHashAlg: "sha256", leafKind: 0 });
 
     const res = await mgr.recoverParkedEntry(AGENT, sid, victimPub, plaintext, hash);
 
@@ -367,7 +371,9 @@ describe("SEC-1: relay-park content authentication (fail-closed)", () => {
       content,
       senderPubkey: counterpartyPub,
       parkSig: sig,
-      // deliberately no structure1Cbor / structure2Cbor
+      // deliberately no structure1Cbor / structure2Cbor,
+      contentHashAlg: "sha256",
+      leafKind: 0,
     });
 
     const res = await mgr.recoverParkedEntry(AGENT, sid, victimPub, plaintext, hash);
@@ -399,6 +405,8 @@ describe("SEC-1: relay-park content authentication (fail-closed)", () => {
       content,
       structure1Cbor: s1,
       structure2Cbor: s2,
+      contentHashAlg: "sha256",
+      leafKind: 0,
     });
 
     // …and exactly what the recover path does: unseal with the RECIPIENT's key, then gate it.
@@ -426,6 +434,8 @@ describe("SEC-1: relay-park content authentication (fail-closed)", () => {
       recipientPubkey: victimPub,
       contentHash: hash,
       content,
+      contentHashAlg: "sha256",
+      leafKind: 0,
     });
 
     const unsealed = await victim.openContentSeal!(ciphertext);
@@ -453,6 +463,8 @@ describe("SEC-1: relay-park content authentication (fail-closed)", () => {
       recipientPubkey: victimPub,
       contentHash: hash,
       content,
+      contentHashAlg: "sha256",
+      leafKind: 0,
     });
     const unsealed = await victim.openContentSeal!(ciphertext);
 
@@ -489,7 +501,7 @@ describe("SEC-1: relay-park content authentication (fail-closed)", () => {
     const content = new TextEncoder().encode("orphan");
     const hash = msgLeafHash(content);
     const sig = await signPark(counterparty, { contentHash: hash });
-    const plaintext = encodeParkEnvelope({ content, senderPubkey: counterpartyPub, parkSig: sig });
+    const plaintext = encodeParkEnvelope({ content, senderPubkey: counterpartyPub, parkSig: sig, contentHashAlg: "sha256", leafKind: 0 });
 
     const res = await mgr.recoverParkedEntry(AGENT, sid, victimPub, plaintext, hash);
 

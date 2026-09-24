@@ -119,7 +119,7 @@ describe("DOD-M15-SEALWIRE-1 part B1: an ABSENT name still works — every peer 
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-alg-a-" });
     await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
 
-    const res = await fx.snm.ingestReceivedContent("alice", SID, CONTENT, wireContentHash(CONTENT), "corr");
+    const res = await fx.snm.ingestReceivedContent("alice", SID, CONTENT, wireContentHash(CONTENT), "corr", undefined, "sha256");
     expect(res.ok, "an unnamed frame must still be accepted").toBe(true);
   }, 60_000);
 
@@ -208,7 +208,7 @@ describe("DOD-M15-SEALWIRE-1 part B1: a version skew is not a tamper", () => {
     await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
 
     const res = await fx.snm.ingestReceivedContent(
-      "alice", SID, CONTENT, wireContentHash(new TextEncoder().encode("the number is 9900")), "corr",
+      "alice", SID, CONTENT, wireContentHash(new TextEncoder().encode("the number is 9900")), "corr", undefined, "sha256"
     );
     expect(res.ok).toBe(false);
     expect(res.ok === false && res.reason).toBe("content_hash_mismatch");
@@ -304,7 +304,7 @@ describe("DOD-M15-SEALWIRE-1 part B1: a refusal must not switch the tamper detec
     await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
 
     await fx.snm.ingestReceivedContent(
-      "alice", SID, CONTENT, wireContentHash(new TextEncoder().encode("different")), "corr",
+      "alice", SID, CONTENT, wireContentHash(new TextEncoder().encode("different")), "corr", undefined, "sha256"
     );
     fx.snm.runAutoAcknowledgeGateForTest("alice", SID);
 
@@ -350,7 +350,7 @@ describe("DOD-M15-SEALWIRE-1 part B1: a refusal must not switch the tamper detec
 
     // Tamper, then junk. The junk must NOT overwrite the tamper mark.
     await fx.snm.ingestReceivedContent(
-      "alice", SID, CONTENT, wireContentHash(new TextEncoder().encode("different")), "corr",
+      "alice", SID, CONTENT, wireContentHash(new TextEncoder().encode("different")), "corr", undefined, "sha256"
     );
     await fx.snm.ingestReceivedContent("alice", SID, CONTENT, wireContentHash(CONTENT), "corr2", undefined, "junk-v1");
     fx.snm.runAutoAcknowledgeGateForTest("alice", SID);
@@ -362,7 +362,7 @@ describe("DOD-M15-SEALWIRE-1 part B1: a refusal must not switch the tamper detec
     // Junk, then tamper — on a separate session so the two orderings cannot mask each other.
     await fx.snm.ingestReceivedContent("alice", SID2, CONTENT, wireContentHash(CONTENT), "corr3", undefined, "junk-v1");
     await fx.snm.ingestReceivedContent(
-      "alice", SID2, CONTENT, wireContentHash(new TextEncoder().encode("different")), "corr4",
+      "alice", SID2, CONTENT, wireContentHash(new TextEncoder().encode("different")), "corr4", undefined, "sha256"
     );
     fx.snm.runAutoAcknowledgeGateForTest("alice", SID2);
     expect(
@@ -384,7 +384,7 @@ describe("DOD-M15-SEALWIRE-1 part B1: a refusal must not switch the tamper detec
 
     await fx.snm.ingestReceivedContent("alice", SID, CONTENT, wireContentHash(CONTENT), "c", undefined, "junk-v1");
     await fx.snm.ingestReceivedContent(
-      "alice", SID2, CONTENT, wireContentHash(new TextEncoder().encode("different")), "c",
+      "alice", SID2, CONTENT, wireContentHash(new TextEncoder().encode("different")), "c", undefined, "sha256"
     );
 
     const skew = evaluateSealUpgrade(fx.snm.getSealUpgradeReadiness("alice", SID));

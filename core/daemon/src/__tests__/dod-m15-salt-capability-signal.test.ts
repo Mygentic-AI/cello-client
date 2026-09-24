@@ -116,6 +116,7 @@ describe("DOD-M15-SEALWIRE-1 B2b-2 constraint 4: the agreement is the capability
       senderPubkey,
       parkSig: await kp.sign(buildParkContentTbs(SID, RECIPIENT, contentHash)),
       contentHashAlg: CONTENT_HASH_ALGS.HMAC_SALT_V1,
+      leafKind: 0,
     });
 
     const decoded = decodeParkEnvelope(v3);

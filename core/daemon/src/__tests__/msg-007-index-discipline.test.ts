@@ -40,7 +40,7 @@ describe("DOD-M12B-INDEX-1: the sender's own leaf takes its relay-assigned posit
     // Their message at position 1 arrives first, so this tree has a gap at 0 and stays empty.
     const theirs1 = new TextEncoder().encode("theirs at 1");
     snm.recordWitnessedSequence(AGENT, SID, hx(msgLeafHash(theirs1)), 1);
-    await snm.ingestReceivedContent(AGENT, SID, theirs1, msgLeafHash(theirs1), "corr");
+    await snm.ingestReceivedContent(AGENT, SID, theirs1, msgLeafHash(theirs1), "corr", undefined, "sha256");
     expect(snm.getSessionTree(AGENT, SID).size(), "the gap at 0 keeps the tree empty").toBe(0);
 
     // Now WE send. The relay assigns position 2. Appending at the tail would put our own message at
@@ -53,7 +53,7 @@ describe("DOD-M12B-INDEX-1: the sender's own leaf takes its relay-assigned posit
     // Their message at 0 arrives. Everything drains in canonical order, ours included.
     const theirs0 = new TextEncoder().encode("theirs at 0");
     snm.recordWitnessedSequence(AGENT, SID, hx(msgLeafHash(theirs0)), 0);
-    await snm.ingestReceivedContent(AGENT, SID, theirs0, msgLeafHash(theirs0), "corr");
+    await snm.ingestReceivedContent(AGENT, SID, theirs0, msgLeafHash(theirs0), "corr", undefined, "sha256");
 
     expect(snm.getSessionTree(AGENT, SID).size()).toBe(3);
     expect(
@@ -69,14 +69,14 @@ describe("DOD-M12B-INDEX-1: the sender's own leaf takes its relay-assigned posit
 
     const theirs = new TextEncoder().encode("theirs at 1");
     snm.recordWitnessedSequence(AGENT, SID, hx(msgLeafHash(theirs)), 1);
-    await snm.ingestReceivedContent(AGENT, SID, theirs, msgLeafHash(theirs), "corr");
+    await snm.ingestReceivedContent(AGENT, SID, theirs, msgLeafHash(theirs), "corr", undefined, "sha256");
 
     const ours = new TextEncoder().encode("something we said");
     snm.placeOwnLeaf(AGENT, SID, hx(msgLeafHash(ours)), ours, 2, "corr-send", "msg", undefined);
 
     const theirs0 = new TextEncoder().encode("theirs at 0");
     snm.recordWitnessedSequence(AGENT, SID, hx(msgLeafHash(theirs0)), 0);
-    await snm.ingestReceivedContent(AGENT, SID, theirs0, msgLeafHash(theirs0), "corr");
+    await snm.ingestReceivedContent(AGENT, SID, theirs0, msgLeafHash(theirs0), "corr", undefined, "sha256");
 
     // Direction is what the transcript is read by. Releasing our own message down the RECEIVED path
     // would put our words in the counterparty's mouth in the sealed record, and hand them back to

@@ -1083,26 +1083,26 @@ export function createContentPark(deps: ContentParkDeps) {
       }
 
       /**
-       * ⚠️ PARSED BEFORE THE BRANCH, and refused on the raw branch rather than dropped — review
-       * HIGH-2, and it was the same defect this parameter exists to prevent, reintroduced one branch
-       * over. It used to be read INSIDE the `content` branch, so `ciphertext` + `contentHashAlg`
-       * discarded the algorithm in silence: the far end then resolves the absent field to `sha256`,
-       * recomputes unsalted, and reports `content_hash_mismatch` — a tamper verdict on an honest
-       * message, with nothing on the sender side logging anything at all.
-       *
-       * A raw deposit has nowhere to PUT the name (there is no envelope), so naming one is a
-       * contradiction, not a preference. Refuse it.
+       * A `content` deposit is sealed into the one park envelope, which names the content-hash
+       * algorithm and the leaf kind — both REQUIRED, never defaulted. A raw `ciphertext` deposit has
+       * no envelope, so naming either is a contradiction and is refused rather than dropped.
        */
-      let contentHashAlg: string | undefined;
       const rawAlg = params?.contentHashAlg;
-      if (rawAlg !== undefined && rawAlg !== null) {
+      const rawLeafKind = params?.leafKind;
+      if (hasCiphertext && (rawAlg !== undefined || rawLeafKind !== undefined)) {
+        return { ok: false, reason: "conflicting_params", guidance: "`contentHashAlg` / `leafKind` cannot ride with `ciphertext`: a raw deposit carries no envelope, so there is nowhere to record them. Use `content` to deposit under a named algorithm." };
+      }
+      let contentHashAlg = "";
+      let leafKind = 0;
+      if (hasContent) {
         if (typeof rawAlg !== "string" || !isKnownContentHashAlg(rawAlg)) {
-          return { ok: false, reason: "unknown_content_hash_alg", guidance: `This daemon cannot compute "${typeof rawAlg === "string" ? rawAlg : `(${typeof rawAlg})`}". Known algorithms: ${Object.values(CONTENT_HASH_ALGS).join(", ")}. Omit the field to mean ${CONTENT_HASH_ALGS.SHA256}.` };
+          return { ok: false, reason: "unknown_content_hash_alg", guidance: `A \`content\` deposit must name its content-hash algorithm; got ${typeof rawAlg === "string" ? `"${rawAlg}"` : `(${typeof rawAlg})`}. Known algorithms: ${Object.values(CONTENT_HASH_ALGS).join(", ")}.` };
         }
-        if (hasCiphertext) {
-          return { ok: false, reason: "conflicting_params", guidance: "`contentHashAlg` cannot ride with `ciphertext`: a raw deposit carries no envelope, so there is nowhere to record the algorithm and the far end would recompute under sha256 and report a content hash mismatch on honest content. Use `content` to deposit under a named algorithm." };
+        if (typeof rawLeafKind !== "number" || !Number.isInteger(rawLeafKind)) {
+          return { ok: false, reason: "missing_params", guidance: "A `content` deposit must name its `leafKind` (0 for a message)." };
         }
         contentHashAlg = rawAlg;
+        leafKind = rawLeafKind;
       }
 
       const node = sessionNodeManager.getStandingReceiverNode();
@@ -1211,7 +1211,8 @@ export function createContentPark(deps: ContentParkDeps) {
           recipientPubkey: Buffer.from(recipientPubkey, "hex"),
           contentHash: Buffer.from(contentHash, "hex"),
           content: Buffer.from(content, "hex"),
-          ...(contentHashAlg !== undefined ? { contentHashAlg } : {}),
+          contentHashAlg,
+          leafKind,
         });
       } else {
         const ciphertext = hexOrNull(params?.ciphertext);

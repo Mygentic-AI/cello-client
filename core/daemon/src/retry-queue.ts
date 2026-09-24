@@ -57,13 +57,12 @@ export interface AwaitingContentEntry {
    * is gone by the time this row is read.
    */
   structure1Signature?: Uint8Array;
-  leafKind?: number;
+  leafKind: number;
   /** M12-P12 (review F2): the relay's signed ordering record, carried so a RE-park is self-ordering
    *  exactly like the live park. Without it `recoverParkedFromRelay` falls back to the in-memory
    *  #witnessedSeq map, which is empty after a receiver restart — the content then appends at its
    *  ARRIVAL index instead of its witnessed sequence, and the session tree diverges at seal.
-   *  Nullable: rows written before this column existed, and the agent-less direct-retry rows,
-   *  legitimately have none. */
+   *  Nullable: the agent-less direct-retry rows, and a message the relay never ordered, have none. */
   /**
    * `DOD-M15-SEALWIRE-1` part B2b — WHICH content-hash algorithm `contentHashHex` was produced
    * under, so a RE-park names the same one the original frame did.
@@ -72,10 +71,9 @@ export interface AwaitingContentEntry {
    * gone, and re-deriving it from the session's current row would be a fact about what THIS side
    * holds now, not about how this message was actually hashed.
    *
-   * Nullable, and `undefined` is meaningful rather than a gap — it is what `resolveContentHashAlg`
-   * reads as "predates the field", the only value meaning legacy. Never defaulted to `"sha256"`.
+   * Always written; never defaulted to `"sha256"`.
    */
-  contentHashAlg?: string;
+  contentHashAlg: string;
   structure1Cbor?: Uint8Array;
   structure2Cbor?: Uint8Array;
   queuedAt: number;
@@ -218,6 +216,16 @@ export class RetryQueue {
           });
           continue;
         }
+        // Every awaiting row is written with both; one without is corrupt, and re-parking it would
+        // either default the algorithm (a tamper verdict at the recipient) or guess the leaf domain.
+        if (row.content_hash_alg === null || row.leaf_kind === null) {
+          this.#logger.error("message.retry.awaiting.unlabelled", {
+            sessionId: row.session_id,
+            nonce: row.content_hash_hex ?? row.nonce_hex,
+            impact: "awaiting-ACK row has no content-hash algorithm or leaf kind; not re-parked",
+          });
+          continue;
+        }
         const entry: AwaitingContentEntry = {
           agentId: row.agent_id,
           sessionId: row.session_id,
@@ -225,11 +233,11 @@ export class RetryQueue {
           contentBlob: this.#openBlob(Uint8Array.from(row.content_blob)),
           // M12-P12 (F2): the ordering record is NOT sealed — it is the relay's own signed record,
           // already public to the relay, and it must be readable to re-seal the park envelope.
-          contentHashAlg: row.content_hash_alg ?? undefined,
+          contentHashAlg: row.content_hash_alg,
           structure1Cbor: row.structure1_cbor ? Uint8Array.from(row.structure1_cbor) : undefined,
           structure2Cbor: row.structure2_cbor ? Uint8Array.from(row.structure2_cbor) : undefined,
           structure1Signature: row.structure1_sig ? Uint8Array.from(row.structure1_sig) : undefined,
-          leafKind: row.leaf_kind ?? undefined,
+          leafKind: row.leaf_kind,
           queuedAt: row.queued_at,
           position: row.position,
         };
@@ -619,7 +627,7 @@ export class RetryQueue {
    * what `resolveContentHashAlg` reads as "predates the field", and that distinction is the one B1
    * and B2a each had to restore after it was collapsed.
    */
-  enqueueAwaitingContent(agentId: string, sessionId: string, contentHash: Uint8Array, contentBlob: Uint8Array, structure1Cbor: Uint8Array | undefined, structure2Cbor: Uint8Array | undefined, contentHashAlg: string | undefined, structure1Signature?: Uint8Array, leafKind?: number): boolean {
+  enqueueAwaitingContent(agentId: string, sessionId: string, contentHash: Uint8Array, contentBlob: Uint8Array, structure1Cbor: Uint8Array | undefined, structure2Cbor: Uint8Array | undefined, contentHashAlg: string, structure1Signature: Uint8Array | undefined, leafKind: number): boolean {
     if (!agentId) throw new Error("enqueueAwaitingContent: an owning agentId is required");
     const contentHashHex = Buffer.from(contentHash).toString("hex");
     const ak = this.#ak(agentId, sessionId);
@@ -657,8 +665,8 @@ export class RetryQueue {
              structure1Cbor ? Buffer.from(structure1Cbor) : null,
              structure2Cbor ? Buffer.from(structure2Cbor) : null,
              structure1Signature ? Buffer.from(structure1Signature) : null,
-             leafKind ?? null,
-             contentHashAlg ?? null);
+             leafKind,
+             contentHashAlg);
     } catch (err: unknown) {
       const reason = extractErrorMessage(err);
       this.#logger.error("message.retry.persist.failed", {
@@ -672,7 +680,7 @@ export class RetryQueue {
     }
 
     this.#positionCounters.set(ak, position);
-    q.push({ agentId, sessionId, contentHashHex, contentBlob, structure1Cbor, structure2Cbor, contentHashAlg, queuedAt, position });
+    q.push({ agentId, sessionId, contentHashHex, contentBlob, structure1Cbor, structure2Cbor, structure1Signature, leafKind, contentHashAlg, queuedAt, position });
     return true;
   }
 

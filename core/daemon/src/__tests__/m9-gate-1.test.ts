@@ -139,7 +139,7 @@ describe("M9-GATE-1: the park-recovery producer is screened by a REAL gateway pr
   it("a CLEAN recovered message is screened by the real gateway and DELIVERED to the agent", async () => {
     const { mgr, storeDb, storeKey } = await setup();
     const content = enc("recovered-from-park, perfectly fine");
-    const res = await mgr.ingestReceivedContent("alice", SID, content, msgLeafHash(content));
+    const res = await mgr.ingestReceivedContent("alice", SID, content, msgLeafHash(content), undefined, undefined, "sha256");
     expect(res.ok).toBe(true);
     expect(mgr.getSessionTree("alice", SID).size()).toBe(1); // leafed
     expect(receivedText(mgr, "alice", SID)).toBe("recovered-from-park, perfectly fine");
@@ -153,7 +153,7 @@ describe("M9-GATE-1: the park-recovery producer is screened by a REAL gateway pr
   it("a recovered TERMINAL-block (non-English) is screened the SAME as direct: leaf recorded, NEVER delivered", async () => {
     const { mgr } = await setup();
     const cjk = enc("这是一条通过中继恢复的中文消息它必须像直达消息一样被语言过滤器拦截");
-    const res = await mgr.ingestReceivedContent("alice", SID, cjk, msgLeafHash(cjk));
+    const res = await mgr.ingestReceivedContent("alice", SID, cjk, msgLeafHash(cjk), undefined, undefined, "sha256");
     // Terminal block via the REAL gateway: durably acknowledged (ok) + leafed for chain parity, but
     // screened OUT — never buffered for the agent. Identical handling to a direct terminal block.
     expect(res.ok).toBe(true);

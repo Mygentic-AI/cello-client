@@ -72,6 +72,8 @@ describe("the envelope version is chosen by the algorithm, not bumped for everyo
      */
     const env = encodeParkEnvelope({
       content: CONTENT, senderPubkey: new Uint8Array(32).fill(1), parkSig: new Uint8Array(64).fill(2),
+      contentHashAlg: "sha256",
+      leafKind: 0,
     });
     expect(decodeParkEnvelope(env).version).toBe(PARK_ENVELOPE_VERSION);
     expect(PARK_ENVELOPE_VERSION).toBe(2);
@@ -83,6 +85,7 @@ describe("the envelope version is chosen by the algorithm, not bumped for everyo
     const env = encodeParkEnvelope({
       content: CONTENT, senderPubkey: new Uint8Array(32).fill(1), parkSig: new Uint8Array(64).fill(2),
       contentHashAlg: CONTENT_HASH_ALGS.SHA256,
+      leafKind: 0,
     });
     expect(decodeParkEnvelope(env).version).toBe(PARK_ENVELOPE_VERSION);
   });
@@ -91,6 +94,7 @@ describe("the envelope version is chosen by the algorithm, not bumped for everyo
     const env = encodeParkEnvelope({
       content: CONTENT, senderPubkey: new Uint8Array(32).fill(1), parkSig: new Uint8Array(64).fill(2),
       contentHashAlg: CONTENT_HASH_ALGS.HMAC_SALT_V1,
+      leafKind: 0,
     });
     const decoded = decodeParkEnvelope(env);
     expect(decoded.version).toBe(PARK_ENVELOPE_VERSION_ALG);
@@ -114,6 +118,7 @@ describe("the envelope version is chosen by the algorithm, not bumped for everyo
     expect(() => encodeParkEnvelope({
       content: CONTENT, senderPubkey: new Uint8Array(32).fill(1), parkSig: new Uint8Array(64).fill(2),
       contentHashAlg: "",
+      leafKind: 0,
     })).toThrow(/cannot itself reproduce/);
   });
 
@@ -123,6 +128,7 @@ describe("the envelope version is chosen by the algorithm, not bumped for everyo
     expect(() => encodeParkEnvelope({
       content: CONTENT, senderPubkey: new Uint8Array(32).fill(1), parkSig: new Uint8Array(64).fill(2),
       contentHashAlg: "hmac-sha512-salt-v9",
+      leafKind: 0,
     })).toThrow(/cannot itself reproduce/);
   });
 
@@ -135,6 +141,8 @@ describe("the envelope version is chosen by the algorithm, not bumped for everyo
      */
     const env = encodeParkEnvelope({
       content: CONTENT, senderPubkey: new Uint8Array(32).fill(1), parkSig: new Uint8Array(64).fill(2),
+      contentHashAlg: "sha256",
+      leafKind: 0,
     });
     expect(decodeParkEnvelope(env).contentHashAlg).toBeUndefined();
   });
@@ -194,6 +202,7 @@ describe("the producer round-trips through the real consumer", () => {
     const sealed = await sealParkEnvelope({
       signer: sender, recipientPubkey: recipientPub, sessionIdHex: SESSION,
       content: CONTENT, contentHash, contentHashAlg: CONTENT_HASH_ALGS.HMAC_SALT_V1,
+      leafKind: 0,
     });
     const env = decodeParkEnvelope(await openAsRecipient(recipient, sealed));
 
@@ -237,6 +246,7 @@ describe("a flipped algorithm name can only cause a REFUSAL, never an acceptance
     const sealed = await sealParkEnvelope({
       signer: sender, recipientPubkey: recipientPub, sessionIdHex: SESSION,
       content: CONTENT, contentHash: trueHash, contentHashAlg: CONTENT_HASH_ALGS.HMAC_SALT_V1,
+      leafKind: 0,
     });
     const env = decodeParkEnvelope(await openAsRecipient(recipient, sealed));
 

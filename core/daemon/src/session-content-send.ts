@@ -808,10 +808,9 @@ export class SessionContentSender {
               impact: "no durable queue is wired — the content is NOT retained and will NOT be retried",
             });
           } else {
-            // B2b-1 review F1: the DURABLE writer. Without the 7th argument the column this unit
-            // added has no producer at all — every queued row would carry NULL, and the crash
-            // backstop would re-park a salted message as sha256 and have it refused forever.
-            durable = this.#ctx.onParkFailed(agentName, sessionId, hashHex, content, orderingS1, orderingS2, contentHashAlg);
+            // The DURABLE writer carries the same claim, signature, algorithm and leaf kind the park
+            // attempt above did, so a later re-park reaches the recipient in a shape it can witness.
+            durable = this.#ctx.onParkFailed(agentName, sessionId, hashHex, content, frameS1, orderingS2, contentHashAlg, frameSig, leafKind);
           }
           if (!durable) {
             if (this.#ctx.onParkFailed !== null) {
@@ -1187,7 +1186,7 @@ export class SessionContentSender {
    * route reads this map, and a v2 envelope omits the field entirely whenever the value is `sha256`,
    * which is every value in play today. That re-opened the exact finding the fix closed.
    */
-  #trackAwaitingAck(agentName: string, sessionId: string, content: Uint8Array, contentHash: Uint8Array, correlationId: string | undefined, structure1Cbor: Uint8Array | undefined, structure2Cbor: Uint8Array | undefined, contentHashAlg: string | undefined, structure1Signature?: Uint8Array, leafKind?: number): void {
+  #trackAwaitingAck(agentName: string, sessionId: string, content: Uint8Array, contentHash: Uint8Array, correlationId: string | undefined, structure1Cbor: Uint8Array | undefined, structure2Cbor: Uint8Array | undefined, contentHashAlg: string, structure1Signature: Uint8Array | undefined, leafKind: number): void {
     const hashHex = Buffer.from(contentHash).toString("hex");
     const ackKey = this.#ctx.sessionKey(agentName, sessionId);
     let bySession = this.#ctx.awaitingAck.get(ackKey);
