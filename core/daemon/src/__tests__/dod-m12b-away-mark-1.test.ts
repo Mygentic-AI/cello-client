@@ -6,17 +6,10 @@
  * that is positive evidence a person answered. Two agents spent a morning exchanging each other's
  * away responders while both operators believed a conversation was happening.
  *
- * `isOwnAwayAutoReply` already existed but only defends OUR OWN responder from answering one — and
- * only by matching this daemon's exact default wording, which by construction cannot recognise an
- * operator's CONFIGURED away message (`resolveAwayMessage`). Nothing told the reader.
+ * ── AN IN-BAND MARKER ─────────────────────────────────────────────────────────────────────────────
  *
- * ── WHY AN IN-BAND MARKER, WHEN away-detection.ts ARGUED AGAINST A MARKER ────────────────────────
- *
- * That file rejected "a marker in the wire frame" because it is a WIRE change an older peer would
- * not send. This is not that. The marker is a token at the front of the message TEXT — the same
- * class of thing as `[[OVER]]` and `[[WRAP]]`, which already ride in the body and which the receive
- * path already parses. An older peer simply sends text without it, which is why the legacy exact
- * matching below MUST stay: it is the only thing that recognises a peer running the old build.
+ * The marker is a token at the front of the message TEXT — the same class of thing as `[[OVER]]` and `[[WRAP]]`, which already ride in the body and which the receive
+ * path already parses.
  *
  * PREFIX, not suffix, and that is load-bearing. `[[WRAP]]` detection is end-anchored on purpose
  * (`DOD-WRAP-SUBSTRING-1`), and an away text may end with `[[WRAP]]` — the daemon's own one-shot
@@ -42,7 +35,6 @@ import type { Logger, DaemonConfig } from "../types.js";
 import {
   AWAY_AUTO_REPLY_TEXTS,
   AWAY_AUTO_REPLY_MARKER,
-  isOwnAwayAutoReply,
   isAutoReplyMarked,
   markAsAutoReply,
 } from "../away-detection.js";
@@ -77,34 +69,15 @@ describe("DOD-M12B-AWAY-MARK-1: every away auto-reply carries the marker", () =>
     expect(twice.indexOf(AWAY_AUTO_REPLY_MARKER)).toBe(twice.lastIndexOf(AWAY_AUTO_REPLY_MARKER));
   });
 
-  it("a CONFIGURED away message becomes recognisable — the gap exact matching could not close", () => {
+  it("a CONFIGURED away message becomes recognisable once marked", () => {
     const custom = "Andre is walking the dog, back in an hour.";
-    expect(isOwnAwayAutoReply(custom)).toBe(false);       // unmarked: indistinguishable from a person
-    expect(isOwnAwayAutoReply(markAsAutoReply(custom))).toBe(true);
-  });
-
-  it("an OLDER peer's unmarked default text is still recognised BY US (one direction only)", () => {
-    // DIRECTION MATTERS AND IS ASSERTED HERE ONLY ONE WAY, deliberately. old→new works: their
-    // unmarked body still matches our legacy branch. new→old does NOT for the one-shot: their build
-    // does `text === ONESHOT_BODY` and our prefix defeats it. The offer text survives even there
-    // (their check is endsWith(OFFER_SUFFIX), which a prefix does not disturb).
-    // Cost of the regression, traced: they fail to recognise our reply and send their own away ack;
-    // we recognise their legacy body and return silently. ONE extra away leaf per session, no
-    // runaway, and no seal — the mutual-seal OUTCOME survives even where recognition does not.
-    // The pre-marker wording, verbatim. DOD-AWAY-MUTUAL-SEAL-1 depends on recognising this from a
-    // peer that has not upgraded; dropping it would let two away agents notarize an empty session.
-    const legacyOneShot =
-      "Agent is currently away. Your message has been received and will be read when the operator returns. " +
-      "This inbox accepts one message per visit — please close the session now (send with signal: wrap) instead of sending more.";
-    const legacyOffer =
-      "CELLO_Support is currently away. Leave a message (send with signal: wrap to close) and it will be read when they return.";
-    expect(isOwnAwayAutoReply(legacyOneShot)).toBe(true);
-    expect(isOwnAwayAutoReply(legacyOffer)).toBe(true);
+    expect(isAutoReplyMarked(custom)).toBe(false);       // unmarked: indistinguishable from a person
+    expect(isAutoReplyMarked(markAsAutoReply(custom))).toBe(true);
   });
 
   it("a bare quote of the marker's tail is not machine traffic — no substring matching", () => {
-    expect(isOwnAwayAutoReply("")).toBe(false);
-    expect(isOwnAwayAutoReply("they said AUTO-REPLY somewhere in here")).toBe(false);
+    expect(isAutoReplyMarked("")).toBe(false);
+    expect(isAutoReplyMarked("they said AUTO-REPLY somewhere in here")).toBe(false);
     // The marker must be at the FRONT to count, not merely present.
     expect(isAutoReplyMarked(`I got your ${AWAY_AUTO_REPLY_MARKER} thing`)).toBe(false);
   });
