@@ -18,7 +18,7 @@
  */
 import * as lp from "it-length-prefixed";
 import { decode } from "cbor-x";
-import { decodeStructure1 } from "@cello-protocol/protocol-types";
+import { decodeStructure1, channelJoinFrameType } from "@cello-protocol/protocol-types";
 import { openSessionContent } from "@cello-protocol/crypto";
 import { CELLO_CONTENT_PROTOCOL_ID, type CelloNode } from "@cello-protocol/transport";
 import { GATEWAY_UNAVAILABLE, GOVERNANCE_TIMEOUT, type SecurityGatewayClient } from "@cello-protocol/gateway";
@@ -646,6 +646,20 @@ export class SessionContentIngest {
     // signed envelope destroys it), and language/injection judge a UTF-8 decode of binary. Size stays
     // bounded twice (MAX_DOCUMENT_FRAME_BYTES at classify, the gate's own cap).
     //
+    // DOD-M16-JOIN-1: a channel JOIN frame skips the screen for the SAME reason and takes the SAME
+    // trade. A join frame is CBOR, so the injection model reads a UTF-8 decode of those bytes as
+    // prose — measured on the first live channel test, the admin's `channel_is_public` refusal
+    // scored 99 and was blocked, and a join request 86–89, so joining could not work at all. The
+    // frame reaches no agent's context on this path (it is consumed by the join branch below into a
+    // `msg` leaf, with no transcript row and no doorbell — the note is dropped, guidance and relays
+    // are stored, never listed), so screening it as text protects nothing and blocks everything.
+    // WHAT IS SKIPPED: only frames `channelJoinFrameType` recognises by a FULL strict decode — a
+    // frame whose slot 0 is a join type but whose body fails to decode is NOT skipped; it is
+    // screened and lands in a transcript, the safe direction. Size stays bounded at classify:
+    // `channelJoinFrameType` rejects anything over MAX_JOIN_FRAME_BYTES before it decodes. Unlike
+    // the document skip, this is fail-CLOSED in neither direction to worry about — a non-join frame
+    // is simply screened as today.
+    //
     // WHAT IS TRADED, stated plainly: the screen skipped here is fail-CLOSED (a gateway that is down
     // returns a transient block, and the frame is held un-acked for redelivery). Its replacement —
     // the gate's in-process rules, then the semantic screen at `document-inbound.ts` step 7a-bis —
@@ -662,7 +676,18 @@ export class SessionContentIngest {
         correlationId,
       });
     }
-    const inboundVerdict: Awaited<ReturnType<SecurityGatewayClient["screenInbound"]>> = isDocFrame
+    // A channel join frame skips the screen too — recognised by the SAME strict classifier the join
+    // router uses, so "skipped the screen" and "routed as a join" can never disagree.
+    const joinFrameType = isDocFrame ? null : channelJoinFrameType(content);
+    if (joinFrameType !== null) {
+      this.#ctx.logger.info("session.content.screen.skipped_channel_join_frame", {
+        sessionId,
+        agentName,
+        correlationId,
+        frameType: joinFrameType,
+      });
+    }
+    const inboundVerdict: Awaited<ReturnType<SecurityGatewayClient["screenInbound"]>> = isDocFrame || joinFrameType !== null
       ? { disposition: "allow", content }
       : await this.#ctx.securityGateway.screenInbound(content, {
           direction: "inbound",

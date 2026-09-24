@@ -42,11 +42,15 @@ import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
+import type { GatewayMode, ScreenContext, ScreenVerdict, SecurityGatewayClient } from "@cello-protocol/gateway";
 import { FileKeyProvider } from "@cello-protocol/crypto";
 import {
   encodeDocumentUpdateEnvelope,
   DOCUMENT_UPDATE_ENCODING_V1,
   type DocumentUpdateEnvelope,
+  encodeChannelJoinRequest,
+  encodeCbor,
+  JOIN_REQUEST_TYPE,
 } from "@cello-protocol/protocol-types";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { DOCUMENTS_FLAG_ENV } from "../document-flag.js";
@@ -77,10 +81,31 @@ interface Captured {
   fields: Record<string, unknown>;
 }
 
+/**
+ * A gateway client that records every inbound screen into a sink and otherwise delegates to the
+ * passthrough. It is how 025-JOINSCREEN proves a frame SKIPPED the screen: the ingest calls
+ * `screenInbound` for everything it does not fork away, so an empty sink after a frame means the
+ * frame never reached the model. Outbound is untouched.
+ */
+class RecordingGatewayClient implements SecurityGatewayClient {
+  readonly mode: GatewayMode = "passthrough";
+  readonly #inner = new PassthroughGatewayClient();
+  readonly #inbound: Uint8Array[];
+  constructor(inbound: Uint8Array[]) { this.#inbound = inbound; }
+  screenOutbound(content: Uint8Array, ctx: ScreenContext): Promise<ScreenVerdict> {
+    return this.#inner.screenOutbound(content, ctx);
+  }
+  screenInbound(content: Uint8Array, ctx: ScreenContext): Promise<ScreenVerdict> {
+    this.#inbound.push(content);
+    return this.#inner.screenInbound(content, ctx);
+  }
+}
+
 describe("074-DOCSFLAG — an inbound document frame with the layer OFF", () => {
   let tempDir: string;
   let handle: DaemonHandle | null;
   let events: Captured[];
+  let screened: Uint8Array[];
   let savedFlag: string | undefined;
 
   beforeEach(async () => {
@@ -89,6 +114,7 @@ describe("074-DOCSFLAG — an inbound document frame with the layer OFF", () => 
     tempDir = await mkdtemp(join(tmpdir(), "cello-docsflag-frame-"));
     handle = null;
     events = [];
+    screened = [];
   });
 
   afterEach(async () => {
@@ -110,7 +136,7 @@ describe("074-DOCSFLAG — an inbound document frame with the layer OFF", () => 
       debug: push("debug"), info: push("info"), warn: push("warn"), error: push("error"),
     } as unknown as Logger;
     const config: DaemonConfig = {
-      securityGateway: new PassthroughGatewayClient(),
+      securityGateway: new RecordingGatewayClient(screened),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),
@@ -128,10 +154,11 @@ describe("074-DOCSFLAG — an inbound document frame with the layer OFF", () => 
    *
    * ⚠️ NOT the installed hook read off a getter. An earlier version of this file reached for
    * `SessionNodeManager`'s internal `onDocumentFrame`, which is not public, and that was the weaker
-   * test anyway: what matters is what the INGEST does with a document frame, and the ingest is the
-   * only thing that knows whether a consumed frame becomes a `doc` leaf or a transcript row.
+   * test anyway: what matters is what the INGEST does with a frame, and the ingest is the only
+   * thing that knows whether a consumed frame becomes a `doc` leaf or a transcript row — and, for
+   * 025-JOINSCREEN, whether the frame was screened at all before the join fork claimed it.
    */
-  async function ingestDocumentFrame(
+  async function ingestFrame(
     h: DaemonHandle,
     sessionId: string,
     frame: Uint8Array,
@@ -172,7 +199,7 @@ describe("074-DOCSFLAG — an inbound document frame with the layer OFF", () => 
   it("OFF: a real document frame is CONSUMED — it becomes a `doc` leaf and never a transcript row", async () => {
     const h = await start("off");
     events = [];
-    await ingestDocumentFrame(h, "sess-off-1", documentFrameBytes(), "corr-off-1");
+    await ingestFrame(h, "sess-off-1", documentFrameBytes(), "corr-off-1");
 
     // THE PROPERTY. `session.document.received` is logged only on the consumed branch — the branch
     // that appends a `doc` leaf, writes NO transcript row and rings NO doorbell. If the hook were
@@ -204,7 +231,7 @@ describe("074-DOCSFLAG — an inbound document frame with the layer OFF", () => 
   it("OFF: the refusal is loud — cause, consequence and a remedy, under the correlationId", async () => {
     const h = await start("off");
     events = [];
-    await ingestDocumentFrame(h, "sess-off-2", documentFrameBytes(), "corr-off-2");
+    await ingestFrame(h, "sess-off-2", documentFrameBytes(), "corr-off-2");
 
     const refusal = events.find((e) => e.event === "document.frame.refused");
     expect(refusal, "the refusal produced no log line at all").toBeDefined();
@@ -222,7 +249,7 @@ describe("074-DOCSFLAG — an inbound document frame with the layer OFF", () => 
   it("OFF: the peer key is truncated in the log and no frame content is logged", async () => {
     const h = await start("off");
     events = [];
-    await ingestDocumentFrame(h, "sess-off-3", documentFrameBytes(), "corr-off-3");
+    await ingestFrame(h, "sess-off-3", documentFrameBytes(), "corr-off-3");
     const refusal = events.find((e) => e.event === "document.frame.refused");
     expect(String(refusal?.fields["senderPubkey"]).length).toBeLessThanOrEqual(16);
     // Content never reaches the log. Asserted on the whole record, because a field added later is
@@ -233,7 +260,7 @@ describe("074-DOCSFLAG — an inbound document frame with the layer OFF", () => 
   it("ON: the same frame is ROUTED, not refused as disabled — the gate did not replace behaviour", async () => {
     const h = await start("on");
     events = [];
-    await ingestDocumentFrame(h, "sess-on-1", documentFrameBytes(), "corr-on-1");
+    await ingestFrame(h, "sess-on-1", documentFrameBytes(), "corr-on-1");
     // Consumed in both states — the difference is the reason, and with the layer on it is not ours.
     expect(events.find((e) => e.event === "session.document.received")).toBeDefined();
     expect(
@@ -262,7 +289,7 @@ describe("074-DOCSFLAG — an inbound document frame with the layer OFF", () => 
     const h = await start("off");
     events = [];
     const message = new TextEncoder().encode("hello there, ordinary message");
-    await ingestDocumentFrame(h, "sess-off-msg", message, "corr-off-msg");
+    await ingestFrame(h, "sess-off-msg", message, "corr-off-msg");
 
     const seen = events.map((e) => e.event);
     expect(seen, "an ordinary message was refused as a document").not.toContain("document.frame.refused");
@@ -275,4 +302,69 @@ describe("074-DOCSFLAG — an inbound document frame with the layer OFF", () => 
       .get("sess-off-msg") as { n: number };
     expect(rows.n, "an ordinary message never reached the operator's conversation history").toBe(1);
   }, 120_000);
+
+  /**
+   * 025-JOINSCREEN — a join frame is recognised BEFORE the screen and skips the injection model,
+   * exactly as a document frame does. The model reads a UTF-8 decode of bytes, so a CBOR join frame
+   * scores as prose (a live test measured 86–99 and blocked the exchange). A frame that only LOOKS
+   * like a join — a join type in slot 0 but a body the decoder rejects — must still be screened.
+   */
+  describe("025-JOINSCREEN — a join frame skips the injection model", () => {
+    const CHANNEL = new Uint8Array(32).fill(0xa1);
+    const SUBSCRIBER = new Uint8Array(32).fill(0xb2);
+
+    // Test 5.
+    it("OFF: a valid join request is NOT screened and IS consumed", async () => {
+      const h = await start("off");
+      events = [];
+      screened.length = 0;
+      const frame = encodeChannelJoinRequest({
+        channel_pubkey: CHANNEL, subscriber_pubkey: SUBSCRIBER, note: "test subscriber",
+      });
+      await ingestFrame(h, "sess-join-1", frame, "corr-join-1");
+
+      // The model never saw it — the whole point.
+      expect(screened.length, "a join frame was handed to the injection model").toBe(0);
+      const skip = events.find((e) => e.event === "session.content.screen.skipped_channel_join_frame");
+      expect(skip, "the skip was not logged, so the screen was not forked").toBeDefined();
+      expect(skip?.fields["frameType"]).toBe(JOIN_REQUEST_TYPE);
+      expect(skip?.fields["correlationId"]).toBe("corr-join-1");
+      // And it reached the join branch — consumed, not filed as conversation.
+      expect(
+        events.find((e) => e.event === "session.channel_join.received"),
+        "the join frame was not consumed by the join branch",
+      ).toBeDefined();
+    }, 120_000);
+
+    // Test 6.
+    it("OFF: a join-typed frame with a bad body IS screened and is NOT consumed", async () => {
+      const h = await start("off");
+      events = [];
+      screened.length = 0;
+      // A request type in slot 0, but a 31-byte channel key — the decoder rejects it, so it is not a
+      // join frame. encodeCbor directly, because encodeChannelJoinRequest refuses this body.
+      const bad = encodeCbor([JOIN_REQUEST_TYPE, new Uint8Array(31).fill(0xa1), SUBSCRIBER, ""]);
+      await ingestFrame(h, "sess-join-bad", bad, "corr-join-bad");
+
+      expect(screened.length, "a frame that fails strict decode must be screened").toBe(1);
+      expect(Buffer.from(screened[0]!).equals(Buffer.from(bad)), "the screened bytes are not the frame").toBe(true);
+      expect(
+        events.find((e) => e.event === "session.content.screen.skipped_channel_join_frame"),
+        "a frame that failed decode was wrongly skipped on slot 0",
+      ).toBeUndefined();
+      expect(
+        events.find((e) => e.event === "session.channel_join.received"),
+        "a frame that failed decode was wrongly consumed as a join",
+      ).toBeUndefined();
+    }, 120_000);
+
+    // Test 7.
+    it("OFF: an ordinary text message is still screened", async () => {
+      const h = await start("off");
+      events = [];
+      screened.length = 0;
+      await ingestFrame(h, "sess-join-text", new TextEncoder().encode("hello"), "corr-join-text");
+      expect(screened.length, "an ordinary message was not screened").toBe(1);
+    }, 120_000);
+  });
 });
