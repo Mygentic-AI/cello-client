@@ -52,6 +52,12 @@ export interface ChannelPublishWiringDeps {
    */
   currentFetchKey?: (channelHex: string) => Promise<{ pubkey: Uint8Array; time_ms: number; signature: Uint8Array } | undefined>;
   /**
+   * M16 028-GROUPPUB: encrypt a post body under the channel's current group key. From the membership
+   * half, which owns the group key, so this half never has to hold one. Rejects
+   * `channel_group_key_unavailable` rather than ever falling back to plaintext.
+   */
+  encryptBody: (plaintext: Uint8Array, channelHex: string, seq: number) => Promise<Uint8Array>;
+  /**
    * Online AND not explicitly switched off — the same pair every other background loop here reads.
    * Collecting for an agent the operator switched off is the kill switch failing to switch off.
    */
@@ -114,12 +120,14 @@ export function wireChannelPublishing(
       getChannelKey: channelKeyByPubkey,
       getAgentKey: (name) => keyProviders.get(name) ?? null,
       /**
-       * ⚠️ **THERE IS NO GROUP KEY UNTIL 019**, so a private channel REFUSES to publish rather than
-       * depositing a body that looks encrypted and is not. Publishing plaintext under an `access`
-       * that promises members-only would put the operator's content on two relays under a claim
-       * this code cannot keep — the one failure the whole encrypt step exists to prevent.
+       * ⚠️ **028-GROUPPUB: THE CHANNEL'S CURRENT GROUP KEY, MINTED AT GENERATION 1 IF NOBODY HAS
+       * JOINED YET.** From the membership half, which owns the key — so a post published before the
+       * first member is readable by that member, both paths reaching the same stored key. It rejects
+       * `channel_group_key_unavailable` when this daemon holds no admin key for the channel; it never
+       * falls back to plaintext, because depositing readable bytes under a members-only `access` is
+       * the one failure the encrypt step exists to prevent.
        */
-      encryptBody: () => Promise.reject(new Error("channel_group_key_unavailable")),
+      encryptBody: deps.encryptBody,
       channelInfo: (channelHex) => config.get(channelHex),
     });
   };

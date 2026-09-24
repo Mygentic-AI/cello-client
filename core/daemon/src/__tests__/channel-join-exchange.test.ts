@@ -29,7 +29,9 @@ import type { DaemonDatabase } from "../sqlcipher-db.js";
 import type { Logger } from "../types.js";
 import { ChannelMembershipStore } from "../channel-membership-store.js";
 import { ChannelSubscriptionStore } from "../channel-subscription-store.js";
-import { createChannelJoinExchange, type ChannelJoinExchange } from "../channel-join-exchange.js";
+import {
+  createChannelJoinExchange, ensureCurrentGroupKey, type ChannelJoinExchange,
+} from "../channel-join-exchange.js";
 
 const silent: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 const RELAY_A = "/dns4/relay-a.example/tcp/443/tls/ws";
@@ -344,6 +346,41 @@ describe("M16 019 Part B — the join exchange", () => {
     if (result.ok) return;
     expect(result.reason).toContain("not_a_pending_request");
     expect(f.members.statusOf(f.channelHex, f.subscriberHex), "still a member").toBe("active");
+  });
+
+  it("5. a member admitted AFTER a post receives the key that post was encrypted with", async () => {
+    const f = await fixture("open");
+
+    /**
+     * ⚠️ **028-GROUPPUB: PUBLISH AND ADMIT MUST REACH THE SAME STORED KEY.** The publisher mints (or
+     * reuses) the channel's current group key through `ensureCurrentGroupKey` before anyone has
+     * joined — the admin's agent id in this fixture's `localChannelAdmin` is "admin-1". A member who
+     * joins afterwards must be handed that SAME key, or the pre-join post is permanently unreadable
+     * to the first member. If the two paths minted separately, the bytes below would differ.
+     */
+    const minted = ensureCurrentGroupKey(
+      { members: f.members, subscriptions: f.subs, now: () => 1_800_000_000_000 },
+      "admin-1", f.channelHex,
+    );
+    expect(minted, "the publish path must mint a key for a non-public channel").toBeDefined();
+    if (!minted) return;
+    expect(minted.generation).toBe(1);
+
+    // Then a member joins the ordinary way — the same admit path tests 6/6c use.
+    const request = encodeChannelJoinRequest({
+      channel_pubkey: await f.channelKp.getPublicKey(),
+      subscriber_pubkey: await f.subscriberKp.getPublicKey(),
+      note: "",
+    });
+    await f.exchange.onAdminFrame("s1", f.subscriberHex, request);
+    const result = await f.exchange.onSubscriberFrame("agent-2", "s1", f.adminHex, f.sent[0].content);
+    expect(result.ok, result.ok ? "" : result.reason).toBe(true);
+
+    // The key the new member unwrapped from the acceptance IS the one the pre-join post used.
+    const memberKeys = f.subs.keysFor("agent-2", f.channelHex);
+    expect(memberKeys).toHaveLength(1);
+    expect(memberKeys[0].generation).toBe(minted.generation);
+    expect(Buffer.from(memberKeys[0].key).equals(Buffer.from(minted.key)), "same key bytes").toBe(true);
   });
 
   it("a frame that is not a join frame is NOT consumed — it is somebody talking", async () => {

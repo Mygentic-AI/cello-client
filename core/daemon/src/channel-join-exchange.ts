@@ -102,6 +102,42 @@ export interface ChannelJoinExchange {
   refuse: (channelHex: string, subscriberHex: string, sessionId: string) => Promise<{ ok: true } | { ok: false; reason: string }>;
 }
 
+/**
+ * The channel's CURRENT group key for its admin: the key at `settings.key_generation`, started at 1
+ * and minted if absent, stored under the admin's own agent id. Used by BOTH admitting a member and
+ * publishing, so a post made before anyone joined is readable by the first member.
+ * `undefined` for a public channel or a channel with no membership settings.
+ *
+ * ⚠️ **THE ADMIN STORES ITS OWN CHANNEL'S GROUP KEY IN THE SAME TABLE ITS SUBSCRIBERS USE**, under
+ * its own agent id. A key held only in this process is lost on restart — and then the second member
+ * admitted after a restart gets a DIFFERENT key at the same generation, so the two decrypt different
+ * halves of the channel and neither can tell why. The admin is a reader of its own channel; storing
+ * the key where readers keep keys is the honest place for it.
+ *
+ * ⚠️ **THE GENERATION COMES FROM SETTINGS, NOT FROM "NEWEST KEY HELD".** `settings.key_generation`,
+ * started with `members.startGeneration` when it is still 0 — exactly what admitting a member does.
+ * Both the exchange and the publisher reach this ONE function, so a post published before anyone
+ * joined and the first member's key are the same bytes at the same generation.
+ */
+export function ensureCurrentGroupKey(
+  deps: { members: ChannelMembershipStore; subscriptions: ChannelSubscriptionStore; now: () => number },
+  adminAgentId: string,
+  channelHex: string,
+): GroupKey | undefined {
+  const settings = deps.members.settings(channelHex);
+  // No membership settings, or a public channel, has no group key and mints none.
+  if (!settings || settings.access === "public") return undefined;
+
+  let generation = settings.key_generation;
+  if (generation === 0) generation = deps.members.startGeneration(channelHex);
+
+  const held = deps.subscriptions.keysFor(adminAgentId, channelHex).find((k) => k.generation === generation);
+  if (held) return held;
+  const minted = generateGroupKey(generation);
+  deps.subscriptions.addKey(adminAgentId, channelHex, minted, deps.now());
+  return minted;
+}
+
 export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): ChannelJoinExchange {
   const { logger, members, subscriptions } = deps;
   const now = deps.now ?? (() => Date.now());
@@ -111,23 +147,6 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
       channel_pubkey: Buffer.from(channelPubkey).toString("hex"), reason,
     });
     await deps.sendInSession(sessionId, encodeChannelJoinRefused({ channel_pubkey: channelPubkey, reason }));
-  }
-
-  /**
-   * Mint or reuse this channel's current group key, wrap it for one member, and send the acceptance.
-   *
-   * ⚠️ **THE ADMIN STORES ITS OWN CHANNEL'S GROUP KEY IN THE SAME TABLE ITS SUBSCRIBERS USE**, under
-   * its own agent id. A key held only in this process is lost on restart — and then the second
-   * member admitted after a restart gets a DIFFERENT key at the same generation, so the two decrypt
-   * different halves of the channel and neither can tell why. The admin is a reader of its own
-   * channel; storing the key where readers keep keys is the honest place for it.
-   */
-  function currentGroupKey(adminAgentId: string, channelHex: string, generation: number): GroupKey {
-    const held = subscriptions.keysFor(adminAgentId, channelHex).find((k) => k.generation === generation);
-    if (held) return held;
-    const minted = generateGroupKey(generation);
-    subscriptions.addKey(adminAgentId, channelHex, minted, now());
-    return minted;
   }
 
   async function acceptInto(
@@ -141,9 +160,12 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
      */
     if (!settings) return { ok: false, reason: "channel_not_configured_for_membership" };
 
-    let generation = settings.key_generation;
-    if (generation === 0) generation = members.startGeneration(channelHex);
-    const gk = currentGroupKey(admin.agentId, channelHex, generation);
+    // The SAME mint-or-reuse the publisher reaches, so a post made before this member joined is
+    // readable with the very key delivered here. `undefined` only for the states settings rules out
+    // above (absent) or a public channel (which never admits), so it is defended, not expected.
+    const gk = ensureCurrentGroupKey({ members, subscriptions, now }, admin.agentId, channelHex);
+    if (!gk) return { ok: false, reason: "channel_not_configured_for_membership" };
+    const generation = gk.generation;
 
     const channelPubkey = await admin.channelKeyProvider.getPublicKey();
     const bundle = await wrapGroupKeyFor(

@@ -713,6 +713,9 @@ async function startDaemonHoldingLock(
     // From the membership half, which owns the group key. This is what carries a re-key to the
     // relays on the next post, and so what makes an ejection lock a member out AT the relay.
     currentFetchKey: channelMembership.currentFetchKey,
+    // M16 028-GROUPPUB: encrypt a post body under the channel's current group key, minting
+    // generation 1 if nobody has joined yet. Also from the membership half, which owns the key.
+    encryptBody: (plaintext, channelHex, seq) => channelMembership.encryptBodyFor(channelHex, seq, plaintext),
     // M16 021-WAKE: who to wake after a post, and the stream to ask on. The member list comes from
     // the membership half, which is the only place it lives.
     activeMembers: channelMembership.activeMembers,

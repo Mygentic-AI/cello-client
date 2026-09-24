@@ -21,7 +21,8 @@ import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
-import { FileKeyProvider } from "@cello-protocol/crypto";
+import { FileKeyProvider, decryptBody, type GroupKey } from "@cello-protocol/crypto";
+import { decodeBroadcastArtifact } from "@cello-protocol/protocol-types";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import type { Logger, DaemonConfig } from "../types.js";
@@ -233,26 +234,116 @@ describe("M16 018-PUBCOLLECT: the channel verbs on a live daemon", () => {
     expect(String(answer["guidance"])).toContain("did not drop");
   });
 
-  it("33. a PRIVATE channel refuses to publish rather than depositing readable plaintext", async () => {
+  /**
+   * The `channel_subscription_keys` rows this daemon holds for a channel, and the `channel_log`
+   * bodies it stored — read straight from the live SQLCipher database, so the assertions are about
+   * what was actually persisted, not what a seam reported.
+   */
+  const keyRowsFor = (channelHex: string): Array<{ generation: number; key: Uint8Array }> =>
+    (handle!.getSessionNodeManager().getDb()
+      .prepare(`SELECT generation, key FROM channel_subscription_keys WHERE channel_pubkey = ? ORDER BY generation ASC`)
+      .all(channelHex.toLowerCase()) as Array<{ generation: number | bigint; key: Uint8Array }>)
+      .map((r) => ({ generation: Number(r.generation), key: new Uint8Array(r.key) }));
+
+  const logBodyAt = (channelHex: string, seq: number): Uint8Array => {
+    const row = handle!.getSessionNodeManager().getDb()
+      .prepare(`SELECT post_cbor FROM channel_log WHERE channel_pubkey = ? AND seq = ?`)
+      .get(channelHex.toLowerCase(), seq) as { post_cbor: Uint8Array } | undefined;
+    if (!row) throw new Error(`no channel_log row at seq ${String(seq)}`);
+    // The SAME decoder channel-log-store.ts uses on every read — the stored bytes are authoritative.
+    const decoded = decodeBroadcastArtifact(new Uint8Array(row.post_cbor));
+    if (!decoded.ok) throw new Error(`post_cbor at seq ${String(seq)} does not decode: ${decoded.reason}`);
+    return decoded.artifact.body;
+  };
+
+  const logCount = (channelHex: string): number =>
+    Number((handle!.getSessionNodeManager().getDb()
+      .prepare(`SELECT COUNT(*) AS n FROM channel_log WHERE channel_pubkey = ?`)
+      .get(channelHex.toLowerCase()) as { n: number | bigint }).n);
+
+  it("1. a private channel's post is stored as ciphertext that its own group key opens", async () => {
     await call("cello_channel_config", {
       agent: "alice", channel: alicePubkeyHex, access: "invite_only", relays: [RELAY_A, RELAY_B],
     });
 
     /**
-     * ⚠️ **FAIL CLOSED.** There is no group key until 019. A publisher that fell back to plaintext
-     * would put the operator's content on two relays under an `access` that promises members-only —
-     * the one outcome the encrypt step exists to prevent. The daemon refuses, and the CLI prints
-     * what it said rather than blaming the socket.
+     * ⚠️ **028-GROUPPUB: THE PUBLISHER NOW MINTS GENERATION 1 IF NOBODY HAS JOINED YET.** Before it,
+     * every publish on a non-public channel rejected `channel_group_key_unavailable` — the encrypt
+     * step was a placeholder. There is no relay in this harness, so the deposit still fails
+     * `no_relay_accepted`; what this asserts is that the body reached the LOG as ciphertext under the
+     * channel's own group key, which is what makes the first member able to read a pre-join post.
      */
-    let refusal: unknown;
-    try {
-      await call("cello_channel_publish", {
-        agent: "alice", channel: alicePubkeyHex, title: "members only", body: "secret",
-      });
-    } catch (err: unknown) {
-      refusal = err;
-    }
-    expect(refusal, "a private publish must not succeed").toBeDefined();
-    expect(String((refusal as Error).message)).toContain("channel_group_key_unavailable");
+    const answer = await call("cello_channel_publish", {
+      agent: "alice", channel: alicePubkeyHex, title: "members only", body: "secret",
+    }) as { ok: boolean; reason?: string; detail?: string };
+
+    // The refusal that used to fire is gone — the post got past the encrypt step.
+    expect(String(answer.reason ?? "")).not.toContain("channel_group_key_unavailable");
+    expect(String(answer.detail ?? "")).not.toContain("channel_group_key_unavailable");
+
+    // Exactly one group key, minted at generation 1 under the admin's own agent id.
+    const keys = keyRowsFor(alicePubkeyHex);
+    expect(keys).toHaveLength(1);
+    expect(keys[0].generation).toBe(1);
+
+    // The stored body is NOT the plaintext bytes the publisher was handed for `body`.
+    const body = logBodyAt(alicePubkeyHex, 1);
+    const publisherPlaintext = new TextEncoder().encode("secret"); // ChannelPublisher encodes `body`
+    expect(Buffer.from(body).equals(Buffer.from(publisherPlaintext)), "stored body must be ciphertext").toBe(false);
+
+    // And that same key opens it, back to exactly what the publisher encrypted.
+    const gk: GroupKey = keys[0];
+    const opened = decryptBody([gk], new Uint8Array(Buffer.from(alicePubkeyHex, "hex")), 1, body);
+    expect(opened.ok, opened.ok ? "" : opened.reason).toBe(true);
+    if (opened.ok) expect(Buffer.from(opened.plaintext).equals(Buffer.from(publisherPlaintext))).toBe(true);
+  });
+
+  it("2. a second post reuses the generation-1 key — no key is minted per post", async () => {
+    await call("cello_channel_config", {
+      agent: "alice", channel: alicePubkeyHex, access: "invite_only", relays: [RELAY_A, RELAY_B],
+    });
+    await call("cello_channel_publish", { agent: "alice", channel: alicePubkeyHex, title: "one", body: "first" });
+    await call("cello_channel_publish", { agent: "alice", channel: alicePubkeyHex, title: "two", body: "second" });
+
+    // Still exactly one key row: a per-post mint would leave two.
+    const keys = keyRowsFor(alicePubkeyHex);
+    expect(keys).toHaveLength(1);
+    expect(keys[0].generation).toBe(1);
+
+    // The second body decrypts with it at seq 2 — the position is bound in, so the seq must match.
+    const body2 = logBodyAt(alicePubkeyHex, 2);
+    const opened = decryptBody([keys[0]], new Uint8Array(Buffer.from(alicePubkeyHex, "hex")), 2, body2);
+    expect(opened.ok, opened.ok ? "" : opened.reason).toBe(true);
+    if (opened.ok) expect(Buffer.from(opened.plaintext).toString("utf8")).toBe("second");
+  });
+
+  it("3. a PUBLIC channel mints nothing and stores plaintext", async () => {
+    await call("cello_channel_config", {
+      agent: "alice", channel: alicePubkeyHex, access: "public", relays: [RELAY_A, RELAY_B],
+    });
+    await call("cello_channel_publish", { agent: "alice", channel: alicePubkeyHex, title: "open", body: "anyone can read" });
+
+    // No group key exists for a public channel — the encryptor returns undefined and never mints.
+    expect(keyRowsFor(alicePubkeyHex)).toHaveLength(0);
+    // And the body is stored in the clear: encrypting it would lock out the readers it exists for.
+    const body = logBodyAt(alicePubkeyHex, 1);
+    expect(Buffer.from(body).equals(Buffer.from("anyone can read", "utf8"))).toBe(true);
+  });
+
+  it("4. publish on a channel whose key this daemon does not hold is refused, and nothing is logged", async () => {
+    const foreign = "de".repeat(32);
+    const answer = await call("cello_channel_publish", {
+      agent: "alice", channel: foreign, title: "not mine", body: "secret",
+    }) as { ok: boolean; reason?: string };
+
+    /**
+     * ⚠️ The not-local path fires FIRST — there is no config for a channel this daemon does not hold,
+     * so the publisher answers `channel_unknown` before the encrypt step. (`channel_group_key_unavailable`
+     * from the no-admin branch of the encryptor is only reachable in a unit; the order says assert the
+     * one that actually fires here.) Either way there must be NO plaintext fallback and NO post logged.
+     */
+    expect(answer.ok).toBe(false);
+    expect(["channel_unknown", "channel_group_key_unavailable"]).toContain(answer.reason);
+    expect(logCount(foreign)).toBe(0);
   });
 });

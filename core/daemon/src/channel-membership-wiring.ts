@@ -17,11 +17,12 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import {
   channelJoinFrameType, encodeChannelRekey, buildChannelFetchKeyTbs, JOIN_REQUEST_TYPE,
 } from "@cello-protocol/protocol-types";
-import { generateGroupKey, wrapGroupKeyFor, deriveFetchKey, decryptBody } from "@cello-protocol/crypto";
+import { generateGroupKey, wrapGroupKeyFor, deriveFetchKey, decryptBody, encryptBody } from "@cello-protocol/crypto";
 import { ChannelMembershipStore } from "./channel-membership-store.js";
 import { ChannelSubscriptionStore } from "./channel-subscription-store.js";
 import {
-  createChannelJoinExchange, type LocalChannelAdmin, type AdminLookupOutcome,
+  createChannelJoinExchange, ensureCurrentGroupKey,
+  type LocalChannelAdmin, type AdminLookupOutcome,
 } from "./channel-join-exchange.js";
 import {
   createChannelAdminLookup, type ChannelAdminOutcome, type SignalingLike,
@@ -152,6 +153,14 @@ export interface ChannelMembershipWiring {
    * ejection undid.
    */
   activeMembers: (channelHex: string) => string[];
+  /**
+   * M16 028-GROUPPUB: encrypt a post body under the channel's CURRENT group key, minting generation
+   * 1 if no member has been admitted yet. Handed to the publishing half so a private channel can
+   * publish before anyone joins and the first member can still read that post. Rejects
+   * `channel_group_key_unavailable` when this daemon holds no admin key for the channel — never a
+   * plaintext fallback. Public channels never reach here; the publisher does not encrypt them.
+   */
+  encryptBodyFor: (channelHex: string, seq: number, plaintext: Uint8Array) => Promise<Uint8Array>;
 }
 
 export function wireChannelMembership(deps: ChannelMembershipWiringDeps): ChannelMembershipWiring {
@@ -566,6 +575,21 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
 
   return {
     activeMembers: (channelHex: string) => members.activeMembers(channelHex),
+    /**
+     * ⚠️ **NO PLAINTEXT FALLBACK, EVER.** No admin key held for this channel, or no group key mint
+     * possible (a public channel, which never reaches here anyway), throws
+     * `channel_group_key_unavailable` — the publisher must refuse rather than deposit readable bytes
+     * under an `access` that promises members-only.
+     */
+    encryptBodyFor: async (channelHex, seq, plaintext) => {
+      const admin = localChannelAdmin(channelHex);
+      if (!admin) throw new Error("channel_group_key_unavailable");
+      const gk = ensureCurrentGroupKey({ members, subscriptions, now: Date.now }, admin.agentId, channelHex);
+      if (!gk) throw new Error("channel_group_key_unavailable");
+      const out = encryptBody(gk, new Uint8Array(Buffer.from(channelHex, "hex")), seq, plaintext);
+      logger.debug("channel.post.encrypted", { channel_pubkey: channelHex, seq, generation: gk.generation });
+      return Promise.resolve(out);
+    },
     currentFetchKey: async (channelHex) => {
       const admin = localChannelAdmin(channelHex);
       if (!admin) return undefined;
