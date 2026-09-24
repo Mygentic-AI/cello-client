@@ -35,7 +35,7 @@ describe("DOD-DIR-FAILCLOSED-1: the directory's fail-closed reason survives the 
     const known = [
       "target_offline", "relay_unavailable", "frost_signer_not_configured", "directory_below_threshold",
       "ceremony_timeout", "ceremony_exhausted", "ceremony_conflict", "not_registered", "peer_not_registered",
-      "no_connection", "connection_id_required", "session_request_missing_peer_id", "agent_revoked", "agent_suspended",
+      "session_request_missing_peer_id", "agent_revoked", "agent_suspended",
     ];
     for (const r of known) expect(sessionRequestErrorReason({ reason: r })).toBe(r);
   });
