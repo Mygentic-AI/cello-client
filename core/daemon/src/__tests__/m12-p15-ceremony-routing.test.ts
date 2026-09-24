@@ -14,7 +14,7 @@
  *     so `#maybeProcessSeal` never fires and we would report ok:true for a session that can never
  *     seal. A permanent false success is worse than the dead end.
  * So the responder names the ceremony and the initiator routes ONLY on the one it can complete.
- * An absent field (older peer) means DO NOT SUBMIT.
+ * An absent field means DO NOT SUBMIT.
  */
 import { describe, it, expect, vi } from "vitest";
 import { createSealFlows } from "../seal-flows.js";
@@ -65,7 +65,7 @@ const RECORD = {
 } as never;
 
 const close = (h: ReturnType<typeof harness>) =>
-  h.flows.handleSealInterruptedFlow(SID, RECORD, "corr", "") as Promise<Record<string, unknown>>;
+  h.flows.handleSealInterruptedFlow(SID, RECORD, "corr") as Promise<Record<string, unknown>>;
 
 describe("M12-P15: the initiator routes on the counterparty's ceremony", () => {
   it("relay_bilateral → submit our half; that is the ceremony our leaf can complete", async () => {
