@@ -24,7 +24,7 @@
  * notice; nothing in this file approves one. There is no heuristic, no allowlist, no auto-approve.
  */
 import {
-  decodeChannelJoinRequest, decodeChannelJoinAccepted, decodeChannelRekey,
+  decodeChannelJoinRequest, decodeChannelJoinAccepted, decodeChannelJoinRefused, decodeChannelRekey,
   encodeChannelJoinAccepted, encodeChannelJoinRefused, encodeChannelRekey,
   isChannelJoinFrame,
   type ChannelJoinRefusedReason,
@@ -71,6 +71,14 @@ export interface ChannelJoinExchangeDeps {
   profileAdminPubkey: (channelHex: string, agentId: string) => Promise<AdminLookupOutcome>;
   keyProviderFor: (agentId: string) => KeyProvider | null;
   raiseNotice: (event: string, channelHex: string, subscriberHex: string) => void;
+  /**
+   * M16 032-NOTICES: how THIS agent's own join request was answered — `admitted` when an acceptance
+   * is stored, `pending` on a `pending_approval` refusal, `refused` (+ the reason word) on any other
+   * refusal. The wiring turns it into the content-free `channel_join_answer` doorbell. Optional and
+   * additive: an older wiring omits it and the exchange behaves exactly as before. A re-key is NOT
+   * an answer to a join and never rings this — that is out of scope (notices for re-key).
+   */
+  onJoinAnswer?: (agentId: string, channelHex: string, outcome: "admitted" | "pending" | "refused", reason?: string) => void;
   now?: () => number;
 }
 
@@ -78,7 +86,7 @@ export type SubscriberJoinResult =
   | { ok: true; channelHex: string; generation: number }
   | {
       ok: false;
-      reason: "not_a_join_frame" | "malformed" | "not_admin_of_channel" | "admin_unresolved" | "key_unwrap_failed" | "no_key_provider";
+      reason: "not_a_join_frame" | "malformed" | "not_admin_of_channel" | "admin_unresolved" | "key_unwrap_failed" | "no_key_provider" | "refused_by_admin";
       /**
        * M16 021-WAKE item 21: WHY, when the reason alone cannot say.
        *
@@ -296,7 +304,24 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
         const rekeyResult = decodeChannelRekey(content);
         if (rekeyResult.ok) rekeyFrame = rekeyResult.frame;
       }
-      if (!acceptedFrame && !rekeyFrame) return { ok: false, reason: "malformed" };
+      if (!acceptedFrame && !rekeyFrame) {
+        /**
+         * M16 032-NOTICES: a REFUSAL is the admin's answer to THIS agent's own request. Store
+         * nothing — a refusal grants no key and no subscription — but report the outcome so the
+         * operator is not left silent. `pending_approval` means the request is queued for an
+         * invite-only admin; every other reason is a terminal refusal, and the reason word travels
+         * so the operator knows why (the fixed refusal vocabulary only, never free text).
+         */
+        const refused = decodeChannelJoinRefused(content);
+        if (refused.ok) {
+          const reason = refused.frame.reason;
+          const refusedHex = Buffer.from(refused.frame.channel_pubkey).toString("hex");
+          if (reason === "pending_approval") deps.onJoinAnswer?.(agentId, refusedHex, "pending");
+          else deps.onJoinAnswer?.(agentId, refusedHex, "refused", reason);
+          return { ok: false, reason: "refused_by_admin", detail: reason };
+        }
+        return { ok: false, reason: "malformed" };
+      }
 
       const channelPubkey = acceptedFrame ? acceptedFrame.channel_pubkey : rekeyFrame!.channel_pubkey;
       const channelHex = Buffer.from(channelPubkey).toString("hex");
@@ -367,6 +392,9 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
         });
       }
       subscriptions.addKey(agentId, channelHex, unwrapped.gk, now());
+      // M16 032-NOTICES: an ACCEPTANCE stored means this agent is IN — ring "admitted". A re-key
+      // also lands a key here but is not an answer to a join, so it never rings (out of scope).
+      if (acceptedFrame) deps.onJoinAnswer?.(agentId, channelHex, "admitted");
       return { ok: true, channelHex, generation: unwrapped.gk.generation };
     },
 

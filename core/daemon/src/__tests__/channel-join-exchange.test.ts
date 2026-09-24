@@ -21,7 +21,7 @@ import {
 } from "@cello-protocol/crypto";
 import {
   encodeChannelJoinRequest, decodeChannelJoinAccepted, decodeChannelJoinRefused,
-  encodeChannelJoinAccepted, isChannelJoinFrame, channelJoinFrameType,
+  encodeChannelJoinAccepted, encodeChannelJoinRefused, isChannelJoinFrame, channelJoinFrameType,
   JOIN_ACCEPTED_TYPE, JOIN_REQUEST_TYPE,
 } from "@cello-protocol/protocol-types";
 import { openTestDb } from "./helpers/encrypted-db.js";
@@ -56,6 +56,8 @@ interface Fixture {
   /** What the directory profile says the channel's admin is. */
   profileAdmin: Map<string, string>;
   notices: Array<{ event: string; channel: string; subscriber: string }>;
+  /** M16 032-NOTICES: every onJoinAnswer the subscriber half fired, in order. */
+  joinAnswers: Array<{ agentId: string; channelHex: string; outcome: string; reason?: string }>;
 }
 
 async function fixture(access: "open" | "invite_only" | "public" = "open"): Promise<Fixture> {
@@ -76,6 +78,7 @@ async function fixture(access: "open" | "invite_only" | "public" = "open"): Prom
   const sent: Array<{ sessionId: string; content: Uint8Array }> = [];
   const profileAdmin = new Map<string, string>([[channelHex, adminHex]]);
   const notices: Array<{ event: string; channel: string; subscriber: string }> = [];
+  const joinAnswers: Array<{ agentId: string; channelHex: string; outcome: string; reason?: string }> = [];
 
   const exchange = createChannelJoinExchange({
     logger: silent,
@@ -96,12 +99,13 @@ async function fixture(access: "open" | "invite_only" | "public" = "open"): Prom
     },
     keyProviderFor: () => subscriberKp,
     raiseNotice: (event, channel, subscriber) => { notices.push({ event, channel, subscriber }); },
+    onJoinAnswer: (agentId, chHex, outcome, reason) => { joinAnswers.push({ agentId, channelHex: chHex, outcome, reason }); },
     now: () => 1_800_000_000_000,
   });
 
   return {
     exchange, members, subs, channelKp, adminKp, subscriberKp,
-    channelHex, adminHex, subscriberHex, sent, profileAdmin, notices,
+    channelHex, adminHex, subscriberHex, sent, profileAdmin, notices, joinAnswers,
   };
 }
 
@@ -381,6 +385,45 @@ describe("M16 019 Part B — the join exchange", () => {
     expect(memberKeys).toHaveLength(1);
     expect(memberKeys[0].generation).toBe(minted.generation);
     expect(Buffer.from(memberKeys[0].key).equals(Buffer.from(minted.key)), "same key bytes").toBe(true);
+  });
+
+  it("3. join outcomes reach onJoinAnswer — admitted / pending / refused+reason — and a pending request reaches the admin notice", async () => {
+    // (a) ADMIN side: an invite-only request lands pending and fires the admin's notice ONCE, named
+    // with the counterparty. The wiring turns that notice into the channel_join_request doorbell.
+    const fa = await fixture("invite_only");
+    const request = encodeChannelJoinRequest({
+      channel_pubkey: await fa.channelKp.getPublicKey(),
+      subscriber_pubkey: await fa.subscriberKp.getPublicKey(),
+      note: "",
+    });
+    await fa.exchange.onAdminFrame("s1", fa.subscriberHex, request);
+    const pendingNotices = fa.notices.filter((n) => n.event === "channel.join.pending");
+    expect(pendingNotices).toHaveLength(1);
+    expect(pendingNotices[0].subscriber).toBe(fa.subscriberHex);
+
+    // (b) SUBSCRIBER side, ADMITTED: an acceptance stored → onJoinAnswer "admitted", no reason.
+    const fo = await fixture("open");
+    const req2 = encodeChannelJoinRequest({
+      channel_pubkey: await fo.channelKp.getPublicKey(),
+      subscriber_pubkey: await fo.subscriberKp.getPublicKey(),
+      note: "",
+    });
+    await fo.exchange.onAdminFrame("s1", fo.subscriberHex, req2);
+    const admitted = await fo.exchange.onSubscriberFrame("agent-2", "s1", fo.adminHex, fo.sent[0].content);
+    expect(admitted.ok, admitted.ok ? "" : admitted.reason).toBe(true);
+    expect(fo.joinAnswers).toEqual([{ agentId: "agent-2", channelHex: fo.channelHex, outcome: "admitted", reason: undefined }]);
+
+    // (c) SUBSCRIBER side, PENDING: a refused frame carrying pending_approval → onJoinAnswer "pending".
+    const fp = await fixture("invite_only");
+    const pendingFrame = encodeChannelJoinRefused({ channel_pubkey: await fp.channelKp.getPublicKey(), reason: "pending_approval" });
+    await fp.exchange.onSubscriberFrame("agent-2", "s1", fp.adminHex, pendingFrame);
+    expect(fp.joinAnswers).toEqual([{ agentId: "agent-2", channelHex: fp.channelHex, outcome: "pending", reason: undefined }]);
+
+    // (d) SUBSCRIBER side, REFUSED: any other refusal → onJoinAnswer "refused" + the reason word.
+    const fr = await fixture("invite_only");
+    const ejectedFrame = encodeChannelJoinRefused({ channel_pubkey: await fr.channelKp.getPublicKey(), reason: "ejected" });
+    await fr.exchange.onSubscriberFrame("agent-2", "s1", fr.adminHex, ejectedFrame);
+    expect(fr.joinAnswers).toEqual([{ agentId: "agent-2", channelHex: fr.channelHex, outcome: "refused", reason: "ejected" }]);
   });
 
   it("a frame that is not a join frame is NOT consumed — it is somebody talking", async () => {
