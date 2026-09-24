@@ -33,6 +33,22 @@ import { extractErrorMessage } from "./error-message.js";
 
 type Handler = (params: Record<string, unknown> | undefined, connectionId: string) => Promise<unknown>;
 
+/**
+ * M16 032-NOTICES — the three content-free channel doorbells, as the wirings see them. Each takes an
+ * agent ID and maps it to the daemon's display NAME (`agentNameForId`) before reaching the
+ * dispatcher, which routes to connections where that name is current — the same rule cello_message
+ * follows. Defined here and shared by both wirings; the composition root supplies the one
+ * implementation (it holds the late-bound dispatcher).
+ */
+export interface ChannelNotify {
+  /** A collect pass advanced this agent's delivered position: `count` new posts, now at `through`. */
+  channelPosts: (agentId: string, channelHex: string, count: number, through: number) => void;
+  /** This agent's own join request was answered. */
+  channelJoinAnswer: (agentId: string, channelHex: string, outcome: "admitted" | "pending" | "refused", reason?: string) => void;
+  /** A new pending request landed on an invite-only channel this agent administers. */
+  channelJoinRequest: (adminAgentId: string, channelHex: string, subscriberHex: string) => void;
+}
+
 export interface ChannelMembershipWiringDeps {
   handlers: Map<string, Handler>;
   logger: Logger;
@@ -63,6 +79,8 @@ export interface ChannelMembershipWiringDeps {
    * channel's administrator.
    */
   openSessionFor: (agentName: string, opts: { targetPubkey: string }) => Promise<unknown>;
+  /** M16 032-NOTICES: the content-free doorbells for a join answer and a new join request. */
+  notify: ChannelNotify;
 }
 
 /**
@@ -233,6 +251,12 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
 
   const raiseNotice = (event: string, channelHex: string, subscriberHex: string): void => {
     logger.info(event, { channel_pubkey: channelHex, subscriber_pubkey: subscriberHex });
+    // M16 032-NOTICES: a pending request was a log line nobody reads. Ring the admin's join-request
+    // doorbell too — the admin agent is resolved from the channel, since the notice carries only the
+    // channel and the subscriber. No local admin (a channel this daemon does not administer) means
+    // there is nobody here to wake, which the getter below simply skips.
+    const admin = localChannelAdmin(channelHex);
+    if (admin) deps.notify.channelJoinRequest(admin.agentId, channelHex, subscriberHex);
   };
 
   /** Which agent a session belongs to, so the hook's answers go back down the right one. */
@@ -245,6 +269,8 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     profileAdminPubkey,
     keyProviderFor,
     raiseNotice,
+    // M16 032-NOTICES: the subscriber's own join answer — admitted / pending / refused (+ reason).
+    onJoinAnswer: (agentId, channelHex, outcome, reason) => deps.notify.channelJoinAnswer(agentId, channelHex, outcome, reason),
   });
 
   /**

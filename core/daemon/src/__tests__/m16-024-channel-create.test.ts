@@ -282,6 +282,7 @@ describe("M16 024-CREATE Section C: the config create records is real, and publi
       isAgentOnline: () => true,
       activeMembers: () => [],
       signalingFor: () => null,
+      notify: { channelPosts() {}, channelJoinAnswer() {}, channelJoinRequest() {} },
     });
     return handlers;
   }
@@ -358,6 +359,7 @@ describe("M16 024-CREATE Section C: the config create records is real, and publi
       keyProviders: new Map<string, KeyProvider>([["admin", adminKp], ["channel", channelKp]]),
       resolveCurrentAgent: (_c, explicit) => explicit ?? "admin",
       isAgentOnline: () => true, activeMembers: () => [], signalingFor: () => null,
+      notify: { channelPosts() {}, channelJoinAnswer() {}, channelJoinRequest() {} },
     });
 
     await handlers.get("cello_channel_create")!({ agent: "admin", name: "channel", access: "public" }, "conn1");
@@ -424,6 +426,7 @@ describe("M16 024-CREATE item 6: a failed rollback is logged, not swallowed", ()
       loadedAgents, keyProviders,
       resolveCurrentAgent: (_c, explicit) => explicit ?? "admin",
       isAgentOnline: () => true, activeMembers: () => [], signalingFor: () => null,
+      notify: { channelPosts() {}, channelJoinAnswer() {}, channelJoinRequest() {} },
     });
 
     const created = (await handlers.get("cello_channel_create")!(
@@ -485,6 +488,7 @@ describe("M16 024-CREATE item 4: the directory's refusal detail reaches the oper
       keyProviders: new Map<string, KeyProvider>([["admin", adminKp], ["channel", channelKp]]),
       resolveCurrentAgent: (_c, explicit) => explicit ?? "admin",
       isAgentOnline: () => true, activeMembers: () => [], signalingFor: () => null,
+      notify: { channelPosts() {}, channelJoinAnswer() {}, channelJoinRequest() {} },
     });
 
     const created = (await handlers.get("cello_channel_create")!(

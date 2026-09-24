@@ -118,6 +118,7 @@ async function harness(opts: {
       signalingAskedFor.push(agentName);
       return agentName === SUB_NAME ? signaling : null;
     },
+    notify: { channelPosts() {}, channelJoinAnswer() {}, channelJoinRequest() {} },
   });
 
   /** A genuine acceptance, wrapped to the subscriber's real key — no shortcuts through the crypto. */

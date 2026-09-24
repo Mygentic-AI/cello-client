@@ -402,7 +402,11 @@ export default [
     // in a message so a public key is not redacted as a secret. The four queries and the extractor
     // live in `known-public-keys.ts`; what lands here is one import and wiring the dep into the
     // content handlers — a composition seam the root is the only place to pass.
-    rules: { "max-lines": ["error", { max: 1463, skipBlankLines: false, skipComments: false }] },
+    // 1,463 → 1,482 (+19, M16 032-NOTICES): the three content-free channel doorbells (posts arrived,
+    // join answered, join requested). The channelNotify object lives here because the dispatcher it
+    // reads is a late-bound const below and both channel wirings need it — the one seam the root
+    // holds. Each function only maps agent id → name and routes; INV-CONTENTFREE lives downstream.
+    rules: { "max-lines": ["error", { max: 1482, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/daemon-handle.ts"],

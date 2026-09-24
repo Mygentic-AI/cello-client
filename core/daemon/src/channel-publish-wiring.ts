@@ -29,6 +29,7 @@ import { ChannelSubscriptionStore } from "./channel-subscription-store.js";
 import { ChannelInboxStore } from "./channel-inbox-store.js";
 import { createChannelCollectTicker } from "./channel-collect-tick.js";
 import { createChannelWakeSender } from "./channel-wake-sender.js";
+import type { ChannelNotify } from "./channel-membership-wiring.js";
 
 type Handler = (params: Record<string, unknown> | undefined, connectionId: string) => Promise<unknown>;
 
@@ -63,6 +64,8 @@ export interface ChannelPublishWiringDeps {
    * Collecting for an agent the operator switched off is the kill switch failing to switch off.
    */
   isAgentOnline: (agentId: string) => boolean;
+  /** M16 032-NOTICES: the content-free `channel_posts` doorbell, rung when a collect advances. */
+  notify: ChannelNotify;
 }
 
 export function wireChannelPublishing(
@@ -335,6 +338,9 @@ export function wireChannelPublishing(
       });
       return Promise.resolve();
     },
+    // M16 032-NOTICES: a collect that advanced the position rings the content-free channel_posts
+    // doorbell. count = after − before; `through` is the new delivered position.
+    onDelivered: (agentId, channelHex, before, after) => deps.notify.channelPosts(agentId, channelHex, after - before, after),
   });
 
   const ticker = createChannelCollectTicker({

@@ -55,7 +55,7 @@ import { registerAgentAdminHandlers } from "./agent-admin-handlers.js";
 import { wireChannelPublishing } from "./channel-publish-wiring.js";
 import { createIsAgentOnlineById } from "./agent-online.js";
 import { ChannelSubscriptionStore } from "./channel-subscription-store.js";
-import { wireChannelMembership } from "./channel-membership-wiring.js";
+import { wireChannelMembership, type ChannelNotify } from "./channel-membership-wiring.js";
 import { createChannelFrameSender } from "./channel-frame-send.js";
 import { registerStatusHandler } from "./status-handler.js";
 import { registerBackupRestoreHandlers } from "./backup-restore-handlers.js";
@@ -680,8 +680,27 @@ async function startDaemonHoldingLock(
   // per-channel publisher → channel-publish-wiring.ts. What stays here is the wiring.
   // M16 019-MEMBERSHIP: joining, the group key, the eject re-key and the operator's channel verbs
   // → channel-membership-wiring.ts. What stays here is the wiring.
+  // M16 032-NOTICES: the three content-free channel doorbells. Built here because the dispatcher is
+  // a const ~390 lines below; these arrows read it at RING time, the late-bind the WAKE handle above
+  // uses. Each maps agent id → name and drops the ring when the id no longer resolves (a retired
+  // agent has nobody to wake). INV-CONTENTFREE lives in the dispatcher; this only routes.
+  const channelNotify: ChannelNotify = {
+    channelPosts: (agentId, channelHex, count, through) => {
+      const name = sessionNodeManager.agentNameForId(agentId);
+      if (name !== null) notificationDispatcher.dispatchChannelPosts(name, channelHex, count, through);
+    },
+    channelJoinAnswer: (agentId, channelHex, outcome, reason) => {
+      const name = sessionNodeManager.agentNameForId(agentId);
+      if (name !== null) notificationDispatcher.dispatchChannelJoinAnswer(name, channelHex, outcome, reason);
+    },
+    channelJoinRequest: (adminAgentId, channelHex, subscriberHex) => {
+      const name = sessionNodeManager.agentNameForId(adminAgentId);
+      if (name !== null) notificationDispatcher.dispatchChannelJoinRequest(name, channelHex, subscriberHex);
+    },
+  };
+
   const channelMembership = wireChannelMembership({
-    handlers, logger,
+    handlers, logger, notify: channelNotify,
     getDb: () => sessionNodeManager.getDb(),
     // 027-JOINSEQ: the join-frame sender commits its own leaf after the send, exactly as every other
     // sender does — extracted so it is testable; the old inline body discarded the send result and
@@ -704,7 +723,7 @@ async function startDaemonHoldingLock(
   });
 
   const channelWiring = wireChannelPublishing({
-    handlers, logger,
+    handlers, logger, notify: channelNotify,
     getDb: () => sessionNodeManager.getDb(),
     getNode: () => sessionNodeManager.getStandingReceiverNode() ?? null,
     screenOutbound: (content, ctx) => securityGateway.screenOutbound(content, ctx),
