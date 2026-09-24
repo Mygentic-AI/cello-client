@@ -26,7 +26,16 @@ const silent: Logger = { debug() {}, info() {}, warn() {}, error() {} };
  * restarting the daemon on the same directory. Returns the agent's K_local key provider, for a test
  * that signs as the agent.
  */
-export async function provisionAgentIdentity(celloDir: string, name: string): Promise<InMemoryKeyProvider> {
+export async function provisionAgentIdentity(
+  celloDir: string,
+  name: string,
+  /**
+   * `true` (the default): the agent is REGISTERED with its fixture PQ keys, for a test that builds its
+   * sessions from signed-assignment fixtures. `false`: a plain agent row, exactly what `cello
+   * create-agent` writes, for a test that then registers it for real against a directory.
+   */
+  opts: { registered?: boolean } = {},
+): Promise<InMemoryKeyProvider> {
   mkdirSync(celloDir, { recursive: true });
   const dbPath = join(celloDir, "sessions.db");
   const db = openEncryptedDatabase(dbPath, resolveDbKey(dbPath, dbKeyPathFor(dbPath)));
@@ -39,7 +48,7 @@ export async function provisionAgentIdentity(celloDir: string, name: string): Pr
     const pubkeyHex = Buffer.from(await keyProvider.getPublicKey()).toString("hex");
     store.createAgent(name, seed, pubkeyHex);
     // M9D 003-PQSESSION: registered, with its fixture PQ keys — a session announce needs the ML-DSA key.
-    await giveFixturePqIdentity(db, name, pubkeyHex);
+    if (opts.registered ?? true) await giveFixturePqIdentity(db, name, pubkeyHex);
     return keyProvider;
   } finally {
     db.close();
