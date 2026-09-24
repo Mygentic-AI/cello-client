@@ -210,6 +210,14 @@ export interface ScreeningStatusInfo {
 export interface ChannelSummary {
   name: string;
   pubkey?: string;
+  /**
+   * M16 033-CHANNELVIEW (reviewer LOW): present only for a channel whose identity would not load —
+   * `load_failed`, mirroring how a broken agent is listed with its state. A healthy channel omits
+   * it (it carries name + pubkey), so `state` is the one signal that says "this channel is broken".
+   */
+  state?: AgentState;
+  /** The load error, for a `load_failed` channel — same shape as `AgentInfo.error`. */
+  error?: string;
 }
 
 export interface DaemonStatusResponse {

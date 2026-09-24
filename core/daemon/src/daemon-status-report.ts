@@ -119,11 +119,15 @@ export function createDaemonStatusReport(deps: DaemonStatusDeps) {
           ? { standing_receiver_refusal: sessionNodeManager.getStandingReceiverRefusal(a.name) }
           : {}),
       })),
-      // M16 033-CHANNELVIEW: the channels this daemon administers — same registry as `agents`, name
-      // + pubkey only, so `cello status` shows test-open and proof024b as channels, not agents.
+      // M16 033-CHANNELVIEW: the channels this daemon administers — same registry as `agents`, so
+      // `cello status` shows test-open and proof024b as channels, not agents. A healthy channel is
+      // name + pubkey; a `load_failed` channel is kept and listed with its state (reviewer LOW), or
+      // it would fall out of both lists and vanish, exactly as a broken agent stays visible above.
       channels: agents
-        .filter((a) => a.state !== "load_failed" && isChannelAgent(a.name))
-        .map((a) => ({ name: a.name, pubkey: a.pubkey })),
+        .filter((a) => isChannelAgent(a.name))
+        .map((a) => a.state === "load_failed"
+          ? { name: a.name, state: a.state, ...(a.error !== undefined ? { error: a.error } : {}) }
+          : { name: a.name, pubkey: a.pubkey }),
       standing_receiver_ready: sessionNodeManager.getStandingReceiverReady(),
       retryQueueDepth: retryQueue.getTotalDepth(),
       interrupted_sessions,

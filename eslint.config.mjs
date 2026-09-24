@@ -466,7 +466,7 @@ export default [
   },
   {
     files: ["core/daemon/src/daemon-status-report.ts"],
-    rules: { "max-lines": ["error", { max: 136, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 140, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/ipc-surface.ts"],
@@ -489,7 +489,7 @@ export default [
   },
   {
     files: ["core/daemon/src/connection-agents.ts"],
-    rules: { "max-lines": ["error", { max: 106, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 109, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/session-notify.ts"],

@@ -91,15 +91,18 @@ export function createConnectionAgents(deps: ConnectionAgentsDeps) {
   /**
    * M16 033-CHANNELVIEW: the channels this daemon administers — the complement of the agent list
    * above, drawn from the SAME loaded registry so the two can never disagree about an identity.
-   * Name + pubkey only: a channel is selected by nobody and driven by its administering agent, so
-   * none of the per-agent readiness/selection fields apply. A load-failed identity is omitted from
-   * both lists, exactly as the agent surface omits it.
+   * Name + pubkey only for a healthy channel: it is selected by nobody and driven by its
+   * administering agent, so none of the per-agent readiness/selection fields apply. A `load_failed`
+   * channel is NOT dropped (reviewer LOW): it would otherwise vanish from every surface — the agent
+   * list excludes it as a channel, and this list would exclude it as load_failed. It is listed here
+   * with its state, exactly as a broken agent stays visible as broken on the agent surface.
    */
   function getChannelsForConnection(_connectionId: string): ChannelSummary[] {
     return agents
-      .filter((a) => a.state !== "load_failed")
       .filter((a) => isChannelAgent(a.name))
-      .map((a) => ({ name: a.name, pubkey: a.pubkey }));
+      .map((a) => a.state === "load_failed"
+        ? { name: a.name, state: a.state, ...(a.error !== undefined ? { error: a.error } : {}) }
+        : { name: a.name, pubkey: a.pubkey });
   }
 
   return { getAgentsForConnection, getChannelsForConnection };
