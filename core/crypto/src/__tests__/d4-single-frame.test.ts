@@ -59,13 +59,21 @@ function sources(): string[] {
 
 const rel = (f: string): string => relative(CORE, f).split(sep).join("/");
 
+const ML_DSA_PROVIDER_TYPES = new Set(["MlDsaKeyProvider", "InMemoryMlDsaKeyProvider"]);
+
+/**
+ * Is this the ML-DSA provider type declared by crypto's ml-dsa module? Matched on the declaring
+ * FILE NAME and the TYPE NAME, never on the directory: a caller in another package sees the built
+ * declarations through `node_modules` at their REAL path, and `dist` is a symlink to `dist.nosync`
+ * here (the iCloud workaround) — a directory match once made every cross-package call invisible.
+ */
 function declaredInMlDsa(type: ts.Type): boolean {
   const types = type.isUnionOrIntersection() ? type.types : [type];
   for (const t of types) {
     const sym = t.getSymbol() ?? t.aliasSymbol;
-    for (const d of sym?.getDeclarations() ?? []) {
-      const file = d.getSourceFile().fileName.split(sep).join("/");
-      if (/\/crypto\/(src|dist)\/ml-dsa\.(ts|d\.ts)$/.test(file)) return true;
+    if (!sym || !ML_DSA_PROVIDER_TYPES.has(sym.getName())) continue;
+    for (const d of sym.getDeclarations() ?? []) {
+      if (/(^|[\\/])ml-dsa\.(d\.)?ts$/.test(d.getSourceFile().fileName)) return true;
     }
   }
   return false;
@@ -119,6 +127,14 @@ describe("001-PQPRIM Part D — D4: the Contract 2 frame is the only ML-DSA rout
     expect(files.length).toBeGreaterThan(100);
     expect(files).toContain("crypto/src/pq-frame.ts");
     expect(files).toContain("daemon/src/registration-manager.ts");
+  });
+
+  it("POSITIVE CONTROL: reports all three offence kinds in core/daemon's d4-offender fixture", () => {
+    const fixture = join(CORE, "daemon/src/__tests__/fixtures/d4-offender.ts");
+    const offences = scan([fixture]);
+    expect(offences.some((o) => o.includes("raw ML-DSA provider.sign()")), offences.join("\n")).toBe(true);
+    expect(offences.some((o) => o.includes("subtle.sign(ML-DSA…)")), offences.join("\n")).toBe(true);
+    expect(offences.some((o) => o.includes('literal "ML-KEM-768"')), offences.join("\n")).toBe(true);
   });
 
   it("finds no ML-DSA signature produced or checked outside pq-frame.ts / ml-dsa.ts", () => {
