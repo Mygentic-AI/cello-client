@@ -159,11 +159,9 @@ export const REFUSAL_REASONS = {
    * 038-KEYBIND — the caller's assignment carried no proof that its threshold key is theirs, or
    * carried one that does not hold.
    *
-   * ⚠️ ITS OWN REASON, not folded into INBOUND_ASSIGNMENT_INVALID, because the remedy is different
-   * and the other one's remedy is actively wrong here. "The assignment did not verify" tells the
-   * caller their frame was damaged and to start a new session; a retry cannot produce a binding
-   * that was never minted. What this actually means is that the directory node that brokered the
-   * session dropped the field.
+   * ⚠️ ITS OWN REASON, not folded into INBOUND_ASSIGNMENT_INVALID, because the cause is different.
+   * "The assignment did not verify" means the frame was damaged. This means the directory node that
+   * brokered the session dropped the field, and the operator is told so.
    */
   INBOUND_ASSIGNMENT_KEY_BINDING: "inbound_assignment_key_binding",
   /**
@@ -382,8 +380,9 @@ export const REFUSAL_GUIDANCE: Record<RefusalReason, string> = {
     "on it is yours — the signature your own identity key makes over it at registration. Without " +
     "that, they would be taking a directory's word for which key is yours, and recording it as your " +
     "identity for every future conversation. The proof is minted at registration and every directory " +
-    "node carries it, so the node that brokered this dropped the field; retry and another node will " +
-    "serve it.",
+    "node carries it, so the node that brokered this dropped the field. There is nothing for you to " +
+    "retry: the next session request can be brokered by another node. If it repeats, run cello_status " +
+    "to check that your agent shows as registered.",
 };
 
 /**
