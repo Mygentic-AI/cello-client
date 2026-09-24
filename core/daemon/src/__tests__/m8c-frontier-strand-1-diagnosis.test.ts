@@ -166,9 +166,9 @@ describe("DOD-FRONTIER-STRAND-1 AC2: a frontier mismatch names both frontiers", 
       expect(r.guidance).not.toMatch(/ask the counterparty/i);
     });
 
-    it("F5: a leaf_count_mismatch with NO numbers is the only case that blames an older daemon", () => {
+    it("F5: a leaf_count_mismatch with NO numbers is named as a malformed rejection", () => {
       const r = renderSealRejection("leaf_count_mismatch", SID_HEX);
-      expect(r.guidance).toMatch(/older daemon/);
+      expect(r.guidance).toMatch(/malformed rejection/);
       expect(r.your_leaf_count).toBeUndefined(); // never invents a count it did not receive
     });
 

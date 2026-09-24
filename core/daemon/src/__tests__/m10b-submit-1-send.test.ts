@@ -8,10 +8,8 @@
  * precisely because `submission_id` is content-derived (M10B-D20).
  *
  * Two failure modes get specific attention because both are silent by default:
- *   - VERSION SKEW. A directory node that has not deployed this frame kind replies
- *     `not_authenticated` (its decoder returns null). Reporting that verbatim sends an operator to
- *     debug KEYS for a day over a rollout artefact — the ERROR SUBSTITUTION trap (§5b Lens 3a2).
- *     Directory nodes are sovereign and deploy per region, so this is the NORMAL rollout case.
+ *   - NOT_AUTHENTICATED. The node replies it for a frame that arrived before auth completed or that
+ *     it could not decode. Reporting the label verbatim is the ERROR SUBSTITUTION trap (§5b Lens 3a2).
  *   - DUPLICATE. `stored: false` means an id was already present. Usually the submitter's own retry,
  *     and also the shape of a single-node censorship attack (Entry 20), so it must never be
  *     collapsed into plain success.

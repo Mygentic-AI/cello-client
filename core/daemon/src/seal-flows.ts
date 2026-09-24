@@ -22,7 +22,7 @@ import { extractErrorMessage } from "./error-message.js";
  * DOD-FRONTIER-STRAND-1 AC2: a failure may carry the numbers that caused it. `reason` stays the
  * machine-readable discriminator every caller already switches on; these are additive detail so an
  * operator is told WHAT disagreed rather than being sent to a counterparty that may be this same
- * daemon. All optional — a rejection from an older counterparty carries none of them.
+ * daemon. Present when the counterparty reported them.
  */
 export interface SealFailureDetail {
   /** The counterparty's own refusal reason, distinct from OUR terminal `reason`. */
@@ -130,12 +130,11 @@ export function renderSealRejection(
     return { rejection_reason: reason, guidance: terminal[reason] };
   }
   // Only a leaf_count_mismatch is EXPECTED to carry the numbers, so only there is their absence
-  // evidence of an older daemon. The responder rejects for five other reasons, and rendering those
-  // as a version problem asserts a cause the code never observed.
+  // worth naming. The responder rejects for five other reasons, reported verbatim.
   return {
     rejection_reason: reason,
     guidance: reason === "leaf_count_mismatch"
-      ? `The counterparty rejected the seal-interrupted request because the two sides disagree on how many messages this session holds, but it did not report its own count — it is running an older daemon. Compare the two transcripts with cello_transcript ${sessionId}; a session strands when one side holds a leaf the other never recorded.`
+      ? `The counterparty rejected the seal-interrupted request because the two sides disagree on how many messages this session holds, but its rejection did not carry the counts, which is a malformed rejection. Compare the two transcripts with cello_transcript ${sessionId}; a session strands when one side holds a leaf the other never recorded.`
       : `The counterparty rejected the seal-interrupted request: ${reason}. That is its own reason, reported verbatim — nothing here diagnoses it further. Check the counterparty's daemon for that condition; cello_transcript ${sessionId} shows this side's record if you need it.`,
   };
 }
@@ -208,9 +207,8 @@ export function createSealFlows(deps: SealFlowDeps) {
   type SealAckResult =
     | { type: "seal_interrupted_ack"; sealInterruptedLeaf: Record<string, unknown>; nonce: string | null }
     // DOD-FRONTIER-STRAND-1 AC2: the responder's frontier numbers ride the rejection so the
-    // initiator can name the mismatch instead of guessing at it. Optional — an older counterparty
-    // sends the bare reason, and the renderer must degrade to the old wording rather than print
-    // "undefined vs undefined".
+    // initiator can name the mismatch instead of guessing at it. Optional in the type because only
+    // leaf_count_mismatch carries it; the renderer must not print "undefined vs undefined".
     | { type: "seal_interrupted_rejection"; reason: string; pendingCeremony?: string; frontier?: { responder: number; initiator: number; diverging: number } }
     | { type: "timeout" };
 
