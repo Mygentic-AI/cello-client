@@ -64,7 +64,7 @@ export interface RegistrationContext {
   /**
    * DOD-MANIFEST-1/DKG-1: the consortium directory-node roster resolved from the verified
    * manifest (one entry per resolved node), or NULL when NO consortium manifest is configured.
-   * `null` ⇒ single-node DKG against getDirectoryEndpoint() (M6/M7 back-compat). A non-null
+   * `null` ⇒ single-node DKG against getDirectoryEndpoint() (local, no consortium manifest). A non-null
    * array ⇒ a consortium IS configured and the DKG must fan across exactly these nodes
    * (T-of-N); an EMPTY array (manifest configured but the whole consortium unresolved) is NOT
    * a fallback to single-node — it must REFUSE (the threshold gate). This null-vs-empty
@@ -329,11 +329,10 @@ export class RegistrationManager {
       impact: "a channel registration was answered without channel: true, so the directory did not record this identity as a channel; the registration failed and no registration state was persisted",
     });
     // A `register_success` means the directory has just STORED this identity, as an ordinary agent.
-    // Retrying cannot change that: every later attempt gets `already_registered`. An
-    // `already_registered` answer can mean the same, or nodes that predate channel support.
+    // Retrying cannot change that: every later attempt gets `already_registered`.
     const detail = frame["type"] === "register_success"
-      ? "The directory registered this identity as an ordinary agent, not a channel: its nodes do not support channels yet. That profile is now fixed, so this identity cannot become a channel. Once the directory supports channels, register the channel under a new identity."
-      : "The directory already holds this identity without a channel flag. Either it was registered as an ordinary agent, which cannot change, or the directory nodes do not support channels yet. Register the channel under a new identity once they do.";
+      ? "The directory registered this identity as an ordinary agent, not a channel, although the request asked for a channel. That is a directory defect, and the profile is now fixed, so this identity cannot become a channel. Register the channel under a new identity."
+      : "The directory already holds this identity without a channel flag: it was registered as an ordinary agent, which cannot change. Register the channel under a new identity.";
     return { error: "directory_missing_channel_support", detail };
   }
 
@@ -478,7 +477,7 @@ export class RegistrationManager {
     // Step 5: send register_request (SignalingManager CBOR/lp-encodes the frame)
     // M8B quorum: include the nodeIds we can reach right now (our resolved roster) so the directory can
     // pick the DKG quorum Q = these ∩ its manifest, |Q| ≥ T=majority(N). getConsortiumEndpoints() is
-    // null on the single-node back-compat path (no consortium manifest) → omit the field.
+    // null on the local single-node path (no consortium manifest) → omit the field.
     const reachableRoster = this.#ctx.getConsortiumEndpoints();
     const reachableNodeIds = reachableRoster?.map((e) => e.nodeId);
     const regSent = await this.#ctx.sendSignalingFrame({
@@ -494,8 +493,7 @@ export class RegistrationManager {
         ? {
             channel: true,
             admin_pubkey: channelOpts.adminPubkeyHex,
-            // Omitted when the caller did not ask for one: a directory that predates this reads an
-            // absent access as `open`, which is exactly what every channel already registered is.
+            // Omitted when the caller did not ask for one: an absent access means `open`.
             ...(channelOpts.access !== undefined ? { access: channelOpts.access } : {}),
           }
         : {}),
@@ -587,9 +585,9 @@ export class RegistrationManager {
     // DOD-DKG-1: build the directory-node set the DKG fans across. With a verified consortium
     // manifest the client resolved the full N-node roster (getConsortiumEndpoints) and the DKG
     // runs across ALL of them (the generated key is T-of-N). Without a manifest the roster is
-    // empty → the single primary endpoint (single-node DKG, M6/M7 back-compat).
+    // empty → the single primary endpoint (single-node DKG — a LOCAL daemon with no consortium manifest).
     // getConsortiumEndpoints() returns the resolved roster when a consortium manifest IS
-    // configured, or NULL when none is (the M6/M7 single-node back-compat path). Branching on
+    // configured, or NULL when none is (the local single-node path). Branching on
     // "manifest configured" (roster !== null) — NOT "roster non-empty" — is the load-bearing
     // distinction (code-reviewer B1 / cello-fallback-finder HIGH): an EMPTY roster with a
     // manifest configured (the whole consortium momentarily unreachable) must REFUSE, never
@@ -620,7 +618,8 @@ export class RegistrationManager {
           }),
       );
     } else {
-      // No consortium manifest configured → single-node DKG (M6/M7 back-compat).
+      // No consortium manifest configured → single-node DKG (local development against one directory).
+      // The node is labelled by its peerId here, and the signer's single-node path uses the same id.
       const directoryEndpoint = this.#ctx.getDirectoryEndpoint();
       if (!directoryEndpoint) {
         return { error: "directory_unreachable" };
@@ -669,7 +668,7 @@ export class RegistrationManager {
           verifyingSharesCbor: encodeCbor(dkgResult.verifyingShares) as Uint8Array,
           dkgMethod: "network_dkg",
           // M8B quorum: persist the quorum Q (nodeIds the DKG ran among) so a restored signer targets the
-          // actual share-holders, not the full live roster. null on the single-node back-compat path.
+          // actual share-holders, not the full live roster. null on the local single-node path.
           directoryNodeIds: roster ? roster.map((e) => e.nodeId) : undefined,
         };
       }

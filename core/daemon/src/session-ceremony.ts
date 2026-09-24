@@ -202,18 +202,16 @@ export function wireSessionOfferHandler(deps: {
          * grant me a slot", so the operator goes and looks at relay capacity, and the fault is on
          * the directory and has nothing to do with slots. One line makes that a grep.
          *
-         * INFO, not WARN: against a directory that has not rolled yet this is the expected shape,
-         * and the agent degrades correctly to its direct address. It is loud enough to find, and it
-         * says which of the two states it is.
+         * The agent degrades to its direct address. The line says which of the two states it is.
          */
         deps.logger.info("session.offer.reservation.not_offered", {
           agentName: deps.agentName,
           hasRelayEndpoint: offeredRelay !== undefined,
           impact: offeredRelay === undefined
             ? "the directory's offer named no relay, so this agent asked nobody for a slot and will " +
-              "answer with the addresses it already has. Expected against a directory that predates " +
-              "on-demand reservations; unexpected otherwise, and under relay-only it means the call " +
-              "is about to be refused for a reason that points at the wrong side."
+              "answer with the addresses it already has. Every directory names one, so this is a " +
+              "directory defect; under relay-only it means the call is about to be refused for a " +
+              "reason that points at the wrong side."
             : "the offer carried a relay_endpoint this agent could not read — no usable peer id or " +
               "no multiaddrs — so no slot was asked for. That is a malformed frame from the " +
               "directory, not a relay at capacity.",
@@ -372,7 +370,7 @@ export interface CeremonyWiringDeps {
    * DOD-SIGN-1: resolve the FULL consortium directory-node roster from the verified manifest at
    * ceremony time, or NULL when no consortium manifest is configured. A non-null roster ⇒ the
    * threshold signer coordinates the FROST ceremony across ALL these nodes (T-of-N — it excludes
-   * a node that's down and reaches any T). Null ⇒ single-node (M6/M7 back-compat).
+   * a node that's down and reaches any T). Null ⇒ single-node (local, no consortium manifest).
    */
   getConsortiumEndpoints: () => Promise<ConsortiumEndpoint[] | null>;
   /** The agent's per-agent signaling seam (where ceremony_request arrives + result is sent). */
@@ -450,7 +448,7 @@ async function hydrateShareAndStubs(
   // DOD-SIGN-1: build a directory-node stub PER consortium node so the FROST threshold signer
   // can run the signing ceremony across ALL N nodes (it reaches any T and excludes a node that's
   // down — "kill a node, still signs"). With no consortium manifest configured the roster is null
-  // → the single primary endpoint (M6/M7 single-node back-compat). NOTE: the share's threshold T
+  // → the single primary endpoint (the local single-node path). NOTE: the share's threshold T
   // (from the multi-node DKG) is FIXED — a degraded roster (fewer than T reachable) makes signing
   // FAIL, it can never forge a lower-threshold signature, so a single-stub fallback is safe.
   let directoryNodeStubs: NetworkDirectoryNode[] | undefined;
@@ -466,8 +464,8 @@ async function hydrateShareAndStubs(
   // node shares are bound to derive(region), and the node SIGNS under derive(region). If the client verifies
   // /aggregates partials under derive(peerId) instead, every verifyShare fails → all nodes excluded →
   // ceremony_exhausted. `id` feeds Identifier.derive() in the signer; `directoryPeerId` is the network dial
-  // and stays the libp2p peerId. (nodeId and peerId coincide only for legacy single-node agents whose DKG
-  // predates the region-as-nodeId change — the single-node fallback below passes peerId for that reason.)
+  // and stays the libp2p peerId. (The local single-node path below is the exception: its DKG labelled the
+  // one node by peerId — see registration-manager — so it signs under the same id.)
   const mkStub = (nodeId: string, peerId: string, multiaddr: string): NetworkDirectoryNode => {
     const stub = new NetworkDirectoryNode({
       id: nodeId,
@@ -483,8 +481,8 @@ async function hydrateShareAndStubs(
     // M8B quorum: filter the live roster to the SHARE-HOLDER quorum Q the agent registered with
     // (share.directoryNodeIds), so the seal targets holders — not nodes that came back online after a
     // quorum registration but hold NO share for this agent (they'd pad the count via isReachable()===true
-    // and burn the retry budget). Absent Q (pre-quorum agent / single-node) → full roster (unchanged
-    // DOD-SIGN-1). Defensive: if every Q node has vanished from the roster, fall back to the full roster
+    // and burn the retry budget). Absent Q (an agent registered on the local single-node path) → full roster
+    // (DOD-SIGN-1). Defensive: if every Q node has vanished from the roster, fall back to the full roster
     // rather than an empty signer set (the ceremony's own below-threshold pre-check then applies).
     const q = share.directoryNodeIds;
     const filtered = q && q.length > 0 ? roster.filter((ep) => q.includes(ep.nodeId)) : roster;
@@ -503,8 +501,8 @@ async function hydrateShareAndStubs(
     }
     const ep = await deps.getDirectoryEndpoint();
     if (ep && ep.multiaddr) {
-      // Single-node back-compat: no region is available from getDirectoryEndpoint, and legacy single-node
-      // agents' DKG labeled the node by peerId (pre region-as-nodeId), so the FROST id stays the peerId here.
+      // Local single-node path: registration's single-node DKG labelled the node by its peerId
+      // (registration-manager), so the FROST id is the peerId here too.
       directoryNodeStubs = [mkStub(ep.peerId, ep.peerId, ep.multiaddr)];
     }
   }
