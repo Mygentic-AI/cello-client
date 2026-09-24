@@ -30,10 +30,16 @@ export class PqCryptoError extends Error {
 }
 
 /**
- * Map a rejection from `crypto.subtle` for an algorithm this runtime does not implement to
- * `pq_runtime_unsupported`. Node below 24.7 rejects the algorithm name with a NotSupportedError.
- * Anything else is returned as-is for the caller to classify.
+ * Is this `crypto.subtle` rejection "this Node does not implement the algorithm"? Callers map it to
+ * `pq_runtime_unsupported`; anything else is theirs to classify.
+ *
+ * Two shapes, both seen for real:
+ *  - Node 24.6 rejects the `raw-seed` / `raw-public` KEY FORMAT before it looks at the algorithm:
+ *    TypeError, code ERR_INVALID_ARG_VALUE, "… is not a valid enum value of type KeyFormat."
+ *  - An unknown algorithm name: DOMException NotSupportedError.
  */
 export function isUnsupportedAlgorithm(err: unknown): boolean {
-  return err instanceof Error && err.name === "NotSupportedError";
+  if (!(err instanceof Error)) return false;
+  if (err.name === "NotSupportedError") return true;
+  return (err as { code?: unknown }).code === "ERR_INVALID_ARG_VALUE" && /type (KeyFormat|Algorithm)/.test(err.message);
 }
