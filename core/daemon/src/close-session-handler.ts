@@ -639,7 +639,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         counterparty_notice_reason: notice.reason,
         guidance: `Session ${sessionId} was force-abandoned — marked terminal locally with no bilateral seal. Use force only for a half-open session that cannot be sealed; a normal close (no force) still attempts the seal so both parties get a notarized receipt.` +
           (told
-            ? ` The notice was sent — a counterparty running a current client will stop calling this session. There is no acknowledgement for it, so if connection attempts keep arriving they are on an older build that does not understand it.`
+            ? ` The notice was sent, and their client stops calling this session when it arrives. There is no acknowledgement for it, so if connection attempts keep arriving the notice did not reach them.`
             : notice.reason === "no_local_node"
               ? ` They were NOT told: this side had already torn the session down, so there was nothing to send the notice on. Their half stays open and they may go on retrying delivery and re-dialling until they give up. If connection attempts keep arriving from them, that is why — it is not a network fault.`
               : ` They were NOT told (${notice.reason}), so their half stays open: they may go on retrying delivery and re-dialling this session until they give up. If connection attempts keep arriving from them, that is why.`) +

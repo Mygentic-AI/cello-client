@@ -2028,15 +2028,14 @@ export class SessionContentIngest {
        * signs now, on every content frame, so identity no longer needs the relay and position still
        * does not require identity.
        *
-       * ⚠️ REFUSED, NOT FROZEN. A frozen session is only cleared by opening a new one, and the
-       * overwhelmingly likely cause of an absent proof is a counterparty on an older build. The
-       * freeze is for a proof that FAILED (below, and in `#recordFrameOrdering`) — a positive fact
+       * ⚠️ REFUSED, NOT FROZEN. A frozen session is only cleared by opening a new one, and an
+       * absent proof is a stripped or malformed frame, not evidence about their key. The freeze is
+       * for a proof that FAILED (below, and in `#recordFrameOrdering`) — a positive fact
        * about their key.
        */
       if (!(s1Cbor instanceof Uint8Array) || !(senderSig instanceof Uint8Array)) {
         this.#ctx.refusals.refuseUnprovenAuthorship(agentName, sessionId, "authorship_proof_absent", contentHash, {
-          // WHICH half is missing. A sender on an older build supplies neither; a stripped frame is
-          // likelier to be missing one, and an investigator should not have to guess which.
+          // WHICH half is missing, so an investigator does not have to guess.
           hasStructure1: s1Cbor instanceof Uint8Array,
           hasSenderSignature: senderSig instanceof Uint8Array,
         }, correlationId);

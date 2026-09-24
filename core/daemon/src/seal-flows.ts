@@ -420,8 +420,8 @@ export function createSealFlows(deps: SealFlowDeps) {
       //
       // ONLY `relay_bilateral`. A peer on the seal-interrupted ceremony has no relay SEAL ctrl leaf
       // and never will, so our leaf would be one leaf into a log that can never hold a second
-      // distinct sender: the seal never completes and we would have reported ok. An ABSENT field
-      // (older peer) is not a hint — it is unknown, and unknown means do not sign.
+      // distinct sender: the seal never completes and we would have reported ok. An ABSENT field is
+      // not a hint — it is unknown, and unknown means do not sign.
       if (ackResult.reason === "session_seal_already_pending" && ackResult.pendingCeremony === "relay_bilateral") {
         logger.info("session.seal.ceremony.realigned", {
           sessionId, agentName: record.agent_name,

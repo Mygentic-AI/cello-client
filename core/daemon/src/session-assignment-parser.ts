@@ -306,8 +306,8 @@ import { validateMoniker } from "@cello-protocol/protocol-types";
 
 /**
  * The receiver's wire boundary, validated ONCE here so downstream code can never
- * observe an invalid moniker. Absent ≠ invalid: an absent field is an older client
- * (silent, rejected: false); a present-but-invalid value means the sender runs
+ * observe an invalid moniker. Absent ≠ invalid: an absent field is an initiator that offered
+ * no name (silent, rejected: false); a present-but-invalid value means the sender runs
  * modified code (rejected: true — the caller logs `moniker.rejected`, never the raw
  * value). Reject, never strip: the value is returned verbatim or null, never repaired.
  */

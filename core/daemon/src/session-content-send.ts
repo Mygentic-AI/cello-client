@@ -148,8 +148,8 @@ export class SessionContentSender {
     //
     // DOD-MSG-4 (self-ordering content frame): the relay's committed ordering record for this leaf,
     // captured from the hash submit so it can be stamped into the content frame (and the parked
-    // entry). Undefined if the relay is unreachable / an old relay — the receiver then falls back to
-    // the leaf_deliver witness stream / arrival order.
+    // entry). Undefined if the relay is unreachable — the receiver then falls back to the
+    // leaf_deliver witness stream / arrival order.
     let orderingS1: Uint8Array | undefined;
     let orderingS2: Uint8Array | undefined;
     /**
@@ -656,9 +656,8 @@ export class SessionContentSender {
         structure1_cbor: frameS1,
         sender_signature: frameSig,
         structure2_cbor: frameS2,
-        // DOD-M15-SEALWIRE-1 part B2b: HOW `content_hash` was produced. An older peer ignores an
-        // unknown CBOR key, so emitting it is safe for every build in existence; a newer one reads
-        // it and verifies under the named algorithm instead of assuming.
+        // DOD-M15-SEALWIRE-1 part B2b: HOW `content_hash` was produced. The receiver verifies under
+        // this name and refuses a frame that names none.
         content_hash_alg: contentHashAlg,
         /**
          * 034-CARRYLEAF review F5 — WHICH LEAF DOMAIN this content belongs to.
@@ -670,9 +669,8 @@ export class SessionContentSender {
          * canonical log and the carried `leaf_kind` would describe the leaf as something it is not,
          * and a leaf kind selects a HASH DOMAIN everywhere else in this protocol.
          *
-         * Same argument as `content_hash_alg` beside it: an older peer ignores an unknown CBOR key,
-         * so emitting it is safe for every build in existence, and a receiver that does not see it
-         * declines to witness rather than guessing (see `#witnessReceivedLeaf`).
+         * A receiver that does not see it declines to witness rather than guessing (see
+         * `#witnessReceivedLeaf`).
          */
         leaf_kind: leafKind,
       }) as Uint8Array;

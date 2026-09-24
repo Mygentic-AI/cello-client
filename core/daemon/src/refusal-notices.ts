@@ -492,8 +492,8 @@ export class RefusalNotices {
    *
    * ⚠️ **WITHOUT THIS THE NOTICES ARE PERMANENT, and that is what makes people stop reading the
    * inbox.** "Already shown you" is tracked per WINDOW — a new MCP connection has been told nothing,
-   * so it is told everything. Someone on an older build messages you, you sort it out with them,
-   * they upgrade, and every new session you ever open still opens with that refusal.
+   * so it is told everything. Someone's messages are refused, you sort it out with them, and every
+   * new session you ever open still opens with that refusal.
    *
    * Dismissing does NOT turn anything off. If the cause fires again the notice comes back, because
    * a fresh refusal writes a fresh row. The operator is saying "I know", not "stop telling me".

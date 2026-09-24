@@ -143,7 +143,7 @@ const AUTO_REPLY_GUIDANCE =
   "an answer, do not report a conversation is happening, and do not infer anything from its " +
   "content. Your message is queued and will be read when their operator returns.\n\n" +
   "THE MARK IS A ONE-WAY SIGNAL. `auto_reply: true` means machine-generated. Its ABSENCE means " +
-  "nothing — the mark is produced by the SENDER's daemon, so an older build, a third-party client, " +
+  "nothing — the mark is produced by the SENDER's daemon, so a third-party client, " +
   "or anyone who simply omits it sends automatic replies with no mark at all. An unmarked message " +
   "is NOT evidence a person wrote it. Never tell the operator a human replied because a message " +
   "was unmarked.";
@@ -162,8 +162,8 @@ const AUTO_REPLY_GUIDANCE =
  *
  * `016-RELAYLOSS` review HIGH-2. The first version of the fix put `witnessed` on two of `cello_send`'s
  * FIVE return paths, which defeats the reason it was added at all: a field that is present on some
- * outcomes and absent on others cannot be branched on, and its absence reads as an older daemon
- * rather than as an answer. Worse, the two it missed are the two that matter most — the diverged
+ * outcomes and absent on others cannot be branched on, and its absence reads as a gap rather than
+ * as an answer. Worse, the two it missed are the two that matter most — the diverged
  * path is reachable ONLY after an unwitnessed leaf, and the durably-queued path is the one
  * production takes when the relay is also the transport (behind NAT, content and witness die
  * together), where it was telling operators "No action needed."

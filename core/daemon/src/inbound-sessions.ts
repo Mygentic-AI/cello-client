@@ -459,12 +459,12 @@ export function extractInboundSessionAssignment(frame: Record<string, unknown>):
       // DOD-FIRSTMSG-WITNESS-1: the directory's per-node relay signature. WITHOUT it the
       // responder cannot present `client_record_assignment`, so it can never create its own
       // relay session state and its first message races the initiator's record — the live
-      // same-machine `session_not_found`. undefined = the directory issued none
-      // (direct/legacy/pre-Option-B); it must read as ABSENT, never as an empty signature,
+      // same-machine `session_not_found`. undefined = the directory issued none (a direct
+      // session); it must read as ABSENT, never as an empty signature,
       // because presenting an empty one would be rejected as forged.
       relayDirectorySignature: Uint8Array | undefined;
-      // True when the field was PRESENT but not a well-formed 64-byte signature — a wire/version
-      // bug, reported distinctly from "the directory issued none" (a legacy/direct session).
+      // True when the field was PRESENT but not a well-formed 64-byte signature — a wire bug,
+      // reported distinctly from "the directory issued none" (a direct session).
       relayDirectorySignatureMalformed: boolean;
       /** The directory's 64-byte FROST signature over the session establishment; the genesis includes it. */
       sessionSignature: Uint8Array | undefined;
@@ -473,13 +473,13 @@ export function extractInboundSessionAssignment(frame: Record<string, unknown>):
       relayIdHex: string | null;
       // MONIKER-2 AC2: the initiator's offered name, validated ONCE here at the wire
       // boundary — downstream code can never observe an invalid moniker. null when
-      // absent (older client) or invalid; monikerRejected distinguishes the two so the
+      // absent (the initiator offered none) or invalid; monikerRejected distinguishes the two so the
       // caller can log `moniker.rejected` (invalid) vs stay silent (absent).
       offeredMoniker: string | null;
       monikerRejected: boolean;
       monikerRejectReason: "not_string" | "length" | "charset" | null;
       // DOD-PRESENT-1: trust signals that survived the directory's dumb check.
-      // undefined = absent (older directory or initiator presented nothing).
+      // undefined = absent (the initiator presented nothing).
       trustSignals: Array<{ hash: string; blob: Uint8Array }> | undefined;
     }
   | null {
@@ -1274,8 +1274,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
        * path, where the counterparty has no say and a refusal would say nothing about conduct.
        *
        * ⚠️ AND IT NAMES WHAT WAS OBSERVED, NEVER A VERDICT. The same frame comes from a hostile peer
-       * and from a counterparty on a build that predates brokered sessions, and this side cannot
-       * tell them apart — so the notice says what is missing and what it costs, never that anyone
+       * and from a malfunctioning one, and this side cannot tell them apart — so the notice says what is missing and what it costs, never that anyone
        * is malicious.
        *
        * Best-effort identifiers: the frame did not parse, so the session id and sender are read
@@ -1595,7 +1594,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
           // operator "it was altered in transit" points them at the network for something no retry
           // can fix, and every node runs the same build so "try another node" is dead advice.
           : isBindingFault
-            ? "the caller's session record carries no valid proof that its threshold signing key is theirs. Nothing on your side produces this and nothing you can do here fixes it — the proof is minted on THEIR machine at registration. Tell them out of band to re-register their agent, or to retry so a different directory node serves the field. Do not clear their contact: the pin is not what failed."
+            ? "the caller's session record carries no valid proof that its threshold signing key is theirs. Nothing on your side produces this and nothing you can do here fixes it — the proof is minted on THEIR machine at registration and every directory node carries it, so the node that brokered this dropped it. Ask them to retry so a different directory node serves the field. Do not clear their contact: the pin is not what failed."
             : pinnedSigner !== null
               ? "the signature did not verify under the key this agent recorded for that counterparty. Two things produce this and they need different actions: the frame was altered in transit, OR the two of you are running different CELLO versions and disagree about what gets signed. Check `cello -v` on both sides and upgrade the older one before retrying — a retry alone will not fix a version gap, and every directory node runs the same build."
               : "the assignment is tampered or malformed — its signature does not match its own contents. Retry to reach a different directory node; if it repeats, that node is not producing valid assignments",

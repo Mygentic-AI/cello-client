@@ -626,11 +626,9 @@ export interface SessionRecord {
   /**
    * DOD-M15-REFUSED-INBOUND-SILENT-1 — whether this session's content hashes are salted.
    *
-   * Deliberately a status field and not an alert: an unsalted session is exactly as verifiable as
-   * every session shipped before salting existed, so nothing is wrong and there is nothing to
-   * interrupt anyone with. It exists so an operator can tell *unsalted because this build predates
-   * the feature* from *unsalted because adoption was refused* — only the second says anything about
-   * their setup. Absent on records that did not come from a listing surface.
+   * Deliberately a status field and not an alert: an unsalted session is exactly as verifiable, so
+   * nothing is wrong and there is nothing to interrupt anyone with. It exists so an operator can tell
+   * WHY a session is unsalted — only a refused adoption says anything about their setup. Absent on records that did not come from a listing surface.
    */
   content_hashes_salted?: boolean;
   /**
@@ -714,9 +712,7 @@ export interface SessionListEntry {
    * salted, so it stays readable rather than becoming a field on every row that everyone skips.
    *
    * Its absence is the healthy, ordinary case. Its presence does not mean anything is wrong — an
-   * unsalted session is exactly as verifiable as every session shipped before salting existed — it
-   * means the operator can tell *unsalted because this build predates the feature* from *unsalted
-   * because adoption was refused*, and only the second says anything about their setup.
+   * unsalted session is exactly as verifiable — and the reason beside it says why.
    */
   contentHashesSalted?: false;
   /**
@@ -785,11 +781,10 @@ export interface SessionListEntry {
   /**
    * Whether this session's message hashes are salted — `DOD-M15-SEALWIRE-1` bullet 6.
    *
-   * `false` is not a fault. It means this conversation hashes the way every build before the salt
-   * existed, which is exactly as verifiable; what it loses is that a relay holding the hashes could
-   * confirm a guess at a short message in this conversation. The common cause is a counterparty who
-   * was offline or on an older build when the session opened, and it is permanent for the session
-   * either way — the agreement runs at open, before anything is hashed.
+   * `false` is not a fault. The conversation is exactly as verifiable; what it loses is that a relay
+   * holding the hashes could confirm a guess at a short message in this conversation. The common
+   * cause is a counterparty who was offline when the session opened, and it is permanent for the
+   * session — the agreement runs at open, before anything is hashed.
    *
    * ⚠️ REQUIRED, NOT OPTIONAL. An absent field would be indistinguishable from `false`, so an older
    * daemon and an unprotected session would read the same — the exact collapse Decision #15 spends a

@@ -190,10 +190,10 @@ export const SALT_FREEZE_GUIDANCE: Record<SaltFreezeReason, string> = {
     "STOPPED ON PURPOSE. You and your counterparty ended up with different values for this " +
     "session's content salt, so from here every message either of you sent would be discarded by " +
     "the other with nothing said about it. Nothing was lost and nothing was tampered with. Two " +
-    "things cause it: one of you is running an older build, or one side restarted midway through " +
-    "opening the session and came back without the half it had already sent. Check the log for " +
+    "things cause it: one side restarted midway through opening the session and came back without " +
+    "the half it had already sent, or a salt write failed. Check the log for " +
     "session.salt.persist.failed or session.salt.announce.failed on either machine — if you see " +
-    "one, it was the restart and there is nothing to fix. Otherwise compare versions. Either way, " +
+    "one, that is the cause and there is nothing to fix. Either way, " +
     "start a new session.",
   [SALT_FREEZE_REASONS.STATE_DIVERGENT]:
     "STOPPED ON PURPOSE. This side holds the session's content salt but no longer holds the random " +
@@ -480,10 +480,6 @@ export function onPeerSaltFrame(state: {
    * Deliberately NOT moved above the malformed-frame guard: the `ownSalt` block reads
    * `hasContribution`/`hasFingerprint` and relies on exactly one of them being set.
    *
-   * A legacy peer on an older build can still send the misleading frame, and a fixed side would
-   * still discard on it. Accepted rather than defended against with a wire field: we are pre-launch
-   * with no external installs, and the standing rule here is to re-derive against an empty database
-   * rather than carry compatibility for a state nobody is in.
    */
   if (state.ownAdoption?.closed && !state.ownSalt) {
     return {

@@ -596,8 +596,8 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
        * ⚠️ PRESENT ON EVERY ROW, INCLUDING THE TRUE ONE — the one place this list breaks its own
        * present-only-when-interesting convention (`sealing`, `frontierMismatch`), and deliberately.
        * Those two say *something is happening*; absence means nothing is. This says *what protects
-       * this conversation*, and for that, absence is unreadable: a missing field on an older daemon
-       * and a missing field meaning "unprotected" would look identical, which is the collapse
+       * this conversation*, and for that, absence is unreadable: a missing field and a missing field
+       * meaning "unprotected" would look identical, which is the collapse
        * Decision #15 spends a whole wire discriminator avoiding. A security property must not be
        * inferable from a gap.
        *
@@ -755,8 +755,8 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
      * DOD-M15-NO-SILENT-REFUSAL-1: dismissing a conversation clears its REFUSAL NOTICES too.
      *
      * Done FIRST and unconditionally, because a refusal can sit on a LIVE conversation — the case
-     * that matters most is a counterparty on an older build whose messages keep being refused, and
-     * that conversation is very much still open. Without this the notice is permanent: "already
+     * that matters most is a counterparty whose messages keep being refused, and that conversation
+     * is very much still open. Without this the notice is permanent: "already
      * shown you" is per window, so every new session opens with a refusal the operator dealt with
      * weeks ago, which is how an inbox becomes something people stop reading.
      */

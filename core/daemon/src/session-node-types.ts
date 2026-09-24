@@ -91,8 +91,7 @@ export const MAX_REFUSALS_PER_READ = 25;
  * Five seconds because both errors cost real things. Too short and a merely slow counterparty makes
  * the session permanently unsalted for no reason — the decision is irreversible, so the bound should
  * be generous relative to the round trip. Too long and the first message of every conversation with
- * a peer on an older build visibly hangs, which is the failure a user actually notices and blames
- * the product for. This is only ever paid by a session that HAS an agreement outstanding: a
+ * a slow peer visibly hangs, which is the failure a user actually notices and blames the product for. This is only ever paid by a session that HAS an agreement outstanding: a
  * park-only session never starts one and never waits (constraint 5).
  */
 export const SALT_AGREEMENT_WAIT_MS = 5_000;
@@ -362,8 +361,7 @@ export const capStaleBefore = (): number => Date.now() - CAP_INTERRUPTED_TTL_MS;
  * have no node left to send on.
  *
  * `told: true` means the bytes left this node. There is no acknowledgement, so it is not proof the
- * far side acted — a counterparty on an older client does not understand the frame and keeps
- * calling. The guidance says so rather than promising they will stop.
+ * far side acted. The guidance says so rather than promising they will stop.
  */
 export interface AbandonNoticeResult {
   told: boolean;
@@ -873,10 +871,10 @@ export interface AwaitingAckEntry {
  *
  *   - `refuted`   — a proof was supplied and it FAILED. That is evidence about the counterparty's
  *                   key, and it freezes the session (`#freezeOnIdentityFailure`).
- *   - `unusable`  — there is nothing here that could be checked against this message. Almost always
- *                   a peer on an older build; possibly someone stripping the field. It refuses THE
- *                   MESSAGE and leaves the session alone, because freezing on it would turn every
- *                   version skew into an incident only a new session can clear.
+ *   - `unusable`  — there is nothing here that could be checked against this message: a stripped
+ *                   or malformed field. It refuses THE MESSAGE and leaves the session alone,
+ *                   because freezing on it would turn every malformed frame into an incident only a
+ *                   new session can clear.
  *
  * Absent is not a fourth case: a frame with no `sender_signature` never reaches the verifier, and
  * its caller refuses it on the same path an `unusable` verdict takes. Missing, malformed and
@@ -931,8 +929,8 @@ export const AUTHORSHIP_SESSION_MISMATCH = "session_mismatch";
  * what the claim says the sender had SEEN.
  *
  * They are three names and not one because the operator's next move differs for each, and because an
- * investigator who cannot tell "your counterparty is on an older build" from "your counterparty
- * acknowledged something you never sent" is looking at the wrong half of the problem.
+ * investigator who cannot tell "the field is missing" from "your counterparty acknowledged something
+ * you never sent" is looking at the wrong half of the problem.
  *
  * ⚠️ **NAME WHAT WAS OBSERVED, NEVER AN INFERRED CONCLUSION** (`DOD-M15-ERRSTRING-1`). Not one of
  * these says "peer is malicious" — a mismatch is equally what a genuine software fault on the other

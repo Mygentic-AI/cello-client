@@ -404,8 +404,7 @@ export class ParkRecovery {
     if (!own) return "none";
     try {
       // Canonical Structure 1 is [version, content_hash, sender_pubkey, session_id, last_seen_seq,
-      // timestamp], plus last_seen_hash at index 6 on a v2 claim (020-ACKHASH). content_hash is
-      // index 1 in both.
+      // timestamp, last_seen_hash, prev_own_hash]. content_hash is index 1.
       const s1 = decodeStructure1(own.structure1Cbor);
       if (!s1.ok) {
         this.#ctx.logger.warn("session.seal.leaf.recover.failed", {
@@ -579,38 +578,12 @@ export class ParkRecovery {
     });
 
     /**
-     * DOD-M15-SEALWIRE-1 part B1 — RECOVERED-FROM-PARK CONTENT CARRIES NO ALGORITHM NAME, and that
-     * is correct today rather than an oversight.
+     * DOD-M15-SEALWIRE-1 — the park envelope NAMES its content-hash algorithm, and recovery verifies
+     * under that name, exactly as the direct path does; an envelope naming none is refused.
      *
-     * The park envelope has no field for one, so this passes `undefined`, which resolves to
-     * `sha256`. In part B1 that was exactly right and provably so: no sender salted, so every parked
-     * entry in existence had been hashed unsalted.
-     *
-     * ✅ FIXED IN PART B2a, at BOTH sites: here, and the independent verifier in `content-park.ts`.
-     * The envelope carries the algorithm from v3 onward, and a v2 envelope's absent field resolves to
-     * `sha256` — which is what a peer predating the field actually used.
-     *
-     * > **⛔ THE LAST SENTENCE HERE READ "Every envelope this build emits is still v2, because
-     * > nothing salts yet." THAT IS FALSE NOW.** B2b-2 turned salting on: a session holding an
-     * > agreed salt hashes under `hmac-sha256-salt-v1`, so this build DOES emit v3 envelopes.
-     * > Rewritten rather than deleted, per `DOD-M15-CLAIM-COMMENTS-1` — the sentence is why the
-     * > staleness survived, and an absence would read as deliberate.
-     * >
-     * > The consequence is not theoretical: a v2 envelope carrying a SALTED hash recomputes unsalted
-     * > at the far end and reports `content_hash_mismatch` — a false tamper claim on honest content,
-     * > which also blocks auto-co-sign at seal. Measured on 2026-08-24.
-     *
-     * ─── AND THE REFUSAL DOES NOT HOLD — review F2 ────────────────────────────────────────────
-     *
-     * A direct-path refusal sends no delivery ACK, so the sender's TTF backstop parks the message
-     * and it arrives here seconds later, where `undefined` means `sha256` and it may well succeed.
-     * A frame refused BY NAME on one path is then accepted on the other, with nothing tying the two
-     * together in the log — an operator sees an ERROR and, ten seconds on, a healthy delivery.
-     *
-     * That is not repaired by refusing here as well: today's park entry genuinely IS `sha256`, and
-     * refusing it would drop good mail. What is wrong is the SILENCE, so the reconciliation is
-     * logged instead — the two events become one story, and B2 removes the ambiguity for real by
-     * putting the name in the envelope.
+     * A direct-path refusal sends no delivery ACK, so the sender's TTF backstop parks the message and
+     * it arrives here seconds later. When it is then accepted, the two events are reconciled in the
+     * log below, so an operator sees one story rather than an ERROR followed by a silent delivery.
      */
     /**
      * ⚠️ LOGGED AFTER THE INGEST, NOT BEFORE IT — review B2a F1, and the previous version of this
@@ -619,10 +592,9 @@ export class ParkRecovery {
      * It fired on a memo hit and said *"the message is being delivered by the other route"*, which
      * was true-by-construction only while the park path passed `undefined` for the algorithm. Part
      * B2a made the park path carry `env.contentHashAlg` — so a peer that names an unreadable
-     * algorithm on the direct path AND parks the same content as v3 with the same name is refused
+     * algorithm on the direct path AND parks the same content with the same name is refused
      * AGAIN here, re-arms the memo, is never confirm-deleted, and repeats on every drain. An
-     * unbounded stream of warnings asserting a delivery that never occurs, drowning the real
-     * reconciliation when the sender eventually re-parks as v2.
+     * unbounded stream of warnings asserting a delivery that never occurs.
      *
      * The claim is only sound once the ingest has actually succeeded, so it is made there.
      */
@@ -643,7 +615,7 @@ export class ParkRecovery {
      * message with no ordering record AND no signature over its ordering claim delivers something
      * readable that can never enter a receipt. The obvious fix is to refuse it here.
      *
-     * **It cannot ship yet, and the reason is our OWN path, not an older peer's.** `SEC-1` AC5 is
+     * **It cannot ship yet, and the reason is our OWN path.** `SEC-1` AC5 is
      * explicit: the crash-backstop shape — signed by the sender, no ordering record — is legal and
      * must be accepted. That envelope is produced when content is queued before anything witnessed
      * it, and from the recipient's side it is INDISTINGUISHABLE from an attacker's stripped one. So
@@ -659,8 +631,7 @@ export class ParkRecovery {
     const refusedForAuthorship = this.#ctx.refusals.wasRefusedOnDirectPath(agentName, sessionId, contentHashHex);
     const result = await this.#ctx.ingestReceivedContent(
       agentName, sessionId, env.content, contentHash, correlationId, recoveredSeq ?? undefined,
-      // The envelope's own claim, verbatim — `undefined` on a v2 envelope, which resolves to
-      // `sha256` and is exactly right for a peer that predates the field.
+      // The envelope's own claim, verbatim; an absent one is refused by the resolver.
       env.contentHashAlg,
     );
     /**
@@ -692,16 +663,11 @@ export class ParkRecovery {
      * happened" — and it is reached the same two ways: their relay was briefly unreachable, or they
      * are withholding on purpose.
      *
-     * ⚠️ THE SIGNATURE COMES FROM THE ENVELOPE, AND ONLY A v4 ENVELOPE HAS ONE. `parkSig`
-     * authenticates the DEPOSIT — it signs `(session_id, recipient_pubkey, content_hash)` — and the
-     * relay will not accept it, because a counter-submit is admissible only against the author's own
-     * signature over their own ordering claim. A v2 or v3 envelope therefore cannot be witnessed on
-     * its author's behalf, and is left alone rather than guessed at.
-     *
-     * **So this route is closed against a peer running a stock client, and open to one that
-     * deliberately emits an older envelope.** Requiring v4 is the step that closes it completely,
-     * and it waits on nothing in the field emitting v2 or v3 — the same tolerate-then-enforce
-     * sequence every bilateral wire change in this milestone follows.
+     * ⚠️ THE SIGNATURE COMES FROM THE ENVELOPE's signed-claim slot. `parkSig` authenticates the
+     * DEPOSIT — it signs `(session_id, recipient_pubkey, content_hash)` — and the relay will not
+     * accept it, because a counter-submit is admissible only against the author's own signature
+     * over their own ordering claim. An envelope with no signed claim therefore cannot be witnessed
+     * on its author's behalf, and is left alone rather than guessed at.
      */
     if (
       result.ok && result.held !== true && result.screenedOut !== true &&
