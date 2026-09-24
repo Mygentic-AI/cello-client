@@ -6,9 +6,9 @@
  * recognised in another, and an observer holding the plaintext cannot confirm a guess by hashing it.
  *
  * Moved verbatim, comments included. The operator-facing strings in here are unusually careful and
- * they must stay that way: several exist specifically to distinguish "your counterparty is on a
- * build that predates the salt" from "our own write failed", because those have opposite remedies
- * and people have already been sent the wrong way once.
+ * they must stay that way: several exist specifically to distinguish a counterparty-side cause from
+ * "our own write failed", because those have opposite remedies and people have already been sent
+ * the wrong way once.
  *
  * ⚠️ THIS CLASS OWNS ELEVEN PER-SESSION SALT MAPS, of which **TEN** were cleared by hand in
  * `#evictSessionCaches`. One `evictSession` call replaces those ten.
@@ -257,11 +257,9 @@ export class SessionSalts {
   /**
    * DOD-M15-REFUSED-INBOUND-SILENT-1, the DECLINED PROTECTION half — a FIELD, not an alert.
    *
-   * An unsalted session is exactly as verifiable as every session shipped before salting existed,
-   * so there is nothing to interrupt the operator with and no event to fire. What was missing is
-   * STATE: nothing let anyone tell *"unsalted because this build predates the feature"* from
-   * *"unsalted because adoption was refused"* — and only the second says something about their
-   * setup. The session's own status now answers it, which costs nothing per message and cannot
+   * An unsalted session is exactly as verifiable, so there is nothing to interrupt the operator with
+   * and no event to fire. What was missing is STATE: nothing let anyone tell WHY a session is
+   * unsalted — and only a refused adoption says something about their setup. The session's own status now answers it, which costs nothing per message and cannot
    * become a flood.
    *
    * The raw salt is dropped on the way out rather than passed through. `SELECT *` was handing the
@@ -277,9 +275,8 @@ export class SessionSalts {
    * moment the session had STOPPED salting — and because the field is emitted only when `false`,
    * the agent saw nothing at all, which reads as "not unsalted".
    *
-   * That is precisely the case this field was added for. Its own note above says it exists to tell
-   * *"unsalted because this build predates the feature"* from *"unsalted because adoption was
-   * refused"*, and the refused case was the one it could not report.
+   * That is precisely the case this field was added for — a refused or suspended salt — and it was
+   * the one it could not report.
    */
   saltStatusOf(row: SessionRecord, agentName: string | null): SessionRecord {
     const { content_salt, ...rest } = row as SessionRecord & { content_salt?: Uint8Array | null };
