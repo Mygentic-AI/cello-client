@@ -103,8 +103,13 @@ function inboundHarness(opts: { tier?: number } = {}) {
    * moment a third handler was added, and every test here failed for a reason that had nothing to
    * do with what it was testing. The real manager fans out; so does this.
    */
-  const inboundHandlers: Array<(frame: Record<string, unknown>) => void> = [];
-  const inbound = (frame: Record<string, unknown>): void => { for (const h of [...inboundHandlers]) h(frame); };
+  const inboundHandlers: Array<(frame: Record<string, unknown>) => unknown> = [];
+  // Awaits what each handler returns: the session-assignment handler's verification is asynchronous
+  // (M9D 002-PQKEYS — ML-DSA via Web Crypto), and a test that did not wait for it would be asserting
+  // on a handler that has not finished.
+  const inbound = async (frame: Record<string, unknown>): Promise<void> => {
+    await Promise.all([...inboundHandlers].map((h) => h(frame)));
+  };
 
   const durable: Array<{ agent: string; session: string; reason: string }> = [];
   /** Re-closing the receiver gate to the offered dialer — half of what `refuseInboundSession` does. */
@@ -132,7 +137,7 @@ function inboundHarness(opts: { tier?: number } = {}) {
     checkUnknownSenderAcceptanceBound: () => ({ ok: true as const }),
     sessionsConsumingCap: () => 0,
     capDiagnostics: () => ({}),
-    recordCounterpartyPrimary: () => {},
+    recordCounterpartyKeys: () => {},
     recordOfferedMoniker: () => {},
     addContact: () => {},
     recordSessionGenesis: () => {},
@@ -154,7 +159,7 @@ function inboundHarness(opts: { tier?: number } = {}) {
     isSubscribedChannel: (name: string, counterpartyHex: string) =>
       name === ALICE && counterpartyHex.toLowerCase() === COUNTERPARTY.toLowerCase() && aliceSubscribes,
     sharedSignaling: {
-      registerInboundHandler(h: (frame: Record<string, unknown>) => void) {
+      registerInboundHandler(h: (frame: Record<string, unknown>) => unknown) {
         inboundHandlers.push(h);
         return () => { const i = inboundHandlers.indexOf(h); if (i >= 0) inboundHandlers.splice(i, 1); };
       },
@@ -197,7 +202,7 @@ function inboundHarness(opts: { tier?: number } = {}) {
       sig[0] ^= 0x01;
       assignment.directory_signature = sig;
     }
-    inbound(frame);
+    await inbound(frame);
   }
 
   return {

@@ -29,7 +29,7 @@ import { describe, it, expect } from "vitest";
 import { generateKeypair } from "@cello-protocol/crypto";
 import { createOutboundSessions, type OutboundSessionDeps } from "../outbound-sessions.js";
 import { registerInitiateSessionHandler, type InitiateSessionDeps } from "../initiate-session-handler.js";
-import { makeSignedAssignmentFrame, fixtureIdentity, FIXTURE_RESPONDER_PRIMARY } from "./helpers/signed-assignment.js";
+import { makeSignedAssignmentFrame, fixtureIdentity, fixturePqKeys, FIXTURE_RESPONDER_PRIMARY } from "./helpers/signed-assignment.js";
 import type { Logger } from "../types.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
@@ -66,6 +66,7 @@ interface Harness {
   counterpartyConnects: string[][];
   /** 038-KEYBIND: the responder group keys the initiator pinned, in order. */
   counterpartyPrimaries: string[];
+  counterpartyPqKeys: Array<{ mlDsaHex: string; mlKemHex: string }>;
 }
 
 /**
@@ -120,13 +121,18 @@ async function makeHarness(opts: {
   const sessionNodesCreated: string[] = [];
   const counterpartyConnects: string[][] = [];
   const counterpartyPrimaries: string[] = [];
+  const counterpartyPqKeys: Array<{ mlDsaHex: string; mlKemHex: string }> = [];
 
   const sessionNodeManager = {
     getStandingReceiverInfo: () => ({ peerId: "12D3KooWInitiatorReceiver", addrs: ["/ip4/127.0.0.1/tcp/3"] }),
     getSessionNodePeerId: () => null,
     recordSessionGenesis: () => {},
     // 038-KEYBIND: the initiator records the responder's group key once the negotiation proved it.
-    recordCounterpartyPrimary: (_agent: string, _sid: string, hex: string) => { counterpartyPrimaries.push(hex); },
+    // M9D 002-PQKEYS: the responder's PQ keys ride the same verified result, in the same write.
+    recordCounterpartyKeys: (_agent: string, _sid: string, keys: { primaryHex: string; mlDsaHex: string; mlKemHex: string }) => {
+      counterpartyPrimaries.push(keys.primaryHex);
+      counterpartyPqKeys.push({ mlDsaHex: keys.mlDsaHex, mlKemHex: keys.mlKemHex });
+    },
     // 038-KEYBIND review F5: the pin the outbound path now compares against before dialling.
     getPinnedCounterpartyPrimary: () => opts.pinnedCounterpartyPrimary ?? null,
     createSessionNode: async (sessionId: string) => {
@@ -189,7 +195,7 @@ async function makeHarness(opts: {
     isSubscribedChannel: () => false,
   } as unknown as InitiateSessionDeps);
 
-  return { openSessionAs, events, dials, sessionNodesCreated, counterpartyConnects, counterpartyPrimaries };
+  return { openSessionAs, events, dials, sessionNodesCreated, counterpartyConnects, counterpartyPrimaries, counterpartyPqKeys };
 }
 
 /** Every step that would have put bytes on the wire toward the named peer. */
@@ -270,6 +276,9 @@ describe("DOD-M15-ASSIGN-TARGET-1: the assignment must name who the operator ask
       h.counterpartyPrimaries,
       "the initiator must record the responder's group key — the seal anchor for a responder-first close",
     ).toEqual([hex(FIXTURE_RESPONDER_PRIMARY)]);
+    // M9D 002-PQKEYS: and exactly the responder's two post-quantum keys, recorded with it.
+    const responderPq = await fixturePqKeys(hex(ASKED_FOR));
+    expect(h.counterpartyPqKeys).toEqual([{ mlDsaHex: hex(responderPq.mlDsaPubkey), mlKemHex: hex(responderPq.mlKemPubkey) }]);
   });
 
   it("038-KEYBIND F5: REFUSES — before any dial — a counterparty group key that differs from the pin", async () => {

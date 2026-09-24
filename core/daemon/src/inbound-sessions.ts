@@ -1928,7 +1928,9 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     });
     mgr.registerInboundHandler((frame) => {
       if (frame["type"] !== "session_assignment") return;
-      void handleInboundSessionAssignment(frame as Record<string, unknown>, streamAgentName).catch((err: unknown) => {
+      // Returned, not voided: the signaling dispatcher ignores it, and an in-process caller (a test
+      // harness) can await the verification — which is asynchronous since M9D 002-PQKEYS.
+      return handleInboundSessionAssignment(frame as Record<string, unknown>, streamAgentName).catch((err: unknown) => {
         logger.error("session.inbound.assignment.handler_failed", {
           streamAgentName,
           error: extractErrorMessage(err),

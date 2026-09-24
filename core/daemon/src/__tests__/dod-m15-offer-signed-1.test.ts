@@ -80,8 +80,13 @@ function harness(opts: {
    * moment a third handler was added, and every test here failed for a reason that had nothing to
    * do with what it was testing. The real manager fans out; so does this.
    */
-  const inboundHandlers: Array<(frame: Record<string, unknown>) => void> = [];
-  const inbound = (frame: Record<string, unknown>): void => { for (const h of [...inboundHandlers]) h(frame); };
+  const inboundHandlers: Array<(frame: Record<string, unknown>) => unknown> = [];
+  // Awaits what each handler returns: the session-assignment handler's verification is asynchronous
+  // (M9D 002-PQKEYS — ML-DSA via Web Crypto), and a test that did not wait for it would be asserting
+  // on a handler that has not finished.
+  const inbound = async (frame: Record<string, unknown>): Promise<void> => {
+    await Promise.all([...inboundHandlers].map((h) => h(frame)));
+  };
 
   const revoked: Array<{ agent: string; session: string }> = [];
   const accepted: string[] = [];
@@ -120,7 +125,7 @@ function harness(opts: {
     checkUnknownSenderAcceptanceBound: () => ({ ok: true as const }),
     sessionsConsumingCap: () => 0,
     capDiagnostics: () => ({}),
-    recordCounterpartyPrimary: () => {},
+    recordCounterpartyKeys: () => {},
     recordOfferedMoniker: () => {},
     addContact: () => {},
     // The responder records the session's chain starting point immediately before accepting it.
@@ -137,7 +142,7 @@ function harness(opts: {
     sessionNodeManager,
     agents: [{ name: AGENT, pubkey: AGENT_PUBKEY }],
     sharedSignaling: {
-      registerInboundHandler(h: (frame: Record<string, unknown>) => void) {
+      registerInboundHandler(h: (frame: Record<string, unknown>) => unknown) {
         inboundHandlers.push(h);
         return () => { const i = inboundHandlers.indexOf(h); if (i >= 0) inboundHandlers.splice(i, 1); };
       },
@@ -187,7 +192,7 @@ function harness(opts: {
       initiatorSessionPeerId: assignedDialer,
       signWith: signer,
     });
-    inbound(frame);
+    await inbound(frame);
   };
 
   return {
@@ -394,7 +399,7 @@ describe("DOD-M15-OFFER-SIGNED-1: a counterparty's pinned identity cannot change
     (frame["assignment"] as Record<string, unknown>)["initiator_session_peer_id"] = "12D3KooWImpostor";
 
     const h = harness({ offeredDialer: "12D3KooWImpostor", pinnedPrimary: null });
-    h.injectRaw(frame);
+    await h.injectRaw(frame);
     await settle();
 
     const refused = h.events.find((e) => e.event === "session.inbound.assignment.invalid");
@@ -434,7 +439,7 @@ describe("DOD-M15-OFFER-SIGNED-1: a counterparty's pinned identity cannot change
     (frame["assignment"] as Record<string, unknown>)["initiator_session_peer_id"] = "12D3KooWImpostor";
 
     const h = harness({ offeredDialer: "12D3KooWImpostor", pinnedPrimary: signerHex });
-    h.injectRaw(frame);
+    await h.injectRaw(frame);
     await settle();
 
     // Still refused — this is a real failure and must stay loud and blocking.
