@@ -53,10 +53,27 @@ describe("DOD-M9C-SCREENBASE-1 — language no longer refuses ordinary mail", ()
     expect(delivered).not.toContain("NO semantic screening ran");
   });
 
-  it("the default path still BLOCKS a non-Latin jailbreak when the classifier is installed", async () => {
-    // The safety case for delivering non-Latin mail is that the classifier catches the attacks. That
-    // rested entirely on an external measurement; nothing in the suite held it.
+  it("the default path DELIVERS a non-Latin jailbreak WITH the injection finding attached", async () => {
+    // 026-NOBLOCK: the safety case for delivering non-Latin mail is that the classifier catches the
+    // attack — but the model now FLAGS, it does not block (Andre, 2026-09-24: it scored ordinary
+    // coordination at 99). So the jailbreak still reaches the agent, and the classifier still catches
+    // it: it arrives carrying the injection finding, warning the agent before it reads the message.
+    // Refusal returns when per-tier blocking lands, and it is proven in the next case.
     const hostile = new InjectionScanner({ async classify() { return { injectionProbability: 0.999, label: "injection" }; } });
+    const v = await new InboundScreener({ injectionScanner: hostile }).screen(enc(CYRILLIC_JAILBREAK));
+    expect(v.disposition).not.toBe("block");
+    expect(v.reason).not.toBe(INBOUND_INJECTION_BLOCKED);
+    expect(v.events.some((e) => e.stage === "injection_scan" && e.disposition === "observe" && e.category === "injection:semantic")).toBe(true);
+    // The finding travels in the DELIVERED text (the note the flag path writes), not only the events
+    // array — an event with no consumer is not a warning. And the jailbreak itself still arrives whole.
+    const delivered = new TextDecoder().decode(v.content);
+    expect(delivered).toContain("FLAGGED, not blocked");
+    expect(delivered).toContain("cause=semantic");
+    expect(delivered).toContain(CYRILLIC_JAILBREAK);
+  });
+
+  it("with blocking ON the same non-Latin jailbreak is REFUSED — the per-tier block path when it lands", async () => {
+    const hostile = new InjectionScanner({ async classify() { return { injectionProbability: 0.999, label: "injection" }; } }, { blocking: true });
     const v = await new InboundScreener({ injectionScanner: hostile }).screen(enc(CYRILLIC_JAILBREAK));
     expect(v.disposition).toBe("block");
     expect(v.reason).toBe(INBOUND_INJECTION_BLOCKED);
