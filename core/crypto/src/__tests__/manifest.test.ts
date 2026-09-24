@@ -38,6 +38,9 @@ import {
   makeTestManifest,
 } from "../index.js";
 import type { ConsortiumManifestInput } from "../manifest.js";
+import { mlDsaProviderFromSeed } from "../ml-dsa.js";
+import { mlKemKeypairFromSeed } from "../ml-kem.js";
+import { signMlDsa } from "../pq-frame.js";
 import { TEST_OFFICER_SEEDS } from "../manifest-test-fixture.js";
 import type { TestConsortiumNode } from "../manifest-test-fixture.js";
 
@@ -735,5 +738,121 @@ describe("AC-018: all malformed entries processed — no early exit", () => {
     if (!result.ok) {
       expect(result.detail).toContain("0 valid");
     }
+  });
+});
+
+// ─── M9D 004-PQNODEKEYS: the manifest is signed post-quantum too (D21) ───────────────────────────
+
+describe("004 — both signature sets are required", () => {
+  const PQ_CONTEXT = "cello-mldsa-consortium-manifest-v1" as const;
+
+  async function pqOfficer(seedByte: number) {
+    const provider = await mlDsaProviderFromSeed(new Uint8Array(32).fill(seedByte));
+    return { provider, pubHex: toHex(await provider.getPublicKey()) };
+  }
+
+  /** A fully valid v4-shape manifest: every node has an ML-DSA key, plus the ML-KEM intake key. */
+  async function pqManifest(): Promise<ConsortiumManifestInput> {
+    const nodes = await Promise.all(makeNodes().map(async (n, i) => ({
+      ...n,
+      mldsa_pubkey: (await pqOfficer(0x60 + i)).pubHex,
+    })));
+    const kem = await mlKemKeypairFromSeed(new Uint8Array(64).fill(0x77));
+    return {
+      version: 4,
+      not_before: "2026-01-01T00:00:00Z",
+      expires: "2099-01-01T00:00:00Z",
+      nodes,
+      intake_key: { key_id: "intake-0", pubkey: "d".repeat(64) },
+      mlkem_intake_key: toHex(kem.publicKey),
+      signatures: [],
+      pq_signatures: [],
+    };
+  }
+
+  async function signBoth(m: ConsortiumManifestInput, edIdx: number[], pqSigners: Array<{ idx: number; seedByte: number }>) {
+    m.signatures = signManifest(m, edIdx);
+    const body = canonicalManifestBody(m);
+    m["pq_signatures"] = await Promise.all(pqSigners.map(async ({ idx, seedByte }) => ({
+      officerIndex: idx,
+      signature: toHex(await signMlDsa((await pqOfficer(seedByte)).provider, PQ_CONTEXT, body)),
+    })));
+    return m;
+  }
+
+  const ROOT_PQ_SEED = 0x51;
+  async function opts(threshold = 3) {
+    return { rootKeys: TEST_OFFICER_PUBKEYS, threshold, rootKeysPq: [(await pqOfficer(ROOT_PQ_SEED)).pubHex], pqThreshold: 1 };
+  }
+
+  it("control: both sets valid → accepted", async () => {
+    const m = await signBoth(await pqManifest(), [0, 1, 2], [{ idx: 0, seedByte: ROOT_PQ_SEED }]);
+    expect(await verifyManifest(m, await opts())).toMatchObject({ ok: true });
+  });
+
+  it("★ test 1 (exemplar): valid Ed25519 + a genuine ML-DSA signature by a NON-root key → manifest_pq_signatures_below_threshold", async () => {
+    const m = await signBoth(await pqManifest(), [0, 1, 2], [{ idx: 0, seedByte: 0x52 }]);
+    const r = await verifyManifest(m, await opts());
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("manifest_pq_signatures_below_threshold");
+  });
+
+  it("test 2: valid PQ, Ed25519 below threshold → the existing Ed25519 reason", async () => {
+    const m = await signBoth(await pqManifest(), [0, 1], [{ idx: 0, seedByte: ROOT_PQ_SEED }]);
+    const r = await verifyManifest(m, await opts(3));
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("manifest_signature_invalid");
+  });
+
+  it("test 3: pq_signatures absent → manifest_pq_signatures_missing", async () => {
+    const m = await signBoth(await pqManifest(), [0, 1, 2], []);
+    delete (m as Record<string, unknown>)["pq_signatures"];
+    const r = await verifyManifest(m, await opts());
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("manifest_pq_signatures_missing");
+  });
+
+  it("test 4: the same PQ officer index twice counts once", async () => {
+    const m = await signBoth(await pqManifest(), [0, 1, 2], [{ idx: 0, seedByte: ROOT_PQ_SEED }, { idx: 0, seedByte: ROOT_PQ_SEED }]);
+    const two = { ...(await opts()), pqThreshold: 2, rootKeysPq: [(await pqOfficer(ROOT_PQ_SEED)).pubHex, (await pqOfficer(0x53)).pubHex] };
+    const r = await verifyManifest(m, two);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("manifest_pq_signatures_below_threshold");
+  });
+
+  it("test 5: the body covers every node's mldsa_pubkey, and excludes BOTH signature fields", async () => {
+    const m = await signBoth(await pqManifest(), [0, 1, 2], [{ idx: 0, seedByte: ROOT_PQ_SEED }]);
+    const withoutPq = { ...m } as Record<string, unknown>;
+    delete withoutPq["pq_signatures"];
+    expect(toHex(canonicalManifestBody(withoutPq as ConsortiumManifestInput))).toBe(toHex(canonicalManifestBody(m)));
+
+    const tampered = JSON.parse(JSON.stringify(m)) as ConsortiumManifestInput;
+    (tampered.nodes[0] as Record<string, unknown>)["mldsa_pubkey"] = (await pqOfficer(0x70)).pubHex;
+    const r = await verifyManifest(tampered, await opts());
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("manifest_signature_invalid"); // Ed25519 is checked first, and it fails
+    const edOnly = await verifyManifest(tampered, { ...(await opts()), threshold: 0 });
+    expect(edOnly.ok).toBe(false);
+    if (!edOnly.ok) expect(edOnly.reason).toBe("manifest_pq_signatures_below_threshold"); // and so does the PQ set
+  });
+
+  it("test 6: malformed or duplicate node keys and a short intake key are refused by name", async () => {
+    const short = await pqManifest();
+    (short.nodes[0] as Record<string, unknown>)["mldsa_pubkey"] = "a".repeat(2622);
+    await signBoth(short, [0, 1, 2], [{ idx: 0, seedByte: ROOT_PQ_SEED }]);
+    const r1 = await verifyManifest(short, await opts());
+    expect(r1.ok === false && r1.reason).toBe("manifest_node_mldsa_pubkey_invalid");
+
+    const dup = await pqManifest();
+    (dup.nodes[1] as Record<string, unknown>)["mldsa_pubkey"] = (dup.nodes[0] as Record<string, unknown>)["mldsa_pubkey"];
+    await signBoth(dup, [0, 1, 2], [{ idx: 0, seedByte: ROOT_PQ_SEED }]);
+    const r2 = await verifyManifest(dup, await opts());
+    expect(r2.ok === false && r2.reason).toBe("manifest_node_mldsa_pubkey_invalid");
+
+    const kem = await pqManifest();
+    kem["mlkem_intake_key"] = "e".repeat(2366);
+    await signBoth(kem, [0, 1, 2], [{ idx: 0, seedByte: ROOT_PQ_SEED }]);
+    const r3 = await verifyManifest(kem, await opts());
+    expect(r3.ok === false && r3.reason).toBe("manifest_mlkem_intake_key_invalid");
   });
 });
