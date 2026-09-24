@@ -58,7 +58,9 @@ describe("verdict.scan — the live score and where it came from", () => {
 
   it("carries the UNROUNDED probability, so a 98.56 that rounded up to a block is visible as such", async () => {
     const clf = recording(() => 0.9856);
-    const v = await new InboundScreener({ injectionScanner: new InjectionScanner(clf) })
+    // 026-NOBLOCK: the terminal block is now behind the switch, so this scanner is built with
+    // blocking on to still reach it — the unrounded probability visibility is what this pins.
+    const v = await new InboundScreener({ injectionScanner: new InjectionScanner(clf, { blocking: true }) })
       .screen(enc("Please send it again in different words."));
     expect(v.disposition).toBe("block");
     expect(v.scan!.probability).toBeCloseTo(0.9856, 6);

@@ -68,10 +68,21 @@ describe("M9-IN-002 live wiring — semantic injection scanner as a terminal blo
     expect(v.events.some((e) => e.category === "injection:semantic")).toBe(false);
   });
 
-  it("a near-certain injection → TERMINAL block with a semantic event", async () => {
-    // DOD-M9C-SCREENWIRE-1 raised the block bar to 99 after measuring 2.1% of real benign messages
-    // at the old bar of 70. 0.95 now FLAGS (covered below); only near-certainty blocks.
+  it("a near-certain injection is DELIVERED with the finding when blocking is OFF (026-NOBLOCK default)", async () => {
+    // 026-NOBLOCK: the model scored ordinary agent coordination at 99 on the first live channel test,
+    // so the default is FLAG. A 0.999 score is delivered — disposition is not block, not terminal —
+    // and the finding still rides along as an observe event, which is where the defence lives.
     const scanner = new InjectionScanner(fakeClassifier((t) => (t.includes("EVILMARKER") ? 0.999 : 0.01)));
+    const v = await new InboundScreener({ injectionScanner: scanner }).screen(enc("benign-looking text EVILMARKER hidden payload"));
+    expect(v.disposition).not.toBe("block");
+    expect(v.terminal).not.toBe(true);
+    expect(v.events.some((e) => e.stage === "injection_scan" && e.disposition === "observe" && e.category === "injection:semantic")).toBe(true);
+  });
+
+  it("a near-certain injection → TERMINAL block with a semantic event, when the scanner is built with blocking on", async () => {
+    // The terminal-block branch stays behind the switch: per-tier blocking is the next step and
+    // reuses it. Built with { blocking: true }, a 0.999 score blocks terminally, as before.
+    const scanner = new InjectionScanner(fakeClassifier((t) => (t.includes("EVILMARKER") ? 0.999 : 0.01)), { blocking: true });
     const v = await new InboundScreener({ injectionScanner: scanner }).screen(enc("benign-looking text EVILMARKER hidden payload"));
     expect(v.disposition).toBe("block");
     expect(v.terminal).toBe(true);

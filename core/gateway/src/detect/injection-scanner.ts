@@ -20,19 +20,33 @@ export type InjectionVerdict = "block" | "flag" | "pass";
 /**
  * Score thresholds (0–100). Score GOVERNS the verdict — a label that disagrees never overrides it.
  *
- * **The block bar is PROVISIONAL and deliberately high (DOD-M9C-SCREENWIRE-1).** Measured on
- * 2026-09-17 against 1,200 real benign messages, the shipped model scores 2.1% of them at ≥70 —
- * one ordinary message in fifty refused. A screener that blocks one in fifty of a stranger's
- * messages is not a screener anyone will keep installed, so until `002-SCREENCORPUS` measures the
- * bar the classifier FLAGS what it is unsure of and blocks only what it is nearly certain about.
- * Flagged content is still delivered with the finding attached, which is where most of the defence
- * lives anyway.
+ * **`BLOCK_THRESHOLD` bites only when the scanner is constructed with `blocking: true`
+ * (026-NOBLOCK).** By default the scanner never blocks: a score at or above this bar is a FLAG, and
+ * the message is delivered with the finding attached. Andre, 2026-09-24: on the first live channel
+ * test the model scored ordinary agent-to-agent coordination at 99 ("What were your seq 3 and 4?"
+ * alone scores 92), which silently deadlocked a working session. Until per-tier blocking is wired,
+ * the model only FLAGS. The bar itself stays high and PROVISIONAL (DOD-M9C-SCREENWIRE-1): measured
+ * 2026-09-17 against 1,200 real benign messages, the shipped model scores 2.1% of them at ≥70, so
+ * even with blocking on the bar is deliberately near-certainty. Flagged content is delivered with
+ * the finding attached, which is where most of the defence lives anyway.
  */
 export const BLOCK_THRESHOLD = 99;
 export const FLAG_THRESHOLD = 35;
 
-export function scoreToVerdict(score: number): InjectionVerdict {
-  if (score >= BLOCK_THRESHOLD) return "block";
+/**
+ * Construction options for {@link InjectionScanner}.
+ */
+export interface InjectionScannerOptions {
+  /**
+   * When false (the default), a score at or above BLOCK_THRESHOLD is a FLAG: the message is
+   * delivered with the finding attached. Andre, 2026-09-24: the model scored ordinary agent
+   * coordination at 99 on the first live channel test. Turned on per tier later, never globally.
+   */
+  blocking?: boolean;
+}
+
+export function scoreToVerdict(score: number, blocking = false): InjectionVerdict {
+  if (score >= BLOCK_THRESHOLD) return blocking ? "block" : "flag";
   if (score >= FLAG_THRESHOLD) return "flag";
   return "pass";
 }
@@ -93,10 +107,16 @@ export interface ScanResult {
 
 export class InjectionScanner {
   readonly #classifier: InjectionClassifier | null;
+  readonly #blocking: boolean;
 
-  /** @param classifier the in-process model, or null when Layer-2 is unavailable (graceful degrade). */
-  constructor(classifier: InjectionClassifier | null) {
+  /**
+   * @param classifier the in-process model, or null when Layer-2 is unavailable (graceful degrade).
+   * @param opts `blocking: true` makes a score ≥ BLOCK_THRESHOLD a terminal block. The default is
+   *   false — the scanner FLAGS such a score and delivers it (026-NOBLOCK). Production passes nothing.
+   */
+  constructor(classifier: InjectionClassifier | null, opts: InjectionScannerOptions = {}) {
     this.#classifier = classifier;
+    this.#blocking = opts.blocking === true;
   }
 
   available(): boolean {
@@ -127,7 +147,7 @@ export class InjectionScanner {
       available: true,
       score,
       probability: Math.max(0, Math.min(1, injectionProbability)),
-      verdict: scoreToVerdict(score),
+      verdict: scoreToVerdict(score, this.#blocking),
       label,
     };
   }

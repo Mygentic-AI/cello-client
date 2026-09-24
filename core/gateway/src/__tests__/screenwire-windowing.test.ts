@@ -92,7 +92,9 @@ describe("SCREENWIRE: the block bar is provisional and high", () => {
     // the finding attached, which is where most of the defence lives.
     expect(scoreToVerdict(97)).toBe("flag");
     expect(scoreToVerdict(70)).toBe("flag");
-    expect(scoreToVerdict(BLOCK_THRESHOLD)).toBe("block");
+    // 026-NOBLOCK: the bar flags by default and blocks only when the scanner is told to block.
+    expect(scoreToVerdict(BLOCK_THRESHOLD)).toBe("flag");
+    expect(scoreToVerdict(BLOCK_THRESHOLD, true)).toBe("block");
     expect(BLOCK_THRESHOLD).toBeGreaterThanOrEqual(99);
   });
 
