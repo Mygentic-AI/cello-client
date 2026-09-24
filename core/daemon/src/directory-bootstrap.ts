@@ -272,19 +272,6 @@ async function probeOnce(directoryUrl: string, fetchFn: typeof fetch, timeoutMs:
 }
 
 /**
- * Auto-discover the directory multiaddr via GET /bootstrap on the directory HTTP
- * endpoint. Returns the multiaddr (which embeds the peer ID after "/p2p/"), or null.
- * Thin compatibility wrapper over fetchBootstrapResult (which carries the failure class).
- */
-export async function fetchBootstrapMultiaddr(
-  directoryUrl: string,
-  fetchFn: typeof fetch = fetch,
-): Promise<string | null> {
-  const result = await fetchBootstrapResult(directoryUrl, fetchFn);
-  return result.ok ? result.multiaddr : null;
-}
-
-/**
  * Extract the libp2p peer ID from a multiaddr — the segment after the final
  * "/p2p/". Returns null if absent.
  */
@@ -324,7 +311,7 @@ export interface ConsortiumEndpoint {
  * that is not `http(s)://` (a bare multiaddr, a wss dial address, a typo) is a config
  * error in officer-SIGNED data: return null so the caller logs it DISTINCTLY from a
  * transient outage and never dials a wrong port. A single trailing slash is stripped
- * (fetchBootstrapMultiaddr appends `/bootstrap`).
+ * (fetchBootstrapResult appends `/bootstrap`).
  */
 export function mapEndpointToBootstrapBase(endpoint: string): string | null {
   const noSlash = endpoint.replace(/\/$/, "");

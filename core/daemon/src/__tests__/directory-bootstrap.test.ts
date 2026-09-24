@@ -8,7 +8,6 @@
 import { describe, it, expect, vi } from "vitest";
 import {
   resolveDirectoryUrl,
-  fetchBootstrapMultiaddr,
   fetchBootstrapResult,
   parsePeerIdFromMultiaddr,
   createDirectoryEndpointResolver,
@@ -58,7 +57,7 @@ describe("parsePeerIdFromMultiaddr", () => {
     expect(parsePeerIdFromMultiaddr(MULTIADDR)).toBe(PEER);
   });
 
-  it("returns null when there is no /p2p/ segment", () => {
+  it("fails when there is no /p2p/ segment", () => {
     expect(parsePeerIdFromMultiaddr("/dns4/host/tcp/80/ws")).toBeNull();
   });
 
@@ -72,40 +71,40 @@ describe("parsePeerIdFromMultiaddr", () => {
   });
 });
 
-describe("fetchBootstrapMultiaddr", () => {
+describe("fetchBootstrapResult — success and failure", () => {
   it("returns the multiaddr on HTTP 200 with a valid /p2p/ payload", async () => {
     const fetchFn = vi.fn(async () => jsonResponse({ multiaddr: MULTIADDR }));
-    const result = await fetchBootstrapMultiaddr("http://dir.example", fetchFn as unknown as typeof fetch);
-    expect(result).toBe(MULTIADDR);
+    const result = await fetchBootstrapResult("http://dir.example", fetchFn as unknown as typeof fetch);
+    expect(result).toMatchObject({ ok: true, multiaddr: MULTIADDR });
     expect(fetchFn).toHaveBeenCalledWith("http://dir.example/bootstrap", expect.anything());
   });
 
   it("strips a trailing slash from the directory URL", async () => {
     const fetchFn = vi.fn(async () => jsonResponse({ multiaddr: MULTIADDR }));
-    await fetchBootstrapMultiaddr("http://dir.example/", fetchFn as unknown as typeof fetch);
+    await fetchBootstrapResult("http://dir.example/", fetchFn as unknown as typeof fetch);
     expect(fetchFn).toHaveBeenCalledWith("http://dir.example/bootstrap", expect.anything());
   });
 
-  it("returns null on non-200", async () => {
+  it("fails on non-200", async () => {
     const fetchFn = vi.fn(async () => jsonResponse({ multiaddr: MULTIADDR }, false));
-    expect(await fetchBootstrapMultiaddr("http://dir.example", fetchFn as unknown as typeof fetch)).toBeNull();
+    expect((await fetchBootstrapResult("http://dir.example", fetchFn as unknown as typeof fetch)).ok).toBe(false);
   });
 
-  it("returns null when the payload has no /p2p/", async () => {
+  it("fails when the payload has no /p2p/", async () => {
     const fetchFn = vi.fn(async () => jsonResponse({ multiaddr: "/dns4/host/tcp/80/ws" }));
-    expect(await fetchBootstrapMultiaddr("http://dir.example", fetchFn as unknown as typeof fetch)).toBeNull();
+    expect((await fetchBootstrapResult("http://dir.example", fetchFn as unknown as typeof fetch)).ok).toBe(false);
   });
 
-  it("returns null when multiaddr is missing/non-string", async () => {
+  it("fails when multiaddr is missing/non-string", async () => {
     const fetchFn = vi.fn(async () => jsonResponse({ notMultiaddr: 1 }));
-    expect(await fetchBootstrapMultiaddr("http://dir.example", fetchFn as unknown as typeof fetch)).toBeNull();
+    expect((await fetchBootstrapResult("http://dir.example", fetchFn as unknown as typeof fetch)).ok).toBe(false);
   });
 
-  it("returns null on network error (fetch throws)", async () => {
+  it("fails on network error (fetch throws)", async () => {
     const fetchFn = vi.fn(async () => {
       throw new Error("ECONNREFUSED");
     });
-    expect(await fetchBootstrapMultiaddr("http://dir.example", fetchFn as unknown as typeof fetch)).toBeNull();
+    expect((await fetchBootstrapResult("http://dir.example", fetchFn as unknown as typeof fetch)).ok).toBe(false);
   });
 });
 
@@ -246,7 +245,7 @@ describe("createDirectoryEndpointResolver", () => {
     expect(fetchFn).toHaveBeenCalledTimes(2);
   });
 
-  it("returns null and re-attempts until the bootstrap succeeds", async () => {
+  it("fails and re-attempts until the bootstrap succeeds", async () => {
     const fetchFn = vi
       .fn()
       .mockResolvedValueOnce(jsonResponse({}, false)) // first attempt fails, no last-good yet
@@ -530,13 +529,13 @@ describe("mapEndpointToBootstrapBase", () => {
     expect(mapEndpointToBootstrapBase("http://127.0.0.1:5001/")).toBe("http://127.0.0.1:5001");
   });
 
-  it("returns null for a wss:// dial address — NOT port-guessed to plaintext:443", () => {
+  it("fails for a wss:// dial address — NOT port-guessed to plaintext:443", () => {
     // The wss address is what /bootstrap RETURNS, not the bootstrap base. Mapping it to
     // http://host:443 would speak plaintext to the TLS port and silently fail — refuse it.
     expect(mapEndpointToBootstrapBase("wss://directory-us1.cello.mygentic.ai:443")).toBeNull();
   });
 
-  it("returns null for a bare multiaddr (a config error in signed data, not a base)", () => {
+  it("fails for a bare multiaddr (a config error in signed data, not a base)", () => {
     expect(mapEndpointToBootstrapBase("/ip4/127.0.0.1/tcp/0")).toBeNull();
   });
 });
