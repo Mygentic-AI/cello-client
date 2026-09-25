@@ -349,8 +349,17 @@ export class ChannelMembershipStore {
    */
   forget(channelHex: string): void {
     const channel = channelHex.toLowerCase();
-    this.#db.prepare(`DELETE FROM channel_members WHERE channel_pubkey = ?`).run(channel);
-    this.#db.prepare(`DELETE FROM channel_config WHERE channel_pubkey = ?`).run(channel);
+    // One transaction: a crash between the two deletes would leave the config without its members,
+    // and `info` would then read a deleted channel as live and empty.
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      this.#db.prepare(`DELETE FROM channel_members WHERE channel_pubkey = ?`).run(channel);
+      this.#db.prepare(`DELETE FROM channel_config WHERE channel_pubkey = ?`).run(channel);
+      this.#db.exec("COMMIT");
+    } catch (err) {
+      try { this.#db.exec("ROLLBACK"); } catch { /* the transaction is already gone */ }
+      throw err;
+    }
   }
 
   /** Mint the FIRST generation for a channel that has never issued a key. */

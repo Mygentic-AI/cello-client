@@ -734,8 +734,8 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
      * still needs these rows.
      */
     if (retired) {
+      // One call clears both: the settings and the config are the same `channel_config` row.
       members.forget(channel.channelHex);
-      channelConfig.forget(channel.channelHex);
       logger.info("channel.delete.local_forgotten", { channel_pubkey: channel.channelHex });
     }
 
