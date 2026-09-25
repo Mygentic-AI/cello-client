@@ -27,7 +27,7 @@ import { ChannelSubscriptionStore } from "../../channel-subscription-store.js";
 import { ChannelLogStore } from "../../channel-log-store.js";
 import { ChannelRelayClient } from "../../channel-relay-client.js";
 import { ChannelPublisher } from "../../channel-publisher.js";
-import { createChannelJoinExchange } from "../../channel-join-exchange.js";
+import { createChannelJoinExchange, ensureCurrentGroupKey } from "../../channel-join-exchange.js";
 import { extractErrorMessage } from "../../error-message.js";
 import type { Logger } from "../../types.js";
 
@@ -124,11 +124,13 @@ async function main(): Promise<void> {
     screenOutbound: () => Promise.resolve({ disposition: "allow" as const }),
     getChannelKey: () => channelKp,
     getAgentKey: () => adminKp,
-    // The REAL group key, read back from where the join stored it.
-    encryptBody: (plaintext, _chHex, seq) => {
-      const newest = subscriptions.keysFor("admin-agent", channelHex)[0];
-      if (!newest) throw new Error("no group key");
-      return Promise.resolve(encryptBody(newest, channelPubkey, seq, plaintext));
+    // 037-TESTTRUTH (028): the PRODUCTION mint-or-reuse the daemon's `encryptBodyFor` runs, not a
+    // hand-rolled "newest key held" lookup — so a private publish here fails exactly when production
+    // would. The generation comes from settings (the eject bumps it), and `encryptBody` binds it.
+    encryptBody: (plaintext, chHex, seq) => {
+      const gk = ensureCurrentGroupKey({ members, subscriptions, now: Date.now }, "admin-agent", chHex);
+      if (!gk) throw new Error("channel_group_key_unavailable");
+      return Promise.resolve(encryptBody(gk, channelPubkey, seq, plaintext));
     },
     currentFetchKey,
     channelInfo: () => {
