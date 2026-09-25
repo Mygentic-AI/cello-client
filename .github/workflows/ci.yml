@@ -379,18 +379,23 @@ jobs:
           #
           # The registry's own `time` map is the authoritative answer: a version that published has
           # a timestamp. Nothing about a packument is harder to misread, and it is not tag-cached.
-          # The retry stays only for read-after-write on the packument itself.
+          #
+          # The wait is 10 minutes, not 60s. npm STAGES an accepted upload and lists it only later:
+          # on v0.0.348 (2026-09-25) the seven accepts landed 1 to 8 minutes after npm printed
+          # `+ pkg@ver`, and a re-run's publish was refused `409 Cannot publish over previously
+          # staged version` — the first upload was never lost. A 60s wait failed three packages per
+          # release (v0.0.345 and v0.0.348 both), which cost a manual re-run each time for nothing.
           exists() {
             name="$1"; want="$2"
-            for attempt in $(seq 1 6); do
+            for attempt in $(seq 1 60); do
               if curl -s -H 'Cache-Control: no-cache' "https://registry.npmjs.org/@cello-protocol%2f$name" \
                    | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.exit(JSON.parse(d).time?.['$want']?0:1)}catch{process.exit(1)}})"; then
                 echo "OK: @cello-protocol/$name@$want is on the registry"; return 0
               fi
-              echo "… @cello-protocol/$name@$want not on the registry yet (attempt $attempt/6)"
+              echo "… @cello-protocol/$name@$want not on the registry yet (attempt $attempt/60)"
               sleep 10
             done
-            echo "FAIL: @cello-protocol/$name@$want ABSENT from the registry after retries."
+            echo "FAIL: @cello-protocol/$name@$want ABSENT from the registry after 10 minutes."
             echo "      The publish did not persist. The version is NOT burned — re-run this job."
             return 1
           }
@@ -673,18 +678,23 @@ jobs:
           #
           # The registry's own `time` map is the authoritative answer: a version that published has
           # a timestamp. Nothing about a packument is harder to misread, and it is not tag-cached.
-          # The retry stays only for read-after-write on the packument itself.
+          #
+          # The wait is 10 minutes, not 60s. npm STAGES an accepted upload and lists it only later:
+          # on v0.0.348 (2026-09-25) the seven accepts landed 1 to 8 minutes after npm printed
+          # `+ pkg@ver`, and a re-run's publish was refused `409 Cannot publish over previously
+          # staged version` — the first upload was never lost. A 60s wait failed three packages per
+          # release (v0.0.345 and v0.0.348 both), which cost a manual re-run each time for nothing.
           exists() {
             name="$1"; want="$2"
-            for attempt in $(seq 1 6); do
+            for attempt in $(seq 1 60); do
               if curl -s -H 'Cache-Control: no-cache' "https://registry.npmjs.org/@cello-protocol%2f$name" \
                    | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.exit(JSON.parse(d).time?.['$want']?0:1)}catch{process.exit(1)}})"; then
                 echo "OK: @cello-protocol/$name@$want is on the registry"; return 0
               fi
-              echo "… @cello-protocol/$name@$want not on the registry yet (attempt $attempt/6)"
+              echo "… @cello-protocol/$name@$want not on the registry yet (attempt $attempt/60)"
               sleep 10
             done
-            echo "FAIL: @cello-protocol/$name@$want ABSENT from the registry after retries."
+            echo "FAIL: @cello-protocol/$name@$want ABSENT from the registry after 10 minutes."
             echo "      The publish did not persist. The version is NOT burned — re-run this job."
             return 1
           }
