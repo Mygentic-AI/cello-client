@@ -71,12 +71,17 @@ export interface ChannelCollectorOptions {
   /** Ask the PUBLISHER to re-deposit a range. It answers by re-depositing, never by sending posts. */
   requestRepair: (agentId: string, channelHex: string, from: number, to: number) => Promise<void>;
   /**
-   * M16 032-NOTICES: rung ONCE per collect pass that advances `delivered_through`, with the position
-   * before and after — never when nothing advanced. The wiring turns this into the content-free
-   * `channel_posts` doorbell (count = after − before). Optional and additive: an omitted callback
-   * collects exactly as before, so nothing downstream depends on it existing.
+   * M16 032-NOTICES: rung ONCE per collect pass that advances `delivered_through` — never when
+   * nothing advanced. Carries the COUNT of posts actually delivered in this pass and the new
+   * `through` position. Optional and additive: an omitted callback collects exactly as before.
+   *
+   * ⚠️ **`count` IS THE POSTS THAT ARRIVED, NOT `after − before` (038-RETESTFIX Part C).** When the
+   * relay's floor has moved (an old post pruned), the position jumps ACROSS the pruned seq to the
+   * floor, so `after − before` includes positions that were never delivered — the doorbell then said
+   * "5 new posts" when 4 were readable (live F37). The count is the number of held posts the position
+   * advanced over, which is what the operator can actually read.
    */
-  onDelivered?: (agentId: string, channelHex: string, before: number, after: number) => void;
+  onDelivered?: (agentId: string, channelHex: string, count: number, through: number) => void;
   now?: () => number;
   maxBytesPerFetch?: number;
 }
@@ -239,15 +244,20 @@ export class ChannelCollector {
     if (floor !== undefined && floor > next && !held.has(next)) next = floor;
 
     let advanced = sub.delivered_through;
+    // 038-RETESTFIX Part C: count the posts actually delivered — one per held position advanced over,
+    // never the distance `advanced − delivered_through`, which would include a pruned seq skipped to
+    // reach the floor.
+    let delivered = 0;
     while (held.has(next) && !forked.has(next)) {
       advanced = next;
       next += 1;
+      delivered += 1;
     }
     if (advanced > sub.delivered_through) {
       subscriptions.setDeliveredThrough(agentId, channelHex, advanced);
       // M16 032-NOTICES: the position moved, so posts arrived — ring the doorbell once for the whole
-      // pass. `sub.delivered_through` is the position we started from; `advanced` is the new one.
-      this.#opts.onDelivered?.(agentId, channelHex, sub.delivered_through, advanced);
+      // pass. `delivered` is how many posts arrived; `advanced` is the new position.
+      this.#opts.onDelivered?.(agentId, channelHex, delivered, advanced);
     }
   }
 

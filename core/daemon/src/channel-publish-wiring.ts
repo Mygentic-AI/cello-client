@@ -352,8 +352,9 @@ export function wireChannelPublishing(
       return Promise.resolve();
     },
     // M16 032-NOTICES: a collect that advanced the position rings the content-free channel_posts
-    // doorbell. count = after − before; `through` is the new delivered position.
-    onDelivered: (agentId, channelHex, before, after) => deps.notify.channelPosts(agentId, channelHex, after - before, after),
+    // doorbell. 038-RETESTFIX Part C: the collector now hands the COUNT of posts actually delivered
+    // (not after − before, which over-counted across a pruned floor) and the new `through` position.
+    onDelivered: (agentId, channelHex, count, through) => deps.notify.channelPosts(agentId, channelHex, count, through),
   });
 
   const ticker = createChannelCollectTicker({

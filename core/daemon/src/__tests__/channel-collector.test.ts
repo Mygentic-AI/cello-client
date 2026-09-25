@@ -74,8 +74,10 @@ interface Harness {
   relays: Map<string, Relay>;
   events: Array<{ name: string; ctx?: unknown }>;
   repairs: Array<{ from: number; to: number }>;
-  /** M16 032-NOTICES: every onDelivered ring, in order, so the doorbell's count can be asserted. */
-  delivered: Array<{ agentId: string; channelHex: string; before: number; after: number }>;
+  /** M16 032-NOTICES: every onDelivered ring, in order, so the doorbell's count can be asserted.
+   *  038-RETESTFIX Part C: the ring now carries the COUNT of posts actually delivered in the pass
+   *  and the new `through` position — not before/after, which over-counted across a pruned floor. */
+  delivered: Array<{ agentId: string; channelHex: string; count: number; through: number }>;
   post: (seq: number, opts?: { body?: Uint8Array; agentKp?: InMemoryKeyProvider }) => Promise<BroadcastArtifact>;
   place: (relay: string, post: BroadcastArtifact) => Promise<void>;
 }
@@ -91,7 +93,7 @@ async function harness(): Promise<Harness> {
     [RELAY_B, { posts: new Map(), receipts: new Map(), firstHeld: null, down: false, asked: 0 }],
   ]);
   const repairs: Array<{ from: number; to: number }> = [];
-  const delivered: Array<{ agentId: string; channelHex: string; before: number; after: number }> = [];
+  const delivered: Array<{ agentId: string; channelHex: string; count: number; through: number }> = [];
 
   const subs = new ChannelSubscriptionStore(db, logger);
   subs.upsert({
@@ -125,7 +127,7 @@ async function harness(): Promise<Harness> {
       repairs.push({ from, to });
       return Promise.resolve();
     },
-    onDelivered: (agentId, chHex, before, after) => { delivered.push({ agentId, channelHex: chHex, before, after }); },
+    onDelivered: (agentId, chHex, count, through) => { delivered.push({ agentId, channelHex: chHex, count, through }); },
   });
 
   async function post(seq: number, opts: { body?: Uint8Array; agentKp?: InMemoryKeyProvider } = {}): Promise<BroadcastArtifact> {
@@ -387,9 +389,9 @@ describe("M16 018-PUBCOLLECT: collecting", () => {
 
     await h.collector.collectOnce(AGENT, h.channelHex);
     // The doorbell is what tells the agent posts arrived; without this call a member finds every
-    // post by listing by hand, which is the defect this order exists to fix. before=0, after=3, so
-    // count = after − before = 3, and it rings exactly once for the whole pass, not once per post.
-    expect(h.delivered).toEqual([{ agentId: AGENT, channelHex: h.channelHex, before: 0, after: 3 }]);
+    // post by listing by hand, which is the defect this order exists to fix. Three posts delivered,
+    // now at position 3, and it rings exactly once for the whole pass, not once per post.
+    expect(h.delivered).toEqual([{ agentId: AGENT, channelHex: h.channelHex, count: 3, through: 3 }]);
   });
 
   it("2. a collect that stores NOTHING rings nothing — and a repeat collect that adds nothing is silent too", async () => {
@@ -405,7 +407,21 @@ describe("M16 018-PUBCOLLECT: collecting", () => {
     await h.collector.collectOnce(AGENT, h.channelHex);
     await h.collector.collectOnce(AGENT, h.channelHex);
     expect(h.delivered, "one ring for the advance, none for the no-op re-collect").toEqual(
-      [{ agentId: AGENT, channelHex: h.channelHex, before: 0, after: 3 }],
+      [{ agentId: AGENT, channelHex: h.channelHex, count: 3, through: 3 }],
     );
+  });
+
+  it("038 Part C — the count is the posts ACTUALLY delivered, not the distance across a pruned floor", async () => {
+    const h = await harness();
+    // The relay pruned post 1 and serves 2,3,4,5, reporting first_held_seq 2. The position jumps
+    // from 0 to the floor and advances across the four held posts.
+    for (const s of [2, 3, 4, 5]) await h.place(RELAY_A, await h.post(s));
+
+    await h.collector.collectOnce(AGENT, h.channelHex);
+    // Live evidence (F37): "5 new post(s)" printed when 4 were readable — seq 1 had been pruned.
+    // count = after − before counted the skipped floor position; the true count is the 4 posts that
+    // arrived. `through` is still 5 (the new delivered position).
+    expect(h.subs.get(AGENT, h.channelHex)?.delivered_through).toBe(5);
+    expect(h.delivered).toEqual([{ agentId: AGENT, channelHex: h.channelHex, count: 4, through: 5 }]);
   });
 });
