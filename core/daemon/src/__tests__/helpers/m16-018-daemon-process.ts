@@ -13,7 +13,7 @@
  * Prints one JSON line describing the outcome.
  */
 import { InMemoryKeyProvider, deriveFetchKey, type GroupKey } from "@cello-protocol/crypto";
-import { buildChannelFetchKeyTbs, buildChannelFetchAuthTbs } from "@cello-protocol/protocol-types";
+import { buildChannelFetchKeyTbs } from "@cello-protocol/protocol-types";
 import { createNode } from "@cello-protocol/transport";
 import { ChannelLogStore } from "../../channel-log-store.js";
 import { ChannelPublisher } from "../../channel-publisher.js";
@@ -21,6 +21,7 @@ import { ChannelCollector } from "../../channel-collector.js";
 import { ChannelInboxStore } from "../../channel-inbox-store.js";
 import { ChannelSubscriptionStore } from "../../channel-subscription-store.js";
 import { ChannelRelayClient } from "../../channel-relay-client.js";
+import { createChannelFetchAuth } from "../../channel-fetch-auth.js";
 import { openTestDb } from "./encrypted-db.js";
 import type { Logger } from "../../types.js";
 
@@ -121,25 +122,25 @@ async function main(): Promise<void> {
       const [channelHex, adminHex, relayA, relayB] = rest;
       const subs = new ChannelSubscriptionStore(db, logger);
       const inbox = new ChannelInboxStore(db, logger);
+      // 037-TESTTRUTH (030): this is a non-public (`open`) channel — the relay gates it on the fetch
+      // key the publisher deposited, so the subscriber must sign. A `public` access would make the
+      // production fetch-auth mint nothing (public is served to anyone), which is why the inline
+      // version signed unconditionally and hid 030's placeholder.
       subs.upsert({
         agent_id: AGENT, channel_pubkey: channelHex, admin_pubkey: adminHex,
-        access: "public", relays: [relayA, relayB],
+        access: "open", relays: [relayA, relayB],
       });
+      // The same fixed group key the publisher used, held where a real subscriber keeps its keys, so
+      // the production fetch-auth derives the identical fetch key the relays were told to require.
+      subs.addKey(AGENT, channelHex, ENFORCER_GROUP_KEY, Date.now());
 
       const collector = new ChannelCollector({
         db, logger, subscriptions: subs, inbox,
         fetch: (relay, req) => relayClient.fetch(relay, req),
-        // The same fixed group key the publisher used, so the derived fetch key matches what the
-        // relays were told to require. A subscriber that could not sign would be turned away.
-        fetchAuth: async (_agentId, _access, chHex, sinceSeq) => {
-          const channelPubkey = new Uint8Array(Buffer.from(chHex, "hex"));
-          const fetchKey = await deriveFetchKey(ENFORCER_GROUP_KEY, channelPubkey);
-          const timeMs = Date.now();
-          return {
-            signature: await fetchKey.sign(buildChannelFetchAuthTbs(channelPubkey, sinceSeq, timeMs)),
-            time_ms: timeMs,
-          };
-        },
+        // The PRODUCTION fetch auth (030), fed by this subscriber's real key store. When it returned
+        // undefined for every member the relays refused every fetch; the enforcer never saw it
+        // because this helper built and signed its own auth instead.
+        fetchAuth: createChannelFetchAuth({ keysFor: (a, c) => subs.keysFor(a, c), logger }),
         localAgentKeys: () => [],
         requestRepair: () => Promise.resolve(),
       });
