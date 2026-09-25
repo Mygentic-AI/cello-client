@@ -212,3 +212,62 @@ describe("§3 bash-adapter contract: JSON out, verbatim structured errors, exit 
     }
   });
 });
+
+describe("M16 041-HELPTRUTH — channel help is one paragraph per verb, and each verb answers -h alone", () => {
+  const channel = findCommand("channel")!;
+  const page = channel.help;
+
+  it("every channel verb has its own blank-line-separated paragraph in the page", () => {
+    // The page is a `Usage:` block, then one paragraph per verb (each led `  <verb>  — …`), then the
+    // notes — all separated by a blank line. approve and refuse share one paragraph, on purpose.
+    const blocks = page.split("\n\n");
+    const paraBlocks = blocks.filter((b) => b.startsWith("  ") && b.includes(" — "));
+    const leadOf = (b: string): string => b.slice(2, b.indexOf(" — ")).trim();
+
+    for (const verb of channel.verbs!) {
+      const covered = paraBlocks.some((b) => leadOf(b).split(/\s*\/\s*/).includes(verb.name));
+      expect(covered, `channel verb '${verb.name}' has no paragraph in 'cello channel -h'`).toBe(true);
+    }
+    // One paragraph block per verb GROUP: 15 verbs, but approve/refuse share one, so 14 blocks. That
+    // each is a distinct split on "\n\n" is what proves the paragraphs are blank-line separated.
+    expect(paraBlocks.length, "each verb group is its own blank-line-separated paragraph").toBe(channel.verbs!.length - 1);
+
+    // The two general notes are their own paragraph at the end (item 1 + the following-takes-a-key note).
+    expect(page).toContain("optional once you have selected one with `cello use-agent`");
+    expect(page).toContain("Following a channel takes only its public key.");
+  });
+
+  it("`cello channel info -h` prints ONLY info's help, not the whole page or join's (item 7)", () => {
+    const infoHelp = helpForCommand("channel", ["info"]);
+    // info's own usage line and paragraph are there...
+    expect(infoHelp).toContain("cello channel info <channel>");
+    expect(infoHelp).toContain("Look up a channel by its key");
+    // ...and nothing from another verb: join's usage and paragraph are absent.
+    expect(infoHelp).not.toContain("cello channel join");
+    expect(infoHelp).not.toContain("Ask to join a channel");
+    // It is a fraction of the full page, not the page itself.
+    expect(infoHelp.length).toBeLessThan(page.length);
+  });
+
+  it("`cello channel -h` (no verb) stays the full page (item 7)", () => {
+    expect(helpForCommand("channel", [])).toBe(page);
+    expect(helpForCommand("channel", [])).toContain("cello channel join");
+    expect(helpForCommand("channel", [])).toContain("cello channel resend");
+  });
+
+  it("info's paragraph says it returns access/relays/description and reports a deleted channel (item 3)", () => {
+    const infoHelp = helpForCommand("channel", ["info"]);
+    expect(infoHelp).toContain("access, relays and description");
+    expect(infoHelp).toContain("deleted by its admin");
+  });
+
+  it("the page and each verb's help derive from ONE source — every verb usage line appears on the page", () => {
+    // The page is assembled from the same per-verb blocks the -h help is, so a verb's usage line is
+    // on the page and identical in its own -h help. A drift here means the assembly stopped sharing.
+    for (const verb of channel.verbs!) {
+      const verbHelp = helpForCommand("channel", [verb.name]);
+      const usageLine = verbHelp.split("\n").find((l) => l.startsWith("Usage: "))!.slice("Usage: ".length);
+      expect(page, `'${verb.name}' usage line must appear on the full page`).toContain(usageLine);
+    }
+  });
+});

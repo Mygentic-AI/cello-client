@@ -81,7 +81,13 @@ export function helpForCommand(command: string, args: readonly string[] = []): s
   // which names propose's six flags and explains none of them.
   const sub = args.find((a) => !a.startsWith("-"));
   if (sub) {
-    const detail = findCommand(command)?.subHelp?.[sub];
+    const spec = findCommand(command);
+    // M16 041-HELPTRUTH item 7: a verb carrying its own `help` answers `cello <cmd> <verb> -h` with
+    // just that verb's usage line and paragraph — the same text the full page is assembled from, so
+    // the two cannot drift. `subHelp` (the `doc` verbs) is the older mechanism and still honoured.
+    const verbHelp = spec?.verbs?.find((v) => v.name === sub)?.help;
+    if (verbHelp) return verbHelp;
+    const detail = spec?.subHelp?.[sub];
     if (detail) return detail;
   }
   return findCommand(command)?.help ?? USAGE;

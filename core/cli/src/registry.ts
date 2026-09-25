@@ -167,7 +167,7 @@ export interface CommandSpec {
    * M16 022: subcommands to list individually in `cello -h`, for a command whose subcommands ARE
    * the feature. Absent means the command is one line, as before.
    */
-  verbs?: ReadonlyArray<{ name: string; summary: string }>;
+  verbs?: ReadonlyArray<{ name: string; summary: string; help?: string }>;
   /** Full per-command help, printed by `cello <cmd> --help`. */
   help: string;
   flags?: readonly FlagSpec[];
@@ -333,6 +333,164 @@ const DOC_VERB_HELP: Record<string, string> = {
     "leaves only by removing THEMSELVES. Choose your admins accordingly.\n",
 };
 
+
+/**
+ * M16 041-HELPTRUTH items 6 & 7 — the `channel` verbs, each with its usage line(s), a `cello --help`
+ * summary, and ONE short paragraph saying only what the code does.
+ *
+ * This is the SINGLE SOURCE the help is built from, so the page (`cello channel -h`) and the per-verb
+ * page (`cello channel <verb> -h`) cannot drift: both are assembled here. `approve` and `refuse`
+ * share one block (and one paragraph), which is why a block lists one OR two verbs. The order is the
+ * order the verbs render, subscriber verbs first.
+ */
+const CHANNEL_DOCS: ReadonlyArray<{
+  verbs: ReadonlyArray<{ name: string; summary: string }>;
+  usage: readonly string[];
+  paragraph: string;
+}> = [
+  {
+    verbs: [{ name: "info", summary: "Look up a channel: whether it exists and who runs it." }],
+    usage: ["cello channel info <channel> [--agent <agent>]"],
+    paragraph:
+      "Look up a channel by its key. It returns which agent runs the channel, and — when this daemon " +
+      "administers or follows it — the access, relays and description. For a channel you follow, the " +
+      "description is refreshed from the channel's relays. A deleted channel is reported as deleted by its admin.",
+  },
+  {
+    verbs: [{ name: "join", summary: "Ask to join a channel and start receiving its posts." }],
+    usage: ["cello channel join <channel> [<note>] [--agent <agent>]"],
+    paragraph:
+      "Ask to join a channel and start receiving its posts. It opens a session with the admin and sends " +
+      "the request; the answer comes back on its own and brings the relays, so you pass no relay. A note is optional.",
+  },
+  {
+    verbs: [{ name: "read", summary: "Read new posts on a channel you follow." }],
+    usage: ["cello channel read <channel> [--all] [--agent <agent>]"],
+    paragraph:
+      "Read new posts on a channel you follow, oldest first, and move your read position past them. " +
+      "--all re-reads from the start without moving it. A post whose body will not open is listed by " +
+      "number rather than skipped — usually a key change you did not receive.",
+  },
+  {
+    verbs: [{ name: "name", summary: "Label a channel so you can tell it apart. Only you see it." }],
+    usage: ["cello channel name <channel> <label> [--agent <agent>]"],
+    paragraph:
+      "Give a channel a label so you can tell it apart from its key. The label is stored on this machine " +
+      "and goes nowhere — the publisher and the other members do not see it.",
+  },
+  {
+    verbs: [{ name: "leave", summary: "Stop receiving a channel's posts. Local — nothing is sent." }],
+    usage: ["cello channel leave <channel> [--agent <agent>]"],
+    paragraph:
+      "Stop receiving a channel's posts. Local: nothing is sent, the publisher is not told, and your keys " +
+      "are kept so old posts stay readable.",
+  },
+  {
+    verbs: [{ name: "create", summary: "Make a new channel you run — one command registers it, the directory picks its relays, and it is described. Do this first." }],
+    usage: ["cello channel create <name> <access> [--guidance <text>] [--agent <agent>]"],
+    paragraph:
+      "Make a new channel you run. One command registers the channel identity <name>, the directory picks " +
+      "its two relays, and the description is published. It takes no pre-auth token and no relay: the agent " +
+      "you are running is already registered, and that identity is the whole basis of the channel's right. " +
+      "Do this first. <access> is public (anyone reads), open (anyone may ask to join) or invite_only.",
+  },
+  {
+    verbs: [{ name: "setup", summary: "Change the relays on a channel you already run. Access is fixed at create." }],
+    usage: ["cello channel setup <channel> <access> <relay> <relay> [--agent <agent>]"],
+    paragraph:
+      "Change the relays on a channel you already run. Pass the channel's current <access>: a channel's " +
+      "access is fixed at create and cannot change, because subscribers joined the access they were told. " +
+      "A different value is refused.",
+  },
+  {
+    verbs: [{ name: "publish", summary: "Publish a post to your channel." }],
+    usage: ["cello channel publish <channel> <title> <body> [--agent <agent>]"],
+    paragraph:
+      "Publish a post to your channel. It is signed by BOTH the channel key and your agent key, so a reader " +
+      "can tell which operator published it, not only which channel. It goes to the channel's two relays; " +
+      "one relay refusing is not a failed publish, and 'resend' refills a relay that lost it.",
+  },
+  {
+    verbs: [{ name: "info-set", summary: "Publish your channel's description so others can find it." }],
+    usage: ["cello channel info-set <channel> [--guidance <text>] [--agent <agent>]"],
+    paragraph:
+      "Sign and deposit the channel's description so subscribers can read it. Pass --guidance <text> to " +
+      "change the description first; existing members see the new text the next time they run 'channel info'.",
+  },
+  {
+    verbs: [
+      { name: "approve", summary: "Admit someone who asked to join an invite-only channel." },
+      { name: "refuse", summary: "Turn down a request to join." },
+    ],
+    usage: [
+      "cello channel approve <channel> <member> [--agent <agent>]",
+      "cello channel refuse <channel> <member> [--agent <agent>]",
+    ],
+    paragraph:
+      "Answer a pending join request on an invite-only or open channel. 'approve' admits the member and " +
+      "starts sending them posts; 'refuse' turns the request down. <member> is their 64-character hex public key.",
+  },
+  {
+    verbs: [{ name: "eject", summary: "Remove a member and rotate the key, so they stop receiving posts." }],
+    usage: ["cello channel eject <channel> <member> [--agent <agent>]"],
+    paragraph:
+      "Remove a member from an invite-only channel and rotate its key, which is what stops them reading and " +
+      "even fetching. An open channel's member rejoins the instant they are ejected, so ejecting them does " +
+      "not remove them — delete the channel or run it invite-only instead. <member> is their 64-character hex public key.",
+  },
+  {
+    verbs: [{ name: "delete", summary: "Delete a channel you run: tell its members, prune both relays, retire it. Cannot be undone." }],
+    usage: ["cello channel delete <channel> [--agent <agent>]"],
+    paragraph:
+      "Delete a channel you run. It tells the members, clears both relays and retires the channel identity, " +
+      "and there is no undo. Posts stay readable to the members who already have them.",
+  },
+  {
+    verbs: [{ name: "prune", summary: "Drop the oldest posts from the relays." }],
+    usage: ["cello channel prune <channel> <through_seq> [--agent <agent>]"],
+    paragraph:
+      "Drop posts from the relays, through the post number you give. It removes from the OLDEST end only.",
+  },
+  {
+    verbs: [{ name: "resend", summary: "Refill a relay that lost posts, or one you just added." }],
+    usage: ["cello channel resend <channel> [<relay>] [--agent <agent>]"],
+    paragraph:
+      "Refill a relay that lost posts, or one you just added. With no relay named, it refills every relay " +
+      "the channel publishes to.",
+  },
+];
+
+/** The two notes that apply to every channel verb — their own paragraph at the foot of the page. */
+const CHANNEL_GENERAL_NOTES =
+  "Following a channel takes only its public key. `--agent` is optional once you have selected one with `cello use-agent`.";
+
+/** One block's `Usage:`-prefixed usage lines. The first carries the label; the rest align under it. */
+function renderChannelUsage(lines: readonly string[]): string {
+  return lines.map((u, i) => `${i === 0 ? "Usage: " : "       "}${u}`).join("\n");
+}
+
+/** A block's paragraph, led by its verb name(s) — `  info  — …`, or `  approve / refuse  — …`. */
+function renderChannelParagraph(block: (typeof CHANNEL_DOCS)[number]): string {
+  return `  ${block.verbs.map((v) => v.name).join(" / ")}  — ${block.paragraph}`;
+}
+
+/** Per-verb help (item 7): the block's usage line(s) and its one paragraph, nothing else. */
+function channelVerbHelp(verbName: string): string {
+  const block = CHANNEL_DOCS.find((b) => b.verbs.some((v) => v.name === verbName));
+  if (!block) return channelHelpPage();
+  return `${renderChannelUsage(block.usage)}\n\n${renderChannelParagraph(block)}`;
+}
+
+/** The full `cello channel -h` page (item 6): every usage line, then one paragraph per verb, then the notes. */
+function channelHelpPage(): string {
+  const usageBlock = renderChannelUsage(CHANNEL_DOCS.flatMap((b) => b.usage));
+  const paragraphs = CHANNEL_DOCS.map((b) => renderChannelParagraph(b));
+  return [usageBlock, ...paragraphs, `  ${CHANNEL_GENERAL_NOTES}`].join("\n\n");
+}
+
+/** The `channel` command's verb list for `cello --help`, each carrying its own `-h` help (item 7). */
+const CHANNEL_VERBS: ReadonlyArray<{ name: string; summary: string; help: string }> =
+  CHANNEL_DOCS.flatMap((b) => b.verbs.map((v) => ({ name: v.name, summary: v.summary, help: channelVerbHelp(v.name) })));
 
 const ALL_COMMANDS: readonly CommandSpec[] = [
   // ═══ Setup — get a working agent, in the order you actually do it ═══════════════════════════
@@ -1563,9 +1721,12 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
     summary: "List channels you follow or publish, with unread counts.",
     help:
       "Usage: cello channels [--agent <agent>]\n" +
-      "  Every channel this agent follows or publishes, with how many posts are waiting.\n" +
-      "  'unread' is the gap between what the daemon has FETCHED and what you have READ —\n" +
-      "  'cello channel read <channel>' closes it.",
+      "  The channels this agent follows AND the ones it runs. A followed channel shows how many\n" +
+      "  posts are waiting: 'unread' is the gap between what the daemon has FETCHED and what you\n" +
+      "  have READ, and 'cello channel read <channel>' closes it. A channel you run is listed with\n" +
+      "  its access, relays and last post number.\n" +
+      "  With no --agent and no agent selected, it lists every agent's channels instead, grouped by\n" +
+      "  agent. --agent is optional once you have selected one with `cello use-agent`.",
     // The usage shows `--agent`, so the parser must recognize it — without this, `cello channels
     // --agent X` was rejected as "Unknown flag" for a flag its own help documents.
     flags: AGENT_FLAG,
@@ -1581,64 +1742,10 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
     summary: "Follow a channel, or run one you hold the key to.",
     // Subscriber verbs first: following a channel is the common case, publishing is the rare one,
     // and the order on this page is what tells an operator which of the two the feature is for.
-    verbs: [
-      { name: "info", summary: "Look up a channel: whether it exists and who runs it." },
-      { name: "join", summary: "Ask to join a channel and start receiving its posts." },
-      { name: "read", summary: "Read new posts on a channel you follow." },
-      { name: "name", summary: "Label a channel so you can tell it apart. Only you see it." },
-      { name: "leave", summary: "Stop receiving a channel's posts. Local — nothing is sent." },
-      { name: "create", summary: "Make a new channel you run — one command registers it, the directory picks its relays, and it is described. Do this first." },
-      { name: "setup", summary: "Change the relays on a channel you already run. Access is fixed at create." },
-      { name: "publish", summary: "Publish a post to your channel." },
-      { name: "info-set", summary: "Publish your channel's description so others can find it." },
-      { name: "approve", summary: "Admit someone who asked to join an invite-only channel." },
-      { name: "refuse", summary: "Turn down a request to join." },
-      { name: "eject", summary: "Remove a member and rotate the key, so they stop receiving posts." },
-      { name: "delete", summary: "Delete a channel you run: tell its members, prune both relays, retire it. Cannot be undone." },
-      { name: "prune", summary: "Drop the oldest posts from the relays." },
-      { name: "resend", summary: "Refill a relay that lost posts, or one you just added." },
-    ],
-    help:
-      "Usage: cello channel info <channel> [--agent <agent>]\n" +
-      "       cello channel join <channel> [<note>] [--agent <agent>]\n" +
-      "       cello channel read <channel> [--all] [--agent <agent>]\n" +
-      "       cello channel name <channel> <label> [--agent <agent>] | leave <channel> [--agent <agent>]\n" +
-      "       cello channel create <name> <access> [--guidance <text>] [--agent <agent>]\n" +
-      "       cello channel setup <channel> <access> <relay> <relay> [--agent <agent>]\n" +
-      "       cello channel publish <channel> <title> <body> [--agent <agent>]\n" +
-      "       cello channel info-set <channel> [--guidance <text>] [--agent <agent>]\n" +
-      "       cello channel prune <channel> <through_seq> [--agent <agent>]\n" +
-      "       cello channel resend <channel> [<relay>] [--agent <agent>]\n" +
-      "       cello channel eject <channel> <member> | approve <channel> <member> | refuse <channel> <member> [--agent <agent>]\n" +
-      "       cello channel delete <channel> [--agent <agent>]\n" +
-      "  <channel> is the channel's 64-character hex public key.\n" +
-      "  'create' comes FIRST for a channel you run: it registers the channel identity <name>,\n" +
-      "  the DIRECTORY picks its two relays for you, and it publishes the description — in one step.\n" +
-      "  A channel takes NO pre-auth token and NO relay: the agent you are running is already\n" +
-      "  registered, and that identity is the whole basis of the channel's right. 'setup' CHANGES\n" +
-      "  the relays on a channel that already exists — a channel's ACCESS is fixed at create and\n" +
-      "  cannot change, because subscribers joined the access they were told. Pass the channel's\n" +
-      "  current <access> (public — anyone reads, open — anyone may ask to join, or invite_only); a\n" +
-      "  different one is refused.\n" +
-      "  A post is signed by BOTH the channel key and your agent key, so a reader can tell which\n" +
-      "  operator published it, not only which channel.\n" +
-      "  It goes to the channel's two relays. ONE relay refusing is not a failed publish — the post\n" +
-      "  is in your log either way, and 'resend' refills a relay that lost it or one you just added.\n" +
-      "  'prune' drops posts from the OLDEST end only, through the number you give.\n" +
-      "  'info-set' signs and deposits the channel's description so subscribers can read it; pass\n" +
-      "  --guidance <text> to change the description first — existing members see the new text the\n" +
-      "  next time they run 'channel info'. 'cello channels' lists the channels you follow and how\n" +
-      "  many posts are unread. 'name' is a label only\n" +
-      "  you see. 'leave' is local — nothing is sent, and your keys are kept so old posts stay readable.\n" +
-      "  'eject' removes a member from an invite-only channel AND rotates its key, which is what stops\n" +
-      "  them reading and even fetching. <member> is their 64-character hex public key.\n" +
-      "\n" +
-      "  FOLLOWING A CHANNEL takes its public key and nothing else. 'info' asks the directory who\n" +
-      "  administers it. 'join' opens a session with that admin and asks; the answer comes back on\n" +
-      "  its own and brings the relays, so you do not type one. 'read' prints new posts and moves\n" +
-      "  your read position; --all re-reads from the start without moving it. A post whose body\n" +
-      "  will not open is listed by number rather than skipped — that usually means a key change\n" +
-      "  you did not receive.",
+    // M16 041-HELPTRUTH items 6 & 7: the verbs AND the page below are both built from CHANNEL_DOCS,
+    // so `cello channel -h` and `cello channel <verb> -h` are one source and cannot drift.
+    verbs: CHANNEL_VERBS,
+    help: channelHelpPage(),
     // `--all` is `channel read`'s own flag (re-read from the start without moving the read
     // position). It was documented in the usage and honoured by the run handler but never declared,
     // so `cello channel read <k> --all` was rejected as "Unknown flag" before dispatch.
