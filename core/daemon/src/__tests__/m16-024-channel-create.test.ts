@@ -560,4 +560,43 @@ describe("M16 040-CLEANUP: publish/info-set refusal guidance", () => {
     // MUST NOT CHANGE #2: the new description was stored locally BEFORE the deposit was attempted.
     expect(setCalls).toEqual([{ channelHex: CHANNEL_HEX, guidance: "new description" }]);
   });
+
+  it("Part E: a post EVERY relay refused not_a_channel says the channel is too new and to resend", async () => {
+    // Right after create, a relay's short negative cache can refuse `not_a_channel` for up to 30s.
+    const { handlers } = wireHandlers(
+      { publish: () => Promise.resolve({ ok: false, reason: "no_relay_accepted", seq: 1, deposited: [
+        { relay: RELAY_A, ok: false, reason: "not_a_channel" },
+        { relay: RELAY_B, ok: false, reason: "not_a_channel" },
+      ] }) },
+      CFG,
+    );
+    const res = (await handlers.get("cello_channel_publish")!(
+      { channel: CHANNEL_HEX, title: "v1", body: "hi", agent: "admin" }, "conn1",
+    )) as { ok: boolean; reason: string; guidance: string };
+
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("no_relay_accepted");
+    expect(res.guidance).toContain("do not know this channel yet");
+    expect(res.guidance).toContain("30 seconds");
+    expect(res.guidance).toContain("cello channel resend");
+    // Not the ordinary "retry now" text — this is the too-new case.
+    expect(res.guidance).not.toContain("retry with");
+  });
+
+  it("Part E: any OTHER refusal keeps today's post-in-the-log text", async () => {
+    // One relay refused not_a_channel, the other for a different reason → NOT the all-new case.
+    const { handlers } = wireHandlers(
+      { publish: () => Promise.resolve({ ok: false, reason: "no_relay_accepted", seq: 1, deposited: [
+        { relay: RELAY_A, ok: false, reason: "not_a_channel" },
+        { relay: RELAY_B, ok: false, reason: "clock_skew" },
+      ] }) },
+      CFG,
+    );
+    const res = (await handlers.get("cello_channel_publish")!(
+      { channel: CHANNEL_HEX, title: "v1", body: "hi", agent: "admin" }, "conn1",
+    )) as { ok: boolean; guidance: string };
+
+    expect(res.guidance).toContain("It is in your log");
+    expect(res.guidance).not.toContain("do not know this channel yet");
+  });
 });

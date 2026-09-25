@@ -187,16 +187,27 @@ export function registerChannelPublishHandlers(deps: ChannelPublishDeps): void {
       };
     }
     logger.info("channel.publish.refused", { channel_pubkey: channel.channelHex, reason: result.reason });
+    /**
+     * 040-CLEANUP Part E: right after `create`, a relay may not know the channel yet and refuses
+     * `not_a_channel` for up to 30s (its short negative cache). When EVERY relay refused for that
+     * one reason, the post did not fail for a lasting reason — the relays just have not caught up.
+     * Say so, so the operator waits and resends rather than reading it as a broken channel. Any
+     * other refusal keeps the ordinary "post is in your log" text.
+     */
+    const deposited = result.deposited ?? [];
+    const allNotAChannel = deposited.length > 0 && deposited.every((d) => d.ok === false && d.reason === "not_a_channel");
     return {
       ok: false, reason: result.reason, detail: result.detail,
       // `no_relay_accepted` is the one refusal where the post SURVIVES, and a caller that did not
       // know that would publish it again and burn a second post number on the same content.
-      guidance: result.reason === "no_relay_accepted"
-        // `cello channel resend`, NOT the handler's own name: these verbs are terminal-only, so a
-        // `cello_*` token here would hand the operator a command that does not exist on any surface
-        // they can reach.
-        ? "No relay took the post. It is in your log — retry with 'cello channel resend' rather than publishing it again."
-        : undefined,
+      guidance: result.reason !== "no_relay_accepted"
+        ? undefined
+        : allNotAChannel
+          ? `The relays do not know this channel yet — a channel created in the last minute takes up to 30 seconds to reach them. Your post is saved; run \`cello channel resend ${channel.channelHex}\` in half a minute.`
+          // `cello channel resend`, NOT the handler's own name: these verbs are terminal-only, so a
+          // `cello_*` token here would hand the operator a command that does not exist on any surface
+          // they can reach.
+          : "No relay took the post. It is in your log — retry with 'cello channel resend' rather than publishing it again.",
     };
   });
 
