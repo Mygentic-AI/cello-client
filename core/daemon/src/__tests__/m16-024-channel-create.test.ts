@@ -199,7 +199,9 @@ describe("M16 024-CREATE Section B: register failure leaves NO active identity (
 
   it("create mints the identity, signs with the admin key, the real registration fails with no directory, and the mint is rolled back", async () => {
     celloDir = await makeCelloDir("cello-m16-024-");
-    daemon = spawnRealDaemon(celloDir);
+    // A closed local port, so the real `cello_register` genuinely has NO directory — never the live
+    // consortium the bundled manifest would pick.
+    daemon = spawnRealDaemon(celloDir, { CELLO_DIRECTORY_URL: "http://127.0.0.1:9" });
     await daemon.waitForEvent("daemon.started");
 
     const client = await connectToDaemon(join(celloDir, "daemon.sock"));
@@ -225,6 +227,12 @@ describe("M16 024-CREATE Section B: register failure leaves NO active identity (
       expect(names, "the rolled-back channel identity must not remain an active agent").not.toContain("brand-new-channel");
       // The admin the fixture booted with is untouched.
       expect(names).toContain("singleton-test-agent");
+
+      // "Fails with no directory" must be TRUE, not just the comment's claim. Without a directory
+      // override this daemon bootstrapped against the LIVE consortium, and every full-suite run
+      // registered a throwaway channel there; the live directory then crashed replying to the
+      // vanished test daemon (2026-09-25). The daemon's own log must never name a live node.
+      expect(daemon.output(), "the test daemon reached a live CELLO directory").not.toMatch(/mygentic\.ai/);
     } finally {
       client.close();
     }
