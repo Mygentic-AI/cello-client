@@ -255,11 +255,20 @@ export function registerChannelPublishHandlers(deps: ChannelPublishDeps): void {
       };
     }
 
-    const guidance = typeof params?.["guidance"] === "string" ? params["guidance"] : "";
+    /**
+     * 038-RETESTFIX Part A: an absent field KEEPS the stored value on a re-setup, and only falls to
+     * the empty/default when there is no stored config (a create). The first cut defaulted an absent
+     * guidance to "" and an absent retention to the default unconditionally, so re-running setup to
+     * change the relays WIPED the channel's description (live F34). `existing` is the config store's
+     * current row, already read above for the access check.
+     */
+    const guidance = typeof params?.["guidance"] === "string"
+      ? params["guidance"]
+      : (existing ? existing.guidance : "");
     const retention = params?.["retention_seconds"];
     const retention_seconds = typeof retention === "number" && Number.isSafeInteger(retention) && retention > 0
       ? retention
-      : DEFAULT_RETENTION_SECONDS;
+      : (existing ? existing.retention_seconds : DEFAULT_RETENTION_SECONDS);
 
     const recorded = recordChannelConfig(deps, agent.agentName, channel.channelHex, {
       access, relays, guidance, retention_seconds,

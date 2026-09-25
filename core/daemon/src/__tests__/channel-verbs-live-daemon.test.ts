@@ -235,6 +235,26 @@ describe("M16 018-PUBCOLLECT: the channel verbs on a live daemon", () => {
     expect(info2.guidance, "info-set with no guidance must leave the description alone").toBe("the new description");
   });
 
+  it("038 Part A — a re-run of setup with new relays and NO guidance keeps the stored description", async () => {
+    // Live evidence (F34): test-public's `channel info` showed guidance "" after later setup runs;
+    // create had set it. `cello_channel_config` defaulted an absent guidance to "" and overwrote the
+    // stored description on every re-setup — so changing relays wiped the channel's description.
+    await call("cello_channel_config", {
+      agent: "alice", channel: alicePubkeyHex, access: "public",
+      relays: [RELAY_A, RELAY_B], guidance: "the original description",
+    });
+    // Re-setup: change the relays, pass NO guidance. The stored description must survive.
+    const resetup = await call("cello_channel_config", {
+      agent: "alice", channel: alicePubkeyHex, access: "public", relays: [RELAY_B, RELAY_A],
+    });
+    expect(resetup["ok"], JSON.stringify(resetup)).toBe(true);
+    const info = await call("cello_channel_info", { agent: "alice", channel: alicePubkeyHex }) as
+      { guidance?: string; relays?: string[] };
+    expect(info.guidance, "re-setup without guidance must keep the stored description").toBe("the original description");
+    // ...and the relays DID change (a normal setup still changes relays — MUST NOT CHANGE item 1).
+    expect(info.relays).toEqual([RELAY_B, RELAY_A]);
+  });
+
   it("28. a channel must be SET UP before it can publish, and the refusal says so", async () => {
     const answer = await call("cello_channel_publish", {
       agent: "alice", channel: alicePubkeyHex, title: "before setup", body: "body",
