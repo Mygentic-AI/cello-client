@@ -609,16 +609,11 @@ async function nextWithTimeout(
 }
 
 /**
- * 079-CAPREASON — the relay's reason and counts when it refuses a session's assignment. Stored on the
- * session's own relay record and surfaced by `getAssignmentRefusal`, so an unwitnessed send can tell
- * the operator WHY the session is unwitnessed. `concurrent`/`cap` are present only for the tuple cap.
+ * 079-CAPREASON — the relay's reason and counts when it refuses a session's assignment, stored on the
+ * session's record so an unwitnessed send can tell the operator WHY. `concurrent`/`cap` only for the
+ * tuple cap. A rejection now settles the in-flight record with these (was the bare `"rejected"`).
  */
 export interface AssignmentRefusal { reason: string; concurrent?: number; cap?: number; }
-
-/**
- * 079-CAPREASON — the settlement of an in-flight `client_record_assignment`. `"ok"` and `"closed"`
- * are unchanged; a rejection now carries the relay's reason and counts (was the bare `"rejected"`).
- */
 type RecordResult = "ok" | "closed" | ({ rejected: true } & AssignmentRefusal);
 
 /**
@@ -700,8 +695,7 @@ export class AgentRelayClient {
 
   /**
    * 079-CAPREASON — the relay's reason and counts for THIS session's assignment rejection, or null if
-   * it was never rejected. Read by the unwitnessed-send answer so the agent learns why the session is
-   * unwitnessed and what to do (close some of the open sessions it holds with this counterparty).
+   * it was never rejected. Read by the unwitnessed-send answer so the agent learns why and what to do.
    */
   getAssignmentRefusal(sessionIdHex: string): AssignmentRefusal | null {
     return this.#sessions.get(sessionIdHex)?.assignmentRefusal ?? null;
@@ -766,20 +760,12 @@ export class AgentRelayClient {
   /**
    * Resolver for the in-flight `client_record_assignment` ack. The ack carries
    * no session_id (like hash_submit_ack), so at most one record is in flight; records are serialized on
-   * the same `#submitChain` as submits, guaranteeing no overlap.
-   *
-   * 079-CAPREASON — a rejection is no longer the bare string `"rejected"`: it carries the relay's
-   * `reason` and, for the tuple cap, the counts, so `#doRecord` can store them on the session's own
-   * record. The counts are the one actionable fact the operator needs — how many sessions they hold
-   * and what the limit is — and the `assignment_invalid` frame has no session_id to route them by, so
-   * they ride the resolver of the record that is in flight.
+   * the same `#submitChain` as submits, guaranteeing no overlap. 079-CAPREASON: a rejection settles
+   * this with the relay's reason and counts, which `#doRecord` stores on the session.
    */
   #pendingRecord: ((result: RecordResult) => void) | null = null;
-  /**
-   * 079-CAPREASON — the session hex of the in-flight record, so the `assignment_invalid` frame handler
-   * (whose frame carries no session_id) can name the session in its log line. Set beside
-   * `#pendingRecord`, cleared with it.
-   */
+  /** 079-CAPREASON — the in-flight record's session hex, so the session_id-less `assignment_invalid`
+   *  frame can name the session in its log. Set beside `#pendingRecord`, cleared with it. */
   #pendingRecordSessionHex: string | null = null;
   /**
    * 054-SRSPLIT — the in-flight `relay_release_reservation`. At most one: releases are rare and
@@ -815,10 +801,10 @@ export class AgentRelayClient {
      */
     recordRejected: boolean;
     /**
-     * 079-CAPREASON — the relay's reason and counts for THIS session's rejection, kept beside
-     * `recordRejected` so an unwitnessed send on it can tell the operator why. Per session, not per
-     * stream: `#lastAuthRefusal` answers "why did this relay refuse us" for the whole connection; this
-     * answers "why is THIS conversation unwitnessed", which is the question the send answer asks.
+     * 079-CAPREASON — the relay's reason and counts for THIS session's rejection, beside
+     * `recordRejected`. Per session, not per stream: `#lastAuthRefusal` answers "why did this relay
+     * refuse us" for the connection; this answers "why is THIS conversation unwitnessed", which is the
+     * question the send answer asks.
      */
     assignmentRefusal?: AssignmentRefusal;
     /**
@@ -927,8 +913,7 @@ export class AgentRelayClient {
       recorded: existing?.recorded ?? false,
       recordRejected: existing?.recordRejected ?? false,
       recordTimedOut: existing?.recordTimedOut ?? false,
-      // 079-CAPREASON: a re-registration must not drop a rejection's reason/counts — the same reason
-      // `recordRejected` is carried forward, and losing it would blank the send answer's explanation.
+      // 079-CAPREASON: carry the rejection reason/counts across re-registration, as recordRejected is.
       ...(existing?.assignmentRefusal ? { assignmentRefusal: existing.assignmentRefusal } : {}),
     });
     /**
@@ -1012,9 +997,8 @@ export class AgentRelayClient {
     let resolveRec!: (result: RecordResult) => void;
     const ackPromise = new Promise<RecordResult>((r) => { resolveRec = r; });
     this.#pendingRecord = resolveRec;
-    // 079-CAPREASON: name the session the in-flight record belongs to, so the reason-less
-    // `assignment_invalid` frame can log which session it refused.
-    this.#pendingRecordSessionHex = sessionIdHex;
+    this.#pendingRecordSessionHex = sessionIdHex; // 079-CAPREASON: names the session for the refusal log
+
     try {
       stream.send(lp.encode.single(frame));
     } catch (err: unknown) {
@@ -1046,8 +1030,7 @@ export class AgentRelayClient {
         // re-presenting. The session has no relay witness; sends still complete via the direct path
         // (sovereign-node redundancy) and a hash_submit will fail loud (session_not_found) — diagnosable.
         sess.recordRejected = true;
-        // 079-CAPREASON: keep the relay's reason and counts on the session itself, so an unwitnessed
-        // send on it can tell the operator WHY (and, for the tuple cap, how many sessions to close).
+        // 079-CAPREASON: keep the reason/counts on the session so an unwitnessed send can explain it.
         sess.assignmentRefusal = {
           reason: result.reason,
           ...(result.concurrent !== undefined ? { concurrent: result.concurrent } : {}),
@@ -1408,9 +1391,8 @@ export class AgentRelayClient {
       const reason = typeof frame["reason"] === "string" ? (frame["reason"] as string) : "unknown";
       const concurrent = typeof frame["concurrent_sessions"] === "number" ? (frame["concurrent_sessions"] as number) : undefined;
       const cap = typeof frame["session_cap"] === "number" ? (frame["session_cap"] as number) : undefined;
-      // 079-CAPREASON: the counts and the session (the frame carries no session_id, so name the
-      // in-flight record's session) go IN THE LOG too — the durable forensic half of the same fact
-      // the send answer now carries to the agent.
+      // 079-CAPREASON: counts + the session (the frame has no session_id, so name the in-flight
+      // record's) go IN THE LOG too — the forensic half of what the send answer now tells the agent.
       const refusedSessionHex = this.#pendingRecordSessionHex;
       this.#logger.warn("session.relay.assignment.invalid", {
         relayPeerId: this.#relayPeerId, reason,
@@ -1431,8 +1413,7 @@ export class AgentRelayClient {
         ...(concurrent !== undefined ? { slotsHeld: concurrent } : {}),
         ...(cap !== undefined ? { slotCap: cap } : {}),
       });
-      // 079-CAPREASON: carry the reason and counts to `#doRecord`, which stores them on the session —
-      // the send answer reads them back per session, not off this per-stream classifier.
+      // 079-CAPREASON: carry reason+counts to `#doRecord`, which stores them on the session.
       const r = this.#pendingRecord; this.#pendingRecord = null; this.#pendingRecordSessionHex = null;
       if (r) r({ rejected: true, reason, ...(concurrent !== undefined ? { concurrent } : {}), ...(cap !== undefined ? { cap } : {}) });
     } else if (type === "leaf_deliver") {

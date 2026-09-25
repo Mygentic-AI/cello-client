@@ -125,6 +125,16 @@ const SENDRAW_SELECTORS = [
  * the trade — what is skipped, why, and that size is bounded at classify. That prose is the finding;
  * deleting it to stay under the number is how the next author rescreens join frames as prose. The
  * fork belongs here — it is the single inbound funnel — so a split is not what this unit is for.
+ *
+ * TWO MOVED ON 2026-09-25 FOR `079-CAPREASON`. `session-relay-client.ts` 3167 -> 3214,
+ * `session-node-manager.ts` 3433 -> 3447. The unit puts the relay's tuple-cap refusal reason and
+ * counts on the session's own record and into the unwitnessed-send answer, so an agent is told WHY a
+ * session is unwitnessed and which sessions to close -- feature work in exactly the two files these
+ * ratchets pin (the relay client that receives the refusal, the node manager that resolves it per
+ * session). The relay-client comments were already trimmed once (-19) to what carries the reasoning:
+ * why the refusal is stored PER SESSION and not off the per-stream classifier, the fact a later edit
+ * would otherwise re-break. Compressing past that deletes the finding, the trade every note above
+ * records as the wrong one; a split is `DOD-M15-GODFILE-1`, not this unit. Shrink only.
  */
 const ERROR_FORMAT_SELECTORS = [
   {
@@ -355,7 +365,7 @@ export default [
     // — record the counterparty's refusal, read it back on the next send or read, and find which
     // local agent owns a session id. Same argument as the line above: the data and the reasoning are
     // in `session-records.ts` and `session-queries.ts`; this file is the handle every consumer holds.
-    rules: { "max-lines": ["error", { max: 3433, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 3447, skipBlankLines: false, skipComments: false }] },
   },
   {
     // 040-DAEMONROOT, lowered every unit; the target is under 1,000 and this pin is what stops the
@@ -442,7 +452,7 @@ export default [
     // a second capture site on the delivery path plus the anchor lookup, and the refusal notes on
     // both — which differ, because a refusal costs OUR send its witness and must not cost THEIRS
     // its delivery.
-    rules: { "max-lines": ["error", { max: 3167, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 3214, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/session-views.ts"],
