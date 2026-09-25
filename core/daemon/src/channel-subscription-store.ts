@@ -24,6 +24,7 @@
  */
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
+import { addColumnIfMissing } from "./column-birth.js";
 import type { ChannelAccess } from "@cello-protocol/protocol-types";
 
 export const CHANNEL_SUBSCRIPTION_CREATE_SQL = `
@@ -35,8 +36,8 @@ export const CHANNEL_SUBSCRIPTION_CREATE_SQL = `
     guidance           TEXT    NOT NULL DEFAULT '',
     -- 041-HELPTRUTH Part C replay guard: the signed updated_at of the info record the stored guidance
     -- came from. 0 = the admission description (no anchor), so the first relay record after admission
-    -- is accepted; a later relay record is accepted only when its updated_at is strictly greater. In
-    -- the full column set here, not a migration — this table forbids migrations (empty DB, see header).
+    -- is accepted; a later relay record is accepted only when its updated_at is strictly greater.
+    -- Existing tables get it from the constructor's addColumnIfMissing: live daemons already hold rows.
     guidance_updated_at INTEGER NOT NULL DEFAULT 0,
     retention_seconds  INTEGER NOT NULL DEFAULT 604800,
     -- JSON array of multiaddrs: the relays this channel publishes to, in the order the info record
@@ -130,6 +131,16 @@ export class ChannelSubscriptionStore {
     this.#db = db;
     this.#logger = logger;
     this.#db.exec(CHANNEL_SUBSCRIPTION_CREATE_SQL);
+    /**
+     * ⚠️ `CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists, and every daemon
+     * that ran a channel before 041 has this table WITHOUT `guidance_updated_at`. Every SELECT below
+     * names it, so without this every subscription read on an upgraded daemon would fail "no such
+     * column" and channels would stop working. The column-birth guard makes it idempotent.
+     */
+    addColumnIfMissing(this.#db, this.#logger, {
+      table: "channel_subscriptions", column: "guidance_updated_at",
+      sql: "ALTER TABLE channel_subscriptions ADD COLUMN guidance_updated_at INTEGER NOT NULL DEFAULT 0",
+    });
     this.#db.exec(CHANNEL_SUBSCRIPTION_KEYS_CREATE_SQL);
   }
 

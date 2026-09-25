@@ -203,3 +203,32 @@ describe("M16 019 Part D — subscription state", () => {
     expect(subs.get(AGENT, CHANNEL)?.channel_pubkey).toBe(CHANNEL);
   });
 });
+
+describe("041 upgrade — a table created before guidance_updated_at existed", () => {
+  it("gains the column on open, keeps its rows, and reads them", () => {
+    // The shape every pre-041 daemon holds: the same table without guidance_updated_at, with a row.
+    const oldDir = mkdtempSync(join(tmpdir(), "cello-041-upgrade-"));
+    const oldDb = openTestDb(join(oldDir, "sessions.db"));
+    try {
+      oldDb.exec(`CREATE TABLE channel_subscriptions (
+        agent_id TEXT NOT NULL, channel_pubkey TEXT NOT NULL, admin_pubkey TEXT NOT NULL,
+        access TEXT NOT NULL, guidance TEXT NOT NULL DEFAULT '', retention_seconds INTEGER NOT NULL DEFAULT 604800,
+        relays TEXT NOT NULL DEFAULT '[]', moniker TEXT NOT NULL DEFAULT '',
+        delivered_through INTEGER NOT NULL DEFAULT 0, processed_through INTEGER NOT NULL DEFAULT 0,
+        joined_at INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'active',
+        PRIMARY KEY (agent_id, channel_pubkey))`);
+      oldDb.prepare(`INSERT INTO channel_subscriptions (agent_id, channel_pubkey, admin_pubkey, access, guidance)
+        VALUES (?, ?, ?, 'open', 'old description')`).run(AGENT, CHANNEL, ADMIN);
+
+      const upgraded = new ChannelSubscriptionStore(oldDb, silent);
+      const got = upgraded.get(AGENT, CHANNEL);
+      expect(got?.guidance).toBe("old description");
+      expect(got?.guidance_updated_at).toBe(0);
+      // A second open is a no-op, not a failure.
+      expect(() => new ChannelSubscriptionStore(oldDb, silent)).not.toThrow();
+    } finally {
+      oldDb.close();
+      rmSync(oldDir, { recursive: true, force: true });
+    }
+  });
+});
