@@ -550,6 +550,16 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
 
   handlers.set("cello_channels", async (params, connectionId) => {
     const explicit = typeof params?.["agent"] === "string" ? (params["agent"]) : undefined;
+    // 041-HELPTRUTH review LOW: an explicit `--agent` that names no operator agent is an ERROR that
+    // names it, not an empty list — an empty list reads as "this agent runs/follows nothing", which
+    // is a different, misleading fact. A channel identity is not an operator agent, so it is rejected
+    // here too. (No explicit `--agent` falls through to the current-agent / all-agents branches.)
+    if (explicit !== undefined && !deps.loadedAgents.some((a) => a.name === explicit && !deps.isChannelAgent(a.name))) {
+      return Promise.resolve({
+        ok: false, reason: "agent_unknown",
+        guidance: `No agent named '${explicit}' on this daemon. Run 'cello agents' to see the agents you have.`,
+      });
+    }
     const current = deps.resolveCurrentAgent(connectionId, explicit);
     // 041-HELPTRUTH Part A: with neither `--agent` nor a selected agent, list EVERY operator agent's
     // channels grouped, instead of refusing `no_current_agent` — a shell that never selected an agent

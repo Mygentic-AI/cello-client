@@ -745,6 +745,21 @@ describe("M16 041-HELPTRUTH Part A — no agent lists every operator agent's cha
     expect(byAgent.get("Agent One")).toContain(ch1);
     expect(byAgent.get("Agent Two")).toContain(ch2);
   });
+
+  it("review LOW: an explicit --agent that names no operator agent answers agent_unknown, not an empty list", async () => {
+    const h = await listHarness();
+    const res = (await h.handlers.get("cello_channels")!({ agent: "Bogus" }, "conn-1")) as {
+      ok: boolean; reason?: string; guidance?: string; channels?: unknown[];
+    };
+    expect(res.ok, "an unknown --agent is an error, not an empty success").toBe(false);
+    expect(res.reason).toBe("agent_unknown");
+    expect(res.guidance).toContain("Bogus");
+    expect(res.channels).toBeUndefined();
+
+    // A REAL agent named explicitly still lists (ok: true), so the guard does not reject valid names.
+    const ok = (await h.handlers.get("cello_channels")!({ agent: "Agent One" }, "conn-1")) as { ok: boolean };
+    expect(ok.ok).toBe(true);
+  });
 });
 
 describe("M16 041-HELPTRUTH Part B — the list also carries the channels you RUN", () => {
