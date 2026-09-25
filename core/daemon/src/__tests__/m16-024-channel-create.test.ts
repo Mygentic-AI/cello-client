@@ -38,6 +38,9 @@ import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { generateKeypair, verify, type InMemoryKeyProvider, type KeyProvider } from "@cello-protocol/crypto";
 import { registerChannelCreateHandler, type ChannelCreateDeps } from "../channel-create-handler.js";
 import { wireChannelPublishing } from "../channel-publish-wiring.js";
+import { registerChannelPublishHandlers } from "../channel-publish-handlers.js";
+import type { ChannelPublisher } from "../channel-publisher.js";
+import type { ChannelConfig } from "../channel-config-store.js";
 import { ChannelConfigStore } from "../channel-config-store.js";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import { connectToDaemon } from "../ipc-client.js";
@@ -510,5 +513,51 @@ describe("M16 024-CREATE item 4: the directory's refusal detail reaches the oper
     const failed = logs.find((l) => l.event === "channel.create.failed");
     expect(failed, "channel.create.failed must be logged").toBeDefined();
     expect(String(failed!.ctx["guidance"])).toContain("admin signature does not verify");
+  });
+});
+
+// ─── M16 040-CLEANUP Parts C & E — refusal guidance on the publisher's verbs ────────────────────
+//
+// Both parts live in registerChannelPublishHandlers, which builds the operator-facing guidance from
+// what the publisher returned. A fake publisher lets a test force the exact refusal shape each part
+// is about — an info deposit no relay took (Part C), and a post every relay refused `not_a_channel`
+// (Part E) — without a directory or a real relay.
+describe("M16 040-CLEANUP: publish/info-set refusal guidance", () => {
+  type H = (params: Record<string, unknown> | undefined, connectionId: string) => Promise<unknown>;
+
+  function wireHandlers(publisherFake: Partial<ChannelPublisher>, cfg: ChannelConfig | null) {
+    const handlers = new Map<string, H>();
+    const setCalls: Array<{ channelHex: string; guidance: string }> = [];
+    registerChannelPublishHandlers({
+      handlers,
+      logger: silent,
+      getPublisher: () => publisherFake as unknown as ChannelPublisher,
+      setChannelConfig: (_agentName, channelHex, config) => { setCalls.push({ channelHex, guidance: config.guidance }); return { ok: true }; },
+      getChannelConfig: () => cfg,
+      resolveCurrentAgent: (_connectionId, explicit) => explicit ?? "admin",
+    });
+    return { handlers, setCalls };
+  }
+
+  const CFG: ChannelConfig = {
+    access: "invite_only", relays: [RELAY_A, RELAY_B], guidance: "old description",
+    retention_seconds: 3600, admin_pubkey: ADMIN_HEX,
+  };
+
+  it("Part C: info-set --guidance with every deposit refused says subscribers still see the old text, and still saves locally", async () => {
+    const { handlers, setCalls } = wireHandlers(
+      { publishInfo: () => Promise.resolve({ ok: false, reason: "no_relay_accepted" }) },
+      CFG,
+    );
+    const res = (await handlers.get("cello_channel_info_set")!(
+      { channel: CHANNEL_HEX, guidance: "new description", agent: "admin" }, "conn1",
+    )) as { ok: boolean; reason: string; guidance: string };
+
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("no_relay_accepted");
+    expect(res.guidance).toContain("Saved here, but no relay took it");
+    expect(res.guidance).toContain("subscribers still see the old description");
+    // MUST NOT CHANGE #2: the new description was stored locally BEFORE the deposit was attempted.
+    expect(setCalls).toEqual([{ channelHex: CHANNEL_HEX, guidance: "new description" }]);
   });
 });

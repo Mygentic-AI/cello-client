@@ -293,6 +293,7 @@ export function registerChannelPublishHandlers(deps: ChannelPublishDeps): void {
      * info` reads it back. Absent guidance, nothing is stored and this is the old deposit-only path.
      */
     const guidance = params?.["guidance"];
+    let guidanceChanged = false;
     if (typeof guidance === "string") {
       const cfg = deps.getChannelConfig(channel.channelHex);
       if (!cfg) {
@@ -305,8 +306,23 @@ export function registerChannelPublishHandlers(deps: ChannelPublishDeps): void {
       }
       const saved = deps.setChannelConfig(agent.agentName, channel.channelHex, { ...cfg, guidance });
       if (!saved.ok) return { ok: false, reason: saved.reason, guidance: saved.guidance };
+      guidanceChanged = true;
     }
-    return depositChannelInfo(deps, agent.agentName, channel.channelHex);
+    const deposited = await depositChannelInfo(deps, agent.agentName, channel.channelHex);
+    /**
+     * 040-CLEANUP Part C: the new description IS saved locally above, but if no relay took the
+     * deposit the change has not reached subscribers — they still read the OLD text. The generic
+     * "nobody can discover this channel" line does not say that, so an operator who changed the
+     * description thinks it landed. Say plainly that the save is local-only and how to retry.
+     * Only when the description was actually CHANGED — an unchanged re-deposit has no "old text".
+     */
+    if (guidanceChanged && !deposited.ok && deposited.reason === "no_relay_accepted") {
+      return {
+        ok: false, reason: "no_relay_accepted",
+        guidance: `Saved here, but no relay took it — subscribers still see the old description. Run \`cello channel info-set ${channel.channelHex}\` again to retry.`,
+      };
+    }
+    return deposited;
   });
 
   handlers.set("cello_channel_prune", async (params, connectionId) => {
