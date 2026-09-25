@@ -65,19 +65,48 @@ describe("M16 019 Part B — the join frames", () => {
     expect(decoded.frame.access).toBe("invite_only");
   });
 
-  it("a PUBLIC channel cannot be accepted into — there is nothing to join", () => {
-    // Public channels have no join, no keys and nothing to eject. An acceptance naming one would be
-    // a frame the subscriber could act on to store a key for a channel that has none.
+  it("036-PUBLICSUB test 1: a PUBLIC acceptance carries an EMPTY bundle and round-trips; OPEN with an empty bundle is refused", () => {
+    // A public channel's posts are not encrypted, so admission carries no key — the bundle MUST be
+    // empty. The relays, guidance and retention still travel: that is what lets the reader fetch.
+    const bytes = encodeChannelJoinAccepted({
+      channel_pubkey: CHANNEL, key_bundle: new Uint8Array(0), guidance: "the bulletin",
+      retention_seconds: 3600, access: "public", relays: [RELAY_A, RELAY_B], members_visible: true,
+    });
+    const decoded = decodeChannelJoinAccepted(bytes);
+    expect(decoded.ok, decoded.ok ? "" : decoded.reason).toBe(true);
+    if (!decoded.ok) return;
+    expect(decoded.frame.access).toBe("public");
+    expect(decoded.frame.key_bundle.length).toBe(0);
+    expect(decoded.frame.relays).toEqual([RELAY_A, RELAY_B]);
+    expect(decoded.frame.guidance).toBe("the bulletin");
+
+    // ⚠️ The empty bundle is legal ONLY for public. An OPEN or invite-only channel has a key, so an
+    // empty bundle would be an acceptance that admits without one — refused at both encode and decode.
+    expect(() => encodeChannelJoinAccepted({
+      channel_pubkey: CHANNEL, key_bundle: new Uint8Array(0), guidance: "", retention_seconds: 3600,
+      access: "open", relays: [RELAY_A], members_visible: false,
+    })).toThrow(/bad_key_bundle/);
+    const openEmpty = encodeCbor([JOIN_ACCEPTED_TYPE, CHANNEL, new Uint8Array(0), "", 3600, "open", [RELAY_A], false]);
+    expect(decodeChannelJoinAccepted(openEmpty).ok).toBe(false);
+  });
+
+  it("036-PUBLICSUB test 2: a PUBLIC acceptance carrying a NON-EMPTY bundle is refused", () => {
+    // Public posts have no key, so a non-empty bundle on a public acceptance is a key for a channel
+    // that has none — a frame the subscriber must not act on. Refused at encode and at decode.
     expect(() => encodeChannelJoinAccepted({
       channel_pubkey: CHANNEL, key_bundle: BUNDLE, guidance: "", retention_seconds: 3600,
-      access: "public" as "open", relays: [RELAY_A], members_visible: false,
-    })).toThrow(/bad_access/);
+      access: "public", relays: [RELAY_A], members_visible: false,
+    })).toThrow(/bad_key_bundle/);
+    const publicWithKey = encodeCbor([JOIN_ACCEPTED_TYPE, CHANNEL, BUNDLE, "", 3600, "public", [RELAY_A], false]);
+    expect(decodeChannelJoinAccepted(publicWithKey).ok).toBe(false);
   });
 
   it("every refusal reason is carried by name", () => {
     for (const reason of [
       "not_admin_of_channel", "pending_approval", "refused_by_admin",
-      "already_member", "ejected", "channel_is_public",
+      "already_member", "ejected",
+      // 036-PUBLICSUB: `channel_is_public` is gone — a public join is now ADMITTED, not refused, so
+      // no branch ever sends that reason and the vocabulary no longer knows it.
       // M16 034-LIFECYCLE: the admin deleted the whole channel. Distinct from `ejected` (that member
       // alone was removed): here the channel itself is gone, and the member's daemon marks the
       // subscription `closed` rather than `ejected`.
@@ -155,7 +184,7 @@ describe("025-JOINSCREEN — channelJoinFrameType is strict, by full decode", ()
       retention_seconds: 3600, access: "invite_only", relays: [RELAY_A, RELAY_B], members_visible: false,
     }))).toBe(JOIN_ACCEPTED_TYPE);
     expect(channelJoinFrameType(encodeChannelJoinRefused({
-      channel_pubkey: CHANNEL, reason: "channel_is_public",
+      channel_pubkey: CHANNEL, reason: "ejected",
     }))).toBe(JOIN_REFUSED_TYPE);
     expect(channelJoinFrameType(encodeChannelRekey({
       channel_pubkey: CHANNEL, key_bundle: BUNDLE, generation: 3,
@@ -174,7 +203,8 @@ describe("025-JOINSCREEN — channelJoinFrameType is strict, by full decode", ()
     expect(channelJoinFrameType(encodeCbor([
       JOIN_REFUSED_TYPE, CHANNEL, "made_up",
     ]))).toBeNull();
-    // accepted naming a PUBLIC channel — there is nothing to join
+    // accepted naming a PUBLIC channel WITH a key bundle — public posts have no key, so a bundle
+    // here is a key for a channel that has none (036-PUBLICSUB); the decoder rejects it.
     expect(channelJoinFrameType(encodeCbor([
       JOIN_ACCEPTED_TYPE, CHANNEL, BUNDLE, "", 3600, "public", [RELAY_A], false,
     ]))).toBeNull();
