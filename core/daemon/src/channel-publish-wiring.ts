@@ -392,7 +392,13 @@ export function wireChannelPublishing(
     },
     // 041-HELPTRUTH Part B: the post count for an admin row in `cello channels`. Reads the log this
     // half owns; a channel with an empty log (or none) is `null`, never a fabricated 0.
-    channelLastSeq: (channelHex) => log.head(channelHex).last_seq,
+    // `head` THROWS on a channel with no log row (created, never published), so the row is ensured
+    // first, exactly as pruneAllPosts does above — without it one unpublished channel failed the whole
+    // `cello channels` listing (live, 0.0.252).
+    channelLastSeq: (channelHex) => {
+      log.ensureChannel(channelHex);
+      return log.head(channelHex).last_seq;
+    },
     // 041-HELPTRUTH Part C: fetch the channel's info record from its relays, first that answers. A
     // relay fault on one is not fatal — the next is tried; all silent is `null` (the caller falls
     // back to the stored description).

@@ -453,6 +453,35 @@ describe("M16 024-CREATE item 6: a failed rollback is logged, not swallowed", ()
   });
 });
 
+describe("041 fix: the post count of a channel that has never published", () => {
+  let dir: string;
+  let db: DaemonDatabase;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "cello-041-lastseq-"));
+    db = openTestDb(join(dir, "sessions.db"));
+  });
+  afterEach(() => {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("is null, not a throw — one unpublished channel must not fail the whole `cello channels` list", () => {
+    const wiring = wireChannelPublishing({
+      handlers: new Map<string, Handler>(), logger: silent, getDb: () => db, getNode: () => null,
+      screenOutbound: (content, ctx) => new PassthroughGatewayClient().screenOutbound(content, ctx),
+      loadedAgents: [], keyProviders: new Map<string, KeyProvider>(),
+      resolveCurrentAgent: (_c, explicit) => explicit ?? "admin",
+      isAgentOnline: () => true, activeMembers: () => [], signalingFor: () => null,
+      notify: { channelPosts() {}, channelJoinAnswer() {}, channelJoinRequest() {} },
+    });
+    try {
+      expect(wiring.channelLastSeq("cd".repeat(32))).toBeNull();
+    } finally {
+      wiring.stop();
+    }
+  });
+});
+
 describe("M16 024-CREATE item 4: the directory's refusal detail reaches the operator", () => {
   let dir: string;
   let db: DaemonDatabase;
