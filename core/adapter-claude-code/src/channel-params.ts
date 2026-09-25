@@ -140,7 +140,9 @@ function doorbellText(type: string, data: Record<string, unknown>): string {
       const raw = data["count"];
       const count = typeof raw === "number" && Number.isFinite(raw) ? String(raw) : "some";
       // {label} is the SHORT key; the read command carries the FULL key — the agent must paste it.
-      return `📢 CELLO — ${count} new post(s) on channel ${shortKey(key)}. Run cello_channel_read ${key} to read them.`;
+      // F33: an em dash, not a full stop, after the shortened key — a `…` immediately before a `.`
+      // reads as a typo (`bea7ebfeae96…. Run`).
+      return `📢 CELLO — ${count} new post(s) on channel ${shortKey(key)} — run cello_channel_read ${key} to read them.`;
     }
     case "channel_join_answer": {
       const label = shortKey(String(data["channel"] ?? ""));
@@ -172,7 +174,8 @@ function doorbellText(type: string, data: Record<string, unknown>): string {
         return `🔒 CELLO — channel ${label} was deleted by its admin. Earlier posts stay readable.`;
       }
       // `ejected`, or a reason this shim does not recognise from a newer daemon: a member is out.
-      return `🚫 CELLO — you were removed from channel ${label}. Earlier posts stay readable; new ones will not arrive.`;
+      // F33: em dash after the shortened key, not a full stop — same fix as the new-post notice.
+      return `🚫 CELLO — you were removed from channel ${label} — Earlier posts stay readable; new ones will not arrive.`;
     }
     case "channel_join_request": {
       // 034-LIFECYCLE: FULL keys, so approving is a copy-paste of the exact command — the admin

@@ -351,4 +351,27 @@ describe("M16 032-NOTICES: channel doorbells render and ask for an action", () =
       expect(content).not.toContain("NaN");
     }
   });
+
+  // ─── 040-CLEANUP Part D (F33) — a shortened key ends in an ellipsis, so nothing may put a full
+  // stop straight after it: `bea7ebfeae96…. Run` reads as a typo. Every channel notice that shows a
+  // shortened key is checked.
+  it("F33: no channel notice renders an ellipsis directly before a full stop", () => {
+    const SUB = "cd".repeat(32);
+    const notices = [
+      buildChannelParams({ type: "channel_posts", channel: CH, count: 3, through: 3 }, "channel_posts"),
+      buildChannelParams({ type: "channel_join_answer", channel: CH, outcome: "admitted" }, "channel_join_answer"),
+      buildChannelParams({ type: "channel_join_answer", channel: CH, outcome: "pending" }, "channel_join_answer"),
+      buildChannelParams({ type: "channel_join_answer", channel: CH, outcome: "refused", reason: "already_member" }, "channel_join_answer"),
+      buildChannelParams({ type: "channel_membership_ended", channel: CH, reason: "ejected" }, "channel_membership_ended"),
+      buildChannelParams({ type: "channel_membership_ended", channel: CH, reason: "channel_closed" }, "channel_membership_ended"),
+      buildChannelParams({ type: "channel_join_request", channel: CH, subscriber: SUB }, "channel_join_request"),
+    ];
+    for (const n of notices) expect(n.content).not.toContain("….");
+  });
+
+  it("F33: the new-post notice reads '— run …' and still carries the full read command", () => {
+    const { content } = buildChannelParams({ type: "channel_posts", channel: CH, count: 3, through: 3 }, "channel_posts");
+    expect(content).not.toContain("….");
+    expect(content).toContain(`— run cello_channel_read ${CH} to read them`);
+  });
 });
