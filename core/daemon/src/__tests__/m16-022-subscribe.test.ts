@@ -176,14 +176,14 @@ describe("M16 022 — info", () => {
 // relay answers or the record does not verify, marking the source so the reader knows which it got.
 describe("M16 041-HELPTRUTH Part C — a member's info refreshes the description from the relays", () => {
   /** A signed info record for `channel`, from `signer` (the channel key for a genuine one). */
-  async function signedInfo(signer: typeof channelKp, channelHex: string, guidance: string): Promise<Uint8Array> {
+  async function signedInfo(signer: typeof channelKp, channelHex: string, guidance: string, updatedAt = 1_800_000_000_000): Promise<Uint8Array> {
     const info = await signChannelInfo(signer, {
       access: "open",
       admin_pubkey: await adminKp.getPublicKey(),
       relays: [RELAY],
       guidance,
       retention_seconds: 7 * 24 * 3600,
-      updated_at: 1_800_000_000_000,
+      updated_at: updatedAt,
       ext: null,
     });
     return encodeChannelInfo(info);
@@ -220,6 +220,24 @@ describe("M16 041-HELPTRUTH Part C — a member's info refreshes the description
       expect(r.description_source).toBe("stored");
     }
     expect(subs.get(AGENT, channelHex)?.guidance, "the stored description is untouched").toBe("old stored text");
+  });
+
+  it("C4. a valid but OLDER record does not overwrite a newer stored description (review MEDIUM replay)", async () => {
+    const channelHex = Buffer.from(await channelKp.getPublicKey()).toString("hex");
+    subs.upsert({ agent_id: AGENT, channel_pubkey: channelHex, admin_pubkey: ADMIN, access: "open", relays: [RELAY], guidance: "admission text" });
+
+    // A newer record (updated_at 200) is accepted and stored WITH its updated_at as the anchor.
+    const newer = await signedInfo(channelKp, channelHex, "text at t=200", 200);
+    const r1 = await build({ fetchInfo: () => Promise.resolve(newer) }).api.info(AGENT, channelHex);
+    expect(r1.ok && r1.guidance).toBe("text at t=200");
+    expect(r1.ok && r1.description_source).toBe("relay");
+
+    // Now a validly-signed but OLDER record (updated_at 100) — a replay — must be ignored.
+    const older = await signedInfo(channelKp, channelHex, "stale text at t=100", 100);
+    const r2 = await build({ fetchInfo: () => Promise.resolve(older) }).api.info(AGENT, channelHex);
+    expect(r2.ok && r2.guidance, "the older record does not overwrite the newer stored text").toBe("text at t=200");
+    expect(r2.ok && r2.description_source).toBe("stored");
+    expect(subs.get(AGENT, channelHex)?.guidance, "the store keeps the newer text").toBe("text at t=200");
   });
 
   it("C3. no relay answers → the stored text is shown, source stored", async () => {

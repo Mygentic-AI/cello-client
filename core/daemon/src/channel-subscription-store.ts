@@ -33,6 +33,11 @@ export const CHANNEL_SUBSCRIPTION_CREATE_SQL = `
     admin_pubkey       TEXT    NOT NULL,
     access             TEXT    NOT NULL,
     guidance           TEXT    NOT NULL DEFAULT '',
+    -- 041-HELPTRUTH Part C replay guard: the signed updated_at of the info record the stored guidance
+    -- came from. 0 = the admission description (no anchor), so the first relay record after admission
+    -- is accepted; a later relay record is accepted only when its updated_at is strictly greater. In
+    -- the full column set here, not a migration — this table forbids migrations (empty DB, see header).
+    guidance_updated_at INTEGER NOT NULL DEFAULT 0,
     retention_seconds  INTEGER NOT NULL DEFAULT 604800,
     -- JSON array of multiaddrs: the relays this channel publishes to, in the order the info record
     -- gave them. A column per relay would fix the count at two, and the count is the publisher's.
@@ -78,6 +83,8 @@ export interface ChannelSubscription {
   /** What the channel is for, in the publisher's words — and how long its posts last. Both arrive
    * on the acceptance and have no other source, so a subscriber that drops them cannot recover them. */
   guidance: string;
+  /** 041 Part C: the signed `updated_at` the stored `guidance` came from; 0 for the admission text. */
+  guidance_updated_at: number;
   retention_seconds: number;
   delivered_through: number;
   processed_through: number;
@@ -108,6 +115,7 @@ interface Row {
   relays: string;
   moniker: string;
   guidance: string;
+  guidance_updated_at: number | bigint;
   retention_seconds: number | bigint;
   delivered_through: number | bigint;
   processed_through: number | bigint;
@@ -166,7 +174,7 @@ export class ChannelSubscriptionStore {
   get(agentId: string, channelPubkeyHex: string): ChannelSubscription | null {
     const row = this.#db
       .prepare(
-        `SELECT agent_id, channel_pubkey, admin_pubkey, access, relays, moniker, guidance, retention_seconds, delivered_through, processed_through, status
+        `SELECT agent_id, channel_pubkey, admin_pubkey, access, relays, moniker, guidance, guidance_updated_at, retention_seconds, delivered_through, processed_through, status
            FROM channel_subscriptions WHERE agent_id = ? AND channel_pubkey = ?`,
       )
       .get(agentId, channelPubkeyHex.toLowerCase()) as Row | undefined;
@@ -177,7 +185,7 @@ export class ChannelSubscriptionStore {
   active(): ChannelSubscription[] {
     const rows = this.#db
       .prepare(
-        `SELECT agent_id, channel_pubkey, admin_pubkey, access, relays, moniker, guidance, retention_seconds, delivered_through, processed_through, status
+        `SELECT agent_id, channel_pubkey, admin_pubkey, access, relays, moniker, guidance, guidance_updated_at, retention_seconds, delivered_through, processed_through, status
            FROM channel_subscriptions WHERE status = 'active' ORDER BY channel_pubkey ASC, agent_id ASC`,
       )
       .all() as Row[];
@@ -193,7 +201,7 @@ export class ChannelSubscriptionStore {
   listedFor(agentId: string): ChannelSubscription[] {
     const rows = this.#db
       .prepare(
-        `SELECT agent_id, channel_pubkey, admin_pubkey, access, relays, moniker, guidance, retention_seconds, delivered_through, processed_through, status
+        `SELECT agent_id, channel_pubkey, admin_pubkey, access, relays, moniker, guidance, guidance_updated_at, retention_seconds, delivered_through, processed_through, status
            FROM channel_subscriptions WHERE agent_id = ? AND status != 'left' ORDER BY channel_pubkey ASC`,
       )
       .all(agentId) as Row[];
@@ -334,10 +342,12 @@ export class ChannelSubscriptionStore {
    * when the admin re-deposits its description; this writes the verified value back so the next read
    * is cheap. Only ever called with a description that verified against the channel key.
    */
-  setGuidance(agentId: string, channelPubkeyHex: string, guidance: string): void {
+  setGuidance(agentId: string, channelPubkeyHex: string, guidance: string, updatedAt: number): void {
+    // `updatedAt` is the record's signed `updated_at`, stored as the replay anchor: a later relay
+    // record is accepted only when its `updated_at` is strictly greater than this (041 Part C).
     this.#db
-      .prepare(`UPDATE channel_subscriptions SET guidance = ? WHERE agent_id = ? AND channel_pubkey = ?`)
-      .run(guidance, agentId, channelPubkeyHex.toLowerCase());
+      .prepare(`UPDATE channel_subscriptions SET guidance = ?, guidance_updated_at = ? WHERE agent_id = ? AND channel_pubkey = ?`)
+      .run(guidance, updatedAt, agentId, channelPubkeyHex.toLowerCase());
   }
 
   /** A local display label. The pubkey is the identity and naming it changes nothing. */
@@ -380,6 +390,7 @@ export class ChannelSubscriptionStore {
       relays,
       moniker: row.moniker,
       guidance: row.guidance,
+      guidance_updated_at: Number(row.guidance_updated_at),
       retention_seconds: Number(row.retention_seconds),
       delivered_through: Number(row.delivered_through),
       processed_through: Number(row.processed_through),

@@ -136,7 +136,7 @@ export function createChannelSubscribe(deps: ChannelSubscribeDeps) {
     // DESCRIPTION, though, was frozen at admission — so refresh it from the channel's relays, which
     // is what the info-set help promises a member sees. Never show an unverified description.
     if (sub) {
-      const fresh = await currentDescription(agentId, channelHex, sub.relays, sub.guidance);
+      const fresh = await currentDescription(agentId, channelHex, sub.relays, sub.guidance, sub.guidance_updated_at);
       return {
         ...base, access: sub.access, guidance: fresh.guidance, relays: sub.relays,
         status: sub.status, description_source: fresh.source,
@@ -151,13 +151,15 @@ export function createChannelSubscribe(deps: ChannelSubscribeDeps) {
    * 041-HELPTRUTH Part C — the CURRENT description for a followed channel.
    *
    * Asks the subscription's relays for the signed info record, decodes it, verifies its signature
-   * against the CHANNEL key, and checks the record names THIS channel. On success returns that
-   * description (source `"relay"`) and writes it back to the subscription. On any miss — no relay
-   * answered, a decode failure, a bad signature, or a record for another channel — it falls back to
-   * the stored description (source `"stored"`). An unverified description is NEVER returned.
+   * against the CHANNEL key, checks the record names THIS channel, and checks its signed `updated_at`
+   * is STRICTLY NEWER than the stored one (`storedUpdatedAt`; 0 for the admission text). On success
+   * returns that description (source `"relay"`) and writes it back with its `updated_at`. On any miss
+   * — no relay answered, a decode failure, a bad signature, a record for another channel, or an older
+   * or equal `updated_at` (a replayed record) — it falls back to the stored description (source
+   * `"stored"`) and leaves the store untouched. An unverified description is NEVER returned.
    */
   async function currentDescription(
-    agentId: string, channelHex: string, relays: string[], stored: string,
+    agentId: string, channelHex: string, relays: string[], stored: string, storedUpdatedAt: number,
   ): Promise<{ guidance: string; source: "relay" | "stored" }> {
     let raw: Uint8Array | null = null;
     try {
@@ -173,11 +175,13 @@ export function createChannelSubscribe(deps: ChannelSubscribeDeps) {
         decoded.ok
         && Buffer.from(decoded.info.channel_pubkey).toString("hex") === wanted
         && verifyChannelInfo(decoded.info)
+        // Replay guard: a validly-signed but OLDER record must not overwrite a newer stored one.
+        && decoded.info.updated_at > storedUpdatedAt
       ) {
-        deps.subscriptions.setGuidance(agentId, channelHex, decoded.info.guidance);
+        deps.subscriptions.setGuidance(agentId, channelHex, decoded.info.guidance, decoded.info.updated_at);
         return { guidance: decoded.info.guidance, source: "relay" };
       }
-      deps.logger.info("channel.info.record_unverified", { channel_pubkey: channelHex });
+      deps.logger.info("channel.info.record_not_adopted", { channel_pubkey: channelHex });
     }
     return { guidance: stored, source: "stored" };
   }
