@@ -78,7 +78,7 @@ interface Harness {
   pruneCalls: Array<{ relay: string; throughSeq: number; signature: Uint8Array }>;
 }
 
-async function harness(opts: { access?: "public" | "open"; noFetchKey?: boolean } = {}): Promise<Harness> {
+async function harness(opts: { access?: "public" | "open" | "invite_only"; noFetchKey?: boolean } = {}): Promise<Harness> {
   const log = new ChannelLogStore(db, silent);
   const channelKp = generateKeypair();
   const adminKp = generateKeypair();
@@ -563,5 +563,90 @@ describe("M16 018-PUBCOLLECT: publishing", () => {
     if (published.ok) return;
     expect(published.reason).toBe("no_relay_accepted");
     expect(h.infoHeld.size).toBe(0);
+  });
+});
+
+/**
+ * M16 039-NEWCHANFIX Part A — EVERY deposit carries the channel's current fetch key, not only the
+ * first attempt of an ordinary publish. A relay learns a non-public channel's fetch key only from a
+ * PUBLISH it accepts, so a resend or a clock-skew retry that omits it delivers the posts and leaves
+ * the relay serving the queue to nobody: every member's fetch is refused `not_a_member`.
+ */
+describe("M16 039-NEWCHANFIX Part A: resend and the skew retry carry the fetch key", () => {
+  it("A1. resendMissing carries the channel's current fetch key on every deposit", async () => {
+    const h = await harness({ access: "invite_only" });
+    // Publish three posts while RELAY_B is down, so the log holds posts RELAY_B never took.
+    h.down.add(RELAY_B);
+    for (const t of ["one", "two", "three"]) await h.publisher.publish("agent-1", h.channelHex, t, "body");
+    h.down.clear();
+    // Only the resend's deposits should be under scrutiny.
+    h.depositFrames.length = 0;
+    h.deposits.length = 0;
+
+    const result = await h.publisher.resendMissing("agent-1", h.channelHex, RELAY_B);
+    expect(result.deposited).toBe(3);
+
+    const expected = await h.options.currentFetchKey!(h.channelHex);
+    expect(expected, "the channel has a current fetch key").toBeDefined();
+    expect(h.depositFrames).toHaveLength(3);
+    for (const frame of h.depositFrames) {
+      expect(frame.fetch_key, "every resent deposit carries the fetch key").toBeDefined();
+      expect(Buffer.from(frame.fetch_key!.pubkey).equals(Buffer.from(expected!.pubkey)), "the same pubkey currentFetchKey returns").toBe(true);
+      expect(Buffer.from(frame.fetch_key!.signature).equals(Buffer.from(expected!.signature)), "the same signature currentFetchKey returns").toBe(true);
+    }
+  });
+
+  it("A2. the clock-skew retry carries the fetch key on every re-deposit", async () => {
+    const h = await harness({ access: "invite_only" });
+    // Both relays refuse the first attempt with clock_skew, so the corrected retry is what they take.
+    h.refuse.set(RELAY_A, { reason: "clock_skew", skew_ms: 60_000 });
+    h.refuse.set(RELAY_B, { reason: "clock_skew", skew_ms: 90_000 });
+
+    const result = await h.publisher.publish("agent-1", h.channelHex, "re-signed", "body");
+    expect(result.ok).toBe(true);
+
+    const expected = await h.options.currentFetchKey!(h.channelHex);
+    // Two relays, two attempts each: the first (refused) and the corrected retry.
+    expect(h.depositFrames).toHaveLength(4);
+    for (const frame of h.depositFrames) {
+      expect(frame.fetch_key, "the first attempt AND the skew retry both carry it").toBeDefined();
+      expect(Buffer.from(frame.fetch_key!.pubkey).equals(Buffer.from(expected!.pubkey))).toBe(true);
+    }
+  });
+
+  it("A3. a PUBLIC channel's resend carries no fetch key (unchanged behaviour pinned)", async () => {
+    const h = await harness({ access: "public" });
+    h.down.add(RELAY_B);
+    for (const t of ["one", "two"]) await h.publisher.publish("agent-1", h.channelHex, t, "body");
+    h.down.clear();
+    h.depositFrames.length = 0;
+
+    const result = await h.publisher.resendMissing("agent-1", h.channelHex, RELAY_B);
+    expect(result.deposited).toBe(2);
+    expect(h.depositFrames.every((f) => f.fetch_key === undefined), "a public channel gates on nothing").toBe(true);
+  });
+
+  it("A4. a non-public channel with no group key resends NOTHING and logs the refusal", async () => {
+    const h = await harness({ access: "invite_only" });
+    // Get posts into the log with a key present, so the log is non-empty for the resend.
+    h.down.add(RELAY_B);
+    for (const t of ["one", "two"]) await h.publisher.publish("agent-1", h.channelHex, t, "body");
+    h.down.clear();
+    h.deposits.length = 0;
+
+    // A publisher that now holds NO fetch key for the channel — the state right after create, before
+    // anyone has joined. It must refuse to deposit rather than serve the queue to the world.
+    const logs: Array<{ event: string; ctx: Record<string, unknown> }> = [];
+    const rec: Logger = { debug() {}, info() {}, warn(e, c) { logs.push({ event: e, ctx: (c as Record<string, unknown>) ?? {} }); }, error() {} };
+    const noKey = new ChannelPublisher({ ...h.options, logger: rec, currentFetchKey: () => Promise.resolve(undefined) });
+
+    const result = await noKey.resendMissing("agent-1", h.channelHex, RELAY_B);
+    expect(result.deposited).toBe(0);
+    expect(h.deposits, "nothing was deposited without a fetch key").toEqual([]);
+
+    const refused = logs.find((l) => l.event === "channel.resend.refused");
+    expect(refused, "the refusal is logged, same rule and wording as publish").toBeDefined();
+    expect(refused!.ctx.reason).toBe("no_fetch_key");
+    expect(refused!.ctx.channel_pubkey).toBe(h.channelHex);
   });
 });

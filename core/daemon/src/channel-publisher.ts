@@ -251,7 +251,12 @@ export class ChannelPublisher {
       const corrected = await this.#resignForSkew(agentName, channelHex, post, deposited, correlationId);
       if (corrected) {
         post = corrected;
-        deposited = await Promise.all(info.relays.map((relay) => this.#depositOnce(relay, post, channelHex, correlationId)));
+        // ⚠️ THE RETRY CARRIES THE SAME FETCH KEY AS THE FIRST ATTEMPT. A relay learns a non-public
+        // channel's fetch key only from a deposit it accepts — so a retry that dropped it would land
+        // the post on a relay that then serves the queue to nobody, and every member's fetch is
+        // refused `not_a_member`. The first attempt was refused for skew, not taken, so the relay
+        // still holds no key.
+        deposited = await Promise.all(info.relays.map((relay) => this.#depositOnce(relay, post, channelHex, correlationId, fetchKey)));
         ok = deposited.filter((d) => d.ok);
       }
     }
@@ -403,6 +408,29 @@ export class ChannelPublisher {
     if (head.first_seq === null || head.last_seq === null) return { deposited: 0 };
 
     /**
+     * ⚠️ THE FETCH KEY RIDES EVERY RESENT DEPOSIT TOO — computed ONCE per call, not per post. A relay
+     * learns a non-public channel's fetch key only from a deposit it accepts, so a resend that lands
+     * the posts without it leaves the relay serving the queue to nobody: every member's fetch is
+     * refused `not_a_member`. A public channel has none (anyone may read it).
+     *
+     * ⚠️ **A NON-PUBLIC CHANNEL WITH NO FETCH KEY DEPOSITS NOTHING** — the same rule and wording as
+     * `publish`. The absent key means no group key has been minted yet, and depositing without one
+     * tells the relay nothing about who may read, so it serves the queue to the world under an
+     * `access` that promises members-only. Refuse and say so, never paper over it.
+     */
+    const info = this.#opts.channelInfo(channelHex);
+    const fetchKey = info && info.access !== "public"
+      ? await this.#opts.currentFetchKey?.(channelHex)
+      : undefined;
+    if (info && info.access !== "public" && !fetchKey) {
+      logger.warn("channel.resend.refused", {
+        ...(correlationId !== undefined ? { correlationId } : {}),
+        channel_pubkey: channelHex, reason: "no_fetch_key",
+      });
+      return { deposited: 0 };
+    }
+
+    /**
      * ⚠️ WHAT THE RELAY HOLDS NOW, NOT WHAT IT ONCE RECEIPTED — and this is a deviation from the
      * order, raised there.
      *
@@ -442,7 +470,7 @@ export class ChannelPublisher {
       // way through and the rest of the backlog is refused, which looks exactly like a relay that
       // will not take the channel's posts at all.
       if (deposited > 0) await this.#pause(this.#opts.resendPaceMs ?? DEFAULT_RESEND_PACE_MS);
-      const outcome = await this.#depositOnce(relay, post, channelHex, correlationId);
+      const outcome = await this.#depositOnce(relay, post, channelHex, correlationId, fetchKey);
       if (outcome.ok) deposited += 1;
     }
     logger.info("channel.resend.completed", {
