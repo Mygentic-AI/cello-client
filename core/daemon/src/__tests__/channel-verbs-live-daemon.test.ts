@@ -174,6 +174,32 @@ describe("M16 018-PUBCOLLECT: the channel verbs on a live daemon", () => {
     expect(good["ok"], JSON.stringify(good)).toBe(true);
   });
 
+  it("036-PUBLICSUB (reviewer M-1): setup cannot CHANGE a channel's access; relays stay changeable", async () => {
+    // A channel's access is FIXED at create. The subscriber's read decides plaintext-vs-decrypt from
+    // its stored access, so an admin flipping public→open would make existing readers try to decrypt
+    // a public (plaintext) post — ciphertext as a post. Matches the directory's V67 note: a channel
+    // that wants different access is a different channel.
+    const created = await call("cello_channel_config", {
+      agent: "alice", channel: alicePubkeyHex, access: "public", relays: [RELAY_A, RELAY_B],
+    });
+    expect(created["ok"], JSON.stringify(created)).toBe(true);
+
+    // Changing access on an existing channel is refused by name, and the stored access is untouched.
+    const flip = await call("cello_channel_config", {
+      agent: "alice", channel: alicePubkeyHex, access: "open", relays: [RELAY_A, RELAY_B],
+    });
+    expect(flip["ok"]).toBe(false);
+    expect(flip["reason"]).toBe("access_is_fixed");
+    const info = await call("cello_channel_info", { agent: "alice", channel: alicePubkeyHex }) as { access?: string };
+    expect(info.access, "access unchanged after a refused flip").toBe("public");
+
+    // The SAME access with new relays is fine — relays remain changeable.
+    const relayChange = await call("cello_channel_config", {
+      agent: "alice", channel: alicePubkeyHex, access: "public", relays: [RELAY_B, RELAY_A],
+    });
+    expect(relayChange["ok"], JSON.stringify(relayChange)).toBe(true);
+  });
+
   it("035 item 1 — info on a channel this daemon ADMINISTERS carries access, guidance, relays", async () => {
     // The directory answers only the admin key; item 1 adds access/description/relays from the LOCAL
     // config the publisher wrote. Here alice administers her own channel, so info reports all three.

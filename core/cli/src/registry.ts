@@ -1588,7 +1588,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       { name: "name", summary: "Label a channel so you can tell it apart. Only you see it." },
       { name: "leave", summary: "Stop receiving a channel's posts. Local — nothing is sent." },
       { name: "create", summary: "Make a new channel you run — one command registers it, the directory picks its relays, and it is described. Do this first." },
-      { name: "setup", summary: "Change the relays or access on a channel you already run." },
+      { name: "setup", summary: "Change the relays on a channel you already run. Access is fixed at create." },
       { name: "publish", summary: "Publish a post to your channel." },
       { name: "info-set", summary: "Publish your channel's description so others can find it." },
       { name: "approve", summary: "Admit someone who asked to join an invite-only channel." },
@@ -1616,8 +1616,10 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "  the DIRECTORY picks its two relays for you, and it publishes the description — in one step.\n" +
       "  A channel takes NO pre-auth token and NO relay: the agent you are running is already\n" +
       "  registered, and that identity is the whole basis of the channel's right. 'setup' CHANGES\n" +
-      "  the relays or access on a channel that already exists. <access> is public (anyone reads),\n" +
-      "  open (anyone may ask to join) or invite_only.\n" +
+      "  the relays on a channel that already exists — a channel's ACCESS is fixed at create and\n" +
+      "  cannot change, because subscribers joined the access they were told. Pass the channel's\n" +
+      "  current <access> (public — anyone reads, open — anyone may ask to join, or invite_only); a\n" +
+      "  different one is refused.\n" +
       "  A post is signed by BOTH the channel key and your agent key, so a reader can tell which\n" +
       "  operator published it, not only which channel.\n" +
       "  It goes to the channel's two relays. ONE relay refusing is not a failed publish — the post\n" +

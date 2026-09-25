@@ -238,6 +238,23 @@ export function registerChannelPublishHandlers(deps: ChannelPublishDeps): void {
         guidance: "Pass `access`: public (anyone can read), open (anyone may ask to join) or invite_only.",
       };
     }
+    /**
+     * ⚠️ **ACCESS IS FIXED AT CREATE (036-PUBLICSUB reviewer M-1).** Subscribers joined the access
+     * they were told, and a subscriber's read decides plaintext-vs-decrypt from its STORED access —
+     * so flipping public→open here would make existing readers try to decrypt a plaintext post, and
+     * open→public would strip a channel's encryption out from under them. A channel that wants
+     * different access is a different channel (the directory's V67 note). Relays remain changeable;
+     * only an access that DIFFERS from the stored one is refused, so re-running setup to change
+     * relays with the same access is fine, and create (which writes the first config) is unaffected.
+     */
+    const existing = deps.getChannelConfig(channel.channelHex);
+    if (existing && existing.access !== access) {
+      return {
+        ok: false, reason: "access_is_fixed",
+        guidance: "A channel's access is set when it is created and cannot change — subscribers joined the one they were told. Create a new channel with the access you want.",
+      };
+    }
+
     const guidance = typeof params?.["guidance"] === "string" ? params["guidance"] : "";
     const retention = params?.["retention_seconds"];
     const retention_seconds = typeof retention === "number" && Number.isSafeInteger(retention) && retention > 0
