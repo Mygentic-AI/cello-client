@@ -58,6 +58,30 @@ export const CHANNEL_LOG_CREATE_SQL = `
   );
 `;
 
+/**
+ * 042-UPGRADE Part B: retire a pre-posts `channel_log` rather than patch it.
+ *
+ * The first committed shape (@71f137a4, 2026-09-17) had `epoch_index`, `leaf_hash` and
+ * `artifact_cbor` NOT NULL with no default — from the epoch design removed the next day (@3e5d9c4d).
+ * The current table has `post_cbor` instead, and current INSERTs supply none of the old NOT-NULL
+ * columns, so an old-shaped table cannot be written at all: adding `post_cbor` alone would leave the
+ * three NOT-NULL epoch columns rejecting every insert. So an old-shaped table is renamed aside
+ * (keeping its bytes; nothing reads them) and the CREATE below makes the current table fresh.
+ *
+ * The marker is `post_cbor`'s ABSENCE. A table that has it is current and is left untouched — no
+ * rename, no row loss. A fresh database has no `channel_log` yet, so this is a no-op there too.
+ */
+export function retirePrePostsChannelLog(db: DaemonDatabase, logger: Logger): void {
+  const cols = db.prepare("PRAGMA table_info(channel_log)").all() as Array<{ name: string }>;
+  if (cols.length === 0) return; // no table yet — a fresh database
+  if (cols.some((c) => c.name === "post_cbor")) return; // already the current shape — leave it alone
+  const rows = Number(
+    (db.prepare("SELECT COUNT(*) AS n FROM channel_log").get() as { n: number | bigint }).n,
+  );
+  db.exec("ALTER TABLE channel_log RENAME TO channel_log_epoch_retired");
+  logger.info("channel.log.legacy_retired", { rows });
+}
+
 export type ChannelLogErrorCode =
   | "channel_unknown" | "seq_not_next" | "position_taken" | "post_invalid"
   // recordReceipt: the receipt does not verify against the post this log holds at that number, or
@@ -103,6 +127,9 @@ export class ChannelLogStore {
   constructor(db: DaemonDatabase, logger: Logger) {
     this.#db = db;
     this.#logger = logger;
+    // 042-UPGRADE Part B: retire a pre-posts table BEFORE the CREATE, so the CREATE then makes the
+    // current shape rather than finding an old one and doing nothing.
+    retirePrePostsChannelLog(this.#db, this.#logger);
     this.#db.exec(CHANNEL_LOG_CREATE_SQL);
   }
 
