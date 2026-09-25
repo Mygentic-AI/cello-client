@@ -191,7 +191,10 @@ async function collectMode(rest: string[]): Promise<void> {
     }
   }
 
-  process.stdout.write(`${JSON.stringify({ agentId, agentName, collected, posts })}\n`);
+  // Decision 3: name the position advanced and the key generations held — the outcome, not "no throw".
+  const deliveredThrough = subs.get(agentId, channelHex)?.delivered_through ?? 0;
+  const generations = subs.keysFor(agentId, channelHex).map((k) => k.generation);
+  process.stdout.write(`${JSON.stringify({ agentId, agentName, collected, posts, deliveredThrough, generations })}\n`);
   await node.stop();
   db.close();
 }

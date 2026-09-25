@@ -62,7 +62,10 @@ interface E2EAdminResult {
   channelHex: string; adminHex: string; gen1BundleA: string;
   publicBundleEmpty?: boolean; posts: E2EPost[];
 }
-interface CollectResult { agentId: string; agentName: string; collected: number[]; posts: E2EPost[] }
+interface CollectResult {
+  agentId: string; agentName: string; collected: number[]; posts: E2EPost[];
+  deliveredThrough: number; generations: number[];
+}
 
 function runHelper<T>(script: string, args: string[]): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -208,6 +211,10 @@ describe("M16 019-MEMBERSHIP enforcer", () => {
     ]);
     expect(inviteRead.collected, "the member collected both posts").toEqual([1, 2]);
     expect(inviteRead.posts, "and read them as the exact plaintext the admin published").toEqual(inviteAdmin.posts);
+    // Decision 3: delivered_through advanced across the contiguous run, and the member holds the
+    // generation-1 group key the join delivered (that key is what let it decrypt).
+    expect(inviteRead.deliveredThrough, "delivered_through advanced to the second post").toBe(2);
+    expect(inviteRead.generations, "the member holds the generation-1 group key from the join").toEqual([1]);
 
     // ── public: member joins a public channel → admitted with an empty bundle → reads a post ────────
     const publicAdmin = await runHelper<E2EAdminResult>("m16-019-admin-process.ts", [
@@ -224,5 +231,7 @@ describe("M16 019-MEMBERSHIP enforcer", () => {
     ]);
     expect(publicRead.collected, "the public reader collected the post").toEqual([1]);
     expect(publicRead.posts, "and read it as the exact plaintext").toEqual(publicAdmin.posts);
+    expect(publicRead.deliveredThrough, "delivered_through advanced to the public post").toBe(1);
+    expect(publicRead.generations, "a public channel carries no group key").toEqual([]);
   }, 180_000);
 });
