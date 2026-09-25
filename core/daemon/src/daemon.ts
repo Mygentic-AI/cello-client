@@ -684,24 +684,15 @@ async function startDaemonHoldingLock(
   // a const ~390 lines below; these arrows read it at RING time, the late-bind the WAKE handle above
   // uses. Each maps agent id → name and drops the ring when the id no longer resolves (a retired
   // agent has nobody to wake). INV-CONTENTFREE lives in the dispatcher; this only routes.
+  // Each channel doorbell maps the agent id to its current display name (a channel notice routes like
+  // cello_message) and dispatches only when a name is current; the null-check is shared here.
+  const named = (id: string): string | null => sessionNodeManager.agentNameForId(id);
   const channelNotify: ChannelNotify = {
-    channelPosts: (agentId, channelHex, count, through) => {
-      const name = sessionNodeManager.agentNameForId(agentId);
-      if (name !== null) notificationDispatcher.dispatchChannelPosts(name, channelHex, count, through);
-    },
-    channelJoinAnswer: (agentId, channelHex, outcome, reason) => {
-      const name = sessionNodeManager.agentNameForId(agentId);
-      if (name !== null) notificationDispatcher.dispatchChannelJoinAnswer(name, channelHex, outcome, reason);
-    },
-    channelJoinRequest: (adminAgentId, channelHex, subscriberHex) => {
-      const name = sessionNodeManager.agentNameForId(adminAgentId);
-      if (name !== null) notificationDispatcher.dispatchChannelJoinRequest(name, channelHex, subscriberHex);
-    },
+    channelPosts: (id, ch, count, through) => { const n = named(id); if (n !== null) notificationDispatcher.dispatchChannelPosts(n, ch, count, through); },
+    channelJoinAnswer: (id, ch, outcome, reason) => { const n = named(id); if (n !== null) notificationDispatcher.dispatchChannelJoinAnswer(n, ch, outcome, reason); },
+    channelJoinRequest: (id, ch, sub) => { const n = named(id); if (n !== null) notificationDispatcher.dispatchChannelJoinRequest(n, ch, sub); },
     // 038-RETESTFIX Part E: this agent was ejected, or its channel was deleted — its own doorbell.
-    channelMembershipEnded: (agentId, channelHex, reason) => {
-      const name = sessionNodeManager.agentNameForId(agentId);
-      if (name !== null) notificationDispatcher.dispatchChannelMembershipEnded(name, channelHex, reason);
-    },
+    channelMembershipEnded: (id, ch, reason) => { const n = named(id); if (n !== null) notificationDispatcher.dispatchChannelMembershipEnded(n, ch, reason); },
   };
 
   const channelMembership = wireChannelMembership({
