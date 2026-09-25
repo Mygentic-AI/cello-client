@@ -1436,7 +1436,8 @@ describe("SessionNodeManager — integration tests", () => {
         // tsx is a devDep of THIS package (pnpm isolated layout) — pin the child's cwd to
         // the package root so `--import tsx` resolves under a workspace-root vitest run too.
         cwd: join(import.meta.dirname, "../.."),
-        env: { ...process.env, CELLO_DIR: daemonDir, CELLO_VERSION: "0.0.1-sigterm-test" },
+        // 037-TESTTRUTH: pin a closed local port so this real daemon never dials the live consortium.
+        env: { ...process.env, CELLO_DIR: daemonDir, CELLO_VERSION: "0.0.1-sigterm-test", CELLO_DIRECTORY_URL: "http://127.0.0.1:9" },
         stdio: ["ignore", "pipe", "pipe"],
       },
     );

@@ -54,7 +54,8 @@ const DAEMON_BIN = resolve(here, "../../../daemon/dist/bin/cello-daemon.js");
 // and the narrower type would be a lie the compiler correctly refuses.
 function spawnDaemon(celloDir: string): ChildProcess {
   return spawn(process.execPath, [DAEMON_BIN], {
-    env: { ...process.env, CELLO_DIR: celloDir },
+    // 037-TESTTRUTH: pin a closed local port so this real daemon never dials the live consortium.
+    env: { ...process.env, CELLO_DIR: celloDir, CELLO_DIRECTORY_URL: "http://127.0.0.1:9" },
     stdio: ["ignore", "pipe", "pipe"],
   });
 }
@@ -81,7 +82,8 @@ interface Shim {
 function startWithNoDaemon(): { shim: Shim; celloDir: string; cleanup: () => void } {
   const celloDir = mkdtempSync(resolve(tmpdir(), "cello-stranded-"));
   const proc = spawn(process.execPath, [BIN], {
-    env: { ...process.env, CELLO_DIR: celloDir },
+    // 037-TESTTRUTH: the shim may autostart a daemon — pin a closed local port so it never dials live.
+    env: { ...process.env, CELLO_DIR: celloDir, CELLO_DIRECTORY_URL: "http://127.0.0.1:9" },
     stdio: ["pipe", "pipe", "pipe"],
   }) as ChildProcessWithoutNullStreams;
 

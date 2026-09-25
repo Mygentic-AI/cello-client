@@ -52,6 +52,9 @@ describe("daemon binary (AC-011)", () => {
           ...process.env,
           CELLO_DIR: tempDir,
           CELLO_VERSION: "0.0.1-binary-test",
+          // 037-TESTTRUTH: a real daemon with no directory override dials the LIVE consortium from
+          // the bundled manifest. Pin a closed local port so no test reaches production.
+          CELLO_DIRECTORY_URL: "http://127.0.0.1:9",
         },
         stdio: ["ignore", "pipe", "pipe"],
       },

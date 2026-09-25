@@ -215,7 +215,8 @@ describe("DOD-LOGOUT-EXIT-1: the daemon must actually exit when logout says it s
     const stdout: string[] = [];
     const child = spawn(process.execPath, ["--import", "tsx", daemonBin], {
       cwd: join(import.meta.dirname, "../.."),
-      env: { ...process.env, CELLO_DIR: tempDir, CELLO_VERSION: "0.0.1-logout-exit-test" },
+      // 037-TESTTRUTH: pin a closed local port so this real daemon never dials the live consortium.
+      env: { ...process.env, CELLO_DIR: tempDir, CELLO_VERSION: "0.0.1-logout-exit-test", CELLO_DIRECTORY_URL: "http://127.0.0.1:9" },
       stdio: ["ignore", "pipe", "pipe"],
     });
     child.stdout?.on("data", (b: Buffer) => { stdout.push(...b.toString().split("\n")); });

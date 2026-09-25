@@ -10,7 +10,7 @@
  * - Status when no daemon running: exits 1 with {daemon: "stopped"}
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -33,6 +33,19 @@ describe("cli commands", () => {
   let logEvents: Array<{ level: string; event: string; context: Record<string, unknown> }>;
   let logger: Logger;
   let handle: DaemonHandle | null;
+
+  // 037-TESTTRUTH: `login` spawns the real daemon binary and the in-process daemons boot the same
+  // path; with no directory override either dials the LIVE consortium from the bundled manifest.
+  // Pin a closed local port for the whole file (restored after) so no test reaches production.
+  let priorDirectoryUrl: string | undefined;
+  beforeAll(() => {
+    priorDirectoryUrl = process.env["CELLO_DIRECTORY_URL"];
+    process.env["CELLO_DIRECTORY_URL"] = "http://127.0.0.1:9";
+  });
+  afterAll(() => {
+    if (priorDirectoryUrl === undefined) delete process.env["CELLO_DIRECTORY_URL"];
+    else process.env["CELLO_DIRECTORY_URL"] = priorDirectoryUrl;
+  });
 
   beforeEach(async () => {
     tempDir = await mkdtemp(join(tmpdir(), "cello-cli-test-"));
