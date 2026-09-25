@@ -188,11 +188,12 @@ export function registerChannelPublishHandlers(deps: ChannelPublishDeps): void {
     }
     logger.info("channel.publish.refused", { channel_pubkey: channel.channelHex, reason: result.reason });
     /**
-     * 040-CLEANUP Part E: right after `create`, a relay may not know the channel yet and refuses
-     * `not_a_channel` for up to 30s (its short negative cache). When EVERY relay refused for that
-     * one reason, the post did not fail for a lasting reason — the relays just have not caught up.
-     * Say so, so the operator waits and resends rather than reading it as a broken channel. Any
-     * other refusal keeps the ordinary "post is in your log" text.
+     * 040-CLEANUP Part E / 041 Part E2: when EVERY relay refused `not_a_channel`, there are TWO
+     * causes and the guidance must cover both. A channel created in the last minute has not reached
+     * the relays yet (their short negative cache holds `not_a_channel` for up to 30s) — wait and
+     * resend. But an OLDER channel refused this way may have been deleted, so also point at
+     * `channel info`. The first version assumed only the new-channel case, which read as wrong for a
+     * channel that was actually gone. Any other refusal keeps the ordinary "post is in your log" text.
      */
     const deposited = result.deposited ?? [];
     const allNotAChannel = deposited.length > 0 && deposited.every((d) => d.ok === false && d.reason === "not_a_channel");
@@ -203,10 +204,10 @@ export function registerChannelPublishHandlers(deps: ChannelPublishDeps): void {
       guidance: result.reason !== "no_relay_accepted"
         ? undefined
         : allNotAChannel
-          ? `The relays do not know this channel yet — a channel created in the last minute takes up to 30 seconds to reach them. Your post is saved; run \`cello channel resend ${channel.channelHex}\` in half a minute.`
-          // `cello channel resend`, NOT the handler's own name: these verbs are terminal-only, so a
-          // `cello_*` token here would hand the operator a command that does not exist on any surface
-          // they can reach.
+          // `cello channel resend`/`cello channel info`, NOT the handlers' own names: these verbs are
+          // terminal-only, so a `cello_*` token here would name a command that exists on no surface
+          // the operator can reach.
+          ? `The relays do not know this channel. If you created it in the last minute, they need up to 30 seconds — run \`cello channel resend ${channel.channelHex}\` in half a minute. If it is older, check \`cello channel info ${channel.channelHex}\`: it may have been deleted.`
           : "No relay took the post. It is in your log — retry with 'cello channel resend' rather than publishing it again.",
     };
   });

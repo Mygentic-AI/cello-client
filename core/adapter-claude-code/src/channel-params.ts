@@ -175,7 +175,7 @@ function doorbellText(type: string, data: Record<string, unknown>): string {
       }
       // `ejected`, or a reason this shim does not recognise from a newer daemon: a member is out.
       // F33: em dash after the shortened key, not a full stop — same fix as the new-post notice.
-      return `🚫 CELLO — you were removed from channel ${label} — Earlier posts stay readable; new ones will not arrive.`;
+      return `🚫 CELLO — you were removed from channel ${label} — earlier posts stay readable; new ones will not arrive.`;
     }
     case "channel_join_request": {
       // 034-LIFECYCLE: FULL keys, so approving is a copy-paste of the exact command — the admin

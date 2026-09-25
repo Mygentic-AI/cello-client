@@ -576,9 +576,14 @@ describe("M16 040-CLEANUP: publish/info-set refusal guidance", () => {
 
     expect(res.ok).toBe(false);
     expect(res.reason).toBe("no_relay_accepted");
-    expect(res.guidance).toContain("do not know this channel yet");
+    // 041 Part E2: the guidance now covers BOTH cases — a channel created moments ago that the
+    // relays have not caught up on, AND an older channel that may have been deleted.
+    expect(res.guidance).toContain("do not know this channel");
     expect(res.guidance).toContain("30 seconds");
     expect(res.guidance).toContain("cello channel resend");
+    // The older-channel half: check its info, it may have been deleted.
+    expect(res.guidance).toContain("cello channel info");
+    expect(res.guidance).toContain("deleted");
     // Not the ordinary "retry now" text — this is the too-new case.
     expect(res.guidance).not.toContain("retry with");
   });
@@ -597,6 +602,6 @@ describe("M16 040-CLEANUP: publish/info-set refusal guidance", () => {
     )) as { ok: boolean; guidance: string };
 
     expect(res.guidance).toContain("It is in your log");
-    expect(res.guidance).not.toContain("do not know this channel yet");
+    expect(res.guidance).not.toContain("do not know this channel");
   });
 });

@@ -316,7 +316,10 @@ describe("M16 032-NOTICES: channel doorbells render and ask for an action", () =
     const removed = buildChannelParams({ type: "channel_membership_ended", channel: CH, reason: "ejected" }, "channel_membership_ended");
     expect(removed.content).toContain("🚫");
     expect(removed.content).toContain("you were removed from channel");
-    expect(removed.content).toContain("Earlier posts stay readable");
+    // 041 Part E1: lowercase after the em dash, as the new-post notice does — the removed notice
+    // reads "… — earlier posts stay readable; …", not a capitalised sentence mid-line.
+    expect(removed.content).toContain("— earlier posts stay readable");
+    expect(removed.content).not.toContain("— Earlier posts");
     expect(removed.content).not.toContain("refused your join");
     // SHORTENED key: the 12-char prefix is shown, the full 64-hex key is NOT.
     expect(removed.content).toContain(CH.slice(0, 12));
