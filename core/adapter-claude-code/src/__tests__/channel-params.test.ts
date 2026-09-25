@@ -289,9 +289,11 @@ describe("M16 032-NOTICES: channel doorbells render and ask for an action", () =
     expect(pending.content).toContain("waiting for the admin");
     expect(pending.meta.wake_action).toBe("read_inbox");
 
-    const refused = buildChannelParams({ type: "channel_join_answer", channel: CH, outcome: "refused", reason: "ejected" }, "channel_join_answer");
+    // A GENERIC refusal keeps 032's wording (034-LIFECYCLE moved `ejected` and `channel_closed` to
+    // their own renders — see test 8 below). `already_member` is a plain terminal refusal.
+    const refused = buildChannelParams({ type: "channel_join_answer", channel: CH, outcome: "refused", reason: "already_member" }, "channel_join_answer");
     expect(refused.content).toContain("refused your join");
-    expect(refused.content).toContain("ejected");
+    expect(refused.content).toContain("already_member");
     expect(refused.meta.wake_action).toBe("read_inbox");
   });
 
@@ -304,6 +306,37 @@ describe("M16 032-NOTICES: channel doorbells render and ask for an action", () =
     expect(content).toContain("cello_channel_refuse");
     expect(content).toContain(SUB.slice(0, 12)); // the subscriber key is shown, shortened
     expect(meta.wake_action).toBe("read_inbox");
+  });
+
+  it("034-LIFECYCLE test 8: removed, deleted and join-request renders use FULL keys and never print '….'", () => {
+    const SUB = "cd".repeat(32);
+
+    // (a) EJECTED — the member was removed from THIS channel. Its own render, not the generic one.
+    const removed = buildChannelParams({ type: "channel_join_answer", channel: CH, outcome: "refused", reason: "ejected" }, "channel_join_answer");
+    expect(removed.content).toContain("🚫");
+    expect(removed.content).toContain("you were removed from channel");
+    expect(removed.content).toContain("Earlier posts stay readable");
+    expect(removed.content).not.toContain("refused your join");
+    // FULL key, and no ellipsis-then-full-stop (F33).
+    expect(removed.content).toContain(CH);
+    expect(removed.content).not.toContain("….");
+
+    // (b) CHANNEL_CLOSED — the whole channel was deleted by its admin.
+    const deleted = buildChannelParams({ type: "channel_join_answer", channel: CH, outcome: "refused", reason: "channel_closed" }, "channel_join_answer");
+    expect(deleted.content).toContain("🔒");
+    expect(deleted.content).toContain("was deleted by its admin");
+    expect(deleted.content).toContain("Earlier posts stay readable");
+    expect(deleted.content).toContain(CH);
+    expect(deleted.content).not.toContain("….");
+
+    // (c) JOIN REQUEST — both keys full, and the approve command carries channel then subscriber.
+    const req = buildChannelParams({ type: "channel_join_request", channel: CH, subscriber: SUB }, "channel_join_request");
+    expect(req.content).toContain("🙋");
+    expect(req.content).toContain(CH);
+    expect(req.content).toContain(SUB);
+    expect(req.content).toContain(`cello_channel_approve ${CH} ${SUB}`);
+    expect(req.content).toContain("cello_channel_refuse");
+    expect(req.content).not.toContain("….");
   });
 
   it("5d. an older daemon that omits fields does not crash and never emits 'undefined' or 'NaN'", () => {

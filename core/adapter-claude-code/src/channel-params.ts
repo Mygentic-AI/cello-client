@@ -144,19 +144,38 @@ function doorbellText(type: string, data: Record<string, unknown>): string {
     }
     case "channel_join_answer": {
       const label = shortKey(String(data["channel"] ?? ""));
+      // 034-LIFECYCLE: the FULL key, so an operator can tell exactly which channel — and so no
+      // ellipsis is printed before a full stop (F33). Used only by the two removal renders below.
+      const full = String(data["channel"] ?? "");
       switch (String(data["outcome"] ?? "")) {
         case "admitted":
           return `✅ CELLO — you're in: channel ${label} admitted you. Its posts will arrive here.`;
         case "pending":
           return `⏳ CELLO — your request to join channel ${label} is waiting for the admin.`;
-        case "refused":
-          return `CELLO — channel ${label} refused your join (${String(data["reason"] ?? "no reason given")}).`;
+        case "refused": {
+          // 034-LIFECYCLE: removal from a channel gets its own words. `ejected` = this member alone;
+          // `channel_closed` = the whole channel is gone. Every OTHER refusal keeps 032's wording.
+          const reason = String(data["reason"] ?? "no reason given");
+          if (reason === "ejected") {
+            return `🚫 CELLO — you were removed from channel ${full}. Earlier posts stay readable; new ones will not arrive.`;
+          }
+          if (reason === "channel_closed") {
+            return `🔒 CELLO — channel ${full} was deleted by its admin. Earlier posts stay readable.`;
+          }
+          return `CELLO — channel ${label} refused your join (${reason}).`;
+        }
         default:
           return `CELLO — channel ${label} answered your join.`;
       }
     }
-    case "channel_join_request":
-      return `🙋 CELLO — ${shortKey(String(data["subscriber"] ?? ""))} asked to join channel ${shortKey(String(data["channel"] ?? ""))}. Run cello_channel_approve or cello_channel_refuse.`;
+    case "channel_join_request": {
+      // 034-LIFECYCLE: FULL keys, so approving is a copy-paste of the exact command — the admin
+      // needs both keys in full for cello_channel_approve, and shortened keys forced a dig through
+      // the meta attributes. Full keys also mean no ellipsis before a full stop (F33).
+      const chan = String(data["channel"] ?? "");
+      const sub = String(data["subscriber"] ?? "");
+      return `🙋 CELLO — ${sub} asked to join channel ${chan}. Run cello_channel_approve ${chan} ${sub} (or cello_channel_refuse).`;
+    }
     case "agent_state_changed":
       return `CELLO: agent ${String(data["agent"] ?? "your agent")} is now ${String(data["state"] ?? "changed")}.`;
     case "agent_current_changed":
