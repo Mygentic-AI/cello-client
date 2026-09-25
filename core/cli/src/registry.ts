@@ -435,8 +435,8 @@ const CHANNEL_DOCS: ReadonlyArray<{
     usage: ["cello channel eject <channel> <member> [--agent <agent>]"],
     paragraph:
       "Remove a member from an invite-only channel and rotate its key, which is what stops them reading and " +
-      "even fetching. An open channel's member rejoins the instant they are ejected, so ejecting them does " +
-      "not remove them — delete the channel or run it invite-only instead. <member> is their 64-character hex public key.",
+      "even fetching. An open channel admits anyone who asks, so its members cannot be ejected — the command is refused. " +
+      "Delete the channel or run it invite-only instead. <member> is their 64-character hex public key.",
   },
   {
     verbs: [{ name: "delete", summary: "Delete a channel you run: tell its members, prune both relays, retire it. Cannot be undone." }],

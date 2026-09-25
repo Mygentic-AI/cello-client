@@ -255,6 +255,15 @@ describe("M16 041-HELPTRUTH — channel help is one paragraph per verb, and each
     expect(helpForCommand("channel", [])).toContain("cello channel resend");
   });
 
+  it("eject's paragraph says an open channel's member is REFUSED, not just futile (review HIGH)", () => {
+    const ejectHelp = helpForCommand("channel", ["eject"]);
+    // The daemon refuses eject on an open channel (`eject_not_applicable_open_channel`), so the help
+    // must say it is refused — not that it runs but is undone by an immediate rejoin.
+    expect(ejectHelp).toContain("cannot be ejected — the command is refused");
+    expect(ejectHelp).toContain("Delete the channel or run it invite-only instead");
+    expect(ejectHelp).not.toContain("rejoins the instant");
+  });
+
   it("info's paragraph says it returns access/relays/description and reports a deleted channel (item 3)", () => {
     const infoHelp = helpForCommand("channel", ["info"]);
     expect(infoHelp).toContain("access, relays and description");

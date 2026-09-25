@@ -408,6 +408,20 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   },
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
+    claim: "channel eject help: an open channel's members 'cannot be ejected — the command is refused'.",
+    excerpts: ["so its members cannot be ejected — the command is refused."],
+    enforcedBy: "daemon-local",
+    verdict: "true",
+    evidence:
+      "M16 041-HELPTRUTH review HIGH. `cello_channel_eject` on an OPEN channel is refused before any " +
+      "removal or re-key: `ChannelMembershipStore.eject` returns `eject_not_applicable_open_channel` " +
+      "when `settings.access === \"open\"` (channel-membership-store.ts ~297, reason 'an open channel " +
+      "admits anyone who asks, so an ejected member would rejoin immediately'). The earlier help said " +
+      "the member 'rejoins the instant they are ejected', which described a run-but-futile eject that " +
+      "never happens — the command does not run at all on an open channel.",
+  },
+  {
+    surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "sealed-receipt: 'what was said, and who signed off on it.'",
     excerpts: ["notarized receipt — what was said, and who signed off on it."],
     enforcedBy: "directory",
