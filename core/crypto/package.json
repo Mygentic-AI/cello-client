@@ -1,6 +1,6 @@
 {
   "name": "@cello-protocol/crypto",
-  "version": "0.0.117",
+  "version": "0.0.118",
   "private": false,
   "type": "module",
   "engines": {
