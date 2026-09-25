@@ -1100,7 +1100,7 @@ server.tool("cello_channels", "List the channels this agent follows AND the ones
   agent: channelAgent(),
 }, async ({ agent }) => jsonText(await proxy.call("cello_channels", { ...(agent ? { agent } : {}) })));
 
-server.tool("cello_channel_info", "Look up a channel by its public key: whether it is a channel the directory knows, and which agent administers it. Asks the directory only — it does not join, does not contact the administrator, and returns nothing about the channel's posts.", {
+server.tool("cello_channel_info", "Look up a channel by its public key: which agent administers it (from the directory) and, when this daemon administers or follows it, its access, relays and description. For a channel you follow, the description is refreshed from the channel's relays and shown only if it verifies against the channel key, otherwise the stored text is shown (the answer says which). It does not join and does not contact the administrator. A deleted channel reports that it was deleted by its admin.", {
   channel: channelKey(),
   agent: channelAgent(),
 }, async ({ channel, agent }) => jsonText(await proxy.call("cello_channel_info", { channel, ...(agent ? { agent } : {}) })));

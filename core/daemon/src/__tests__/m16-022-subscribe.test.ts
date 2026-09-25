@@ -16,7 +16,7 @@ import type { Logger } from "../types.js";
 import { ChannelSubscriptionStore } from "../channel-subscription-store.js";
 import { ChannelInboxStore } from "../channel-inbox-store.js";
 import { createChannelSubscribe } from "../channel-subscribe.js";
-import { decodeChannelJoinRequest, signBroadcastArtifact } from "@cello-protocol/protocol-types";
+import { decodeChannelJoinRequest, signBroadcastArtifact, signChannelInfo, encodeChannelInfo } from "@cello-protocol/protocol-types";
 import { generateKeypair } from "@cello-protocol/crypto";
 
 const silent: Logger = { debug() {}, info() {}, warn() {}, error() {} };
@@ -58,6 +58,8 @@ function build(over: Partial<Parameters<typeof createChannelSubscribe>[0]> = {})
     sendInSession: (_a, sessionId, content) => { sent.push({ sessionId, content }); return Promise.resolve(); },
     agentPubkey: () => AGENT_PUBKEY,
     decrypt: (_a, _c, _s, body) => Promise.resolve(body),
+    // 041 Part C: by default no relay holds an info record — the stored description is used.
+    fetchInfo: () => Promise.resolve(null),
     ...over,
   });
   return { api, sent };
@@ -161,6 +163,75 @@ describe("M16 022 — info", () => {
     if (!r.ok) {
       expect(r.reason).toBe("channel_deleted");
       expect(r.status).toBe("closed");
+    }
+  });
+});
+
+// ─── M16 041-HELPTRUTH Part C — a member's `channel info` shows the CURRENT description ──────────
+//
+// The info-set help promises "existing members see the new text the next time they run 'channel
+// info'", but a member's `info` answered from the subscription row whose description was frozen at
+// admission. Now a member asks its relays for the signed info record, verifies it against the
+// channel key, and prefers it — falling back to the stored text (never an unverified one) when no
+// relay answers or the record does not verify, marking the source so the reader knows which it got.
+describe("M16 041-HELPTRUTH Part C — a member's info refreshes the description from the relays", () => {
+  /** A signed info record for `channel`, from `signer` (the channel key for a genuine one). */
+  async function signedInfo(signer: typeof channelKp, channelHex: string, guidance: string): Promise<Uint8Array> {
+    const info = await signChannelInfo(signer, {
+      access: "open",
+      admin_pubkey: await adminKp.getPublicKey(),
+      relays: [RELAY],
+      guidance,
+      retention_seconds: 7 * 24 * 3600,
+      updated_at: 1_800_000_000_000,
+      ext: null,
+    });
+    return encodeChannelInfo(info);
+  }
+
+  it("C1. a relay serves a newer signed record → the new text is shown and the stored row is updated", async () => {
+    const channelHex = Buffer.from(await channelKp.getPublicKey()).toString("hex");
+    subs.upsert({ agent_id: AGENT, channel_pubkey: channelHex, admin_pubkey: ADMIN, access: "open", relays: [RELAY], guidance: "old stored text" });
+    const record = await signedInfo(channelKp, channelHex, "the current description");
+    const { api } = build({ fetchInfo: () => Promise.resolve(record) });
+
+    const r = await api.info(AGENT, channelHex);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.guidance, "the fresh, verified description is shown").toBe("the current description");
+      expect(r.description_source).toBe("relay");
+    }
+    // And the fresh text was written back to the subscription row.
+    expect(subs.get(AGENT, channelHex)?.guidance, "the stored description was refreshed").toBe("the current description");
+  });
+
+  it("C2. a record signed by ANOTHER key is refused → the stored text is shown, source stored", async () => {
+    const channelHex = Buffer.from(await channelKp.getPublicKey()).toString("hex");
+    subs.upsert({ agent_id: AGENT, channel_pubkey: channelHex, admin_pubkey: ADMIN, access: "open", relays: [RELAY], guidance: "old stored text" });
+    // Signed by the ADMIN key, not the channel key — it verifies against its own (admin) pubkey, so
+    // the channel-pubkey match fails and the record is refused. An unverified description is NEVER shown.
+    const forged = await signedInfo(adminKp, channelHex, "a description the channel never signed");
+    const { api } = build({ fetchInfo: () => Promise.resolve(forged) });
+
+    const r = await api.info(AGENT, channelHex);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.guidance, "the unverified relay record is ignored").toBe("old stored text");
+      expect(r.description_source).toBe("stored");
+    }
+    expect(subs.get(AGENT, channelHex)?.guidance, "the stored description is untouched").toBe("old stored text");
+  });
+
+  it("C3. no relay answers → the stored text is shown, source stored", async () => {
+    const channelHex = Buffer.from(await channelKp.getPublicKey()).toString("hex");
+    subs.upsert({ agent_id: AGENT, channel_pubkey: channelHex, admin_pubkey: ADMIN, access: "open", relays: [RELAY], guidance: "old stored text" });
+    const { api } = build({ fetchInfo: () => Promise.resolve(null) });
+
+    const r = await api.info(AGENT, channelHex);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.guidance).toBe("old stored text");
+      expect(r.description_source).toBe("stored");
     }
   });
 });

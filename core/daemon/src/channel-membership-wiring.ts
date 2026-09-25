@@ -83,6 +83,12 @@ export interface ChannelMembershipWiringDeps {
    * this half reads the post count rather than reimplementing the log.
    */
   channelLastSeq: (channelHex: string) => number | null;
+  /**
+   * 041-HELPTRUTH Part C: the channel's signed info record as its relays hold it, tried in order,
+   * first that answers. From the publishing half, which owns the relay client. `info` (a member's)
+   * verifies it against the channel key before showing it.
+   */
+  fetchChannelInfo: (relays: string[], channelHex: string) => Promise<Uint8Array | null>;
   /** Open sessions for an agent, so a re-key can ride one this daemon already holds. */
   activeSessionsFor: (agentName: string) => Array<{ sessionId: string; counterpartyPubkeyHex: string }>;
   /**
@@ -474,6 +480,8 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
       const out = decryptBody(keys, new Uint8Array(Buffer.from(channelHex, "hex")), seq, body);
       return Promise.resolve(out.ok ? out.plaintext : null);
     },
+    // 041-HELPTRUTH Part C: a member's `info` refreshes the description from the channel's relays.
+    fetchInfo: (relays, channelHex) => deps.fetchChannelInfo(relays, channelHex),
   });
 
   handlers.set("cello_channel_info", async (params, connectionId) => {

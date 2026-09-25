@@ -328,6 +328,18 @@ export class ChannelSubscriptionStore {
     });
   }
 
+  /**
+   * 041-HELPTRUTH Part C: refresh the stored description after a member's `info` fetched and VERIFIED
+   * a newer signed info record from the channel's relays. The guidance stored at admission goes stale
+   * when the admin re-deposits its description; this writes the verified value back so the next read
+   * is cheap. Only ever called with a description that verified against the channel key.
+   */
+  setGuidance(agentId: string, channelPubkeyHex: string, guidance: string): void {
+    this.#db
+      .prepare(`UPDATE channel_subscriptions SET guidance = ? WHERE agent_id = ? AND channel_pubkey = ?`)
+      .run(guidance, agentId, channelPubkeyHex.toLowerCase());
+  }
+
   /** A local display label. The pubkey is the identity and naming it changes nothing. */
   setMoniker(agentId: string, channelPubkeyHex: string, moniker: string): void {
     this.#db

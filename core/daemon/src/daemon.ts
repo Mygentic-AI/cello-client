@@ -722,6 +722,9 @@ async function startDaemonHoldingLock(
     // 041-HELPTRUTH Part B: the post count for a channel this agent administers, from the publishing
     // half's log. Late-bound like pruneAllPosts — `channelWiring` is assigned just below.
     channelLastSeq: (channelHex) => channelWiring.channelLastSeq(channelHex),
+    // 041-HELPTRUTH Part C: a member's `info` refreshes the description from the channel's relays,
+    // through the publishing half's relay client. Late-bound, same as above.
+    fetchChannelInfo: (relays, channelHex) => channelWiring.fetchInfo(relays, channelHex),
     // 038-RETESTFIX Part B: a newly-active subscription collects its existing posts at once, through
     // the SAME collectNow the wake uses. Assigned below (after the collector exists), so this closure
     // reads it only when an acceptance is processed — long after wiring, like pruneAllPosts above.

@@ -86,6 +86,12 @@ export function wireChannelPublishing(
    * null when the log holds nothing. The membership half uses it for the post count on an admin row.
    */
   channelLastSeq: (channelHex: string) => number | null;
+  /**
+   * 041-HELPTRUTH Part C: the channel's signed info record as its relays hold it, tried in order and
+   * the first that answers. Uses the relay client this half owns; the membership half verifies the
+   * record against the channel key before showing it to a member.
+   */
+  fetchInfo: (relays: string[], channelHex: string) => Promise<Uint8Array | null>;
 } {
   const { logger, keyProviders } = deps;
 
@@ -387,5 +393,20 @@ export function wireChannelPublishing(
     // 041-HELPTRUTH Part B: the post count for an admin row in `cello channels`. Reads the log this
     // half owns; a channel with an empty log (or none) is `null`, never a fabricated 0.
     channelLastSeq: (channelHex) => log.head(channelHex).last_seq,
+    // 041-HELPTRUTH Part C: fetch the channel's info record from its relays, first that answers. A
+    // relay fault on one is not fatal — the next is tried; all silent is `null` (the caller falls
+    // back to the stored description).
+    fetchInfo: async (relays, channelHex) => {
+      const channelKey = new Uint8Array(Buffer.from(channelHex, "hex"));
+      for (const addr of relays) {
+        try {
+          const record = await relay.info(addr, channelKey);
+          if (record !== null) return record;
+        } catch {
+          // Try the next relay — a single relay being unreachable must not hide a record another holds.
+        }
+      }
+      return null;
+    },
   };
 }

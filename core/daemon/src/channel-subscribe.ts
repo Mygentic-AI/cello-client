@@ -12,7 +12,9 @@
  * relay argument — wrong, and contradicted by the frame 019 already shipped.
  */
 import type { Logger } from "./types.js";
-import { encodeChannelJoinRequest, type ChannelAccess } from "@cello-protocol/protocol-types";
+import {
+  encodeChannelJoinRequest, decodeChannelInfo, verifyChannelInfo, type ChannelAccess,
+} from "@cello-protocol/protocol-types";
 import type { ChannelSubscriptionStore } from "./channel-subscription-store.js";
 import type { ChannelInboxStore } from "./channel-inbox-store.js";
 import { extractErrorMessage } from "./error-message.js";
@@ -25,6 +27,11 @@ export type ChannelInfoResult =
       // store (a channel followed here). `status` is present only for a followed channel.
       access?: ChannelAccess; guidance?: string; relays?: string[];
       status?: "active" | "left" | "ejected" | "closed";
+      // 041-HELPTRUTH Part C: for a FOLLOWED channel, where `guidance` came from. `"relay"` is a
+      // fresh, signature-verified record fetched just now; `"stored"` is the value from admission,
+      // used when no relay answered or the record did not verify. Absent for an administered channel
+      // (this daemon signs its own) or a channel it neither administers nor follows.
+      description_source?: "relay" | "stored";
       // Present only when this daemon knows nothing beyond the admin — neither administers nor
       // follows the channel — so a reader is told how to see the description and relays.
       detail?: string;
@@ -78,6 +85,12 @@ export interface ChannelSubscribeDeps {
   agentPubkey: (agentName: string) => string | null;
   /** Decrypt one stored post body for this subscription, or null if no key fits. */
   decrypt: (agentId: string, channelHex: string, seq: number, body: Uint8Array) => Promise<Uint8Array | null>;
+  /**
+   * 041-HELPTRUTH Part C: the channel's signed info record as its relays hold it, or null when none
+   * answers. Tries the relays in order and returns the first record; the CALLER decodes, verifies
+   * and matches it against the channel key — this only fetches bytes.
+   */
+  fetchInfo: (relays: string[], channelHex: string) => Promise<Uint8Array | null>;
 }
 
 export function createChannelSubscribe(deps: ChannelSubscribeDeps) {
@@ -119,11 +132,54 @@ export function createChannelSubscribe(deps: ChannelSubscribeDeps) {
     const cfg = deps.channelConfig(channelHex);
     if (cfg) return { ...base, access: cfg.access, guidance: cfg.guidance, relays: cfg.relays };
 
-    // Following it carries the same three from the acceptance, plus this member's own status.
-    if (sub) return { ...base, access: sub.access, guidance: sub.guidance, relays: sub.relays, status: sub.status };
+    // Following it carries access, relays and this member's status from the acceptance. The
+    // DESCRIPTION, though, was frozen at admission — so refresh it from the channel's relays, which
+    // is what the info-set help promises a member sees. Never show an unverified description.
+    if (sub) {
+      const fresh = await currentDescription(agentId, channelHex, sub.relays, sub.guidance);
+      return {
+        ...base, access: sub.access, guidance: fresh.guidance, relays: sub.relays,
+        status: sub.status, description_source: fresh.source,
+      };
+    }
 
     // Neither administered nor followed here: only the admin is known.
     return { ...base, detail: "Join the channel to see its description and relays." };
+  }
+
+  /**
+   * 041-HELPTRUTH Part C — the CURRENT description for a followed channel.
+   *
+   * Asks the subscription's relays for the signed info record, decodes it, verifies its signature
+   * against the CHANNEL key, and checks the record names THIS channel. On success returns that
+   * description (source `"relay"`) and writes it back to the subscription. On any miss — no relay
+   * answered, a decode failure, a bad signature, or a record for another channel — it falls back to
+   * the stored description (source `"stored"`). An unverified description is NEVER returned.
+   */
+  async function currentDescription(
+    agentId: string, channelHex: string, relays: string[], stored: string,
+  ): Promise<{ guidance: string; source: "relay" | "stored" }> {
+    let raw: Uint8Array | null = null;
+    try {
+      raw = await deps.fetchInfo(relays, channelHex);
+    } catch {
+      // A relay fault is a fall-back, not a failure of `info` — the stored description still stands.
+      raw = null;
+    }
+    if (raw !== null) {
+      const decoded = decodeChannelInfo(raw);
+      const wanted = channelHex.toLowerCase();
+      if (
+        decoded.ok
+        && Buffer.from(decoded.info.channel_pubkey).toString("hex") === wanted
+        && verifyChannelInfo(decoded.info)
+      ) {
+        deps.subscriptions.setGuidance(agentId, channelHex, decoded.info.guidance);
+        return { guidance: decoded.info.guidance, source: "relay" };
+      }
+      deps.logger.info("channel.info.record_unverified", { channel_pubkey: channelHex });
+    }
+    return { guidance: stored, source: "stored" };
   }
 
   /**
