@@ -26,8 +26,8 @@
  * unwrapped here with its own identity key (empty for a public channel, which carries no key).
  */
 import { InMemoryKeyProvider } from "@cello-protocol/crypto";
-import { decodeBroadcastArtifact, buildChannelFetchAuthTbs, type ChannelAccess } from "@cello-protocol/protocol-types";
-import { decryptBody, deriveFetchKey, unwrapGroupKey, type GroupKey } from "@cello-protocol/crypto";
+import { decodeBroadcastArtifact, type ChannelAccess } from "@cello-protocol/protocol-types";
+import { decryptBody, unwrapGroupKey, type GroupKey } from "@cello-protocol/crypto";
 import { createNode } from "@cello-protocol/transport";
 import { ChannelRelayClient } from "../../channel-relay-client.js";
 import { ChannelCollector } from "../../channel-collector.js";
@@ -54,9 +54,11 @@ async function unwrapAll(bundles: string[], channelPubkey: Uint8Array, member: I
 }
 
 /**
- * The 019 ejection path: fetch directly, signing with the NEWEST key held. An ejected member's
- * newest is the generation before the re-key, so its signature no longer matches what the relays
- * were told to require — the refusal happens at the RELAY, before any ciphertext moves.
+ * The 019 ejection path: fetch each relay, signing through the PRODUCTION `createChannelFetchAuth`
+ * (037 review M-4). It signs with the NEWEST key held — and an ejected member's newest is the
+ * generation before the re-key, so the signature no longer matches what the relays were told to
+ * require and the refusal happens at the RELAY, before any ciphertext moves. Production behaves
+ * exactly as the old hand-signed auth did here, so the ejection property is unchanged.
  */
 async function fetchMode(rest: string[]): Promise<void> {
   const [, agentId, channelHex, , memberSeedHex, relayA, relayB, keysJson] = rest;
@@ -75,18 +77,19 @@ async function fetchMode(rest: string[]): Promise<void> {
   await node.start();
   const client = new ChannelRelayClient({ getNode: () => node, logger: silent });
 
-  const newest = [...keys].sort((a, b) => b.generation - a.generation)[0];
-  const fetchKey = newest ? await deriveFetchKey(newest, channelPubkey) : null;
+  // The production fetch auth, fed the keys this member holds (newest first — the ejected member's
+  // newest is a stale generation, and the relay refuses it). The 019 channel is invite_only.
+  const fetchAuth = createChannelFetchAuth({
+    keysFor: () => [...keys].sort((a, b) => b.generation - a.generation),
+    logger: silent,
+  });
 
   const fetched = new Set<number>();
   const decrypted = new Set<number>();
   const refusals: string[] = [];
 
   for (const relay of [relayA, relayB]) {
-    const timeMs = Date.now();
-    const auth = fetchKey
-      ? { signature: await fetchKey.sign(buildChannelFetchAuthTbs(channelPubkey, 1, timeMs)), time_ms: timeMs }
-      : undefined;
+    const auth = await fetchAuth(agentId, "invite_only", channelHex, 1);
     let answer;
     try {
       answer = await client.fetch(relay, {
