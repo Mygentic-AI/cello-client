@@ -714,15 +714,11 @@ async function startDaemonHoldingLock(
     activeSessionsFor: (agentName) => sessionNodeManager.getSessionsForAgent(agentName)
       .filter((s) => s.status === "active")
       .map((s) => ({ sessionId: s.session_id, counterpartyPubkeyHex: s.counterparty_pubkey })),
-    // M16 020-CHANADMIN: the subscriber asks the directory who administers a channel, on its own
-    // authenticated stream. No stream means the join is refused, not accepted.
+    // M16 020-CHANADMIN: the subscriber asks the directory who administers a channel; no stream, no join.
     signalingFor: (agentName) => signalingFor(agentName) ?? null,
-    // M16 022: `join` opens a session with the channel's admin — a subscriber has never spoken to
-    // them. The same path cello_initiate_session takes, callable without an IPC connection.
+    // M16 022 `join` opens a session with the channel's admin; 034-LIFECYCLE delete prunes via the
+    // publishing half through a closure that runs long after `channelWiring` is assigned below.
     openSessionFor: (agentName, opts) => openSessionFor(agentName, opts),
-    // M16 034-LIFECYCLE: the delete verb prunes the whole channel on both relays. The publisher and
-    // log live in the publishing half (built just below), so this defers to it — the closure runs
-    // at delete time, long after `channelWiring` is assigned.
     pruneAllPosts: (agentName, channelHex) => channelWiring.pruneAllPosts(agentName, channelHex),
   });
 
