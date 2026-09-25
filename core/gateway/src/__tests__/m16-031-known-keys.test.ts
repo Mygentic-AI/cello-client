@@ -82,4 +82,39 @@ describe("M16 031 — known public keys pass outbound governance unchanged", () 
     expect(refused.text).toBe(already);
     expect(refused.restore(refused.text)).toBe(already);
   });
+
+  // ─── 040-CLEANUP Part B — match keys as the daemon does: case-insensitively, whole tokens only ──
+
+  it("test 6: an UPPERCASE occurrence of a known key passes through intact", () => {
+    // The daemon lowercases the keys it hands us; the agent may have typed the key in uppercase.
+    // A case-sensitive match missed it, so the uppercase key was redacted as a secret.
+    const screener = new OutboundScreener();
+    const upper = K.toUpperCase();
+    const text = `channel key: ${upper}`;
+    const v = screener.screen(enc(text), { agentName: "a", sessionId: "s", knownPublicKeys: [K] });
+    expect(v.disposition).toBe("allow");
+    expect(dec(v.content)).toBe(text); // the uppercase key survives every stage, byte-for-byte
+    expect(v.events.some((e) => e.category.startsWith("secret:") || e.category.startsWith("pii:"))).toBe(false);
+
+    // protectKnownKeys restores the EXACT matched text, preserving the case it appeared in.
+    const p = protectKnownKeys(`key ${upper}`, [K]);
+    expect(p.count).toBe(1);
+    expect(p.text).not.toContain(upper);
+    expect(p.restore(p.text)).toBe(`key ${upper}`);
+  });
+
+  it("test 7: a known key that is a substring of a longer 70-hex run is NOT protected", () => {
+    // A known key embedded inside a longer hex run is a different value — it must be screened, not
+    // protected. Substring replacement used to protect it, corrupting the longer run on restore.
+    const longRun = `${K}abcdef`; // 70 hex; K is its first 64 characters but this is not the key K
+    const screener = new OutboundScreener();
+    const v = screener.screen(enc(`channel key: ${longRun}`), { agentName: "a", sessionId: "s", knownPublicKeys: [K] });
+    // Not counted as a protected known key.
+    expect(v.knownKeysProtected).toBeUndefined();
+
+    // And protectKnownKeys touches nothing for the embedded case.
+    const p = protectKnownKeys(`x ${longRun}`, [K]);
+    expect(p.count).toBe(0);
+    expect(p.text).toBe(`x ${longRun}`);
+  });
 });

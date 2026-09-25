@@ -104,23 +104,41 @@ export function protectKnownKeys(
   keys: string[],
 ): { text: string; restore: (t: string) => string; count: number } {
   const identity = { text, restore: (t: string): string => t, count: 0 };
-  const present = [...new Set(keys)].filter((k) => k.length > 0 && text.includes(k));
-  if (present.length === 0) return identity;
+  // The daemon lowercases the keys it hands us. Match CASE-INSENSITIVELY so an uppercase occurrence
+  // in the agent's text is still recognised, and only as a WHOLE 64-hex token — a known key embedded
+  // in a longer hex run is a different value and must be screened, not protected. Substring matching
+  // did both wrong: it missed uppercase and it protected (and then corrupted) the longer run.
+  const canon = [...new Set(keys.map((k) => k.toLowerCase()))].filter((k) => k.length > 0);
+  if (canon.length === 0) return identity;
 
-  const mapping = present.map((key, i) => ({ key, placeholder: PLACEHOLDER_PREFIX + indexToLetters(i) }));
-  // Refuse if any placeholder already occurs — restoring it would rewrite text we did not protect.
-  if (mapping.some((m) => text.includes(m.placeholder))) return identity;
+  // Not flanked by another hex digit on either side → whole-token only. Alternation over the keys.
+  const pattern = new RegExp(`(?<![0-9a-fA-F])(?:${canon.join("|")})(?![0-9a-fA-F])`, "gi");
 
-  let protectedText = text;
-  for (const m of mapping) protectedText = protectedText.split(m.key).join(m.placeholder);
+  // One placeholder per OCCURRENCE, mapped to the EXACT matched text so restore preserves its case.
+  const restoreMap = new Map<string, string>();
+  let i = 0;
+  const protectedText = text.replace(pattern, (match) => {
+    const placeholder = PLACEHOLDER_PREFIX + indexToLetters(i);
+    i += 1;
+    restoreMap.set(placeholder, match);
+    return placeholder;
+  });
+  if (restoreMap.size === 0) return identity;
+
+  // Refuse if any placeholder we assigned already occurs in the ORIGINAL text — restoring it would
+  // rewrite text we did not protect.
+  for (const placeholder of restoreMap.keys()) {
+    if (text.includes(placeholder)) return identity;
+  }
+
   // Restore longest placeholder first, so a shorter placeholder is never matched inside a longer one.
-  const ordered = [...mapping].sort((a, b) => b.placeholder.length - a.placeholder.length);
+  const ordered = [...restoreMap.keys()].sort((a, b) => b.length - a.length);
   const restore = (t: string): string => {
     let out = t;
-    for (const m of ordered) out = out.split(m.placeholder).join(m.key);
+    for (const placeholder of ordered) out = out.split(placeholder).join(restoreMap.get(placeholder)!);
     return out;
   };
-  return { text: protectedText, restore, count: mapping.length };
+  return { text: protectedText, restore, count: restoreMap.size };
 }
 
 export class OutboundScreener {
