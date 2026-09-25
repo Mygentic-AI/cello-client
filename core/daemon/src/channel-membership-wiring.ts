@@ -77,6 +77,12 @@ export interface ChannelMembershipWiringDeps {
    * agents only — the same agents/channels partition 033-CHANNELVIEW draws on every other surface.
    */
   isChannelAgent: (agentName: string) => boolean;
+  /**
+   * 041-HELPTRUTH Part B: the last published seq for a channel this agent administers, or null when
+   * the log is empty / this daemon holds no key. From the publishing half, which owns the log — so
+   * this half reads the post count rather than reimplementing the log.
+   */
+  channelLastSeq: (channelHex: string) => number | null;
   /** Open sessions for an agent, so a re-key can ride one this daemon already holds. */
   activeSessionsFor: (agentName: string) => Array<{ sessionId: string; counterpartyPubkeyHex: string }>;
   /**
@@ -502,7 +508,8 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
    */
   const channelsForAgent = (agentName: string): Array<Record<string, unknown>> => {
     const agentId = deps.resolveAgentId(agentName);
-    return subscriptions.listedFor(agentId).map((s) => ({
+    // Channels this agent FOLLOWS — role "member" (041-HELPTRUTH Part B).
+    const rows: Array<Record<string, unknown>> = subscriptions.listedFor(agentId).map((s) => ({
       channel: s.channel_pubkey,
       moniker: s.moniker,
       access: s.access,
@@ -511,7 +518,26 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
       processed_through: s.processed_through,
       // What the operator actually wants to know: how much is waiting.
       unread: Math.max(0, s.delivered_through - s.processed_through),
+      role: "member",
     }));
+    // 041-HELPTRUTH Part B: channels this agent RUNS — the config rows whose admin is this agent's
+    // key. The help says `cello channels` lists what you follow AND publish; before this it listed
+    // subscriptions only, so an admin who ran four channels and followed none saw an empty list.
+    const agentPubkey = deps.loadedAgents.find((a) => a.name === agentName)?.pubkey;
+    if (agentPubkey !== undefined) {
+      for (const c of channelConfig.listForAdmin(agentPubkey)) {
+        rows.push({
+          channel: c.channel_pubkey,
+          // The channel identity's display name, looked up by its pubkey (never by name).
+          name: deps.loadedAgents.find((a) => a.pubkey.toLowerCase() === c.channel_pubkey.toLowerCase())?.name ?? null,
+          access: c.access,
+          relays: c.relays,
+          posts: deps.channelLastSeq(c.channel_pubkey),
+          role: "admin",
+        });
+      }
+    }
+    return rows;
   };
 
   handlers.set("cello_channels", async (params, connectionId) => {

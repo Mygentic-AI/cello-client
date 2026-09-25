@@ -101,6 +101,34 @@ export class ChannelConfigStore {
     };
   }
 
+  /**
+   * 041-HELPTRUTH Part B: every channel this AGENT administers, so `cello channels` can list the
+   * channels an operator RUNS alongside the ones they follow. Matched case-insensitively on
+   * `admin_pubkey` because a hex key is compared, not typed. A row with a corrupt relay list is
+   * skipped and logged rather than failing the whole listing.
+   */
+  listForAdmin(adminPubkeyHex: string): Array<{ channel_pubkey: string; access: ChannelAccess; relays: string[] }> {
+    const rows = this.#db
+      .prepare(
+        `SELECT channel_pubkey, access, relays FROM channel_config
+           WHERE LOWER(admin_pubkey) = ? ORDER BY channel_pubkey ASC`,
+      )
+      .all(adminPubkeyHex.toLowerCase()) as Array<{ channel_pubkey: string; access: string; relays: string }>;
+    const out: Array<{ channel_pubkey: string; access: ChannelAccess; relays: string[] }> = [];
+    for (const row of rows) {
+      let relays: string[] = [];
+      try {
+        const parsed = JSON.parse(row.relays) as unknown;
+        if (Array.isArray(parsed)) relays = parsed.filter((r): r is string => typeof r === "string");
+      } catch {
+        this.#logger.error("channel.config.relays_corrupt", { channel_pubkey: row.channel_pubkey });
+        continue;
+      }
+      out.push({ channel_pubkey: row.channel_pubkey, access: row.access as ChannelAccess, relays });
+    }
+    return out;
+  }
+
   set(channelHex: string, config: ChannelConfig, now: number): void {
     this.#db
       .prepare(

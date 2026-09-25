@@ -81,6 +81,11 @@ export function wireChannelPublishing(
    */
   pruneAllPosts: (agentName: string, channelHex: string) =>
     Promise<{ pruned: number; relays: Array<{ relay: string; ok: boolean; reason?: string }> }>;
+  /**
+   * 041-HELPTRUTH Part B: the last published seq for a channel, read from the log this half owns, or
+   * null when the log holds nothing. The membership half uses it for the post count on an admin row.
+   */
+  channelLastSeq: (channelHex: string) => number | null;
 } {
   const { logger, keyProviders } = deps;
 
@@ -379,5 +384,8 @@ export function wireChannelPublishing(
       if (head.last_seq === null) return { pruned: 0, relays: [] };
       return publisher.pruneChannel(agentName, channelHex, head.last_seq);
     },
+    // 041-HELPTRUTH Part B: the post count for an admin row in `cello channels`. Reads the log this
+    // half owns; a channel with an empty log (or none) is `null`, never a fabricated 0.
+    channelLastSeq: (channelHex) => log.head(channelHex).last_seq,
   };
 }

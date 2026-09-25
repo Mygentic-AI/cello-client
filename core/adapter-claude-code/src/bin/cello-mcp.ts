@@ -1096,7 +1096,7 @@ const publisherAgent = () =>
 const adminAgent = () =>
   z.string().optional().describe("The administrating agent, the one that holds the channel's key (defaults to the agent you are attending)");
 
-server.tool("cello_channels", "List the channels this agent FOLLOWS, with how many posts are waiting to be read on each. Local — it reads what this daemon has already collected and asks no relay. A channel this agent PUBLISHES does not appear: the list is built from subscriptions, and setting a channel up does not create one.", {
+server.tool("cello_channels", "List the channels this agent follows AND the ones it runs. Local — it reads what this daemon has already collected and asks no relay. A followed channel is role \"member\", with how many posts are waiting to be read; a channel this agent administers is role \"admin\", with the channel's name, access, relays and its last published post number. With no agent named and none selected, it lists every agent's channels instead, grouped by agent.", {
   agent: channelAgent(),
 }, async ({ agent }) => jsonText(await proxy.call("cello_channels", { ...(agent ? { agent } : {}) })));
 

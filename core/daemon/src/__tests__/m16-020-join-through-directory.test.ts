@@ -339,6 +339,10 @@ async function adminHarness() {
       prunedChannels.push(chHex);
       return Promise.resolve({ pruned: 3, relays: [{ relay: RELAY_A, ok: true }, { relay: RELAY_B, ok: true }] });
     },
+    // 041-HELPTRUTH: the two deps `cello_channels` reads. This channel identity is CHANNEL_NAME, and
+    // its log is empty here (the post count on an admin row is null).
+    isChannelAgent: (name) => name === CHANNEL_NAME,
+    channelLastSeq: () => null,
   });
 
   return {
@@ -740,5 +744,38 @@ describe("M16 041-HELPTRUTH Part A — no agent lists every operator agent's cha
     expect([...byAgent.keys()].sort()).toEqual(["Agent One", "Agent Two"]);
     expect(byAgent.get("Agent One")).toContain(ch1);
     expect(byAgent.get("Agent Two")).toContain(ch2);
+  });
+});
+
+describe("M16 041-HELPTRUTH Part B — the list also carries the channels you RUN", () => {
+  it("an agent that administers one channel and follows one subscription gets two rows, one per role", async () => {
+    const h = await listHarness();
+    const followed = "3c".repeat(32);
+    // Agent One follows one channel...
+    h.subs.upsert({ agent_id: "id-of-Agent One", channel_pubkey: followed, admin_pubkey: "aa".repeat(32), access: "public", relays: [RELAY_A] });
+    // ...and administers the test-channel: a config row whose admin is Agent One's key.
+    h.config.set(h.chHex, {
+      access: "invite_only", relays: [RELAY_A, RELAY_B], guidance: "release notes",
+      retention_seconds: 7 * 24 * 3600, members_visible: false, admin_pubkey: h.a1Hex,
+    }, Date.now());
+    h.setLastSeq(h.chHex, 7);
+    h.setCurrent("Agent One");
+
+    const res = (await h.handlers.get("cello_channels")!({}, "conn-1")) as {
+      ok: boolean; channels: Array<Record<string, unknown>>;
+    };
+    expect(res.ok).toBe(true);
+
+    // The followed channel is a member row.
+    const member = res.channels.find((c) => c.role === "member" && c.channel === followed);
+    expect(member, "the followed channel is listed as a member row").toBeDefined();
+
+    // The administered channel is an admin row, with the channel's name, access, relays and last seq.
+    const admin = res.channels.find((c) => c.role === "admin" && c.channel === h.chHex);
+    expect(admin, "the administered channel is listed as an admin row").toBeDefined();
+    expect(admin!.name, "the admin row carries the channel identity's display name").toBe("test-channel");
+    expect(admin!.access).toBe("invite_only");
+    expect(admin!.relays).toEqual([RELAY_A, RELAY_B]);
+    expect(admin!.posts, "the admin row carries the last published seq").toBe(7);
   });
 });
