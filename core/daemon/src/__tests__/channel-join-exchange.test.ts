@@ -470,6 +470,34 @@ describe("M16 019 Part B — the join exchange", () => {
     expect(f.subs.keysFor("agent-2", f.channelHex)).toHaveLength(1);
   });
 
+  it("034-LIFECYCLE (review HIGH): an ejected/closed frame from a NON-admin peer changes nothing", async () => {
+    // A refused(ejected)/refused(channel_closed) removes a member's subscription — a privileged act.
+    // The session proves who the peer IS, not that they administer the channel. Without checking the
+    // sender against the subscription's stored admin, any peer that can open a session could mark you
+    // ejected or your channel deleted. This pins the check the accept/rekey branch already makes.
+    const f = await fixture("invite_only");
+    f.subs.upsert({
+      agent_id: "agent-2", channel_pubkey: f.channelHex, admin_pubkey: f.adminHex,
+      access: "invite_only", relays: [RELAY_A, RELAY_B],
+    });
+    const stranger = generateKeypair();
+    const strangerHex = hex(await stranger.getPublicKey());
+
+    for (const reason of ["ejected", "channel_closed"] as const) {
+      const frame = encodeChannelJoinRefused({ channel_pubkey: await f.channelKp.getPublicKey(), reason });
+      const res = await f.exchange.onSubscriberFrame("agent-2", "s1", strangerHex, frame);
+      expect(res.ok).toBe(false);
+      // The status is untouched, and no removal doorbell fired — a stranger cannot remove you.
+      expect(f.subs.get("agent-2", f.channelHex)?.status, `${reason} from a stranger`).toBe("active");
+    }
+    expect(f.joinAnswers, "no removal doorbell fired for a non-admin sender").toEqual([]);
+
+    // And from the ACTUAL admin, the same frame still marks it.
+    const ejected = encodeChannelJoinRefused({ channel_pubkey: await f.channelKp.getPublicKey(), reason: "ejected" });
+    await f.exchange.onSubscriberFrame("agent-2", "s1", f.adminHex, ejected);
+    expect(f.subs.get("agent-2", f.channelHex)?.status).toBe("ejected");
+  });
+
   it("034-LIFECYCLE: a refused(ejected) for a channel NOT subscribed does not throw and marks nothing", async () => {
     // The member never joined. Marking must be guarded on the subscription existing — a bare
     // markEjected would throw subscription_unknown and take the handler down.
