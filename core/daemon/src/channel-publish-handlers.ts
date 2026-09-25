@@ -82,6 +82,27 @@ function needChannel(params: Record<string, unknown> | undefined):
 }
 
 /**
+ * 035-INFOCLI item 5: a channel relay must be a real, dialable multiaddr.
+ *
+ * ⚠️ **THE `/p2p/<peer id>` TAIL IS REQUIRED, NOT DECORATION.** The peer id is how the relay is
+ * AUTHENTICATED on connect — a directory-picked relay and the libp2p relays the enforcer runs all
+ * carry one (`/ip4/…/tcp/…/p2p/12D3KooW…`). An address without it is not a usable relay: setup used
+ * to accept a bare hostname like `relay-usc1.cello.mygentic.ai`, and every later publish then failed
+ * on a dial that never had a peer to reach.
+ *
+ * Shape: `/dns4|dns6|ip4|ip6/<host>/tcp/<port>` then any transport segments (`/tls/ws`, …) and
+ * ending in `/p2p/<peer id>`.
+ */
+const RELAY_MULTIADDR_RE = /^\/(dns4|dns6|ip4|ip6)\/[^/]+\/tcp\/\d+(\/[^/]+)*\/p2p\/[A-Za-z0-9]+$/;
+
+function badRelay(relay: string): Record<string, unknown> {
+  return {
+    ok: false, reason: "bad_relay",
+    guidance: `'${relay}' is not a usable relay. A relay must be a multiaddr of the form /dns4|dns6|ip4|ip6/<host>/tcp/<port>/…/p2p/<peer id> — the peer id (…/p2p/12D3KooW…) is how the relay is authenticated when the channel dials it.`,
+  };
+}
+
+/**
  * Record a publisher's decisions for a channel it holds the key to — the SAME code
  * `cello_channel_config` runs, extracted so `cello_channel_create` (024) composes it rather than
  * copying it. Returns only success/failure; the config handler adds its own operator-facing shape.
@@ -205,6 +226,11 @@ export function registerChannelPublishHandlers(deps: ChannelPublishDeps): void {
         guidance: "Pass `relays`: the multiaddrs this channel publishes to. Two is the design — one is a single point of failure, and the subscriber takes the union of both.",
       };
     }
+    // 035-INFOCLI item 5: each relay must be a real, /p2p-terminated multiaddr — a bare hostname or
+    // a multiaddr with no peer id cannot be dialed, and accepting it made every later verb fail on a
+    // relay it could never reach.
+    const badRelayValue = relays.find((r) => !RELAY_MULTIADDR_RE.test(r));
+    if (badRelayValue !== undefined) return badRelay(badRelayValue);
     const access = params?.["access"];
     if (access !== "public" && access !== "open" && access !== "invite_only") {
       return {

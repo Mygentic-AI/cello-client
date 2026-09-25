@@ -27,8 +27,10 @@ import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import type { Logger, DaemonConfig } from "../types.js";
 
-const RELAY_A = "/dns4/relay-a.example/tcp/443/tls/ws";
-const RELAY_B = "/dns4/relay-b.example/tcp/443/tls/ws";
+// 035-INFOCLI item 5: a channel relay is a /p2p-terminated multiaddr — the peer id authenticates it
+// on connect. The old loose form (no /p2p) is now refused by `cello_channel_config`.
+const RELAY_A = "/dns4/relay-a.example/tcp/443/tls/ws/p2p/12D3KooWJXHpnWQhGk3jXBJYdXMmeLxEhRqzwZCYd1bxSUh4pg83";
+const RELAY_B = "/dns4/relay-b.example/tcp/443/tls/ws/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X";
 
 describe("M16 018-PUBCOLLECT: the channel verbs on a live daemon", () => {
   let tempDir: string;
@@ -141,6 +143,35 @@ describe("M16 018-PUBCOLLECT: the channel verbs on a live daemon", () => {
     }) as { ok: boolean; reason?: string };
     expect(answer.ok).toBe(false);
     expect(answer.reason, "the operator is told they follow nothing, not given an empty list").toBe("not_subscribed");
+  });
+
+  it("035 item 5 — setup refuses a relay that is not a /p2p-terminated multiaddr", async () => {
+    // Live evidence: `setup` accepted a bare hostname `relay-usc1.cello.mygentic.ai`, which cannot be
+    // dialed — every later publish then failed on a relay with no peer to reach.
+    const bare = await call("cello_channel_config", {
+      agent: "alice", channel: alicePubkeyHex, access: "public",
+      relays: ["relay-usc1.cello.mygentic.ai", RELAY_B],
+    });
+    expect(bare["ok"]).toBe(false);
+    expect(bare["reason"]).toBe("bad_relay");
+    // The refusal names the offending value AND the expected shape.
+    expect(String(bare["guidance"])).toContain("relay-usc1.cello.mygentic.ai");
+    expect(String(bare["guidance"])).toContain("/p2p/");
+
+    // A multiaddr WITHOUT the /p2p peer id is also refused — it is not a usable relay.
+    const noPeer = await call("cello_channel_config", {
+      agent: "alice", channel: alicePubkeyHex, access: "public",
+      relays: ["/dns4/relay-a.example/tcp/443/tls/ws", RELAY_B],
+    });
+    expect(noPeer["ok"]).toBe(false);
+    expect(noPeer["reason"]).toBe("bad_relay");
+    expect(String(noPeer["guidance"])).toContain("/dns4/relay-a.example/tcp/443/tls/ws");
+
+    // Two proper /p2p multiaddrs are accepted.
+    const good = await call("cello_channel_config", {
+      agent: "alice", channel: alicePubkeyHex, access: "public", relays: [RELAY_A, RELAY_B],
+    });
+    expect(good["ok"], JSON.stringify(good)).toBe(true);
   });
 
   it("035 item 1 — info on a channel this daemon ADMINISTERS carries access, guidance, relays", async () => {
