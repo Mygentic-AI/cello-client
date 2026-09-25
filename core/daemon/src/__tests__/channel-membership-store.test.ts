@@ -152,4 +152,15 @@ describe("M16 019 — the publisher's membership records", () => {
     expect(members.settings("dd".repeat(32))).toBeNull();
     expect(members.statusOf("dd".repeat(32), ALICE)).toBeNull();
   });
+
+  it("035 item 6 — approve with nothing pending is not_a_pending_request, with refuse's own guidance", () => {
+    // Today approve threw `not_an_active_member: no pending request…` — a DIFFERENT reason word from
+    // `refuse` for the same situation, so an operator who typed approve when there was no request got
+    // a contradictory label. Both now report not_a_pending_request and point at eject.
+    expect(() => members.approve(CHANNEL, ALICE)).toThrow(/not_a_pending_request/);
+    expect(() => members.approve(CHANNEL, ALICE)).toThrow(/eject them/);
+    // The SAME guidance refuse gives for the same state — the two are now indistinguishable in reason.
+    expect(() => members.refusePending(CHANNEL, ALICE)).toThrow(/not_a_pending_request/);
+    expect(() => members.refusePending(CHANNEL, ALICE)).toThrow(/eject them/);
+  });
 });

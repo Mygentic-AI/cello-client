@@ -190,7 +190,14 @@ export class ChannelMembershipStore {
       )
       .run(channelHex.toLowerCase(), subscriberHex.toLowerCase());
     if (Number(changed.changes) === 0) {
-      throw new ChannelMembershipError("not_an_active_member", "no pending request for that subscriber");
+      // Same reason word AND guidance as `refusePending` below: approve and refuse address the same
+      // pending request, so a missing one must read identically whichever verb the admin typed. The
+      // old `not_an_active_member: no pending request…` was a contradictory label — it named the
+      // active-member path for a request that was never active.
+      throw new ChannelMembershipError(
+        "not_a_pending_request",
+        `${subscriberHex.slice(0, 16)} has no pending request on this channel. To remove an existing member, eject them — which re-keys the channel.`,
+      );
     }
     this.#logger.info("channel.member.joined", {
       channel_pubkey: channelHex, subscriber_pubkey: subscriberHex, status: "active",
