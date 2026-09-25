@@ -720,6 +720,10 @@ async function startDaemonHoldingLock(
     // publishing half through a closure that runs long after `channelWiring` is assigned below.
     openSessionFor: (agentName, opts) => openSessionFor(agentName, opts),
     pruneAllPosts: (agentName, channelHex) => channelWiring.pruneAllPosts(agentName, channelHex),
+    // 038-RETESTFIX Part B: a newly-active subscription collects its existing posts at once, through
+    // the SAME collectNow the wake uses. Assigned below (after the collector exists), so this closure
+    // reads it only when an acceptance is processed — long after wiring, like pruneAllPosts above.
+    collectNow: (agentId) => channelCollectNow?.(agentId),
   });
 
   const channelWiring = wireChannelPublishing({

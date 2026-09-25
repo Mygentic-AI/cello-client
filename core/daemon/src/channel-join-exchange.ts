@@ -79,6 +79,14 @@ export interface ChannelJoinExchangeDeps {
    * an answer to a join and never rings this — that is out of scope (notices for re-key).
    */
   onJoinAnswer?: (agentId: string, channelHex: string, outcome: "admitted" | "pending" | "refused", reason?: string) => void;
+  /**
+   * 038-RETESTFIX Part B: a subscription that has just BECOME ACTIVE — an acceptance stored (open /
+   * invite-only) or a public admission — must collect the channel's existing posts at once, instead
+   * of waiting for the next post's wake or the backstop poll. Wired to the SAME `collectNow` the
+   * wake uses (fire-and-forget, and it keeps its own online check, so a switched-off agent is still
+   * skipped — MUST NOT CHANGE item 2). Optional and additive: absent, the exchange behaves as before.
+   */
+  collectNow?: (agentId: string) => void;
   now?: () => number;
 }
 
@@ -434,6 +442,9 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
           joined_at: now(),
         });
         deps.onJoinAnswer?.(agentId, channelHex, "admitted");
+        // 038-RETESTFIX Part B: the subscription is active NOW — collect the channel's existing posts
+        // at once rather than waiting for the next post's wake. Same seam the wake uses.
+        deps.collectNow?.(agentId);
         return { ok: true, channelHex, generation: 0 };
       }
 
@@ -465,7 +476,12 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
       subscriptions.addKey(agentId, channelHex, unwrapped.gk, now());
       // M16 032-NOTICES: an ACCEPTANCE stored means this agent is IN — ring "admitted". A re-key
       // also lands a key here but is not an answer to a join, so it never rings (out of scope).
-      if (acceptedFrame) deps.onJoinAnswer?.(agentId, channelHex, "admitted");
+      if (acceptedFrame) {
+        deps.onJoinAnswer?.(agentId, channelHex, "admitted");
+        // 038-RETESTFIX Part B: fresh subscription → collect the existing posts now, not on the next
+        // wake. A re-key is NOT a fresh admission (the member was already collecting), so it does not.
+        deps.collectNow?.(agentId);
+      }
       return { ok: true, channelHex, generation: unwrapped.gk.generation };
     },
 

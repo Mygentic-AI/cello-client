@@ -58,6 +58,8 @@ interface Fixture {
   notices: Array<{ event: string; channel: string; subscriber: string }>;
   /** M16 032-NOTICES: every onJoinAnswer the subscriber half fired, in order. */
   joinAnswers: Array<{ agentId: string; channelHex: string; outcome: string; reason?: string }>;
+  /** 038-RETESTFIX Part B: every collectNow the subscriber half fired, in order (agent ids). */
+  collectNowCalls: string[];
 }
 
 async function fixture(access: "open" | "invite_only" | "public" = "open"): Promise<Fixture> {
@@ -79,6 +81,7 @@ async function fixture(access: "open" | "invite_only" | "public" = "open"): Prom
   const profileAdmin = new Map<string, string>([[channelHex, adminHex]]);
   const notices: Array<{ event: string; channel: string; subscriber: string }> = [];
   const joinAnswers: Array<{ agentId: string; channelHex: string; outcome: string; reason?: string }> = [];
+  const collectNowCalls: string[] = [];
 
   const exchange = createChannelJoinExchange({
     logger: silent,
@@ -100,12 +103,13 @@ async function fixture(access: "open" | "invite_only" | "public" = "open"): Prom
     keyProviderFor: () => subscriberKp,
     raiseNotice: (event, channel, subscriber) => { notices.push({ event, channel, subscriber }); },
     onJoinAnswer: (agentId, chHex, outcome, reason) => { joinAnswers.push({ agentId, channelHex: chHex, outcome, reason }); },
+    collectNow: (agentId) => { collectNowCalls.push(agentId); },
     now: () => 1_800_000_000_000,
   });
 
   return {
     exchange, members, subs, channelKp, adminKp, subscriberKp,
-    channelHex, adminHex, subscriberHex, sent, profileAdmin, notices, joinAnswers,
+    channelHex, adminHex, subscriberHex, sent, profileAdmin, notices, joinAnswers, collectNowCalls,
   };
 }
 
@@ -148,6 +152,41 @@ describe("M16 019 Part B — the join exchange", () => {
     const sub = f.subs.get("agent-2", f.channelHex);
     expect(sub?.relays).toEqual([RELAY_A, RELAY_B]);
     expect(f.subs.keysFor("agent-2", f.channelHex)).toHaveLength(1);
+  });
+
+  it("038 Part B — a stored acceptance triggers an immediate collect for that agent, no wake needed", async () => {
+    // Live evidence (F35): Miss_Chelly joined test-public, delivered_through stayed 0, and the four
+    // existing posts arrived only when a NEW post rang the wake. A subscription that becomes active
+    // must collect at once. The recorder starts EMPTY, so a green assertion proves the acceptance —
+    // and only the acceptance — drove the collect; nothing here rings a wake.
+    const f = await fixture("open");
+    const request = encodeChannelJoinRequest({
+      channel_pubkey: await f.channelKp.getPublicKey(),
+      subscriber_pubkey: await f.subscriberKp.getPublicKey(),
+      note: "collect me in",
+    });
+    await f.exchange.onAdminFrame("s1", f.subscriberHex, request);
+    // Nothing collected until the subscriber actually stores the acceptance.
+    expect(f.collectNowCalls).toEqual([]);
+
+    const result = await f.exchange.onSubscriberFrame("agent-2", "s1", f.adminHex, f.sent[0].content);
+    expect(result.ok, result.ok ? "" : result.reason).toBe(true);
+    // The acceptance stored → collect fired once, for THIS agent id, with no wake.
+    expect(f.collectNowCalls).toEqual(["agent-2"]);
+  });
+
+  it("038 Part B — a public admission also triggers an immediate collect", async () => {
+    const f = await fixture("public");
+    const request = encodeChannelJoinRequest({
+      channel_pubkey: await f.channelKp.getPublicKey(),
+      subscriber_pubkey: await f.subscriberKp.getPublicKey(),
+      note: "public collect",
+    });
+    await f.exchange.onAdminFrame("s1", f.subscriberHex, request);
+    expect(f.collectNowCalls).toEqual([]);
+    const result = await f.exchange.onSubscriberFrame("agent-2", "s1", f.adminHex, f.sent[0].content);
+    expect(result.ok, result.ok ? "" : result.reason).toBe(true);
+    expect(f.collectNowCalls).toEqual(["agent-2"]);
   });
 
   it("7. an INVITE-ONLY channel replies pending_approval, and approval delivers the key", async () => {

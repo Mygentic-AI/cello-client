@@ -84,6 +84,12 @@ export interface ChannelMembershipWiringDeps {
   /** M16 032-NOTICES: the content-free doorbells for a join answer and a new join request. */
   notify: ChannelNotify;
   /**
+   * 038-RETESTFIX Part B: collect a newly-active subscription's existing posts at once. Wired to the
+   * SAME `collectNow` the wake uses (the publishing half's ticker), so a fresh acceptance does not
+   * wait for the next post's wake or the backstop poll. It keeps its own online check.
+   */
+  collectNow: (agentId: string) => void;
+  /**
    * M16 034-LIFECYCLE: prune every post the channel holds, on both relays, through the log's last
    * seq — the delete verb's second step. From the publishing half, which owns the log and the
    * publisher, so this half does not reimplement prune. `pruned: 0` with no relays when this daemon
@@ -318,6 +324,8 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     raiseNotice,
     // M16 032-NOTICES: the subscriber's own join answer — admitted / pending / refused (+ reason).
     onJoinAnswer: (agentId, channelHex, outcome, reason) => deps.notify.channelJoinAnswer(agentId, channelHex, outcome, reason),
+    // 038-RETESTFIX Part B: a stored acceptance / public admission collects at once.
+    collectNow: (agentId) => deps.collectNow(agentId),
   });
 
   /**
