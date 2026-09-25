@@ -78,6 +78,10 @@ describe("M16 019 Part B — the join frames", () => {
     for (const reason of [
       "not_admin_of_channel", "pending_approval", "refused_by_admin",
       "already_member", "ejected", "channel_is_public",
+      // M16 034-LIFECYCLE: the admin deleted the whole channel. Distinct from `ejected` (that member
+      // alone was removed): here the channel itself is gone, and the member's daemon marks the
+      // subscription `closed` rather than `ejected`.
+      "channel_closed",
     ] as const) {
       const decoded = decodeChannelJoinRefused(encodeChannelJoinRefused({ channel_pubkey: CHANNEL, reason }));
       expect(decoded.ok && decoded.frame.reason).toBe(reason);
