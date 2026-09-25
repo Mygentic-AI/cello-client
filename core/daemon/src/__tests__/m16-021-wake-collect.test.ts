@@ -25,7 +25,7 @@ const AGENT = "agent-1";
 const CHANNEL = "aa".repeat(32);
 const CHANNEL_B = "bb".repeat(32);
 const ADMIN = "cc".repeat(32);
-const RELAY_A = "/dns4/relay-a.example/tcp/443/tls/ws";
+const RELAY_A = "/dns4/relay-a.example/tcp/443/tls/ws/p2p/12D3KooWJXHpnWQhGk3jXBJYdXMmeLxEhRqzwZCYd1bxSUh4pg83";
 
 let dir: string;
 let db: DaemonDatabase;

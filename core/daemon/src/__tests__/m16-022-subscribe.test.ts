@@ -25,7 +25,7 @@ const AGENT_NAME = "Alice";
 const AGENT_PUBKEY = "a1".repeat(32);
 const CHANNEL = "c1".repeat(32);
 const ADMIN = "ad".repeat(32);
-const RELAY = "/dns4/relay-a.example/tcp/443/tls/ws";
+const RELAY = "/dns4/relay-a.example/tcp/443/tls/ws/p2p/12D3KooWJXHpnWQhGk3jXBJYdXMmeLxEhRqzwZCYd1bxSUh4pg83";
 
 let dir: string;
 let db: DaemonDatabase;
@@ -92,14 +92,14 @@ describe("M16 022 — info", () => {
 
   it("1a. 035 item 1 — a channel this daemon ADMINISTERS carries access, guidance, relays from config", async () => {
     const { api } = build({
-      channelConfig: () => ({ access: "invite_only", guidance: "the release channel", relays: [RELAY, "/dns4/relay-b.example/tcp/443/tls/ws"] }),
+      channelConfig: () => ({ access: "invite_only", guidance: "the release channel", relays: [RELAY, "/dns4/relay-b.example/tcp/443/tls/ws/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X"] }),
     });
     const r = await api.info(AGENT, CHANNEL);
     expect(r.ok).toBe(true);
     if (r.ok) {
       expect(r.access).toBe("invite_only");
       expect(r.guidance).toBe("the release channel");
-      expect(r.relays).toEqual([RELAY, "/dns4/relay-b.example/tcp/443/tls/ws"]);
+      expect(r.relays).toEqual([RELAY, "/dns4/relay-b.example/tcp/443/tls/ws/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X"]);
       // Administering the channel is not following it, so no member status is reported.
       expect(r.status).toBeUndefined();
       expect(r.detail).toBeUndefined();

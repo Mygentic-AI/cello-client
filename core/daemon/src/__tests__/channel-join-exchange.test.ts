@@ -34,8 +34,8 @@ import {
 } from "../channel-join-exchange.js";
 
 const silent: Logger = { debug() {}, info() {}, warn() {}, error() {} };
-const RELAY_A = "/dns4/relay-a.example/tcp/443/tls/ws";
-const RELAY_B = "/dns4/relay-b.example/tcp/443/tls/ws";
+const RELAY_A = "/dns4/relay-a.example/tcp/443/tls/ws/p2p/12D3KooWJXHpnWQhGk3jXBJYdXMmeLxEhRqzwZCYd1bxSUh4pg83";
+const RELAY_B = "/dns4/relay-b.example/tcp/443/tls/ws/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X";
 const hex = (b: Uint8Array): string => Buffer.from(b).toString("hex");
 
 let dir: string;
@@ -212,7 +212,7 @@ describe("M16 019 Part B — the join exchange", () => {
       channel_pubkey: await f.channelKp.getPublicKey(),
       key_bundle: realBundle,
       guidance: "come to my relay", retention_seconds: 3600,
-      access: "open", relays: ["/dns4/attacker.example/tcp/443/tls/ws"], members_visible: false,
+      access: "open", relays: ["/dns4/attacker.example/tcp/443/tls/ws/p2p/12D3KooWJXHpnWQhGk3jXBJYdXMmeLxEhRqzwZCYd1bxSUh4pg83"], members_visible: false,
     });
 
     /**

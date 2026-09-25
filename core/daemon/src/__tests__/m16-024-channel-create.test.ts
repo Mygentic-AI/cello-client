@@ -49,8 +49,8 @@ import type { Logger } from "../types.js";
 const silent: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 const ADMIN_HEX = "aa".repeat(32);
 const CHANNEL_HEX = "cc".repeat(32);
-const RELAY_A = "/dns4/relay-a.example/tcp/443/tls/ws";
-const RELAY_B = "/dns4/relay-b.example/tcp/443/tls/ws";
+const RELAY_A = "/dns4/relay-a.example/tcp/443/tls/ws/p2p/12D3KooWJXHpnWQhGk3jXBJYdXMmeLxEhRqzwZCYd1bxSUh4pg83";
+const RELAY_B = "/dns4/relay-b.example/tcp/443/tls/ws/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X";
 
 type Handler = (params: Record<string, unknown> | undefined, connectionId: string) => Promise<unknown>;
 

@@ -25,8 +25,8 @@ import { encodeCbor } from "../cbor.js";
 const CHANNEL = new Uint8Array(Buffer.alloc(32, 0xa1));
 const SUBSCRIBER = new Uint8Array(Buffer.alloc(32, 0xb2));
 const BUNDLE = new Uint8Array(Buffer.alloc(120, 0xc3));
-const RELAY_A = "/dns4/relay-a.example/tcp/443/tls/ws";
-const RELAY_B = "/dns4/relay-b.example/tcp/443/tls/ws";
+const RELAY_A = "/dns4/relay-a.example/tcp/443/tls/ws/p2p/12D3KooWJXHpnWQhGk3jXBJYdXMmeLxEhRqzwZCYd1bxSUh4pg83";
+const RELAY_B = "/dns4/relay-b.example/tcp/443/tls/ws/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X";
 
 describe("M16 019 Part B — the join frames", () => {
   it("a join request round-trips, and the note is bounded", () => {

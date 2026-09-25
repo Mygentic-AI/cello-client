@@ -32,8 +32,8 @@ import type { DaemonDatabase } from "../sqlcipher-db.js";
 import type { Logger } from "../types.js";
 
 const silent: Logger = { debug() {}, info() {}, warn() {}, error() {} };
-const RELAY_A = "/dns4/relay-a.example/tcp/443/tls/ws";
-const RELAY_B = "/dns4/relay-b.example/tcp/443/tls/ws";
+const RELAY_A = "/dns4/relay-a.example/tcp/443/tls/ws/p2p/12D3KooWJXHpnWQhGk3jXBJYdXMmeLxEhRqzwZCYd1bxSUh4pg83";
+const RELAY_B = "/dns4/relay-b.example/tcp/443/tls/ws/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X";
 
 let dir: string;
 let db: DaemonDatabase;
