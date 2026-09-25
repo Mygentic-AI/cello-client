@@ -725,6 +725,20 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
       });
     }
 
+    /**
+     * 039-NEWCHANFIX Part B: ONLY after a SUCCESSFUL retire, forget the channel's local admin rows —
+     * its settings/config and its member rows — so a deleted channel no longer answers `info`/`join`
+     * from local state and asks the directory like any other daemon, which is where the revoked
+     * answer comes from. The post log is KEPT (the admin's own record). A FAILED retire forgets
+     * nothing: the channel identity is still loaded and the operator's guidance to finish by hand
+     * still needs these rows.
+     */
+    if (retired) {
+      members.forget(channel.channelHex);
+      channelConfig.forget(channel.channelHex);
+      logger.info("channel.delete.local_forgotten", { channel_pubkey: channel.channelHex });
+    }
+
     logger.info("channel.deleted", {
       channel_pubkey: channel.channelHex,
       members_notified: membersNotified,

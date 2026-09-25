@@ -16,12 +16,14 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { generateKeypair, generateGroupKey, wrapGroupKeyFor, type InMemoryKeyProvider } from "@cello-protocol/crypto";
-import { encodeChannelJoinAccepted, decodeChannelMembershipEnded } from "@cello-protocol/protocol-types";
+import { encodeChannelJoinAccepted, decodeChannelMembershipEnded, signBroadcastArtifact } from "@cello-protocol/protocol-types";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import type { DaemonDatabase } from "../sqlcipher-db.js";
 import type { Logger } from "../types.js";
 import { ChannelSubscriptionStore } from "../channel-subscription-store.js";
 import { ChannelMembershipStore } from "../channel-membership-store.js";
+import { ChannelConfigStore } from "../channel-config-store.js";
+import { ChannelLogStore } from "../channel-log-store.js";
 import { wireChannelMembership, type ChannelMembershipWiringDeps } from "../channel-membership-wiring.js";
 import type { SignalingLike } from "../channel-admin-lookup.js";
 
@@ -280,6 +282,10 @@ async function adminHarness() {
   let openSessionForResult: { ok: boolean; sessionId?: string; reason?: string } = { ok: false, reason: "offline" };
   // Configurable: whether the fake retire path succeeds.
   let removeAgentResult: { ok: boolean; reason?: string } = { ok: true };
+  // Configurable: the admin's directory connection. Null by default (this daemon administers the
+  // channel from its own settings, so no directory round trip is needed). B3 sets one that answers
+  // `revoked` to prove a deleted channel's `info` now asks the directory.
+  let signaling: SignalingLike | null = null;
 
   // A fake retire path — the real cello_remove_agent lives in agent-handlers; here we only prove
   // delete REACHES it with the channel's name.
@@ -308,7 +314,7 @@ async function adminHarness() {
     resolveAgentId: (agentName) => (agentName === ADMIN_NAME ? ADMIN_ID : `id-of-${agentName}`),
     resolveCurrentAgent: () => ADMIN_NAME,
     activeSessionsFor: (agentName) => (agentName === ADMIN_NAME ? openSessions : []),
-    signalingFor: () => null,
+    signalingFor: (agentName) => (agentName === ADMIN_NAME ? signaling : null),
     openSessionFor: (agentName, opts) => {
       openedSessionsFor.push(opts.targetPubkey);
       return Promise.resolve(openSessionForResult);
@@ -326,6 +332,7 @@ async function adminHarness() {
     setOpenSessions: (s: typeof openSessions) => { openSessions = s; },
     setOpenSessionForResult: (r: typeof openSessionForResult) => { openSessionForResult = r; },
     setRemoveAgentResult: (r: typeof removeAgentResult) => { removeAgentResult = r; },
+    setSignaling: (s: SignalingLike | null) => { signaling = s; },
     subs: new ChannelSubscriptionStore(db, silent),
   };
 }
@@ -501,5 +508,101 @@ describe("M16 034-LIFECYCLE — admin side: eject tells the member, delete remov
     expect(res.retire_reason).toBe("agent_not_found");
     expect(typeof res.guidance).toBe("string");
     expect(String(res.guidance)).toContain(CHANNEL_NAME);
+  });
+
+  // ─── M16 039-NEWCHANFIX Part B — a deleted channel is forgotten by the admin's OWN daemon ──────
+  //
+  // A delete used to leave the channel's local settings and config rows behind, so `channel info` on
+  // the admin's own daemon still answered admin/access/relays/description from them without ever
+  // asking the directory — the channel read as live after it was deleted. After a SUCCESSFUL retire
+  // the delete now forgets those rows; the post log (the admin's own record) survives.
+
+  it("B1. after delete with a successful retire, settings and config are gone but the post log survives (039-NEWCHANFIX Part B)", async () => {
+    const h = await adminHarness();
+    const config = new ChannelConfigStore(db, silent);
+
+    // A post in the admin's own log — the durable record a delete must NOT touch (MUST NOT CHANGE 4).
+    const log = new ChannelLogStore(db, silent);
+    log.ensureChannel(h.channelHex);
+    const { seq } = log.nextPosition(h.channelHex);
+    const post = await signBroadcastArtifact(h.channelKp, h.adminKp, {
+      seq, published_at: 1000, title: "kept", body: new TextEncoder().encode("body"), supersedes: null, ext: null,
+    });
+    log.append(h.channelHex, post);
+
+    // Present before the delete.
+    expect(h.members.settings(h.channelHex), "settings present before delete").not.toBeNull();
+    expect(config.get(h.channelHex), "config present before delete").not.toBeNull();
+
+    h.setOpenSessions([]);
+    h.setOpenSessionForResult({ ok: true, sessionId: "s-opened" });
+    const res = (await h.handlers.get("cello_channel_delete")!({ channel: h.channelHex }, "conn-1")) as Record<string, unknown>;
+    expect(res.ok).toBe(true);
+    expect(res.retired, "the retire succeeded, so the local rows are forgotten").toBe(true);
+
+    // The admin's local rows are gone — info/join now ask the directory like any other daemon.
+    expect(h.members.settings(h.channelHex), "settings row removed").toBeNull();
+    expect(config.get(h.channelHex), "config row removed").toBeNull();
+    // But the post log survives.
+    expect(log.readRange(h.channelHex, seq, seq), "the admin's post log is kept").toHaveLength(1);
+  });
+
+  it("B2. a FAILED retire forgets nothing — the local rows remain (039-NEWCHANFIX Part B)", async () => {
+    const h = await adminHarness();
+    const config = new ChannelConfigStore(db, silent);
+    const memberKp = generateKeypair() as InMemoryKeyProvider;
+    const memberHex = hex(await memberKp.getPublicKey());
+    h.members.admit(h.channelHex, memberHex, "active", 1000);
+    h.setOpenSessions([{ sessionId: "s-member", counterpartyPubkeyHex: memberHex }]);
+    h.setRemoveAgentResult({ ok: false, reason: "agent_not_found" });
+
+    const res = (await h.handlers.get("cello_channel_delete")!({ channel: h.channelHex }, "conn-1")) as Record<string, unknown>;
+    expect(res.retired).toBe(false);
+
+    // The channel identity is still loaded, so the rows must stay — the guidance to finish by hand
+    // still needs them, and a still-loaded channel must still resolve locally.
+    expect(h.members.settings(h.channelHex), "settings row kept on a failed retire").not.toBeNull();
+    expect(config.get(h.channelHex), "config row kept on a failed retire").not.toBeNull();
+    expect(h.members.statusOf(h.channelHex, memberHex), "member row kept on a failed retire").toBe("active");
+  });
+
+  it("B3. info on a deleted channel asks the directory and reports channel_deleted (039-NEWCHANFIX Part B)", async () => {
+    const h = await adminHarness();
+
+    // A directory connection that answers this channel is revoked, recording each query.
+    const inbound = new Set<(f: Record<string, unknown>) => void>();
+    const asked: string[] = [];
+    const signaling: SignalingLike = {
+      registerInboundHandler(cb) { inbound.add(cb); return () => inbound.delete(cb); },
+      sendRaw(frame: unknown) {
+        const sent = frame as Record<string, unknown>;
+        const askedHex = Buffer.from(sent["channel_pubkey"] as Uint8Array).toString("hex");
+        asked.push(askedHex);
+        queueMicrotask(() => {
+          for (const cb of inbound) {
+            cb({
+              type: "channel_admin_result",
+              channel_pubkey: new Uint8Array(Buffer.from(askedHex, "hex")),
+              registered: false, channel: false, revoked: true,
+            });
+          }
+        });
+        return Promise.resolve({ ok: true as const });
+      },
+    };
+    h.setSignaling(signaling);
+
+    // Delete with a successful retire — this forgets the local settings and config rows.
+    h.setOpenSessions([]);
+    const del = (await h.handlers.get("cello_channel_delete")!({ channel: h.channelHex }, "conn-1")) as Record<string, unknown>;
+    expect(del.retired).toBe(true);
+
+    // With the rows gone, `info` can no longer answer locally — it asks the directory, which says
+    // the channel is revoked, and that surfaces as channel_deleted.
+    const info = (await h.handlers.get("cello_channel_info")!({ channel: h.channelHex }, "conn-1")) as Record<string, unknown>;
+    expect(info.ok).toBe(false);
+    expect(info.reason).toBe("channel_deleted");
+    // The directory was asked exactly once, for this channel — the local short-circuit is gone.
+    expect(asked, "info reached the directory once for the deleted channel").toEqual([h.channelHex]);
   });
 });

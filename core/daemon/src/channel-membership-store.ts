@@ -340,6 +340,19 @@ export class ChannelMembershipStore {
     return { generation, remaining };
   }
 
+  /**
+   * Forget everything this store holds for a channel: its settings row (in `channel_config`) and all
+   * of its member rows. Called by the delete verb after the channel identity has been retired, so a
+   * deleted channel no longer answers locally and `info`/`join` ask the directory like any other
+   * daemon. The channel's post log lives in a different store and is deliberately NOT touched — it is
+   * the admin's own record of what it published.
+   */
+  forget(channelHex: string): void {
+    const channel = channelHex.toLowerCase();
+    this.#db.prepare(`DELETE FROM channel_members WHERE channel_pubkey = ?`).run(channel);
+    this.#db.prepare(`DELETE FROM channel_config WHERE channel_pubkey = ?`).run(channel);
+  }
+
   /** Mint the FIRST generation for a channel that has never issued a key. */
   startGeneration(channelHex: string): number {
     this.#db

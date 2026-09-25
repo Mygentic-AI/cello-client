@@ -123,4 +123,12 @@ export class ChannelConfigStore {
       channel_pubkey: channelHex, access: config.access, relays: config.relays.length,
     });
   }
+
+  /**
+   * Delete this channel's config row. Called by the delete verb after a successful retire, so a
+   * deleted channel is no longer answered from local config and `info` asks the directory instead.
+   */
+  forget(channelHex: string): void {
+    this.#db.prepare(`DELETE FROM channel_config WHERE channel_pubkey = ?`).run(channelHex.toLowerCase());
+  }
 }
