@@ -707,27 +707,18 @@ async function startDaemonHoldingLock(
     resolveAgentId: (agentName) => sessionNodeManager.resolveAgentId(agentName),
     resolveCurrentAgent: (connectionId, explicitAgent) =>
       resolveCurrentAgent(perConnectionState.get(connectionId), explicitAgent),
-    // 041-HELPTRUTH Part A: `cello channels` with no selection groups by operator agent, so it needs
-    // the same agents/channels partition every other surface uses (M16 033-CHANNELVIEW).
+    // 041-HELPTRUTH: isChannelAgent (Part A), channelLastSeq (Part B) and fetchChannelInfo (Part C, both late-bound to channelWiring below) — full contracts on channel-membership-wiring.ts.
     isChannelAgent: channelAgentLookup(sessionNodeManager, logger),
     activeSessionsFor: (agentName) => sessionNodeManager.getSessionsForAgent(agentName)
       .filter((s) => s.status === "active")
       .map((s) => ({ sessionId: s.session_id, counterpartyPubkeyHex: s.counterparty_pubkey })),
     // M16 020-CHANADMIN: the subscriber asks the directory who administers a channel; no stream, no join.
     signalingFor: (agentName) => signalingFor(agentName) ?? null,
-    // M16 022 `join` opens a session with the channel's admin; 034-LIFECYCLE delete prunes via the
-    // publishing half through a closure that runs long after `channelWiring` is assigned below.
     openSessionFor: (agentName, opts) => openSessionFor(agentName, opts),
     pruneAllPosts: (agentName, channelHex) => channelWiring.pruneAllPosts(agentName, channelHex),
-    // 041-HELPTRUTH Part B: the post count for a channel this agent administers, from the publishing
-    // half's log. Late-bound like pruneAllPosts — `channelWiring` is assigned just below.
     channelLastSeq: (channelHex) => channelWiring.channelLastSeq(channelHex),
-    // 041-HELPTRUTH Part C: a member's `info` refreshes the description from the channel's relays,
-    // through the publishing half's relay client. Late-bound, same as above.
     fetchChannelInfo: (relays, channelHex) => channelWiring.fetchInfo(relays, channelHex),
-    // 038-RETESTFIX Part B: a newly-active subscription collects its existing posts at once, through
-    // the SAME collectNow the wake uses. Assigned below (after the collector exists), so this closure
-    // reads it only when an acceptance is processed — long after wiring, like pruneAllPosts above.
+    // 038-RETESTFIX Part B: a newly-active subscription collects its existing posts via the wake's collectNow, assigned below after the collector exists.
     collectNow: (agentId) => channelCollectNow?.(agentId),
   });
 
