@@ -102,7 +102,7 @@ export type SubscriberJoinResult =
   | { ok: true; channelHex: string; generation: number }
   | {
       ok: false;
-      reason: "not_a_join_frame" | "malformed" | "not_admin_of_channel" | "admin_unresolved" | "key_unwrap_failed" | "no_key_provider" | "refused_by_admin" | "membership_ended";
+      reason: "not_a_join_frame" | "malformed" | "not_admin_of_channel" | "admin_unresolved" | "key_unwrap_failed" | "no_key_provider" | "refused_by_admin" | "membership_ended" | "not_subscribed";
       /**
        * M16 021-WAKE item 21: WHY, when the reason alone cannot say.
        *
@@ -352,24 +352,29 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
          * who the peer IS, not that they administer the channel; the accept/rekey branch below makes
          * the same admin check. Without it, any peer that can open a session could mark you ejected or
          * your channel deleted. So: only when a subscription exists AND the sender is its admin do we
-         * mark it. A non-admin sender changes nothing and rings nothing. When there is no subscription
-         * there is nothing to mark, but the operator is still told (the same as the old refusal path).
+         * mark it. A non-admin sender changes nothing and rings nothing. With no subscription there is
+         * no membership to end and no admin to check the sender against, so it rings nothing either —
+         * otherwise any peer could fake a "removed" notice for a channel this agent never followed.
          */
         const ended = decodeChannelMembershipEnded(content);
         if (ended.ok) {
           const reason = ended.frame.reason;
           const endedHex = Buffer.from(ended.frame.channel_pubkey).toString("hex");
           const sub = subscriptions.get(agentId, endedHex);
-          if (sub !== null) {
-            if (sub.admin_pubkey.toLowerCase() !== counterpartyHex.toLowerCase()) {
-              logger.warn("channel.membership.ended.not_admin", {
-                channel_pubkey: endedHex, sender: counterpartyHex, reason,
-              });
-              return { ok: false, reason: "not_admin_of_channel" };
-            }
-            if (reason === "ejected") subscriptions.markEjected(agentId, endedHex);
-            else subscriptions.markClosed(agentId, endedHex);
+          if (sub === null) {
+            logger.warn("channel.membership.ended.not_subscribed", {
+              channel_pubkey: endedHex, sender: counterpartyHex, reason,
+            });
+            return { ok: false, reason: "not_subscribed" };
           }
+          if (sub.admin_pubkey.toLowerCase() !== counterpartyHex.toLowerCase()) {
+            logger.warn("channel.membership.ended.not_admin", {
+              channel_pubkey: endedHex, sender: counterpartyHex, reason,
+            });
+            return { ok: false, reason: "not_admin_of_channel" };
+          }
+          if (reason === "ejected") subscriptions.markEjected(agentId, endedHex);
+          else subscriptions.markClosed(agentId, endedHex);
           deps.onMembershipEnded?.(agentId, endedHex, reason);
           return { ok: false, reason: "membership_ended", detail: reason };
         }

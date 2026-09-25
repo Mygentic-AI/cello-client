@@ -604,16 +604,32 @@ describe("M16 019 Part B — the join exchange", () => {
     expect(f.subs.get("agent-2", f.channelHex)?.status).toBe("ejected");
   });
 
+  it("038 review LOW: a membership-ended frame for a channel this agent does not follow rings nothing", async () => {
+    // With no subscription there is no stored admin to check the sender against, so any peer could
+    // otherwise fake a "you were removed" / "channel deleted" doorbell for an arbitrary channel.
+    const f = await fixture("invite_only");
+    const stranger = generateKeypair();
+    const strangerHex = hex(await stranger.getPublicKey());
+    for (const reason of ["ejected", "channel_closed"] as const) {
+      const frame = encodeChannelMembershipEnded({ channel_pubkey: await f.channelKp.getPublicKey(), reason });
+      const res = await f.exchange.onSubscriberFrame("agent-2", "s1", strangerHex, frame);
+      expect(res).toEqual({ ok: false, reason: "not_subscribed" });
+    }
+    expect(f.membershipEnded, "no removal doorbell for a channel never followed").toEqual([]);
+    expect(f.subs.get("agent-2", f.channelHex)).toBeNull();
+  });
+
   it("034-LIFECYCLE: a membership-ended(ejected) for a channel NOT subscribed does not throw and marks nothing", async () => {
     // The member never joined. Marking must be guarded on the subscription existing — a bare
     // markEjected would throw subscription_unknown and take the handler down.
     const f = await fixture("invite_only");
     const ejected = encodeChannelMembershipEnded({ channel_pubkey: await f.channelKp.getPublicKey(), reason: "ejected" });
     const result = await f.exchange.onSubscriberFrame("agent-2", "s1", f.adminHex, ejected);
-    expect(result.ok).toBe(false);
+    expect(result).toEqual({ ok: false, reason: "not_subscribed" });
     expect(f.subs.get("agent-2", f.channelHex)).toBeNull();
-    // Nothing to mark, but the operator is still told the membership ended.
-    expect(f.membershipEnded).toEqual([{ agentId: "agent-2", channelHex: f.channelHex, reason: "ejected" }]);
+    // 038 review LOW: no doorbell either — with no subscription there is no stored admin to check
+    // the sender against, so a notice here is one any peer could fake.
+    expect(f.membershipEnded).toEqual([]);
   });
 
   it("a frame that is not a join frame is NOT consumed — it is somebody talking", async () => {
