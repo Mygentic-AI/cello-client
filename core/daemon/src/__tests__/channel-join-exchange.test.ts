@@ -430,6 +430,57 @@ describe("M16 019 Part B — the join exchange", () => {
     expect(fr.joinAnswers).toEqual([{ agentId: "agent-2", channelHex: fr.channelHex, outcome: "refused", reason: "ejected" }]);
   });
 
+  it("034-LIFECYCLE test 3: a refused(ejected) frame marks a subscribed channel `ejected` and fires onJoinAnswer", async () => {
+    const f = await fixture("invite_only");
+    // The member is genuinely subscribed — this is the state an eject arrives into.
+    f.subs.upsert({
+      agent_id: "agent-2", channel_pubkey: f.channelHex, admin_pubkey: f.adminHex,
+      access: "invite_only", relays: [RELAY_A, RELAY_B],
+    });
+    f.subs.addKey("agent-2", f.channelHex, { generation: 1, key: new Uint8Array(32) }, 1000);
+    expect(f.subs.get("agent-2", f.channelHex)?.status).toBe("active");
+
+    const ejected = encodeChannelJoinRefused({ channel_pubkey: await f.channelKp.getPublicKey(), reason: "ejected" });
+    const result = await f.exchange.onSubscriberFrame("agent-2", "s1", f.adminHex, ejected);
+    expect(result.ok).toBe(false);
+
+    // ⚠️ THE SUBSCRIPTION IS MARKED, so it stops looking like a normal one forever — the live defect.
+    expect(f.subs.get("agent-2", f.channelHex)?.status).toBe("ejected");
+    // And the doorbell fires so the operator learns of it (032's onJoinAnswer, reason carried).
+    expect(f.joinAnswers).toEqual([{ agentId: "agent-2", channelHex: f.channelHex, outcome: "refused", reason: "ejected" }]);
+    // The kept key is untouched: earlier posts stay readable.
+    expect(f.subs.keysFor("agent-2", f.channelHex)).toHaveLength(1);
+  });
+
+  it("034-LIFECYCLE test 7: a refused(channel_closed) frame marks a subscribed channel `closed` and fires onJoinAnswer", async () => {
+    const f = await fixture("invite_only");
+    f.subs.upsert({
+      agent_id: "agent-2", channel_pubkey: f.channelHex, admin_pubkey: f.adminHex,
+      access: "invite_only", relays: [RELAY_A, RELAY_B],
+    });
+    f.subs.addKey("agent-2", f.channelHex, { generation: 1, key: new Uint8Array(32) }, 1000);
+
+    const closed = encodeChannelJoinRefused({ channel_pubkey: await f.channelKp.getPublicKey(), reason: "channel_closed" });
+    const result = await f.exchange.onSubscriberFrame("agent-2", "s1", f.adminHex, closed);
+    expect(result.ok).toBe(false);
+
+    // `closed`, NOT `ejected`: the whole channel is gone, and the doorbell renders differently for it.
+    expect(f.subs.get("agent-2", f.channelHex)?.status).toBe("closed");
+    expect(f.joinAnswers).toEqual([{ agentId: "agent-2", channelHex: f.channelHex, outcome: "refused", reason: "channel_closed" }]);
+    expect(f.subs.keysFor("agent-2", f.channelHex)).toHaveLength(1);
+  });
+
+  it("034-LIFECYCLE: a refused(ejected) for a channel NOT subscribed does not throw and marks nothing", async () => {
+    // The member never joined. Marking must be guarded on the subscription existing — a bare
+    // markEjected would throw subscription_unknown and take the handler down.
+    const f = await fixture("invite_only");
+    const ejected = encodeChannelJoinRefused({ channel_pubkey: await f.channelKp.getPublicKey(), reason: "ejected" });
+    const result = await f.exchange.onSubscriberFrame("agent-2", "s1", f.adminHex, ejected);
+    expect(result.ok).toBe(false);
+    expect(f.subs.get("agent-2", f.channelHex)).toBeNull();
+    expect(f.joinAnswers).toEqual([{ agentId: "agent-2", channelHex: f.channelHex, outcome: "refused", reason: "ejected" }]);
+  });
+
   it("a frame that is not a join frame is NOT consumed — it is somebody talking", async () => {
     const f = await fixture("open");
     const message = new TextEncoder().encode("hello, are you there?");

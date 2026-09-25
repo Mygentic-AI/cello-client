@@ -81,7 +81,12 @@ export interface ChannelSubscription {
   retention_seconds: number;
   delivered_through: number;
   processed_through: number;
-  status: "active" | "left" | "ejected";
+  /**
+   * `closed` (034-LIFECYCLE) is the admin deleting the WHOLE channel — distinct from `ejected` (this
+   * member alone was removed) and `left` (the subscriber's own choice). The column is TEXT, so this
+   * is a new value, not a migration.
+   */
+  status: "active" | "left" | "ejected" | "closed";
 }
 
 export type ChannelSubscriptionErrorCode = "subscription_unknown" | "position_regression";
@@ -176,6 +181,22 @@ export class ChannelSubscriptionStore {
            FROM channel_subscriptions WHERE status = 'active' ORDER BY channel_pubkey ASC, agent_id ASC`,
       )
       .all() as Row[];
+    return rows.map((r) => this.#toSubscription(r));
+  }
+
+  /**
+   * What `cello_channels` shows ONE agent: everything but `left` — active channels, and the
+   * `ejected` / `closed` ones so the operator can see WHY a channel went quiet (034-LIFECYCLE). A
+   * `left` channel is the operator's own choice and stays hidden, matching the leave guidance. Keyed
+   * on `agent_id`, the stable identity.
+   */
+  listedFor(agentId: string): ChannelSubscription[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT agent_id, channel_pubkey, admin_pubkey, access, relays, moniker, guidance, retention_seconds, delivered_through, processed_through, status
+           FROM channel_subscriptions WHERE agent_id = ? AND status != 'left' ORDER BY channel_pubkey ASC`,
+      )
+      .all(agentId) as Row[];
     return rows.map((r) => this.#toSubscription(r));
   }
 
@@ -285,7 +306,17 @@ export class ChannelSubscriptionStore {
     this.#setStatus(agentId, channelPubkeyHex, "ejected");
   }
 
-  #setStatus(agentId: string, channelPubkeyHex: string, status: "active" | "left" | "ejected"): void {
+  /**
+   * The admin DELETED the whole channel (034-LIFECYCLE). Distinct from `ejected` — that removed one
+   * member and the channel lives on; this says the channel itself is gone. Like `ejected`, the
+   * subscriber's kept keys stay so earlier posts remain readable; unlike `left`, they did not choose
+   * it, so an operator asking why a channel went quiet needs to see which of the three happened.
+   */
+  markClosed(agentId: string, channelPubkeyHex: string): void {
+    this.#setStatus(agentId, channelPubkeyHex, "closed");
+  }
+
+  #setStatus(agentId: string, channelPubkeyHex: string, status: "active" | "left" | "ejected" | "closed"): void {
     const changed = this.#db
       .prepare(`UPDATE channel_subscriptions SET status = ? WHERE agent_id = ? AND channel_pubkey = ?`)
       .run(status, agentId, channelPubkeyHex.toLowerCase());
@@ -340,7 +371,7 @@ export class ChannelSubscriptionStore {
       retention_seconds: Number(row.retention_seconds),
       delivered_through: Number(row.delivered_through),
       processed_through: Number(row.processed_through),
-      status: row.status as "active" | "left" | "ejected",
+      status: row.status as "active" | "left" | "ejected" | "closed",
     };
   }
 }

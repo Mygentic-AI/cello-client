@@ -118,6 +118,34 @@ describe("M16 019 Part D — subscription state", () => {
     expect(subs.active()).toEqual([]);
   });
 
+  it("034-LIFECYCLE: markClosed is its own state, and listedFor shows everything but `left`", () => {
+    // The channel was deleted by its admin. `closed` is distinct from `ejected` (that member alone)
+    // and from `left` (the subscriber's own choice) — the collector still stops (active() excludes
+    // it), but the operator's list should still show it so they see WHY it went quiet.
+    subs.markClosed(AGENT, CHANNEL);
+    expect(subs.get(AGENT, CHANNEL)?.status).toBe("closed");
+    expect(subs.active(), "a closed channel is not collected").toEqual([]);
+
+    // listedFor is what `cello_channels` reads: active AND ejected AND closed, never `left`.
+    const active = "cc".repeat(32);
+    const ejected = "dd".repeat(32);
+    const left = "ff".repeat(32);
+    for (const ch of [active, ejected, left]) {
+      subs.upsert({ agent_id: AGENT, channel_pubkey: ch, admin_pubkey: ADMIN, access: "open", relays: [RELAY_A] });
+    }
+    subs.markEjected(AGENT, ejected);
+    subs.markLeft(AGENT, left);
+
+    const listed = subs.listedFor(AGENT).map((s) => [s.channel_pubkey, s.status]);
+    // CHANNEL is closed, `active` is active, `ejected` is ejected — all three show; `left` is hidden.
+    expect(new Map(listed)).toEqual(new Map([
+      [CHANNEL, "closed"],
+      [active, "active"],
+      [ejected, "ejected"],
+    ]));
+    expect(listed.map(([ch]) => ch)).not.toContain(left);
+  });
+
   it("21c. the gate's lookup takes an agent ID — a NAME matches nothing, and nothing reads as allow", () => {
     /**
      * ⚠️ **THE DEFECT THIS PINS WAS INVISIBLE FROM BOTH SIDES.** The inbound path hands the gate

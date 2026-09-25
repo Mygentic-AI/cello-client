@@ -316,6 +316,19 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
         if (refused.ok) {
           const reason = refused.frame.reason;
           const refusedHex = Buffer.from(refused.frame.channel_pubkey).toString("hex");
+          /**
+           * M16 034-LIFECYCLE: an `ejected` / `channel_closed` refusal is not the answer to a fresh
+           * request — it is the admin telling an EXISTING member they are out (that one alone, or the
+           * whole channel is gone). Mark the subscription so it stops looking like a normal one; the
+           * kept keys are untouched, so earlier posts stay readable. GUARDED on the subscription
+           * existing — `markEjected`/`markClosed` throw `subscription_unknown` on an absent row, and a
+           * refusal for a channel this agent never joined must not take the handler down.
+           */
+          if ((reason === "ejected" || reason === "channel_closed")
+            && subscriptions.get(agentId, refusedHex) !== null) {
+            if (reason === "ejected") subscriptions.markEjected(agentId, refusedHex);
+            else subscriptions.markClosed(agentId, refusedHex);
+          }
           if (reason === "pending_approval") deps.onJoinAnswer?.(agentId, refusedHex, "pending");
           else deps.onJoinAnswer?.(agentId, refusedHex, "refused", reason);
           return { ok: false, reason: "refused_by_admin", detail: reason };
