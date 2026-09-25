@@ -1566,6 +1566,9 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "  Every channel this agent follows or publishes, with how many posts are waiting.\n" +
       "  'unread' is the gap between what the daemon has FETCHED and what you have READ —\n" +
       "  'cello channel read <channel>' closes it.",
+    // The usage shows `--agent`, so the parser must recognize it — without this, `cello channels
+    // --agent X` was rejected as "Unknown flag" for a flag its own help documents.
+    flags: AGENT_FLAG,
     jsonOut: true,
     async run(ctx, args) {
       const { agent } = parityOpts(args);
@@ -1599,14 +1602,14 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "Usage: cello channel info <channel> [--agent <agent>]\n" +
       "       cello channel join <channel> [<note>] [--agent <agent>]\n" +
       "       cello channel read <channel> [--all] [--agent <agent>]\n" +
-      "       cello channel name <channel> <label> | leave <channel>\n" +
+      "       cello channel name <channel> <label> [--agent <agent>] | leave <channel> [--agent <agent>]\n" +
       "       cello channel create <name> <access> [--guidance <text>] [--agent <agent>]\n" +
       "       cello channel setup <channel> <access> <relay> <relay> [--agent <agent>]\n" +
       "       cello channel publish <channel> <title> <body> [--agent <agent>]\n" +
-      "       cello channel info-set <channel> [--agent <agent>]\n" +
+      "       cello channel info-set <channel> [--guidance <text>] [--agent <agent>]\n" +
       "       cello channel prune <channel> <through_seq> [--agent <agent>]\n" +
       "       cello channel resend <channel> [<relay>] [--agent <agent>]\n" +
-      "       cello channel eject <channel> <member> | approve <channel> <member> | refuse <channel> <member>\n" +
+      "       cello channel eject <channel> <member> | approve <channel> <member> | refuse <channel> <member> [--agent <agent>]\n" +
       "       cello channel delete <channel> [--agent <agent>]\n" +
       "  <channel> is the channel's 64-character hex public key.\n" +
       "  'create' comes FIRST for a channel you run: it registers the channel identity <name>,\n" +
@@ -1620,8 +1623,10 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "  It goes to the channel's two relays. ONE relay refusing is not a failed publish — the post\n" +
       "  is in your log either way, and 'resend' refills a relay that lost it or one you just added.\n" +
       "  'prune' drops posts from the OLDEST end only, through the number you give.\n" +
-      "  'info-set' signs and deposits the channel's description so subscribers can read it.\n" +
-      "  'list' shows the channels you follow and how many posts are unread. 'name' is a label only\n" +
+      "  'info-set' signs and deposits the channel's description so subscribers can read it; pass\n" +
+      "  --guidance <text> to change the description first — existing members see the new text the\n" +
+      "  next time they run 'channel info'. 'cello channels' lists the channels you follow and how\n" +
+      "  many posts are unread. 'name' is a label only\n" +
       "  you see. 'leave' is local — nothing is sent, and your keys are kept so old posts stay readable.\n" +
       "  'eject' removes a member from an invite-only channel AND rotates its key, which is what stops\n" +
       "  them reading and even fetching. <member> is their 64-character hex public key.\n" +
@@ -1632,7 +1637,14 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "  your read position; --all re-reads from the start without moving it. A post whose body\n" +
       "  will not open is listed by number rather than skipped — that usually means a key change\n" +
       "  you did not receive.",
-    flags: [{ name: "--agent", consumesValue: false }, { name: "--guidance", consumesValue: true }],
+    // `--all` is `channel read`'s own flag (re-read from the start without moving the read
+    // position). It was documented in the usage and honoured by the run handler but never declared,
+    // so `cello channel read <k> --all` was rejected as "Unknown flag" before dispatch.
+    flags: [
+      { name: "--agent", consumesValue: false },
+      { name: "--guidance", consumesValue: true },
+      { name: "--all", consumesValue: false },
+    ],
     jsonOut: true,
     async run(ctx, args) {
       const { agent, positional } = parityOpts(args);

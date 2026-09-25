@@ -204,6 +204,37 @@ describe("F2: unknown flags are rejected, not coerced to positionals", () => {
     expect(checkArgs("refresh", ["alice"])).toEqual({ kind: "ok" });
   });
 
+  // ─── M16 035-INFOCLI item 3: the channel verbs must accept the flags their usage lists ───
+  describe("035 item 3 — channel flags parse instead of 'Unknown flag'", () => {
+    const CH = "aa".repeat(32);
+    it("`channels --agent X` is accepted (its usage lists --agent, the spec declared none)", () => {
+      // Live: `cello channels --agent X` → "Unknown flag" because the `channels` spec declared no flags.
+      expect(checkArgs("channels", ["--agent", "alice"])).toEqual({ kind: "ok" });
+    });
+    it("`channel read <k> --all` is accepted (--all was undeclared on the `channel` spec)", () => {
+      // Live: `cello channel read <k> --all` → "Unknown flag".
+      expect(checkArgs("channel", ["read", CH, "--all"])).toEqual({ kind: "ok" });
+    });
+    it("--agent parses on the admin verbs its usage now shows (approve/refuse/eject/name/leave)", () => {
+      expect(checkArgs("channel", ["approve", CH, "22".repeat(32), "--agent", "alice"])).toEqual({ kind: "ok" });
+      expect(checkArgs("channel", ["eject", CH, "22".repeat(32), "--agent", "alice"])).toEqual({ kind: "ok" });
+      expect(checkArgs("channel", ["leave", CH, "--agent", "alice"])).toEqual({ kind: "ok" });
+    });
+    it("an unknown flag on a channel verb is still rejected", () => {
+      expect(checkArgs("channel", ["read", CH, "--bogus"])).toEqual({ kind: "unknown_flag", flag: "--bogus" });
+    });
+  });
+
+  // ─── M16 035-INFOCLI item 4: the help must not name a `list` verb that does not exist ───
+  it("035 item 4 — the `channel` help no longer claims a 'list' verb", () => {
+    const help = helpForCommand("channel");
+    // The command is `cello channels`, not `cello channel list` — the sentence "'list' shows the
+    // channels you follow…" pointed at a verb that never existed.
+    expect(help).not.toContain("'list' shows");
+    // delete (034) stays listed in the usage.
+    expect(help).toContain("channel delete");
+  });
+
   // M10B / DOD-END-SURFACE-1 F8 — verbs that take FREE PROSE.
   describe("the `--` terminator protects prose from flag parsing", () => {
     it("a dash-leading token after `--` is text, not an unknown flag", () => {
