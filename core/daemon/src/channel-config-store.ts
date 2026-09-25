@@ -14,6 +14,7 @@
  */
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
+import { addColumnIfMissing } from "./column-birth.js";
 import type { ChannelAccess } from "@cello-protocol/protocol-types";
 
 /** Seven days, matching the relay's own default retention. */
@@ -47,6 +48,34 @@ export const CHANNEL_CONFIG_CREATE_SQL = `
   );
 `;
 
+/**
+ * 042-UPGRADE Part A: add the three columns `channel_config` grew after its first commit (018,
+ * @798de4fb) to a table an operator already holds. `CREATE TABLE IF NOT EXISTS` does nothing to an
+ * existing table, so a daemon that created `channel_config` before these columns existed never got
+ * them — live on the Hermes box that surfaced as `cello_channel_join` failing
+ * `no such column: members_visible`.
+ *
+ * ⚠️ **BOTH `ChannelConfigStore` AND `ChannelMembershipStore` READ `channel_config`, and either can
+ * be constructed first.** So this lives in one exported function both constructors call after the
+ * CREATE — whichever opens first upgrades the table, and the second call is a no-op via the
+ * duplicate-column guard. On a fresh database the CREATE already made these columns, so every
+ * `addColumnIfMissing` here is a no-op — the table gets exactly today's schema.
+ */
+export function upgradeChannelConfigColumns(db: DaemonDatabase, logger: Logger): void {
+  addColumnIfMissing(db, logger, {
+    table: "channel_config", column: "members_visible",
+    sql: "ALTER TABLE channel_config ADD COLUMN members_visible INTEGER NOT NULL DEFAULT 0",
+  });
+  addColumnIfMissing(db, logger, {
+    table: "channel_config", column: "key_generation",
+    sql: "ALTER TABLE channel_config ADD COLUMN key_generation INTEGER NOT NULL DEFAULT 0",
+  });
+  addColumnIfMissing(db, logger, {
+    table: "channel_config", column: "admin_pubkey",
+    sql: "ALTER TABLE channel_config ADD COLUMN admin_pubkey TEXT NOT NULL DEFAULT ''",
+  });
+}
+
 export interface ChannelConfig {
   access: ChannelAccess;
   relays: string[];
@@ -65,6 +94,7 @@ export class ChannelConfigStore {
     this.#db = db;
     this.#logger = logger;
     this.#db.exec(CHANNEL_CONFIG_CREATE_SQL);
+    upgradeChannelConfigColumns(this.#db, this.#logger);
   }
 
   get(channelHex: string): ChannelConfig | null {

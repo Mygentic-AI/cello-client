@@ -35,7 +35,7 @@ import type { ChannelAccess } from "@cello-protocol/protocol-types";
  * `channel_config` while the database was still empty. If you are about to add a second table for a
  * publisher's decisions about its own channel: that is this bug.
  */
-import { CHANNEL_CONFIG_CREATE_SQL } from "./channel-config-store.js";
+import { CHANNEL_CONFIG_CREATE_SQL, upgradeChannelConfigColumns } from "./channel-config-store.js";
 export { CHANNEL_CONFIG_CREATE_SQL };
 
 export const CHANNEL_MEMBERS_CREATE_SQL = `
@@ -104,6 +104,9 @@ export class ChannelMembershipStore {
     this.#db = db;
     this.#logger = logger;
     this.#db.exec(CHANNEL_CONFIG_CREATE_SQL);
+    // 042-UPGRADE Part A: this store reads `channel_config` too and can be constructed before
+    // ChannelConfigStore, so it upgrades the shared table itself — whichever opens first wins.
+    upgradeChannelConfigColumns(this.#db, this.#logger);
     this.#db.exec(CHANNEL_MEMBERS_CREATE_SQL);
   }
 
