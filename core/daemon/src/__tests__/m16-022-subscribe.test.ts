@@ -290,4 +290,28 @@ describe("M16 022 — read", () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe("not_subscribed");
   });
+
+  it("036-PUBLICSUB test 5: read on a PUBLIC subscription returns posts as plaintext WITHOUT attempting decryption", async () => {
+    /**
+     * ⚠️ A public channel's posts are stored in clear (028) — there is no key. The read path must
+     * return the body as plaintext directly; routing a public body through decryptBody finds no key
+     * for it and reports it `undecryptable`, so a public reader would see nothing. The decrypt seam
+     * is stubbed to RETURN NULL here so the test reddens the moment the code touches it.
+     */
+    subs.upsert({ agent_id: AGENT, channel_pubkey: CHANNEL, admin_pubkey: ADMIN, access: "public", relays: [RELAY] });
+    subs.setDeliveredThrough(AGENT, CHANNEL, 1);
+    await storePost(1, "bulletin", "the morning news");
+
+    const decrypt = vi.fn((): Promise<Uint8Array | null> => Promise.resolve(null));
+    const { api } = build({ decrypt });
+    const r = await api.read(AGENT, CHANNEL);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.posts.map((p) => p.body)).toEqual(["the morning news"]);
+      expect(r.undecryptable, "a public post is never undecryptable — there is nothing to decrypt").toEqual([]);
+    }
+    // ⚠️ The decrypt seam was NEVER reached: a public read does not decrypt.
+    expect(decrypt, "public read must not call decryptBody").not.toHaveBeenCalled();
+    expect(subs.get(AGENT, CHANNEL)?.processed_through).toBe(1);
+  });
 });

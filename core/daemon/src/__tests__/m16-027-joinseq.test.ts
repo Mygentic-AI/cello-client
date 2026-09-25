@@ -58,7 +58,7 @@ function makeSender(fx: TwoConnectionFixture, sendResult: SendResult): {
 }
 
 const REFUSED = () =>
-  encodeChannelJoinRefused({ channel_pubkey: new Uint8Array(32).fill(7), reason: "channel_is_public" });
+  encodeChannelJoinRefused({ channel_pubkey: new Uint8Array(32).fill(7), reason: "refused_by_admin" });
 
 function transcriptRows(fx: TwoConnectionFixture): Array<{ sequence: number; direction: string }> {
   return fx.snm.getDb()

@@ -33,7 +33,7 @@ export type ChannelInfoResult =
 
 export type ChannelJoinResult =
   | { ok: true; channelHex: string; state: "requested" }
-  | { ok: false; reason: "not_a_channel" | "unavailable" | "no_session" | "send_failed" | "channel_is_public"; detail?: string };
+  | { ok: false; reason: "not_a_channel" | "unavailable" | "no_session" | "send_failed"; detail?: string };
 
 export interface ReadPost {
   seq: number;
@@ -116,14 +116,12 @@ export function createChannelSubscribe(deps: ChannelSubscribeDeps) {
     if (found.kind === "unavailable") return { ok: false, reason: "unavailable", detail: found.reason };
 
     /**
-     * ⚠️ **A PUBLIC CHANNEL'S `channel_is_public` COMES FROM THE ADMIN, NOT FROM HERE, AND THAT IS
-     * NOT A CHOICE.** The directory's answer carries `registered`, `channel` and `admin_pubkey` and
-     * says nothing about access, so this side cannot know. 019's admin half already refuses a join
-     * to a public channel by that name and the refusal arrives on the session.
-     *
-     * A pre-check here would have been dead code that looked like a guard. Recorded in the order
-     * instead: subscribing to a public channel has no path at all yet, because there is no
-     * acceptance to carry its relays.
+     * ⚠️ **THIS VERB DOES NOT BRANCH ON ACCESS, AND MUST NOT.** The directory's answer carries
+     * `registered`, `channel` and `admin_pubkey` and says nothing about access, so this side cannot
+     * know whether a channel is public, open or invite-only. It sends the same join request either
+     * way; the admin's half decides. Since 036-PUBLICSUB the admin ADMITS a public join (with an
+     * empty-bundle acceptance carrying the relays) rather than refusing it, so a public subscription
+     * now completes through the ordinary path.
      */
     const subscriberHex = deps.agentPubkey(agentName);
     if (subscriberHex === null) return { ok: false, reason: "no_session", detail: "agent_unknown" };
@@ -177,7 +175,14 @@ export function createChannelSubscribe(deps: ChannelSubscribeDeps) {
       let highest = sub.processed_through;
 
       for (const entry of stored) {
-        const plain = await deps.decrypt(agentId, channelHex, entry.seq, entry.body);
+        /**
+         * ⚠️ **A PUBLIC CHANNEL'S POSTS ARE STORED IN CLEAR (028, 036-PUBLICSUB) — do not decrypt.**
+         * There is no group key for a public subscription, so routing the body through `decryptBody`
+         * would find no key and report every post `undecryptable`. The body IS the plaintext.
+         */
+        const plain = sub.access === "public"
+          ? entry.body
+          : await deps.decrypt(agentId, channelHex, entry.seq, entry.body);
         if (plain === null) {
           /**
            * ⚠️ **THE READ POSITION STOPS HERE.** Naming the post and then advancing past it is

@@ -168,9 +168,32 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
      */
     if (!settings) return { ok: false, reason: "channel_not_configured_for_membership" };
 
+    const channelPubkeyPublic = await admin.channelKeyProvider.getPublicKey();
+    /**
+     * ⚠️ **A PUBLIC CHANNEL IS ADMITTED WITH NO KEY (036-PUBLICSUB).** Its posts are not encrypted,
+     * so there is nothing to mint or wrap — the acceptance carries the relays, guidance and retention
+     * and an EMPTY bundle. Minting a key here would store bytes nobody uses and that no ejection could
+     * ever bite. The empty bundle is exactly what the frame requires for `access: "public"`.
+     */
+    if (settings.access === "public") {
+      await deps.sendInSession(sessionId, encodeChannelJoinAccepted({
+        channel_pubkey: channelPubkeyPublic,
+        key_bundle: new Uint8Array(0),
+        guidance: settings.guidance,
+        retention_seconds: settings.retention_seconds,
+        access: "public",
+        relays: settings.relays,
+        members_visible: settings.members_visible,
+      }));
+      logger.info("channel.member.joined", {
+        channel_pubkey: channelHex, subscriber_pubkey: subscriberHex, access: "public",
+      });
+      return { ok: true };
+    }
+
     // The SAME mint-or-reuse the publisher reaches, so a post made before this member joined is
     // readable with the very key delivered here. `undefined` only for the states settings rules out
-    // above (absent) or a public channel (which never admits), so it is defended, not expected.
+    // above (absent) or a public channel (handled above), so it is defended, not expected.
     const gk = ensureCurrentGroupKey({ members, subscriptions, now }, admin.agentId, channelHex);
     if (!gk) return { ok: false, reason: "channel_not_configured_for_membership" };
     const generation = gk.generation;
@@ -252,12 +275,6 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
         await refuseTo(sessionId, channelPubkey, "not_admin_of_channel");
         return { consumed: true };
       }
-      // A public channel has no keys and no membership: anyone may read it. Admitting somebody would
-      // record a membership that means nothing and promise a key that does not exist.
-      if (settings.access === "public") {
-        await refuseTo(sessionId, channelPubkey, "channel_is_public");
-        return { consumed: true };
-      }
 
       const status = members.statusOf(channelHex, namedSubscriber);
       if (status === "active") {
@@ -275,7 +292,11 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
         return { consumed: true };
       }
 
-      if (settings.access === "open") {
+      // Open and public both admit at once — the difference is only the key. A public channel's
+      // posts are not encrypted, so its acceptance carries none; `acceptInto` sends the empty-bundle
+      // frame for it (Andre's Option B, 036-PUBLICSUB). `already_member` above already handled a
+      // repeat, so this admits a first-time reader.
+      if (settings.access === "open" || settings.access === "public") {
         members.admit(channelHex, namedSubscriber, "active", now());
         await acceptInto(sessionId, channelHex, namedSubscriber, admin);
         return { consumed: true };
@@ -391,6 +412,29 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
           answered_by: counterpartyHex, profile_admin: profileAdmin,
         });
         return { ok: false, reason: "not_admin_of_channel" };
+      }
+
+      /**
+       * ⚠️ **A PUBLIC ACCEPTANCE CARRIES NO KEY — store the subscription, unwrap nothing (036-PUBLICSUB).**
+       * Reached ONLY after the admin check above, exactly as the keyed path is: the security property
+       * that the answering agent must be the channel's directory admin is identical for public. A
+       * public channel's posts are read in clear, so calling `unwrapGroupKey`/`addKey` here would try
+       * to open an empty bundle and store a phantom key. The upsert records the relays, guidance and
+       * retention the same as `open`; `onJoinAnswer` rings `admitted`, same as any admission.
+       */
+      if (acceptedFrame && acceptedFrame.access === "public") {
+        subscriptions.upsert({
+          agent_id: agentId,
+          channel_pubkey: channelHex,
+          admin_pubkey: profileAdmin,
+          access: "public",
+          relays: acceptedFrame.relays,
+          guidance: acceptedFrame.guidance,
+          retention_seconds: acceptedFrame.retention_seconds,
+          joined_at: now(),
+        });
+        deps.onJoinAnswer?.(agentId, channelHex, "admitted");
+        return { ok: true, channelHex, generation: 0 };
       }
 
       const myKeys = deps.keyProviderFor(agentId);

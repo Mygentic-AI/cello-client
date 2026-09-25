@@ -233,7 +233,7 @@ describe("M16 019 Part B — the join exchange", () => {
     expect(f.subs.keysFor("agent-2", f.channelHex)).toEqual([]);
   });
 
-  it("10. a PUBLIC channel refuses the join — there is nothing to join", async () => {
+  it("036-PUBLICSUB test 3: a PUBLIC channel ADMITS the join — accepted frame, empty bundle, the relays, NO key stored", async () => {
     const f = await fixture("public");
     const request = encodeChannelJoinRequest({
       channel_pubkey: await f.channelKp.getPublicKey(),
@@ -241,12 +241,71 @@ describe("M16 019 Part B — the join exchange", () => {
       note: "",
     });
 
+    const handled = await f.exchange.onAdminFrame("s1", f.subscriberHex, request);
+    expect(handled.consumed).toBe(true);
+    // ⚠️ Admitted, not refused (Andre's Option B). The member is recorded `active` because that is
+    // what feeds reader counts and wakes — a public reader is still a reader.
+    expect(f.members.statusOf(f.channelHex, f.subscriberHex)).toBe("active");
+
+    expect(f.sent).toHaveLength(1);
+    const accepted = decodeChannelJoinAccepted(f.sent[0].content);
+    expect(accepted.ok, accepted.ok ? "" : accepted.reason).toBe(true);
+    if (!accepted.ok) return;
+    expect(accepted.frame.access).toBe("public");
+    // Public posts are not encrypted, so the acceptance carries NO key — the bundle is empty.
+    expect(accepted.frame.key_bundle.length).toBe(0);
+    // The relays still travel: without them the reader knows the channel's name and can fetch nothing.
+    expect(accepted.frame.relays).toEqual([RELAY_A, RELAY_B]);
+    expect(accepted.frame.guidance).toBe("release notes");
+
+    // ⚠️ ZERO KEYS were minted or stored under the admin's own id — a public channel has none, and
+    // minting one would be a key nobody uses that ejection could never bite.
+    expect(f.subs.keysFor("admin-1", f.channelHex)).toEqual([]);
+  });
+
+  it("036-PUBLICSUB test 4: receiving a PUBLIC acceptance creates an active subscription with the relays and NO key, and rings admitted", async () => {
+    const f = await fixture("public");
+    const request = encodeChannelJoinRequest({
+      channel_pubkey: await f.channelKp.getPublicKey(),
+      subscriber_pubkey: await f.subscriberKp.getPublicKey(),
+      note: "",
+    });
+    // The admin admits (test 3), then the subscriber receives that very frame.
     await f.exchange.onAdminFrame("s1", f.subscriberHex, request);
-    const refused = decodeChannelJoinRefused(f.sent[0].content);
-    // A public channel has no keys and no membership: anyone may read it. Admitting somebody would
-    // record a membership that means nothing and promise a key that does not exist.
-    expect(refused.ok && refused.frame.reason).toBe("channel_is_public");
-    expect(f.members.statusOf(f.channelHex, f.subscriberHex)).toBeNull();
+    const result = await f.exchange.onSubscriberFrame("agent-2", "s1", f.adminHex, f.sent[0].content);
+    expect(result.ok, result.ok ? "" : result.reason).toBe(true);
+
+    const sub = f.subs.get("agent-2", f.channelHex);
+    expect(sub?.status).toBe("active");
+    expect(sub?.access).toBe("public");
+    expect(sub?.relays).toEqual([RELAY_A, RELAY_B]);
+    // ⚠️ NO key was unwrapped or stored — a public acceptance carries none, and calling addKey would
+    // store a phantom key. This is the assertion the revert test reddens.
+    expect(f.subs.keysFor("agent-2", f.channelHex)).toEqual([]);
+    // 032's doorbell: the reader is IN, so onJoinAnswer fires `admitted`, no reason.
+    expect(f.joinAnswers).toEqual([{ agentId: "agent-2", channelHex: f.channelHex, outcome: "admitted", reason: undefined }]);
+  });
+
+  it("036-PUBLICSUB (security): a PUBLIC acceptance from a NON-admin peer is refused and stores nothing", async () => {
+    // ⚠️ **THE ADMIN CHECK STAYS ON THE PUBLIC BRANCH.** The session proves who the peer is, not that
+    // they administer the channel. Without comparing the sender against the directory's admin, any
+    // agent that can open a session hands you a relay pair and becomes your channel — even a public
+    // one, where the reader would fetch a stranger's posts believing them the real channel's.
+    const f = await fixture("public");
+    const attacker = generateKeypair();
+    const attackerHex = hex(await attacker.getPublicKey());
+    const publicAccept = encodeChannelJoinAccepted({
+      channel_pubkey: await f.channelKp.getPublicKey(),
+      key_bundle: new Uint8Array(0), guidance: "read my relay instead", retention_seconds: 3600,
+      access: "public", relays: [RELAY_A], members_visible: true,
+    });
+
+    const result = await f.exchange.onSubscriberFrame("agent-2", "s1", attackerHex, publicAccept);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe("not_admin_of_channel");
+    // Nothing stored: no subscription created off a stranger's public acceptance.
+    expect(f.subs.get("agent-2", f.channelHex)).toBeNull();
   });
 
   it("11. already_member and ejected are refused by NAME, and an ejected member stays out", async () => {
