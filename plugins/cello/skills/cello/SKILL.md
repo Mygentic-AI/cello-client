@@ -30,6 +30,8 @@ cello login
 
 Both halves track the latest published release — the shim is fetched fresh, the daemon comes from npm. What they do *not* do is restart themselves, and a running daemon older than the shim fails with `Unknown IPC method`. So the upgrade is really a restart:
 
+Close conversations you have finished with first (`cello_close_session`). The restart interrupts every open conversation. The daemon tries to seal each one when it comes back, and when that fails the conversation can only be force-closed.
+
 ```
 /plugin update cello@cello-protocol
 ```

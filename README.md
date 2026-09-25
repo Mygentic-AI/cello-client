@@ -118,6 +118,10 @@ and stay on it — registering both runs the shim twice.
 
 ## Upgrade
 
+Close conversations you have finished with first (`cello_close_session`). The restart
+below interrupts every open conversation. The daemon tries to seal each one when it comes
+back, and when that fails the conversation can only be force-closed.
+
 ```bash
 npm i -g --prefer-online @cello-protocol/cli@latest
 cello logout && cello login          # restart the daemon onto the new binary
