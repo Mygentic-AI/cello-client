@@ -191,6 +191,8 @@ export function wireChannelPublishing(
     getPublisher: buildPublisher,
     wakeMembers: (agentName, channelHex) => sendWake(agentName, channelHex),
     setChannelConfig,
+    // 035-INFOCLI item 2: read the current config so info-set can change only the guidance.
+    getChannelConfig: (channelHex) => config.get(channelHex),
   });
 
   /**

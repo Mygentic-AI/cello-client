@@ -160,6 +160,24 @@ describe("M16 018-PUBCOLLECT: the channel verbs on a live daemon", () => {
     expect(info.detail).toBeUndefined();
   });
 
+  it("035 item 2 — info-set --guidance stores the new description before it deposits", async () => {
+    await call("cello_channel_config", {
+      agent: "alice", channel: alicePubkeyHex, access: "public",
+      relays: [RELAY_A, RELAY_B], guidance: "the original description",
+    });
+    // Change the description. The deposit fails in this harness (no relay), but item 2's job is to
+    // STORE the new text in the config first — which item 1's `info` reads back.
+    await call("cello_channel_info_set", {
+      agent: "alice", channel: alicePubkeyHex, guidance: "the new description",
+    });
+    const info = await call("cello_channel_info", { agent: "alice", channel: alicePubkeyHex }) as { guidance?: string };
+    expect(info.guidance, "info-set with --guidance must have updated the stored description").toBe("the new description");
+    // info-set WITHOUT guidance must NOT wipe the description — it only re-deposits.
+    await call("cello_channel_info_set", { agent: "alice", channel: alicePubkeyHex });
+    const info2 = await call("cello_channel_info", { agent: "alice", channel: alicePubkeyHex }) as { guidance?: string };
+    expect(info2.guidance, "info-set with no guidance must leave the description alone").toBe("the new description");
+  });
+
   it("28. a channel must be SET UP before it can publish, and the refusal says so", async () => {
     const answer = await call("cello_channel_publish", {
       agent: "alice", channel: alicePubkeyHex, title: "before setup", body: "body",

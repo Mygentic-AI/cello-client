@@ -31,6 +31,12 @@ export interface ChannelPublishDeps {
    */
   setChannelConfig: (agentName: string, channelHex: string, config: ChannelConfig) =>
     { ok: true } | { ok: false; reason: string; guidance?: string };
+  /**
+   * Read the channel's current config, or null when this daemon holds none. Used by
+   * `cello_channel_info_set` to change ONE field (the guidance) while keeping the others, so it
+   * never has to re-supply the relays/access to edit the description (035-INFOCLI item 2).
+   */
+  getChannelConfig: (channelHex: string) => ChannelConfig | null;
   /** The daemon's single agent-selection rule, injected rather than re-implemented here. */
   resolveCurrentAgent: (connectionId: string, explicitAgent?: string) => string | null;
   /**
@@ -228,6 +234,26 @@ export function registerChannelPublishHandlers(deps: ChannelPublishDeps): void {
     if (!agent.ok) return agent.answer;
     const channel = needChannel(params);
     if (!channel.ok) return channel.answer;
+
+    /**
+     * 035-INFOCLI item 2: `--guidance <text>` CHANGES the description. Store it in the same config
+     * the deposit is signed from, THEN deposit — so the record carries the new text and `channel
+     * info` reads it back. Absent guidance, nothing is stored and this is the old deposit-only path.
+     */
+    const guidance = params?.["guidance"];
+    if (typeof guidance === "string") {
+      const cfg = deps.getChannelConfig(channel.channelHex);
+      if (!cfg) {
+        // No local config means this daemon does not administer the channel, so there is nothing to
+        // edit — the same shape `cello_channel_config` gives for a channel whose key it does not hold.
+        return {
+          ok: false, reason: "channel_unknown",
+          guidance: "This daemon holds no config for that channel, so there is no description to change. Set it up first with 'cello channel setup' or 'cello channel create'.",
+        };
+      }
+      const saved = deps.setChannelConfig(agent.agentName, channel.channelHex, { ...cfg, guidance });
+      if (!saved.ok) return { ok: false, reason: saved.reason, guidance: saved.guidance };
+    }
     return depositChannelInfo(deps, agent.agentName, channel.channelHex);
   });
 

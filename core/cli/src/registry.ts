@@ -1683,7 +1683,11 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
         return legacy(await channelVerb(ctx.celloDir, "cello_channel_publish", withAgent({ channel, title: a, body: b })));
       }
       if (sub === "info-set" && channel) {
-        return legacy(await channelVerb(ctx.celloDir, "cello_channel_info_set", withAgent({ channel })));
+        // 035-INFOCLI item 2: `--guidance <text>` changes the description before it is deposited.
+        return legacy(await channelVerb(ctx.celloDir, "cello_channel_info_set", withAgent({
+          channel,
+          ...(guidanceFlag !== undefined ? { guidance: guidanceFlag } : {}),
+        })));
       }
       if (sub === "prune" && channel && a !== undefined) {
         // Parsed here so a non-numeric argument is a usage error in the terminal rather than a

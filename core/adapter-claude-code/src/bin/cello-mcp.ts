@@ -1170,10 +1170,11 @@ server.tool("cello_channel_publish", "Publish a post to a channel this agent hol
 }, async ({ channel, title, body, agent }) =>
   jsonText(await proxy.call("cello_channel_publish", { channel, title, body, ...(agent ? { agent } : {}) })));
 
-server.tool("cello_channel_info_set", "Publish the channel's description — what cello_channel_setup recorded locally — signed, to the relays, so somebody who has the channel's key can find out what it is. Deposits; the answer names which relays took the record.", {
+server.tool("cello_channel_info_set", "Publish the channel's description — what cello_channel_setup recorded locally — signed, to the relays, so somebody who has the channel's key can find out what it is. Deposits; the answer names which relays took the record. Pass `guidance` to CHANGE the description first: it is stored in the channel's config and then deposited, and existing members see the new text the next time they run cello_channel_info.", {
   channel: channelKey(),
+  guidance: z.string().optional().describe("A new description for the channel. Stored locally, then deposited; omit to re-deposit the current description unchanged."),
   agent: publisherAgent(),
-}, async ({ channel, agent }) => jsonText(await proxy.call("cello_channel_info_set", { channel, ...(agent ? { agent } : {}) })));
+}, async ({ channel, guidance, agent }) => jsonText(await proxy.call("cello_channel_info_set", { channel, ...(guidance !== undefined ? { guidance } : {}), ...(agent ? { agent } : {}) })));
 
 server.tool("cello_channel_approve", "Admit somebody who asked to join an invite-only channel. Sends them the group key and the relay pair over an open session, so they can collect posts from here on. THEY MUST BE REACHABLE RIGHT NOW: if they are not, the answer is `no_open_session` and NOTHING WAS RECORDED — run approve again when they are back. Their own request cannot restart this; asking again while pending is refused.", {
   channel: channelKey(),
