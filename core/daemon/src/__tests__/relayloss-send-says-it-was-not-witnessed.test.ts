@@ -27,7 +27,10 @@
  */
 import { describe, it, expect, afterEach } from "vitest";
 import { startTwoConnectionFixture, FakeNode, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
-import { queuedSendGuidance } from "../session-content-handlers.js";
+import { queuedSendGuidance, UNWITNESSED_SEND_GUIDANCE } from "../session-content-handlers.js";
+import { AgentRelayClient } from "../session-relay-client.js";
+import { makeFakeRelay, tick, noopLogger, fakeRelayPubkeyHex } from "./relay-client-fake.js";
+import { generateKeypair } from "@cello-protocol/crypto";
 import type { CelloNode } from "@cello-protocol/transport";
 
 const SID = "5c".repeat(32);
@@ -175,4 +178,90 @@ describe("016-RELAYLOSS — an unwitnessed send is not reported as an ordinary s
     expect(compose(undefined, false), "an unwitnessed default must not say no action is needed")
       .not.toMatch(/No action needed/);
   });
+
+  /**
+   * ─── 079-CAPREASON: THE ANSWER TELLS THE AGENT *WHY* IT IS UNWITNESSED ────────────────────────
+   *
+   * The generic guidance says "the relay did not witness it" and to close. When the relay refused
+   * the assignment for the tuple cap, the one actionable fact — you hold {concurrent} open sessions
+   * against a limit of {cap}, close some — was in a log the agent cannot read. These pin the send
+   * ANSWER: with a stored refusal it carries `relay_refusal` and the cap guidance; without one it is
+   * byte-for-byte today's text and carries no new field.
+   *
+   * The refusal is produced by driving a real `AgentRelayClient` to an `assignment_invalid` on this
+   * session and attaching it — the state the live 321b93ac session sat in (the relay refused, sends
+   * still went direct and unwitnessed). Not a hand-set flag: this exercises the whole wire, from the
+   * relay's frame through the per-session store, the node-manager getter, and the send answer.
+   */
+  it("★ an unwitnessed send whose relay refused the tuple cap says so, with the counts and cello_close_session", async () => {
+    fx = await startTwoConnectionFixture({
+      dirPrefix: "cello-caprefusal-",
+      node: new FakeNode() as unknown as CelloNode,
+    });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+    const conn = await fx.connectAs("alice");
+
+    const relayCarry = {
+      participantA: new Uint8Array(32).fill(0xa1),
+      participantB: new Uint8Array(32).fill(0xb2),
+      sessionTimestamp: 1_750_000_000_000,
+      assignmentSignature: new Uint8Array(64).fill(0xc3),
+      sessionSignature: new Uint8Array(64).fill(0xd4),
+      relayPubkeyHex: await fakeRelayPubkeyHex(),
+    };
+    const kp = generateKeypair();
+    const client = new AgentRelayClient({
+      relayPeerId: "12D3KooWRelay",
+      relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWRelay"],
+      keyProvider: kp,
+      senderPubkey: await kp.getPublicKey(),
+      logger: noopLogger,
+    });
+    const relay = makeFakeRelay({ autoRecordAssignment: false });
+    client.registerSession(SID, relay.node, undefined, relayCarry);
+    await tick();
+    relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
+    await tick();
+    relay.push({ type: "relay_auth_ok" });
+    await tick();
+    relay.push({ type: "assignment_invalid", reason: "session_tuple_cap_exceeded", concurrent_sessions: 5, session_cap: 5 });
+    await tick();
+    // PRECONDITION: the client actually holds the refusal, else this test is about nothing.
+    expect(client.getAssignmentRefusal(SID)).toEqual({ reason: "session_tuple_cap_exceeded", concurrent: 5, cap: 5 });
+
+    fx.snm.patchRelayClientForTest("alice", SID, client, Buffer.from(SID, "hex"), relayCarry);
+
+    const res = (await conn.send("cello_send", { session_id: SID, content: "over the cap" })) as Record<string, unknown>;
+    expect(res["ok"], `the send must succeed for this to be about witnessing: ${JSON.stringify(res)}`).toBe(true);
+    expect(res["witnessed"], "a session whose assignment the relay refused cannot be witnessed").toBe(false);
+
+    expect(res["relay_refusal"], `the answer must carry the relay's reason and counts: ${JSON.stringify(res)}`)
+      .toEqual({ reason: "session_tuple_cap_exceeded", concurrent: 5, cap: 5 });
+
+    const guidance = String(res["guidance"] ?? "");
+    expect(guidance, "the guidance must name the actionable fact — how many sessions are open").toMatch(/5 open sessions/);
+    // The verb that fixes it. Asserted surface-agnostically: the daemon's vocabulary layer renders a
+    // named verb per caller (MCP `cello_close_session`, CLI `cello close-session`), and the test IPC
+    // client is the CLI surface — so this passing is also proof the verb is a REAL registered one, as
+    // the affordance invariant requires (the renderer only rewrites verbs it knows).
+    expect(guidance, "and the verb that fixes it").toMatch(/cello[ _]close[-_ ]session/i);
+    client.close();
+  }, 60_000);
+
+  it("★ an unwitnessed send with NO relay refusal keeps today's exact guidance and carries no relay_refusal", async () => {
+    fx = await startTwoConnectionFixture({
+      dirPrefix: "cello-norefusal-",
+      node: new FakeNode() as unknown as CelloNode,
+    });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+    const conn = await fx.connectAs("alice");
+
+    const res = (await conn.send("cello_send", { session_id: SID, content: "no relay behind this session" })) as
+      Record<string, unknown>;
+    expect(res["ok"]).toBe(true);
+    expect(res["witnessed"]).toBe(false);
+    // No relay client on this session ⇒ no stored refusal ⇒ the generic guidance, unchanged, and no new field.
+    expect(res["relay_refusal"], "a session the relay never refused must not carry a refusal").toBeUndefined();
+    expect(res["guidance"], "the no-refusal guidance must be today's text, unchanged").toBe(UNWITNESSED_SEND_GUIDANCE);
+  }, 60_000);
 });

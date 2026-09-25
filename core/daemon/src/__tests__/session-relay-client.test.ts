@@ -23,6 +23,7 @@ import {
 } from "../session-relay-client.js";
 import { RelayReceiptStore } from "../relay-receipt-store.js";
 import { SessionSealLeafStore } from "../session-seal-leaf-store.js";
+import type { Logger } from "../types.js";
 import { makeFakeRelay, tick, noopLogger, fakeNode, fakeRelayAnchor, fakeRelayAttestation, fakeRelayPubkeyHex, pushAck } from "./relay-client-fake.js";
 
 // The fake relay rig lives in `relay-client-fake.ts` (imported above) because the SEALWIRE
@@ -788,5 +789,91 @@ describe("DOD-DOC-LEAF-1: leaf-kind wire bytes", () => {
   it("no document byte collides with the RFC 6962 internal-node prefix 0x01", () => {
     expect(LEAF_KIND_DOC).not.toBe(0x01);
     expect(LEAF_KIND_REJECT).not.toBe(0x01);
+  });
+});
+
+/**
+ * 079-CAPREASON — the relay's reason and counts for a REFUSED assignment are kept PER SESSION.
+ *
+ * When the relay refuses a session because the pair already holds the tuple cap of open sessions, it
+ * answers `assignment_invalid` with `reason: session_tuple_cap_exceeded` and the counts. Before this
+ * unit the counts reached only `#lastAuthRefusal` (per stream) and a log line; the session's own
+ * record kept nothing, so an unwitnessed send on that session could not tell the operator the one
+ * actionable fact — how many sessions they hold and what the limit is. These pin the per-session
+ * store and the count-bearing log line; the send-answer half is pinned in the cello_send test file.
+ */
+describe("AgentRelayClient: assignment refusal is kept per session with its counts (079-CAPREASON)", () => {
+  const carry = async () => ({
+    participantA: new Uint8Array(32).fill(0xa1),
+    participantB: new Uint8Array(32).fill(0xb2),
+    sessionTimestamp: 1_750_000_000_000,
+    assignmentSignature: new Uint8Array(64).fill(0xc3),
+    sessionSignature: new Uint8Array(64).fill(0xd4),
+    relayPubkeyHex: await fakeRelayPubkeyHex(),
+  });
+
+  async function connected(logger: Logger = noopLogger): Promise<AgentRelayClient> {
+    const kp = generateKeypair();
+    return new AgentRelayClient({
+      relayPeerId: "12D3KooWRelay",
+      relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWRelay"],
+      keyProvider: kp,
+      senderPubkey: await kp.getPublicKey(),
+      logger,
+    });
+  }
+
+  it("stores the tuple-cap refusal with its counts on session S, and leaves a sibling session T untouched", async () => {
+    const client = await connected();
+    const relay = makeFakeRelay({ autoRecordAssignment: false });
+    const sidS = new Uint8Array(16).fill(0x51);
+    const sidT = new Uint8Array(16).fill(0x52);
+    const sHex = Buffer.from(sidS).toString("hex");
+    const tHex = Buffer.from(sidT).toString("hex");
+
+    // T is registered but presents NO assignment, so it can never be refused — the isolation control.
+    client.registerSession(tHex, relay.node, undefined, await fakeRelayAnchor(), TEST_GENESIS);
+    // S presents an assignment; the relay refuses it for the tuple cap, WITH the counts.
+    client.registerSession(sHex, relay.node, undefined, await carry());
+    await tick();
+    relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
+    await tick();
+    relay.push({ type: "relay_auth_ok" });
+    await tick();
+    relay.push({ type: "assignment_invalid", reason: "session_tuple_cap_exceeded", concurrent_sessions: 5, session_cap: 5 });
+    await tick();
+
+    // NAME THE VALUE: the exact object the send answer will surface, not merely "something was stored".
+    expect(client.getAssignmentRefusal(sHex)).toEqual({ reason: "session_tuple_cap_exceeded", concurrent: 5, cap: 5 });
+    expect(client.getAssignmentRefusal(tHex), "a sibling session must not inherit S's refusal").toBeNull();
+    client.close();
+  });
+
+  it("the session.relay.assignment.invalid log line carries sessionShort, concurrent and cap", async () => {
+    const lines: { event: string; ctx: Record<string, unknown> }[] = [];
+    const capLogger = {
+      debug() {}, info() {},
+      warn(event: string, ctx: Record<string, unknown>) { lines.push({ event, ctx: ctx ?? {} }); },
+      error() {},
+    } as unknown as Logger;
+    const client = await connected(capLogger);
+    const relay = makeFakeRelay({ autoRecordAssignment: false });
+    const sid = new Uint8Array(16).fill(0x5e);
+    const sidHex = Buffer.from(sid).toString("hex");
+    client.registerSession(sidHex, relay.node, undefined, await carry());
+    await tick();
+    relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
+    await tick();
+    relay.push({ type: "relay_auth_ok" });
+    await tick();
+    relay.push({ type: "assignment_invalid", reason: "session_tuple_cap_exceeded", concurrent_sessions: 5, session_cap: 5 });
+    await tick();
+
+    const line = lines.find((l) => l.event === "session.relay.assignment.invalid");
+    expect(line, "the invalid-assignment refusal must be logged").toBeTruthy();
+    expect(line!.ctx["concurrent"]).toBe(5);
+    expect(line!.ctx["cap"]).toBe(5);
+    expect(line!.ctx["sessionShort"]).toBe(sidHex.slice(0, 16));
+    client.close();
   });
 });

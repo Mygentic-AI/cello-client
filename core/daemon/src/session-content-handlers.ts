@@ -211,6 +211,56 @@ export function queuedSendGuidance(upstream: string | undefined, witnessed: bool
     + "than continuing.";
 }
 
+/**
+ * ─── `016-RELAYLOSS` review MED-D: what an unwitnessed send tells the operator when the relay gave
+ * no specific reason. ──────────────────────────────────────────────────────────────────────────
+ *
+ * NOT "the counterparty's record cannot gain it". On this branch the direct send succeeded, and the
+ * receiving side appends unwitnessed content in arrival order rather than refusing it (refusing would
+ * make the relay a precondition for reading your mail). So they do get the message. What nobody gets
+ * is an independent record that you sent it — which is the thing actually lost, and the thing the
+ * remedy is for. Exported as a constant so the send-answer test can pin it byte-for-byte: this is the
+ * text a session with no stored relay refusal still gets, unchanged by 079-CAPREASON.
+ */
+export const UNWITNESSED_SEND_GUIDANCE =
+  "Delivered and in your transcript — but the relay did not witness it, so the ordering "
+  + "authority has no copy of it: the counterparty has your message, and neither of you "
+  + "has independent proof you sent it. Do NOT resend: "
+  + "that adds a second copy to your record and does not witness the first. "
+  + "ORDERING DOES NOT REPAIR ITSELF — your record is now one leaf ahead of the relay's, "
+  + "so the next message the relay DOES witness will report this session as diverged, "
+  + "and a diverged session can never be sealed with the counterparty. If the receipt "
+  + "matters, stop sending and close now; if you keep talking, do it knowing this "
+  + "conversation is unlikely to produce one.";
+
+/**
+ * 079-CAPREASON — the `guidance` and (when the relay gave one) `relay_refusal` fields for an
+ * UNWITNESSED send.
+ *
+ * The generic text above says only "the relay did not witness it". When the relay refused the
+ * assignment because the pair already holds the tuple cap of open sessions, the one actionable fact —
+ * you hold {concurrent} open sessions against a limit of {cap}, so close some — was reaching only a
+ * log the agent cannot read. With that refusal stored on the session, the answer names it and the
+ * verbs that fix it (`cello_sessions`, `cello_close_session`). Other reasons keep the generic text
+ * plus the relay's reason code, so a novel refusal is never silently reduced to "not witnessed".
+ */
+export function unwitnessedSendFields(
+  refusal: { reason: string; concurrent?: number; cap?: number } | null | undefined,
+): { guidance: string } | { guidance: string; relay_refusal: { reason: string; concurrent?: number; cap?: number } } {
+  if (!refusal) return { guidance: UNWITNESSED_SEND_GUIDANCE };
+  if (refusal.reason === "session_tuple_cap_exceeded") {
+    return {
+      relay_refusal: refusal,
+      guidance:
+        `Delivered, but the relay would not record this conversation: you already have ${refusal.concurrent} open `
+        + `sessions with this counterparty on this relay (the limit is ${refusal.cap}). Close sessions you have `
+        + `finished with (cello_sessions lists them; cello_close_session closes one). New sessions will be `
+        + `recorded once you are under the limit. This session cannot be recorded; close it too.`,
+    };
+  }
+  return { relay_refusal: refusal, guidance: `${UNWITNESSED_SEND_GUIDANCE} (relay reason: ${refusal.reason})` };
+}
+
 export function sentAuthorship(
   r: Awaited<ReturnType<SessionNodeManager["sendContent"]>>,
 ): { senderPubkey: Uint8Array; senderSig: Uint8Array } | undefined {
@@ -1032,29 +1082,15 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
        * `cello status` came out of the advice for the same reason: measured in this unit's own
        * runs, its relay fields read identically during the outage and before it.
        */
+      /**
+       * 079-CAPREASON — the guidance now depends on WHY the session is unwitnessed. With a stored
+       * relay refusal (the tuple cap is the case that reaches real people), the answer adds
+       * `relay_refusal` and names the sessions-to-close remedy; without one it is the generic text,
+       * unchanged. See `unwitnessedSendFields`. Delivery is untouched — only the answer's fields are.
+       */
       ...(wasWitnessed(placement)
         ? {}
-        : {
-            guidance:
-              /**
-               * ⚠️ NOT "the counterparty's record cannot gain it" — review MED-D. On THIS branch the
-               * direct send succeeded, and the receiving side appends unwitnessed content in arrival
-               * order rather than refusing it (refusing would make the relay a precondition for
-               * reading your mail). So they do get the message. What nobody gets is an independent
-               * record that you sent it — which is the thing actually lost, and the thing the remedy
-               * below is for. The old sentence would have had an operator conclude the conversation
-               * was already broken bilaterally when the two trees may still agree.
-               */
-              "Delivered and in your transcript — but the relay did not witness it, so the ordering "
-              + "authority has no copy of it: the counterparty has your message, and neither of you "
-              + "has independent proof you sent it. Do NOT resend: "
-              + "that adds a second copy to your record and does not witness the first. "
-              + "ORDERING DOES NOT REPAIR ITSELF — your record is now one leaf ahead of the relay's, "
-              + "so the next message the relay DOES witness will report this session as diverged, "
-              + "and a diverged session can never be sealed with the counterparty. If the receipt "
-              + "matters, stop sending and close now; if you keep talking, do it knowing this "
-              + "conversation is unlikely to produce one.",
-          }),
+        : unwitnessedSendFields(sessionNodeManager.getAssignmentRefusal(agentName, sessionId))),
       // On a redact, tell the agent exactly what was transformed (the §6 sender-side surface).
       ...(modified ? { transformations: (outboundVerdict.events ?? []).filter((e) => e.disposition === "redact") } : {}),
     };

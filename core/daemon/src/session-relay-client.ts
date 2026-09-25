@@ -609,6 +609,19 @@ async function nextWithTimeout(
 }
 
 /**
+ * 079-CAPREASON — the relay's reason and counts when it refuses a session's assignment. Stored on the
+ * session's own relay record and surfaced by `getAssignmentRefusal`, so an unwitnessed send can tell
+ * the operator WHY the session is unwitnessed. `concurrent`/`cap` are present only for the tuple cap.
+ */
+export interface AssignmentRefusal { reason: string; concurrent?: number; cap?: number; }
+
+/**
+ * 079-CAPREASON — the settlement of an in-flight `client_record_assignment`. `"ok"` and `"closed"`
+ * are unchanged; a rejection now carries the relay's reason and counts (was the bare `"rejected"`).
+ */
+type RecordResult = "ok" | "closed" | ({ rejected: true } & AssignmentRefusal);
+
+/**
  * Per-AGENT relay witness client. Shared across all of an agent's sessions; one
  * authenticated stream at a time (the relay keys by agent pubkey). Submits are FIFO and
  * single-in-flight on the stream; `leaf_deliver` is routed by session_id.
@@ -686,6 +699,15 @@ export class AgentRelayClient {
   }
 
   /**
+   * 079-CAPREASON — the relay's reason and counts for THIS session's assignment rejection, or null if
+   * it was never rejected. Read by the unwitnessed-send answer so the agent learns why the session is
+   * unwitnessed and what to do (close some of the open sessions it holds with this counterparty).
+   */
+  getAssignmentRefusal(sessionIdHex: string): AssignmentRefusal | null {
+    return this.#sessions.get(sessionIdHex)?.assignmentRefusal ?? null;
+  }
+
+  /**
    * Drop any verdict from an earlier attempt — review HIGH-2.
    *
    * A METHOD rather than an inline `= null`, deliberately: assigning the field directly narrows its
@@ -745,8 +767,20 @@ export class AgentRelayClient {
    * Resolver for the in-flight `client_record_assignment` ack. The ack carries
    * no session_id (like hash_submit_ack), so at most one record is in flight; records are serialized on
    * the same `#submitChain` as submits, guaranteeing no overlap.
+   *
+   * 079-CAPREASON — a rejection is no longer the bare string `"rejected"`: it carries the relay's
+   * `reason` and, for the tuple cap, the counts, so `#doRecord` can store them on the session's own
+   * record. The counts are the one actionable fact the operator needs — how many sessions they hold
+   * and what the limit is — and the `assignment_invalid` frame has no session_id to route them by, so
+   * they ride the resolver of the record that is in flight.
    */
-  #pendingRecord: ((result: "ok" | "rejected" | "closed") => void) | null = null;
+  #pendingRecord: ((result: RecordResult) => void) | null = null;
+  /**
+   * 079-CAPREASON — the session hex of the in-flight record, so the `assignment_invalid` frame handler
+   * (whose frame carries no session_id) can name the session in its log line. Set beside
+   * `#pendingRecord`, cleared with it.
+   */
+  #pendingRecordSessionHex: string | null = null;
   /**
    * 054-SRSPLIT — the in-flight `relay_release_reservation`. At most one: releases are rare and
    * serialized on the shared stream, exactly like `#pendingRecord`, whose ack also carries no id.
@@ -780,6 +814,13 @@ export class AgentRelayClient {
      * it, so a misconfigured relay can't trigger a reconnect/re-present storm across sibling sessions.
      */
     recordRejected: boolean;
+    /**
+     * 079-CAPREASON — the relay's reason and counts for THIS session's rejection, kept beside
+     * `recordRejected` so an unwitnessed send on it can tell the operator why. Per session, not per
+     * stream: `#lastAuthRefusal` answers "why did this relay refuse us" for the whole connection; this
+     * answers "why is THIS conversation unwitnessed", which is the question the send answer asks.
+     */
+    assignmentRefusal?: AssignmentRefusal;
     /**
      * The record TIMED OUT rather than failing fast. A distinct sub-state because it means the
      * relay is unhealthy, not that the session is "not ready yet" — and the retry loop below is
@@ -886,6 +927,9 @@ export class AgentRelayClient {
       recorded: existing?.recorded ?? false,
       recordRejected: existing?.recordRejected ?? false,
       recordTimedOut: existing?.recordTimedOut ?? false,
+      // 079-CAPREASON: a re-registration must not drop a rejection's reason/counts — the same reason
+      // `recordRejected` is carried forward, and losing it would blank the send answer's explanation.
+      ...(existing?.assignmentRefusal ? { assignmentRefusal: existing.assignmentRefusal } : {}),
     });
     /**
      * SEED THE ACKNOWLEDGEMENT, never backwards. A session that already received a leaf holds a REAL
@@ -965,13 +1009,16 @@ export class AgentRelayClient {
       assignment_signature: a.assignmentSignature,
       session_signature: a.sessionSignature,
     }) as Uint8Array;
-    let resolveRec!: (result: "ok" | "rejected" | "closed") => void;
-    const ackPromise = new Promise<"ok" | "rejected" | "closed">((r) => { resolveRec = r; });
+    let resolveRec!: (result: RecordResult) => void;
+    const ackPromise = new Promise<RecordResult>((r) => { resolveRec = r; });
     this.#pendingRecord = resolveRec;
+    // 079-CAPREASON: name the session the in-flight record belongs to, so the reason-less
+    // `assignment_invalid` frame can log which session it refused.
+    this.#pendingRecordSessionHex = sessionIdHex;
     try {
       stream.send(lp.encode.single(frame));
     } catch (err: unknown) {
-      if (this.#pendingRecord === resolveRec) this.#pendingRecord = null;
+      if (this.#pendingRecord === resolveRec) { this.#pendingRecord = null; this.#pendingRecordSessionHex = null; }
       this.#logger.warn("session.relay.record.send.failed", { relayPeerId: this.#relayPeerId, error: extractErrorMessage(err) });
       return false;
     }
@@ -993,12 +1040,19 @@ export class AgentRelayClient {
         this.#logger.warn("session.relay.assignment.record.timeout", { relayPeerId: this.#relayPeerId, sessionShort: sessionIdHex.slice(0, 16) });
         return false;
       }
-      if (result === "rejected") {
+      if (typeof result === "object" && result.rejected) {
         // The relay cleanly rejected (assignment_invalid) — the ack already arrived, the stream is HEALTHY.
         // Do NOT reset (that would tear down sibling sessions' in-flight submits). Mark terminal so we stop
         // re-presenting. The session has no relay witness; sends still complete via the direct path
         // (sovereign-node redundancy) and a hash_submit will fail loud (session_not_found) — diagnosable.
         sess.recordRejected = true;
+        // 079-CAPREASON: keep the relay's reason and counts on the session itself, so an unwitnessed
+        // send on it can tell the operator WHY (and, for the tuple cap, how many sessions to close).
+        sess.assignmentRefusal = {
+          reason: result.reason,
+          ...(result.concurrent !== undefined ? { concurrent: result.concurrent } : {}),
+          ...(result.cap !== undefined ? { cap: result.cap } : {}),
+        };
         this.#logger.warn("session.relay.assignment.record.rejected", { relayPeerId: this.#relayPeerId, sessionShort: sessionIdHex.slice(0, 16) });
         return false;
       }
@@ -1007,7 +1061,7 @@ export class AgentRelayClient {
       return false;
     } finally {
       clearTimeout(timer);
-      if (this.#pendingRecord === resolveRec) this.#pendingRecord = null;
+      if (this.#pendingRecord === resolveRec) { this.#pendingRecord = null; this.#pendingRecordSessionHex = null; }
     }
   }
 
@@ -1347,12 +1401,23 @@ export class AgentRelayClient {
       if (r) r(frame["released"] === true);
     } else if (type === "assignment_ok") {
       // The relay verified + recorded our client-presented assignment.
-      const r = this.#pendingRecord; this.#pendingRecord = null; if (r) r("ok");
+      const r = this.#pendingRecord; this.#pendingRecord = null; this.#pendingRecordSessionHex = null; if (r) r("ok");
     } else if (type === "assignment_invalid") {
       // The relay rejected the assignment (e.g. directory_signature_invalid — not signed by any
       // consortium directory). Fail LOUD: the session has no relay witness until this is resolved.
       const reason = typeof frame["reason"] === "string" ? (frame["reason"] as string) : "unknown";
-      this.#logger.warn("session.relay.assignment.invalid", { relayPeerId: this.#relayPeerId, reason });
+      const concurrent = typeof frame["concurrent_sessions"] === "number" ? (frame["concurrent_sessions"] as number) : undefined;
+      const cap = typeof frame["session_cap"] === "number" ? (frame["session_cap"] as number) : undefined;
+      // 079-CAPREASON: the counts and the session (the frame carries no session_id, so name the
+      // in-flight record's session) go IN THE LOG too — the durable forensic half of the same fact
+      // the send answer now carries to the agent.
+      const refusedSessionHex = this.#pendingRecordSessionHex;
+      this.#logger.warn("session.relay.assignment.invalid", {
+        relayPeerId: this.#relayPeerId, reason,
+        ...(refusedSessionHex ? { sessionShort: refusedSessionHex.slice(0, 16) } : {}),
+        ...(concurrent !== undefined ? { concurrent } : {}),
+        ...(cap !== undefined ? { cap } : {}),
+      });
       /**
        * DOD-M15-RELAYSLOTS-1 review M2 — **the tuple cap has to reach the operator too.**
        *
@@ -1362,13 +1427,14 @@ export class AgentRelayClient {
        * whoever hits it believes they have none. Routed through the same classifier and onto the
        * same surface as every other relay refusal.
        */
-      const concurrent = typeof frame["concurrent_sessions"] === "number" ? (frame["concurrent_sessions"] as number) : undefined;
-      const cap = typeof frame["session_cap"] === "number" ? (frame["session_cap"] as number) : undefined;
       this.#lastAuthRefusal = classifyRelayAuthRefusal(reason, {
         ...(concurrent !== undefined ? { slotsHeld: concurrent } : {}),
         ...(cap !== undefined ? { slotCap: cap } : {}),
       });
-      const r = this.#pendingRecord; this.#pendingRecord = null; if (r) r("rejected");
+      // 079-CAPREASON: carry the reason and counts to `#doRecord`, which stores them on the session —
+      // the send answer reads them back per session, not off this per-stream classifier.
+      const r = this.#pendingRecord; this.#pendingRecord = null; this.#pendingRecordSessionHex = null;
+      if (r) r({ rejected: true, reason, ...(concurrent !== undefined ? { concurrent } : {}), ...(cap !== undefined ? { cap } : {}) });
     } else if (type === "leaf_deliver") {
       const seq = typeof frame["sequence_number"] === "number" ? frame["sequence_number"] : -1;
       const sidHex = Buffer.from(toU8(frame["session_id"])).toString("hex");
@@ -2380,7 +2446,7 @@ export class AgentRelayClient {
         // Settle an in-flight record too, so #doRecord doesn't
         // wait the full timeout on a dropped stream. "closed" is transient (not a directory rejection) ⇒
         // recorded stays false and it is retried after reconnect.
-        { const r = this.#pendingRecord; this.#pendingRecord = null; if (r) r("closed"); }
+        { const r = this.#pendingRecord; this.#pendingRecord = null; this.#pendingRecordSessionHex = null; if (r) r("closed"); }
         // 054-SRSPLIT: settle an in-flight release too — `false`, because the relay was not told.
         { const r = this.#pendingRelease; this.#pendingRelease = null; if (r) r(false); }
         // DOD-M15-AWAYSCOPE-1: and an in-flight liveness query, so a status read does not wait its
@@ -3157,7 +3223,7 @@ export class AgentRelayClient {
     this.#closed = true;
     this.#settlePending({ ok: false, reason: "relay_client_closed" });
     // Settle any in-flight record so #doRecord resolves promptly.
-    { const r = this.#pendingRecord; this.#pendingRecord = null; if (r) r("closed"); }
+    { const r = this.#pendingRecord; this.#pendingRecord = null; this.#pendingRecordSessionHex = null; if (r) r("closed"); }
     const stream = this.#stream;
     this.#stream = null;
     if (stream) {

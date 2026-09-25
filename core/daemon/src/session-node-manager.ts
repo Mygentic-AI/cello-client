@@ -2534,6 +2534,20 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     );
   }
 
+  /**
+   * 079-CAPREASON — the relay's reason and counts if it refused THIS session's assignment, else null.
+   *
+   * Resolved through the session's own relay record, the same way `queryRelayLiveness` above is: the
+   * per-session refusal is keyed on the RELAY session id (`relaySessionIdBytes`), which is what the
+   * relay client registered the session under. Null when there is no relay behind the session, which
+   * is indistinguishable — and correctly so — from a session the relay never refused.
+   */
+  getAssignmentRefusal(agentName: string, sessionId: string): { reason: string; concurrent?: number; cap?: number } | null {
+    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
+    if (!entry?.relayClient || !entry.relaySessionIdBytes) return null;
+    return entry.relayClient.getAssignmentRefusal(Buffer.from(entry.relaySessionIdBytes).toString("hex"));
+  }
+
   sealReadiness(...args: Parameters<SessionSeal["sealReadiness"]>): ReturnType<SessionSeal["sealReadiness"]> { return this.#seal.sealReadiness(...args); }
 
   sealReadinessView(...args: Parameters<SessionSeal["sealReadinessView"]>): ReturnType<SessionSeal["sealReadinessView"]> { return this.#seal.sealReadinessView(...args); }
