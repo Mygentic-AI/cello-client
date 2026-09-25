@@ -398,7 +398,9 @@ export class ChannelPublisher {
    * This is what refills a relay that lost content and what fills a newly added one — the same path,
    * which is why it is exercised by ordinary operation rather than only by a crash.
    */
-  async resendMissing(agentName: string, channelHex: string, relay: string, correlationId?: string): Promise<{ deposited: number }> {
+  async resendMissing(
+    agentName: string, channelHex: string, relay: string, correlationId?: string,
+  ): Promise<{ deposited: number; refused?: "channel_unknown" | "no_fetch_key" }> {
     const { log, logger } = this.#opts;
     // A channel that has been set up but never published has no log row yet, and `head` THROWS on
     // one. Nothing to resend is an ANSWER — `deposited: 0` — not an error: a freshly created channel
@@ -419,15 +421,26 @@ export class ChannelPublisher {
      * `access` that promises members-only. Refuse and say so, never paper over it.
      */
     const info = this.#opts.channelInfo(channelHex);
-    const fetchKey = info && info.access !== "public"
-      ? await this.#opts.currentFetchKey?.(channelHex)
-      : undefined;
-    if (info && info.access !== "public" && !fetchKey) {
+    /**
+     * ⚠️ **NO CONFIG, NO DEPOSIT.** A deleted channel keeps its post log but loses its config (039
+     * Part B), so `info` is null while there are posts to send. Without the config this daemon
+     * cannot know whether the channel is public, and guessing "public" would hand a pruned relay a
+     * members-only queue with no fetch key — served to any caller.
+     */
+    if (!info) {
+      logger.warn("channel.resend.refused", {
+        ...(correlationId !== undefined ? { correlationId } : {}),
+        channel_pubkey: channelHex, reason: "channel_unknown",
+      });
+      return { deposited: 0, refused: "channel_unknown" };
+    }
+    const fetchKey = info.access !== "public" ? await this.#opts.currentFetchKey?.(channelHex) : undefined;
+    if (info.access !== "public" && !fetchKey) {
       logger.warn("channel.resend.refused", {
         ...(correlationId !== undefined ? { correlationId } : {}),
         channel_pubkey: channelHex, reason: "no_fetch_key",
       });
-      return { deposited: 0 };
+      return { deposited: 0, refused: "no_fetch_key" };
     }
 
     /**

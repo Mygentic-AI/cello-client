@@ -641,12 +641,28 @@ describe("M16 039-NEWCHANFIX Part A: resend and the skew retry carry the fetch k
     const noKey = new ChannelPublisher({ ...h.options, logger: rec, currentFetchKey: () => Promise.resolve(undefined) });
 
     const result = await noKey.resendMissing("agent-1", h.channelHex, RELAY_B);
-    expect(result.deposited).toBe(0);
+    expect(result).toEqual({ deposited: 0, refused: "no_fetch_key" });
     expect(h.deposits, "nothing was deposited without a fetch key").toEqual([]);
 
     const refused = logs.find((l) => l.event === "channel.resend.refused");
     expect(refused, "the refusal is logged, same rule and wording as publish").toBeDefined();
     expect(refused!.ctx.reason).toBe("no_fetch_key");
     expect(refused!.ctx.channel_pubkey).toBe(h.channelHex);
+  });
+
+  it("039 review: a DELETED non-public channel (log kept, config gone) resends nothing", async () => {
+    // After a delete the post log survives but the config does not, so the daemon cannot tell
+    // whether the channel is public. Guessing public would refill a pruned relay with a
+    // members-only queue and no fetch key — served to anyone. It must refuse instead.
+    const h = await harness({ access: "invite_only" });
+    h.down.add(RELAY_B);
+    for (const t of ["one", "two"]) await h.publisher.publish("agent-1", h.channelHex, t, "body");
+    h.down.clear();
+    h.deposits.length = 0;
+
+    const deleted = new ChannelPublisher({ ...h.options, channelInfo: () => null });
+    const result = await deleted.resendMissing("agent-1", h.channelHex, RELAY_B);
+    expect(result).toEqual({ deposited: 0, refused: "channel_unknown" });
+    expect(h.deposits, "nothing deposited for a channel whose access is unknown").toEqual([]);
   });
 });

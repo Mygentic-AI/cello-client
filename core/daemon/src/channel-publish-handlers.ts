@@ -367,6 +367,20 @@ export function registerChannelPublishHandlers(deps: ChannelPublishDeps): void {
     const per: Array<{ relay: string; deposited: number }> = [];
     for (const target of targets) {
       const result = await publisher.resendMissing(agent.agentName, channel.channelHex, target);
+      // 039 review: a refusal is not "nothing to resend". It is the same for every relay, so the
+      // first one answers for all of them and names why nothing was sent.
+      if (result.refused === "channel_unknown") {
+        return {
+          ok: false, reason: "channel_unknown",
+          guidance: "This daemon has no settings for that channel (it may have been deleted), so it cannot tell who may read it and sends nothing.",
+        };
+      }
+      if (result.refused === "no_fetch_key") {
+        return {
+          ok: false, reason: "key_unavailable",
+          guidance: "This channel has no group key yet, so the relays cannot be told who may read it; admit a member first.",
+        };
+      }
       per.push({ relay: target, deposited: result.deposited });
     }
     return { ok: true, deposited: per.reduce((n, r) => n + r.deposited, 0), relays: per };
