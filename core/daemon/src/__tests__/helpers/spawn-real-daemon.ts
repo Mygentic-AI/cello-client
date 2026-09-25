@@ -56,13 +56,33 @@ export async function cleanupCelloDir(dir: string | undefined): Promise<void> {
   if (dir) await rm(dir, { recursive: true, force: true });
 }
 
+/**
+ * ⚠️ **THE DIRECTORY PIN IS A DEFAULT, NOT A PER-TEST CHORE (037-TESTTRUTH, decision 4).**
+ *
+ * A daemon booted with no `CELLO_DIRECTORY_URL` picks a directory from the bundled manifest, which
+ * names the LIVE GCP consortium (`*.cello.mygentic.ai`). Every unpinned `spawnRealDaemon` in the
+ * suite therefore dialled production on every full-suite run — and the 024 create test even
+ * registered throwaway channels there, crashing a directory (fixed in fe8c5341). Pinning was left to
+ * each caller, so a new test forgets it and reopens the hole. The pin now lives HERE: a closed local
+ * port (`127.0.0.1:9`) unless the caller sets `CELLO_DIRECTORY_URL` explicitly, or `CELLO_E2E_LIVE`
+ * marks a deliberately-gated live test. `m16-037-directory-pin-guard.test.ts` fails if a
+ * helper-started daemon's log ever names a live node.
+ */
+const CLOSED_LOCAL_DIRECTORY = "http://127.0.0.1:9";
+
 export function spawnRealDaemon(celloDir: string, env: Record<string, string> = {}): SpawnedDaemon {
   const daemonBin = join(import.meta.dirname, "../../bin/cello-daemon.ts");
+  // The pin overrides an inherited `process.env.CELLO_DIRECTORY_URL` too, but a caller's explicit
+  // `env` still wins (it is spread last), and `CELLO_E2E_LIVE` opts a gated live test back out.
+  const directoryPin: Record<string, string> =
+    "CELLO_DIRECTORY_URL" in env || process.env["CELLO_E2E_LIVE"] !== undefined
+      ? {}
+      : { CELLO_DIRECTORY_URL: CLOSED_LOCAL_DIRECTORY };
   const child = spawn(process.execPath, ["--import", "tsx", daemonBin], {
     // tsx is a devDep of THIS package (pnpm isolated layout) — pin cwd to the package root so
     // `--import tsx` resolves under a workspace-root vitest run too.
     cwd: join(import.meta.dirname, "../../.."),
-    env: { ...process.env, CELLO_DIR: celloDir, CELLO_VERSION: "0.0.1-singleton-test", ...env },
+    env: { ...process.env, CELLO_DIR: celloDir, CELLO_VERSION: "0.0.1-singleton-test", ...directoryPin, ...env },
     stdio: ["ignore", "pipe", "pipe"],
   });
 
