@@ -308,26 +308,27 @@ describe("M16 032-NOTICES: channel doorbells render and ask for an action", () =
     expect(meta.wake_action).toBe("read_inbox");
   });
 
-  it("034-LIFECYCLE test 8: removed, deleted and join-request renders use FULL keys and never print '….'", () => {
+  it("038 Part E: removal and deletion arrive as channel_membership_ended and render with the SHORTENED key", () => {
     const SUB = "cd".repeat(32);
 
-    // (a) EJECTED — the member was removed from THIS channel. Its own render, not the generic one.
-    const removed = buildChannelParams({ type: "channel_join_answer", channel: CH, outcome: "refused", reason: "ejected" }, "channel_join_answer");
+    // (a) EJECTED — the member was removed from THIS channel. Its own type now, and the SHORTENED key
+    // (034-LIFECYCLE had printed the full key here; 038 brings it in line with the other notices).
+    const removed = buildChannelParams({ type: "channel_membership_ended", channel: CH, reason: "ejected" }, "channel_membership_ended");
     expect(removed.content).toContain("🚫");
     expect(removed.content).toContain("you were removed from channel");
     expect(removed.content).toContain("Earlier posts stay readable");
     expect(removed.content).not.toContain("refused your join");
-    // FULL key, and no ellipsis-then-full-stop (F33).
-    expect(removed.content).toContain(CH);
-    expect(removed.content).not.toContain("….");
+    // SHORTENED key: the 12-char prefix is shown, the full 64-hex key is NOT.
+    expect(removed.content).toContain(CH.slice(0, 12));
+    expect(removed.content).not.toContain(CH);
 
     // (b) CHANNEL_CLOSED — the whole channel was deleted by its admin.
-    const deleted = buildChannelParams({ type: "channel_join_answer", channel: CH, outcome: "refused", reason: "channel_closed" }, "channel_join_answer");
+    const deleted = buildChannelParams({ type: "channel_membership_ended", channel: CH, reason: "channel_closed" }, "channel_membership_ended");
     expect(deleted.content).toContain("🔒");
     expect(deleted.content).toContain("was deleted by its admin");
     expect(deleted.content).toContain("Earlier posts stay readable");
-    expect(deleted.content).toContain(CH);
-    expect(deleted.content).not.toContain("….");
+    expect(deleted.content).toContain(CH.slice(0, 12));
+    expect(deleted.content).not.toContain(CH);
 
     // (c) JOIN REQUEST — both keys full, and the approve command carries channel then subscriber.
     const req = buildChannelParams({ type: "channel_join_request", channel: CH, subscriber: SUB }, "channel_join_request");
@@ -342,7 +343,7 @@ describe("M16 032-NOTICES: channel doorbells render and ask for an action", () =
   it("5d. an older daemon that omits fields does not crash and never emits 'undefined' or 'NaN'", () => {
     // The shim can be newer than the daemon (CLAUDE.md forbids pinning). A frame missing its fields
     // must still render a non-empty, clean body — never a leaked placeholder.
-    for (const type of ["channel_posts", "channel_join_answer", "channel_join_request"]) {
+    for (const type of ["channel_posts", "channel_join_answer", "channel_join_request", "channel_membership_ended"]) {
       const { content } = buildChannelParams({ type }, type);
       expect(typeof content).toBe("string");
       expect(content.length).toBeGreaterThan(0);

@@ -15,8 +15,8 @@ import type { Logger } from "./types.js";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import {
-  channelJoinFrameType, encodeChannelRekey, encodeChannelJoinRefused, buildChannelFetchKeyTbs,
-  JOIN_REQUEST_TYPE, type ChannelJoinRefusedReason,
+  channelJoinFrameType, encodeChannelRekey, encodeChannelMembershipEnded, buildChannelFetchKeyTbs,
+  JOIN_REQUEST_TYPE, type MembershipEndedReason,
 } from "@cello-protocol/protocol-types";
 import { generateGroupKey, wrapGroupKeyFor, deriveFetchKey, decryptBody, encryptBody } from "@cello-protocol/crypto";
 import { ChannelMembershipStore } from "./channel-membership-store.js";
@@ -49,6 +49,11 @@ export interface ChannelNotify {
   channelJoinAnswer: (agentId: string, channelHex: string, outcome: "admitted" | "pending" | "refused", reason?: string) => void;
   /** A new pending request landed on an invite-only channel this agent administers. */
   channelJoinRequest: (adminAgentId: string, channelHex: string, subscriberHex: string) => void;
+  /**
+   * 038-RETESTFIX Part E: this agent's membership ENDED — it was ejected, or the channel was deleted.
+   * Its own doorbell (rendered with the shortened key), not a refused join answer.
+   */
+  channelMembershipEnded: (agentId: string, channelHex: string, reason: "ejected" | "channel_closed") => void;
 }
 
 export interface ChannelMembershipWiringDeps {
@@ -279,9 +284,13 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
    * daemon holds one, else open one the way the join path does. Returns whether the member was
    * reached — a member who cannot be reached is NOT a failed eject/delete (they are out at the relay
    * regardless), it is a `member_notified: false` the caller reports and logs.
+   *
+   * 038-RETESTFIX Part E: this now sends a `channel_membership_ended` frame, NOT a join refusal — a
+   * refusal answers a request, while this is the admin ENDING an existing membership, and the two
+   * render differently to the operator.
    */
-  const notifyRefused = async (
-    agentName: string, memberPubkeyHex: string, channelPubkey: Uint8Array, reason: ChannelJoinRefusedReason,
+  const notifyMembershipEnded = async (
+    agentName: string, memberPubkeyHex: string, channelPubkey: Uint8Array, reason: MembershipEndedReason,
   ): Promise<boolean> => {
     let sessionId = openSessionWith(agentName, memberPubkeyHex);
     // ⚠️ A session THIS call opens just to deliver the notice must be CLOSED again — an opened,
@@ -296,7 +305,7 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
       openedByUs = sessionId !== null;
     }
     if (sessionId === null) return false;
-    await deps.sendInSession(agentName, sessionId, encodeChannelJoinRefused({ channel_pubkey: channelPubkey, reason }));
+    await deps.sendInSession(agentName, sessionId, encodeChannelMembershipEnded({ channel_pubkey: channelPubkey, reason }));
     if (openedByUs) {
       // A normal SEALING close, through the same handler cello_close_session drives — so the notice
       // session is notarized and torn down, not left dangling. Registered at boot; a miss here would
@@ -329,6 +338,8 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     raiseNotice,
     // M16 032-NOTICES: the subscriber's own join answer — admitted / pending / refused (+ reason).
     onJoinAnswer: (agentId, channelHex, outcome, reason) => deps.notify.channelJoinAnswer(agentId, channelHex, outcome, reason),
+    // 038-RETESTFIX Part E: a membership ended (ejected / channel deleted) — its own doorbell.
+    onMembershipEnded: (agentId, channelHex, reason) => deps.notify.channelMembershipEnded(agentId, channelHex, reason),
     // 038-RETESTFIX Part B: a stored acceptance / public admission collects at once.
     collectNow: (agentId) => deps.collectNow(agentId),
   });
@@ -618,7 +629,7 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
      * unreachable is `member_notified: false`, logged and reported — the ejection still holds, so
      * this never fails the eject.
      */
-    const memberNotified = await notifyRefused(
+    const memberNotified = await notifyMembershipEnded(
       agent.agentName, subscriber.toLowerCase(), channelPubkey, "ejected",
     );
     if (!memberNotified) {
@@ -671,7 +682,7 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     let membersNotified = 0;
     const membersUnreached: string[] = [];
     for (const member of toNotify) {
-      const notified = await notifyRefused(agent.agentName, member, channelPubkey, "channel_closed");
+      const notified = await notifyMembershipEnded(agent.agentName, member, channelPubkey, "channel_closed");
       if (notified) {
         membersNotified += 1;
       } else {

@@ -258,6 +258,17 @@ export class NotificationDispatcher {
     });
   }
 
+  /**
+   * 038-RETESTFIX Part E: this agent's membership ended — ejected, or the channel deleted. Its own
+   * notification type (the shim renders it with the shortened key), not a refused join answer. The
+   * `reason` is one of a fixed two words, so it stays content-free.
+   */
+  dispatchChannelMembershipEnded(agentName: string, channelHex: string, reason: "ejected" | "channel_closed"): void {
+    this.#dispatchToCurrent(agentName, "channel_membership_ended", {
+      agent: agentName, type: "channel_membership_ended", channel: channelHex, reason,
+    });
+  }
+
   /** Route a frame to every connection where `agentName` is current — the cello_message rule. */
   #dispatchToCurrent(agentName: string, notificationType: string, data: Record<string, unknown>): void {
     const notification: IpcNotification = { notification: notificationType, data };

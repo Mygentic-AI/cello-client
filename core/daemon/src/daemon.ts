@@ -697,6 +697,11 @@ async function startDaemonHoldingLock(
       const name = sessionNodeManager.agentNameForId(adminAgentId);
       if (name !== null) notificationDispatcher.dispatchChannelJoinRequest(name, channelHex, subscriberHex);
     },
+    // 038-RETESTFIX Part E: this agent was ejected, or its channel was deleted — its own doorbell.
+    channelMembershipEnded: (agentId, channelHex, reason) => {
+      const name = sessionNodeManager.agentNameForId(agentId);
+      if (name !== null) notificationDispatcher.dispatchChannelMembershipEnded(name, channelHex, reason);
+    },
   };
 
   const channelMembership = wireChannelMembership({

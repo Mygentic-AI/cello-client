@@ -16,7 +16,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { generateKeypair, generateGroupKey, wrapGroupKeyFor, type InMemoryKeyProvider } from "@cello-protocol/crypto";
-import { encodeChannelJoinAccepted, decodeChannelJoinRefused } from "@cello-protocol/protocol-types";
+import { encodeChannelJoinAccepted, decodeChannelMembershipEnded } from "@cello-protocol/protocol-types";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import type { DaemonDatabase } from "../sqlcipher-db.js";
 import type { Logger } from "../types.js";
@@ -331,7 +331,7 @@ async function adminHarness() {
 }
 
 describe("M16 034-LIFECYCLE — admin side: eject tells the member, delete removes the channel", () => {
-  it("1. eject sends the ejected member a refused(ejected) frame on the open session", async () => {
+  it("1. eject sends the ejected member a membership_ended(ejected) frame on the open session", async () => {
     const h = await adminHarness();
     // A single active member, so the re-key loop is empty and the only send is the notice.
     const memberKp = generateKeypair() as InMemoryKeyProvider;
@@ -345,10 +345,11 @@ describe("M16 034-LIFECYCLE — admin side: eject tells the member, delete remov
 
     expect(res.ok).toBe(true);
     expect(res.member_notified, "the ejected member was told").toBe(true);
-    // The frame reached the member's session, and it is a refusal naming `ejected`.
+    // 038-RETESTFIX Part E: the frame reached the member's session, and it is a MEMBERSHIP-ENDED
+    // frame naming `ejected` — its own type now, not a join refusal.
     const notice = h.sent.find((s) => s.sessionId === "s-member");
     expect(notice, "a frame was sent on the member's session").toBeDefined();
-    const decoded = decodeChannelJoinRefused(notice!.content);
+    const decoded = decodeChannelMembershipEnded(notice!.content);
     expect(decoded.ok && decoded.frame.reason).toBe("ejected");
   });
 
@@ -417,7 +418,8 @@ describe("M16 034-LIFECYCLE — admin side: eject tells the member, delete remov
     // (a) both members were told the channel is gone.
     expect(res.members_notified).toBe(2);
     expect(res.members_unreached).toEqual([]);
-    const closedReasons = h.sent.map((s) => decodeChannelJoinRefused(s.content)).filter((d) => d.ok).map((d) => (d.ok ? d.frame.reason : ""));
+    // 038-RETESTFIX Part E: deletion is a MEMBERSHIP-ENDED frame now, not a join refusal.
+    const closedReasons = h.sent.map((s) => decodeChannelMembershipEnded(s.content)).filter((d) => d.ok).map((d) => (d.ok ? d.frame.reason : ""));
     expect(closedReasons).toEqual(["channel_closed", "channel_closed"]);
     // (b) the whole channel was pruned on both relays.
     expect(h.prunedChannels).toEqual([h.channelHex]);

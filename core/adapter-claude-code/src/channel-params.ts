@@ -144,29 +144,35 @@ function doorbellText(type: string, data: Record<string, unknown>): string {
     }
     case "channel_join_answer": {
       const label = shortKey(String(data["channel"] ?? ""));
-      // 034-LIFECYCLE: the FULL key, so an operator can tell exactly which channel — and so no
-      // ellipsis is printed before a full stop (F33). Used only by the two removal renders below.
-      const full = String(data["channel"] ?? "");
       switch (String(data["outcome"] ?? "")) {
         case "admitted":
           return `✅ CELLO — you're in: channel ${label} admitted you. Its posts will arrive here.`;
         case "pending":
           return `⏳ CELLO — your request to join channel ${label} is waiting for the admin.`;
         case "refused": {
-          // 034-LIFECYCLE: removal from a channel gets its own words. `ejected` = this member alone;
-          // `channel_closed` = the whole channel is gone. Every OTHER refusal keeps 032's wording.
+          // 038-RETESTFIX Part E: removal and deletion are no longer refusals — they arrive as
+          // `channel_membership_ended` (its own case below). A refusal now answers a would-be
+          // subscriber's request, including an ejected member who tried to rejoin (reason `ejected`).
           const reason = String(data["reason"] ?? "no reason given");
-          if (reason === "ejected") {
-            return `🚫 CELLO — you were removed from channel ${full}. Earlier posts stay readable; new ones will not arrive.`;
-          }
-          if (reason === "channel_closed") {
-            return `🔒 CELLO — channel ${full} was deleted by its admin. Earlier posts stay readable.`;
-          }
           return `CELLO — channel ${label} refused your join (${reason}).`;
         }
         default:
           return `CELLO — channel ${label} answered your join.`;
       }
+    }
+    // 038-RETESTFIX Part E: a membership ENDED — this member was ejected, or the channel was deleted.
+    // Its own notice, rendered with the SHORTENED key like every other channel notice (034-LIFECYCLE
+    // had printed the full key here, out of step with the rest). An older daemon that still sends the
+    // removal as a `channel_join_answer` refusal renders via the generic refusal line above — not as
+    // pretty, but never broken. A missing reason is defended, never printed as "undefined".
+    case "channel_membership_ended": {
+      const label = shortKey(String(data["channel"] ?? ""));
+      const reason = String(data["reason"] ?? "");
+      if (reason === "channel_closed") {
+        return `🔒 CELLO — channel ${label} was deleted by its admin. Earlier posts stay readable.`;
+      }
+      // `ejected`, or a reason this shim does not recognise from a newer daemon: a member is out.
+      return `🚫 CELLO — you were removed from channel ${label}. Earlier posts stay readable; new ones will not arrive.`;
     }
     case "channel_join_request": {
       // 034-LIFECYCLE: FULL keys, so approving is a copy-paste of the exact command — the admin

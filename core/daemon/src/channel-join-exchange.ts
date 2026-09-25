@@ -25,9 +25,10 @@
  */
 import {
   decodeChannelJoinRequest, decodeChannelJoinAccepted, decodeChannelJoinRefused, decodeChannelRekey,
+  decodeChannelMembershipEnded,
   encodeChannelJoinAccepted, encodeChannelJoinRefused, encodeChannelRekey,
   isChannelJoinFrame,
-  type ChannelJoinRefusedReason,
+  type ChannelJoinRefusedReason, type MembershipEndedReason,
 } from "@cello-protocol/protocol-types";
 import {
   generateGroupKey, wrapGroupKeyFor, unwrapGroupKey, type GroupKey,
@@ -80,6 +81,13 @@ export interface ChannelJoinExchangeDeps {
    */
   onJoinAnswer?: (agentId: string, channelHex: string, outcome: "admitted" | "pending" | "refused", reason?: string) => void;
   /**
+   * 038-RETESTFIX Part E: a membership ENDED for this agent — it was ejected, or the channel was
+   * deleted. Its own doorbell, not a join answer: the wiring turns it into the `channel_membership_ended`
+   * notice, rendered with the shortened key. Fired only after the admin check passes (an existing sub)
+   * or for a channel this agent does not follow (nothing to mark, but the operator is still told).
+   */
+  onMembershipEnded?: (agentId: string, channelHex: string, reason: MembershipEndedReason) => void;
+  /**
    * 038-RETESTFIX Part B: a subscription that has just BECOME ACTIVE — an acceptance stored (open /
    * invite-only) or a public admission — must collect the channel's existing posts at once, instead
    * of waiting for the next post's wake or the backstop poll. Wired to the SAME `collectNow` the
@@ -94,7 +102,7 @@ export type SubscriberJoinResult =
   | { ok: true; channelHex: string; generation: number }
   | {
       ok: false;
-      reason: "not_a_join_frame" | "malformed" | "not_admin_of_channel" | "admin_unresolved" | "key_unwrap_failed" | "no_key_provider" | "refused_by_admin";
+      reason: "not_a_join_frame" | "malformed" | "not_admin_of_channel" | "admin_unresolved" | "key_unwrap_failed" | "no_key_provider" | "refused_by_admin" | "membership_ended";
       /**
        * M16 021-WAKE item 21: WHY, when the reason alone cannot say.
        *
@@ -335,6 +343,38 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
       }
       if (!acceptedFrame && !rekeyFrame) {
         /**
+         * 038-RETESTFIX Part E: a MEMBERSHIP-ENDED frame is the admin telling an EXISTING member they
+         * are out — that one member (`ejected`) or the whole channel (`channel_closed`). Its own frame
+         * now, not a join refusal. Mark the subscription so it stops looking like a normal one; the
+         * kept keys are untouched, so earlier posts stay readable.
+         *
+         * ⚠️ **ENDING A SUBSCRIPTION IS PRIVILEGED — ONLY ITS STORED ADMIN MAY.** The session proves
+         * who the peer IS, not that they administer the channel; the accept/rekey branch below makes
+         * the same admin check. Without it, any peer that can open a session could mark you ejected or
+         * your channel deleted. So: only when a subscription exists AND the sender is its admin do we
+         * mark it. A non-admin sender changes nothing and rings nothing. When there is no subscription
+         * there is nothing to mark, but the operator is still told (the same as the old refusal path).
+         */
+        const ended = decodeChannelMembershipEnded(content);
+        if (ended.ok) {
+          const reason = ended.frame.reason;
+          const endedHex = Buffer.from(ended.frame.channel_pubkey).toString("hex");
+          const sub = subscriptions.get(agentId, endedHex);
+          if (sub !== null) {
+            if (sub.admin_pubkey.toLowerCase() !== counterpartyHex.toLowerCase()) {
+              logger.warn("channel.membership.ended.not_admin", {
+                channel_pubkey: endedHex, sender: counterpartyHex, reason,
+              });
+              return { ok: false, reason: "not_admin_of_channel" };
+            }
+            if (reason === "ejected") subscriptions.markEjected(agentId, endedHex);
+            else subscriptions.markClosed(agentId, endedHex);
+          }
+          deps.onMembershipEnded?.(agentId, endedHex, reason);
+          return { ok: false, reason: "membership_ended", detail: reason };
+        }
+
+        /**
          * M16 032-NOTICES: a REFUSAL is the admin's answer to THIS agent's own request. Store
          * nothing — a refusal grants no key and no subscription — but report the outcome so the
          * operator is not left silent. `pending_approval` means the request is queued for an
@@ -345,33 +385,6 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
         if (refused.ok) {
           const reason = refused.frame.reason;
           const refusedHex = Buffer.from(refused.frame.channel_pubkey).toString("hex");
-          /**
-           * M16 034-LIFECYCLE: an `ejected` / `channel_closed` refusal is not the answer to a fresh
-           * request — it is the admin telling an EXISTING member they are out (that one alone, or the
-           * whole channel is gone). Mark the subscription so it stops looking like a normal one; the
-           * kept keys are untouched, so earlier posts stay readable.
-           *
-           * ⚠️ **REMOVING A SUBSCRIPTION IS PRIVILEGED — ONLY ITS STORED ADMIN MAY.** The session
-           * proves who the peer IS, not that they administer the channel; the accept/rekey branch
-           * below makes the same admin check for the same reason. Without it, any peer that can open a
-           * session could mark you ejected or your channel deleted. So: only when a subscription
-           * exists (nothing to change otherwise — this is then an answer to a fresh request that falls
-           * through to the doorbell) AND the sender is its admin do we mark and ring the removal
-           * doorbell. A non-admin sender changes nothing and rings nothing; it is logged and dropped.
-           */
-          if (reason === "ejected" || reason === "channel_closed") {
-            const sub = subscriptions.get(agentId, refusedHex);
-            if (sub !== null) {
-              if (sub.admin_pubkey.toLowerCase() !== counterpartyHex.toLowerCase()) {
-                logger.warn("channel.join.refused.not_admin", {
-                  channel_pubkey: refusedHex, sender: counterpartyHex, reason,
-                });
-                return { ok: false, reason: "not_admin_of_channel" };
-              }
-              if (reason === "ejected") subscriptions.markEjected(agentId, refusedHex);
-              else subscriptions.markClosed(agentId, refusedHex);
-            }
-          }
           if (reason === "pending_approval") deps.onJoinAnswer?.(agentId, refusedHex, "pending");
           else deps.onJoinAnswer?.(agentId, refusedHex, "refused", reason);
           return { ok: false, reason: "refused_by_admin", detail: reason };

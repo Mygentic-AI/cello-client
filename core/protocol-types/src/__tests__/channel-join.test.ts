@@ -14,11 +14,12 @@ import {
   encodeChannelJoinAccepted, decodeChannelJoinAccepted,
   encodeChannelJoinRefused, decodeChannelJoinRefused,
   encodeChannelRekey, decodeChannelRekey,
+  encodeChannelMembershipEnded, decodeChannelMembershipEnded,
   isChannelJoinFrame,
   channelJoinFrameType,
   MAX_JOIN_NOTE_CHARS,
   MAX_JOIN_FRAME_BYTES,
-  JOIN_REQUEST_TYPE, JOIN_ACCEPTED_TYPE, JOIN_REFUSED_TYPE, REKEY_TYPE,
+  JOIN_REQUEST_TYPE, JOIN_ACCEPTED_TYPE, JOIN_REFUSED_TYPE, REKEY_TYPE, MEMBERSHIP_ENDED_TYPE,
 } from "../channel-join.js";
 import { encodeCbor } from "../cbor.js";
 
@@ -102,24 +103,40 @@ describe("M16 019 Part B — the join frames", () => {
   });
 
   it("every refusal reason is carried by name", () => {
+    // 038-RETESTFIX Part E: `ejected` STAYS a refusal reason (the admin refusing an ejected member's
+    // re-request). `channel_closed` is gone — a deleted channel is never a refusal, only a
+    // `ChannelMembershipEnded` reason.
     for (const reason of [
-      "not_admin_of_channel", "pending_approval", "refused_by_admin",
-      "already_member", "ejected",
-      // 036-PUBLICSUB: `channel_is_public` is gone — a public join is now ADMITTED, not refused, so
-      // no branch ever sends that reason and the vocabulary no longer knows it.
-      // M16 034-LIFECYCLE: the admin deleted the whole channel. Distinct from `ejected` (that member
-      // alone was removed): here the channel itself is gone, and the member's daemon marks the
-      // subscription `closed` rather than `ejected`.
-      "channel_closed",
+      "not_admin_of_channel", "pending_approval", "refused_by_admin", "already_member", "ejected",
     ] as const) {
       const decoded = decodeChannelJoinRefused(encodeChannelJoinRefused({ channel_pubkey: CHANNEL, reason }));
       expect(decoded.ok && decoded.frame.reason).toBe(reason);
     }
+    // `channel_closed` no longer decodes as a refusal — it belongs to the membership-ended frame.
+    expect(decodeChannelJoinRefused(encodeCbor([JOIN_REFUSED_TYPE, CHANNEL, "channel_closed"])).ok,
+      "channel_closed is no longer a refusal reason").toBe(false);
     // ⚠️ AN UNKNOWN REASON IS REFUSED, not passed through. These are shown to an operator, and a
     // reason invented by the far side would put its words on our screen.
     expect(decodeChannelJoinRefused(encodeChannelJoinRefused({
-      channel_pubkey: CHANNEL, reason: "made_up" as "ejected",
+      channel_pubkey: CHANNEL, reason: "made_up" as "already_member",
     })).ok).toBe(false);
+  });
+
+  it("038 Part E — a membership-ended frame round-trips ejected and channel_closed, and refuses anything else", () => {
+    for (const reason of ["ejected", "channel_closed"] as const) {
+      const decoded = decodeChannelMembershipEnded(encodeChannelMembershipEnded({ channel_pubkey: CHANNEL, reason }));
+      expect(decoded.ok && decoded.frame.reason).toBe(reason);
+    }
+    // A refusal reason is NOT a membership-ended reason, and neither is an invented one.
+    for (const bad of ["refused_by_admin", "made_up"]) {
+      expect(decodeChannelMembershipEnded(encodeCbor([MEMBERSHIP_ENDED_TYPE, CHANNEL, bad])).ok,
+        `${bad} is not a membership-ended reason`).toBe(false);
+    }
+    // A membership-ended frame is classified as its own type, and never decodes as a refusal.
+    const ended = encodeChannelMembershipEnded({ channel_pubkey: CHANNEL, reason: "ejected" });
+    expect(channelJoinFrameType(ended)).toBe(MEMBERSHIP_ENDED_TYPE);
+    expect(isChannelJoinFrame(ended)).toBe(true);
+    expect(decodeChannelJoinRefused(ended).ok).toBe(false);
   });
 
   it("a re-key carries its generation, and the generation must be a real one", () => {
@@ -166,7 +183,7 @@ describe("M16 019 Part B — the join frames", () => {
   it("a frame of one type does not decode as another", () => {
     // The type is in the frame, so a refusal cannot be read as an acceptance — which would have a
     // subscriber store a key bundle built from whatever those bytes happened to contain.
-    const refused = encodeChannelJoinRefused({ channel_pubkey: CHANNEL, reason: "ejected" });
+    const refused = encodeChannelJoinRefused({ channel_pubkey: CHANNEL, reason: "refused_by_admin" });
     expect(decodeChannelJoinAccepted(refused).ok).toBe(false);
     expect(decodeChannelRekey(refused).ok).toBe(false);
     expect(decodeChannelJoinRequest(refused).ok).toBe(false);
@@ -184,7 +201,7 @@ describe("025-JOINSCREEN — channelJoinFrameType is strict, by full decode", ()
       retention_seconds: 3600, access: "invite_only", relays: [RELAY_A, RELAY_B], members_visible: false,
     }))).toBe(JOIN_ACCEPTED_TYPE);
     expect(channelJoinFrameType(encodeChannelJoinRefused({
-      channel_pubkey: CHANNEL, reason: "ejected",
+      channel_pubkey: CHANNEL, reason: "refused_by_admin",
     }))).toBe(JOIN_REFUSED_TYPE);
     expect(channelJoinFrameType(encodeChannelRekey({
       channel_pubkey: CHANNEL, key_bundle: BUNDLE, generation: 3,
