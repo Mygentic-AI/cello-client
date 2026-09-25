@@ -395,6 +395,19 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   },
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
+    claim: "channel setup help: a channel's ACCESS is fixed at create and 'cannot change'.",
+    excerpts: ["cannot change, because subscribers joined the access they were told."],
+    enforcedBy: "daemon-local",
+    verdict: "true",
+    evidence:
+      "M16 036-PUBLICSUB review M-1 (d9b00a86): `cello_channel_config` refuses `access_is_fixed` " +
+      "when the channel already has stored config and the requested access differs " +
+      "(`channel-publish-handlers.ts`, the `access_is_fixed` branch), leaving the stored access " +
+      "untouched; proven by the `reviewer M-1` case in `channel-verbs-live-daemon.test.ts`. " +
+      "Create is the only path that sets access.",
+  },
+  {
+    surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "sealed-receipt: 'what was said, and who signed off on it.'",
     excerpts: ["notarized receipt — what was said, and who signed off on it."],
     enforcedBy: "directory",
