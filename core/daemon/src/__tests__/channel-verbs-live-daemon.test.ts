@@ -143,6 +143,23 @@ describe("M16 018-PUBCOLLECT: the channel verbs on a live daemon", () => {
     expect(answer.reason, "the operator is told they follow nothing, not given an empty list").toBe("not_subscribed");
   });
 
+  it("035 item 1 — info on a channel this daemon ADMINISTERS carries access, guidance, relays", async () => {
+    // The directory answers only the admin key; item 1 adds access/description/relays from the LOCAL
+    // config the publisher wrote. Here alice administers her own channel, so info reports all three.
+    await call("cello_channel_config", {
+      agent: "alice", channel: alicePubkeyHex, access: "public",
+      relays: [RELAY_A, RELAY_B], guidance: "the original description",
+    });
+    const info = await call("cello_channel_info", { agent: "alice", channel: alicePubkeyHex }) as
+      { ok: boolean; adminPubkeyHex?: string; access?: string; guidance?: string; relays?: string[]; detail?: string };
+    expect(info.ok, JSON.stringify(info)).toBe(true);
+    expect(info.access).toBe("public");
+    expect(info.guidance).toBe("the original description");
+    expect(info.relays).toEqual([RELAY_A, RELAY_B]);
+    // Administering the channel, it does NOT fall back to the "join to see the description" detail.
+    expect(info.detail).toBeUndefined();
+  });
+
   it("28. a channel must be SET UP before it can publish, and the refusal says so", async () => {
     const answer = await call("cello_channel_publish", {
       agent: "alice", channel: alicePubkeyHex, title: "before setup", body: "body",

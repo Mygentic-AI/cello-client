@@ -21,6 +21,7 @@ import {
 import { generateGroupKey, wrapGroupKeyFor, deriveFetchKey, decryptBody, encryptBody } from "@cello-protocol/crypto";
 import { ChannelMembershipStore } from "./channel-membership-store.js";
 import { ChannelSubscriptionStore } from "./channel-subscription-store.js";
+import { ChannelConfigStore } from "./channel-config-store.js";
 import {
   createChannelJoinExchange, ensureCurrentGroupKey,
   type LocalChannelAdmin, type AdminLookupOutcome,
@@ -195,6 +196,9 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
 
   const members = new ChannelMembershipStore(deps.getDb(), logger);
   const subscriptions = new ChannelSubscriptionStore(deps.getDb(), logger);
+  // Reads the `channel_config` table the publish half writes — for `channel info` on a channel this
+  // daemon administers (035-INFOCLI item 1). Same table, read-only here.
+  const channelConfig = new ChannelConfigStore(deps.getDb(), logger);
 
   /**
    * ⚠️ A CHANNEL IS AN AGENT THIS DAEMON HOLDS, looked up BY PUBKEY — the same rule the publisher
@@ -420,6 +424,12 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
       return { ok: false, reason: res.reason ?? "session_open_failed", guidance: res.guidance };
     },
     sendInSession: (agentName, sessionId, content) => deps.sendInSession(agentName, sessionId, content),
+    /**
+     * 035-INFOCLI item 1: what THIS daemon knows about a channel it administers — the SAME
+     * `channel_config` table the publisher half writes (setup/create), read here for `info`. Reading
+     * one table from a second store instance is one source of truth, not two.
+     */
+    channelConfig: (channelHex) => channelConfig.get(channelHex),
     agentPubkey: (agentName) => deps.loadedAgents.find((a) => a.name === agentName)?.pubkey ?? null,
     decrypt: (agentId, channelHex, seq, body) => {
       const keys = subscriptions.keysFor(agentId, channelHex);

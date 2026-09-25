@@ -12,13 +12,23 @@
  * relay argument — wrong, and contradicted by the frame 019 already shipped.
  */
 import type { Logger } from "./types.js";
-import { encodeChannelJoinRequest } from "@cello-protocol/protocol-types";
+import { encodeChannelJoinRequest, type ChannelAccess } from "@cello-protocol/protocol-types";
 import type { ChannelSubscriptionStore } from "./channel-subscription-store.js";
 import type { ChannelInboxStore } from "./channel-inbox-store.js";
 import { extractErrorMessage } from "./error-message.js";
 
 export type ChannelInfoResult =
-  | { ok: true; channelHex: string; adminPubkeyHex: string }
+  | {
+      ok: true; channelHex: string; adminPubkeyHex: string;
+      // Added from LOCAL knowledge only (035-INFOCLI item 1). The directory names just the admin;
+      // these come from the config store (a channel this daemon administers) or the subscription
+      // store (a channel followed here). `status` is present only for a followed channel.
+      access?: ChannelAccess; guidance?: string; relays?: string[];
+      status?: "active" | "left" | "ejected" | "closed";
+      // Present only when this daemon knows nothing beyond the admin — neither administers nor
+      // follows the channel — so a reader is told how to see the description and relays.
+      detail?: string;
+    }
   | { ok: false; reason: "not_a_channel" | "unavailable"; detail?: string };
 
 export type ChannelJoinResult =
@@ -52,6 +62,11 @@ export interface ChannelSubscribeDeps {
     { ok: true; sessionId: string } | { ok: false; reason: string; guidance?: string }
   >;
   sendInSession: (agentName: string, sessionId: string, content: Uint8Array) => Promise<void>;
+  /**
+   * What THIS daemon has decided about a channel it administers (the config store `create`/`setup`
+   * write), or null when it holds no config for that channel. Read-only — `info` never writes it.
+   */
+  channelConfig: (channelHex: string) => { access: ChannelAccess; guidance: string; relays: string[] } | null;
   /** This agent's own public key — the subscriber identity the request names. */
   agentPubkey: (agentName: string) => string | null;
   /** Decrypt one stored post body for this subscription, or null if no key fits. */
@@ -59,12 +74,32 @@ export interface ChannelSubscribeDeps {
 }
 
 export function createChannelSubscribe(deps: ChannelSubscribeDeps) {
-  /** Directory only. One argument, the channel key. */
+  /**
+   * The directory names the admin; LOCAL knowledge adds the rest when this daemon has it (035 item 1).
+   *
+   * ⚠️ **NO DIRECTORY CHANGE, and the added fields come from LOCAL stores only.** The directory
+   * answers `not_a_channel` / `unavailable` / the admin key and nothing else — access, the
+   * description and the relays are the publisher's, learned by administering the channel (config
+   * store) or by following it (subscription store). A daemon that does neither cannot know them, so
+   * it says how to find out rather than inventing a value.
+   */
   async function info(agentId: string, channelHex: string): Promise<ChannelInfoResult> {
     const found = await deps.lookupAdmin(agentId, channelHex);
-    if (found.kind === "admin") return { ok: true, channelHex, adminPubkeyHex: found.adminPubkeyHex };
     if (found.kind === "not_a_channel") return { ok: false, reason: "not_a_channel" };
-    return { ok: false, reason: "unavailable", detail: found.reason };
+    if (found.kind === "unavailable") return { ok: false, reason: "unavailable", detail: found.reason };
+
+    const base = { ok: true as const, channelHex, adminPubkeyHex: found.adminPubkeyHex };
+
+    // Administering the channel is the fullest source — this daemon holds the config it signs from.
+    const cfg = deps.channelConfig(channelHex);
+    if (cfg) return { ...base, access: cfg.access, guidance: cfg.guidance, relays: cfg.relays };
+
+    // Following it carries the same three from the acceptance, plus this member's own status.
+    const sub = deps.subscriptions.get(agentId, channelHex);
+    if (sub) return { ...base, access: sub.access, guidance: sub.guidance, relays: sub.relays, status: sub.status };
+
+    // Neither administered nor followed here: only the admin is known.
+    return { ...base, detail: "Join the channel to see its description and relays." };
   }
 
   /**

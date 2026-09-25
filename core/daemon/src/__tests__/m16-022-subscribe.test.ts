@@ -52,6 +52,8 @@ function build(over: Partial<Parameters<typeof createChannelSubscribe>[0]> = {})
     subscriptions: subs,
     inbox,
     lookupAdmin: () => Promise.resolve({ kind: "admin" as const, adminPubkeyHex: ADMIN }),
+    // Default: this daemon administers NO channel. Overridden per-test to prove the administered case.
+    channelConfig: () => null,
     sessionWith: () => Promise.resolve({ ok: true as const, sessionId: "session-1" }),
     sendInSession: (_a, sessionId, content) => { sent.push({ sessionId, content }); return Promise.resolve(); },
     agentPubkey: () => AGENT_PUBKEY,
@@ -77,10 +79,46 @@ async function storePost(seq: number, title: string, body: string) {
 }
 
 describe("M16 022 — info", () => {
-  it("1. says who administers a channel, from the directory alone", async () => {
+  it("1. a channel this daemon neither administers nor follows carries only the admin + a detail", async () => {
+    // 035-INFOCLI item 1: the directory names just the admin, so `info` says how to learn the rest
+    // rather than inventing an access/description/relays it cannot know.
     const { api } = build();
     const r = await api.info(AGENT, CHANNEL);
-    expect(r).toEqual({ ok: true, channelHex: CHANNEL, adminPubkeyHex: ADMIN });
+    expect(r).toEqual({
+      ok: true, channelHex: CHANNEL, adminPubkeyHex: ADMIN,
+      detail: "Join the channel to see its description and relays.",
+    });
+  });
+
+  it("1a. 035 item 1 — a channel this daemon ADMINISTERS carries access, guidance, relays from config", async () => {
+    const { api } = build({
+      channelConfig: () => ({ access: "invite_only", guidance: "the release channel", relays: [RELAY, "/dns4/relay-b.example/tcp/443/tls/ws"] }),
+    });
+    const r = await api.info(AGENT, CHANNEL);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.access).toBe("invite_only");
+      expect(r.guidance).toBe("the release channel");
+      expect(r.relays).toEqual([RELAY, "/dns4/relay-b.example/tcp/443/tls/ws"]);
+      // Administering the channel is not following it, so no member status is reported.
+      expect(r.status).toBeUndefined();
+      expect(r.detail).toBeUndefined();
+    }
+  });
+
+  it("1b. 035 item 1 — a channel this daemon FOLLOWS carries access, guidance, relays AND status", async () => {
+    // The subscription the acceptance created (guidance included), and this daemon administers nothing.
+    subs.upsert({ agent_id: AGENT, channel_pubkey: CHANNEL, admin_pubkey: ADMIN, access: "open", relays: [RELAY], guidance: "what it is for" });
+    const { api } = build();
+    const r = await api.info(AGENT, CHANNEL);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.access).toBe("open");
+      expect(r.guidance).toBe("what it is for");
+      expect(r.relays).toEqual([RELAY]);
+      expect(r.status).toBe("active");
+      expect(r.detail).toBeUndefined();
+    }
   });
 
   it("2. a pubkey that is not a channel is a settled NO, not an outage", async () => {
