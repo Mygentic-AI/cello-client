@@ -11,19 +11,19 @@
  * Real SQLCipher DB. No mocks.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { generateKeypair } from "@cello-protocol/crypto";
 import { signBroadcastArtifact } from "@cello-protocol/protocol-types";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import type { DaemonDatabase } from "../sqlcipher-db.js";
 import type { Logger } from "../types.js";
-import { ChannelConfigStore, CHANNEL_CONFIG_CREATE_SQL } from "../channel-config-store.js";
-import { ChannelMembershipStore, CHANNEL_MEMBERS_CREATE_SQL } from "../channel-membership-store.js";
-import { ChannelLogStore, CHANNEL_LOG_CREATE_SQL } from "../channel-log-store.js";
-import { ChannelSubscriptionStore, CHANNEL_SUBSCRIPTION_CREATE_SQL } from "../channel-subscription-store.js";
+import { ChannelConfigStore } from "../channel-config-store.js";
+import { ChannelMembershipStore } from "../channel-membership-store.js";
+import { ChannelLogStore } from "../channel-log-store.js";
+import { ChannelSubscriptionStore } from "../channel-subscription-store.js";
 
 interface LogEvent { level: string; event: string; context?: Record<string, unknown> }
 function capturing(): { logger: Logger; events: LogEvent[] } {
@@ -100,6 +100,54 @@ const CHANNEL_SUBSCRIPTIONS_V1_SQL = `
     joined_at          INTEGER NOT NULL DEFAULT 0,
     status             TEXT    NOT NULL DEFAULT 'active',
     PRIMARY KEY (agent_id, channel_pubkey)
+  );
+`;
+
+/** channel_inbox @dceb84af (021-WAKE) — born complete; unchanged since. */
+const CHANNEL_INBOX_V1_SQL = `
+  CREATE TABLE IF NOT EXISTS channel_inbox (
+    agent_id        TEXT    NOT NULL,
+    channel_pubkey  TEXT    NOT NULL,
+    seq             INTEGER NOT NULL,
+    post_hash       TEXT    NOT NULL,
+    post_cbor       BLOB    NOT NULL,
+    receipt_cbor    BLOB,
+    from_relay      TEXT    NOT NULL,
+    collected_at    INTEGER NOT NULL,
+    PRIMARY KEY (agent_id, channel_pubkey, seq, post_hash)
+  );
+`;
+
+/** channel_state @3e5d9c4d (016-CLIENTREWORK) — born with the post log; unchanged since. */
+const CHANNEL_STATE_V1_SQL = `
+  CREATE TABLE IF NOT EXISTS channel_state (
+    channel_pubkey   TEXT    NOT NULL PRIMARY KEY,
+    next_seq         INTEGER NOT NULL,
+    pruned_through   INTEGER NOT NULL DEFAULT 0
+  );
+`;
+
+/** channel_log_receipts @3e5d9c4d (016-CLIENTREWORK) — born with the post log; unchanged since. */
+const CHANNEL_LOG_RECEIPTS_V1_SQL = `
+  CREATE TABLE IF NOT EXISTS channel_log_receipts (
+    channel_pubkey   TEXT    NOT NULL,
+    seq              INTEGER NOT NULL,
+    relay_pubkey     TEXT    NOT NULL,
+    received_at      INTEGER NOT NULL,
+    receipt_cbor     BLOB    NOT NULL,
+    PRIMARY KEY (channel_pubkey, seq, relay_pubkey)
+  );
+`;
+
+/** channel_subscription_keys @581b0560 (019-MEMBERSHIP) — born complete; unchanged since. */
+const CHANNEL_SUBSCRIPTION_KEYS_V1_SQL = `
+  CREATE TABLE IF NOT EXISTS channel_subscription_keys (
+    agent_id        TEXT    NOT NULL,
+    channel_pubkey  TEXT    NOT NULL,
+    generation      INTEGER NOT NULL,
+    key             BLOB    NOT NULL,
+    received_at     INTEGER NOT NULL,
+    PRIMARY KEY (agent_id, channel_pubkey, generation)
   );
 `;
 
@@ -298,10 +346,9 @@ describe("042-UPGRADE: invariants that must not change", () => {
  * `PRIMARY KEY (a, b)` line does not end the block early.
  */
 function tableColumns(sql: string, table: string): string[] {
-  const marker = `CREATE TABLE IF NOT EXISTS ${table} (`;
-  const start = sql.indexOf(marker);
-  if (start === -1) throw new Error(`no CREATE TABLE for ${table}`);
-  const open = start + marker.length - 1;
+  const m = new RegExp(`CREATE TABLE IF NOT EXISTS ${table}\\s*\\(`).exec(sql);
+  if (!m) throw new Error(`no CREATE TABLE for ${table}`);
+  const open = m.index + m[0].length - 1; // the opening paren
   let depth = 0;
   let end = -1;
   for (let j = open; j < sql.length; j++) {
@@ -321,37 +368,95 @@ function tableColumns(sql: string, table: string): string[] {
   return cols;
 }
 
-/** Columns an `addColumnIfMissing`/`ALTER … ADD COLUMN` call in a store's source upgrades in place. */
-function addColumnNames(sourceRelPath: string): string[] {
-  const text = readFileSync(fileURLToPath(new URL(sourceRelPath, import.meta.url)), "utf8");
-  return [...text.matchAll(/ADD COLUMN\s+(\w+)/g)].map((m) => m[1]);
+/**
+ * Every `CREATE TABLE IF NOT EXISTS channel_*` the daemon ships, DISCOVERED from source rather than
+ * hand-listed. A hand-written list only ever gets shorter when someone forgets a table, and a
+ * shorter list is never red — which is the whole failure mode this guard exists to stop. So the set
+ * of tables to check is derived: only the CURRENT source can add a table, and adding one with no
+ * baseline below fails the test until its first-version SQL is recorded.
+ *
+ * Scans `core/daemon/src/channel-*.ts` (top level only — the __tests__ baselines below are not
+ * daemon source). Returns each table's current column set and the file its CREATE lives in.
+ */
+const DAEMON_SRC = dirname(dirname(fileURLToPath(import.meta.url)));
+
+function discoverChannelTables(): Map<string, { columns: string[]; file: string }> {
+  const found = new Map<string, { columns: string[]; file: string }>();
+  const files = readdirSync(DAEMON_SRC).filter((f) => /^channel-.*\.ts$/.test(f));
+  for (const f of files) {
+    const text = readFileSync(join(DAEMON_SRC, f), "utf8");
+    for (const m of text.matchAll(/CREATE TABLE IF NOT EXISTS (channel_[a-z_]+)\s*\(/g)) {
+      const table = m[1];
+      if (found.has(table)) continue; // a re-exported constant can appear in two files; first wins
+      found.set(table, { columns: tableColumns(text, table), file: f });
+    }
+  }
+  return found;
 }
 
-describe("042-UPGRADE Part C guard: a channel table's CREATE SQL cannot gain an unhandled column", () => {
-  // Reading the CURRENT constants keeps the guard honest — it compares live schema, not a copy.
-  const cases: Array<{
-    label: string;
-    table: string;
-    currentSql: string;
-    firstVersionSql: string;
-    source: string;
-    /** Columns handled by a mechanism other than addColumnIfMissing. channel_log is upgraded by
-     * RETIREMENT keyed on post_cbor's absence, so post_cbor is its sentinel; ANY further new column
-     * would slip past that check and this guard forces the next author to handle it. */
-    sentinels: string[];
-  }> = [
-    { label: "channel_config", table: "channel_config", currentSql: CHANNEL_CONFIG_CREATE_SQL, firstVersionSql: CHANNEL_CONFIG_V1_SQL, source: "../channel-config-store.ts", sentinels: [] },
-    { label: "channel_log", table: "channel_log", currentSql: CHANNEL_LOG_CREATE_SQL, firstVersionSql: CHANNEL_LOG_V1_SQL, source: "../channel-log-store.ts", sentinels: ["post_cbor"] },
-    { label: "channel_members", table: "channel_members", currentSql: CHANNEL_MEMBERS_CREATE_SQL, firstVersionSql: CHANNEL_MEMBERS_V1_SQL, source: "../channel-membership-store.ts", sentinels: [] },
-    { label: "channel_subscriptions", table: "channel_subscriptions", currentSql: CHANNEL_SUBSCRIPTION_CREATE_SQL, firstVersionSql: CHANNEL_SUBSCRIPTIONS_V1_SQL, source: "../channel-subscription-store.ts", sentinels: [] },
-  ];
+/**
+ * Every column any `ALTER TABLE <table> ADD COLUMN <col>` upgrades in place, across all channel
+ * source — mapped by table, so a birth in one file covers a CREATE in another (channel_config's
+ * births live with its store; ChannelMembershipStore only calls them).
+ */
+function allAddColumns(): Map<string, Set<string>> {
+  const out = new Map<string, Set<string>>();
+  for (const f of readdirSync(DAEMON_SRC).filter((x) => /^channel-.*\.ts$/.test(x))) {
+    const text = readFileSync(join(DAEMON_SRC, f), "utf8");
+    for (const m of text.matchAll(/ALTER TABLE\s+(\w+)\s+ADD COLUMN\s+(\w+)/g)) {
+      if (!out.has(m[1])) out.set(m[1], new Set());
+      out.get(m[1])!.add(m[2]);
+    }
+  }
+  return out;
+}
 
-  for (const c of cases) {
-    it(`${c.label}: every current column is in the first-version SQL, an addColumnIfMissing call, or a documented sentinel`, () => {
-      const current = tableColumns(c.currentSql, c.table);
-      const covered = new Set([...tableColumns(c.firstVersionSql, c.table), ...addColumnNames(c.source), ...c.sentinels]);
-      const unhandled = current.filter((col) => !covered.has(col));
-      expect(unhandled, `${c.label} has column(s) with no upgrade path — add an addColumnIfMissing for them (042-UPGRADE)`).toEqual([]);
+/**
+ * The first committed CREATE SQL for every channel table (inlined, with the commit it came from).
+ * A table discovered from source with NO entry here fails its test — which forces whoever adds a
+ * new channel table to record its baseline, so the class can never quietly grow past this guard.
+ *
+ * `sentinels`: columns covered by an upgrade mechanism OTHER than addColumnIfMissing. channel_log is
+ * upgraded by RETIREMENT keyed on `post_cbor`'s absence (Part B), so `post_cbor` is its sentinel;
+ * ANY further new column on channel_log would slip past that check, so it is deliberately NOT
+ * sentinel'd and this guard forces the next author to handle it.
+ */
+const BASELINES: Record<string, { firstVersionSql: string; sentinels: string[] }> = {
+  channel_config: { firstVersionSql: CHANNEL_CONFIG_V1_SQL, sentinels: [] },
+  channel_log: { firstVersionSql: CHANNEL_LOG_V1_SQL, sentinels: ["post_cbor"] },
+  channel_members: { firstVersionSql: CHANNEL_MEMBERS_V1_SQL, sentinels: [] },
+  channel_subscriptions: { firstVersionSql: CHANNEL_SUBSCRIPTIONS_V1_SQL, sentinels: [] },
+  channel_inbox: { firstVersionSql: CHANNEL_INBOX_V1_SQL, sentinels: [] },
+  channel_state: { firstVersionSql: CHANNEL_STATE_V1_SQL, sentinels: [] },
+  channel_log_receipts: { firstVersionSql: CHANNEL_LOG_RECEIPTS_V1_SQL, sentinels: [] },
+  channel_subscription_keys: { firstVersionSql: CHANNEL_SUBSCRIPTION_KEYS_V1_SQL, sentinels: [] },
+};
+
+describe("042-UPGRADE Part C guard: no channel table's CREATE SQL can gain an unhandled column", () => {
+  const discovered = discoverChannelTables();
+  const alters = allAddColumns();
+
+  it("the daemon still ships channel tables (the scan found some)", () => {
+    expect(discovered.size).toBeGreaterThan(0);
+  });
+
+  for (const [table, { columns, file }] of discovered) {
+    it(`${table} (${file}): every current column is in its first-version baseline, an ADD COLUMN, or a sentinel`, () => {
+      const baseline = BASELINES[table];
+      expect(
+        baseline,
+        `${table} has no first-version baseline in this test — record its first committed CREATE SQL (042-UPGRADE)`,
+      ).toBeDefined();
+      const covered = new Set([
+        ...tableColumns(baseline.firstVersionSql, table),
+        ...(alters.get(table) ?? new Set<string>()),
+        ...baseline.sentinels,
+      ]);
+      const unhandled = columns.filter((col) => !covered.has(col));
+      expect(
+        unhandled,
+        `${table} has column(s) with no upgrade path — add an addColumnIfMissing for them (042-UPGRADE)`,
+      ).toEqual([]);
     });
   }
 });
