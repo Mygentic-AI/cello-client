@@ -34,6 +34,12 @@ export type ChannelAdminOutcome =
   | { kind: "admin"; adminPubkeyHex: string }
   /** The directory answered, and this pubkey is not a channel — unregistered, or an ordinary agent. */
   | { kind: "not_a_channel" }
+  /**
+   * 038-RETESTFIX Part D: the directory answered that this channel's identity is revoked (deleted).
+   * An authoritative answer the client acts on — distinct from `not_a_channel` (never a channel) and
+   * from `unavailable` (no answer). Returned ONLY on an explicit `revoked: true`.
+   */
+  | { kind: "revoked" }
   /** No answer. NOT a verdict about the channel. */
   | { kind: "unavailable"; reason: string };
 
@@ -135,6 +141,17 @@ export function createChannelAdminLookup(
       if (typeof frame["registered"] !== "boolean" || typeof frame["channel"] !== "boolean") {
         deps.logger.warn("directory.channel.admin.lookup.failed", { channel: channelHex.slice(0, 16), reason: "malformed_reply" });
         return { kind: "unavailable", reason: "malformed_reply" };
+      }
+
+      /**
+       * 038-RETESTFIX Part D: an EXPLICIT `revoked: true` is a settled "the channel was deleted"
+       * answer, told apart from `not_a_channel`. Checked before the `registered` branch because a
+       * revoked channel answers `registered: false`. Requires `=== true`, so absence or a store fault
+       * is never read as deleted (MUST NOT CHANGE item 3).
+       */
+      if (frame["revoked"] === true) {
+        deps.logger.info("directory.channel.admin.lookup", { channel: channelHex.slice(0, 16), answered: "revoked" });
+        return { kind: "revoked" };
       }
 
       if (frame["registered"] !== true || frame["channel"] !== true) {

@@ -136,7 +136,12 @@ export function createProfileAdminPubkey(deps: {
       if (outcome.kind === "admin") return { ok: true, adminPubkeyHex: outcome.adminPubkeyHex };
       // M16 021-WAKE item 21: the reason goes BACK, not just into a log. `admin_unresolved` alone
       // cannot tell a dead stream from an unrolled directory from a channel that does not exist.
-      const reason = outcome.kind === "not_a_channel" ? "not_a_channel" : outcome.reason;
+      // 038-RETESTFIX Part D: `channel_revoked` is the directory saying the channel was deleted — the
+      // subscribe `lookupAdmin` below turns it into `{ kind: "revoked" }`; the exchange fails closed
+      // on it like any other non-admin outcome.
+      const reason = outcome.kind === "not_a_channel" ? "not_a_channel"
+        : outcome.kind === "revoked" ? "channel_revoked"
+        : outcome.reason;
       deps.logger.info("channel.join.admin_unresolved", { channel_pubkey: channelHex, reason });
       return { ok: false, reason };
     } catch (err: unknown) {
@@ -395,9 +400,11 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     lookupAdmin: async (agentId, channelHex) => {
       const found = await profileAdminPubkey(channelHex, agentId);
       if (found.ok) return { kind: "admin" as const, adminPubkeyHex: found.adminPubkeyHex };
-      return found.reason === "not_a_channel"
-        ? { kind: "not_a_channel" as const }
-        : { kind: "unavailable" as const, reason: found.reason };
+      if (found.reason === "not_a_channel") return { kind: "not_a_channel" as const };
+      // 038-RETESTFIX Part D: the directory said the channel is revoked (deleted) — surfaced so
+      // `info`/`join` report `channel_deleted` rather than a generic `unavailable`.
+      if (found.reason === "channel_revoked") return { kind: "revoked" as const };
+      return { kind: "unavailable" as const, reason: found.reason };
     },
     /**
      * An existing session with the admin, or a new one.

@@ -29,11 +29,16 @@ export type ChannelInfoResult =
       // follows the channel — so a reader is told how to see the description and relays.
       detail?: string;
     }
-  | { ok: false; reason: "not_a_channel" | "unavailable"; detail?: string };
+  // 038-RETESTFIX Part D: `channel_deleted` — the directory says this channel's identity is revoked,
+  // OR this member holds a local subscription marked `closed` (it received the channel_closed notice).
+  // `status: "closed"` rides only the local-subscription case.
+  | { ok: false; reason: "not_a_channel" | "unavailable" | "channel_deleted"; detail?: string; guidance?: string; status?: "closed" };
 
 export type ChannelJoinResult =
   | { ok: true; channelHex: string; state: "requested" }
-  | { ok: false; reason: "not_a_channel" | "unavailable" | "no_session" | "send_failed"; detail?: string };
+  // 038-RETESTFIX Part D: `channel_deleted` — a join to a revoked channel is refused BEFORE any
+  // session is opened.
+  | { ok: false; reason: "not_a_channel" | "unavailable" | "no_session" | "send_failed" | "channel_deleted"; detail?: string; guidance?: string };
 
 export interface ReadPost {
   seq: number;
@@ -55,6 +60,8 @@ export interface ChannelSubscribeDeps {
   lookupAdmin: (agentId: string, channelHex: string) => Promise<
     { kind: "admin"; adminPubkeyHex: string }
     | { kind: "not_a_channel" }
+    // 038-RETESTFIX Part D: the directory answered that this channel's identity is revoked (deleted).
+    | { kind: "revoked" }
     | { kind: "unavailable"; reason: string }
   >;
   /** An open session with that agent, opening one if needed. Null when it cannot be reached. */
@@ -85,6 +92,24 @@ export function createChannelSubscribe(deps: ChannelSubscribeDeps) {
    */
   async function info(agentId: string, channelHex: string): Promise<ChannelInfoResult> {
     const found = await deps.lookupAdmin(agentId, channelHex);
+    const sub = deps.subscriptions.get(agentId, channelHex);
+
+    /**
+     * 038-RETESTFIX Part D: a channel this member knows is gone reads as `channel_deleted`. Two
+     * sources: the directory's explicit `revoked` answer, OR a local subscription already marked
+     * `closed` (this member received the channel_closed notice, and the fleet may not be rolled yet
+     * so the directory could still answer `admin`). The closed status rides only the local case.
+     *
+     * ⚠️ **ONLY AN EXPLICIT `revoked` OR a local `closed` — never an `unavailable`/error (MUST NOT
+     * CHANGE item 3).** A directory outage stays `unavailable`; it must not read as deleted.
+     */
+    if (found.kind === "revoked" || sub?.status === "closed") {
+      return {
+        ok: false, reason: "channel_deleted",
+        guidance: "This channel was deleted by its admin.",
+        ...(sub?.status === "closed" ? { status: "closed" as const } : {}),
+      };
+    }
     if (found.kind === "not_a_channel") return { ok: false, reason: "not_a_channel" };
     if (found.kind === "unavailable") return { ok: false, reason: "unavailable", detail: found.reason };
 
@@ -95,7 +120,6 @@ export function createChannelSubscribe(deps: ChannelSubscribeDeps) {
     if (cfg) return { ...base, access: cfg.access, guidance: cfg.guidance, relays: cfg.relays };
 
     // Following it carries the same three from the acceptance, plus this member's own status.
-    const sub = deps.subscriptions.get(agentId, channelHex);
     if (sub) return { ...base, access: sub.access, guidance: sub.guidance, relays: sub.relays, status: sub.status };
 
     // Neither administered nor followed here: only the admin is known.
@@ -113,6 +137,11 @@ export function createChannelSubscribe(deps: ChannelSubscribeDeps) {
   async function join(agentName: string, agentId: string, channelHex: string, note?: string): Promise<ChannelJoinResult> {
     const found = await deps.lookupAdmin(agentId, channelHex);
     if (found.kind === "not_a_channel") return { ok: false, reason: "not_a_channel" };
+    // 038-RETESTFIX Part D: refuse a join to a revoked channel BEFORE any session is opened — the
+    // directory has said the channel is gone, so there is no admin to ask and nothing to join.
+    if (found.kind === "revoked") {
+      return { ok: false, reason: "channel_deleted", guidance: "This channel was deleted by its admin." };
+    }
     if (found.kind === "unavailable") return { ok: false, reason: "unavailable", detail: found.reason };
 
     /**

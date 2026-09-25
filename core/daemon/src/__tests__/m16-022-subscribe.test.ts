@@ -136,6 +136,33 @@ describe("M16 022 — info", () => {
     expect(r.ok).toBe(false);
     if (!r.ok) { expect(r.reason).toBe("unavailable"); expect(r.detail).toBe("timeout"); }
   });
+
+  it("038 Part D — info on a revoked channel says it was deleted", async () => {
+    // Live evidence (F38): after `cello channel delete`, `channel info` still returned admin, access
+    // and relays, so a newcomer would try to join. When the directory answers revoked, info says so.
+    const { api } = build({ lookupAdmin: () => Promise.resolve({ kind: "revoked" as const }) });
+    const r = await api.info(AGENT, CHANNEL);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.reason).toBe("channel_deleted");
+      expect(r.guidance).toBe("This channel was deleted by its admin.");
+    }
+  });
+
+  it("038 Part D — info reports a local subscription's `closed` status even before the fleet is rolled", async () => {
+    // The member received the channel_closed notice, so its subscription is marked closed. Even if
+    // the directory has not yet been rolled (still answers `admin`), info reports the channel deleted
+    // and carries the closed status.
+    subs.upsert({ agent_id: AGENT, channel_pubkey: CHANNEL, admin_pubkey: ADMIN, access: "open", relays: [RELAY] });
+    subs.markClosed(AGENT, CHANNEL);
+    const { api } = build(); // lookupAdmin defaults to { kind: "admin" }
+    const r = await api.info(AGENT, CHANNEL);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.reason).toBe("channel_deleted");
+      expect(r.status).toBe("closed");
+    }
+  });
 });
 
 describe("M16 022 — join", () => {
@@ -195,6 +222,20 @@ describe("M16 022 — join", () => {
        */
       expect(r.detail).toBe("invalid_target_pubkey");
     }
+  });
+
+  it("038 Part D — a join to a revoked channel is refused BEFORE any session is opened", async () => {
+    const sessionWith = vi.fn(() => Promise.resolve({ ok: true as const, sessionId: "session-1" }));
+    const { api, sent } = build({ lookupAdmin: () => Promise.resolve({ kind: "revoked" as const }), sessionWith });
+    const r = await api.join(AGENT_NAME, AGENT, CHANNEL);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.reason).toBe("channel_deleted");
+      expect(r.guidance).toBe("This channel was deleted by its admin.");
+    }
+    // No session opened, nothing sent — the refusal comes from the directory answer alone.
+    expect(sessionWith, "no session is opened for a deleted channel").not.toHaveBeenCalled();
+    expect(sent).toHaveLength(0);
   });
 });
 
