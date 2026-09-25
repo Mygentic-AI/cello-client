@@ -661,3 +661,84 @@ describe("M16 034-LIFECYCLE — admin side: eject tells the member, delete remov
     expect(asked, "info reached the directory once for the deleted channel").toEqual([h.channelHex]);
   });
 });
+
+// ─── M16 041-HELPTRUTH Parts A & B — `cello channels` lists what you follow AND what you run ─────
+//
+// Part A: with neither `--agent` nor a selected agent, `cello_channels` lists every OPERATOR agent's
+// channels, grouped, instead of refusing `no_current_agent`. A channel identity is not an operator
+// agent (033-CHANNELVIEW), so it is left out. Part B: an agent's list also carries a row for each
+// channel it ADMINISTERS on this daemon (the config store's rows whose admin is this agent), with
+// role "admin" and the channel's name/access/relays/last-published seq; followed channels are "member".
+
+/** A daemon holding two operator agents plus one channel identity, driving `cello_channels` only. */
+async function listHarness(): Promise<{
+  handlers: Map<string, Handler>;
+  a1Hex: string; a2Hex: string; chHex: string;
+  subs: ChannelSubscriptionStore; config: ChannelConfigStore;
+  setCurrent: (n: string | null) => void; setLastSeq: (channelHex: string, seq: number) => void;
+}> {
+  const a1kp = generateKeypair() as InMemoryKeyProvider;
+  const a2kp = generateKeypair() as InMemoryKeyProvider;
+  const chKp = generateKeypair() as InMemoryKeyProvider;
+  const a1Hex = hex(await a1kp.getPublicKey());
+  const a2Hex = hex(await a2kp.getPublicKey());
+  const chHex = hex(await chKp.getPublicKey());
+  const handlers = new Map<string, Handler>();
+  let current: string | null = null;
+  const lastSeq = new Map<string, number>();
+
+  wireChannelMembership({
+    handlers, logger: silent, getDb: () => db,
+    sendInSession: () => Promise.resolve(),
+    setOnChannelJoinFrame: () => {},
+    loadedAgents: [
+      { name: "Agent One", pubkey: a1Hex, keyProvider: a1kp },
+      { name: "Agent Two", pubkey: a2Hex, keyProvider: a2kp },
+      { name: "test-channel", pubkey: chHex, keyProvider: chKp },
+    ],
+    keyProviders: new Map<string, InMemoryKeyProvider>([["Agent One", a1kp], ["Agent Two", a2kp], ["test-channel", chKp]]),
+    resolveAgentId: (agentName) => `id-of-${agentName}`,
+    // Null when nothing is selected and nothing was named — the exact case Part A answers.
+    resolveCurrentAgent: (_c, explicit) => explicit ?? current,
+    activeSessionsFor: () => [],
+    signalingFor: () => null,
+    openSessionFor: () => Promise.resolve({ ok: false }),
+    notify: { channelPosts() {}, channelJoinAnswer() {}, channelJoinRequest() {} },
+    pruneAllPosts: () => Promise.resolve({ pruned: 0, relays: [] }),
+    // 041 Part A: a channel identity is not an operator agent, so it is not one of the grouped rows.
+    isChannelAgent: (name) => name === "test-channel",
+    // 041 Part B: the last published seq for a channel this agent administers.
+    channelLastSeq: (channelHex) => lastSeq.get(channelHex) ?? null,
+  });
+
+  return {
+    handlers, a1Hex, a2Hex, chHex,
+    subs: new ChannelSubscriptionStore(db, silent),
+    config: new ChannelConfigStore(db, silent),
+    setCurrent: (n) => { current = n; },
+    setLastSeq: (channelHex, seq) => { lastSeq.set(channelHex, seq); },
+  };
+}
+
+describe("M16 041-HELPTRUTH Part A — no agent lists every operator agent's channels, grouped", () => {
+  it("with neither --agent nor a current agent, returns each operator agent's rows, and never a channel identity", async () => {
+    const h = await listHarness();
+    const ch1 = "1a".repeat(32);
+    const ch2 = "2b".repeat(32);
+    h.subs.upsert({ agent_id: "id-of-Agent One", channel_pubkey: ch1, admin_pubkey: "aa".repeat(32), access: "public", relays: [RELAY_A] });
+    h.subs.upsert({ agent_id: "id-of-Agent Two", channel_pubkey: ch2, admin_pubkey: "bb".repeat(32), access: "open", relays: [RELAY_A] });
+    h.setCurrent(null);
+
+    const res = (await h.handlers.get("cello_channels")!({}, "conn-1")) as {
+      ok: boolean; reason?: string; agents?: Array<{ agent: string; channels: Array<{ channel: string }> }>;
+    };
+
+    expect(res.ok, `no-agent listing must succeed, got ${res.reason ?? "ok"}`).toBe(true);
+    expect(res.agents, "the answer is grouped by agent, not a flat channel list").toBeDefined();
+    const byAgent = new Map(res.agents!.map((a) => [a.agent, a.channels.map((c) => c.channel)]));
+    // Both operator agents appear; the channel identity does not.
+    expect([...byAgent.keys()].sort()).toEqual(["Agent One", "Agent Two"]);
+    expect(byAgent.get("Agent One")).toContain(ch1);
+    expect(byAgent.get("Agent Two")).toContain(ch2);
+  });
+});

@@ -707,6 +707,9 @@ async function startDaemonHoldingLock(
     resolveAgentId: (agentName) => sessionNodeManager.resolveAgentId(agentName),
     resolveCurrentAgent: (connectionId, explicitAgent) =>
       resolveCurrentAgent(perConnectionState.get(connectionId), explicitAgent),
+    // 041-HELPTRUTH Part A: `cello channels` with no selection groups by operator agent, so it needs
+    // the same agents/channels partition every other surface uses (M16 033-CHANNELVIEW).
+    isChannelAgent: channelAgentLookup(sessionNodeManager, logger),
     activeSessionsFor: (agentName) => sessionNodeManager.getSessionsForAgent(agentName)
       .filter((s) => s.status === "active")
       .map((s) => ({ sessionId: s.session_id, counterpartyPubkeyHex: s.counterparty_pubkey })),

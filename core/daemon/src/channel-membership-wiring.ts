@@ -71,6 +71,12 @@ export interface ChannelMembershipWiringDeps {
   keyProviders: Map<string, KeyProvider>;
   resolveAgentId: (agentName: string) => string;
   resolveCurrentAgent: (connectionId: string, explicitAgent?: string) => string | null;
+  /**
+   * 041-HELPTRUTH Part A: is this loaded agent a CHANNEL identity rather than an operator agent? A
+   * channel follows and administers nothing, so `cello channels` with no selection lists operator
+   * agents only — the same agents/channels partition 033-CHANNELVIEW draws on every other surface.
+   */
+  isChannelAgent: (agentName: string) => boolean;
   /** Open sessions for an agent, so a re-key can ride one this daemon already holds. */
   activeSessionsFor: (agentName: string) => Array<{ sessionId: string; counterpartyPubkeyHex: string }>;
   /**
@@ -489,27 +495,40 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     return subscribe.read(deps.resolveAgentId(agent.agentName), channel.channelHex, params?.["all"] === true);
   });
 
+  /**
+   * The channels one agent follows and runs. `listedFor` (034-LIFECYCLE) shows active AND
+   * ejected/closed so an operator whose channel went quiet sees WHY, and hides only `left`, which is
+   * their own choice; `active()` (collector-only) would have dropped the ejected and closed ones.
+   */
+  const channelsForAgent = (agentName: string): Array<Record<string, unknown>> => {
+    const agentId = deps.resolveAgentId(agentName);
+    return subscriptions.listedFor(agentId).map((s) => ({
+      channel: s.channel_pubkey,
+      moniker: s.moniker,
+      access: s.access,
+      status: s.status,
+      delivered_through: s.delivered_through,
+      processed_through: s.processed_through,
+      // What the operator actually wants to know: how much is waiting.
+      unread: Math.max(0, s.delivered_through - s.processed_through),
+    }));
+  };
+
   handlers.set("cello_channels", async (params, connectionId) => {
-    const agent = needAgent(deps, params, connectionId);
-    if (!agent.ok) return agent.answer;
-    const agentId = deps.resolveAgentId(agent.agentName);
-    // M16 034-LIFECYCLE: `listedFor` shows active AND ejected/closed — so an operator whose channel
-    // went quiet sees WHY — and hides only `left`, which is their own choice. Each row carries its
-    // status; `active()` (collector-only) would have dropped the ejected and closed ones silently.
-    const rows = subscriptions.listedFor(agentId);
-    return Promise.resolve({
-      ok: true,
-      channels: rows.map((s) => ({
-        channel: s.channel_pubkey,
-        moniker: s.moniker,
-        access: s.access,
-        status: s.status,
-        delivered_through: s.delivered_through,
-        processed_through: s.processed_through,
-        // What the operator actually wants to know: how much is waiting.
-        unread: Math.max(0, s.delivered_through - s.processed_through),
-      })),
-    });
+    const explicit = typeof params?.["agent"] === "string" ? (params["agent"]) : undefined;
+    const current = deps.resolveCurrentAgent(connectionId, explicit);
+    // 041-HELPTRUTH Part A: with neither `--agent` nor a selected agent, list EVERY operator agent's
+    // channels grouped, instead of refusing `no_current_agent` — a shell that never selected an agent
+    // still wants to see what is here. Channel identities are not operator agents and are left out.
+    if (current === null) {
+      return Promise.resolve({
+        ok: true,
+        agents: deps.loadedAgents
+          .filter((a) => !deps.isChannelAgent(a.name))
+          .map((a) => ({ agent: a.name, channels: channelsForAgent(a.name) })),
+      });
+    }
+    return Promise.resolve({ ok: true, channels: channelsForAgent(current) });
   });
 
   handlers.set("cello_channel_set_moniker", async (params, connectionId) => {
