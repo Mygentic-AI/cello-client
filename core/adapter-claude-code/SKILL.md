@@ -492,8 +492,14 @@ cello_channel_refuse({ channel, subscriber, agent? })
                                              — turn down a request. No key is sent.
 cello_channel_eject({ channel, subscriber, agent? })
                                              — remove a member and rotate the key. CANNOT BE
-                                               UNDONE. Posts made before this still open under the
+                                               UNDONE. The member is TOLD (member_notified in the
+                                               answer). Posts made before this still open under the
                                                key they already hold; later ones do not.
+cello_channel_delete({ channel, agent? })
+                                             — delete a channel you run: tell every member and
+                                               pending requester (their subscription is marked
+                                               closed, earlier posts stay readable), prune both
+                                               relays, and retire the channel. CANNOT BE UNDONE.
 cello_channel_prune({ channel, through_seq, agent? })
                                              — drop the oldest posts. Your copy always goes; a
                                                relay that declines keeps serving them, and is named.
