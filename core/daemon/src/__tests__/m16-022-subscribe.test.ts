@@ -240,6 +240,24 @@ describe("M16 041-HELPTRUTH Part C — a member's info refreshes the description
     expect(subs.get(AGENT, channelHex)?.guidance, "the store keeps the newer text").toBe("text at t=200");
   });
 
+  it("C5. a record for THIS channel with a BAD signature is refused → stored text, store untouched (review MEDIUM)", async () => {
+    const channelHex = Buffer.from(await channelKp.getPublicKey()).toString("hex");
+    subs.upsert({ agent_id: AGENT, channel_pubkey: channelHex, admin_pubkey: ADMIN, access: "open", relays: [RELAY], guidance: "admission text" });
+
+    // A genuine record for THIS channel (channel-pubkey matches, updated_at newer than the anchor),
+    // then a signature byte flipped: it still decodes canonically, but verifyChannelInfo fails. The
+    // ONLY thing rejecting it is the signature check — remove verifyChannelInfo and this record is
+    // accepted (the pin the revert must catch).
+    const valid = await signedInfo(channelKp, channelHex, "text a bad signature must never show", 1_800_000_000_000);
+    const corrupt = Uint8Array.from(valid);
+    corrupt[corrupt.length - 1] ^= 0xff;
+
+    const r = await build({ fetchInfo: () => Promise.resolve(corrupt) }).api.info(AGENT, channelHex);
+    expect(r.ok && r.guidance, "an unverified record is never shown").toBe("admission text");
+    expect(r.ok && r.description_source).toBe("stored");
+    expect(subs.get(AGENT, channelHex)?.guidance, "the store is untouched").toBe("admission text");
+  });
+
   it("C3. no relay answers → the stored text is shown, source stored", async () => {
     const channelHex = Buffer.from(await channelKp.getPublicKey()).toString("hex");
     subs.upsert({ agent_id: AGENT, channel_pubkey: channelHex, admin_pubkey: ADMIN, access: "open", relays: [RELAY], guidance: "old stored text" });
