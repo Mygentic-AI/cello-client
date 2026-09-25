@@ -706,9 +706,10 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
       retired,
       ...(retired ? {} : { retire_reason: retireReason }),
       // Members are told and the relays are pruned either way. When the identity did not retire, the
-      // channel is still loaded on this daemon — say so and how to finish it.
+      // channel is still loaded on this daemon — say so and how to finish it. Retiring an agent is
+      // terminal-only (no MCP tool), so the guidance names the CLI verb, not a cello_* token.
       ...(retired ? {} : {
-        guidance: `Members were notified and the relays were pruned, but the channel identity '${channelAgentName ?? channel.channelHex}' is still loaded (${retireReason ?? "retire_failed"}). Run cello_remove_agent to retire it.`,
+        guidance: `Members were notified and the relays were pruned, but the channel identity '${channelAgentName ?? channel.channelHex}' is still loaded (${retireReason ?? "retire_failed"}). Run cello remove-agent '${channelAgentName ?? ""}' to retire it.`,
       }),
     };
   });
