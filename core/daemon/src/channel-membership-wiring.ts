@@ -606,13 +606,25 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
         unreached.push(member);
         continue;
       }
-      const bundle = await wrapGroupKeyFor(
-        gk, channelPubkey, new Uint8Array(Buffer.from(member, "hex")), admin.adminKeyProvider,
-      );
-      await deps.sendInSession(agent.agentName, sessionId, encodeChannelRekey({
-        channel_pubkey: channelPubkey, key_bundle: bundle, generation: outcome.generation,
-      }));
-      delivered += 1;
+      try {
+        const bundle = await wrapGroupKeyFor(
+          gk, channelPubkey, new Uint8Array(Buffer.from(member, "hex")), admin.adminKeyProvider,
+        );
+        await deps.sendInSession(agent.agentName, sessionId, encodeChannelRekey({
+          channel_pubkey: channelPubkey, key_bundle: bundle, generation: outcome.generation,
+        }));
+        delivered += 1;
+      } catch (err: unknown) {
+        // ⚠️ A SEND THAT THROWS MUST NOT END THE LOOP. Without this catch a single failed send
+        // stopped the re-key: every member AFTER the failure was neither sent the new key nor named
+        // in `unreached`, so the operator saw a clean eject while some members silently kept the old
+        // key and never appeared as behind. Catch per member, name them, and continue.
+        logger.warn("channel.rekey.member_unreached", {
+          channel_pubkey: channel.channelHex, member_pubkey: member,
+          generation: outcome.generation, reason: extractErrorMessage(err),
+        });
+        unreached.push(member);
+      }
     }
 
     logger.info("channel.rekey.completed", {

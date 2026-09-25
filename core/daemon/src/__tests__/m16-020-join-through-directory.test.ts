@@ -276,6 +276,17 @@ async function adminHarness() {
   const prunedChannels: string[] = [];
   const removedAgents: string[] = [];
   const closedSessions: Array<{ session_id: string; agent: string }> = [];
+  // 040-CLEANUP Part A: a capturing logger, so a test can prove the re-key logged an unreached
+  // member with the send error as the reason (not just that the array named them).
+  const logs: Array<{ level: string; event: string; ctx?: Record<string, unknown> }> = [];
+  const capLogger: Logger = {
+    debug: (event, ctx) => { logs.push({ level: "debug", event, ctx }); },
+    info: (event, ctx) => { logs.push({ level: "info", event, ctx }); },
+    warn: (event, ctx) => { logs.push({ level: "warn", event, ctx }); },
+    error: (event, ctx) => { logs.push({ level: "error", event, ctx }); },
+  };
+  // 040-CLEANUP Part A: session ids whose send THROWS — so a re-key delivery can fail mid-loop.
+  let sendThrowSessions = new Set<string>();
   // Configurable: which member pubkeys this daemon holds an OPEN session with.
   let openSessions: Array<{ sessionId: string; counterpartyPubkeyHex: string }> = [];
   // Configurable: whether openSessionFor succeeds, and the session it yields.
@@ -302,9 +313,13 @@ async function adminHarness() {
 
   wireChannelMembership({
     handlers,
-    logger: silent,
+    logger: capLogger,
     getDb: () => db,
-    sendInSession: (agentName, sessionId, content) => { sent.push({ agentName, sessionId, content }); return Promise.resolve(); },
+    sendInSession: (agentName, sessionId, content) => {
+      if (sendThrowSessions.has(sessionId)) return Promise.reject(new Error("relay_send_failed"));
+      sent.push({ agentName, sessionId, content });
+      return Promise.resolve();
+    },
     setOnChannelJoinFrame: () => {},
     loadedAgents: [
       { name: ADMIN_NAME, pubkey: adminHex, keyProvider: adminKp },
@@ -328,7 +343,8 @@ async function adminHarness() {
 
   return {
     handlers, members, adminKp, channelKp, adminHex, channelHex, sent, openedSessionsFor,
-    prunedChannels, removedAgents, closedSessions,
+    prunedChannels, removedAgents, closedSessions, logs,
+    setSendThrows: (ids: string[]) => { sendThrowSessions = new Set(ids); },
     setOpenSessions: (s: typeof openSessions) => { openSessions = s; },
     setOpenSessionForResult: (r: typeof openSessionForResult) => { openSessionForResult = r; },
     setRemoveAgentResult: (r: typeof removeAgentResult) => { removeAgentResult = r; },
@@ -380,6 +396,45 @@ describe("M16 034-LIFECYCLE — admin side: eject tells the member, delete remov
     expect(h.sent).toHaveLength(0);
     // The store recorded the ejection.
     expect(h.members.statusOf(h.channelHex, memberHex)).toBe("ejected");
+  });
+
+  it("040-CLEANUP Part A: a remaining member whose re-key send THROWS is named in unreached, and the others are still re-keyed", async () => {
+    // Three remaining members after an eject; the middle one's send throws. Before the fix the throw
+    // ended the loop, so the third member never got the new key and never appeared in `unreached` —
+    // the ejection re-keyed only the members ahead of the failure and silently skipped the rest.
+    const h = await adminHarness();
+    const mk = async () => hex(await (generateKeypair() as InMemoryKeyProvider).getPublicKey());
+    const ejectHex = await mk();
+    const m1 = await mk();
+    const m2 = await mk();
+    const m3 = await mk();
+    // The ejected member plus three remaining, all active with an open session each.
+    for (const m of [ejectHex, m1, m2, m3]) h.members.admit(h.channelHex, m, "active", 1000);
+    h.setOpenSessions([
+      { sessionId: "s-eject", counterpartyPubkeyHex: ejectHex },
+      { sessionId: "s-m1", counterpartyPubkeyHex: m1 },
+      { sessionId: "s-m2", counterpartyPubkeyHex: m2 },
+      { sessionId: "s-m3", counterpartyPubkeyHex: m3 },
+    ]);
+    // The middle member's re-key send fails.
+    h.setSendThrows(["s-m2"]);
+
+    const res = (await h.handlers.get("cello_channel_eject")!(
+      { channel: h.channelHex, subscriber: ejectHex }, "conn-1",
+    )) as { ok: boolean; delivered: number; unreached: string[] };
+
+    // The eject succeeds, and the loop did NOT abort on the throw.
+    expect(res.ok).toBe(true);
+    // The two reachable members got the re-key; the throwing one did not.
+    expect(res.delivered).toBe(2);
+    expect(res.unreached).toEqual([m2]);
+    expect(h.sent.some((s) => s.sessionId === "s-m1"), "m1 was re-keyed").toBe(true);
+    expect(h.sent.some((s) => s.sessionId === "s-m3"), "m3 was re-keyed even though m2 failed first").toBe(true);
+    expect(h.sent.some((s) => s.sessionId === "s-m2"), "m2's re-key threw, so nothing was sent on it").toBe(false);
+    // The log names the unreached member WITH the send error as the reason.
+    const logged = h.logs.find((l) => l.event === "channel.rekey.member_unreached" && l.ctx?.["member_pubkey"] === m2);
+    expect(logged, "an unreached-member log line was written for m2").toBeDefined();
+    expect(logged!.ctx?.["reason"]).toBe("relay_send_failed");
   });
 
   it("4. cello_channels lists an ejected subscription with status ejected, hides left, and shows unread", async () => {
