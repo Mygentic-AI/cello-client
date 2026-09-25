@@ -273,15 +273,24 @@ async function adminHarness() {
   const openedSessionsFor: string[] = [];
   const prunedChannels: string[] = [];
   const removedAgents: string[] = [];
+  const closedSessions: Array<{ session_id: string; agent: string }> = [];
   // Configurable: which member pubkeys this daemon holds an OPEN session with.
   let openSessions: Array<{ sessionId: string; counterpartyPubkeyHex: string }> = [];
   // Configurable: whether openSessionFor succeeds, and the session it yields.
   let openSessionForResult: { ok: boolean; sessionId?: string; reason?: string } = { ok: false, reason: "offline" };
+  // Configurable: whether the fake retire path succeeds.
+  let removeAgentResult: { ok: boolean; reason?: string } = { ok: true };
 
   // A fake retire path — the real cello_remove_agent lives in agent-handlers; here we only prove
   // delete REACHES it with the channel's name.
   handlers.set("cello_remove_agent", (params) => {
     removedAgents.push(String(params?.["name"] ?? ""));
+    return Promise.resolve(removeAgentResult);
+  });
+  // A fake close path — the real one lives in close-session-handler; here we only prove notifyRefused
+  // closes a session it OPENED and leaves an existing one alone.
+  handlers.set("cello_close_session", (params) => {
+    closedSessions.push({ session_id: String(params?.["session_id"] ?? ""), agent: String(params?.["agent"] ?? "") });
     return Promise.resolve({ ok: true });
   });
 
@@ -313,9 +322,10 @@ async function adminHarness() {
 
   return {
     handlers, members, adminKp, channelKp, adminHex, channelHex, sent, openedSessionsFor,
-    prunedChannels, removedAgents,
+    prunedChannels, removedAgents, closedSessions,
     setOpenSessions: (s: typeof openSessions) => { openSessions = s; },
     setOpenSessionForResult: (r: typeof openSessionForResult) => { openSessionForResult = r; },
+    setRemoveAgentResult: (r: typeof removeAgentResult) => { removeAgentResult = r; },
     subs: new ChannelSubscriptionStore(db, silent),
   };
 }
@@ -414,6 +424,8 @@ describe("M16 034-LIFECYCLE — admin side: eject tells the member, delete remov
     expect(res.relays).toEqual([{ relay: RELAY_A, ok: true }, { relay: RELAY_B, ok: true }]);
     // (c) the channel identity was retired through the existing remove path, by NAME.
     expect(h.removedAgents).toEqual([CHANNEL_NAME]);
+    // (d) a successful retire is reported as retired: true.
+    expect(res.retired).toBe(true);
   });
 
   it("6. delete of a channel this daemon does not administer is refused — nothing sent, nothing pruned, nothing retired", async () => {
@@ -429,5 +441,63 @@ describe("M16 034-LIFECYCLE — admin side: eject tells the member, delete remov
     expect(h.sent, "no member was told").toHaveLength(0);
     expect(h.prunedChannels, "nothing was pruned").toEqual([]);
     expect(h.removedAgents, "no identity was retired").toEqual([]);
+  });
+
+  it("review MEDIUM: a notice that OPENED a session seals it closed afterwards", async () => {
+    // notifyRefused opens a session when none is held. An opened-and-never-closed session counts
+    // against the relay's per-pair cap of 5. The session it opened is closed through the same
+    // (sealing) cello_close_session path.
+    const h = await adminHarness();
+    const memberKp = generateKeypair() as InMemoryKeyProvider;
+    const memberHex = hex(await memberKp.getPublicKey());
+    h.members.admit(h.channelHex, memberHex, "active", 1000);
+    h.setOpenSessions([]); // none open → notifyRefused opens one
+    h.setOpenSessionForResult({ ok: true, sessionId: "s-opened" });
+
+    await h.handlers.get("cello_channel_eject")!({ channel: h.channelHex, subscriber: memberHex }, "conn-1");
+
+    // The session it opened is sealed closed; the close rides the standard handler with the agent.
+    expect(h.closedSessions).toEqual([{ session_id: "s-opened", agent: ADMIN_NAME }]);
+  });
+
+  it("review MEDIUM: a notice riding an EXISTING session leaves it open", async () => {
+    // A session the operator already held is theirs — the notice rides it and it is NOT closed.
+    const h = await adminHarness();
+    const memberKp = generateKeypair() as InMemoryKeyProvider;
+    const memberHex = hex(await memberKp.getPublicKey());
+    h.members.admit(h.channelHex, memberHex, "active", 1000);
+    h.setOpenSessions([{ sessionId: "s-existing", counterpartyPubkeyHex: memberHex }]);
+
+    await h.handlers.get("cello_channel_eject")!({ channel: h.channelHex, subscriber: memberHex }, "conn-1");
+
+    // Rode the existing session (frame sent on it), and closed nothing — openSessionFor untouched.
+    expect(h.sent.some((s) => s.sessionId === "s-existing")).toBe(true);
+    expect(h.openedSessionsFor, "no session was opened").toEqual([]);
+    expect(h.closedSessions, "the operator's own session is left open").toEqual([]);
+  });
+
+  it("review MEDIUM: delete reports retired:false with a reason and guidance when the retire fails", async () => {
+    // The notices and prune already ran, so delete is ok:true — but the channel identity is still
+    // loaded, and an operator must be told that and how to finish. A silent ok:true hid it.
+    const h = await adminHarness();
+    const memberKp = generateKeypair() as InMemoryKeyProvider;
+    const memberHex = hex(await memberKp.getPublicKey());
+    h.members.admit(h.channelHex, memberHex, "active", 1000);
+    h.setOpenSessions([{ sessionId: "s-member", counterpartyPubkeyHex: memberHex }]);
+    h.setRemoveAgentResult({ ok: false, reason: "agent_not_found" });
+
+    const res = (await h.handlers.get("cello_channel_delete")!(
+      { channel: h.channelHex }, "conn-1",
+    )) as Record<string, unknown>;
+
+    // The members were still told and the relays still pruned — delete's first two steps succeeded.
+    expect(res.ok).toBe(true);
+    expect(res.members_notified).toBe(1);
+    expect(h.prunedChannels).toEqual([h.channelHex]);
+    // But the retire failed, and the answer says so, with the reason and operator guidance.
+    expect(res.retired).toBe(false);
+    expect(res.retire_reason).toBe("agent_not_found");
+    expect(typeof res.guidance).toBe("string");
+    expect(String(res.guidance)).toContain(CHANNEL_NAME);
   });
 });

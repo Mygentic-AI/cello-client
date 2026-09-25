@@ -269,13 +269,26 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     agentName: string, memberPubkeyHex: string, channelPubkey: Uint8Array, reason: ChannelJoinRefusedReason,
   ): Promise<boolean> => {
     let sessionId = openSessionWith(agentName, memberPubkeyHex);
+    // ⚠️ A session THIS call opens just to deliver the notice must be CLOSED again — an opened,
+    // never-closed session counts against the relay's per-pair cap of 5, and a channel with many
+    // members could exhaust it on a single delete. A session the operator ALREADY held is theirs,
+    // and is left untouched.
+    let openedByUs = false;
     if (sessionId === null) {
       const res = await deps.openSessionFor(agentName, { targetPubkey: memberPubkeyHex }) as
         { ok?: boolean; sessionId?: string };
       sessionId = res.ok === true && typeof res.sessionId === "string" ? res.sessionId : null;
+      openedByUs = sessionId !== null;
     }
     if (sessionId === null) return false;
     await deps.sendInSession(agentName, sessionId, encodeChannelJoinRefused({ channel_pubkey: channelPubkey, reason }));
+    if (openedByUs) {
+      // A normal SEALING close, through the same handler cello_close_session drives — so the notice
+      // session is notarized and torn down, not left dangling. Registered at boot; a miss here would
+      // be a wiring bug, so it is simply skipped rather than failing the eject/delete.
+      const close = deps.handlers.get("cello_close_session");
+      if (close) await close({ session_id: sessionId, agent: agentName }, "internal:channel-notice-close");
+    }
     return true;
   };
 
@@ -649,18 +662,31 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     const pruned = await deps.pruneAllPosts(agent.agentName, channel.channelHex);
 
     // (c) Retire the channel identity through the EXISTING remove path, addressed by the channel's
-    // display NAME (the pubkey is the identity; remove takes the name). Best-effort: a failed retire
-    // leaves the identity behind for a manual removal, logged — the notices and prune already ran.
+    // display NAME (the pubkey is the identity; remove takes the name).
+    //
+    // ⚠️ **A FAILED RETIRE IS REPORTED, NOT SWALLOWED.** The notices and prune already ran, so the
+    // delete is still `ok: true` — but the channel identity is STILL LOADED, and answering a bare
+    // `ok: true` hid that. `retired: false` with the reason and operator guidance says what did not
+    // happen and how to finish it by hand.
     const channelAgentName = deps.loadedAgents
       .find((a) => a.pubkey.toLowerCase() === channel.channelHex)?.name;
     const removeAgent = deps.handlers.get("cello_remove_agent");
+    let retired = false;
+    let retireReason: string | undefined;
     if (channelAgentName !== undefined && removeAgent) {
       const removed = (await removeAgent({ name: channelAgentName }, connectionId)) as { ok?: boolean; reason?: string };
-      if (removed.ok !== true) {
+      retired = removed.ok === true;
+      if (!retired) {
+        retireReason = removed.reason ?? "retire_failed";
         logger.warn("channel.delete.retire_failed", {
-          channel_pubkey: channel.channelHex, name: channelAgentName, reason: removed.reason,
+          channel_pubkey: channel.channelHex, name: channelAgentName, reason: retireReason,
         });
       }
+    } else {
+      retireReason = "channel_agent_not_loaded";
+      logger.warn("channel.delete.retire_failed", {
+        channel_pubkey: channel.channelHex, reason: retireReason,
+      });
     }
 
     logger.info("channel.deleted", {
@@ -668,6 +694,7 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
       members_notified: membersNotified,
       members_unreached: membersUnreached.length,
       relays_pruned: pruned.relays.filter((r) => r.ok).length,
+      retired,
     });
 
     return {
@@ -676,6 +703,13 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
       members_notified: membersNotified,
       members_unreached: membersUnreached,
       relays: pruned.relays,
+      retired,
+      ...(retired ? {} : { retire_reason: retireReason }),
+      // Members are told and the relays are pruned either way. When the identity did not retire, the
+      // channel is still loaded on this daemon — say so and how to finish it.
+      ...(retired ? {} : {
+        guidance: `Members were notified and the relays were pruned, but the channel identity '${channelAgentName ?? channel.channelHex}' is still loaded (${retireReason ?? "retire_failed"}). Run cello_remove_agent to retire it.`,
+      }),
     };
   });
 
