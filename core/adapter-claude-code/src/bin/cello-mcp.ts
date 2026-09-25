@@ -1196,6 +1196,12 @@ server.tool("cello_channel_eject", "Remove a member and rotate the channel's key
 }, async ({ channel, subscriber, agent }) =>
   jsonText(await proxy.call("cello_channel_eject", { channel, subscriber, ...(agent ? { agent } : {}) })));
 
+server.tool("cello_channel_delete", "Delete a channel you administer, permanently. Every current and pending member is told the channel is gone (their subscription is marked `closed`, and earlier posts they hold stay readable); every post is pruned from BOTH relays; and the channel identity is retired. CANNOT BE UNDONE. The answer names how many members were notified, which were unreachable, and each relay's prune outcome. A member you could not reach is still removed — the channel is gone regardless of who was told.", {
+  channel: channelKey(),
+  agent: adminAgent(),
+}, async ({ channel, agent }) =>
+  jsonText(await proxy.call("cello_channel_delete", { channel, ...(agent ? { agent } : {}) })));
+
 server.tool("cello_channel_prune", "Drop a channel's oldest posts, up to and including a post number, from this publisher's log and ask each relay to drop its copy. The local half always happens; a relay that declines KEEPS SERVING those posts until its retention expires, and the answer names it.", {
   channel: channelKey(),
   through_seq: z.number().describe("The last post number to drop"),

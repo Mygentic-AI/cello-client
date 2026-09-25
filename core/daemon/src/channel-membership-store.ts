@@ -234,6 +234,21 @@ export class ChannelMembershipStore {
     return row ? (row.status as MemberStatus) : null;
   }
 
+  /**
+   * Pending requests awaiting the admin's decision. Separate from `activeMembers` because they hold
+   * no key — but a channel DELETE (034-LIFECYCLE) still tells them the channel is gone, so their own
+   * daemon stops waiting on a request that will never be answered.
+   */
+  pendingMembers(channelHex: string): string[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT subscriber_pubkey FROM channel_members
+          WHERE channel_pubkey = ? AND status = 'pending' ORDER BY subscriber_pubkey ASC`,
+      )
+      .all(channelHex.toLowerCase()) as Array<{ subscriber_pubkey: string }>;
+    return rows.map((r) => r.subscriber_pubkey);
+  }
+
   /** Who a new key goes to. Pending and ejected are excluded, for different reasons — see above. */
   activeMembers(channelHex: string): string[] {
     const rows = this.#db

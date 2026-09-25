@@ -117,6 +117,9 @@ const ALWAYS_ON_VERBS: readonly DualSurfaceVerb[] = [
   { mcp: "cello_channel_approve", cli: "cello channel approve" },
   { mcp: "cello_channel_refuse", cli: "cello channel refuse" },
   { mcp: "cello_channel_eject", cli: "cello channel eject" },
+  // 034-LIFECYCLE: delete the whole channel — notifies members, prunes both relays, retires the
+  // channel identity. Its tool name matches its daemon method, like create.
+  { mcp: "cello_channel_delete", cli: "cello channel delete" },
   { mcp: "cello_channel_prune", cli: "cello channel prune" },
   { mcp: "cello_channel_resend", cli: "cello channel resend" },
   // Other

@@ -720,6 +720,10 @@ async function startDaemonHoldingLock(
     // M16 022: `join` opens a session with the channel's admin — a subscriber has never spoken to
     // them. The same path cello_initiate_session takes, callable without an IPC connection.
     openSessionFor: (agentName, opts) => openSessionFor(agentName, opts),
+    // M16 034-LIFECYCLE: the delete verb prunes the whole channel on both relays. The publisher and
+    // log live in the publishing half (built just below), so this defers to it — the closure runs
+    // at delete time, long after `channelWiring` is assigned.
+    pruneAllPosts: (agentName, channelHex) => channelWiring.pruneAllPosts(agentName, channelHex),
   });
 
   const channelWiring = wireChannelPublishing({

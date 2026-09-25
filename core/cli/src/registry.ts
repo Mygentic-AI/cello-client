@@ -1591,6 +1591,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       { name: "approve", summary: "Admit someone who asked to join an invite-only channel." },
       { name: "refuse", summary: "Turn down a request to join." },
       { name: "eject", summary: "Remove a member and rotate the key, so they stop receiving posts." },
+      { name: "delete", summary: "Delete a channel you run: tell its members, prune both relays, retire it. Cannot be undone." },
       { name: "prune", summary: "Drop the oldest posts from the relays." },
       { name: "resend", summary: "Refill a relay that lost posts, or one you just added." },
     ],
@@ -1606,6 +1607,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "       cello channel prune <channel> <through_seq> [--agent <agent>]\n" +
       "       cello channel resend <channel> [<relay>] [--agent <agent>]\n" +
       "       cello channel eject <channel> <member> | approve <channel> <member> | refuse <channel> <member>\n" +
+      "       cello channel delete <channel> [--agent <agent>]\n" +
       "  <channel> is the channel's 64-character hex public key.\n" +
       "  'create' comes FIRST for a channel you run: it registers the channel identity <name>,\n" +
       "  the DIRECTORY picks its two relays for you, and it publishes the description — in one step.\n" +
@@ -1724,6 +1726,11 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       }
       if (sub === "eject" && channel && a !== undefined) {
         return legacy(await channelVerb(ctx.celloDir, "cello_channel_eject", withAgent({ channel, subscriber: a })));
+      }
+      // 034-LIFECYCLE: delete the whole channel. Takes only the channel key — it notifies members,
+      // prunes both relays and retires the identity.
+      if (sub === "delete" && channel) {
+        return legacy(await channelVerb(ctx.celloDir, "cello_channel_delete", withAgent({ channel })));
       }
       if (sub === "approve" && channel && a !== undefined) {
         return legacy(await channelVerb(ctx.celloDir, "cello_channel_approve", withAgent({ channel, subscriber: a })));

@@ -70,7 +70,18 @@ export interface ChannelPublishWiringDeps {
 
 export function wireChannelPublishing(
   deps: ChannelPublishWiringDeps,
-): { stop: () => void; collectNow: (agentId: string) => Promise<void> } {
+): {
+  stop: () => void;
+  collectNow: (agentId: string) => Promise<void>;
+  /**
+   * M16 034-LIFECYCLE: prune EVERYTHING a channel holds — through the log's last seq — on both
+   * relays. The delete verb's second step. Lives here because the log and the publisher do, so the
+   * membership half reaches it rather than reimplementing prune. `null` publisher (no key held) or
+   * an empty log reports `pruned: 0` with no relay outcomes, never a false success.
+   */
+  pruneAllPosts: (agentName: string, channelHex: string) =>
+    Promise<{ pruned: number; relays: Array<{ relay: string; ok: boolean; reason?: string }> }>;
+} {
   const { logger, keyProviders } = deps;
 
   const log = new ChannelLogStore(deps.getDb(), logger);
@@ -354,5 +365,16 @@ export function wireChannelPublishing(
     // M16 021-WAKE: what the doorbell calls. Exposed rather than wired here because the frame
     // arrives on the agent's signaling stream, which this module does not own.
     collectNow: (agentId: string) => ticker.collectNow(agentId),
+    // M16 034-LIFECYCLE: the delete verb's prune step, over the WHOLE log. `pruneChannel` already
+    // signs with the channel key (looked up by channelHex), so building the publisher with the
+    // caller's admin name is enough — a channel with nothing in its log is `pruned: 0`, not an error.
+    pruneAllPosts: async (agentName, channelHex) => {
+      const publisher = buildPublisher(agentName);
+      if (!publisher) return { pruned: 0, relays: [] };
+      log.ensureChannel(channelHex);
+      const head = log.head(channelHex);
+      if (head.last_seq === null) return { pruned: 0, relays: [] };
+      return publisher.pruneChannel(agentName, channelHex, head.last_seq);
+    },
   };
 }

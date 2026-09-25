@@ -15,7 +15,8 @@ import type { Logger } from "./types.js";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import {
-  channelJoinFrameType, encodeChannelRekey, buildChannelFetchKeyTbs, JOIN_REQUEST_TYPE,
+  channelJoinFrameType, encodeChannelRekey, encodeChannelJoinRefused, buildChannelFetchKeyTbs,
+  JOIN_REQUEST_TYPE, type ChannelJoinRefusedReason,
 } from "@cello-protocol/protocol-types";
 import { generateGroupKey, wrapGroupKeyFor, deriveFetchKey, decryptBody, encryptBody } from "@cello-protocol/crypto";
 import { ChannelMembershipStore } from "./channel-membership-store.js";
@@ -81,6 +82,14 @@ export interface ChannelMembershipWiringDeps {
   openSessionFor: (agentName: string, opts: { targetPubkey: string }) => Promise<unknown>;
   /** M16 032-NOTICES: the content-free doorbells for a join answer and a new join request. */
   notify: ChannelNotify;
+  /**
+   * M16 034-LIFECYCLE: prune every post the channel holds, on both relays, through the log's last
+   * seq — the delete verb's second step. From the publishing half, which owns the log and the
+   * publisher, so this half does not reimplement prune. `pruned: 0` with no relays when this daemon
+   * holds no key for the channel or the log is empty — never a false success.
+   */
+  pruneAllPosts: (agentName: string, channelHex: string) =>
+    Promise<{ pruned: number; relays: Array<{ relay: string; ok: boolean; reason?: string }> }>;
 }
 
 /**
@@ -249,6 +258,27 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     return open ? open.sessionId : null;
   };
 
+  /**
+   * M16 034-LIFECYCLE: tell a member they are out — an ejection (`ejected`) or a whole-channel
+   * delete (`channel_closed`). The SAME send-or-open rule `join` uses: ride an OPEN session if this
+   * daemon holds one, else open one the way the join path does. Returns whether the member was
+   * reached — a member who cannot be reached is NOT a failed eject/delete (they are out at the relay
+   * regardless), it is a `member_notified: false` the caller reports and logs.
+   */
+  const notifyRefused = async (
+    agentName: string, memberPubkeyHex: string, channelPubkey: Uint8Array, reason: ChannelJoinRefusedReason,
+  ): Promise<boolean> => {
+    let sessionId = openSessionWith(agentName, memberPubkeyHex);
+    if (sessionId === null) {
+      const res = await deps.openSessionFor(agentName, { targetPubkey: memberPubkeyHex }) as
+        { ok?: boolean; sessionId?: string };
+      sessionId = res.ok === true && typeof res.sessionId === "string" ? res.sessionId : null;
+    }
+    if (sessionId === null) return false;
+    await deps.sendInSession(agentName, sessionId, encodeChannelJoinRefused({ channel_pubkey: channelPubkey, reason }));
+    return true;
+  };
+
   const raiseNotice = (event: string, channelHex: string, subscriberHex: string): void => {
     logger.info(event, { channel_pubkey: channelHex, subscriber_pubkey: subscriberHex });
     // M16 032-NOTICES: a pending request was a log line nobody reads. Ring the admin's join-request
@@ -414,13 +444,17 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     const agent = needAgent(deps, params, connectionId);
     if (!agent.ok) return agent.answer;
     const agentId = deps.resolveAgentId(agent.agentName);
-    const rows = subscriptions.active().filter((s) => s.agent_id === agentId);
+    // M16 034-LIFECYCLE: `listedFor` shows active AND ejected/closed — so an operator whose channel
+    // went quiet sees WHY — and hides only `left`, which is their own choice. Each row carries its
+    // status; `active()` (collector-only) would have dropped the ejected and closed ones silently.
+    const rows = subscriptions.listedFor(agentId);
     return Promise.resolve({
       ok: true,
       channels: rows.map((s) => ({
         channel: s.channel_pubkey,
         moniker: s.moniker,
         access: s.access,
+        status: s.status,
         delivered_through: s.delivered_through,
         processed_through: s.processed_through,
         // What the operator actually wants to know: how much is waiting.
@@ -539,15 +573,109 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
       delivered_count: delivered,
       failed_count: unreached.length,
     });
+
+    /**
+     * M16 034-LIFECYCLE: TELL THE EJECTED MEMBER. Before this they were removed silently and kept a
+     * normal-looking subscription forever. The frame rides the same send-or-open rule as `join`;
+     * unreachable is `member_notified: false`, logged and reported — the ejection still holds, so
+     * this never fails the eject.
+     */
+    const memberNotified = await notifyRefused(
+      agent.agentName, subscriber.toLowerCase(), channelPubkey, "ejected",
+    );
+    if (!memberNotified) {
+      logger.info("channel.eject.notice.unreached", {
+        channel_pubkey: channel.channelHex, member_pubkey: subscriber.toLowerCase(),
+      });
+    }
+
     return {
       ok: true,
       channel: channel.channelHex,
       generation: outcome.generation,
       delivered,
       unreached,
+      member_notified: memberNotified,
       guidance: unreached.length > 0
         ? `${String(unreached.length)} member(s) were not reachable and still hold the old key. They will ask for the new one when they next read; the ejection itself is done.`
         : undefined,
+    };
+  });
+
+  /**
+   * M16 034-LIFECYCLE — delete a channel this daemon administers.
+   *
+   * ⚠️ **ADMIN ONLY, AND THE CHANNEL KEY MUST BE HELD LOCALLY** — `localChannelAdmin` returns null
+   * otherwise, and a delete never runs for a channel this daemon does not hold. The three steps run
+   * in order and the retire is LAST, because the prune needs the channel key that retiring purges:
+   *   (a) tell every active AND pending member the channel is gone (`channel_closed`);
+   *   (b) prune the whole log on both relays;
+   *   (c) retire the channel identity through the existing `cello_remove_agent` path.
+   * Unreachable members are named, not fatal — the channel is gone regardless of who was told.
+   */
+  handlers.set("cello_channel_delete", async (params, connectionId) => {
+    const agent = needAgent(deps, params, connectionId);
+    if (!agent.ok) return agent.answer;
+    const channel = needChannel(params);
+    if (!channel.ok) return channel.answer;
+
+    const admin = localChannelAdmin(channel.channelHex);
+    if (!admin) {
+      return {
+        ok: false, reason: "channel_not_local",
+        guidance: "This daemon does not hold that channel's key, and deleting is the admin's own act. Cross-daemon admin is not in this release.",
+      };
+    }
+
+    // (a) Tell every active and pending member — the same send-or-open rule as eject.
+    const channelPubkey = await admin.channelKeyProvider.getPublicKey();
+    const toNotify = [...members.activeMembers(channel.channelHex), ...members.pendingMembers(channel.channelHex)];
+    let membersNotified = 0;
+    const membersUnreached: string[] = [];
+    for (const member of toNotify) {
+      const notified = await notifyRefused(agent.agentName, member, channelPubkey, "channel_closed");
+      if (notified) {
+        membersNotified += 1;
+      } else {
+        logger.info("channel.delete.notice.unreached", {
+          channel_pubkey: channel.channelHex, member_pubkey: member,
+        });
+        membersUnreached.push(member);
+      }
+    }
+
+    // (b) Prune everything on both relays. Done BEFORE the retire, which purges the channel key the
+    // prune signature needs.
+    const pruned = await deps.pruneAllPosts(agent.agentName, channel.channelHex);
+
+    // (c) Retire the channel identity through the EXISTING remove path, addressed by the channel's
+    // display NAME (the pubkey is the identity; remove takes the name). Best-effort: a failed retire
+    // leaves the identity behind for a manual removal, logged — the notices and prune already ran.
+    const channelAgentName = deps.loadedAgents
+      .find((a) => a.pubkey.toLowerCase() === channel.channelHex)?.name;
+    const removeAgent = deps.handlers.get("cello_remove_agent");
+    if (channelAgentName !== undefined && removeAgent) {
+      const removed = (await removeAgent({ name: channelAgentName }, connectionId)) as { ok?: boolean; reason?: string };
+      if (removed.ok !== true) {
+        logger.warn("channel.delete.retire_failed", {
+          channel_pubkey: channel.channelHex, name: channelAgentName, reason: removed.reason,
+        });
+      }
+    }
+
+    logger.info("channel.deleted", {
+      channel_pubkey: channel.channelHex,
+      members_notified: membersNotified,
+      members_unreached: membersUnreached.length,
+      relays_pruned: pruned.relays.filter((r) => r.ok).length,
+    });
+
+    return {
+      ok: true,
+      channel: channel.channelHex,
+      members_notified: membersNotified,
+      members_unreached: membersUnreached,
+      relays: pruned.relays,
     };
   });
 
