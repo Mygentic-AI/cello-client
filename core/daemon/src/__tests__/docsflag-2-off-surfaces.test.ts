@@ -178,10 +178,14 @@ describe("074-DOCSFLAG clauses 2/5/6/9 — the daemon's three document surfaces,
   // 75/89 → 76/90 for M16 024-CREATE's `cello_channel_create`, the one command that brings a
   // channel into existence. Registered unconditionally, so both positions move by one and the
   // 14-verb document gap is unchanged again.
-  it("OFF: the operator's socket answers 76 verbs, exactly 14 fewer than ON, and no doc verb", async () => {
+  //
+  // 76/90 → 77/91 for M16 034-LIFECYCLE's `cello_channel_delete`, the verb that retires a channel.
+  // Registered unconditionally, so both positions move by one and the 14-verb document gap is
+  // unchanged again.
+  it("OFF: the operator's socket answers 77 verbs, exactly 14 fewer than ON, and no doc verb", async () => {
     const off = await start("off");
     const offKeys = productionVerbs(off);
-    expect(offKeys).toHaveLength(76);
+    expect(offKeys).toHaveLength(77);
     expect(offKeys.filter((k) => k.startsWith("cello_doc_"))).toEqual([]);
     for (const verb of DOC_VERBS) expect(offKeys).not.toContain(verb);
 
@@ -190,7 +194,7 @@ describe("074-DOCSFLAG clauses 2/5/6/9 — the daemon's three document surfaces,
 
     const on = await start("on");
     const onKeys = productionVerbs(on);
-    expect(onKeys).toHaveLength(90);
+    expect(onKeys).toHaveLength(91);
     // The three assertions that survive any unrelated verb being added or removed.
     expect(onKeys.length - offKeys.length).toBe(14);
     expect(onKeys.filter((k) => k.startsWith("cello_doc_")).sort()).toEqual([...DOC_VERBS].sort());
