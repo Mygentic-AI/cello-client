@@ -57,6 +57,13 @@ interface AdminResult {
   ejectGeneration: number; remaining: string[];
 }
 
+interface E2EPost { seq: number; title: string; body: string }
+interface E2EAdminResult {
+  channelHex: string; adminHex: string; gen1BundleA: string;
+  publicBundleEmpty?: boolean; posts: E2EPost[];
+}
+interface CollectResult { agentId: string; agentName: string; collected: number[]; posts: E2EPost[] }
+
 function runHelper<T>(script: string, args: string[]): Promise<T> {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ["--import", "tsx", join(HELPERS, script), ...args], {
@@ -80,7 +87,8 @@ const runAdmin = (args: string[]): Promise<AdminResult> =>
 
 function runMember(args: string[]): Promise<{ fetched: number[]; decrypted: number[]; refusals: string[] }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ["--import", "tsx", join(HELPERS, "m16-019-member-process.ts"), ...args], {
+    // The ejection path is the member helper's `fetch` mode; `collect` is the 037 end-to-end path.
+    const child = spawn(process.execPath, ["--import", "tsx", join(HELPERS, "m16-019-member-process.ts"), "fetch", ...args], {
       cwd: PKG_ROOT, env: { ...process.env }, stdio: ["ignore", "pipe", "pipe"],
     });
     let out = "";
@@ -164,5 +172,57 @@ describe("M16 019-MEMBERSHIP enforcer", () => {
     expect(bAfter.decrypted).toEqual([]);
     expect(bAfter.refusals, "and both relays said why").toEqual(["not_a_member", "not_a_member"]);
 
+  }, 180_000);
+
+  /**
+   * 037-TESTTRUTH end-to-end (decision 2): the whole channel flow through the PRODUCTION wiring,
+   * across separate OS processes. The admin publishes through the real `ChannelPublisher` (encrypting
+   * via the production group-key path, 028); the member reads through the real `ChannelCollector`
+   * with `createChannelFetchAuth` (030), driven by `createChannelCollectTicker` whose online check is
+   * `createIsAgentOnlineById` (029) — and the member's id ≠ its name, so the id→name mapping is
+   * load-bearing. Assertions name the exact plaintext, never "it did not throw".
+   */
+  it("end-to-end: invite-only join→approve→publish 2→collect→read both as exact plaintext, then a public read", async () => {
+    const relayA = await startRelay(seedHex(0x53));
+    const relayB = await startRelay(seedHex(0x54));
+    children.push(relayA.child, relayB.child);
+
+    const memberSeed = seedHex(0x73);
+    const memberHex = hex(await new InMemoryKeyProvider(new Uint8Array(Buffer.from(memberSeed, "hex"))).getPublicKey());
+
+    // ── invite-only: admin registers the channel, member joins, admin approves, admin publishes 2 ──
+    const inviteAdmin = await runHelper<E2EAdminResult>("m16-019-admin-process.ts", [
+      join(dir, "e2e-invite-admin.db"), seedHex(0x63), seedHex(0x64),
+      memberHex, memberHex, relayA.multiaddr, relayB.multiaddr, "e2e-invite",
+    ]);
+    expect(inviteAdmin.posts.map((p) => p.seq), "the admin published two posts").toEqual([1, 2]);
+    expect(inviteAdmin.gen1BundleA.length, "the member was sent a wrapped key bundle").toBeGreaterThan(0);
+
+    // The member collects through the production collector + fetch auth, its online check keyed on an
+    // id that differs from its name — and reads BOTH posts as the exact titles and bodies the admin
+    // published.
+    const inviteRead = await runHelper<CollectResult>("m16-019-member-process.ts", [
+      "collect", join(dir, "e2e-invite-member.db"), "member-stable-id", "member-display-name",
+      inviteAdmin.channelHex, inviteAdmin.adminHex, memberSeed, "invite_only",
+      relayA.multiaddr, relayB.multiaddr, JSON.stringify([inviteAdmin.gen1BundleA]),
+    ]);
+    expect(inviteRead.collected, "the member collected both posts").toEqual([1, 2]);
+    expect(inviteRead.posts, "and read them as the exact plaintext the admin published").toEqual(inviteAdmin.posts);
+
+    // ── public: member joins a public channel → admitted with an empty bundle → reads a post ────────
+    const publicAdmin = await runHelper<E2EAdminResult>("m16-019-admin-process.ts", [
+      join(dir, "e2e-public-admin.db"), seedHex(0x65), seedHex(0x66),
+      memberHex, memberHex, relayA.multiaddr, relayB.multiaddr, "e2e-public",
+    ]);
+    expect(publicAdmin.publicBundleEmpty, "a public join is admitted with an empty key bundle").toBe(true);
+    expect(publicAdmin.posts.map((p) => p.seq)).toEqual([1]);
+
+    const publicRead = await runHelper<CollectResult>("m16-019-member-process.ts", [
+      "collect", join(dir, "e2e-public-member.db"), "public-stable-id", "public-display-name",
+      publicAdmin.channelHex, publicAdmin.adminHex, memberSeed, "public",
+      relayA.multiaddr, relayB.multiaddr, JSON.stringify([]),
+    ]);
+    expect(publicRead.collected, "the public reader collected the post").toEqual([1]);
+    expect(publicRead.posts, "and read it as the exact plaintext").toEqual(publicAdmin.posts);
   }, 180_000);
 });

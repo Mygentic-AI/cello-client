@@ -34,11 +34,27 @@ import type { Logger } from "../../types.js";
 const silent: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 const hex = (b: Uint8Array): string => Buffer.from(b).toString("hex");
 
+/**
+ * 037-TESTTRUTH end-to-end posts. The member must read these back as EXACTLY this plaintext, so the
+ * enforcer asserts titles and bodies rather than "it did not throw". The admin echoes them in its
+ * output, and the member's decrypted output must equal them.
+ */
+const E2E_INVITE_POSTS: ReadonlyArray<{ title: string; body: string }> = [
+  { title: "invite post one", body: "the first body, members only" },
+  { title: "invite post two", body: "the second body, members only" },
+];
+const E2E_PUBLIC_POSTS: ReadonlyArray<{ title: string; body: string }> = [
+  { title: "public post one", body: "readable by anyone" },
+];
+
 async function main(): Promise<void> {
   const [dbPath, channelSeed, adminSeed, memberAHex, memberBHex, relayA, relayB, phase] = process.argv.slice(2);
   if (!dbPath || !channelSeed || !adminSeed || !memberAHex || !memberBHex || !relayA || !relayB || !phase) {
-    throw new Error("usage: m16-019-admin-process.ts <dbPath> <channelSeed> <adminSeed> <memberAHex> <memberBHex> <relayA> <relayB> <setup|eject>");
+    throw new Error("usage: m16-019-admin-process.ts <dbPath> <channelSeed> <adminSeed> <memberAHex> <memberBHex> <relayA> <relayB> <setup|eject|e2e-invite|e2e-public>");
   }
+  const setup = phase === "setup";
+  const inviteE2e = phase === "e2e-invite";
+  const publicE2e = phase === "e2e-public";
 
   const db = openTestDb(dbPath);
   const channelKp = new InMemoryKeyProvider(new Uint8Array(Buffer.from(channelSeed, "hex")));
@@ -51,9 +67,10 @@ async function main(): Promise<void> {
   const subscriptions = new ChannelSubscriptionStore(db, silent);
   const log = new ChannelLogStore(db, silent);
 
-  // The channel's own settings — the row whose absence made every join refuse.
+  // The channel's own settings — the row whose absence made every join refuse. `e2e-public` is the
+  // one phase whose channel is public; every other phase is invite-only.
   members.putSettings(channelHex, {
-    access: "invite_only", members_visible: false, guidance: "enforcer channel",
+    access: publicE2e ? "public" : "invite_only", members_visible: false, guidance: "enforcer channel",
     retention_seconds: 7 * 24 * 3600, relays: [relayA, relayB], admin_pubkey: adminHex,
   });
 
@@ -88,13 +105,31 @@ async function main(): Promise<void> {
   }
 
   /**
+   * A PUBLIC join is admitted at once — `onAdminFrame` sends the acceptance itself, with an EMPTY
+   * bundle (036-PUBLICSUB), and there is nothing to approve. Returns that bundle so the enforcer can
+   * assert it is empty: admission with no key is the property.
+   */
+  async function joinPublic(memberHex: string): Promise<Uint8Array> {
+    const before = sent.length;
+    await exchange.onAdminFrame("s1", memberHex, encodeChannelJoinRequest({
+      channel_pubkey: channelPubkey,
+      subscriber_pubkey: new Uint8Array(Buffer.from(memberHex, "hex")),
+      note: "enforcer",
+    }));
+    if (sent.length <= before) throw new Error("nothing was sent for the public join");
+    const accepted = decodeChannelJoinAccepted(sent[sent.length - 1]);
+    if (!accepted.ok) throw new Error(`no public acceptance: ${accepted.reason}`);
+    return accepted.frame.key_bundle;
+  }
+
+  /**
    * ⚠️ TWO PHASES, TWO PROCESSES, ONE DATABASE. The members have to read BEFORE the ejection and
    * again after, and the relay's gate moves with the re-key — so the admin cannot do both in one
    * run. Splitting it also proves the admin's own state survives a restart, which is the property
-   * that broke when its group key lived only in memory.
+   * that broke when its group key lived only in memory. The e2e phases join only member A.
    */
-  const setup = phase === "setup";
-  const gen1BundleA = setup ? await join(memberAHex) : new Uint8Array(0);
+  const gen1BundleA = publicE2e ? await joinPublic(memberAHex)
+    : (setup || inviteE2e) ? await join(memberAHex) : new Uint8Array(0);
   const gen1BundleB = setup ? await join(memberBHex) : new Uint8Array(0);
 
   // ─── The publisher, with the fetch key derived exactly as the daemon's wiring derives it ──────
@@ -138,6 +173,26 @@ async function main(): Promise<void> {
       return s ? { access: s.access, relays: s.relays, guidance: s.guidance, retention_seconds: s.retention_seconds } : null;
     },
   });
+
+  // ─── 037-TESTTRUTH end-to-end: publish through the REAL publisher and report the exact plaintext ─
+  if (inviteE2e || publicE2e) {
+    const toPublish = publicE2e ? E2E_PUBLIC_POSTS : E2E_INVITE_POSTS;
+    const posts: Array<{ seq: number; title: string; body: string }> = [];
+    for (const p of toPublish) {
+      const r = await publisher.publish("admin-agent", channelHex, p.title, p.body);
+      if (!r.ok) throw new Error(`e2e publish failed at "${p.title}": ${r.reason}`);
+      posts.push({ seq: r.seq, title: p.title, body: p.body });
+    }
+    process.stdout.write(`${JSON.stringify({
+      channelHex, adminHex,
+      gen1BundleA: hex(gen1BundleA),
+      publicBundleEmpty: publicE2e ? gen1BundleA.length === 0 : undefined,
+      posts,
+    })}\n`);
+    await node.stop();
+    db.close();
+    return;
+  }
 
   let gen2BundleA = new Uint8Array(0);
   let ejectGeneration = 0;
