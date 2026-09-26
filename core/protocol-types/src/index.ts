@@ -415,6 +415,13 @@ export {
 export type {
   ChannelPosterPass, ChannelPosterPassDecodeReason, ChannelPosterPassVerifyResult,
 } from "./channel-poster-pass.js";
+// M16 / 045-NOTICEBELL — the sealed per-member channel notice, stored on the relays by slot.
+export {
+  CHANNEL_NOTICE_DOMAIN, CHANNEL_NOTICE_SLOT_DOMAIN, CHANNEL_NOTICE_TYPES, CHANNEL_NOTICE_MAX_SEALED_BYTES,
+  channelNoticeSlot, buildChannelNoticeTbs, signChannelNotice, encodeChannelNotice, decodeChannelNotice,
+  verifyChannelNotice, encodeNoticePassBody, decodeNoticePassBody, encodeNoticeEjectBody,
+} from "./channel-notice.js";
+export type { ChannelNotice, ChannelNoticeType, ChannelNoticeDecodeReason } from "./channel-notice.js";
 // M16 019-MEMBERSHIP: the join exchange. These travel inside an ordinary sealed session with the
 // channel's ADMIN — a channel never converses itself.
 export {
