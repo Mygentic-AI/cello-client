@@ -32,7 +32,6 @@ import { ChannelPosterPublisher } from "./channel-poster-publisher.js";
 import { ChannelLanePositionStore } from "./channel-lane-position-store.js";
 import { ChannelPosterGrantStore } from "./channel-poster-grant-store.js";
 import { postingInfoExt } from "./channel-posting-admin.js";
-import { createPosterDoorbell } from "./channel-poster-doorbell.js";
 import { ChannelInboxStore } from "./channel-inbox-store.js";
 import { createChannelCollectTicker } from "./channel-collect-tick.js";
 import { createChannelWakeSender, createPosterWakeSender } from "./channel-wake-sender.js";
@@ -449,19 +448,8 @@ export function wireChannelPublishing(
   const ticker = createChannelCollectTicker({
     logger, collector, subscriptions,
     isAgentOnline: deps.isAgentOnline,
-    // 043-POSTERS Part F: the admin's daemon rings members for its channels' poster posts.
-    adminPass: createPosterDoorbell({
-      logger,
-      collectPosterLanesAsAdmin: (id, ch, view) => collector.collectPosterLanesAsAdmin(id, ch, view),
-      postingChannels: () => config.postingChannels(),
-      channelConfig: (ch) => config.get(ch),
-      adminAgent: (adminHex) => {
-        const a = deps.loadedAgents.find((x) => x.pubkey.toLowerCase() === adminHex.toLowerCase());
-        return a ? { name: a.name, agentId: deps.resolveAgentId(a.name) } : null;
-      },
-      isAgentOnline: deps.isAgentOnline,
-      sendWake: (agentName, ch) => sendWake(agentName, ch),
-    }),
+    // 044-POSTERBELL: the admin no longer rings for poster posts — the POSTER rings itself the moment
+    // a relay accepts (see ringPosterWake above), so 043 Part F's admin-side collection is gone.
   });
   ticker.start();
 

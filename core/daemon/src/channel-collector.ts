@@ -223,18 +223,6 @@ export class ChannelCollector {
     if (got.delivered > 0) this.#opts.onDelivered?.(agentId, channelHex, got.delivered, sub.delivered_through, got.posters);
   }
 
-  /**
-   * 043-POSTERS Part F: the ADMIN's own daemon reads its channel's poster lanes as a reader — with
-   * the fetch key it already derives from the group key it holds — so it can ring the members for a
-   * poster's post. Returns how many new poster posts arrived and who wrote them.
-   */
-  async collectPosterLanesAsAdmin(
-    adminAgentId: string, channelHex: string,
-    view: { access: ChannelAccess; relays: string[]; admin_pubkey: string }, correlationId?: string,
-  ): Promise<{ delivered: number; posters: string[] }> {
-    return this.#posterLanesPass(adminAgentId, channelHex, { agent_id: adminAgentId, ...view }, correlationId);
-  }
-
   async #posterLanesPass(
     agentId: string, channelHex: string,
     sub: { agent_id: string; access: ChannelAccess; relays: string[]; admin_pubkey: string }, correlationId?: string,

@@ -313,9 +313,11 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // no pass is ever issued or renewed, so no member can post — every suite green. It is called from
     // channel-membership-wiring.ts, so it lands in `checked`, not EXEMPT.
     //
-    // 119 → 120 for 043-POSTERS Part F's `createPosterDoorbell` (channel-poster-doorbell.ts). Unwired,
-    // a poster's post never rings the members — every suite green. It is called from
-    // channel-publish-wiring.ts as the ticker's adminPass, so it lands in `checked`, not EXEMPT.
+    // 044-POSTERBELL removed 043 Part F's `createPosterDoorbell` (the admin rang for poster posts)
+    // and added `createPosterWakeSender` (channel-wake-sender.ts) — the poster rings itself now.
+    // One factory out, one in, so the count stays 120. `createPosterWakeSender` is called from
+    // channel-publish-wiring.ts, so it lands in `checked`, not EXEMPT; unwired, a poster's post would
+    // ring nobody — every suite green.
     expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(120);
     expect(
       exporters.size - checked.length,
