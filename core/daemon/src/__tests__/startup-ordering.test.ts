@@ -318,7 +318,11 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // One factory out, one in, so the count stays 120. `createPosterWakeSender` is called from
     // channel-publish-wiring.ts, so it lands in `checked`, not EXEMPT; unwired, a poster's post would
     // ring nobody — every suite green.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(120);
+    //
+    // 120 → 121 for M16 045-NOTICEBELL's `createChannelNoticeReader` (channel-notices.ts). Unwired, a
+    // member never reads an eject, a new group key, a pass or a removal — every suite green. It is
+    // called from channel-membership-wiring.ts, so it lands in `checked`, not EXEMPT.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(121);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",

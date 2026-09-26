@@ -163,6 +163,17 @@ const CHANNEL_POSTER_PASSES_V1_SQL = `
   );
 `;
 
+/** channel_notice_seen (045-NOTICEBELL) — born complete. */
+const CHANNEL_NOTICE_SEEN_V1_SQL = `
+  CREATE TABLE IF NOT EXISTS channel_notice_seen (
+    agent_id        TEXT    NOT NULL,
+    channel_pubkey  TEXT    NOT NULL,
+    type            TEXT    NOT NULL,
+    issued_at       INTEGER NOT NULL,
+    PRIMARY KEY (agent_id, channel_pubkey, type)
+  );
+`;
+
 /** channel_lane_positions (043-POSTERS) — born complete. */
 const CHANNEL_LANE_POSITIONS_V1_SQL = `
   CREATE TABLE IF NOT EXISTS channel_lane_positions (
@@ -470,6 +481,8 @@ const BASELINES: Record<string, { firstVersionSql: string; sentinels: string[] }
   channel_poster_passes: { firstVersionSql: CHANNEL_POSTER_PASSES_V1_SQL, sentinels: [] },
   channel_lane_positions: { firstVersionSql: CHANNEL_LANE_POSITIONS_V1_SQL, sentinels: [] },
   channel_poster_grants: { firstVersionSql: CHANNEL_POSTER_GRANTS_V1_SQL, sentinels: [] },
+  // 045-NOTICEBELL: the newest notice each agent applied, per (channel, type) — born complete.
+  channel_notice_seen: { firstVersionSql: CHANNEL_NOTICE_SEEN_V1_SQL, sentinels: [] },
 };
 
 describe("042-UPGRADE Part C guard: no channel table's CREATE SQL can gain an unhandled column", () => {
