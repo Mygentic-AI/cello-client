@@ -148,7 +148,7 @@ async function addPoster(w: World, name: string, moniker?: string): Promise<InMe
   w.subs.upsert({ agent_id: `id-${name}`, channel_pubkey: w.channelHex, admin_pubkey: hex(await w.admin.getPublicKey()), access: "invite_only", relays: [RELAY] });
   w.subs.addKey(`id-${name}`, w.channelHex, w.gk, NOW);
   const pass = await signChannelPosterPass(w.channel, { poster_pubkey: await kp.getPublicKey(), issued_at: NOW - DAY, expires_at: NOW + 6 * DAY });
-  w.passes.put(`id-${name}`, w.channelHex, { pass_cbor: encodeChannelPosterPass(pass), issued_at: pass.issued_at, expires_at: pass.expires_at });
+  w.passes.put(`id-${name}`, w.channelHex, { pass_cbor: encodeChannelPosterPass(pass), issued_at: pass.issued_at, expires_at: pass.expires_at, members: [] });
   if (moniker) (w as World & { names: Map<string, string> }).names.set(hex(await kp.getPublicKey()), moniker);
   return kp;
 }
