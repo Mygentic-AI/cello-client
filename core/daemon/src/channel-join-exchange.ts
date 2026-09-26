@@ -96,6 +96,8 @@ export interface ChannelJoinExchangeDeps {
    * skipped — MUST NOT CHANGE item 2). Optional and additive: absent, the exchange behaves as before.
    */
   collectNow?: (agentId: string) => void;
+  /** 043-POSTERS: a member was admitted (and sent its key) — `members` posting issues it a pass. */
+  onAdmitted?: (channelHex: string, subscriberHex: string) => void;
   /** 043-POSTERS: where a posting pass from the channel's stored admin is kept. Absent → passes are refused. */
   posterPasses?: ChannelPosterPassStore;
   now?: () => number;
@@ -317,7 +319,8 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
       // repeat, so this admits a first-time reader.
       if (settings.access === "open" || settings.access === "public") {
         members.admit(channelHex, namedSubscriber, "active", now());
-        await acceptInto(sessionId, channelHex, namedSubscriber, admin);
+        const accepted = await acceptInto(sessionId, channelHex, namedSubscriber, admin);
+        if (accepted.ok) deps.onAdmitted?.(channelHex, namedSubscriber);
         return { consumed: true };
       }
 
@@ -546,7 +549,9 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
       }
       // The delivery's verdict is the ANSWER. Reporting `ok` regardless told an admin they had
       // admitted somebody who in fact received nothing.
-      return acceptInto(sessionId, channelHex, subscriberHex, admin);
+      const accepted = await acceptInto(sessionId, channelHex, subscriberHex, admin);
+      if (accepted.ok) deps.onAdmitted?.(channelHex, subscriberHex);
+      return accepted;
     },
 
     async refuse(channelHex, subscriberHex, sessionId): Promise<{ ok: true } | { ok: false; reason: string }> {

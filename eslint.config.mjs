@@ -416,7 +416,9 @@ export default [
     // join answered, join requested). The channelNotify object lives here because the dispatcher it
     // reads is a late-bound const below and both channel wirings need it — the one seam the root
     // holds. Each function only maps agent id → name and routes; INV-CONTENTFREE lives downstream.
-    rules: { "max-lines": ["error", { max: 1482, skipBlankLines: false, skipComments: false }] },
+    // 1,482 → 1,483 (+1, M16 043-POSTERS): the membership wiring re-deposits the info record through
+    // the publishing wiring (late-bound, like pruneAllPosts) — a seam only the root can pass.
+    rules: { "max-lines": ["error", { max: 1483, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/daemon-handle.ts"],

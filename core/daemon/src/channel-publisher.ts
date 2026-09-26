@@ -34,6 +34,7 @@ import {
   buildChannelPruneTbs,
   type BroadcastArtifact,
   type ChannelAccess,
+  type ChannelInfoExt,
 } from "@cello-protocol/protocol-types";
 import { ChannelLogStore } from "./channel-log-store.js";
 
@@ -124,6 +125,8 @@ export interface ChannelPublisherOptions {
    * 043-POSTERS: where a publish goes when this daemon does NOT hold the channel key — posting under
    * the admin's pass, in the agent's own lane. Absent, such a publish is `key_unavailable` as before.
    */
+  /** 043-POSTERS: the info record's posting ext for a channel. Absent → `ext: null`. */
+  postingExt?: (channelHex: string) => ChannelInfoExt | null;
   poster?: {
     publish: (agentName: string, channelHex: string, title: string, body: string, correlationId?: string) => Promise<PublishResult>;
     resendMissing: (agentName: string, channelHex: string, relay: string, correlationId?: string) =>
@@ -606,7 +609,8 @@ export class ChannelPublisher {
       guidance: info.guidance,
       retention_seconds: info.retention_seconds,
       updated_at: this.#now(),
-      ext: null,
+      // 043-POSTERS: who may post and who was revoked; null (today's record) for plain admin posting.
+      ext: this.#opts.postingExt?.(channelHex) ?? null,
     });
     const info_cbor = encodeChannelInfo(record);
 

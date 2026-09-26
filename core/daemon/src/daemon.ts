@@ -688,7 +688,7 @@ async function startDaemonHoldingLock(
   // cello_message) and dispatches only when a name is current; the null-check is shared here.
   const named = (id: string): string | null => sessionNodeManager.agentNameForId(id);
   const channelNotify: ChannelNotify = {
-    channelPosts: (id, ch, count, through) => { const n = named(id); if (n !== null) notificationDispatcher.dispatchChannelPosts(n, ch, count, through); },
+    channelPosts: (id, ch, count, through, posters) => { const n = named(id); if (n !== null) notificationDispatcher.dispatchChannelPosts(n, ch, count, through, posters); },
     channelJoinAnswer: (id, ch, outcome, reason) => { const n = named(id); if (n !== null) notificationDispatcher.dispatchChannelJoinAnswer(n, ch, outcome, reason); },
     channelJoinRequest: (id, ch, sub) => { const n = named(id); if (n !== null) notificationDispatcher.dispatchChannelJoinRequest(n, ch, sub); },
     // 038-RETESTFIX Part E: this agent was ejected, or its channel was deleted — its own doorbell.
@@ -718,6 +718,7 @@ async function startDaemonHoldingLock(
     pruneAllPosts: (agentName, channelHex) => channelWiring.pruneAllPosts(agentName, channelHex),
     channelLastSeq: (channelHex) => channelWiring.channelLastSeq(channelHex),
     fetchChannelInfo: (relays, channelHex) => channelWiring.fetchInfo(relays, channelHex),
+    depositChannelInfo: (agentName, channelHex) => channelWiring.depositInfo(agentName, channelHex),
     // 038-RETESTFIX Part B: a newly-active subscription collects its existing posts via the wake's collectNow, assigned below after the collector exists.
     collectNow: (agentId) => channelCollectNow?.(agentId),
   });
@@ -727,7 +728,7 @@ async function startDaemonHoldingLock(
     getDb: () => sessionNodeManager.getDb(),
     getNode: () => sessionNodeManager.getStandingReceiverNode() ?? null,
     screenOutbound: (content, ctx) => securityGateway.screenOutbound(content, ctx),
-    loadedAgents, keyProviders, resolveAgentId: (agentName) => sessionNodeManager.resolveAgentId(agentName),
+    loadedAgents, keyProviders, resolveAgentId: (agentName) => sessionNodeManager.resolveAgentId(agentName), contactMoniker: (n, pk) => sessionNodeManager.getContactMoniker(n, pk),
     resolveCurrentAgent: (connectionId, explicitAgent) =>
       resolveCurrentAgent(perConnectionState.get(connectionId), explicitAgent),
     isAgentOnline: createIsAgentOnlineById({ onlineAgents, explicitlyOfflineAgents, agentNameForId: (id) => sessionNodeManager.agentNameForId(id) }),

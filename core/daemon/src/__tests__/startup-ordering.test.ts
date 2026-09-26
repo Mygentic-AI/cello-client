@@ -308,7 +308,15 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // this order removes, with every suite green. It is called from daemon.ts as the content handlers'
     // `knownPublicKeys`, so it lands in `checked`, not EXEMPT. (`knownPublicKeysDepsFromDaemon` is not
     // a WIRING-verb export, so it is not discovered — it is the deps builder the factory consumes.)
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(118);
+    //
+    // 118 → 119 for M16 043-POSTERS's `createChannelPostingAdmin` (channel-posting-admin.ts). Unwired,
+    // no pass is ever issued or renewed, so no member can post — every suite green. It is called from
+    // channel-membership-wiring.ts, so it lands in `checked`, not EXEMPT.
+    //
+    // 119 → 120 for 043-POSTERS Part F's `createPosterDoorbell` (channel-poster-doorbell.ts). Unwired,
+    // a poster's post never rings the members — every suite green. It is called from
+    // channel-publish-wiring.ts as the ticker's adminPass, so it lands in `checked`, not EXEMPT.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(120);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",

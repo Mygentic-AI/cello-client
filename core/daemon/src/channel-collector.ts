@@ -90,7 +90,9 @@ export interface ChannelCollectorOptions {
    * "5 new posts" when 4 were readable (live F37). The count is the number of held posts the position
    * advanced over, which is what the operator can actually read.
    */
-  onDelivered?: (agentId: string, channelHex: string, count: number, through: number) => void;
+  onDelivered?: (agentId: string, channelHex: string, count: number, through: number, posters?: string[]) => void;
+  /** 043-POSTERS: the local moniker for a poster's pubkey, or null (then the key's first 8 hex digits). */
+  posterName?: (agentId: string, pubkeyHex: string) => string | null;
   /**
    * 043-POSTERS: list a relay's poster lanes, and where this member stands in each. Both absent →
    * only the admin lane is collected, as before 043.
@@ -205,9 +207,32 @@ export class ChannelCollector {
    * one poster's lane never holds back another's. Inbox rows are keyed by the lane.
    */
   async #collectPosterLanes(agentId: string, channelHex: string, correlationId?: string): Promise<void> {
-    const { lanes, lanePositions, logger, inbox } = this.#opts;
     const sub = this.#opts.subscriptions.get(agentId, channelHex);
-    if (!lanes || !lanePositions || !sub || sub.status !== "active") return;
+    if (!sub || sub.status !== "active") return;
+    const got = await this.#posterLanesPass(agentId, channelHex, sub, correlationId);
+    // One doorbell for the poster lanes of this pass, naming who wrote; `through` stays the admin
+    // lane's position.
+    if (got.delivered > 0) this.#opts.onDelivered?.(agentId, channelHex, got.delivered, sub.delivered_through, got.posters);
+  }
+
+  /**
+   * 043-POSTERS Part F: the ADMIN's own daemon reads its channel's poster lanes as a reader — with
+   * the fetch key it already derives from the group key it holds — so it can ring the members for a
+   * poster's post. Returns how many new poster posts arrived and who wrote them.
+   */
+  async collectPosterLanesAsAdmin(
+    adminAgentId: string, channelHex: string,
+    view: { access: ChannelAccess; relays: string[]; admin_pubkey: string }, correlationId?: string,
+  ): Promise<{ delivered: number; posters: string[] }> {
+    return this.#posterLanesPass(adminAgentId, channelHex, { agent_id: adminAgentId, ...view }, correlationId);
+  }
+
+  async #posterLanesPass(
+    agentId: string, channelHex: string,
+    sub: { agent_id: string; access: ChannelAccess; relays: string[]; admin_pubkey: string }, correlationId?: string,
+  ): Promise<{ delivered: number; posters: string[] }> {
+    const { lanes, lanePositions, logger, inbox } = this.#opts;
+    if (!lanes || !lanePositions) return { delivered: 0, posters: [] };
     const cid = correlationId !== undefined ? { correlationId } : {};
     const channelPubkey = new Uint8Array(Buffer.from(channelHex, "hex"));
 
@@ -228,6 +253,7 @@ export class ChannelCollector {
     }
 
     let deliveredTotal = 0;
+    const wrote: string[] = [];
     for (const posterHex of posters) {
       const key = `${channelHex}/${posterHex}`;
       const pos = lanePositions.get(agentId, channelHex, posterHex);
@@ -273,14 +299,14 @@ export class ChannelCollector {
       if (run.advanced > pos.delivered_through) {
         lanePositions.setDelivered(agentId, channelHex, posterHex, run.advanced);
         deliveredTotal += run.delivered;
+        wrote.push(this.#opts.posterName?.(agentId, posterHex) ?? posterHex.slice(0, 8));
       }
       const { missing, first_held_seq } = this.#gapsForKey(agentId, key, run.advanced);
       if (missing.length > 0) {
         logger.warn("channel.gap.detected", { ...cid, channel_pubkey: channelHex, lane: key, missing, first_held_seq });
       }
     }
-    // One doorbell for the poster lanes of this pass; `through` stays the admin lane's position.
-    if (deliveredTotal > 0) this.#opts.onDelivered?.(agentId, channelHex, deliveredTotal, sub.delivered_through);
+    return { delivered: deliveredTotal, posters: wrote };
   }
 
   /**
