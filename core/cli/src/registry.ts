@@ -1811,7 +1811,9 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
         })));
       }
       if (sub === "poster" && (channel === "add" || channel === "remove") && a !== undefined && b !== undefined) {
-        return legacy(await channelVerb(ctx.celloDir, `cello_channel_poster_${channel}`, withAgent({ channel: a, poster: b })));
+        // Both names spelled out: the capability scan looks for the literal handler name.
+        const method = channel === "add" ? "cello_channel_poster_add" : "cello_channel_poster_remove";
+        return legacy(await channelVerb(ctx.celloDir, method, withAgent({ channel: a, poster: b })));
       }
       if (sub === "publish" && channel && a !== undefined && b !== undefined) {
         return legacy(await channelVerb(ctx.celloDir, "cello_channel_publish", withAgent({ channel, title: a, body: b })));
