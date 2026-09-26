@@ -666,3 +666,27 @@ describe("M16 039-NEWCHANFIX Part A: resend and the skew retry carry the fetch k
     expect(h.deposits, "nothing deposited for a channel whose access is unknown").toEqual([]);
   });
 });
+
+describe("043-POSTERS — two agents on ONE daemon", () => {
+  it("a non-admin agent posts as a POSTER even though this daemon holds the channel key; the admin still posts as admin", async () => {
+    const h = await harness();
+    const other = generateKeypair();
+    const posterCalls: string[] = [];
+    const poster = {
+      publish: (agentName: string) => { posterCalls.push(agentName); return Promise.resolve({ ok: true as const, seq: 1, relays: [] }); },
+      resendMissing: () => Promise.resolve({ ok: true as const, deposited: 0 }),
+      relaysFor: () => [],
+    };
+    const adminHex = Buffer.from(await h.adminKp.getPublicKey()).toString("hex");
+    const pub = new ChannelPublisher({
+      ...h.options,
+      poster: poster as unknown as NonNullable<ChannelPublisherOptions["poster"]>,
+      getAgentKey: (name) => (name === "agent-1" ? h.adminKp : name === "agent-2" ? other : null),
+      channelInfo: () => ({ access: "open", relays: [RELAY_A, RELAY_B], guidance: "g", retention_seconds: 3600, admin_pubkey: adminHex }),
+    });
+    await pub.publish("agent-2", h.channelHex, "t", "b");
+    expect(posterCalls).toEqual(["agent-2"]);
+    await pub.publish("agent-1", h.channelHex, "t", "b");
+    expect(posterCalls).toEqual(["agent-2"]);
+  });
+});

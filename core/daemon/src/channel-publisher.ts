@@ -119,6 +119,8 @@ export interface ChannelPublisherOptions {
   currentFetchKey?: (channelHex: string) => Promise<{ pubkey: Uint8Array; time_ms: number; signature: Uint8Array } | undefined>;
   channelInfo: (channelHex: string) => {
     access: ChannelAccess; relays: string[]; guidance: string; retention_seconds: number;
+    /** The channel's admin agent. A different agent on this same daemon is a POSTER. */
+    admin_pubkey?: string;
   } | null;
   now?: () => number;
   /**
@@ -170,9 +172,9 @@ export class ChannelPublisher {
 
   async publish(agentName: string, channelHex: string, title: string, body: string, correlationId?: string): Promise<PublishResult> {
     const { logger, log } = this.#opts;
-    // 043-POSTERS: not our channel key → we can only post as a poster, under the admin's pass.
-    if (this.#opts.poster && !this.#opts.getChannelKey(channelHex)) {
-      return this.#opts.poster.publish(agentName, channelHex, title, body, correlationId);
+    // 043-POSTERS: anyone but the channel's admin posts as a poster, under the admin's pass.
+    if (await this.#postsAsPoster(agentName, channelHex)) {
+      return this.#opts.poster!.publish(agentName, channelHex, title, body, correlationId);
     }
     const info = this.#opts.channelInfo(channelHex);
     if (!info) return { ok: false, reason: "channel_unknown", detail: "no channel info for that pubkey" };
@@ -422,8 +424,8 @@ export class ChannelPublisher {
   ): Promise<{ deposited: number; refused?: "channel_unknown" | "no_fetch_key" | "no_posting_pass" | "key_unavailable" }> {
     const { log, logger } = this.#opts;
     // 043-POSTERS: a poster refills its OWN lane, under its pass.
-    if (this.#opts.poster && !this.#opts.getChannelKey(channelHex)) {
-      return this.#opts.poster.resendMissing(agentName, channelHex, relay, correlationId);
+    if (await this.#postsAsPoster(agentName, channelHex)) {
+      return this.#opts.poster!.resendMissing(agentName, channelHex, relay, correlationId);
     }
     // A channel that has been set up but never published has no log row yet, and `head` THROWS on
     // one. Nothing to resend is an ANSWER — `deposited: 0` — not an error: a freshly created channel
@@ -649,6 +651,20 @@ export class ChannelPublisher {
       return this.#opts.poster.relaysFor(agentName, channelHex);
     }
     return this.#opts.channelInfo(channelHex)?.relays ?? [];
+  }
+
+  /**
+   * 043-POSTERS: is this agent posting as a POSTER? True when this daemon does not hold the channel
+   * key, AND when it does but the agent is not the channel's admin — two agents on one daemon, where
+   * the admin's channel key being loaded must not turn the other agent's post into an admin post.
+   */
+  async #postsAsPoster(agentName: string, channelHex: string): Promise<boolean> {
+    if (!this.#opts.poster) return false;
+    if (!this.#opts.getChannelKey(channelHex)) return true;
+    const admin = this.#opts.channelInfo(channelHex)?.admin_pubkey?.toLowerCase();
+    const agentKey = this.#opts.getAgentKey(agentName);
+    if (!admin || !agentKey) return false;
+    return Buffer.from(await agentKey.getPublicKey()).toString("hex") !== admin;
   }
 
   /** The pacing gap between refill deposits. Its own method so a test can drive it to zero. */
