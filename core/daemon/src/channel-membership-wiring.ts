@@ -1,5 +1,7 @@
 /**
  * M16 019-MEMBERSHIP — the join exchange, the eject re-key, and the operator's channel verbs.
+ * M16 045-NOTICEBELL — every admin notice (pass, removal, eject, new key, delete) is a signed record
+ * plus a directory ring (`channel-notices.ts`); no session is ever opened for one.
  *
  * The publishing half is wired next door in `channel-publish-wiring.ts`; this is membership. Both
  * exist because a module registered into nothing is a feature that does not exist — the mistake 017
@@ -15,8 +17,8 @@ import type { Logger } from "./types.js";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import {
-  channelJoinFrameType, encodeChannelRekey, encodeChannelMembershipEnded, buildChannelFetchKeyTbs,
-  JOIN_REQUEST_TYPE, type MembershipEndedReason,
+  channelJoinFrameType, buildChannelFetchKeyTbs, encodeNoticeEjectBody, encodeNoticePassBody,
+  JOIN_REQUEST_TYPE,
 } from "@cello-protocol/protocol-types";
 import { generateGroupKey, wrapGroupKeyFor, deriveFetchKey, decryptBody, encryptBody } from "@cello-protocol/crypto";
 import { ChannelMembershipStore } from "./channel-membership-store.js";
@@ -36,6 +38,10 @@ import {
 import { createChannelSubscribe } from "./channel-subscribe.js";
 import { ChannelInboxStore } from "./channel-inbox-store.js";
 import { extractErrorMessage } from "./error-message.js";
+import { ChannelNoticeSeenStore, createChannelNoticeReader, writeChannelNotice } from "./channel-notices.js";
+
+/** 045-NOTICEBELL: how often a member re-reads its notices when no ring arrived (the backstop). */
+export const NOTICE_BACKSTOP_TICK_MS = 60 * 60_000;
 
 type Handler = (params: Record<string, unknown> | undefined, connectionId: string) => Promise<unknown>;
 
@@ -134,6 +140,18 @@ export interface ChannelMembershipWiringDeps {
    */
   pruneAllPosts: (agentName: string, channelHex: string) =>
     Promise<{ pruned: number; relays: Array<{ relay: string; ok: boolean; reason?: string }> }>;
+  /**
+   * M16 045-NOTICEBELL: the relay and directory halves of a channel notice, from the publishing
+   * half, which owns the relay client and rings the directory. A notice is a signed record plus a
+   * ring — never a session.
+   */
+  noticeTransport: () => {
+    depositNotice: (relays: string[], record: Uint8Array) => Promise<number>;
+    fetchNotices: (relays: string[], slot: Uint8Array) => Promise<Uint8Array[]>;
+    ringMembers: (adminAgentName: string, channelHex: string, members: string[]) => Promise<boolean>;
+    /** The kill switch: the notice ring and backstop skip an agent the operator switched off. */
+    isAgentOnline: (agentId: string) => boolean;
+  };
 }
 
 /**
@@ -216,6 +234,10 @@ function needChannel(params: Record<string, unknown> | undefined):
 }
 
 export interface ChannelMembershipWiring {
+  /** M16 045-NOTICEBELL: read and apply this agent's channel notices — what a ring (the wake) calls. */
+  checkNotices: (agentId: string) => Promise<void>;
+  /** Stops the notice backstop tick. */
+  stop: () => void;
   /**
    * The channel's CURRENT fetch key, signed, or undefined when this daemon holds no group key for
    * it. Handed to the publishing half so a re-key reaches the relays on the very next post — which
@@ -295,11 +317,8 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     return agent ? deps.signalingFor(agent.name) : null;
   };
 
-  const profileAdminPubkey = createProfileAdminPubkey({
-    members,
-    logger,
-    lookup: createChannelAdminLookup({ signalingFor: signalingForAgentId, logger }),
-  });
+  const adminLookup = createChannelAdminLookup({ signalingFor: signalingForAgentId, logger });
+  const profileAdminPubkey = createProfileAdminPubkey({ members, logger, lookup: adminLookup });
 
   const keyProviderFor = (agentId: string): KeyProvider | null => {
     const agent = deps.loadedAgents.find((a) => deps.resolveAgentId(a.name) === agentId);
@@ -312,51 +331,37 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     return open ? open.sessionId : null;
   };
 
-  /**
-   * M16 034-LIFECYCLE: tell a member they are out — an ejection (`ejected`) or a whole-channel
-   * delete (`channel_closed`). The SAME send-or-open rule `join` uses: ride an OPEN session if this
-   * daemon holds one, else open one the way the join path does. Returns whether the member was
-   * reached — a member who cannot be reached is NOT a failed eject/delete (they are out at the relay
-   * regardless), it is a `member_notified: false` the caller reports and logs.
-   *
-   * 038-RETESTFIX Part E: this now sends a `channel_membership_ended` frame, NOT a join refusal — a
-   * refusal answers a request, while this is the admin ENDING an existing membership, and the two
-   * render differently to the operator.
-   */
-  const notifyMembershipEnded = async (
-    agentName: string, memberPubkeyHex: string, channelPubkey: Uint8Array, reason: MembershipEndedReason,
-  ): Promise<boolean> => {
-    return sendNoticeFrame(agentName, memberPubkeyHex, encodeChannelMembershipEnded({ channel_pubkey: channelPubkey, reason }));
+  // Late-bound: the publishing half (which owns the relay client) is built after this one.
+  const noticeRelays = {
+    deposit: (relays: string[], record: Uint8Array) => deps.noticeTransport().depositNotice(relays, record),
+    fetch: (relays: string[], slot: Uint8Array) => deps.noticeTransport().fetchNotices(relays, slot),
   };
+  const ringMembers = (agentName: string, ch: string, list: string[]): Promise<boolean> =>
+    deps.noticeTransport().ringMembers(agentName, ch, list);
 
   /**
-   * Deliver one admin → member frame: ride an OPEN session if this daemon holds one, else open one
-   * and close it again. `false` = the member could not be reached. Shared by the membership-ended
-   * notice and 043's posting passes.
+   * M16 045-NOTICEBELL: write one sealed notice for one member into the channel's relays. `false` =
+   * no relay took it (logged by the writer). A throw (no key, a bad member key) is logged and false —
+   * one member must never stop an eject or a pass round.
    */
-  const sendNoticeFrame = async (agentName: string, memberPubkeyHex: string, frame: Uint8Array): Promise<boolean> => {
-    let sessionId = openSessionWith(agentName, memberPubkeyHex);
-    // ⚠️ A session THIS call opens just to deliver the notice must be CLOSED again — an opened,
-    // never-closed session counts against the relay's per-pair cap of 5, and a channel with many
-    // members could exhaust it on a single delete. A session the operator ALREADY held is theirs,
-    // and is left untouched.
-    let openedByUs = false;
-    if (sessionId === null) {
-      const res = await deps.openSessionFor(agentName, { targetPubkey: memberPubkeyHex }) as
-        { ok?: boolean; sessionId?: string };
-      sessionId = res.ok === true && typeof res.sessionId === "string" ? res.sessionId : null;
-      openedByUs = sessionId !== null;
+  const writeNotice = async (
+    channelHex: string, memberHex: string, type: "pass" | "eject" | "group_key", body: Uint8Array,
+  ): Promise<boolean> => {
+    const admin = localChannelAdmin(channelHex);
+    const relays = members.settings(channelHex)?.relays ?? [];
+    if (!admin || relays.length === 0) return false;
+    try {
+      return await writeChannelNotice({ relays: noticeRelays, logger }, admin.channelKeyProvider, relays, memberHex, type, body);
+    } catch (err: unknown) {
+      logger.warn("channel.notice.unwritten", { channel_pubkey: channelHex, member_pubkey: memberHex, type, reason: extractErrorMessage(err) });
+      return false;
     }
-    if (sessionId === null) return false;
-    await deps.sendInSession(agentName, sessionId, frame);
-    if (openedByUs) {
-      // A normal SEALING close, through the same handler cello_close_session drives — so the notice
-      // session is notarized and torn down, not left dangling. Registered at boot; a miss here would
-      // be a wiring bug, so it is simply skipped rather than failing the eject/delete.
-      const close = deps.handlers.get("cello_close_session");
-      if (close) await close({ session_id: sessionId, agent: agentName }, "internal:channel-notice-close");
-    }
-    return true;
+  };
+
+  /** The admin agent's NAME for a channel this daemon administers — the ring rides its stream. */
+  const adminAgentNameFor = (channelHex: string): string | null => {
+    const adminHex = members.settings(channelHex)?.admin_pubkey.toLowerCase();
+    return deps.loadedAgents.find((a) => a.pubkey.toLowerCase() === adminHex)?.name ?? null;
   };
 
   const raiseNotice = (event: string, channelHex: string, subscriberHex: string): void => {
@@ -373,12 +378,19 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
   const postingAdmin = createChannelPostingAdmin({
     logger, config: channelConfig, members, grants: new ChannelPosterGrantStore(deps.getDb(), logger),
     channelKeyFor: (ch) => localChannelAdmin(ch)?.channelKeyProvider ?? null,
-    adminAgentNameFor: (ch) => {
-      const adminHex = members.settings(ch)?.admin_pubkey.toLowerCase();
-      return deps.loadedAgents.find((a) => a.pubkey.toLowerCase() === adminHex)?.name ?? null;
-    },
+    adminAgentNameFor,
     postingChannels: () => channelConfig.postingChannels(),
-    sendFrame: sendNoticeFrame,
+    // 045-NOTICEBELL: a pass is a sealed notice plus a ring; a removal is the info record plus a ring.
+    sendPass: async (ch, poster, passCbor, memberList) => {
+      if (!(await writeNotice(ch, poster, "pass", encodeNoticePassBody(passCbor, memberList)))) return false;
+      const name = adminAgentNameFor(ch);
+      if (name) await ringMembers(name, ch, [poster]);
+      return true;
+    },
+    ringPoster: async (ch, poster) => {
+      const name = adminAgentNameFor(ch);
+      if (name) await ringMembers(name, ch, [poster]);
+    },
     depositInfo: (agentName, ch) => deps.depositChannelInfo?.(agentName, ch) ?? Promise.resolve(),
   });
   postingAdmin.start();
@@ -397,15 +409,31 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     raiseNotice,
     // M16 032-NOTICES: the subscriber's own join answer — admitted / pending / refused (+ reason).
     onJoinAnswer: (agentId, channelHex, outcome, reason) => deps.notify.channelJoinAnswer(agentId, channelHex, outcome, reason),
-    // 038-RETESTFIX Part E: a membership ended (ejected / channel deleted) — its own doorbell.
-    onMembershipEnded: (agentId, channelHex, reason) => deps.notify.channelMembershipEnded(agentId, channelHex, reason),
     // 038-RETESTFIX Part B: a stored acceptance / public admission collects at once.
     collectNow: (agentId) => deps.collectNow(agentId),
-    // 043-POSTERS: a posting pass from the channel's stored admin is kept here.
-    posterPasses,
-    // 044-POSTERBELL Part E3: the admin removed us as a poster — surface the notice.
-    onPosterRemoved: (agentId, channelHex) => deps.notify.channelPosterRemoved(agentId, channelHex),
   });
+
+  /**
+   * M16 045-NOTICEBELL — the member half: on a ring (the wake) or the backstop tick, read the
+   * directory's revocation, the info record and this agent's own notice slots; verify; apply; ring
+   * the agent's doorbell once on a real change.
+   */
+  const noticeReader = createChannelNoticeReader({
+    logger, subscriptions, posterPasses, seen: new ChannelNoticeSeenStore(deps.getDb()), relays: noticeRelays,
+    keyProviderFor,
+    fetchInfo: (relays, ch) => deps.fetchChannelInfo(relays, ch),
+    channelRevoked: async (agentId, ch) => (await adminLookup(agentId, ch)).kind === "revoked",
+    onMembershipEnded: (agentId, ch, reason) => deps.notify.channelMembershipEnded(agentId, ch, reason),
+    onPosterRemoved: (agentId, ch) => deps.notify.channelPosterRemoved(agentId, ch),
+  });
+  const noticeTimer = setInterval(() => {
+    const agentIds = new Set(subscriptions.active().map((s) => s.agent_id));
+    for (const agentId of agentIds) {
+      if (!deps.noticeTransport().isAgentOnline(agentId)) continue;
+      void noticeReader.checkNotices(agentId);
+    }
+  }, NOTICE_BACKSTOP_TICK_MS);
+  noticeTimer.unref();
 
   /**
    * ⚠️ CLASSIFY SYNCHRONOUSLY, HANDLE ASYNCHRONOUSLY. The ingest path needs an immediate answer to
@@ -671,11 +699,9 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
    * the relay the moment the next deposit carries the new fetch key, whether or not every remaining
    * member has collected their new key yet.
    *
-   * ⚠️ THIS LINE USED TO END *"A member left behind hits `unknown_generation` and asks."* THEY
-   * CANNOT ASK. There is a rekey RECEIVER (`channel-join-exchange.ts`) and no requester anywhere:
-   * `read` reports `unknown_generation` and stops the read position, and sends nothing. A member
-   * who was unreachable during a re-key stays stuck until the admin ejects or re-admits somebody,
-   * which is what pushes keys again. The answer names them for exactly that reason.
+   * 045-NOTICEBELL: the new key reaches each remaining member as a sealed `group_key` notice on the
+   * relays, read on the ring or the member's backstop tick — never a session. A member whose notice no
+   * relay took is named in `unreached`.
    */
   handlers.set("cello_channel_eject", async (params, connectionId) => {
     const agent = needAgent(deps, params, connectionId);
@@ -713,37 +739,27 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     const gk = generateGroupKey(outcome.generation);
     subscriptions.addKey(admin.agentId, channel.channelHex, gk, Date.now());
     const channelPubkey = await admin.channelKeyProvider.getPublicKey();
+    const ejectedHex = subscriber.toLowerCase();
+
+    /**
+     * M16 045-NOTICEBELL: the new key goes to each REMAINING member as a sealed `group_key` notice on
+     * the channel's relays — never a session. A member whose notice no relay took is named in
+     * `unreached`; one failure never stops the loop.
+     */
     let delivered = 0;
     const unreached: string[] = [];
     for (const member of outcome.remaining) {
-      const sessionId = openSessionWith(agent.agentName, member);
-      if (sessionId === null) {
-        // Not a failure of the ejection. Recorded by name so an operator can see who is behind.
-        logger.warn("channel.rekey.member_unreached", {
-          channel_pubkey: channel.channelHex, member_pubkey: member, generation: outcome.generation,
-        });
-        unreached.push(member);
-        continue;
-      }
+      let written = false;
       try {
-        const bundle = await wrapGroupKeyFor(
-          gk, channelPubkey, new Uint8Array(Buffer.from(member, "hex")), admin.adminKeyProvider,
-        );
-        await deps.sendInSession(agent.agentName, sessionId, encodeChannelRekey({
-          channel_pubkey: channelPubkey, key_bundle: bundle, generation: outcome.generation,
-        }));
-        delivered += 1;
+        const bundle = await wrapGroupKeyFor(gk, channelPubkey, new Uint8Array(Buffer.from(member, "hex")), admin.adminKeyProvider);
+        written = await writeNotice(channel.channelHex, member, "group_key", bundle);
       } catch (err: unknown) {
-        // ⚠️ A SEND THAT THROWS MUST NOT END THE LOOP. Without this catch a single failed send
-        // stopped the re-key: every member AFTER the failure was neither sent the new key nor named
-        // in `unreached`, so the operator saw a clean eject while some members silently kept the old
-        // key and never appeared as behind. Catch per member, name them, and continue.
         logger.warn("channel.rekey.member_unreached", {
-          channel_pubkey: channel.channelHex, member_pubkey: member,
-          generation: outcome.generation, reason: extractErrorMessage(err),
+          channel_pubkey: channel.channelHex, member_pubkey: member, generation: outcome.generation, reason: extractErrorMessage(err),
         });
-        unreached.push(member);
       }
+      if (written) delivered += 1;
+      else unreached.push(member);
     }
 
     logger.info("channel.rekey.completed", {
@@ -754,22 +770,15 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
       failed_count: unreached.length,
     });
 
-    /**
-     * M16 034-LIFECYCLE: TELL THE EJECTED MEMBER. Before this they were removed silently and kept a
-     * normal-looking subscription forever. The frame rides the same send-or-open rule as `join`;
-     * unreachable is `member_notified: false`, logged and reported — the ejection still holds, so
-     * this never fails the eject.
-     */
-    const memberNotified = await notifyMembershipEnded(
-      agent.agentName, subscriber.toLowerCase(), channelPubkey, "ejected",
-    );
+    // The ejected member's own notice, then ONE ring for everyone the eject concerns. The ejection
+    // holds at the relay regardless of whether they are told.
+    const memberNotified = await writeNotice(channel.channelHex, ejectedHex, "eject", encodeNoticeEjectBody(channelPubkey));
     if (!memberNotified) {
-      logger.info("channel.eject.notice.unreached", {
-        channel_pubkey: channel.channelHex, member_pubkey: subscriber.toLowerCase(),
-      });
+      logger.info("channel.eject.notice.unreached", { channel_pubkey: channel.channelHex, member_pubkey: ejectedHex });
     }
+    await ringMembers(agent.agentName, channel.channelHex, [ejectedHex, ...outcome.remaining.filter((m) => !unreached.includes(m))]);
     // 043-POSTERS: an ejected member's posting pass is revoked and never renewed.
-    await postingAdmin.onEjected(channel.channelHex, subscriber.toLowerCase());
+    await postingAdmin.onEjected(channel.channelHex, ejectedHex);
 
     return {
       ok: true,
@@ -779,7 +788,7 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
       unreached,
       member_notified: memberNotified,
       guidance: unreached.length > 0
-        ? `${String(unreached.length)} member(s) were not reachable and still hold the old key. They will ask for the new one when they next read; the ejection itself is done.`
+        ? `${String(unreached.length)} member(s) could not be given the new key (no relay took their notice) and still hold the old one. The ejection itself is done.`
         : undefined,
     };
   });
@@ -809,20 +818,19 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
       };
     }
 
-    // (a) Tell every active and pending member — the same send-or-open rule as eject.
-    const channelPubkey = await admin.channelKeyProvider.getPublicKey();
+    /**
+     * (a) M16 045-NOTICEBELL: RING every active and pending member, BEFORE the retire — the
+     * directory's revocation of the channel identity (step c) IS the notice, and the ring must go
+     * out while the admin still holds the channel. No session is opened. A ring that could not be
+     * sent leaves them to find the revocation on their backstop tick.
+     */
     const toNotify = [...members.activeMembers(channel.channelHex), ...members.pendingMembers(channel.channelHex)];
-    let membersNotified = 0;
-    const membersUnreached: string[] = [];
-    for (const member of toNotify) {
-      const notified = await notifyMembershipEnded(agent.agentName, member, channelPubkey, "channel_closed");
-      if (notified) {
-        membersNotified += 1;
-      } else {
-        logger.info("channel.delete.notice.unreached", {
-          channel_pubkey: channel.channelHex, member_pubkey: member,
-        });
-        membersUnreached.push(member);
+    const rung = await ringMembers(agent.agentName, channel.channelHex, toNotify);
+    const membersNotified = rung ? toNotify.length : 0;
+    const membersUnreached: string[] = rung ? [] : toNotify;
+    if (!rung) {
+      for (const member of toNotify) {
+        logger.info("channel.delete.notice.unreached", { channel_pubkey: channel.channelHex, member_pubkey: member });
       }
     }
 
@@ -974,6 +982,9 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
   });
 
   return {
+    // The kill switch holds here too: a ring for a switched-off agent reads nothing.
+    checkNotices: (agentId: string) => (deps.noticeTransport().isAgentOnline(agentId) ? noticeReader.checkNotices(agentId) : Promise.resolve()),
+    stop: () => { clearInterval(noticeTimer); },
     activeMembers: (channelHex: string) => members.activeMembers(channelHex),
     /**
      * ⚠️ **NO PLAINTEXT FALLBACK, EVER.** No admin key held for this channel, or no group key mint

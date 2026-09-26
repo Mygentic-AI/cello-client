@@ -24,11 +24,10 @@
  * notice; nothing in this file approves one. There is no heuristic, no allowlist, no auto-approve.
  */
 import {
-  decodeChannelJoinRequest, decodeChannelJoinAccepted, decodeChannelJoinRefused, decodeChannelRekey,
-  decodeChannelMembershipEnded, decodeChannelPosterPassFrame, decodeChannelPosterRemovedNotice, verifyPosterPass,
-  encodeChannelJoinAccepted, encodeChannelJoinRefused, encodeChannelRekey,
+  decodeChannelJoinRequest, decodeChannelJoinAccepted, decodeChannelJoinRefused,
+  encodeChannelJoinAccepted, encodeChannelJoinRefused,
   isChannelJoinFrame,
-  type ChannelJoinRefusedReason, type MembershipEndedReason,
+  type ChannelJoinRefusedReason,
 } from "@cello-protocol/protocol-types";
 import {
   generateGroupKey, wrapGroupKeyFor, unwrapGroupKey, type GroupKey,
@@ -37,7 +36,6 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import type { Logger } from "./types.js";
 import type { ChannelMembershipStore } from "./channel-membership-store.js";
 import type { ChannelSubscriptionStore } from "./channel-subscription-store.js";
-import type { ChannelPosterPassStore } from "./channel-poster-pass-store.js";
 import { extractErrorMessage } from "./error-message.js";
 
 /** What this daemon knows about a channel it administers. `null` means it does not administer one. */
@@ -82,13 +80,6 @@ export interface ChannelJoinExchangeDeps {
    */
   onJoinAnswer?: (agentId: string, channelHex: string, outcome: "admitted" | "pending" | "refused", reason?: string) => void;
   /**
-   * 038-RETESTFIX Part E: a membership ENDED for this agent — it was ejected, or the channel was
-   * deleted. Its own doorbell, not a join answer: the wiring turns it into the `channel_membership_ended`
-   * notice, rendered with the shortened key. Fired only after the admin check passes (an existing sub)
-   * or for a channel this agent does not follow (nothing to mark, but the operator is still told).
-   */
-  onMembershipEnded?: (agentId: string, channelHex: string, reason: MembershipEndedReason) => void;
-  /**
    * 038-RETESTFIX Part B: a subscription that has just BECOME ACTIVE — an acceptance stored (open /
    * invite-only) or a public admission — must collect the channel's existing posts at once, instead
    * of waiting for the next post's wake or the backstop poll. Wired to the SAME `collectNow` the
@@ -98,13 +89,6 @@ export interface ChannelJoinExchangeDeps {
   collectNow?: (agentId: string) => void;
   /** 043-POSTERS: a member was admitted (and sent its key) — `members` posting issues it a pass. */
   onAdmitted?: (channelHex: string, subscriberHex: string) => void;
-  /** 043-POSTERS: where a posting pass from the channel's stored admin is kept. Absent → passes are refused. */
-  posterPasses?: ChannelPosterPassStore;
-  /**
-   * 044-POSTERBELL Part E3: the stored admin told this agent it can no longer post — its pass was
-   * deleted here, and this surfaces the channel notice. Optional and additive.
-   */
-  onPosterRemoved?: (agentId: string, channelHex: string) => void;
   now?: () => number;
 }
 
@@ -112,7 +96,7 @@ export type SubscriberJoinResult =
   | { ok: true; channelHex: string; generation: number }
   | {
       ok: false;
-      reason: "not_a_join_frame" | "malformed" | "not_admin_of_channel" | "admin_unresolved" | "key_unwrap_failed" | "no_key_provider" | "refused_by_admin" | "membership_ended" | "not_subscribed" | "pass_invalid";
+      reason: "not_a_join_frame" | "malformed" | "not_admin_of_channel" | "admin_unresolved" | "key_unwrap_failed" | "no_key_provider" | "refused_by_admin";
       /**
        * M16 021-WAKE item 21: WHY, when the reason alone cannot say.
        *
@@ -128,7 +112,7 @@ export type SubscriberJoinResult =
 export interface ChannelJoinExchange {
   /** An inbound frame on the ADMIN's daemon. `consumed: false` means it was not a join frame. */
   onAdminFrame: (sessionId: string, counterpartyHex: string, content: Uint8Array) => Promise<{ consumed: boolean }>;
-  /** An inbound acceptance or re-key on the SUBSCRIBER's daemon. */
+  /** An inbound acceptance or refusal on the SUBSCRIBER's daemon. */
   onSubscriberFrame: (agentId: string, sessionId: string, counterpartyHex: string, content: Uint8Array) => Promise<SubscriberJoinResult>;
   /** The admin agent's explicit decision on a pending invite-only request. */
   approve: (channelHex: string, subscriberHex: string, sessionId: string) => Promise<{ ok: true } | { ok: false; reason: string }>;
@@ -341,111 +325,12 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
       if (!isChannelJoinFrame(content)) return { ok: false, reason: "not_a_join_frame" };
 
       /**
-       * 043-POSTERS: a POSTING PASS. Same rule as a re-key: ONLY the channel's STORED admin may send
-       * one — the session proves who the peer is, not that they administer the channel. The pass
-       * must also verify against the channel key and name THIS agent; anything else stores nothing.
-       */
-      const passFrame = decodeChannelPosterPassFrame(content);
-      if (passFrame.ok) {
-        const pass = passFrame.frame.pass;
-        const passChannelHex = Buffer.from(pass.channel_pubkey).toString("hex");
-        const sub = subscriptions.get(agentId, passChannelHex);
-        if (sub === null) {
-          logger.warn("channel.poster_pass.refused", { channel_pubkey: passChannelHex, sender: counterpartyHex, reason: "not_subscribed" });
-          return { ok: false, reason: "not_subscribed" };
-        }
-        if (sub.admin_pubkey.toLowerCase() !== counterpartyHex.toLowerCase()) {
-          logger.warn("channel.poster_pass.refused", { channel_pubkey: passChannelHex, sender: counterpartyHex, reason: "not_admin_of_channel" });
-          return { ok: false, reason: "not_admin_of_channel" };
-        }
-        const myKey = deps.keyProviderFor(agentId);
-        const mine = myKey ? Buffer.from(await myKey.getPublicKey()).toString("hex") : null;
-        if (!verifyPosterPass(pass, pass.channel_pubkey).ok || mine !== Buffer.from(pass.poster_pubkey).toString("hex") || !deps.posterPasses) {
-          logger.warn("channel.poster_pass.refused", { channel_pubkey: passChannelHex, sender: counterpartyHex, reason: "pass_invalid" });
-          return { ok: false, reason: "pass_invalid" };
-        }
-        deps.posterPasses.put(agentId, passChannelHex, {
-          pass_cbor: passFrame.frame.pass_cbor, issued_at: pass.issued_at, expires_at: pass.expires_at,
-          // 044-POSTERBELL: the current member list the admin sent alongside the pass — who this
-          // poster rings when it posts.
-          members: passFrame.frame.members.map((m) => Buffer.from(m).toString("hex")),
-        });
-        return { ok: true, channelHex: passChannelHex, generation: 0 };
-      }
-
-      /**
-       * 044-POSTERBELL Part E3: the admin telling us we can no longer post — removed, ejected, or the
-       * channel switched to admin-only. Same rule as the pass: ONLY the stored admin may send it, so
-       * a stranger cannot delete our pass or fake the notice. We drop the pass and surface the notice.
-       */
-      const removedNotice = decodeChannelPosterRemovedNotice(content);
-      if (removedNotice.ok) {
-        const noticeChannelHex = Buffer.from(removedNotice.frame.channel_pubkey).toString("hex");
-        const sub = subscriptions.get(agentId, noticeChannelHex);
-        if (sub === null) {
-          logger.warn("channel.poster_removed.refused", { channel_pubkey: noticeChannelHex, sender: counterpartyHex, reason: "not_subscribed" });
-          return { ok: false, reason: "not_subscribed" };
-        }
-        if (sub.admin_pubkey.toLowerCase() !== counterpartyHex.toLowerCase()) {
-          logger.warn("channel.poster_removed.refused", { channel_pubkey: noticeChannelHex, sender: counterpartyHex, reason: "not_admin_of_channel" });
-          return { ok: false, reason: "not_admin_of_channel" };
-        }
-        deps.posterPasses?.remove(agentId, noticeChannelHex);
-        logger.info("channel.poster_removed", { channel_pubkey: noticeChannelHex });
-        deps.onPosterRemoved?.(agentId, noticeChannelHex);
-        return { ok: true, channelHex: noticeChannelHex, generation: 0 };
-      }
-
-      /**
-       * An acceptance OR a re-key. Narrowed into two locals rather than kept as a pair of results,
-       * so the compiler knows which one carries a frame — a non-null assertion here would be the
-       * kind of "I know better" that survives a later edit changing which branch can be reached.
+       * An acceptance, or a refusal. (045-NOTICEBELL: a re-key, a pass, an ejection and a closure are
+       * no longer session frames — they are sealed notices read by channel-notices.ts.)
        */
       const acceptedResult = decodeChannelJoinAccepted(content);
       const acceptedFrame = acceptedResult.ok ? acceptedResult.frame : null;
-      let rekeyFrame: import("@cello-protocol/protocol-types").ChannelRekey | null = null;
       if (!acceptedFrame) {
-        const rekeyResult = decodeChannelRekey(content);
-        if (rekeyResult.ok) rekeyFrame = rekeyResult.frame;
-      }
-      if (!acceptedFrame && !rekeyFrame) {
-        /**
-         * 038-RETESTFIX Part E: a MEMBERSHIP-ENDED frame is the admin telling an EXISTING member they
-         * are out — that one member (`ejected`) or the whole channel (`channel_closed`). Its own frame
-         * now, not a join refusal. Mark the subscription so it stops looking like a normal one; the
-         * kept keys are untouched, so earlier posts stay readable.
-         *
-         * ⚠️ **ENDING A SUBSCRIPTION IS PRIVILEGED — ONLY ITS STORED ADMIN MAY.** The session proves
-         * who the peer IS, not that they administer the channel; the accept/rekey branch below makes
-         * the same admin check. Without it, any peer that can open a session could mark you ejected or
-         * your channel deleted. So: only when a subscription exists AND the sender is its admin do we
-         * mark it. A non-admin sender changes nothing and rings nothing. With no subscription there is
-         * no membership to end and no admin to check the sender against, so it rings nothing either —
-         * otherwise any peer could fake a "removed" notice for a channel this agent never followed.
-         */
-        const ended = decodeChannelMembershipEnded(content);
-        if (ended.ok) {
-          const reason = ended.frame.reason;
-          const endedHex = Buffer.from(ended.frame.channel_pubkey).toString("hex");
-          const sub = subscriptions.get(agentId, endedHex);
-          if (sub === null) {
-            logger.warn("channel.membership.ended.not_subscribed", {
-              channel_pubkey: endedHex, sender: counterpartyHex, reason,
-            });
-            return { ok: false, reason: "not_subscribed" };
-          }
-          if (sub.admin_pubkey.toLowerCase() !== counterpartyHex.toLowerCase()) {
-            logger.warn("channel.membership.ended.not_admin", {
-              channel_pubkey: endedHex, sender: counterpartyHex, reason,
-            });
-            return { ok: false, reason: "not_admin_of_channel" };
-          }
-          if (reason === "ejected") subscriptions.markEjected(agentId, endedHex);
-          else subscriptions.markClosed(agentId, endedHex);
-          deps.onMembershipEnded?.(agentId, endedHex, reason);
-          return { ok: false, reason: "membership_ended", detail: reason };
-        }
-
         /**
          * M16 032-NOTICES: a REFUSAL is the admin's answer to THIS agent's own request. Store
          * nothing — a refusal grants no key and no subscription — but report the outcome so the
@@ -464,7 +349,7 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
         return { ok: false, reason: "malformed" };
       }
 
-      const channelPubkey = acceptedFrame ? acceptedFrame.channel_pubkey : rekeyFrame!.channel_pubkey;
+      const channelPubkey = acceptedFrame.channel_pubkey;
       const channelHex = Buffer.from(channelPubkey).toString("hex");
 
       /**
@@ -475,21 +360,7 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
        * A lookup that cannot be RESOLVED fails closed. An unreachable directory must never mean
        * "accept whoever this is" — that would make a network problem into an admission.
        */
-      /**
-       * ⚠️ **A RE-KEY ASKS NOBODY: the admin was checked when the subscription was made, and is
-       * stored on it.** Going back to the directory for one would put a network round trip, and a
-       * directory outage, in the path of every re-key — and a re-key is how an EJECTION reaches the
-       * remaining members, so losing one is the thing with a cost. It is also what closed the
-       * exposure this check opened: an unsolicited re-key naming any pubkey would otherwise have
-       * bought a stranger a directory lookup, on a handler the session layer is waiting for.
-       *
-       * The asking agent goes with the acceptance case, because the lookup rides THAT agent's own
-       * authenticated directory stream rather than any connection that happens to be open.
-       */
-      const storedAdmin = rekeyFrame ? (subscriptions.get(agentId, channelHex)?.admin_pubkey ?? null) : null;
-      const looked: AdminLookupOutcome = storedAdmin !== null
-        ? { ok: true, adminPubkeyHex: storedAdmin }
-        : await deps.profileAdminPubkey(channelHex, agentId);
+      const looked: AdminLookupOutcome = await deps.profileAdminPubkey(channelHex, agentId);
       if (!looked.ok) {
         // The cause travels with the refusal now. It used to live only in a log line one step
         // upstream, which is not where anyone looks when a join is refused.
@@ -515,7 +386,7 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
        * to open an empty bundle and store a phantom key. The upsert records the relays, guidance and
        * retention the same as `open`; `onJoinAnswer` rings `admitted`, same as any admission.
        */
-      if (acceptedFrame && acceptedFrame.access === "public") {
+      if (acceptedFrame.access === "public") {
         subscriptions.upsert({
           agent_id: agentId,
           channel_pubkey: channelHex,
@@ -536,16 +407,13 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
       const myKeys = deps.keyProviderFor(agentId);
       if (!myKeys) return { ok: false, reason: "no_key_provider" };
 
-      const bundle = acceptedFrame ? acceptedFrame.key_bundle : rekeyFrame!.key_bundle;
-      const unwrapped = await unwrapGroupKey(bundle, channelPubkey, myKeys);
+      const unwrapped = await unwrapGroupKey(acceptedFrame.key_bundle, channelPubkey, myKeys);
       if (!unwrapped.ok) {
         logger.warn("channel.join.refused", { channel_pubkey: channelHex, reason: unwrapped.reason });
         return { ok: false, reason: "key_unwrap_failed" };
       }
 
-      // An ACCEPTANCE brings the subscription with it; a RE-KEY only adds a key to one that exists.
-      if (acceptedFrame) {
-        subscriptions.upsert({
+      subscriptions.upsert({
           agent_id: agentId,
           channel_pubkey: channelHex,
           admin_pubkey: profileAdmin,
@@ -556,17 +424,12 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
           guidance: acceptedFrame.guidance,
           retention_seconds: acceptedFrame.retention_seconds,
           joined_at: now(),
-        });
-      }
+      });
       subscriptions.addKey(agentId, channelHex, unwrapped.gk, now());
-      // M16 032-NOTICES: an ACCEPTANCE stored means this agent is IN — ring "admitted". A re-key
-      // also lands a key here but is not an answer to a join, so it never rings (out of scope).
-      if (acceptedFrame) {
-        deps.onJoinAnswer?.(agentId, channelHex, "admitted");
-        // 038-RETESTFIX Part B: fresh subscription → collect the existing posts now, not on the next
-        // wake. A re-key is NOT a fresh admission (the member was already collecting), so it does not.
-        deps.collectNow?.(agentId);
-      }
+      // M16 032-NOTICES: an ACCEPTANCE stored means this agent is IN — ring "admitted".
+      deps.onJoinAnswer?.(agentId, channelHex, "admitted");
+      // 038-RETESTFIX Part B: fresh subscription → collect the existing posts now, not on the next wake.
+      deps.collectNow?.(agentId);
       return { ok: true, channelHex, generation: unwrapped.gk.generation };
     },
 
@@ -606,6 +469,3 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
     },
   };
 }
-
-/** Re-exported so the caller does not need a second import to build a re-key frame. */
-export { encodeChannelRekey };

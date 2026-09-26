@@ -220,6 +220,19 @@ export class ChannelRelayClient {
     return { ok: false, reason: typeof answer["reason"] === "string" ? answer["reason"] : "unexpected_answer" };
   }
 
+  /** 045-NOTICEBELL: deposit one sealed channel notice. A refusal is `{ ok: false, reason }`. */
+  async depositNotice(relayAddr: string, record: Uint8Array): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const answer = await this.request(relayAddr, { type: "channel_notice_set", record });
+    if (answer["type"] === "channel_notice_set_ok") return { ok: true };
+    return { ok: false, reason: typeof answer["reason"] === "string" ? answer["reason"] : "unexpected_answer" };
+  }
+
+  /** 045-NOTICEBELL: the sealed notice this relay holds at a slot, or null. */
+  async getNotice(relayAddr: string, slot: Uint8Array): Promise<Uint8Array | null> {
+    const answer = await this.request(relayAddr, { type: "channel_notice_get", slot });
+    return answer["record"] instanceof Uint8Array ? answer["record"] : null;
+  }
+
   /** The channel's info record as this relay holds it, or null. */
   async info(relayAddr: string, channelPubkey: Uint8Array): Promise<Uint8Array | null> {
     const answer = await this.request(relayAddr, { type: "channel_info", channel_pubkey: channelPubkey });

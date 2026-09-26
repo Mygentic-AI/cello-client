@@ -27,6 +27,45 @@ export interface ChannelWakeSenderDeps {
   signalingFor: (agentId: string) => WakeSignaling | null;
 }
 
+/** The one `channel_wake_request` frame, shared by a post's doorbell and an admin notice's ring. */
+function sendWakeRequest(signaling: WakeSignaling, channelHex: string, members: string[]): Promise<{ ok: boolean; reason?: string }> {
+  return signaling.sendRaw({
+    type: "channel_wake_request",
+    channel_pubkey: new Uint8Array(Buffer.from(channelHex, "hex")),
+    agent_pubkeys: members.map((m) => new Uint8Array(Buffer.from(m, "hex"))),
+  });
+}
+
+/**
+ * M16 045-NOTICEBELL — ring NAMED members about a channel notice (eject, new key, pass, removal,
+ * delete). The admin agent asks on its own directory stream, exactly as a post's doorbell does; the
+ * directory stores nothing. AWAITED, unlike a post's doorbell: the admin verb reports whether the
+ * ring went out. `false` = no stream, a refusal, or a throw — each logged, never thrown.
+ */
+export async function ringChannelMembers(
+  deps: { logger: Logger; signalingFor: (agentName: string) => WakeSignaling | null },
+  adminAgentName: string, channelHex: string, members: string[],
+): Promise<boolean> {
+  if (members.length === 0) return true;
+  const signaling = deps.signalingFor(adminAgentName);
+  if (!signaling) {
+    deps.logger.warn("channel.notice.ring_skipped", { channel_pubkey: channelHex, reason: "signaling_unavailable", members: members.length });
+    return false;
+  }
+  try {
+    const res = await sendWakeRequest(signaling, channelHex, members);
+    if (!res.ok) {
+      deps.logger.warn("channel.notice.ring_refused", { channel_pubkey: channelHex, reason: res.reason ?? "unknown", members: members.length });
+      return false;
+    }
+    deps.logger.info("channel.notice.rung", { channel_pubkey: channelHex, members: members.length });
+    return true;
+  } catch (err: unknown) {
+    deps.logger.warn("channel.notice.ring_failed", { channel_pubkey: channelHex, reason: extractErrorMessage(err), members: members.length });
+    return false;
+  }
+}
+
 /**
  * Returns a function to call AFTER a successful publish. It resolves as soon as the frame is
  * handed to the transport — it is a nudge, not a handshake, and the publisher must never block on
@@ -60,11 +99,7 @@ export function createChannelWakeSender(
        * The rejection handler exists so a dead stream is a log line rather than an unhandled
        * rejection taking down the process.
        */
-      void signaling.sendRaw({
-        type: "channel_wake_request",
-        channel_pubkey: new Uint8Array(Buffer.from(channelHex, "hex")),
-        agent_pubkeys: members.map((m) => new Uint8Array(Buffer.from(m, "hex"))),
-      }).then(
+      void sendWakeRequest(signaling, channelHex, members).then(
         (res) => {
           if (!res.ok) {
             deps.logger.debug("channel.wake.refused", {

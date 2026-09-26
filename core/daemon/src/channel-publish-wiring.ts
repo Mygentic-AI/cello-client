@@ -34,7 +34,7 @@ import { ChannelPosterGrantStore } from "./channel-poster-grant-store.js";
 import { postingInfoExt } from "./channel-posting-admin.js";
 import { ChannelInboxStore } from "./channel-inbox-store.js";
 import { createChannelCollectTicker } from "./channel-collect-tick.js";
-import { createChannelWakeSender, createPosterWakeSender } from "./channel-wake-sender.js";
+import { createChannelWakeSender, createPosterWakeSender, ringChannelMembers } from "./channel-wake-sender.js";
 import type { ChannelNotify } from "./channel-membership-wiring.js";
 
 type Handler = (params: Record<string, unknown> | undefined, connectionId: string) => Promise<unknown>;
@@ -106,6 +106,14 @@ export function wireChannelPublishing(
    * record against the channel key before showing it to a member.
    */
   fetchInfo: (relays: string[], channelHex: string) => Promise<Uint8Array | null>;
+  /** 045-NOTICEBELL: deposit a sealed notice on every relay; resolves with how many accepted it. */
+  depositNotice: (relays: string[], record: Uint8Array) => Promise<number>;
+  /** 045-NOTICEBELL: every record the relays hold at a slot, one per answering relay. */
+  fetchNotices: (relays: string[], slot: Uint8Array) => Promise<Uint8Array[]>;
+  /** 045-NOTICEBELL: ring named members about a notice, on the admin agent's own directory stream. */
+  ringMembers: (adminAgentName: string, channelHex: string, members: string[]) => Promise<boolean>;
+  /** The kill-switch check this half collects under — shared so the notice backstop honours it too. */
+  isAgentOnline: (agentId: string) => boolean;
 } {
   const { logger, keyProviders } = deps;
 
@@ -505,5 +513,33 @@ export function wireChannelPublishing(
       }
       return null;
     },
+    depositNotice: async (relays, record) => {
+      let accepted = 0;
+      for (const addr of relays) {
+        try {
+          const res = await relay.depositNotice(addr, record);
+          if (res.ok) accepted += 1;
+          else logger.warn("channel.notice.deposit_refused", { relay: addr, reason: res.reason });
+        } catch (err: unknown) {
+          logger.warn("channel.notice.deposit_failed", { relay: addr, reason: extractErrorMessage(err) });
+        }
+      }
+      return accepted;
+    },
+    fetchNotices: async (relays, slot) => {
+      const out: Uint8Array[] = [];
+      for (const addr of relays) {
+        try {
+          const record = await relay.getNotice(addr, slot);
+          if (record !== null) out.push(record);
+        } catch {
+          // One relay unreachable must not hide a notice the other holds.
+        }
+      }
+      return out;
+    },
+    isAgentOnline: deps.isAgentOnline,
+    ringMembers: (adminAgentName, channelHex, members) =>
+      ringChannelMembers({ logger, signalingFor: (name) => deps.signalingFor(name) }, adminAgentName, channelHex, members),
   };
 }

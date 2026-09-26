@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { generateKeypair } from "@cello-protocol/crypto";
 import type { InMemoryKeyProvider } from "@cello-protocol/crypto";
-import { decodeChannelPosterPassFrame, decodeChannelPosterRemovedNotice, verifyPosterPass } from "@cello-protocol/protocol-types";
+import { decodeChannelPosterPass, verifyPosterPass } from "@cello-protocol/protocol-types";
 import { ChannelConfigStore } from "../channel-config-store.js";
 import { ChannelMembershipStore } from "../channel-membership-store.js";
 import { ChannelPosterGrantStore } from "../channel-poster-grant-store.js";
@@ -58,28 +58,29 @@ async function harness(access: "invite_only" | "public" = "invite_only"): Promis
   const grants = new ChannelPosterGrantStore(db, silent);
   config.set(channelHex, { access, relays: [RELAY], guidance: "", retention_seconds: 3600, admin_pubkey: hex(await adminAgent.getPublicKey()) }, T0);
   const h = { config, members, grants, channel, channelHex, clock: { now: T0 }, sent: [], removed: [], unreachable: new Set<string>(), deposits: 0 } as unknown as H;
+  let depositsAtLastRing = -1;
   h.admin = createChannelPostingAdmin({
     logger: silent, config, members, grants, now: () => h.clock.now,
     channelKeyFor: (ch) => (ch === channelHex ? channel : null),
     adminAgentNameFor: (ch) => (ch === channelHex ? "admin" : null),
     postingChannels: () => [channelHex],
-    sendFrame: async (_agent, member, frame) => {
+    // 045-NOTICEBELL: a pass is a sealed notice plus a ring; a removal is the info record plus a ring.
+    sendPass: async (ch, member, passCbor, memberList) => {
       if (h.unreachable.has(member)) return false;
-      // 044-POSTERBELL Part E3: a removed poster gets a poster-removed notice, not a pass.
-      const removed = decodeChannelPosterRemovedNotice(frame);
-      if (removed.ok) {
-        h.removed.push({ member, channelHex: hex(removed.frame.channel_pubkey) });
-        return true;
-      }
-      const d = decodeChannelPosterPassFrame(frame);
+      const d = decodeChannelPosterPass(passCbor);
       if (!d.ok) throw new Error(d.reason);
-      expect(verifyPosterPass(d.frame.pass, await channel.getPublicKey())).toEqual({ ok: true });
-      expect(hex(d.frame.pass.poster_pubkey)).toBe(member);
-      h.sent.push({
-        member, issued_at: d.frame.pass.issued_at, expires_at: d.frame.pass.expires_at,
-        members: d.frame.members.map((m) => hex(m)),
-      });
+      expect(ch).toBe(channelHex);
+      expect(verifyPosterPass(d.pass, await channel.getPublicKey())).toEqual({ ok: true });
+      expect(hex(d.pass.poster_pubkey)).toBe(member);
+      h.sent.push({ member, issued_at: d.pass.issued_at, expires_at: d.pass.expires_at, members: memberList.map((m) => hex(m)) });
       return true;
+    },
+    ringPoster: (ch, member) => {
+      // The ring must follow the deposit of the revoking info record, never precede it.
+      expect(h.deposits, "the revoking info record is deposited before the ring").toBeGreaterThan(depositsAtLastRing);
+      depositsAtLastRing = h.deposits;
+      h.removed.push({ member, channelHex: ch });
+      return Promise.resolve();
     },
     depositInfo: () => { h.deposits += 1; return Promise.resolve(); },
   });
@@ -227,7 +228,7 @@ describe("043-POSTERS Part E — the admin's posting setting", () => {
 
   // 044-POSTERBELL Part E3: a removed poster is TOLD — remove, eject, and switch-to-admin each send
   // the poster-removed notice over the sealed-session route.
-  it("E3. remove, eject and switch-to-admin each notify the poster", async () => {
+  it("E3. remove and switch-to-admin ring the poster after the revoking record; an eject rings through its own eject notice", async () => {
     // remove a listed poster
     const h1 = await harness();
     h1.members.admit(h1.channelHex, memberHex(1), "active", T0);
@@ -242,7 +243,10 @@ describe("043-POSTERS Part E — the admin's posting setting", () => {
     await h2.admin.setPosting(h2.channelHex, "members");
     h2.members.eject(h2.channelHex, memberHex(2));
     await h2.admin.onEjected(h2.channelHex, memberHex(2));
-    expect(h2.removed).toEqual([{ member: memberHex(2), channelHex: h2.channelHex }]);
+    // 045-NOTICEBELL: the eject verb writes the member's eject notice and rings them; the posting
+    // admin only revokes and re-deposits the record — a second ring would be a duplicate notice.
+    expect(h2.removed).toEqual([]);
+    expect(h2.admin.infoExt(h2.channelHex)?.revoked.map((r) => hex(r.poster_pubkey))).toEqual([memberHex(2)]);
 
     // switch to admin — every live poster is told
     const h3 = await harness();

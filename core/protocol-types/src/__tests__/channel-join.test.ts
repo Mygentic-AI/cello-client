@@ -9,23 +9,15 @@
  * decisions they carry are tested against the daemon.
  */
 import { describe, it, expect } from "vitest";
-import { generateKeypair } from "@cello-protocol/crypto";
 import {
   encodeChannelJoinRequest, decodeChannelJoinRequest,
   encodeChannelJoinAccepted, decodeChannelJoinAccepted,
   encodeChannelJoinRefused, decodeChannelJoinRefused,
-  encodeChannelRekey, decodeChannelRekey,
-  encodeChannelMembershipEnded, decodeChannelMembershipEnded,
-  encodeChannelPosterPassFrame, decodeChannelPosterPassFrame,
   isChannelJoinFrame,
   channelJoinFrameType,
   MAX_JOIN_NOTE_CHARS,
   MAX_JOIN_FRAME_BYTES,
-  JOIN_REQUEST_TYPE, JOIN_ACCEPTED_TYPE, JOIN_REFUSED_TYPE, REKEY_TYPE, MEMBERSHIP_ENDED_TYPE, POSTER_PASS_FRAME_TYPE,
-} from "../channel-join.js";
-import { signChannelPosterPass, encodeChannelPosterPass } from "../channel-poster-pass.js";
-import {
-  encodeChannelPosterRemovedNotice, decodeChannelPosterRemovedNotice, POSTER_REMOVED_NOTICE_TYPE,
+  JOIN_REQUEST_TYPE, JOIN_ACCEPTED_TYPE, JOIN_REFUSED_TYPE,
 } from "../channel-join.js";
 import { encodeCbor } from "../cbor.js";
 
@@ -110,8 +102,8 @@ describe("M16 019 Part B — the join frames", () => {
 
   it("every refusal reason is carried by name", () => {
     // 038-RETESTFIX Part E: `ejected` STAYS a refusal reason (the admin refusing an ejected member's
-    // re-request). `channel_closed` is gone — a deleted channel is never a refusal, only a
-    // `ChannelMembershipEnded` reason.
+    // re-request). `channel_closed` is gone — a deleted channel is never a refusal; its news is the
+    // directory's revocation plus a ring (045-NOTICEBELL).
     for (const reason of [
       "not_admin_of_channel", "pending_approval", "refused_by_admin", "already_member", "ejected",
     ] as const) {
@@ -128,35 +120,6 @@ describe("M16 019 Part B — the join frames", () => {
     })).ok).toBe(false);
   });
 
-  it("038 Part E — a membership-ended frame round-trips ejected and channel_closed, and refuses anything else", () => {
-    for (const reason of ["ejected", "channel_closed"] as const) {
-      const decoded = decodeChannelMembershipEnded(encodeChannelMembershipEnded({ channel_pubkey: CHANNEL, reason }));
-      expect(decoded.ok && decoded.frame.reason).toBe(reason);
-    }
-    // A refusal reason is NOT a membership-ended reason, and neither is an invented one.
-    for (const bad of ["refused_by_admin", "made_up"]) {
-      expect(decodeChannelMembershipEnded(encodeCbor([MEMBERSHIP_ENDED_TYPE, CHANNEL, bad])).ok,
-        `${bad} is not a membership-ended reason`).toBe(false);
-    }
-    // A membership-ended frame is classified as its own type, and never decodes as a refusal.
-    const ended = encodeChannelMembershipEnded({ channel_pubkey: CHANNEL, reason: "ejected" });
-    expect(channelJoinFrameType(ended)).toBe(MEMBERSHIP_ENDED_TYPE);
-    expect(isChannelJoinFrame(ended)).toBe(true);
-    expect(decodeChannelJoinRefused(ended).ok).toBe(false);
-  });
-
-  it("a re-key carries its generation, and the generation must be a real one", () => {
-    const decoded = decodeChannelRekey(encodeChannelRekey({
-      channel_pubkey: CHANNEL, key_bundle: BUNDLE, generation: 4,
-    }));
-    expect(decoded.ok && decoded.frame.generation).toBe(4);
-
-    expect(() => encodeChannelRekey({ channel_pubkey: CHANNEL, key_bundle: BUNDLE, generation: 0 }))
-      .toThrow(/bad_generation/);
-    expect(() => encodeChannelRekey({ channel_pubkey: CHANNEL, key_bundle: BUNDLE, generation: -1 }))
-      .toThrow(/bad_generation/);
-  });
-
   it("a conversation message is NEVER classified as a join frame", () => {
     /**
      * ⚠️ THE SAME PROPERTY THE DOCUMENT ROUTER RESTS ON. These frames share the session content
@@ -171,9 +134,6 @@ describe("M16 019 Part B — the join frames", () => {
     expect(isChannelJoinFrame(encodeChannelJoinRequest({
       channel_pubkey: CHANNEL, subscriber_pubkey: SUBSCRIBER, note: "",
     }))).toBe(true);
-    expect(isChannelJoinFrame(encodeChannelRekey({
-      channel_pubkey: CHANNEL, key_bundle: BUNDLE, generation: 2,
-    }))).toBe(true);
   });
 
   it("garbage never throws and never decodes", () => {
@@ -181,7 +141,6 @@ describe("M16 019 Part B — the join frames", () => {
       expect(decodeChannelJoinRequest(junk).ok).toBe(false);
       expect(decodeChannelJoinAccepted(junk).ok).toBe(false);
       expect(decodeChannelJoinRefused(junk).ok).toBe(false);
-      expect(decodeChannelRekey(junk).ok).toBe(false);
       expect(isChannelJoinFrame(junk)).toBe(false);
     }
   });
@@ -191,7 +150,6 @@ describe("M16 019 Part B — the join frames", () => {
     // subscriber store a key bundle built from whatever those bytes happened to contain.
     const refused = encodeChannelJoinRefused({ channel_pubkey: CHANNEL, reason: "refused_by_admin" });
     expect(decodeChannelJoinAccepted(refused).ok).toBe(false);
-    expect(decodeChannelRekey(refused).ok).toBe(false);
     expect(decodeChannelJoinRequest(refused).ok).toBe(false);
   });
 });
@@ -209,9 +167,6 @@ describe("025-JOINSCREEN — channelJoinFrameType is strict, by full decode", ()
     expect(channelJoinFrameType(encodeChannelJoinRefused({
       channel_pubkey: CHANNEL, reason: "refused_by_admin",
     }))).toBe(JOIN_REFUSED_TYPE);
-    expect(channelJoinFrameType(encodeChannelRekey({
-      channel_pubkey: CHANNEL, key_bundle: BUNDLE, generation: 3,
-    }))).toBe(REKEY_TYPE);
   });
 
   // Test 2: a valid type string in slot 0 with a body the decoder rejects is NOT a join frame.
@@ -231,10 +186,6 @@ describe("025-JOINSCREEN — channelJoinFrameType is strict, by full decode", ()
     expect(channelJoinFrameType(encodeCbor([
       JOIN_ACCEPTED_TYPE, CHANNEL, BUNDLE, "", 3600, "public", [RELAY_A], false,
     ]))).toBeNull();
-    // rekey to generation 0 — "no key has ever been issued"
-    expect(channelJoinFrameType(encodeCbor([
-      REKEY_TYPE, CHANNEL, BUNDLE, 0,
-    ]))).toBeNull();
   });
 
   // Test 4: the cap admits the LARGEST legitimate frame. (Test 3 is deliberately not written — see
@@ -253,41 +204,12 @@ describe("025-JOINSCREEN — channelJoinFrameType is strict, by full decode", ()
     expect(channelJoinFrameType(frame)).toBe(JOIN_ACCEPTED_TYPE);
   });
 
-  // 044-POSTERBELL: the pass frame now carries the channel's current members, outside the signed
-  // pass, so a poster knows who to ring the moment it posts.
-  it("a poster pass frame round-trips its member list, and rejects a wrong-length member", async () => {
-    const channel = generateKeypair();
-    const poster = generateKeypair();
-    const pass = await signChannelPosterPass(channel, {
-      poster_pubkey: await poster.getPublicKey(), issued_at: 1_000, expires_at: 8_000,
-    });
-    const passCbor = encodeChannelPosterPass(pass);
-    const members = [new Uint8Array(32).fill(0xaa), new Uint8Array(32).fill(0xbb)];
-
-    const bytes = encodeChannelPosterPassFrame(passCbor, members);
-    expect(channelJoinFrameType(bytes)).toBe(POSTER_PASS_FRAME_TYPE);
-    const decoded = decodeChannelPosterPassFrame(bytes);
-    expect(decoded.ok, decoded.ok ? "" : decoded.reason).toBe(true);
-    if (!decoded.ok) return;
-    expect(decoded.frame.members).toHaveLength(2);
-    expect(Buffer.from(decoded.frame.members[0]!).equals(Buffer.from(members[0]!))).toBe(true);
-
-    // A member that is not 32 bytes cannot identify an agent, so it is refused, never truncated.
-    expect(() => encodeChannelPosterPassFrame(passCbor, [new Uint8Array(16)])).toThrow(/bad_members/);
-    const badWire = encodeCbor([POSTER_PASS_FRAME_TYPE, passCbor, [new Uint8Array(16)]]);
-    const badDecoded = decodeChannelPosterPassFrame(badWire);
-    expect(badDecoded.ok).toBe(false);
-    if (!badDecoded.ok) expect(badDecoded.reason).toBe("bad_members");
-  });
-
-  // 044-POSTERBELL Part E3: the poster-removed notice round-trips and rejects a wrong-length channel.
-  it("a poster-removed notice round-trips and rejects a bad channel key", () => {
-    const channel = new Uint8Array(32).fill(0xa1);
-    const bytes = encodeChannelPosterRemovedNotice(channel);
-    expect(channelJoinFrameType(bytes)).toBe(POSTER_REMOVED_NOTICE_TYPE);
-    const decoded = decodeChannelPosterRemovedNotice(bytes);
-    expect(decoded.ok).toBe(true);
-    if (decoded.ok) expect(Buffer.from(decoded.frame.channel_pubkey).equals(Buffer.from(channel))).toBe(true);
-    expect(() => encodeChannelPosterRemovedNotice(new Uint8Array(16))).toThrow(/bad_channel_pubkey/);
+  // 045-NOTICEBELL: the four notice frames that used to ride a session are gone. Their old type
+  // strings, with a well-formed body, are NOT join frames any more — they would reach the transcript.
+  it("the retired notice frame types are no longer classified as join frames", () => {
+    expect(channelJoinFrameType(encodeCbor(["cello-channel-rekey-v1", CHANNEL, BUNDLE, 2]))).toBeNull();
+    expect(channelJoinFrameType(encodeCbor(["cello-channel-membership-ended-v1", CHANNEL, "ejected"]))).toBeNull();
+    expect(channelJoinFrameType(encodeCbor(["cello-channel-poster-pass-frame-v1", BUNDLE, []]))).toBeNull();
+    expect(channelJoinFrameType(encodeCbor(["cello-channel-poster-removed-v1", CHANNEL]))).toBeNull();
   });
 });

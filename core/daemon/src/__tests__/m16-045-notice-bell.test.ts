@@ -194,6 +194,20 @@ describe("045-NOTICEBELL — the member reads its notices; no session anywhere",
     expect(h.removed).toHaveLength(1);
   });
 
+  it("10. a pass notice naming ANOTHER agent, or a pass not signed by the channel, stores nothing", async () => {
+    const h = await harness();
+    const stranger = generateKeypair() as InMemoryKeyProvider;
+    const forOther = await signChannelPosterPass(h.channel, { poster_pubkey: await stranger.getPublicKey(), issued_at: 500, expires_at: 9_000_000_000_000 });
+    await h.write("pass", encodeNoticePassBody(encodeChannelPosterPass(forOther), []), 1000);
+    await h.reader.checkNotices(MEMBER_ID);
+    expect(h.passes.get(MEMBER_ID, h.channelHex)).toBeNull();
+    const bySomeone = await signChannelPosterPass(stranger, { poster_pubkey: await h.member.getPublicKey(), issued_at: 600, expires_at: 9_000_000_000_000 });
+    await h.write("pass", encodeNoticePassBody(encodeChannelPosterPass({ ...bySomeone, channel_pubkey: await h.channel.getPublicKey() }), []), 2000);
+    await h.reader.checkNotices(MEMBER_ID);
+    expect(h.passes.get(MEMBER_ID, h.channelHex)).toBeNull();
+    expect(h.logs.filter((l) => l.event === "channel.notice.rejected" && l.ctx?.["reason"] === "body_invalid")).toHaveLength(2);
+  });
+
   it("9. a pass issued AFTER the revocation is kept, and nobody is told", async () => {
     const h = await harness({
       info: async (channel, admin, member) => encodeChannelInfo(await signChannelInfo(channel, {

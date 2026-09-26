@@ -16,7 +16,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { generateKeypair, generateGroupKey, wrapGroupKeyFor, type InMemoryKeyProvider } from "@cello-protocol/crypto";
-import { encodeChannelJoinAccepted, decodeChannelMembershipEnded, signBroadcastArtifact } from "@cello-protocol/protocol-types";
+import { encodeChannelJoinAccepted, signBroadcastArtifact, decodeChannelNotice, channelNoticeSlot } from "@cello-protocol/protocol-types";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import type { DaemonDatabase } from "../sqlcipher-db.js";
 import type { Logger } from "../types.js";
@@ -298,6 +298,12 @@ async function adminHarness() {
   // `revoked` to prove a deleted channel's `info` now asks the directory.
   let signaling: SignalingLike | null = null;
 
+  // 045-NOTICEBELL: every notice record deposited (decoded), every ring, and which slots the relays refuse.
+  const notices: Array<{ type: string; slot: string; record: Uint8Array }> = [];
+  const rings: Array<{ agent: string; channel: string; members: string[] }> = [];
+  let refusedSlots = new Set<string>();
+  let ringOk = true;
+
   // A fake retire path — the real cello_remove_agent lives in agent-handlers; here we only prove
   // delete REACHES it with the channel's name.
   handlers.set("cello_remove_agent", (params) => {
@@ -343,11 +349,33 @@ async function adminHarness() {
     // its log is empty here (the post count on an admin row is null).
     isChannelAgent: (name) => name === CHANNEL_NAME,
     channelLastSeq: () => null,
+    fetchChannelInfo: () => Promise.resolve(null),
+    noticeTransport: () => ({
+      depositNotice: (_relays, record) => {
+        const d = decodeChannelNotice(record);
+        if (!d.ok) throw new Error(d.reason);
+        if (refusedSlots.has(hex(d.notice.slot))) return Promise.resolve(0);
+        notices.push({ type: d.notice.type, slot: hex(d.notice.slot), record });
+        return Promise.resolve(2);
+      },
+      fetchNotices: () => Promise.resolve([]),
+      ringMembers: (agent, channel, ringed) => {
+        rings.push({ agent, channel, members: ringed });
+        return Promise.resolve(ringOk);
+      },
+      isAgentOnline: () => true,
+    }),
   });
+
+  /** The slot a notice of `type` for `memberHex` lives under — computed the way the member does. */
+  const slotFor = async (memberHex: string, type: "pass" | "eject" | "group_key"): Promise<string> =>
+    hex(channelNoticeSlot((await channelKp.staticSharedSecret(new Uint8Array(Buffer.from(memberHex, "hex"))))!, type));
 
   return {
     handlers, members, adminKp, channelKp, adminHex, channelHex, sent, openedSessionsFor,
-    prunedChannels, removedAgents, closedSessions, logs,
+    prunedChannels, removedAgents, closedSessions, logs, notices, rings, slotFor,
+    setRefusedSlots: (slots: string[]) => { refusedSlots = new Set(slots); },
+    setRingOk: (ok: boolean) => { ringOk = ok; },
     setSendThrows: (ids: string[]) => { sendThrowSessions = new Set(ids); },
     setOpenSessions: (s: typeof openSessions) => { openSessions = s; },
     setOpenSessionForResult: (r: typeof openSessionForResult) => { openSessionForResult = r; },
@@ -358,87 +386,64 @@ async function adminHarness() {
 }
 
 describe("M16 034-LIFECYCLE — admin side: eject tells the member, delete removes the channel", () => {
-  it("1. eject sends the ejected member a membership_ended(ejected) frame on the open session", async () => {
+  it("1. eject writes the ejected member a sealed eject notice and rings them — no session", async () => {
     const h = await adminHarness();
-    // A single active member, so the re-key loop is empty and the only send is the notice.
     const memberKp = generateKeypair() as InMemoryKeyProvider;
     const memberHex = hex(await memberKp.getPublicKey());
     h.members.admit(h.channelHex, memberHex, "active", 1000);
-    h.setOpenSessions([{ sessionId: "s-member", counterpartyPubkeyHex: memberHex }]);
 
     const res = (await h.handlers.get("cello_channel_eject")!(
       { channel: h.channelHex, subscriber: memberHex }, "conn-1",
     )) as Record<string, unknown>;
 
     expect(res.ok).toBe(true);
-    expect(res.member_notified, "the ejected member was told").toBe(true);
-    // 038-RETESTFIX Part E: the frame reached the member's session, and it is a MEMBERSHIP-ENDED
-    // frame naming `ejected` — its own type now, not a join refusal.
-    const notice = h.sent.find((s) => s.sessionId === "s-member");
-    expect(notice, "a frame was sent on the member's session").toBeDefined();
-    const decoded = decodeChannelMembershipEnded(notice!.content);
-    expect(decoded.ok && decoded.frame.reason).toBe("ejected");
+    expect(res.member_notified, "the eject notice reached the relays").toBe(true);
+    expect(h.notices.map((n) => ({ type: n.type, slot: n.slot }))).toEqual([{ type: "eject", slot: await h.slotFor(memberHex, "eject") }]);
+    expect(h.rings).toEqual([{ agent: ADMIN_NAME, channel: h.channelHex, members: [memberHex] }]);
+    expect(h.sent, "no session frame").toEqual([]);
+    expect(h.openedSessionsFor, "no session opened").toEqual([]);
   });
 
-  it("2. eject with the member unreachable → ok, member_notified false, and the ejection still holds", async () => {
+  it("2. eject when no relay takes the notice → ok, member_notified false, and the ejection still holds", async () => {
     const h = await adminHarness();
     const memberKp = generateKeypair() as InMemoryKeyProvider;
     const memberHex = hex(await memberKp.getPublicKey());
     h.members.admit(h.channelHex, memberHex, "active", 1000);
-    // No open session, and opening one fails: the member is offline.
-    h.setOpenSessions([]);
-    h.setOpenSessionForResult({ ok: false, reason: "offline" });
+    h.setRefusedSlots([await h.slotFor(memberHex, "eject")]);
 
     const res = (await h.handlers.get("cello_channel_eject")!(
       { channel: h.channelHex, subscriber: memberHex }, "conn-1",
     )) as Record<string, unknown>;
 
-    // The eject itself succeeds — the member is out at the relay from the next post regardless.
     expect(res.ok).toBe(true);
-    expect(res.member_notified, "could not reach them to tell them").toBe(false);
-    // And it is not on the open session (there was none) — nothing was sent.
+    expect(res.member_notified).toBe(false);
     expect(h.sent).toHaveLength(0);
-    // The store recorded the ejection.
     expect(h.members.statusOf(h.channelHex, memberHex)).toBe("ejected");
   });
 
-  it("040-CLEANUP Part A: a remaining member whose re-key send THROWS is named in unreached, and the others are still re-keyed", async () => {
-    // Three remaining members after an eject; the middle one's send throws. Before the fix the throw
-    // ended the loop, so the third member never got the new key and never appeared in `unreached` —
-    // the ejection re-keyed only the members ahead of the failure and silently skipped the rest.
+  it("040-CLEANUP Part A (045): a remaining member whose new-key notice no relay takes is named in unreached; the others still get theirs", async () => {
     const h = await adminHarness();
     const mk = async () => hex(await (generateKeypair() as InMemoryKeyProvider).getPublicKey());
     const ejectHex = await mk();
     const m1 = await mk();
     const m2 = await mk();
     const m3 = await mk();
-    // The ejected member plus three remaining, all active with an open session each.
     for (const m of [ejectHex, m1, m2, m3]) h.members.admit(h.channelHex, m, "active", 1000);
-    h.setOpenSessions([
-      { sessionId: "s-eject", counterpartyPubkeyHex: ejectHex },
-      { sessionId: "s-m1", counterpartyPubkeyHex: m1 },
-      { sessionId: "s-m2", counterpartyPubkeyHex: m2 },
-      { sessionId: "s-m3", counterpartyPubkeyHex: m3 },
-    ]);
-    // The middle member's re-key send fails.
-    h.setSendThrows(["s-m2"]);
+    h.setRefusedSlots([await h.slotFor(m2, "group_key")]);
 
     const res = (await h.handlers.get("cello_channel_eject")!(
       { channel: h.channelHex, subscriber: ejectHex }, "conn-1",
     )) as { ok: boolean; delivered: number; unreached: string[] };
 
-    // The eject succeeds, and the loop did NOT abort on the throw.
     expect(res.ok).toBe(true);
-    // The two reachable members got the re-key; the throwing one did not.
     expect(res.delivered).toBe(2);
     expect(res.unreached).toEqual([m2]);
-    expect(h.sent.some((s) => s.sessionId === "s-m1"), "m1 was re-keyed").toBe(true);
-    expect(h.sent.some((s) => s.sessionId === "s-m3"), "m3 was re-keyed even though m2 failed first").toBe(true);
-    expect(h.sent.some((s) => s.sessionId === "s-m2"), "m2's re-key threw, so nothing was sent on it").toBe(false);
-    // The log names the unreached member WITH the send error as the reason.
-    const logged = h.logs.find((l) => l.event === "channel.rekey.member_unreached" && l.ctx?.["member_pubkey"] === m2);
-    expect(logged, "an unreached-member log line was written for m2").toBeDefined();
-    expect(logged!.ctx?.["reason"]).toBe("relay_send_failed");
+    const keySlots = h.notices.filter((n) => n.type === "group_key").map((n) => n.slot).sort();
+    expect(keySlots).toEqual([await h.slotFor(m1, "group_key"), await h.slotFor(m3, "group_key")].sort());
+    // One ring: the ejected member and every remaining member that has a new key to read.
+    expect(h.rings).toHaveLength(1);
+    expect([...h.rings[0]!.members].sort()).toEqual([ejectHex, m1, m3].sort());
+    expect(h.sent).toEqual([]);
   });
 
   it("4. cello_channels lists an ejected subscription with status ejected, hides left, and shows unread", async () => {
@@ -464,7 +469,7 @@ describe("M16 034-LIFECYCLE — admin side: eject tells the member, delete remov
     expect(byChannel.has(left), "a channel the operator LEFT stays hidden").toBe(false);
   });
 
-  it("5. delete notifies active AND pending members, prunes both relays, and retires the channel identity", async () => {
+  it("5. delete rings active AND pending members before the retire, prunes both relays, and retires the channel identity — no session", async () => {
     const h = await adminHarness();
     const activeKp = generateKeypair() as InMemoryKeyProvider;
     const pendingKp = generateKeypair() as InMemoryKeyProvider;
@@ -472,27 +477,20 @@ describe("M16 034-LIFECYCLE — admin side: eject tells the member, delete remov
     const pendingHex = hex(await pendingKp.getPublicKey());
     h.members.admit(h.channelHex, activeHex, "active", 1000);
     h.members.admit(h.channelHex, pendingHex, "pending", 1000);
-    // Reachable through openSessionFor (no pre-existing session needed).
-    h.setOpenSessions([]);
-    h.setOpenSessionForResult({ ok: true, sessionId: "s-opened" });
 
     const res = (await h.handlers.get("cello_channel_delete")!(
       { channel: h.channelHex }, "conn-1",
     )) as Record<string, unknown>;
 
     expect(res.ok).toBe(true);
-    // (a) both members were told the channel is gone.
     expect(res.members_notified).toBe(2);
     expect(res.members_unreached).toEqual([]);
-    // 038-RETESTFIX Part E: deletion is a MEMBERSHIP-ENDED frame now, not a join refusal.
-    const closedReasons = h.sent.map((s) => decodeChannelMembershipEnded(s.content)).filter((d) => d.ok).map((d) => (d.ok ? d.frame.reason : ""));
-    expect(closedReasons).toEqual(["channel_closed", "channel_closed"]);
-    // (b) the whole channel was pruned on both relays.
+    expect(h.rings).toEqual([{ agent: ADMIN_NAME, channel: h.channelHex, members: [activeHex, pendingHex] }]);
+    expect(h.sent).toEqual([]);
+    expect(h.openedSessionsFor).toEqual([]);
     expect(h.prunedChannels).toEqual([h.channelHex]);
     expect(res.relays).toEqual([{ relay: RELAY_A, ok: true }, { relay: RELAY_B, ok: true }]);
-    // (c) the channel identity was retired through the existing remove path, by NAME.
     expect(h.removedAgents).toEqual([CHANNEL_NAME]);
-    // (d) a successful retire is reported as retired: true.
     expect(res.retired).toBe(true);
   });
 
@@ -511,37 +509,28 @@ describe("M16 034-LIFECYCLE — admin side: eject tells the member, delete remov
     expect(h.removedAgents, "no identity was retired").toEqual([]);
   });
 
-  it("review MEDIUM: a notice that OPENED a session seals it closed afterwards", async () => {
-    // notifyRefused opens a session when none is held. An opened-and-never-closed session counts
-    // against the relay's per-pair cap of 5. The session it opened is closed through the same
-    // (sealing) cello_close_session path.
+  it("045: six notices to one member leave ZERO sessions between admin and member", async () => {
     const h = await adminHarness();
-    const memberKp = generateKeypair() as InMemoryKeyProvider;
-    const memberHex = hex(await memberKp.getPublicKey());
+    const memberHex = hex(await (generateKeypair() as InMemoryKeyProvider).getPublicKey());
+    const otherHex = hex(await (generateKeypair() as InMemoryKeyProvider).getPublicKey());
     h.members.admit(h.channelHex, memberHex, "active", 1000);
-    h.setOpenSessions([]); // none open → notifyRefused opens one
-    h.setOpenSessionForResult({ ok: true, sessionId: "s-opened" });
+    h.members.admit(h.channelHex, otherHex, "active", 1000);
+    const call = (verb: string, params: Record<string, unknown>) => h.handlers.get(verb)!({ channel: h.channelHex, ...params }, "conn-1");
 
-    await h.handlers.get("cello_channel_eject")!({ channel: h.channelHex, subscriber: memberHex }, "conn-1");
+    await call("cello_channel_posting", { posting: "listed" });
+    await call("cello_channel_poster_add", { poster: memberHex });      // 1. pass
+    await call("cello_channel_poster_remove", { poster: memberHex });   // 2. poster removed
+    await call("cello_channel_poster_add", { poster: memberHex });      // 3. pass again
+    await call("cello_channel_eject", { subscriber: otherHex });        // 4. new group key
+    await call("cello_channel_eject", { subscriber: memberHex });       // 5. ejected
+    h.members.admit(h.channelHex, memberHex, "pending", 2000);
+    await call("cello_channel_delete", {});                             // 6. channel deleted
 
-    // The session it opened is sealed closed; the close rides the standard handler with the agent.
-    expect(h.closedSessions).toEqual([{ session_id: "s-opened", agent: ADMIN_NAME }]);
-  });
-
-  it("review MEDIUM: a notice riding an EXISTING session leaves it open", async () => {
-    // A session the operator already held is theirs — the notice rides it and it is NOT closed.
-    const h = await adminHarness();
-    const memberKp = generateKeypair() as InMemoryKeyProvider;
-    const memberHex = hex(await memberKp.getPublicKey());
-    h.members.admit(h.channelHex, memberHex, "active", 1000);
-    h.setOpenSessions([{ sessionId: "s-existing", counterpartyPubkeyHex: memberHex }]);
-
-    await h.handlers.get("cello_channel_eject")!({ channel: h.channelHex, subscriber: memberHex }, "conn-1");
-
-    // Rode the existing session (frame sent on it), and closed nothing — openSessionFor untouched.
-    expect(h.sent.some((s) => s.sessionId === "s-existing")).toBe(true);
-    expect(h.openedSessionsFor, "no session was opened").toEqual([]);
-    expect(h.closedSessions, "the operator's own session is left open").toEqual([]);
+    const rungForMember = h.rings.filter((r) => r.members.includes(memberHex)).length;
+    expect(rungForMember).toBe(6);
+    expect(h.openedSessionsFor, "no session was ever opened").toEqual([]);
+    expect(h.sent, "no frame rode any session").toEqual([]);
+    expect(h.closedSessions).toEqual([]);
   });
 
   it("review MEDIUM: delete reports retired:false with a reason and guidance when the retire fails", async () => {
@@ -551,7 +540,6 @@ describe("M16 034-LIFECYCLE — admin side: eject tells the member, delete remov
     const memberKp = generateKeypair() as InMemoryKeyProvider;
     const memberHex = hex(await memberKp.getPublicKey());
     h.members.admit(h.channelHex, memberHex, "active", 1000);
-    h.setOpenSessions([{ sessionId: "s-member", counterpartyPubkeyHex: memberHex }]);
     h.setRemoveAgentResult({ ok: false, reason: "agent_not_found" });
 
     const res = (await h.handlers.get("cello_channel_delete")!(

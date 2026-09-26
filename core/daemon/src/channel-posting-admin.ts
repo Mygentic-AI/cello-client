@@ -19,7 +19,7 @@
  */
 import type { KeyProvider } from "@cello-protocol/crypto";
 import {
-  encodeChannelPosterPass, encodeChannelPosterPassFrame, encodeChannelPosterRemovedNotice, signChannelPosterPass,
+  encodeChannelPosterPass, signChannelPosterPass,
   type ChannelInfoExt, type ChannelPosting,
 } from "@cello-protocol/protocol-types";
 import type { Logger } from "./types.js";
@@ -44,8 +44,13 @@ export interface ChannelPostingAdminDeps {
   adminAgentNameFor: (channelHex: string) => string | null;
   /** The channels whose passes the tick renews. */
   postingChannels: () => string[];
-  /** Deliver a frame to a member over a sealed session. `false` = unreached. */
-  sendFrame: (agentName: string, memberHex: string, frame: Uint8Array) => Promise<boolean>;
+  /**
+   * 045-NOTICEBELL: write the poster's pass (with the member list) into its sealed notice slot and
+   * ring it. `false` = no relay took it. Never a session.
+   */
+  sendPass: (channelHex: string, posterHex: string, passCbor: Uint8Array, members: Uint8Array[]) => Promise<boolean>;
+  /** 045-NOTICEBELL: ring a poster whose pass the info record now revokes. The record is the notice. */
+  ringPoster: (channelHex: string, posterHex: string) => Promise<void>;
   /** Sign and deposit the channel's info record (which carries `infoExt`). */
   depositInfo: (agentName: string, channelHex: string) => Promise<unknown>;
   now?: () => number;
@@ -86,17 +91,18 @@ export function createChannelPostingAdmin(deps: ChannelPostingAdminDeps) {
   };
 
   /**
-   * 044-POSTERBELL Part E3: tell a poster it can no longer post, over the same sealed-session route
-   * as the pass. Best-effort — a poster we cannot reach simply keeps a pass the relays already
-   * refuse, and its next post surfaces the plain refusal (Part E2). Called on every revocation.
+   * 045-NOTICEBELL: tell a poster it can no longer post. The notice IS the revocation in the signed
+   * info record (`ext.revoked`), so this only rings — and it must run AFTER that record is deposited,
+   * or the poster reads the old record and sees nothing. Best-effort: a poster we cannot ring keeps a
+   * pass the relays already refuse, and its backstop tick reads the record later.
    */
-  const notifyPosterRemoved = async (channelHex: string, posterHex: string): Promise<void> => {
-    const agentName = deps.adminAgentNameFor(channelHex);
-    if (!agentName) return;
-    try {
-      await deps.sendFrame(agentName, posterHex, encodeChannelPosterRemovedNotice(new Uint8Array(Buffer.from(channelHex, "hex"))));
-    } catch (err: unknown) {
-      logger.warn("channel.poster_removed.unreached", { channel_pubkey: channelHex, poster_pubkey: posterHex, reason: extractErrorMessage(err) });
+  const ringRemoved = async (channelHex: string, posterHexes: string[]): Promise<void> => {
+    for (const posterHex of posterHexes) {
+      try {
+        await deps.ringPoster(channelHex, posterHex);
+      } catch (err: unknown) {
+        logger.warn("channel.poster_removed.unreached", { channel_pubkey: channelHex, poster_pubkey: posterHex, reason: extractErrorMessage(err) });
+      }
     }
   };
 
@@ -107,8 +113,7 @@ export function createChannelPostingAdmin(deps: ChannelPostingAdminDeps) {
   /** Sign, send, and — only once delivered — record one pass. */
   const issue = async (channelHex: string, posterHex: string): Promise<boolean> => {
     const channelKey = deps.channelKeyFor(channelHex);
-    const agentName = deps.adminAgentNameFor(channelHex);
-    if (!channelKey || !agentName) return false;
+    if (!channelKey || !deps.adminAgentNameFor(channelHex)) return false;
     const leaseMs = (config.get(channelHex)?.poster_lease_seconds ?? 604800) * 1000;
     const issuedAt = now();
     const pass = await signChannelPosterPass(channelKey, {
@@ -117,13 +122,13 @@ export function createChannelPostingAdmin(deps: ChannelPostingAdminDeps) {
     let delivered = false;
     try {
       // 044-POSTERBELL: the pass carries the channel's current members, outside the signed pass.
-      delivered = await deps.sendFrame(agentName, posterHex, encodeChannelPosterPassFrame(encodeChannelPosterPass(pass), memberBytes(channelHex)));
+      delivered = await deps.sendPass(channelHex, posterHex, encodeChannelPosterPass(pass), memberBytes(channelHex));
     } catch (err: unknown) {
       logger.warn("channel.poster_pass.unreached", { channel_pubkey: channelHex, poster_pubkey: posterHex, reason: extractErrorMessage(err) });
       return false;
     }
     if (!delivered) {
-      logger.warn("channel.poster_pass.unreached", { channel_pubkey: channelHex, poster_pubkey: posterHex, reason: "no_session" });
+      logger.warn("channel.poster_pass.unreached", { channel_pubkey: channelHex, poster_pubkey: posterHex, reason: "no_relay_took_it" });
       return false;
     }
     grants.recordIssued(channelHex, posterHex, pass.issued_at, pass.expires_at);
@@ -135,14 +140,14 @@ export function createChannelPostingAdmin(deps: ChannelPostingAdminDeps) {
    * with under two days left. A poster whose last pass was revoked is NOT re-issued here — only an
    * explicit add, an admission or a switch of mode does that.
    */
-  const reconcile = async (channelHex: string): Promise<boolean> => {
+  const reconcile = async (channelHex: string, removedOut: string[]): Promise<boolean> => {
     const posters = new Set(postersOf(channelHex));
     let changed = false;
     for (const g of grants.all(channelHex)) {
       if (grantIsLive(g) && !posters.has(g.poster_pubkey)) {
         grants.revoke(channelHex, g.poster_pubkey, now());
-        // 044-POSTERBELL Part E3: switching to admin, or any mode change that drops a poster, tells it.
-        await notifyPosterRemoved(channelHex, g.poster_pubkey);
+        // Rung by the caller once the revoking info record is deposited.
+        removedOut.push(g.poster_pubkey);
         changed = true;
       }
     }
@@ -182,13 +187,15 @@ export function createChannelPostingAdmin(deps: ChannelPostingAdminDeps) {
       if (refused) return refused;
       const lease = leaseDays !== undefined ? leaseDays * 86400 : (config.get(channelHex)?.poster_lease_seconds ?? 604800);
       config.setPosting(channelHex, posting, lease);
-      await reconcile(channelHex);
+      const removed: string[] = [];
+      await reconcile(channelHex, removed);
       // A switch of mode issues to every poster that does not hold a live pass.
       for (const poster of postersOf(channelHex)) {
         const g = grants.get(channelHex, poster);
         if (!g || !grantIsLive(g)) await issue(channelHex, poster);
       }
       await deposit(channelHex);
+      await ringRemoved(channelHex, removed);
       return { ok: true };
     },
 
@@ -215,9 +222,9 @@ export function createChannelPostingAdmin(deps: ChannelPostingAdminDeps) {
       if (refused) return refused;
       members.setCanPost(channelHex, posterHex, false);
       grants.revoke(channelHex, posterHex, now());
-      // 044-POSTERBELL Part E3: tell the removed poster and delete its pass on its side.
-      await notifyPosterRemoved(channelHex, posterHex);
+      // 045-NOTICEBELL: the revocation reaches the relays in the info record FIRST, then the ring.
       await deposit(channelHex);
+      await ringRemoved(channelHex, [posterHex]);
       return { ok: true };
     },
 
@@ -237,8 +244,8 @@ export function createChannelPostingAdmin(deps: ChannelPostingAdminDeps) {
       const g = grants.get(channelHex, memberHex);
       if (!g || !grantIsLive(g)) return;
       grants.revoke(channelHex, memberHex, now());
-      // 044-POSTERBELL Part E3: an ejected poster is told and its pass deleted on its side.
-      await notifyPosterRemoved(channelHex, memberHex);
+      // The ejected member's own eject notice is its ring; its pass dies with the eject on its side,
+      // and the revocation reaches the relays in the info record.
       await deposit(channelHex);
     },
 
@@ -247,7 +254,9 @@ export function createChannelPostingAdmin(deps: ChannelPostingAdminDeps) {
       for (const channelHex of deps.postingChannels()) {
         if (needAdmin(channelHex)) continue;
         try {
-          if (await reconcile(channelHex)) await deposit(channelHex);
+          const removed: string[] = [];
+          if (await reconcile(channelHex, removed)) await deposit(channelHex);
+          await ringRemoved(channelHex, removed);
         } catch (err: unknown) {
           logger.warn("channel.poster_renew.failed", { channel_pubkey: channelHex, reason: extractErrorMessage(err) });
         }

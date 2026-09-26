@@ -720,7 +720,7 @@ async function startDaemonHoldingLock(
     fetchChannelInfo: (relays, channelHex) => channelWiring.fetchInfo(relays, channelHex),
     depositChannelInfo: (agentName, channelHex) => channelWiring.depositInfo(agentName, channelHex),
     // 038-RETESTFIX Part B: a newly-active subscription collects its existing posts via the wake's collectNow, assigned below after the collector exists.
-    collectNow: (agentId) => channelCollectNow?.(agentId),
+    collectNow: (agentId) => channelCollectNow?.(agentId), noticeTransport: () => channelWiring, // 045: notice records + rings (late-bound)
   });
 
   const channelWiring = wireChannelPublishing({
@@ -750,7 +750,7 @@ async function startDaemonHoldingLock(
       // A failed wake collection is not fatal and must not surface as an unhandled rejection: the
       // backstop poll retries the same channels, which is what it is for.
       logger.warn("channel.collect.wake_failed", { reason: extractErrorMessage(err) });
-    });
+    }); void channelMembership.checkNotices(agentId).catch((err: unknown) => { logger.warn("channel.notice.check_failed", { reason: extractErrorMessage(err) }); }); // 045: the ring also carries notices
   };
 
   // ─── Trust-signal wallet (operator-facing, no agent scope required) ───

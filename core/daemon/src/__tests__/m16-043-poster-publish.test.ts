@@ -14,15 +14,13 @@ import { join } from "node:path";
 import { generateKeypair, generateGroupKey, decryptBody } from "@cello-protocol/crypto";
 import type { InMemoryKeyProvider, GroupKey } from "@cello-protocol/crypto";
 import {
-  decodeBroadcastArtifact, encodeChannelPosterPass, encodeChannelPosterPassFrame, encodeChannelPosterRemovedNotice, posterPassOf,
+  decodeBroadcastArtifact, encodeChannelPosterPass, posterPassOf,
   signChannelPosterPass, signRelayPostReceipt, encodeRelayPostReceipt, verifyBroadcastArtifact,
 } from "@cello-protocol/protocol-types";
 import { ChannelLogStore } from "../channel-log-store.js";
 import { ChannelSubscriptionStore } from "../channel-subscription-store.js";
-import { ChannelMembershipStore } from "../channel-membership-store.js";
 import { ChannelPosterPassStore } from "../channel-poster-pass-store.js";
 import { ChannelPosterPublisher } from "../channel-poster-publisher.js";
-import { createChannelJoinExchange } from "../channel-join-exchange.js";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import type { DaemonDatabase } from "../sqlcipher-db.js";
 import type { Logger } from "../types.js";
@@ -179,79 +177,5 @@ describe("043-POSTERS Part C — posting as a poster", () => {
     expect(h.deposits.map((d) => { const a = decodeBroadcastArtifact(d.post_cbor); return a.ok ? hex(a.artifact.agent_pubkey) : ""; }))
       .toEqual([hex(await bob.getPublicKey()), hex(await bob.getPublicKey())]);
     expect(await h.pub.resendMissing("carol", h.channelHex, RELAY_B)).toMatchObject({ deposited: 0, refused: "no_posting_pass" });
-  });
-});
-
-describe("043-POSTERS Part C — receiving a pass", () => {
-  async function exchangeHarness(): Promise<{
-    ex: ReturnType<typeof createChannelJoinExchange>; h: H; bob: InMemoryKeyProvider; removed: string[];
-  }> {
-    const h = await harness();
-    const bob = await member(h, "bob", { pass: "none" });
-    const removed: string[] = [];
-    const ex = createChannelJoinExchange({
-      logger: silent, members: new ChannelMembershipStore(db, silent), subscriptions: h.subs,
-      sendInSession: () => Promise.resolve(), localChannelAdmin: () => null,
-      profileAdminPubkey: () => Promise.resolve({ ok: false, reason: "unused" }),
-      keyProviderFor: (id) => (id === "id-bob" ? bob : null), raiseNotice: () => {},
-      posterPasses: h.passes, now: () => NOW,
-      onPosterRemoved: (_id, ch) => { removed.push(ch); },
-    });
-    return { ex, h, bob, removed };
-  }
-
-  async function frameFor(h: H, poster: InMemoryKeyProvider, issued = NOW, signer = h.channel): Promise<Uint8Array> {
-    const pass = await signChannelPosterPass(signer, { poster_pubkey: await poster.getPublicKey(), issued_at: issued, expires_at: issued + 7 * DAY });
-    const bytes = encodeChannelPosterPass(signer === h.channel ? pass : { ...pass, channel_pubkey: await h.channel.getPublicKey() });
-    return encodeChannelPosterPassFrame(bytes, []);
-  }
-
-  it("C7. a pass from the stored admin is stored; latest wins", async () => {
-    const { ex, h, bob } = await exchangeHarness();
-    const adminHex = hex(await h.admin.getPublicKey());
-    expect((await ex.onSubscriberFrame("id-bob", "s1", adminHex, await frameFor(h, bob, NOW))).ok).toBe(true);
-    expect(h.passes.get("id-bob", h.channelHex)?.issued_at).toBe(NOW);
-    await ex.onSubscriberFrame("id-bob", "s1", adminHex, await frameFor(h, bob, NOW + 5));
-    expect(h.passes.get("id-bob", h.channelHex)?.issued_at).toBe(NOW + 5);
-    // An OLDER pass arriving late does not displace the newer one.
-    await ex.onSubscriberFrame("id-bob", "s1", adminHex, await frameFor(h, bob, NOW + 1));
-    expect(h.passes.get("id-bob", h.channelHex)?.issued_at).toBe(NOW + 5);
-  });
-
-  it("C8. a pass from anyone but the stored admin, for another agent, or not signed by the channel, is refused", async () => {
-    const { ex, h, bob } = await exchangeHarness();
-    const stranger = generateKeypair();
-    const r1 = await ex.onSubscriberFrame("id-bob", "s1", hex(await stranger.getPublicKey()), await frameFor(h, bob));
-    expect(r1).toMatchObject({ ok: false, reason: "not_admin_of_channel" });
-    const adminHex = hex(await h.admin.getPublicKey());
-    const r2 = await ex.onSubscriberFrame("id-bob", "s1", adminHex, await frameFor(h, stranger));
-    expect(r2).toMatchObject({ ok: false, reason: "pass_invalid" });
-    const r3 = await ex.onSubscriberFrame("id-bob", "s1", adminHex, await frameFor(h, bob, NOW, h.admin));
-    expect(r3).toMatchObject({ ok: false, reason: "pass_invalid" });
-    expect(h.passes.get("id-bob", h.channelHex)).toBeNull();
-  });
-
-  // 044-POSTERBELL Part E3: a poster-removed notice from the STORED admin deletes the held pass and
-  // surfaces the notice; from anyone else it is refused and the pass is kept.
-  it("C9. a poster-removed notice from the admin deletes the pass; from a stranger it is refused", async () => {
-    const { ex, h, bob, removed } = await exchangeHarness();
-    const adminHex = hex(await h.admin.getPublicKey());
-    const channelPubkey = new Uint8Array(Buffer.from(h.channelHex, "hex"));
-    // Bob holds a pass first.
-    expect((await ex.onSubscriberFrame("id-bob", "s1", adminHex, await frameFor(h, bob, NOW))).ok).toBe(true);
-    expect(h.passes.get("id-bob", h.channelHex)).not.toBeNull();
-
-    // A stranger's removed notice is refused and the pass is kept.
-    const stranger = generateKeypair();
-    const notice = encodeChannelPosterRemovedNotice(channelPubkey);
-    expect(await ex.onSubscriberFrame("id-bob", "s1", hex(await stranger.getPublicKey()), notice))
-      .toMatchObject({ ok: false, reason: "not_admin_of_channel" });
-    expect(h.passes.get("id-bob", h.channelHex)).not.toBeNull();
-    expect(removed).toEqual([]);
-
-    // The admin's removed notice deletes the pass and surfaces the notice.
-    expect((await ex.onSubscriberFrame("id-bob", "s1", adminHex, notice)).ok).toBe(true);
-    expect(h.passes.get("id-bob", h.channelHex)).toBeNull();
-    expect(removed).toEqual([h.channelHex]);
   });
 });

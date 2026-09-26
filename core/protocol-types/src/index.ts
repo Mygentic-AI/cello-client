@@ -428,20 +428,14 @@ export {
   encodeChannelJoinRequest, decodeChannelJoinRequest,
   encodeChannelJoinAccepted, decodeChannelJoinAccepted,
   encodeChannelJoinRefused, decodeChannelJoinRefused,
-  encodeChannelRekey, decodeChannelRekey,
-  encodeChannelMembershipEnded, decodeChannelMembershipEnded,
-  encodeChannelPosterPassFrame, decodeChannelPosterPassFrame,
-  encodeChannelPosterRemovedNotice, decodeChannelPosterRemovedNotice,
   isChannelJoinFrame,
   channelJoinFrameType,
   MAX_JOIN_NOTE_CHARS, MAX_JOIN_GUIDANCE_CHARS, MAX_JOIN_RELAYS, MAX_JOIN_FRAME_BYTES,
-  JOIN_REQUEST_TYPE, JOIN_ACCEPTED_TYPE, JOIN_REFUSED_TYPE, REKEY_TYPE, MEMBERSHIP_ENDED_TYPE, POSTER_PASS_FRAME_TYPE,
-  POSTER_REMOVED_NOTICE_TYPE,
+  JOIN_REQUEST_TYPE, JOIN_ACCEPTED_TYPE, JOIN_REFUSED_TYPE,
 } from "./channel-join.js";
 export type {
-  ChannelJoinRequest, ChannelJoinAccepted, ChannelJoinRefused, ChannelRekey, ChannelMembershipEnded, ChannelPosterPassFrame,
-  ChannelPosterRemovedNotice,
-  ChannelJoinAccess, ChannelJoinRefusedReason, MembershipEndedReason, JoinDecodeReason, JoinDecodeResult,
+  ChannelJoinRequest, ChannelJoinAccepted, ChannelJoinRefused,
+  ChannelJoinAccess, ChannelJoinRefusedReason, JoinDecodeReason, JoinDecodeResult,
 } from "./channel-join.js";
 
 // The channel frames that carry a signature of their own. ONE definition, imported by the client

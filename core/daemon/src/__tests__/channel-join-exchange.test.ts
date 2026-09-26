@@ -21,7 +21,7 @@ import {
 } from "@cello-protocol/crypto";
 import {
   encodeChannelJoinRequest, decodeChannelJoinAccepted, decodeChannelJoinRefused,
-  encodeChannelJoinAccepted, encodeChannelJoinRefused, encodeChannelMembershipEnded,
+  encodeChannelJoinAccepted, encodeChannelJoinRefused,
   isChannelJoinFrame, channelJoinFrameType,
   JOIN_ACCEPTED_TYPE, JOIN_REQUEST_TYPE,
 } from "@cello-protocol/protocol-types";
@@ -61,8 +61,6 @@ interface Fixture {
   joinAnswers: Array<{ agentId: string; channelHex: string; outcome: string; reason?: string }>;
   /** 038-RETESTFIX Part B: every collectNow the subscriber half fired, in order (agent ids). */
   collectNowCalls: string[];
-  /** 038-RETESTFIX Part E: every onMembershipEnded the subscriber half fired, in order. */
-  membershipEnded: Array<{ agentId: string; channelHex: string; reason: string }>;
 }
 
 async function fixture(access: "open" | "invite_only" | "public" = "open"): Promise<Fixture> {
@@ -85,7 +83,6 @@ async function fixture(access: "open" | "invite_only" | "public" = "open"): Prom
   const notices: Array<{ event: string; channel: string; subscriber: string }> = [];
   const joinAnswers: Array<{ agentId: string; channelHex: string; outcome: string; reason?: string }> = [];
   const collectNowCalls: string[] = [];
-  const membershipEnded: Array<{ agentId: string; channelHex: string; reason: string }> = [];
 
   const exchange = createChannelJoinExchange({
     logger: silent,
@@ -107,14 +104,13 @@ async function fixture(access: "open" | "invite_only" | "public" = "open"): Prom
     keyProviderFor: () => subscriberKp,
     raiseNotice: (event, channel, subscriber) => { notices.push({ event, channel, subscriber }); },
     onJoinAnswer: (agentId, chHex, outcome, reason) => { joinAnswers.push({ agentId, channelHex: chHex, outcome, reason }); },
-    onMembershipEnded: (agentId, chHex, reason) => { membershipEnded.push({ agentId, channelHex: chHex, reason }); },
     collectNow: (agentId) => { collectNowCalls.push(agentId); },
     now: () => 1_800_000_000_000,
   });
 
   return {
     exchange, members, subs, channelKp, adminKp, subscriberKp,
-    channelHex, adminHex, subscriberHex, sent, profileAdmin, notices, joinAnswers, collectNowCalls, membershipEnded,
+    channelHex, adminHex, subscriberHex, sent, profileAdmin, notices, joinAnswers, collectNowCalls,
   };
 }
 
@@ -532,104 +528,6 @@ describe("M16 019 Part B — the join exchange", () => {
     const refusedFrame = encodeChannelJoinRefused({ channel_pubkey: await fr.channelKp.getPublicKey(), reason: "refused_by_admin" });
     await fr.exchange.onSubscriberFrame("agent-2", "s1", fr.adminHex, refusedFrame);
     expect(fr.joinAnswers).toEqual([{ agentId: "agent-2", channelHex: fr.channelHex, outcome: "refused", reason: "refused_by_admin" }]);
-  });
-
-  it("034-LIFECYCLE test 3 (038 Part E): a membership-ended(ejected) frame marks a subscribed channel `ejected` and fires onMembershipEnded", async () => {
-    const f = await fixture("invite_only");
-    // The member is genuinely subscribed — this is the state an eject arrives into.
-    f.subs.upsert({
-      agent_id: "agent-2", channel_pubkey: f.channelHex, admin_pubkey: f.adminHex,
-      access: "invite_only", relays: [RELAY_A, RELAY_B],
-    });
-    f.subs.addKey("agent-2", f.channelHex, { generation: 1, key: new Uint8Array(32) }, 1000);
-    expect(f.subs.get("agent-2", f.channelHex)?.status).toBe("active");
-
-    // 038-RETESTFIX Part E: removal is its OWN frame now, not a join refusal.
-    const ejected = encodeChannelMembershipEnded({ channel_pubkey: await f.channelKp.getPublicKey(), reason: "ejected" });
-    const result = await f.exchange.onSubscriberFrame("agent-2", "s1", f.adminHex, ejected);
-    expect(result.ok).toBe(false);
-
-    // ⚠️ THE SUBSCRIPTION IS MARKED, so it stops looking like a normal one forever — the live defect.
-    expect(f.subs.get("agent-2", f.channelHex)?.status).toBe("ejected");
-    // And the membership-ended doorbell fires so the operator learns of it — NOT a join answer.
-    expect(f.membershipEnded).toEqual([{ agentId: "agent-2", channelHex: f.channelHex, reason: "ejected" }]);
-    expect(f.joinAnswers, "removal is not a join answer").toEqual([]);
-    // The kept key is untouched: earlier posts stay readable.
-    expect(f.subs.keysFor("agent-2", f.channelHex)).toHaveLength(1);
-  });
-
-  it("034-LIFECYCLE test 7 (038 Part E): a membership-ended(channel_closed) frame marks a subscribed channel `closed` and fires onMembershipEnded", async () => {
-    const f = await fixture("invite_only");
-    f.subs.upsert({
-      agent_id: "agent-2", channel_pubkey: f.channelHex, admin_pubkey: f.adminHex,
-      access: "invite_only", relays: [RELAY_A, RELAY_B],
-    });
-    f.subs.addKey("agent-2", f.channelHex, { generation: 1, key: new Uint8Array(32) }, 1000);
-
-    const closed = encodeChannelMembershipEnded({ channel_pubkey: await f.channelKp.getPublicKey(), reason: "channel_closed" });
-    const result = await f.exchange.onSubscriberFrame("agent-2", "s1", f.adminHex, closed);
-    expect(result.ok).toBe(false);
-
-    // `closed`, NOT `ejected`: the whole channel is gone, and the doorbell renders differently for it.
-    expect(f.subs.get("agent-2", f.channelHex)?.status).toBe("closed");
-    expect(f.membershipEnded).toEqual([{ agentId: "agent-2", channelHex: f.channelHex, reason: "channel_closed" }]);
-    expect(f.subs.keysFor("agent-2", f.channelHex)).toHaveLength(1);
-  });
-
-  it("034-LIFECYCLE (review HIGH): a membership-ended frame from a NON-admin peer changes nothing", async () => {
-    // A membership-ended(ejected)/(channel_closed) removes a member's subscription — a privileged act.
-    // The session proves who the peer IS, not that they administer the channel. Without checking the
-    // sender against the subscription's stored admin, any peer that can open a session could mark you
-    // ejected or your channel deleted. This pins the check the accept/rekey branch already makes.
-    const f = await fixture("invite_only");
-    f.subs.upsert({
-      agent_id: "agent-2", channel_pubkey: f.channelHex, admin_pubkey: f.adminHex,
-      access: "invite_only", relays: [RELAY_A, RELAY_B],
-    });
-    const stranger = generateKeypair();
-    const strangerHex = hex(await stranger.getPublicKey());
-
-    for (const reason of ["ejected", "channel_closed"] as const) {
-      const frame = encodeChannelMembershipEnded({ channel_pubkey: await f.channelKp.getPublicKey(), reason });
-      const res = await f.exchange.onSubscriberFrame("agent-2", "s1", strangerHex, frame);
-      expect(res.ok).toBe(false);
-      // The status is untouched, and no removal doorbell fired — a stranger cannot remove you.
-      expect(f.subs.get("agent-2", f.channelHex)?.status, `${reason} from a stranger`).toBe("active");
-    }
-    expect(f.membershipEnded, "no removal doorbell fired for a non-admin sender").toEqual([]);
-
-    // And from the ACTUAL admin, the same frame still marks it.
-    const ejected = encodeChannelMembershipEnded({ channel_pubkey: await f.channelKp.getPublicKey(), reason: "ejected" });
-    await f.exchange.onSubscriberFrame("agent-2", "s1", f.adminHex, ejected);
-    expect(f.subs.get("agent-2", f.channelHex)?.status).toBe("ejected");
-  });
-
-  it("038 review LOW: a membership-ended frame for a channel this agent does not follow rings nothing", async () => {
-    // With no subscription there is no stored admin to check the sender against, so any peer could
-    // otherwise fake a "you were removed" / "channel deleted" doorbell for an arbitrary channel.
-    const f = await fixture("invite_only");
-    const stranger = generateKeypair();
-    const strangerHex = hex(await stranger.getPublicKey());
-    for (const reason of ["ejected", "channel_closed"] as const) {
-      const frame = encodeChannelMembershipEnded({ channel_pubkey: await f.channelKp.getPublicKey(), reason });
-      const res = await f.exchange.onSubscriberFrame("agent-2", "s1", strangerHex, frame);
-      expect(res).toEqual({ ok: false, reason: "not_subscribed" });
-    }
-    expect(f.membershipEnded, "no removal doorbell for a channel never followed").toEqual([]);
-    expect(f.subs.get("agent-2", f.channelHex)).toBeNull();
-  });
-
-  it("034-LIFECYCLE: a membership-ended(ejected) for a channel NOT subscribed does not throw and marks nothing", async () => {
-    // The member never joined. Marking must be guarded on the subscription existing — a bare
-    // markEjected would throw subscription_unknown and take the handler down.
-    const f = await fixture("invite_only");
-    const ejected = encodeChannelMembershipEnded({ channel_pubkey: await f.channelKp.getPublicKey(), reason: "ejected" });
-    const result = await f.exchange.onSubscriberFrame("agent-2", "s1", f.adminHex, ejected);
-    expect(result).toEqual({ ok: false, reason: "not_subscribed" });
-    expect(f.subs.get("agent-2", f.channelHex)).toBeNull();
-    // 038 review LOW: no doorbell either — with no subscription there is no stored admin to check
-    // the sender against, so a notice here is one any peer could fake.
-    expect(f.membershipEnded).toEqual([]);
   });
 
   it("a frame that is not a join frame is NOT consumed — it is somebody talking", async () => {
