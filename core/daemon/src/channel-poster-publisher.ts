@@ -33,7 +33,13 @@ import { extractErrorMessage } from "./error-message.js";
 
 export type PosterPublishRefusal =
   | "blocked_by_screen" | "channel_unknown" | "key_unavailable" | "no_relay_accepted" | "post_invalid"
-  | "no_posting_pass" | "channel_group_key_unavailable";
+  | "no_posting_pass" | "channel_group_key_unavailable"
+  // 044-POSTERBELL Part E2: the relays refused because the admin removed this poster (or the pass
+  // lapsed). The relay's own reason, surfaced so the poster is told rather than sent to resend.
+  | "pass_revoked" | "posting_closed" | "pass_expired";
+
+/** The relay refusals that mean "you can no longer post here", not "try again". */
+const REMOVED_POSTER_REASONS = new Set<string>(["pass_revoked", "posting_closed", "pass_expired"]);
 
 export type PosterPublishResult =
   | { ok: true; seq: number; deposited: DepositOutcome[]; poster_receipt_cbor?: Uint8Array }
@@ -126,7 +132,18 @@ export class ChannelPosterPublisher {
       ...cid, channel_pubkey: channelHex, lane, seq,
       relays_ok: ok.map((d) => d.relay), relays_failed: deposited.filter((d) => !d.ok).map((d) => d.relay),
     });
-    if (ok.length === 0) return { ok: false, reason: "no_relay_accepted", seq, deposited };
+    if (ok.length === 0) {
+      // 044-POSTERBELL Part E2: if every relay refused because we were removed as a poster (or the
+      // pass lapsed), the post will never land — drop the whole lane so `resend` never offers it,
+      // and surface the relay's real reason so the operator is told, not sent to resend.
+      const removed = deposited.map((d) => d.reason).find((r): r is string => r !== undefined && REMOVED_POSTER_REASONS.has(r));
+      if (removed) {
+        log.pruneThrough(lane, seq);
+        logger.info("channel.publish.refused", { ...cid, channel_pubkey: channelHex, reason: removed, lane, seq });
+        return { ok: false, reason: removed as PosterPublishRefusal, seq, deposited };
+      }
+      return { ok: false, reason: "no_relay_accepted", seq, deposited };
+    }
     // 044-POSTERBELL: hand up one verified relay receipt so the caller can ring the members. A post
     // that was taken but whose every receipt was unverifiable rings nobody — there is no proof to
     // give the directory — and that is correct, not a failure of the publish.

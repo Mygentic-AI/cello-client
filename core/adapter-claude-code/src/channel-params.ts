@@ -177,6 +177,12 @@ function doorbellText(type: string, data: Record<string, unknown>): string {
       // F33: em dash after the shortened key, not a full stop — same fix as the new-post notice.
       return `🚫 CELLO — you were removed from channel ${label} — earlier posts stay readable; new ones will not arrive.`;
     }
+    // 044-POSTERBELL Part E3: the admin removed this agent as a POSTER (or closed posting). It is
+    // still a member and still reads the channel — only its right to post is gone.
+    case "channel_poster_removed": {
+      const label = shortKey(String(data["channel"] ?? ""));
+      return `🚫 CELLO — you can no longer post to channel ${label}. Your earlier posts stay.`;
+    }
     case "channel_join_request": {
       // 034-LIFECYCLE: FULL keys, so approving is a copy-paste of the exact command — the admin
       // needs both keys in full for cello_channel_approve, and shortened keys forced a dig through

@@ -24,6 +24,9 @@ import {
   JOIN_REQUEST_TYPE, JOIN_ACCEPTED_TYPE, JOIN_REFUSED_TYPE, REKEY_TYPE, MEMBERSHIP_ENDED_TYPE, POSTER_PASS_FRAME_TYPE,
 } from "../channel-join.js";
 import { signChannelPosterPass, encodeChannelPosterPass } from "../channel-poster-pass.js";
+import {
+  encodeChannelPosterRemovedNotice, decodeChannelPosterRemovedNotice, POSTER_REMOVED_NOTICE_TYPE,
+} from "../channel-join.js";
 import { encodeCbor } from "../cbor.js";
 
 const CHANNEL = new Uint8Array(Buffer.alloc(32, 0xa1));
@@ -275,5 +278,16 @@ describe("025-JOINSCREEN — channelJoinFrameType is strict, by full decode", ()
     const badDecoded = decodeChannelPosterPassFrame(badWire);
     expect(badDecoded.ok).toBe(false);
     if (!badDecoded.ok) expect(badDecoded.reason).toBe("bad_members");
+  });
+
+  // 044-POSTERBELL Part E3: the poster-removed notice round-trips and rejects a wrong-length channel.
+  it("a poster-removed notice round-trips and rejects a bad channel key", () => {
+    const channel = new Uint8Array(32).fill(0xa1);
+    const bytes = encodeChannelPosterRemovedNotice(channel);
+    expect(channelJoinFrameType(bytes)).toBe(POSTER_REMOVED_NOTICE_TYPE);
+    const decoded = decodeChannelPosterRemovedNotice(bytes);
+    expect(decoded.ok).toBe(true);
+    if (decoded.ok) expect(Buffer.from(decoded.frame.channel_pubkey).equals(Buffer.from(channel))).toBe(true);
+    expect(() => encodeChannelPosterRemovedNotice(new Uint8Array(16))).toThrow(/bad_channel_pubkey/);
   });
 });

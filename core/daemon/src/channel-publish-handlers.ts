@@ -202,6 +202,20 @@ export function registerChannelPublishHandlers(deps: ChannelPublishDeps): void {
     }
     logger.info("channel.publish.refused", { channel_pubkey: channel.channelHex, reason: result.reason });
     /**
+     * 044-POSTERBELL Part E2: a removed poster is TOLD, plainly, and never sent to resend. When the
+     * relays refused because the admin removed this poster (or the pass lapsed), the reason is the
+     * relay's own, the guidance says so, and there is no "resend" advice — a resend would be refused
+     * identically, and the post has already been dropped from the lane.
+     */
+    const removedPoster: Record<string, string> = {
+      pass_revoked: "The admin removed you as a poster on this channel. Your earlier posts stay.",
+      posting_closed: "This channel no longer accepts poster posts; only the admin posts now. Your earlier posts stay.",
+      pass_expired: "Your posting pass for this channel has expired; the admin renews it while online. Your earlier posts stay.",
+    };
+    if (result.reason in removedPoster) {
+      return { ok: false, reason: result.reason, guidance: removedPoster[result.reason] };
+    }
+    /**
      * 040-CLEANUP Part E / 041 Part E2: when EVERY relay refused `not_a_channel`, there are TWO
      * causes and the guidance must cover both. A channel created in the last minute has not reached
      * the relays yet (their short negative cache holds `not_a_channel` for up to 30s) — wait and

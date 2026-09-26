@@ -25,7 +25,7 @@
  */
 import {
   decodeChannelJoinRequest, decodeChannelJoinAccepted, decodeChannelJoinRefused, decodeChannelRekey,
-  decodeChannelMembershipEnded, decodeChannelPosterPassFrame, verifyPosterPass,
+  decodeChannelMembershipEnded, decodeChannelPosterPassFrame, decodeChannelPosterRemovedNotice, verifyPosterPass,
   encodeChannelJoinAccepted, encodeChannelJoinRefused, encodeChannelRekey,
   isChannelJoinFrame,
   type ChannelJoinRefusedReason, type MembershipEndedReason,
@@ -100,6 +100,11 @@ export interface ChannelJoinExchangeDeps {
   onAdmitted?: (channelHex: string, subscriberHex: string) => void;
   /** 043-POSTERS: where a posting pass from the channel's stored admin is kept. Absent → passes are refused. */
   posterPasses?: ChannelPosterPassStore;
+  /**
+   * 044-POSTERBELL Part E3: the stored admin told this agent it can no longer post — its pass was
+   * deleted here, and this surfaces the channel notice. Optional and additive.
+   */
+  onPosterRemoved?: (agentId: string, channelHex: string) => void;
   now?: () => number;
 }
 
@@ -366,6 +371,29 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
           members: passFrame.frame.members.map((m) => Buffer.from(m).toString("hex")),
         });
         return { ok: true, channelHex: passChannelHex, generation: 0 };
+      }
+
+      /**
+       * 044-POSTERBELL Part E3: the admin telling us we can no longer post — removed, ejected, or the
+       * channel switched to admin-only. Same rule as the pass: ONLY the stored admin may send it, so
+       * a stranger cannot delete our pass or fake the notice. We drop the pass and surface the notice.
+       */
+      const removedNotice = decodeChannelPosterRemovedNotice(content);
+      if (removedNotice.ok) {
+        const noticeChannelHex = Buffer.from(removedNotice.frame.channel_pubkey).toString("hex");
+        const sub = subscriptions.get(agentId, noticeChannelHex);
+        if (sub === null) {
+          logger.warn("channel.poster_removed.refused", { channel_pubkey: noticeChannelHex, sender: counterpartyHex, reason: "not_subscribed" });
+          return { ok: false, reason: "not_subscribed" };
+        }
+        if (sub.admin_pubkey.toLowerCase() !== counterpartyHex.toLowerCase()) {
+          logger.warn("channel.poster_removed.refused", { channel_pubkey: noticeChannelHex, sender: counterpartyHex, reason: "not_admin_of_channel" });
+          return { ok: false, reason: "not_admin_of_channel" };
+        }
+        deps.posterPasses?.remove(agentId, noticeChannelHex);
+        logger.info("channel.poster_removed", { channel_pubkey: noticeChannelHex });
+        deps.onPosterRemoved?.(agentId, noticeChannelHex);
+        return { ok: true, channelHex: noticeChannelHex, generation: 0 };
       }
 
       /**

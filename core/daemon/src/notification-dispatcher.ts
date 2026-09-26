@@ -271,6 +271,16 @@ export class NotificationDispatcher {
     });
   }
 
+  /**
+   * 044-POSTERBELL Part E3: the admin removed this agent as a poster (or closed posting). Its own
+   * content-free notice — the shim renders it with the shortened key.
+   */
+  dispatchChannelPosterRemoved(agentName: string, channelHex: string): void {
+    this.#dispatchToCurrent(agentName, "channel_poster_removed", {
+      agent: agentName, type: "channel_poster_removed", channel: channelHex,
+    });
+  }
+
   /** Route a frame to every connection where `agentName` is current — the cello_message rule. */
   #dispatchToCurrent(agentName: string, notificationType: string, data: Record<string, unknown>): void {
     const notification: IpcNotification = { notification: notificationType, data };

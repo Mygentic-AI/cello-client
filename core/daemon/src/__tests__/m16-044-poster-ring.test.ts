@@ -148,4 +148,36 @@ describe("044-POSTERBELL Part C — no relay accepted → no receipt to ring wit
     if (!r.ok) expect(r.reason).toBe("no_relay_accepted");
     expect((r as { poster_receipt_cbor?: Uint8Array }).poster_receipt_cbor).toBeUndefined();
   });
+
+  // 044-POSTERBELL Part E2: a removed poster's post is refused by the relays with pass_revoked — the
+  // publisher surfaces THAT reason (not no_relay_accepted) and drops the post from the lane so it is
+  // never resendable.
+  it("every relay refusing pass_revoked surfaces pass_revoked and drops the lane", async () => {
+    const channel = generateKeypair();
+    const channelHex = hex(await channel.getPublicKey());
+    const bob = generateKeypair();
+    const bobHex = hex(await bob.getPublicKey());
+    const log = new ChannelLogStore(db, silent);
+    const subs = new ChannelSubscriptionStore(db, silent);
+    const passes = new (await import("../channel-poster-pass-store.js")).ChannelPosterPassStore(db, silent);
+    subs.upsert({ agent_id: `id-bob`, channel_pubkey: channelHex, admin_pubkey: "ad".repeat(32), access: "public", relays: [RELAY_A] });
+    const pass = await signChannelPosterPass(channel, { poster_pubkey: await bob.getPublicKey(), issued_at: NOW - DAY, expires_at: NOW + DAY });
+    passes.put(`id-bob`, channelHex, { pass_cbor: encodeChannelPosterPass(pass), issued_at: NOW - DAY, expires_at: NOW + DAY, members: [] });
+
+    const pub = new ChannelPosterPublisher({
+      logger: silent, log, passes, subscriptions: subs,
+      resolveAgentId: (name) => `id-${name}`,
+      getAgentKey: (name) => (name === "bob" ? bob : null),
+      screenOutbound: () => Promise.resolve({ disposition: "allow" }),
+      now: () => NOW,
+      deposit: () => Promise.resolve({ ok: false, reason: "pass_revoked" }),
+    });
+    const r = await pub.publish("bob", channelHex, "t", "b");
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("pass_revoked");
+    // The lane was dropped: nothing left to resend.
+    const lane = `${channelHex}/${bobHex}`;
+    log.ensureChannel(lane);
+    expect(log.head(lane).last_seq).toBeNull();
+  });
 });

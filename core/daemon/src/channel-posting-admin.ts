@@ -19,7 +19,7 @@
  */
 import type { KeyProvider } from "@cello-protocol/crypto";
 import {
-  encodeChannelPosterPass, encodeChannelPosterPassFrame, signChannelPosterPass,
+  encodeChannelPosterPass, encodeChannelPosterPassFrame, encodeChannelPosterRemovedNotice, signChannelPosterPass,
   type ChannelInfoExt, type ChannelPosting,
 } from "@cello-protocol/protocol-types";
 import type { Logger } from "./types.js";
@@ -85,6 +85,21 @@ export function createChannelPostingAdmin(deps: ChannelPostingAdminDeps) {
     return [];
   };
 
+  /**
+   * 044-POSTERBELL Part E3: tell a poster it can no longer post, over the same sealed-session route
+   * as the pass. Best-effort — a poster we cannot reach simply keeps a pass the relays already
+   * refuse, and its next post surfaces the plain refusal (Part E2). Called on every revocation.
+   */
+  const notifyPosterRemoved = async (channelHex: string, posterHex: string): Promise<void> => {
+    const agentName = deps.adminAgentNameFor(channelHex);
+    if (!agentName) return;
+    try {
+      await deps.sendFrame(agentName, posterHex, encodeChannelPosterRemovedNotice(new Uint8Array(Buffer.from(channelHex, "hex"))));
+    } catch (err: unknown) {
+      logger.warn("channel.poster_removed.unreached", { channel_pubkey: channelHex, poster_pubkey: posterHex, reason: extractErrorMessage(err) });
+    }
+  };
+
   /** The channel's current active member pubkeys (bytes) — carried on every pass so posters can ring. */
   const memberBytes = (channelHex: string): Uint8Array[] =>
     members.activeMembers(channelHex).map((m) => new Uint8Array(Buffer.from(m, "hex")));
@@ -126,6 +141,8 @@ export function createChannelPostingAdmin(deps: ChannelPostingAdminDeps) {
     for (const g of grants.all(channelHex)) {
       if (grantIsLive(g) && !posters.has(g.poster_pubkey)) {
         grants.revoke(channelHex, g.poster_pubkey, now());
+        // 044-POSTERBELL Part E3: switching to admin, or any mode change that drops a poster, tells it.
+        await notifyPosterRemoved(channelHex, g.poster_pubkey);
         changed = true;
       }
     }
@@ -179,9 +196,8 @@ export function createChannelPostingAdmin(deps: ChannelPostingAdminDeps) {
       const refused = needAdmin(channelHex);
       if (refused) return refused;
       const cfg = config.get(channelHex);
-      if (cfg?.access === "public") {
-        return { ok: false, reason: "public_channel", guidance: "A public channel has no members to name as posters; use members posting or post as admin." };
-      }
+      // 044-POSTERBELL Part E1: a public channel CAN name posters. The poster must still be an active
+      // member (a reader who joined) — that check below stands; only the blanket public refusal goes.
       if (cfg?.posting !== "listed") {
         return { ok: false, reason: "posting_not_listed", guidance: "Set posting to listed first: cello channel posting <channel> listed." };
       }
@@ -199,6 +215,8 @@ export function createChannelPostingAdmin(deps: ChannelPostingAdminDeps) {
       if (refused) return refused;
       members.setCanPost(channelHex, posterHex, false);
       grants.revoke(channelHex, posterHex, now());
+      // 044-POSTERBELL Part E3: tell the removed poster and delete its pass on its side.
+      await notifyPosterRemoved(channelHex, posterHex);
       await deposit(channelHex);
       return { ok: true };
     },
@@ -219,6 +237,8 @@ export function createChannelPostingAdmin(deps: ChannelPostingAdminDeps) {
       const g = grants.get(channelHex, memberHex);
       if (!g || !grantIsLive(g)) return;
       grants.revoke(channelHex, memberHex, now());
+      // 044-POSTERBELL Part E3: an ejected poster is told and its pass deleted on its side.
+      await notifyPosterRemoved(channelHex, memberHex);
       await deposit(channelHex);
     },
 

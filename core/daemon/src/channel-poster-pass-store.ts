@@ -79,6 +79,13 @@ export class ChannelPosterPassStore {
     return true;
   }
 
+  /** 044-POSTERBELL Part E3: drop this agent's pass for a channel — used when the admin removes it. */
+  remove(agentId: string, channelHex: string): void {
+    this.#db
+      .prepare(`DELETE FROM channel_poster_passes WHERE agent_id = ? AND channel_pubkey = ?`)
+      .run(agentId, channelHex);
+  }
+
   get(agentId: string, channelHex: string): HeldPosterPass | null {
     const row = this.#db
       .prepare(`SELECT pass_cbor, issued_at, expires_at, members_json FROM channel_poster_passes WHERE agent_id = ? AND channel_pubkey = ?`)

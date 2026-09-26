@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { generateKeypair } from "@cello-protocol/crypto";
 import type { InMemoryKeyProvider } from "@cello-protocol/crypto";
-import { decodeChannelPosterPassFrame, verifyPosterPass } from "@cello-protocol/protocol-types";
+import { decodeChannelPosterPassFrame, decodeChannelPosterRemovedNotice, verifyPosterPass } from "@cello-protocol/protocol-types";
 import { ChannelConfigStore } from "../channel-config-store.js";
 import { ChannelMembershipStore } from "../channel-membership-store.js";
 import { ChannelPosterGrantStore } from "../channel-poster-grant-store.js";
@@ -44,6 +44,7 @@ interface H {
   config: ChannelConfigStore; members: ChannelMembershipStore; grants: ChannelPosterGrantStore;
   channel: InMemoryKeyProvider; channelHex: string; clock: { now: number };
   sent: Array<{ member: string; issued_at: number; expires_at: number; members: string[] }>;
+  removed: Array<{ member: string; channelHex: string }>;
   unreachable: Set<string>;
   deposits: number;
 }
@@ -56,7 +57,7 @@ async function harness(access: "invite_only" | "public" = "invite_only"): Promis
   const members = new ChannelMembershipStore(db, silent);
   const grants = new ChannelPosterGrantStore(db, silent);
   config.set(channelHex, { access, relays: [RELAY], guidance: "", retention_seconds: 3600, admin_pubkey: hex(await adminAgent.getPublicKey()) }, T0);
-  const h = { config, members, grants, channel, channelHex, clock: { now: T0 }, sent: [], unreachable: new Set<string>(), deposits: 0 } as unknown as H;
+  const h = { config, members, grants, channel, channelHex, clock: { now: T0 }, sent: [], removed: [], unreachable: new Set<string>(), deposits: 0 } as unknown as H;
   h.admin = createChannelPostingAdmin({
     logger: silent, config, members, grants, now: () => h.clock.now,
     channelKeyFor: (ch) => (ch === channelHex ? channel : null),
@@ -64,6 +65,12 @@ async function harness(access: "invite_only" | "public" = "invite_only"): Promis
     postingChannels: () => [channelHex],
     sendFrame: async (_agent, member, frame) => {
       if (h.unreachable.has(member)) return false;
+      // 044-POSTERBELL Part E3: a removed poster gets a poster-removed notice, not a pass.
+      const removed = decodeChannelPosterRemovedNotice(frame);
+      if (removed.ok) {
+        h.removed.push({ member, channelHex: hex(removed.frame.channel_pubkey) });
+        return true;
+      }
       const d = decodeChannelPosterPassFrame(frame);
       if (!d.ok) throw new Error(d.reason);
       expect(verifyPosterPass(d.frame.pass, await channel.getPublicKey())).toEqual({ ok: true });
@@ -153,10 +160,13 @@ describe("043-POSTERS Part E — the admin's posting setting", () => {
     expect(h.sent.map((s) => s.member)).toEqual([memberHex(2)]);
     expect(await h.admin.addPoster(h.channelHex, memberHex(9))).toMatchObject({ ok: false, reason: "not_an_active_member" });
 
+    // 044-POSTERBELL Part E1: a PUBLIC channel CAN name posters now, as long as the poster is an
+    // active member (a reader who joined). A non-member is still refused.
     const p = await harness("public");
     p.members.admit(p.channelHex, memberHex(1), "active", T0);
     await p.admin.setPosting(p.channelHex, "listed");
-    expect(await p.admin.addPoster(p.channelHex, memberHex(1))).toMatchObject({ ok: false, reason: "public_channel" });
+    expect(await p.admin.addPoster(p.channelHex, memberHex(1))).toEqual({ ok: true });
+    expect(await p.admin.addPoster(p.channelHex, memberHex(9))).toMatchObject({ ok: false, reason: "not_an_active_member" });
   });
 
   it("E5. eject and switching to admin revoke every live pass and stop renewing", async () => {
@@ -213,5 +223,33 @@ describe("043-POSTERS Part E — the admin's posting setting", () => {
     h.clock.now = T0 + 3;
     await h.admin.tick();
     expect(h.sent).toEqual([]);
+  });
+
+  // 044-POSTERBELL Part E3: a removed poster is TOLD — remove, eject, and switch-to-admin each send
+  // the poster-removed notice over the sealed-session route.
+  it("E3. remove, eject and switch-to-admin each notify the poster", async () => {
+    // remove a listed poster
+    const h1 = await harness();
+    h1.members.admit(h1.channelHex, memberHex(1), "active", T0);
+    await h1.admin.setPosting(h1.channelHex, "listed");
+    await h1.admin.addPoster(h1.channelHex, memberHex(1));
+    await h1.admin.removePoster(h1.channelHex, memberHex(1));
+    expect(h1.removed).toEqual([{ member: memberHex(1), channelHex: h1.channelHex }]);
+
+    // eject a members-mode poster
+    const h2 = await harness();
+    h2.members.admit(h2.channelHex, memberHex(2), "active", T0);
+    await h2.admin.setPosting(h2.channelHex, "members");
+    h2.members.eject(h2.channelHex, memberHex(2));
+    await h2.admin.onEjected(h2.channelHex, memberHex(2));
+    expect(h2.removed).toEqual([{ member: memberHex(2), channelHex: h2.channelHex }]);
+
+    // switch to admin — every live poster is told
+    const h3 = await harness();
+    h3.members.admit(h3.channelHex, memberHex(3), "active", T0);
+    await h3.admin.setPosting(h3.channelHex, "members");
+    h3.clock.now = T0 + 1;
+    await h3.admin.setPosting(h3.channelHex, "admin");
+    expect(h3.removed).toEqual([{ member: memberHex(3), channelHex: h3.channelHex }]);
   });
 });

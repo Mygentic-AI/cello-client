@@ -59,6 +59,11 @@ export interface ChannelNotify {
    * Its own doorbell (rendered with the shortened key), not a refused join answer.
    */
   channelMembershipEnded: (agentId: string, channelHex: string, reason: "ejected" | "channel_closed") => void;
+  /**
+   * 044-POSTERBELL Part E3: the admin removed this agent as a poster (or closed posting). Its own
+   * content-free doorbell, rendered with the shortened key.
+   */
+  channelPosterRemoved: (agentId: string, channelHex: string) => void;
 }
 
 export interface ChannelMembershipWiringDeps {
@@ -398,6 +403,8 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     collectNow: (agentId) => deps.collectNow(agentId),
     // 043-POSTERS: a posting pass from the channel's stored admin is kept here.
     posterPasses,
+    // 044-POSTERBELL Part E3: the admin removed us as a poster — surface the notice.
+    onPosterRemoved: (agentId, channelHex) => deps.notify.channelPosterRemoved(agentId, channelHex),
   });
 
   /**

@@ -140,7 +140,10 @@ export interface ChannelPublisherOptions {
 export type PublishRefusal =
   | "blocked_by_screen" | "channel_unknown" | "key_unavailable" | "no_relay_accepted" | "post_invalid"
   // 043-POSTERS: publishing under a pass on a channel this daemon does not hold the key to.
-  | "no_posting_pass" | "channel_group_key_unavailable";
+  | "no_posting_pass" | "channel_group_key_unavailable"
+  // 044-POSTERBELL Part E2: every relay refused a poster post because the poster was removed (or its
+  // pass lapsed). Surfaced instead of no_relay_accepted so the poster is told, not sent to resend.
+  | "pass_revoked" | "posting_closed" | "pass_expired";
 
 export interface DepositOutcome {
   relay: string;
