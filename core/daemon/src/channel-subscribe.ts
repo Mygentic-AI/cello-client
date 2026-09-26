@@ -17,6 +17,7 @@ import {
 } from "@cello-protocol/protocol-types";
 import type { ChannelSubscriptionStore } from "./channel-subscription-store.js";
 import type { ChannelInboxStore } from "./channel-inbox-store.js";
+import type { ChannelLanePositionStore } from "./channel-lane-position-store.js";
 import { extractErrorMessage } from "./error-message.js";
 
 export type ChannelInfoResult =
@@ -52,6 +53,8 @@ export interface ReadPost {
   title: string;
   body: string;
   published_at: number;
+  /** 043-POSTERS: who wrote it — the local moniker for that agent, else its key's first eight hex digits. */
+  poster: string;
 }
 
 export type ChannelReadResult =
@@ -63,6 +66,10 @@ export interface ChannelSubscribeDeps {
   subscriptions: ChannelSubscriptionStore;
   /** Where the COLLECTOR puts a subscriber's posts. Not the publisher's log — different table. */
   inbox: ChannelInboxStore;
+  /** 043-POSTERS: this member's position in each poster lane. Absent → the admin lane only. */
+  lanePositions?: ChannelLanePositionStore;
+  /** 043-POSTERS: the local moniker for an agent pubkey, or null. */
+  posterName?: (agentId: string, pubkeyHex: string) => string | null;
   /** Who the DIRECTORY says administers a channel. 020's lookup, unchanged. */
   lookupAdmin: (agentId: string, channelHex: string) => Promise<
     { kind: "admin"; adminPubkeyHex: string }
@@ -255,21 +262,58 @@ export function createChannelSubscribe(deps: ChannelSubscribeDeps) {
     if (!sub) return { ok: false, reason: "not_subscribed" };
 
     try {
-      // Bounded by `delivered_through`: the collector owns what has been FETCHED, and reading past
-      // that edge would advance the read position over posts nobody has yet.
-      const from = all ? 1 : sub.processed_through + 1;
-      const stored = deps.inbox.range(agentId, channelHex, from, sub.delivered_through);
-      const posts: ReadPost[] = [];
       const undecryptable: number[] = [];
-      let highest = sub.processed_through;
+      // The admin lane, keyed and positioned exactly as before 043.
+      const adminLane = await readLane(agentId, channelHex, channelHex, sub.access, all ? 1 : sub.processed_through + 1,
+        sub.delivered_through, sub.processed_through, undecryptable);
+      const highest = adminLane.highest;
+      const timed = [...adminLane.posts];
 
-      for (const entry of stored) {
+      // 043-POSTERS: every poster lane from its OWN read position; each stops at its own
+      // undecryptable post, and moves only its own position.
+      for (const lane of deps.lanePositions?.lanes(agentId, channelHex) ?? []) {
+        const r = await readLane(agentId, channelHex, `${channelHex}/${lane.lane_poster}`, sub.access,
+          all ? 1 : lane.processed_through + 1, lane.delivered_through, lane.processed_through, undecryptable);
+        timed.push(...r.posts);
+        if (!all && r.highest > lane.processed_through) {
+          deps.lanePositions?.advanceProcessed(agentId, channelHex, lane.lane_poster, r.highest);
+        }
+      }
+      // All lanes merged in the order the relay RECEIVED them; a stable sort keeps a lane's own order.
+      const posts = timed.sort((x, y) => x.at - y.at).map((t) => t.post);
+
+      // `--all` re-reads without moving the position: a caller reviewing history must not have that
+      // count as having seen anything new.
+      if (!all && highest > sub.processed_through) {
+        deps.subscriptions.advanceProcessed(agentId, channelHex, highest);
+      }
+      return { ok: true, posts, through: all ? sub.processed_through : highest, undecryptable };
+    } catch (err: unknown) {
+      return { ok: false, reason: "failed", detail: extractErrorMessage(err) };
+    }
+  }
+
+  /**
+   * One lane's readable posts in [from, deliveredThrough], each with the relay's receipt time and
+   * the poster's name. Bounded by `delivered_through`: the collector owns what has been FETCHED, and
+   * reading past that edge would advance the read position over posts nobody has yet.
+   */
+  async function readLane(
+    agentId: string, channelHex: string, key: string, access: ChannelAccess,
+    from: number, deliveredThrough: number, processedThrough: number, undecryptable: number[],
+  ): Promise<{ posts: Array<{ post: ReadPost; at: number }>; highest: number }> {
+    {
+      const stored = deps.inbox.rangeTimed(agentId, key, from, deliveredThrough);
+      const posts: Array<{ post: ReadPost; at: number }> = [];
+      let highest = processedThrough;
+
+      for (const { post: entry, received_at } of stored) {
         /**
          * ⚠️ **A PUBLIC CHANNEL'S POSTS ARE STORED IN CLEAR (028, 036-PUBLICSUB) — do not decrypt.**
          * There is no group key for a public subscription, so routing the body through `decryptBody`
          * would find no key and report every post `undecryptable`. The body IS the plaintext.
          */
-        const plain = sub.access === "public"
+        const plain = access === "public"
           ? entry.body
           : await deps.decrypt(agentId, channelHex, entry.seq, entry.body);
         if (plain === null) {
@@ -284,24 +328,22 @@ export function createChannelSubscribe(deps: ChannelSubscribeDeps) {
         } else {
           // The TITLE travels in clear on the artifact; only the body is sealed. So a post whose
           // body will not open still has a name, which is what makes `undecryptable` actionable.
+          const agentHex = Buffer.from(entry.agent_pubkey).toString("hex");
           posts.push({
-            seq: entry.seq,
-            title: entry.title,
-            body: Buffer.from(plain).toString("utf8"),
-            published_at: entry.published_at,
+            post: {
+              seq: entry.seq,
+              title: entry.title,
+              body: Buffer.from(plain).toString("utf8"),
+              published_at: entry.published_at,
+              // 043-POSTERS: who wrote it — the local moniker, else the key's first eight hex digits.
+              poster: deps.posterName?.(agentId, agentHex) ?? agentHex.slice(0, 8),
+            },
+            at: received_at,
           });
         }
         if (entry.seq > highest) highest = entry.seq;
       }
-
-      // `--all` re-reads without moving the position: a caller reviewing history must not have that
-      // count as having seen anything new.
-      if (!all && highest > sub.processed_through) {
-        deps.subscriptions.advanceProcessed(agentId, channelHex, highest);
-      }
-      return { ok: true, posts, through: all ? sub.processed_through : highest, undecryptable };
-    } catch (err: unknown) {
-      return { ok: false, reason: "failed", detail: extractErrorMessage(err) };
+      return { posts, highest };
     }
   }
 

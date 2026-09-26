@@ -28,6 +28,7 @@ import { createChannelFetchAuth } from "./channel-fetch-auth.js";
 import { ChannelSubscriptionStore } from "./channel-subscription-store.js";
 import { ChannelPosterPassStore } from "./channel-poster-pass-store.js";
 import { ChannelPosterPublisher } from "./channel-poster-publisher.js";
+import { ChannelLanePositionStore } from "./channel-lane-position-store.js";
 import { ChannelInboxStore } from "./channel-inbox-store.js";
 import { createChannelCollectTicker } from "./channel-collect-tick.js";
 import { createChannelWakeSender } from "./channel-wake-sender.js";
@@ -361,6 +362,9 @@ export function wireChannelPublishing(
     subscriptions,
     inbox,
     fetch: (addr, req) => relay.fetch(addr, req),
+    // 043-POSTERS: every poster lane, each from this member's own position in it.
+    lanes: (addr, req) => relay.lanes(addr, req),
+    lanePositions: new ChannelLanePositionStore(deps.getDb(), logger),
     /**
      * ⚠️ **THE MEMBER PROVES MEMBERSHIP ON EVERY FETCH.** Signs with the fetch key derived from the
      * member's newest held group key, which the relay verifies against the admin's deposited fetch

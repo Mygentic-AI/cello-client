@@ -23,6 +23,7 @@ import { ChannelMembershipStore } from "./channel-membership-store.js";
 import { ChannelSubscriptionStore } from "./channel-subscription-store.js";
 import { ChannelConfigStore } from "./channel-config-store.js";
 import { ChannelPosterPassStore } from "./channel-poster-pass-store.js";
+import { ChannelLanePositionStore } from "./channel-lane-position-store.js";
 import {
   createChannelJoinExchange, ensureCurrentGroupKey,
   type LocalChannelAdmin, type AdminLookupOutcome,
@@ -71,6 +72,8 @@ export interface ChannelMembershipWiringDeps {
   loadedAgents: ReadonlyArray<{ name: string; pubkey: string; keyProvider: KeyProvider }>;
   keyProviders: Map<string, KeyProvider>;
   resolveAgentId: (agentName: string) => string;
+  /** 043-POSTERS: this agent's local moniker for a pubkey, or null — how a read names a post's writer. */
+  contactMoniker?: (agentName: string, pubkeyHex: string) => string | null;
   resolveCurrentAgent: (connectionId: string, explicitAgent?: string) => string | null;
   /**
    * 041-HELPTRUTH Part A: is this loaded agent a CHANNEL identity rather than an operator agent? A
@@ -235,6 +238,7 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
   // daemon administers (035-INFOCLI item 1). Same table, read-only here.
   const channelConfig = new ChannelConfigStore(deps.getDb(), logger);
   const posterPasses = new ChannelPosterPassStore(deps.getDb(), logger);
+  const lanePositions = new ChannelLanePositionStore(deps.getDb(), logger);
 
   /**
    * ⚠️ A CHANNEL IS AN AGENT THIS DAEMON HOLDS, looked up BY PUBKEY — the same rule the publisher
@@ -424,6 +428,12 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     logger,
     subscriptions,
     inbox: new ChannelInboxStore(deps.getDb(), logger),
+    // 043-POSTERS: poster lanes are read from their own positions, and each post names its writer.
+    lanePositions,
+    posterName: (agentId, pubkeyHex) => {
+      const agent = deps.loadedAgents.find((a) => deps.resolveAgentId(a.name) === agentId);
+      return agent ? (deps.contactMoniker?.(agent.name, pubkeyHex) ?? null) : null;
+    },
     /**
      * ⚠️ **THE SAME SOURCE THE ADMIN CHECK USES, and the first version used a different one.** It
      * went straight to the directory, so joining a channel THIS daemon administers answered
@@ -529,7 +539,8 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
       delivered_through: s.delivered_through,
       processed_through: s.processed_through,
       // What the operator actually wants to know: how much is waiting.
-      unread: Math.max(0, s.delivered_through - s.processed_through),
+      // 043-POSTERS: the admin lane plus every poster lane.
+      unread: Math.max(0, s.delivered_through - s.processed_through) + lanePositions.unread(agentId, s.channel_pubkey),
       role: "member",
     }));
     // 041-HELPTRUTH Part B: channels this agent RUNS — the config rows whose admin is this agent's

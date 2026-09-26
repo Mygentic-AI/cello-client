@@ -123,6 +123,8 @@ export class ChannelRelayClient {
   async fetch(relayAddr: string, req: {
     channel_pubkey: Uint8Array; since_seq: number; max_bytes: number;
     auth?: { signature: Uint8Array; time_ms: number }; agent_pubkeys?: Uint8Array[];
+    /** 043-POSTERS: a poster's lane; absent = the admin lane. */
+    lane_poster?: Uint8Array;
   }): Promise<
     | { ok: true; posts: Array<{ seq: number; post_cbor: Uint8Array; receipt_cbor?: Uint8Array }>; first_held_seq: number | null; last_seq: number | null }
     | { ok: false; reason: string }
@@ -134,6 +136,7 @@ export class ChannelRelayClient {
       max_bytes: req.max_bytes,
       ...(req.auth ? { auth: req.auth } : {}),
       ...(req.agent_pubkeys ? { agent_pubkeys: req.agent_pubkeys } : {}),
+      ...(req.lane_poster ? { lane_poster: req.lane_poster } : {}),
     });
     if (answer["type"] !== "channel_posts" || !Array.isArray(answer["posts"])) {
       return { ok: false, reason: typeof answer["reason"] === "string" ? answer["reason"] : "unexpected_answer" };
@@ -157,6 +160,27 @@ export class ChannelRelayClient {
       first_held_seq: typeof answer["first_held_seq"] === "number" ? answer["first_held_seq"] : null,
       last_seq: typeof answer["last_seq"] === "number" ? answer["last_seq"] : null,
     };
+  }
+
+  /** 043-POSTERS: the poster lanes a relay holds for a channel, each with its newest seq. */
+  async lanes(relayAddr: string, req: {
+    channel_pubkey: Uint8Array; auth?: { signature: Uint8Array; time_ms: number };
+  }): Promise<{ ok: true; lanes: Array<{ poster_pubkey: Uint8Array; last_seq: number }> } | { ok: false; reason: string }> {
+    const answer = await this.request(relayAddr, {
+      type: "channel_lanes", channel_pubkey: req.channel_pubkey, ...(req.auth ? { auth: req.auth } : {}),
+    });
+    if (answer["type"] !== "channel_lanes_result" || !Array.isArray(answer["lanes"])) {
+      return { ok: false, reason: typeof answer["reason"] === "string" ? answer["reason"] : "unexpected_answer" };
+    }
+    const lanes: Array<{ poster_pubkey: Uint8Array; last_seq: number }> = [];
+    for (const raw of answer["lanes"] as Array<Record<string, unknown>>) {
+      const pk = raw["poster_pubkey"];
+      const last = raw["last_seq"];
+      // A malformed entry names no lane we could fetch; the others are still good.
+      if (!(pk instanceof Uint8Array) || pk.length !== 32 || typeof last !== "number") continue;
+      lanes.push({ poster_pubkey: pk, last_seq: last });
+    }
+    return { ok: true, lanes };
   }
 
   /** Where a relay's queue begins and ends, without pulling any posts. */

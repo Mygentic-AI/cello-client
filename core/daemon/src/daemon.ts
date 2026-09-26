@@ -704,7 +704,7 @@ async function startDaemonHoldingLock(
     sendInSession: createChannelFrameSender({ sessions: sessionNodeManager, logger }),
     setOnChannelJoinFrame: (cb) => { sessionNodeManager.setOnChannelJoinFrame(cb); },
     loadedAgents, keyProviders,
-    resolveAgentId: (agentName) => sessionNodeManager.resolveAgentId(agentName),
+    resolveAgentId: (agentName) => sessionNodeManager.resolveAgentId(agentName), contactMoniker: (n, pk) => sessionNodeManager.getContactMoniker(n, pk),
     resolveCurrentAgent: (connectionId, explicitAgent) =>
       resolveCurrentAgent(perConnectionState.get(connectionId), explicitAgent),
     // 041-HELPTRUTH: isChannelAgent (Part A), channelLastSeq (Part B) and fetchChannelInfo (Part C, both late-bound to channelWiring below) — full contracts on channel-membership-wiring.ts.
