@@ -30,6 +30,8 @@
 import type { Logger } from "./types.js";
 import {
   broadcastPostHash,
+  decodeChannelPosterPass,
+  type ChannelPosterRevocation,
   decodeBroadcastArtifact,
   validateBroadcastTitle,
   verifyBroadcastArtifact,
@@ -99,6 +101,12 @@ export interface ChannelCollectorOptions {
    */
   lanes?: RelayLanesSeam;
   lanePositions?: ChannelLanePositionStore;
+  /**
+   * 043-POSTERS review MEDIUM: the channel's revoked posters, from the newest VERIFIED info record
+   * any of its relays holds. The member enforces revocation itself, so a stale or dishonest relay
+   * that still serves a removed poster's posts does not get them read. Absent → relay-only.
+   */
+  revocations?: (relays: string[], channelHex: string) => Promise<ChannelPosterRevocation[]>;
   now?: () => number;
   maxBytesPerFetch?: number;
 }
@@ -252,6 +260,13 @@ export class ChannelCollector {
       }
     }
 
+    const revoked = posters.size > 0 && this.#opts.revocations
+      ? await this.#opts.revocations(sub.relays, channelHex).catch((err: unknown) => {
+          logger.warn("channel.revocations.unavailable", { ...cid, channel_pubkey: channelHex, reason: extract(err) });
+          return [] as ChannelPosterRevocation[];
+        })
+      : [];
+
     let deliveredTotal = 0;
     const wrote: string[] = [];
     for (const posterHex of posters) {
@@ -282,7 +297,7 @@ export class ChannelCollector {
         }
         let stored = 0;
         for (const entry of answer.posts) {
-          const post = this.#verify(agentId, channelHex, sub.admin_pubkey, posterHex, entry.post_cbor, relay, correlationId);
+          const post = this.#verify(agentId, channelHex, sub.admin_pubkey, posterHex, entry.post_cbor, relay, correlationId, revoked);
           if (!post) continue;
           const result = inbox.store(agentId, key, post, {
             ...(entry.receipt_cbor ? { receiptCbor: entry.receipt_cbor } : {}),
@@ -318,7 +333,7 @@ export class ChannelCollector {
    */
   #verify(
     agentId: string, channelHex: string, adminPubkeyHex: string, lanePosterHex: string | null,
-    cbor: Uint8Array, relay: string, correlationId?: string,
+    cbor: Uint8Array, relay: string, correlationId?: string, revoked: ChannelPosterRevocation[] = [],
   ): BroadcastArtifact | null {
     const drop = (check: string, detail: string): null => {
       this.#opts.logger.warn("channel.post.invalid", {
@@ -352,6 +367,13 @@ export class ChannelCollector {
       }
     } else if (post.ext === null || agentHex !== lanePosterHex) {
       return drop("poster", "the post is not a pass-carrying post by this lane's poster");
+    } else {
+      // Same rule as the relay: a revocation at or after the pass's issue time kills the pass.
+      const pass = decodeChannelPosterPass(post.ext.poster_pass);
+      if (!pass.ok || revoked.some((r) =>
+        Buffer.from(r.poster_pubkey).toString("hex") === agentHex && r.revoked_at >= pass.pass.issued_at)) {
+        return drop("revoked", "the admin removed this poster; their pass is revoked");
+      }
     }
     return post;
   }

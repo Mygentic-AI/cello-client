@@ -95,6 +95,7 @@ interface World {
   collector: ChannelCollector; read: ReturnType<typeof createChannelSubscribe>["read"];
   poster: ChannelPosterPublisher; agents: Map<string, InMemoryKeyProvider>; passes: ChannelPosterPassStore;
   adminSeq: number;
+  revoked: { poster_pubkey: Uint8Array; revoked_at: number }[];
 }
 
 async function world(): Promise<World> {
@@ -108,6 +109,7 @@ async function world(): Promise<World> {
   const lanes = new ChannelLanePositionStore(db, silent);
   const passes = new ChannelPosterPassStore(db, silent);
   const agents = new Map<string, InMemoryKeyProvider>();
+  const revoked: World["revoked"] = [];
   const names = new Map<string, string>();
   const collector = new ChannelCollector({
     logger: silent, subscriptions: subs, inbox, lanePositions: lanes,
@@ -115,6 +117,7 @@ async function world(): Promise<World> {
     lanes: (_r, req) => relay.lanesOf(req.channel_pubkey),
     fetchAuth: () => Promise.resolve(undefined),
     localAgentKeys: () => [], requestRepair: () => Promise.resolve(),
+    revocations: () => Promise.resolve(revoked),
   });
   const { read } = createChannelSubscribe({
     logger: silent, subscriptions: subs, inbox, lanePositions: lanes,
@@ -134,7 +137,7 @@ async function world(): Promise<World> {
   // The reading member.
   subs.upsert({ agent_id: "id-reader", channel_pubkey: channelHex, admin_pubkey: hex(await admin.getPublicKey()), access: "invite_only", relays: [RELAY] });
   subs.addKey("id-reader", channelHex, gk, NOW);
-  const w: World = { relay, channel, admin, channelHex, gk, subs, inbox, lanes, collector, read, poster, agents, passes, adminSeq: 0 };
+  const w: World = { relay, channel, admin, channelHex, gk, subs, inbox, lanes, collector, read, poster, agents, passes, adminSeq: 0, revoked };
   (w as World & { names: Map<string, string> }).names = names;
   return w;
 }
@@ -215,6 +218,21 @@ describe("043-POSTERS Parts C+D — a member reads every lane", () => {
     const r = await w.read("id-reader", w.channelHex);
     expect(r.ok && r.posts.length).toBe(0);
     expect(w.inbox.heldSeqs("id-reader", `${w.channelHex}/${hex(await mallory.getPublicKey())}`)).toEqual([]);
+  });
+
+  it("D5. the member drops a REVOKED poster's post even when the relay still serves it; a revocation older than the pass does not", async () => {
+    const w = await world();
+    const bob = await addPoster(w, "bob");
+    expect(await w.poster.publish("bob", w.channelHex, "b1", "bob body 1")).toMatchObject({ ok: true, seq: 1 });
+    w.revoked.push({ poster_pubkey: await bob.getPublicKey(), revoked_at: NOW });
+    await w.collector.collectOnce("id-reader", w.channelHex);
+    let r = await w.read("id-reader", w.channelHex);
+    expect(r.ok && r.posts.length).toBe(0);
+
+    w.revoked.splice(0, 1, { poster_pubkey: await bob.getPublicKey(), revoked_at: NOW - 2 * DAY });
+    await w.collector.collectOnce("id-reader", w.channelHex);
+    r = await w.read("id-reader", w.channelHex);
+    expect(r.ok && r.posts.length).toBe(1);
   });
 
   it("D4. unread is the sum of the admin lane and every poster lane", async () => {

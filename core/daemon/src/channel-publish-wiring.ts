@@ -15,6 +15,7 @@ import type { CelloNode } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { ScreenContext, ScreenVerdict } from "@cello-protocol/gateway";
 import { Buffer } from "node:buffer";
+import { decodeChannelInfo, verifyChannelInfo, type ChannelPosterRevocation } from "@cello-protocol/protocol-types";
 import { registerChannelPublishHandlers, recordChannelConfig, depositChannelInfo } from "./channel-publish-handlers.js";
 import { registerChannelCreateHandler } from "./channel-create-handler.js";
 import { extractErrorMessage } from "./error-message.js";
@@ -375,6 +376,23 @@ export function wireChannelPublishing(
     // 043-POSTERS: every poster lane, each from this member's own position in it.
     lanes: (addr, req) => relay.lanes(addr, req),
     lanePositions: new ChannelLanePositionStore(deps.getDb(), logger),
+    // Every relay is asked and the NEWEST verified record wins, so one relay withholding a fresh
+    // record cannot hide a revocation the other holds.
+    revocations: async (relays, channelHex) => {
+      const channelKey = new Uint8Array(Buffer.from(channelHex, "hex"));
+      let best: { updated_at: number; revoked: ChannelPosterRevocation[] } | null = null;
+      for (const addr of relays) {
+        const raw = await relay.info(addr, channelKey).catch(() => null);
+        if (raw === null) continue;
+        const d = decodeChannelInfo(raw);
+        if (!d.ok || Buffer.from(d.info.channel_pubkey).toString("hex") !== channelHex.toLowerCase()
+          || !verifyChannelInfo(d.info)) continue;
+        if (best === null || d.info.updated_at > best.updated_at) {
+          best = { updated_at: d.info.updated_at, revoked: d.info.ext?.revoked ?? [] };
+        }
+      }
+      return best?.revoked ?? [];
+    },
     /**
      * ⚠️ **THE MEMBER PROVES MEMBERSHIP ON EVERY FETCH.** Signs with the fetch key derived from the
      * member's newest held group key, which the relay verifies against the admin's deposited fetch
