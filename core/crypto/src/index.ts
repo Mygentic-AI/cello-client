@@ -66,7 +66,7 @@ export { buildCheckpointTbs, computeCheckpointHash } from "./checkpoint.js";
 export { buildRelayRegistrationTbs, verifyRelayRegistrationSignature } from "./relay-registration.js";
 
 // M7-MSG-001: recipient content sealed box (E2E encryption for parked content)
-export { sealToRecipient, openSealed, CONTENT_SEAL_OVERHEAD_BYTES } from "./content-seal.js";
+export { sealToRecipient, openSealed, staticSharedSecret, CONTENT_SEAL_OVERHEAD_BYTES } from "./content-seal.js";
 // Decisions Carried #8/#9/#10: the SESSION SALT — agreed in the same exchange as the envelope key
 // but NOT derived from it, because the key must be destroyed at close and the salt must survive the
 // session. Both sides contribute; HMAC for the salted content hash; a fingerprint for the open check.

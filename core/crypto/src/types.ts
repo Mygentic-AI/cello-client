@@ -12,6 +12,11 @@ export interface KeyProvider {
    * and signing-only providers do not. Callers must feature-detect before use.
    */
   openContentSeal?(blob: Uint8Array): Promise<Uint8Array | null>;
+  /**
+   * M16 045-NOTICEBELL: the static X25519 secret with a peer's Ed25519 key — what a channel notice
+   * slot is hashed from. OPTIONAL, same providers as `openContentSeal`; null on an invalid peer key.
+   */
+  staticSharedSecret?(peerPubkey: Uint8Array): Promise<Uint8Array | null>;
 }
 
 export interface KeyFileCorruptError {

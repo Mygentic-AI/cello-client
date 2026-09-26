@@ -85,6 +85,21 @@ function ed25519SeedToMontgomeryScalar(seed: Uint8Array): Uint8Array {
   return s;
 }
 
+/**
+ * M16 045-NOTICEBELL: the static X25519 secret between this seed and a peer's Ed25519 public key
+ * (RFC 7748 §4.1 map, then X25519). Symmetric: both holders derive the same 32 bytes. Null on an
+ * invalid peer key — never throws.
+ */
+export function staticSharedSecret(ed25519Seed: Uint8Array, peerEd25519Pub: Uint8Array): Uint8Array | null {
+  const uPub = edwardsPubToMontgomeryU(peerEd25519Pub);
+  if (!uPub) return null;
+  try {
+    return x25519.getSharedSecret(ed25519SeedToMontgomeryScalar(ed25519Seed), uPub);
+  } catch {
+    return null;
+  }
+}
+
 /** Encrypt `plaintext` to a recipient identified by their Ed25519 public key. */
 export function sealToRecipient(recipientEd25519Pub: Uint8Array, plaintext: Uint8Array): Uint8Array {
   const uPub = edwardsPubToMontgomeryU(recipientEd25519Pub);

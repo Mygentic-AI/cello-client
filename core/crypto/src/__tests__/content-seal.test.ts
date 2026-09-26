@@ -109,3 +109,27 @@ describe("content-seal — recipient sealed box (MSG-001 SI-001)", () => {
     expect(opened!.length).toBe(0);
   });
 });
+
+/**
+ * M16 045-NOTICEBELL — the static X25519 secret between two Ed25519 identities. The notice slot is a
+ * hash of it, so only the channel's admin and the member can compute where a notice lives.
+ */
+describe("staticSharedSecret (045-NOTICEBELL)", () => {
+  it("both sides derive the same 32 bytes, and a third key derives different bytes", async () => {
+    const a = new InMemoryKeyProvider(new Uint8Array(randomBytes(32)));
+    const b = new InMemoryKeyProvider(new Uint8Array(randomBytes(32)));
+    const c = new InMemoryKeyProvider(new Uint8Array(randomBytes(32)));
+    const ab = await a.staticSharedSecret(await b.getPublicKey());
+    const ba = await b.staticSharedSecret(await a.getPublicKey());
+    const ac = await a.staticSharedSecret(await c.getPublicKey());
+    expect(ab).not.toBeNull();
+    expect(ab!.length).toBe(32);
+    expect(Buffer.from(ab!).toString("hex")).toBe(Buffer.from(ba!).toString("hex"));
+    expect(Buffer.from(ac!).toString("hex")).not.toBe(Buffer.from(ab!).toString("hex"));
+  });
+
+  it("an invalid peer key answers null, never throws", async () => {
+    const a = new InMemoryKeyProvider(new Uint8Array(randomBytes(32)));
+    expect(await a.staticSharedSecret(new Uint8Array(31))).toBeNull();
+  });
+});

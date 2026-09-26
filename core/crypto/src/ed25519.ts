@@ -3,7 +3,7 @@ import { randomBytes } from "@noble/hashes/utils.js";
 import { readFile, rename, mkdir, open as fsOpen } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { KeyProvider, PublicKey, Signature } from "./types.js";
-import { openSealed } from "./content-seal.js";
+import { openSealed, staticSharedSecret } from "./content-seal.js";
 
 const INSPECT = Symbol.for("nodejs.util.inspect.custom");
 const KEY_FILE_MAGIC = new Uint8Array([0xce, 0x11, 0x0e, 0x01]); // "CELLO\x01"
@@ -33,6 +33,11 @@ export class InMemoryKeyProvider implements KeyProvider {
   /** CELLO-M7-MSG-001: open a content-park sealed blob addressed to this identity key. */
   async openContentSeal(blob: Uint8Array): Promise<Uint8Array | null> {
     return openSealed(this.#seed, blob);
+  }
+
+  /** M16 045-NOTICEBELL: the static X25519 secret with a peer (the notice slot's input). */
+  async staticSharedSecret(peerPubkey: Uint8Array): Promise<Uint8Array | null> {
+    return staticSharedSecret(this.#seed, peerPubkey);
   }
 
   toJSON(): Record<string, string> {
@@ -121,6 +126,10 @@ export class FileKeyProvider implements KeyProvider {
   /** CELLO-M7-MSG-001: open a content-park sealed blob addressed to this identity key. */
   async openContentSeal(blob: Uint8Array): Promise<Uint8Array | null> {
     return this.#inner.openContentSeal(blob);
+  }
+
+  async staticSharedSecret(peerPubkey: Uint8Array): Promise<Uint8Array | null> {
+    return this.#inner.staticSharedSecret(peerPubkey);
   }
 
   toJSON(): Record<string, unknown> {
