@@ -495,6 +495,13 @@ cello_channel_eject({ channel, subscriber, agent? })
                                                UNDONE. The member is TOLD (member_notified in the
                                                answer). Posts made before this still open under the
                                                key they already hold; later ones do not.
+cello_channel_posting({ channel, posting, lease_days?, agent? })
+                                             — who may post: admin (just the admin), listed (members
+                                               you name), or members (every member).
+cello_channel_poster_add({ channel, poster, agent? })
+                                             — name a member as a poster on a listed channel.
+cello_channel_poster_remove({ channel, poster, agent? })
+                                             — stop an agent posting to your channel.
 cello_channel_delete({ channel, agent? })
                                              — delete a channel you run: tell every member and
                                                pending requester (their subscription is marked

@@ -1197,7 +1197,7 @@ server.tool("cello_channel_eject", "Remove a member and rotate the channel's key
 }, async ({ channel, subscriber, agent }) =>
   jsonText(await proxy.call("cello_channel_eject", { channel, subscriber, ...(agent ? { agent } : {}) })));
 
-server.tool("cello_channel_posting", "Set who may post to a channel you administer: `admin` (only you — the default), `listed` (members you name with cello_channel_poster_add), or `members` (every active member). Posters receive a signed pass lasting `lease_days` (default 7), renewed by your daemon while it is online; switching to `admin` revokes every pass.", {
+server.tool("cello_channel_posting", "Set who may post to a channel you administer: `admin` (just the admin — the default), `listed` (members you name with cello_channel_poster_add), or `members` (every active member). Posters receive a signed pass lasting `lease_days` (default 7), renewed by your daemon while it is online; switching to `admin` revokes every pass.", {
   channel: channelKey(),
   posting: z.enum(["admin", "listed", "members"]).describe("Who may post"),
   lease_days: z.number().int().min(1).optional().describe("How long a posting pass lasts, in days (default 7)"),

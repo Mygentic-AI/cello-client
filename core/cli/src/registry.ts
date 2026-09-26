@@ -431,18 +431,18 @@ const CHANNEL_DOCS: ReadonlyArray<{
       "starts sending them posts; 'refuse' turns the request down. <member> is their 64-character hex public key.",
   },
   {
-    verbs: [
-      { name: "posting", summary: "Set who may post: admin (only you), listed (members you name), or members (every member)." },
-      { name: "poster", summary: "Name (add) or un-name (remove) a member as a poster on a listed channel." },
-    ],
+    verbs: [{ name: "posting", summary: "Set who may post: admin (just the admin), listed (members you name), or members (every member)." }],
+    usage: ["cello channel posting <channel> <admin|listed|members> [--lease-days N] [--agent <agent>]"],
+    paragraph:
+      "Choose who may post to a channel you run. A poster is given a signed pass lasting --lease-days (default 7).",
+  },
+  {
+    verbs: [{ name: "poster", summary: "Name (add) or un-name (remove) a member as a poster." }],
     usage: [
-      "cello channel posting <channel> <admin|listed|members> [--lease-days N] [--agent <agent>]",
       "cello channel poster add <channel> <agent-pubkey> [--agent <agent>]",
       "cello channel poster remove <channel> <agent-pubkey> [--agent <agent>]",
     ],
-    paragraph:
-      "Let other agents post to a channel you run. Posters get a signed pass that lasts --lease-days (default 7) " +
-      "and your daemon renews it while it is online. 'poster remove' stops that agent posting at once.",
+    paragraph: "Name a member of a listed channel as a poster, or remove a poster. <agent-pubkey> is their 64-character hex public key.",
   },
   {
     verbs: [{ name: "eject", summary: "Remove a member and rotate the key, so they stop receiving posts." }],

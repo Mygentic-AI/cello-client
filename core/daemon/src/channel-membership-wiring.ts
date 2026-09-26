@@ -930,21 +930,22 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
       typeof lease === "number" ? lease : undefined);
   });
 
-  for (const [verb, act] of [["cello_channel_poster_add", "add"], ["cello_channel_poster_remove", "remove"]] as const) {
-    handlers.set(verb, async (params, connectionId) => {
-      const agent = needAgent(deps, params, connectionId);
-      if (!agent.ok) return agent.answer;
-      const channel = needChannel(params);
-      if (!channel.ok) return channel.answer;
-      const poster = params?.["poster"];
-      if (typeof poster !== "string" || !/^[0-9a-fA-F]{64}$/.test(poster)) {
-        return { ok: false, reason: "bad_poster", guidance: "Pass the agent's 64-character hex public key as `poster`." };
-      }
-      return act === "add"
-        ? postingAdmin.addPoster(channel.channelHex, poster.toLowerCase())
-        : postingAdmin.removePoster(channel.channelHex, poster.toLowerCase());
-    });
-  }
+  const posterVerb = async (
+    act: "add" | "remove", params: Record<string, unknown> | undefined, connectionId: string, poster: unknown,
+  ): Promise<unknown> => {
+    const agent = needAgent(deps, params, connectionId);
+    if (!agent.ok) return agent.answer;
+    const channel = needChannel(params);
+    if (!channel.ok) return channel.answer;
+    if (typeof poster !== "string" || !/^[0-9a-fA-F]{64}$/.test(poster)) {
+      return { ok: false, reason: "bad_poster", guidance: "Pass the agent's 64-character hex public key as `poster`." };
+    }
+    return act === "add"
+      ? postingAdmin.addPoster(channel.channelHex, poster.toLowerCase())
+      : postingAdmin.removePoster(channel.channelHex, poster.toLowerCase());
+  };
+  handlers.set("cello_channel_poster_add", (params, connectionId) => posterVerb("add", params, connectionId, params?.["poster"]));
+  handlers.set("cello_channel_poster_remove", (params, connectionId) => posterVerb("remove", params, connectionId, params?.["poster"]));
 
   handlers.set("cello_channel_refuse", async (params, connectionId) => {
     const agent = needAgent(deps, params, connectionId);
