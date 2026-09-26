@@ -361,6 +361,9 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
         }
         deps.posterPasses.put(agentId, passChannelHex, {
           pass_cbor: passFrame.frame.pass_cbor, issued_at: pass.issued_at, expires_at: pass.expires_at,
+          // 044-POSTERBELL: the current member list the admin sent alongside the pass — who this
+          // poster rings when it posts.
+          members: passFrame.frame.members.map((m) => Buffer.from(m).toString("hex")),
         });
         return { ok: true, channelHex: passChannelHex, generation: 0 };
       }

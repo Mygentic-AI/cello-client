@@ -68,6 +68,15 @@ export function createChannelPostingAdmin(deps: ChannelPostingAdminDeps) {
   const { logger, config, members, grants } = deps;
   const now = deps.now ?? (() => Date.now());
 
+  /**
+   * 044-POSTERBELL: channels whose membership changed since their posters last got a pass. A pass
+   * carries the member list, so a change (admit or eject) means every current poster holds a stale
+   * list until it is re-sent. The next renewal tick re-issues them regardless of remaining lease —
+   * without this an ejected member would linger in a poster's ring targets until the pass expired.
+   */
+  const membersDirty = new Set<string>();
+  const markMembersChanged = (channelHex: string): void => { membersDirty.add(channelHex); };
+
   /** Who should hold a pass right now. */
   const postersOf = (channelHex: string): string[] => {
     const posting = config.get(channelHex)?.posting ?? "admin";
@@ -75,6 +84,10 @@ export function createChannelPostingAdmin(deps: ChannelPostingAdminDeps) {
     if (posting === "members") return members.activeMembers(channelHex);
     return [];
   };
+
+  /** The channel's current active member pubkeys (bytes) — carried on every pass so posters can ring. */
+  const memberBytes = (channelHex: string): Uint8Array[] =>
+    members.activeMembers(channelHex).map((m) => new Uint8Array(Buffer.from(m, "hex")));
 
   /** Sign, send, and — only once delivered — record one pass. */
   const issue = async (channelHex: string, posterHex: string): Promise<boolean> => {
@@ -88,7 +101,8 @@ export function createChannelPostingAdmin(deps: ChannelPostingAdminDeps) {
     });
     let delivered = false;
     try {
-      delivered = await deps.sendFrame(agentName, posterHex, encodeChannelPosterPassFrame(encodeChannelPosterPass(pass)));
+      // 044-POSTERBELL: the pass carries the channel's current members, outside the signed pass.
+      delivered = await deps.sendFrame(agentName, posterHex, encodeChannelPosterPassFrame(encodeChannelPosterPass(pass), memberBytes(channelHex)));
     } catch (err: unknown) {
       logger.warn("channel.poster_pass.unreached", { channel_pubkey: channelHex, poster_pubkey: posterHex, reason: extractErrorMessage(err) });
       return false;
@@ -115,9 +129,13 @@ export function createChannelPostingAdmin(deps: ChannelPostingAdminDeps) {
         changed = true;
       }
     }
+    // 044-POSTERBELL: a membership change forces a re-send to every current poster so the new member
+    // list reaches them now, not only when a pass nears expiry. Cleared once the re-send is done.
+    const forceResend = membersDirty.delete(channelHex);
     for (const poster of posters) {
       const g = grants.get(channelHex, poster);
-      if (!g || !grantIsLive(g) || g.expires_at - now() >= POSTER_RENEW_BEFORE_MS) continue;
+      if (!g || !grantIsLive(g)) continue;
+      if (!forceResend && g.expires_at - now() >= POSTER_RENEW_BEFORE_MS) continue;
       if (await issue(channelHex, poster)) changed = true;
     }
     return changed;
@@ -187,12 +205,17 @@ export function createChannelPostingAdmin(deps: ChannelPostingAdminDeps) {
 
     /** `members` posting: a newly admitted member is a poster at once. */
     async onAdmitted(channelHex: string, memberHex: string): Promise<void> {
+      // 044-POSTERBELL: the roster changed, so every poster's stored member list is now stale.
+      markMembersChanged(channelHex);
       if (config.get(channelHex)?.posting !== "members") return;
       if (await issue(channelHex, memberHex)) await deposit(channelHex);
     },
 
     /** An ejected member's pass is revoked and never renewed. */
     async onEjected(channelHex: string, memberHex: string): Promise<void> {
+      // 044-POSTERBELL: the roster changed; the next tick re-sends passes so the ejected member
+      // drops out of every poster's ring targets.
+      markMembersChanged(channelHex);
       const g = grants.get(channelHex, memberHex);
       if (!g || !grantIsLive(g)) return;
       grants.revoke(channelHex, memberHex, now());

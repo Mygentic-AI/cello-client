@@ -43,7 +43,7 @@ interface H {
   admin: ReturnType<typeof createChannelPostingAdmin>;
   config: ChannelConfigStore; members: ChannelMembershipStore; grants: ChannelPosterGrantStore;
   channel: InMemoryKeyProvider; channelHex: string; clock: { now: number };
-  sent: Array<{ member: string; issued_at: number; expires_at: number }>;
+  sent: Array<{ member: string; issued_at: number; expires_at: number; members: string[] }>;
   unreachable: Set<string>;
   deposits: number;
 }
@@ -68,7 +68,10 @@ async function harness(access: "invite_only" | "public" = "invite_only"): Promis
       if (!d.ok) throw new Error(d.reason);
       expect(verifyPosterPass(d.frame.pass, await channel.getPublicKey())).toEqual({ ok: true });
       expect(hex(d.frame.pass.poster_pubkey)).toBe(member);
-      h.sent.push({ member, issued_at: d.frame.pass.issued_at, expires_at: d.frame.pass.expires_at });
+      h.sent.push({
+        member, issued_at: d.frame.pass.issued_at, expires_at: d.frame.pass.expires_at,
+        members: d.frame.members.map((m) => hex(m)),
+      });
       return true;
     },
     depositInfo: () => { h.deposits += 1; return Promise.resolve(); },
@@ -178,5 +181,37 @@ describe("043-POSTERS Part E — the admin's posting setting", () => {
     const h = await harness();
     expect(await h.admin.setPosting(h.channelHex, "everyone" as never)).toMatchObject({ ok: false, reason: "bad_posting" });
     expect(await h.admin.setPosting(h.channelHex, "members", 0)).toMatchObject({ ok: false, reason: "bad_lease" });
+  });
+
+  // 044-POSTERBELL Part B: every pass carries the channel's current members, and a membership change
+  // re-sends passes on the next tick even when the lease is nowhere near expiring — so an ejected
+  // member drops out of a poster's ring targets promptly rather than at expiry.
+  it("B. a pass carries current members, and after an eject the tick re-sends without the ejected", async () => {
+    const h = await harness();
+    h.members.admit(h.channelHex, memberHex(1), "active", T0);
+    h.members.admit(h.channelHex, memberHex(2), "active", T0);
+    await h.admin.setPosting(h.channelHex, "members");
+    // Both posters got a pass, each carrying BOTH members.
+    expect(h.sent.map((s) => s.member).sort()).toEqual([memberHex(1), memberHex(2)]);
+    for (const s of h.sent) expect(s.members.slice().sort()).toEqual([memberHex(1), memberHex(2)]);
+
+    // Eject member 1. Its grant is revoked; member 2 still holds a pass with plenty of lease left.
+    h.clock.now = T0 + 1;
+    h.members.eject(h.channelHex, memberHex(1));
+    await h.admin.onEjected(h.channelHex, memberHex(1));
+    h.sent.length = 0;
+
+    // The next tick — nowhere near the 2-day renewal window — re-sends to member 2 because the
+    // roster changed, and the fresh pass's member list no longer names the ejected member.
+    h.clock.now = T0 + 2;
+    await h.admin.tick();
+    expect(h.sent.map((s) => s.member)).toEqual([memberHex(2)]);
+    expect(h.sent[0]!.members).toEqual([memberHex(2)]);
+
+    // A second tick with no further change sends nothing (the dirty flag was cleared).
+    h.sent.length = 0;
+    h.clock.now = T0 + 3;
+    await h.admin.tick();
+    expect(h.sent).toEqual([]);
   });
 });

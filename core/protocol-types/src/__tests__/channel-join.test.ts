@@ -9,18 +9,21 @@
  * decisions they carry are tested against the daemon.
  */
 import { describe, it, expect } from "vitest";
+import { generateKeypair } from "@cello-protocol/crypto";
 import {
   encodeChannelJoinRequest, decodeChannelJoinRequest,
   encodeChannelJoinAccepted, decodeChannelJoinAccepted,
   encodeChannelJoinRefused, decodeChannelJoinRefused,
   encodeChannelRekey, decodeChannelRekey,
   encodeChannelMembershipEnded, decodeChannelMembershipEnded,
+  encodeChannelPosterPassFrame, decodeChannelPosterPassFrame,
   isChannelJoinFrame,
   channelJoinFrameType,
   MAX_JOIN_NOTE_CHARS,
   MAX_JOIN_FRAME_BYTES,
-  JOIN_REQUEST_TYPE, JOIN_ACCEPTED_TYPE, JOIN_REFUSED_TYPE, REKEY_TYPE, MEMBERSHIP_ENDED_TYPE,
+  JOIN_REQUEST_TYPE, JOIN_ACCEPTED_TYPE, JOIN_REFUSED_TYPE, REKEY_TYPE, MEMBERSHIP_ENDED_TYPE, POSTER_PASS_FRAME_TYPE,
 } from "../channel-join.js";
+import { signChannelPosterPass, encodeChannelPosterPass } from "../channel-poster-pass.js";
 import { encodeCbor } from "../cbor.js";
 
 const CHANNEL = new Uint8Array(Buffer.alloc(32, 0xa1));
@@ -245,5 +248,32 @@ describe("025-JOINSCREEN — channelJoinFrameType is strict, by full decode", ()
     });
     expect(frame.length).toBeLessThanOrEqual(MAX_JOIN_FRAME_BYTES);
     expect(channelJoinFrameType(frame)).toBe(JOIN_ACCEPTED_TYPE);
+  });
+
+  // 044-POSTERBELL: the pass frame now carries the channel's current members, outside the signed
+  // pass, so a poster knows who to ring the moment it posts.
+  it("a poster pass frame round-trips its member list, and rejects a wrong-length member", async () => {
+    const channel = generateKeypair();
+    const poster = generateKeypair();
+    const pass = await signChannelPosterPass(channel, {
+      poster_pubkey: await poster.getPublicKey(), issued_at: 1_000, expires_at: 8_000,
+    });
+    const passCbor = encodeChannelPosterPass(pass);
+    const members = [new Uint8Array(32).fill(0xaa), new Uint8Array(32).fill(0xbb)];
+
+    const bytes = encodeChannelPosterPassFrame(passCbor, members);
+    expect(channelJoinFrameType(bytes)).toBe(POSTER_PASS_FRAME_TYPE);
+    const decoded = decodeChannelPosterPassFrame(bytes);
+    expect(decoded.ok, decoded.ok ? "" : decoded.reason).toBe(true);
+    if (!decoded.ok) return;
+    expect(decoded.frame.members).toHaveLength(2);
+    expect(Buffer.from(decoded.frame.members[0]!).equals(Buffer.from(members[0]!))).toBe(true);
+
+    // A member that is not 32 bytes cannot identify an agent, so it is refused, never truncated.
+    expect(() => encodeChannelPosterPassFrame(passCbor, [new Uint8Array(16)])).toThrow(/bad_members/);
+    const badWire = encodeCbor([POSTER_PASS_FRAME_TYPE, passCbor, [new Uint8Array(16)]]);
+    const badDecoded = decodeChannelPosterPassFrame(badWire);
+    expect(badDecoded.ok).toBe(false);
+    if (!badDecoded.ok) expect(badDecoded.reason).toBe("bad_members");
   });
 });

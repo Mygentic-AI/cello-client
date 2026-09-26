@@ -97,7 +97,7 @@ async function member(h: H, name: string, opts: { pass?: "valid" | "expired" | "
   if (which !== "none") {
     const expires = which === "valid" ? NOW + 6 * DAY : NOW - 1;
     const pass = await signChannelPosterPass(h.channel, { poster_pubkey: await kp.getPublicKey(), issued_at: NOW - DAY, expires_at: expires });
-    h.passes.put(`id-${name}`, h.channelHex, { pass_cbor: encodeChannelPosterPass(pass), issued_at: pass.issued_at, expires_at: pass.expires_at });
+    h.passes.put(`id-${name}`, h.channelHex, { pass_cbor: encodeChannelPosterPass(pass), issued_at: pass.issued_at, expires_at: pass.expires_at, members: [] });
   }
   return kp;
 }
@@ -196,7 +196,7 @@ describe("043-POSTERS Part C — receiving a pass", () => {
   async function frameFor(h: H, poster: InMemoryKeyProvider, issued = NOW, signer = h.channel): Promise<Uint8Array> {
     const pass = await signChannelPosterPass(signer, { poster_pubkey: await poster.getPublicKey(), issued_at: issued, expires_at: issued + 7 * DAY });
     const bytes = encodeChannelPosterPass(signer === h.channel ? pass : { ...pass, channel_pubkey: await h.channel.getPublicKey() });
-    return encodeChannelPosterPassFrame(bytes);
+    return encodeChannelPosterPassFrame(bytes, []);
   }
 
   it("C7. a pass from the stored admin is stored; latest wins", async () => {
