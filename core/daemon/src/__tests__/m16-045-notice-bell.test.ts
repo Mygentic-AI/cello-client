@@ -167,7 +167,7 @@ describe("045-NOTICEBELL — the member reads its notices; no session anywhere",
     expect(h.subs.keysFor(MEMBER_ID, h.channelHex).map((k) => k.generation)).toEqual([3]);
   });
 
-  it("7. a channel the directory reports revoked is marked closed and rings channel_closed once", async () => {
+  it("7. a rung member whose directory already reports the channel revoked sees deleted on its FIRST check, once", async () => {
     const h = await harness({ revoked: true });
     await h.reader.checkNotices(MEMBER_ID);
     expect(h.subs.get(MEMBER_ID, h.channelHex)?.status).toBe("closed");

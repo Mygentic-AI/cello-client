@@ -300,7 +300,7 @@ async function adminHarness() {
 
   // 045-NOTICEBELL: every notice record deposited (decoded), every ring, and which slots the relays refuse.
   const notices: Array<{ type: string; slot: string; record: Uint8Array }> = [];
-  const rings: Array<{ agent: string; channel: string; members: string[] }> = [];
+  const rings: Array<{ agent: string; channel: string; members: string[]; afterRetire: boolean }> = [];
   let refusedSlots = new Set<string>();
   let ringOk = true;
 
@@ -360,7 +360,8 @@ async function adminHarness() {
       },
       fetchNotices: () => Promise.resolve([]),
       ringMembers: (agent, channel, ringed) => {
-        rings.push({ agent, channel, members: ringed });
+        // Whether the retire (the directory revocation) had already run when this ring went out.
+        rings.push({ agent, channel, members: ringed, afterRetire: removedAgents.length > 0 });
         return Promise.resolve(ringOk);
       },
       isAgentOnline: () => true,
@@ -399,7 +400,7 @@ describe("M16 034-LIFECYCLE — admin side: eject tells the member, delete remov
     expect(res.ok).toBe(true);
     expect(res.member_notified, "the eject notice reached the relays").toBe(true);
     expect(h.notices.map((n) => ({ type: n.type, slot: n.slot }))).toEqual([{ type: "eject", slot: await h.slotFor(memberHex, "eject") }]);
-    expect(h.rings).toEqual([{ agent: ADMIN_NAME, channel: h.channelHex, members: [memberHex] }]);
+    expect(h.rings).toEqual([{ agent: ADMIN_NAME, channel: h.channelHex, members: [memberHex], afterRetire: false }]);
     expect(h.sent, "no session frame").toEqual([]);
     expect(h.openedSessionsFor, "no session opened").toEqual([]);
   });
@@ -469,7 +470,7 @@ describe("M16 034-LIFECYCLE — admin side: eject tells the member, delete remov
     expect(byChannel.has(left), "a channel the operator LEFT stays hidden").toBe(false);
   });
 
-  it("5. delete rings active AND pending members before the retire, prunes both relays, and retires the channel identity — no session", async () => {
+  it("5. delete prunes, retires (revokes at the directory), THEN rings active AND pending members — no session", async () => {
     const h = await adminHarness();
     const activeKp = generateKeypair() as InMemoryKeyProvider;
     const pendingKp = generateKeypair() as InMemoryKeyProvider;
@@ -485,7 +486,8 @@ describe("M16 034-LIFECYCLE — admin side: eject tells the member, delete remov
     expect(res.ok).toBe(true);
     expect(res.members_notified).toBe(2);
     expect(res.members_unreached).toEqual([]);
-    expect(h.rings).toEqual([{ agent: ADMIN_NAME, channel: h.channelHex, members: [activeHex, pendingHex] }]);
+    // The ring goes out only after the revocation, so a rung member's first check reads "deleted".
+    expect(h.rings).toEqual([{ agent: ADMIN_NAME, channel: h.channelHex, members: [activeHex, pendingHex], afterRetire: true }]);
     expect(h.sent).toEqual([]);
     expect(h.openedSessionsFor).toEqual([]);
     expect(h.prunedChannels).toEqual([h.channelHex]);

@@ -797,11 +797,11 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
    * M16 034-LIFECYCLE — delete a channel this daemon administers.
    *
    * ⚠️ **ADMIN ONLY, AND THE CHANNEL KEY MUST BE HELD LOCALLY** — `localChannelAdmin` returns null
-   * otherwise, and a delete never runs for a channel this daemon does not hold. The three steps run
-   * in order and the retire is LAST, because the prune needs the channel key that retiring purges:
-   *   (a) tell every active AND pending member the channel is gone (`channel_closed`);
-   *   (b) prune the whole log on both relays;
-   *   (c) retire the channel identity through the existing `cello_remove_agent` path.
+   * otherwise, and a delete never runs for a channel this daemon does not hold. In order:
+   *   (a) read who to tell — every active AND pending member;
+   *   (b) prune the whole log on both relays (needs the channel key the retire purges);
+   *   (c) retire the channel identity through `cello_remove_agent` — revocation at the directory;
+   *   (d) ring the members (045-NOTICEBELL), so their first check already reads "deleted".
    * Unreachable members are named, not fatal — the channel is gone regardless of who was told.
    */
   handlers.set("cello_channel_delete", async (params, connectionId) => {
@@ -818,21 +818,8 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
       };
     }
 
-    /**
-     * (a) M16 045-NOTICEBELL: RING every active and pending member, BEFORE the retire — the
-     * directory's revocation of the channel identity (step c) IS the notice, and the ring must go
-     * out while the admin still holds the channel. No session is opened. A ring that could not be
-     * sent leaves them to find the revocation on their backstop tick.
-     */
+    // (a) Who to tell: every active and pending member, read NOW — a successful retire forgets these rows.
     const toNotify = [...members.activeMembers(channel.channelHex), ...members.pendingMembers(channel.channelHex)];
-    const rung = await ringMembers(agent.agentName, channel.channelHex, toNotify);
-    const membersNotified = rung ? toNotify.length : 0;
-    const membersUnreached: string[] = rung ? [] : toNotify;
-    if (!rung) {
-      for (const member of toNotify) {
-        logger.info("channel.delete.notice.unreached", { channel_pubkey: channel.channelHex, member_pubkey: member });
-      }
-    }
 
     // (b) Prune everything on both relays. Done BEFORE the retire, which purges the channel key the
     // prune signature needs.
@@ -864,6 +851,22 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
       logger.warn("channel.delete.retire_failed", {
         channel_pubkey: channel.channelHex, reason: retireReason,
       });
+    }
+
+    /**
+     * (d) M16 045-NOTICEBELL: RING the members AFTER the retire has recorded the revocation at the
+     * directory, so a rung member's first check already reads "deleted". The ring rides the ADMIN
+     * agent's stream (the directory accepts a revoked channel's recorded admin), so the channel key
+     * the retire purged is not needed. No session is opened. A ring that could not be sent leaves
+     * them to find the revocation on their backstop tick.
+     */
+    const rung = await ringMembers(agent.agentName, channel.channelHex, toNotify);
+    const membersNotified = rung ? toNotify.length : 0;
+    const membersUnreached: string[] = rung ? [] : toNotify;
+    if (!rung) {
+      for (const member of toNotify) {
+        logger.info("channel.delete.notice.unreached", { channel_pubkey: channel.channelHex, member_pubkey: member });
+      }
     }
 
     /**
