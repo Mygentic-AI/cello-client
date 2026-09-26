@@ -36,7 +36,7 @@ export type PosterPublishRefusal =
   | "no_posting_pass" | "channel_group_key_unavailable";
 
 export type PosterPublishResult =
-  | { ok: true; seq: number; deposited: DepositOutcome[] }
+  | { ok: true; seq: number; deposited: DepositOutcome[]; poster_receipt_cbor?: Uint8Array }
   | { ok: false; reason: PosterPublishRefusal; detail?: string; seq?: number; deposited?: DepositOutcome[] };
 
 export interface ChannelPosterPublisherOptions {
@@ -127,13 +127,17 @@ export class ChannelPosterPublisher {
       relays_ok: ok.map((d) => d.relay), relays_failed: deposited.filter((d) => !d.ok).map((d) => d.relay),
     });
     if (ok.length === 0) return { ok: false, reason: "no_relay_accepted", seq, deposited };
-    return { ok: true, seq, deposited };
+    // 044-POSTERBELL: hand up one verified relay receipt so the caller can ring the members. A post
+    // that was taken but whose every receipt was unverifiable rings nobody — there is no proof to
+    // give the directory — and that is correct, not a failure of the publish.
+    const withReceipt = ok.find((d) => d.receipt_cbor !== undefined)?.receipt_cbor;
+    return { ok: true, seq, deposited, ...(withReceipt ? { poster_receipt_cbor: withReceipt } : {}) };
   }
 
   /** Re-deposit this agent's lane on one relay. Refuses when no unexpired pass is held — the relay would. */
   async resendMissing(
     agentName: string, channelHex: string, relay: string, correlationId?: string,
-  ): Promise<{ deposited: number; refused?: "no_posting_pass" | "key_unavailable" }> {
+  ): Promise<{ deposited: number; refused?: "no_posting_pass" | "key_unavailable"; poster_receipt_cbor?: Uint8Array }> {
     const agentId = this.#o.resolveAgentId(agentName);
     const pass = this.#o.passes.get(agentId, channelHex);
     if (!pass || this.#now() > pass.expires_at) {
@@ -151,13 +155,16 @@ export class ChannelPosterPublisher {
     // Everything logged, oldest first: `channel_head` has no lane, and a relay answers a post it
     // already holds with its original receipt, so a repeat costs a round trip and changes nothing.
     let deposited = 0;
+    let receipt: Uint8Array | undefined;
     const pace = this.#o.resendPaceMs ?? DEFAULT_RESEND_PACE_MS;
     for (const post of log.readRange(lane, head.first_seq, head.last_seq)) {
       const outcome = await this.#depositOnce(relay, post, lane, correlationId);
       if (outcome.ok) deposited += 1;
+      // 044-POSTERBELL: keep one verified receipt so the resend can ring the members too.
+      if (outcome.receipt_cbor && !receipt) receipt = outcome.receipt_cbor;
       if (pace > 0) await new Promise((r) => setTimeout(r, pace));
     }
-    return { deposited };
+    return { deposited, ...(receipt ? { poster_receipt_cbor: receipt } : {}) };
   }
 
   async #depositOnce(relay: string, post: BroadcastArtifact, lane: string, correlationId?: string): Promise<DepositOutcome> {
@@ -178,12 +185,14 @@ export class ChannelPosterPublisher {
       this.#o.logger.warn("channel.post.deposit_failed", { ...cid, lane, seq: post.seq, relay, reason: "receipt_invalid" });
       return { relay, ok: true, receipt_unfiled: "receipt_invalid" };
     }
+    // 044-POSTERBELL: keep the verified receipt bytes so the ring can prove this post to the directory.
+    const receipt_cbor = new Uint8Array(answer.receipt_cbor);
     try {
       this.#o.log.recordReceipt(lane, decoded.receipt, correlationId);
-      return { relay, ok: true };
+      return { relay, ok: true, receipt_cbor };
     } catch (err: unknown) {
       this.#o.logger.warn("channel.post.receipt_unfiled", { ...cid, lane, seq: post.seq, relay, reason: extractErrorMessage(err) });
-      return { relay, ok: true, receipt_unfiled: extractErrorMessage(err) };
+      return { relay, ok: true, receipt_unfiled: extractErrorMessage(err), receipt_cbor };
     }
   }
 }

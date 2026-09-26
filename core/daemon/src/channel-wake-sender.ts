@@ -92,3 +92,88 @@ export function createChannelWakeSender(
     }
   };
 }
+
+/**
+ * M16 044-POSTERBELL — a POSTER's own doorbell.
+ *
+ * When a poster posts, its daemon rings the channel's members itself — the admin is no longer in the
+ * path. The ring carries the poster's PASS (its authority) and one RELAY RECEIPT (proof it just
+ * posted); the directory checks those instead of an admin binding. Targets are the members the admin
+ * last sent with the pass, minus the poster itself.
+ *
+ * ⚠️ **NOTHING HERE CAN FAIL A PUBLISH.** By the time this runs the post is on the relays. A missing
+ * pass, no members yet, no directory stream, a refusal — every one is a log line and a fall back to
+ * the members' backstop poll, never a publish failure.
+ */
+export interface PosterWakeSenderDeps {
+  logger: Logger;
+  /** The poster's held pass row for a channel: its pass bytes and the members it should ring. */
+  posterPassFor: (agentId: string, channelHex: string) => { pass_cbor: Uint8Array; members: string[] } | null;
+  /** The poster's own pubkey hex, so it never rings itself. */
+  ownPubkeyHex: (agentName: string) => string | null;
+  /** The poster agent's own directory connection (keyed by agent name), or null when it has none. */
+  signalingFor: (agentName: string) => WakeSignaling | null;
+  resolveAgentId: (agentName: string) => string;
+}
+
+export function createPosterWakeSender(
+  deps: PosterWakeSenderDeps,
+): (agentName: string, channelHex: string, relayReceiptCbor: Uint8Array) => Promise<void> {
+  return function ringPosterWake(agentName: string, channelHex: string, relayReceiptCbor: Uint8Array): Promise<void> {
+    try {
+      const agentId = deps.resolveAgentId(agentName);
+      const held = deps.posterPassFor(agentId, channelHex);
+      if (!held) {
+        deps.logger.debug("channel.poster_wake.skipped", {
+          channel_pubkey: channelHex, reason: "no_pass",
+          impact: "members collect this post on their backstop poll instead of at once",
+        });
+        return Promise.resolve();
+      }
+      const own = deps.ownPubkeyHex(agentName)?.toLowerCase();
+      const targets = held.members.filter((m) => m.toLowerCase() !== own);
+      if (targets.length === 0) {
+        // Nobody but the poster to ring: a request naming nobody can only be refused.
+        return Promise.resolve();
+      }
+      const signaling = deps.signalingFor(agentName);
+      if (!signaling) {
+        deps.logger.debug("channel.poster_wake.skipped", {
+          channel_pubkey: channelHex, reason: "signaling_unavailable",
+          impact: "members collect this post on their backstop poll instead of at once",
+        });
+        return Promise.resolve();
+      }
+      // Not awaited: the reply is for the directory's own logs; the poster does not act on it.
+      void signaling.sendRaw({
+        type: "channel_wake_request",
+        channel_pubkey: new Uint8Array(Buffer.from(channelHex, "hex")),
+        agent_pubkeys: targets.map((m) => new Uint8Array(Buffer.from(m, "hex"))),
+        poster_pass: held.pass_cbor,
+        relay_receipt: relayReceiptCbor,
+      }).then(
+        (res) => {
+          if (!res.ok) {
+            deps.logger.debug("channel.poster_wake.refused", {
+              channel_pubkey: channelHex, reason: res.reason ?? "unknown",
+              impact: "members collect this post on their backstop poll instead of at once",
+            });
+          }
+        },
+        (err: unknown) => {
+          deps.logger.debug("channel.poster_wake.failed", {
+            channel_pubkey: channelHex, reason: extractErrorMessage(err),
+            impact: "members collect this post on their backstop poll instead of at once",
+          });
+        },
+      );
+      return Promise.resolve();
+    } catch (err: unknown) {
+      deps.logger.warn("channel.poster_wake.failed", {
+        channel_pubkey: channelHex, reason: extractErrorMessage(err),
+        impact: "members collect this post on their backstop poll instead of at once",
+      });
+      return Promise.resolve();
+    }
+  };
+}

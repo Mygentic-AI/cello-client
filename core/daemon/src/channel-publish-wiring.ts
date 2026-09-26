@@ -35,7 +35,7 @@ import { postingInfoExt } from "./channel-posting-admin.js";
 import { createPosterDoorbell } from "./channel-poster-doorbell.js";
 import { ChannelInboxStore } from "./channel-inbox-store.js";
 import { createChannelCollectTicker } from "./channel-collect-tick.js";
-import { createChannelWakeSender } from "./channel-wake-sender.js";
+import { createChannelWakeSender, createPosterWakeSender } from "./channel-wake-sender.js";
 import type { ChannelNotify } from "./channel-membership-wiring.js";
 
 type Handler = (params: Record<string, unknown> | undefined, connectionId: string) => Promise<unknown>;
@@ -123,10 +123,11 @@ export function wireChannelPublishing(
   };
 
   const grants = new ChannelPosterGrantStore(deps.getDb(), logger);
+  const posterPasses = new ChannelPosterPassStore(deps.getDb(), logger);
   // 043-POSTERS: publishing under a pass, for a channel this daemon does not hold the key to.
   const posterPublisher = new ChannelPosterPublisher({
     logger, log,
-    passes: new ChannelPosterPassStore(deps.getDb(), logger),
+    passes: posterPasses,
     subscriptions: new ChannelSubscriptionStore(deps.getDb(), logger),
     deposit: (addr, req) => relay.deposit(addr, { post_cbor: req.post_cbor }),
     resolveAgentId: deps.resolveAgentId,
@@ -203,6 +204,22 @@ export function wireChannelPublishing(
     signalingFor: (agentId) => deps.signalingFor(agentId),
   });
 
+  /**
+   * 044-POSTERBELL: a POSTER rings the members itself the moment a relay accepts its post — the
+   * admin is no longer in the path. Authorised by the poster's pass and one relay receipt, targeting
+   * the members the admin last sent with the pass, minus the poster.
+   */
+  const ringPosterWake = createPosterWakeSender({
+    logger,
+    posterPassFor: (agentId, channelHex) => {
+      const held = posterPasses.get(agentId, channelHex);
+      return held ? { pass_cbor: held.pass_cbor, members: held.members } : null;
+    },
+    ownPubkeyHex: (agentName) => deps.loadedAgents.find((a) => a.name === agentName)?.pubkey ?? null,
+    signalingFor: (agentName) => deps.signalingFor(agentName),
+    resolveAgentId: deps.resolveAgentId,
+  });
+
   const setChannelConfig = (agentName: string, channelHex: string, cfg: ChannelConfig):
     { ok: true } | { ok: false; reason: string; guidance?: string } => {
     // The channel key must be one this daemon HOLDS. Recording relays for a channel we cannot
@@ -235,6 +252,8 @@ export function wireChannelPublishing(
     resolveCurrentAgent: deps.resolveCurrentAgent,
     getPublisher: buildPublisher,
     wakeMembers: (agentName, channelHex) => sendWake(agentName, channelHex),
+    // 044-POSTERBELL: a poster's own ring, carrying its pass and a relay receipt from the publish.
+    ringPosterWake: (agentName, channelHex, receiptCbor) => ringPosterWake(agentName, channelHex, receiptCbor),
     setChannelConfig,
     // 035-INFOCLI item 2: read the current config so info-set can change only the guidance.
     getChannelConfig: (channelHex) => config.get(channelHex),

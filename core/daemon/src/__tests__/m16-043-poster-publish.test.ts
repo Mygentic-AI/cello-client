@@ -133,6 +133,9 @@ describe("043-POSTERS Part C — posting as a poster", () => {
     const rc = await h.pub.publish("carol", h.channelHex, "from carol", "hello from carol");
     expect(rb).toMatchObject({ ok: true, seq: 1 });
     expect(rc).toMatchObject({ ok: true, seq: 1 });
+    // 044-POSTERBELL: a successful poster publish hands up one verified relay receipt so the daemon
+    // can ring the members.
+    if (rb.ok) expect(rb.poster_receipt_cbor).toBeInstanceOf(Uint8Array);
     expect(h.deposits.map((d) => d.relay).sort()).toEqual([RELAY_A, RELAY_A, RELAY_B, RELAY_B]);
     for (const d of h.deposits) {
       expect(d.fetch_key).toBeUndefined();
@@ -169,7 +172,9 @@ describe("043-POSTERS Part C — posting as a poster", () => {
     await h.pub.publish("bob", h.channelHex, "two", "2");
     h.deposits.length = 0;
     const r = await h.pub.resendMissing("bob", h.channelHex, RELAY_B);
-    expect(r).toEqual({ deposited: 2 });
+    // 044-POSTERBELL: a poster resend also carries one verified receipt up, so it can ring the members.
+    expect(r.deposited).toBe(2);
+    expect(r.poster_receipt_cbor).toBeInstanceOf(Uint8Array);
     expect(h.deposits.every((d) => d.relay === RELAY_B)).toBe(true);
     expect(h.deposits.map((d) => { const a = decodeBroadcastArtifact(d.post_cbor); return a.ok ? hex(a.artifact.agent_pubkey) : ""; }))
       .toEqual([hex(await bob.getPublicKey()), hex(await bob.getPublicKey())]);

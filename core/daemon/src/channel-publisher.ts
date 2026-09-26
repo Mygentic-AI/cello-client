@@ -132,7 +132,7 @@ export interface ChannelPublisherOptions {
   poster?: {
     publish: (agentName: string, channelHex: string, title: string, body: string, correlationId?: string) => Promise<PublishResult>;
     resendMissing: (agentName: string, channelHex: string, relay: string, correlationId?: string) =>
-      Promise<{ deposited: number; refused?: "no_posting_pass" | "key_unavailable" }>;
+      Promise<{ deposited: number; refused?: "no_posting_pass" | "key_unavailable"; poster_receipt_cbor?: Uint8Array }>;
     relaysFor: (agentName: string, channelHex: string) => string[];
   };
 }
@@ -155,10 +155,18 @@ export interface DepositOutcome {
    * on two relays as `no_relay_accepted`, and sent the operator to resend something already there.
    */
   receipt_unfiled?: string;
+  /**
+   * 044-POSTERBELL: the relay's signed receipt for this deposit, as it arrived on the wire. Carried
+   * so a POSTER can hand one to the directory as proof it just posted, which is what lets it ring
+   * the members. Present only on a deposit whose receipt verified against the post.
+   */
+  receipt_cbor?: Uint8Array;
 }
 
 export type PublishResult =
-  | { ok: true; seq: number; deposited: DepositOutcome[] }
+  // 044-POSTERBELL: a POSTER publish carries one verified relay receipt up so the handler can ring
+  // the members; an admin publish never sets it (the admin rings by its binding, not a receipt).
+  | { ok: true; seq: number; deposited: DepositOutcome[]; poster_receipt_cbor?: Uint8Array }
   | { ok: false; reason: PublishRefusal; detail?: string; seq?: number; deposited?: DepositOutcome[] };
 
 export class ChannelPublisher {
@@ -421,7 +429,7 @@ export class ChannelPublisher {
    */
   async resendMissing(
     agentName: string, channelHex: string, relay: string, correlationId?: string,
-  ): Promise<{ deposited: number; refused?: "channel_unknown" | "no_fetch_key" | "no_posting_pass" | "key_unavailable" }> {
+  ): Promise<{ deposited: number; refused?: "channel_unknown" | "no_fetch_key" | "no_posting_pass" | "key_unavailable"; poster_receipt_cbor?: Uint8Array }> {
     const { log, logger } = this.#opts;
     // 043-POSTERS: a poster refills its OWN lane, under its pass.
     if (await this.#postsAsPoster(agentName, channelHex)) {

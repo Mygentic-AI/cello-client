@@ -47,6 +47,12 @@ export interface ChannelPublishDeps {
    * collect on their backstop poll, which is what the poll is for.
    */
   wakeMembers?: (agentName: string, channelHex: string) => Promise<void>;
+  /**
+   * 044-POSTERBELL: a POSTER's own doorbell, rung after its post lands, carrying a relay receipt as
+   * proof. Same "cannot fail a publish" contract as `wakeMembers`. Called instead of `wakeMembers`
+   * when the publish was a poster publish (the result carries a `poster_receipt_cbor`).
+   */
+  ringPosterWake?: (agentName: string, channelHex: string, relayReceiptCbor: Uint8Array) => Promise<void>;
 }
 
 function needAgent(deps: ChannelPublishDeps, params: Record<string, unknown> | undefined, connectionId: string):
@@ -179,7 +185,15 @@ export function registerChannelPublishHandlers(deps: ChannelPublishDeps): void {
     if (result.ok) {
       // The doorbell, after the post is durable and never before: a wake for a post that failed to
       // deposit would send every member to fetch something that is not there.
-      await deps.wakeMembers?.(agent.agentName, channel.channelHex);
+      //
+      // 044-POSTERBELL: a POSTER rings the members ITSELF, carrying a relay receipt as proof — the
+      // admin is no longer in the path. A poster publish carries `poster_receipt_cbor`; an admin
+      // publish does not, and rings by its admin binding exactly as before.
+      if (result.poster_receipt_cbor) {
+        await deps.ringPosterWake?.(agent.agentName, channel.channelHex, result.poster_receipt_cbor);
+      } else {
+        await deps.wakeMembers?.(agent.agentName, channel.channelHex);
+      }
       return {
         ok: true, seq: result.seq,
         relays_ok: result.deposited.filter((d) => d.ok).map((d) => d.relay),
@@ -393,6 +407,7 @@ export function registerChannelPublishHandlers(deps: ChannelPublishDeps): void {
     }
 
     const per: Array<{ relay: string; deposited: number }> = [];
+    let rung = false;
     for (const target of targets) {
       const result = await publisher.resendMissing(agent.agentName, channel.channelHex, target);
       // 039 review: a refusal is not "nothing to resend". It is the same for every relay, so the
@@ -419,6 +434,12 @@ export function registerChannelPublishHandlers(deps: ChannelPublishDeps): void {
         };
       }
       per.push({ relay: target, deposited: result.deposited });
+      // 044-POSTERBELL: a poster refilling its lane rings the members too, with a receipt from this
+      // resend. One ring for the whole resend — the first relay that yielded a receipt is enough.
+      if (result.poster_receipt_cbor && !rung) {
+        rung = true;
+        await deps.ringPosterWake?.(agent.agentName, channel.channelHex, result.poster_receipt_cbor);
+      }
     }
     return { ok: true, deposited: per.reduce((n, r) => n + r.deposited, 0), relays: per };
   });
