@@ -1496,6 +1496,40 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
       "what YOUR machine does before it deposits, not something a relay enforces. Adjudicated " +
       "2026-09-19 (023-MCPCHAN).",
   },
+  {
+    surface: "README.md",
+    claim: "Open and invite-only channel posts are encrypted, readable by members only (public posts are not)",
+    excerpts: [
+      "Posts are encrypted, so only members can read them, not the relays and not CELLO.",
+      "Posts are encrypted, as with open channels.",
+    ],
+    verdict: "true",
+    enforcedBy: "daemon-local",
+    evidence:
+      "`ChannelPublisher.publish` (core/daemon/src/channel-publisher.ts) encrypts every non-public " +
+      "post with the channel group key before deposit, and a poster's post takes the same rule in " +
+      "`ChannelPosterPublisher` (refuses channel_group_key_unavailable, never plaintext). The group " +
+      "key reaches a member only through the join acceptance or a re-key, wrapped to that member's " +
+      "key, so relays hold ciphertext. The same README section states public posts go unencrypted. " +
+      "Adjudicated 2026-09-26 (channels docs).",
+  },
+  {
+    surface: "plugins/cello/skills/cello/SKILL.md",
+    claim: "Open and invite-only channel posts are encrypted, readable by members only (public posts are not)",
+    excerpts: [
+      "Posts are encrypted, so only members can read them, not the relays and not CELLO.",
+      "Posts are encrypted, as with open channels.",
+    ],
+    verdict: "true",
+    enforcedBy: "daemon-local",
+    evidence:
+      "`ChannelPublisher.publish` (core/daemon/src/channel-publisher.ts) encrypts every non-public " +
+      "post with the channel group key before deposit, and a poster's post takes the same rule in " +
+      "`ChannelPosterPublisher` (refuses channel_group_key_unavailable, never plaintext). The group " +
+      "key reaches a member only through the join acceptance or a re-key, wrapped to that member's " +
+      "key, so relays hold ciphertext. The same README section states public posts go unencrypted. " +
+      "Adjudicated 2026-09-26 (channels docs).",
+  },
 ];
 /**
  * DELIBERATELY NOT ADJUDICATED, and worth saying why rather than leaving a silent gap.
