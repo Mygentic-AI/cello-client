@@ -120,10 +120,22 @@ export interface ChannelPublisherOptions {
     access: ChannelAccess; relays: string[]; guidance: string; retention_seconds: number;
   } | null;
   now?: () => number;
+  /**
+   * 043-POSTERS: where a publish goes when this daemon does NOT hold the channel key — posting under
+   * the admin's pass, in the agent's own lane. Absent, such a publish is `key_unavailable` as before.
+   */
+  poster?: {
+    publish: (agentName: string, channelHex: string, title: string, body: string, correlationId?: string) => Promise<PublishResult>;
+    resendMissing: (agentName: string, channelHex: string, relay: string, correlationId?: string) =>
+      Promise<{ deposited: number; refused?: "no_posting_pass" | "key_unavailable" }>;
+    relaysFor: (agentName: string, channelHex: string) => string[];
+  };
 }
 
 export type PublishRefusal =
-  | "blocked_by_screen" | "channel_unknown" | "key_unavailable" | "no_relay_accepted" | "post_invalid";
+  | "blocked_by_screen" | "channel_unknown" | "key_unavailable" | "no_relay_accepted" | "post_invalid"
+  // 043-POSTERS: publishing under a pass on a channel this daemon does not hold the key to.
+  | "no_posting_pass" | "channel_group_key_unavailable";
 
 export interface DepositOutcome {
   relay: string;
@@ -155,6 +167,10 @@ export class ChannelPublisher {
 
   async publish(agentName: string, channelHex: string, title: string, body: string, correlationId?: string): Promise<PublishResult> {
     const { logger, log } = this.#opts;
+    // 043-POSTERS: not our channel key → we can only post as a poster, under the admin's pass.
+    if (this.#opts.poster && !this.#opts.getChannelKey(channelHex)) {
+      return this.#opts.poster.publish(agentName, channelHex, title, body, correlationId);
+    }
     const info = this.#opts.channelInfo(channelHex);
     if (!info) return { ok: false, reason: "channel_unknown", detail: "no channel info for that pubkey" };
 
@@ -400,8 +416,12 @@ export class ChannelPublisher {
    */
   async resendMissing(
     agentName: string, channelHex: string, relay: string, correlationId?: string,
-  ): Promise<{ deposited: number; refused?: "channel_unknown" | "no_fetch_key" }> {
+  ): Promise<{ deposited: number; refused?: "channel_unknown" | "no_fetch_key" | "no_posting_pass" | "key_unavailable" }> {
     const { log, logger } = this.#opts;
+    // 043-POSTERS: a poster refills its OWN lane, under its pass.
+    if (this.#opts.poster && !this.#opts.getChannelKey(channelHex)) {
+      return this.#opts.poster.resendMissing(agentName, channelHex, relay, correlationId);
+    }
     // A channel that has been set up but never published has no log row yet, and `head` THROWS on
     // one. Nothing to resend is an ANSWER — `deposited: 0` — not an error: a freshly created channel
     // is the most likely thing an operator runs this against, and it came back looking broken.
@@ -619,7 +639,11 @@ export class ChannelPublisher {
   }
 
   /** The relays this channel publishes to, so a caller can refill all of them without naming one. */
-  relaysFor(channelHex: string): string[] {
+  relaysFor(channelHex: string, agentName?: string): string[] {
+    // 043-POSTERS: a poster has no channel config; its relays are on its subscription row.
+    if (this.#opts.poster && agentName !== undefined && !this.#opts.getChannelKey(channelHex)) {
+      return this.#opts.poster.relaysFor(agentName, channelHex);
+    }
     return this.#opts.channelInfo(channelHex)?.relays ?? [];
   }
 

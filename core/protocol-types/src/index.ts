@@ -423,13 +423,14 @@ export {
   encodeChannelJoinRefused, decodeChannelJoinRefused,
   encodeChannelRekey, decodeChannelRekey,
   encodeChannelMembershipEnded, decodeChannelMembershipEnded,
+  encodeChannelPosterPassFrame, decodeChannelPosterPassFrame,
   isChannelJoinFrame,
   channelJoinFrameType,
   MAX_JOIN_NOTE_CHARS, MAX_JOIN_GUIDANCE_CHARS, MAX_JOIN_RELAYS, MAX_JOIN_FRAME_BYTES,
-  JOIN_REQUEST_TYPE, JOIN_ACCEPTED_TYPE, JOIN_REFUSED_TYPE, REKEY_TYPE, MEMBERSHIP_ENDED_TYPE,
+  JOIN_REQUEST_TYPE, JOIN_ACCEPTED_TYPE, JOIN_REFUSED_TYPE, REKEY_TYPE, MEMBERSHIP_ENDED_TYPE, POSTER_PASS_FRAME_TYPE,
 } from "./channel-join.js";
 export type {
-  ChannelJoinRequest, ChannelJoinAccepted, ChannelJoinRefused, ChannelRekey, ChannelMembershipEnded,
+  ChannelJoinRequest, ChannelJoinAccepted, ChannelJoinRefused, ChannelRekey, ChannelMembershipEnded, ChannelPosterPassFrame,
   ChannelJoinAccess, ChannelJoinRefusedReason, MembershipEndedReason, JoinDecodeReason, JoinDecodeResult,
 } from "./channel-join.js";
 

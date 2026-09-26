@@ -97,6 +97,22 @@ export interface ChannelHead {
 
 const hexOf = (b: Uint8Array): string => Buffer.from(b).toString("hex");
 
+/**
+ * 043-POSTERS: the log key a post belongs under. The admin's post (no pass) is keyed by the channel
+ * hex exactly as before; a poster's post by its LANE, `<channelHex>/<posterHex>`, so each poster
+ * numbers its own posts from 1 without colliding with the admin or another poster.
+ */
+export function laneKeyOf(post: { channel_pubkey: Uint8Array; agent_pubkey: Uint8Array; ext: unknown }): string {
+  const channelHex = hexOf(post.channel_pubkey);
+  return post.ext === null ? channelHex : `${channelHex}/${hexOf(post.agent_pubkey)}`;
+}
+
+/** The channel a log key names — the key itself for the admin lane, the part before `/` for a poster lane. */
+function channelOfKey(key: string): string {
+  const slash = key.indexOf("/");
+  return slash === -1 ? key : key.slice(0, slash);
+}
+
 export class ChannelLogStore {
   readonly #db: DaemonDatabase;
   readonly #logger: Logger;
@@ -155,8 +171,10 @@ export class ChannelLogStore {
       // Verification proves the post was signed by the keys it NAMES — it says nothing about which
       // channel's log it was handed to. Without this, a post signed by channel A files cleanly under
       // channel B: every check passes, and B's relay is later refilled with A's posts, which every
-      // subscriber of B rejects for a key mismatch with nothing in B's log saying why.
-      if (hexOf(post.channel_pubkey) !== channelPubkeyHex) {
+      // subscriber of B rejects for a key mismatch with nothing in B's log saying why. 043: the same
+      // holds per lane — a poster's post files only under its own lane, an admin post only under the
+      // channel.
+      if (laneKeyOf(post) !== channelPubkeyHex) {
         throw new ChannelLogError(
           "post_invalid",
           `the post is signed by channel ${hexOf(post.channel_pubkey).slice(0, 16)}, not ${channelPubkeyHex.slice(0, 16)}`,
@@ -221,7 +239,7 @@ export class ChannelLogStore {
       if (!decoded.ok) throw new ChannelLogError("post_invalid", `${decoded.reason}: ${decoded.detail}`);
       const verdict = verifyBroadcastArtifact(decoded.artifact);
       if (!verdict.ok) throw new ChannelLogError("post_invalid", verdict.reason);
-      if (hexOf(post.channel_pubkey) !== channelPubkeyHex) {
+      if (laneKeyOf(post) !== channelPubkeyHex) {
         throw new ChannelLogError(
           "post_invalid",
           `the post is signed by channel ${hexOf(post.channel_pubkey).slice(0, 16)}, not ${channelPubkeyHex.slice(0, 16)}`,
@@ -261,7 +279,8 @@ export class ChannelLogStore {
     const state = this.#state(channelPubkeyHex);
     // Same binding check as `append`: the receipt names its channel inside the relay's signature, and
     // a receipt for another channel filed here would sit in this log looking like proof.
-    if (hexOf(receipt.channel_pubkey) !== channelPubkeyHex) {
+    // A lane's receipt names the channel; the lane's post it binds to is checked by hash below.
+    if (hexOf(receipt.channel_pubkey) !== channelOfKey(channelPubkeyHex)) {
       throw new ChannelLogError(
         "receipt_invalid",
         `the receipt names channel ${hexOf(receipt.channel_pubkey).slice(0, 16)}, not ${channelPubkeyHex.slice(0, 16)}`,

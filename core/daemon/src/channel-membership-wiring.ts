@@ -22,6 +22,7 @@ import { generateGroupKey, wrapGroupKeyFor, deriveFetchKey, decryptBody, encrypt
 import { ChannelMembershipStore } from "./channel-membership-store.js";
 import { ChannelSubscriptionStore } from "./channel-subscription-store.js";
 import { ChannelConfigStore } from "./channel-config-store.js";
+import { ChannelPosterPassStore } from "./channel-poster-pass-store.js";
 import {
   createChannelJoinExchange, ensureCurrentGroupKey,
   type LocalChannelAdmin, type AdminLookupOutcome,
@@ -233,6 +234,7 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
   // Reads the `channel_config` table the publish half writes — for `channel info` on a channel this
   // daemon administers (035-INFOCLI item 1). Same table, read-only here.
   const channelConfig = new ChannelConfigStore(deps.getDb(), logger);
+  const posterPasses = new ChannelPosterPassStore(deps.getDb(), logger);
 
   /**
    * ⚠️ A CHANNEL IS AN AGENT THIS DAEMON HOLDS, looked up BY PUBKEY — the same rule the publisher
@@ -360,6 +362,8 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     onMembershipEnded: (agentId, channelHex, reason) => deps.notify.channelMembershipEnded(agentId, channelHex, reason),
     // 038-RETESTFIX Part B: a stored acceptance / public admission collects at once.
     collectNow: (agentId) => deps.collectNow(agentId),
+    // 043-POSTERS: a posting pass from the channel's stored admin is kept here.
+    posterPasses,
   });
 
   /**

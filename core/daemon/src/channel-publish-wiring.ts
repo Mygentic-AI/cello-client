@@ -26,6 +26,8 @@ import { ChannelRelayClient } from "./channel-relay-client.js";
 import { ChannelCollector } from "./channel-collector.js";
 import { createChannelFetchAuth } from "./channel-fetch-auth.js";
 import { ChannelSubscriptionStore } from "./channel-subscription-store.js";
+import { ChannelPosterPassStore } from "./channel-poster-pass-store.js";
+import { ChannelPosterPublisher } from "./channel-poster-publisher.js";
 import { ChannelInboxStore } from "./channel-inbox-store.js";
 import { createChannelCollectTicker } from "./channel-collect-tick.js";
 import { createChannelWakeSender } from "./channel-wake-sender.js";
@@ -47,6 +49,8 @@ export interface ChannelPublishWiringDeps {
   loadedAgents: ReadonlyArray<{ name: string; pubkey: string; keyProvider: KeyProvider }>;
   keyProviders: Map<string, KeyProvider>;
   resolveCurrentAgent: (connectionId: string, explicitAgent?: string) => string | null;
+  /** 043-POSTERS: agent name → the stable agent_id the pass and subscription rows are keyed on. */
+  resolveAgentId: (agentName: string) => string;
   /**
    * M16 019: the channel's current fetch key, signed, or undefined when this daemon holds no group
    * key for it. Injected rather than derived here so the membership half owns the group key and
@@ -109,9 +113,27 @@ export function wireChannelPublishing(
     return match ? match.keyProvider : null;
   };
 
+  // 043-POSTERS: publishing under a pass, for a channel this daemon does not hold the key to.
+  const posterPublisher = new ChannelPosterPublisher({
+    logger, log,
+    passes: new ChannelPosterPassStore(deps.getDb(), logger),
+    subscriptions: new ChannelSubscriptionStore(deps.getDb(), logger),
+    deposit: (addr, req) => relay.deposit(addr, { post_cbor: req.post_cbor }),
+    resolveAgentId: deps.resolveAgentId,
+    getAgentKey: (name) => keyProviders.get(name) ?? null,
+    screenOutbound: (bytes, ctx) =>
+      deps.screenOutbound(bytes, {
+        direction: "outbound",
+        agentName: ctx.agentName,
+        sessionId: `channel:${ctx.agentName}`,
+        ...(ctx.correlationId !== undefined ? { correlationId: ctx.correlationId } : {}),
+      }),
+  });
+
   const buildPublisher = (agentName: string): ChannelPublisher | null => {
     if (!keyProviders.has(agentName)) return null;
     return new ChannelPublisher({
+      poster: posterPublisher,
       logger,
       log,
       deposit: (addr, req) => relay.deposit(addr, {
