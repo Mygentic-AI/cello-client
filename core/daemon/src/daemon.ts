@@ -691,9 +691,7 @@ async function startDaemonHoldingLock(
     channelPosts: (id, ch, count, through, posters) => { const n = named(id); if (n !== null) notificationDispatcher.dispatchChannelPosts(n, ch, count, through, posters); },
     channelJoinAnswer: (id, ch, outcome, reason) => { const n = named(id); if (n !== null) notificationDispatcher.dispatchChannelJoinAnswer(n, ch, outcome, reason); },
     channelJoinRequest: (id, ch, sub) => { const n = named(id); if (n !== null) notificationDispatcher.dispatchChannelJoinRequest(n, ch, sub); },
-    // 038-RETESTFIX Part E: this agent was ejected, or its channel was deleted — its own doorbell.
     channelMembershipEnded: (id, ch, reason) => { const n = named(id); if (n !== null) notificationDispatcher.dispatchChannelMembershipEnded(n, ch, reason); },
-    // 044-POSTERBELL Part E3: this agent was removed as a poster — its own doorbell.
     channelPosterRemoved: (id, ch) => { const n = named(id); if (n !== null) notificationDispatcher.dispatchChannelPosterRemoved(n, ch); },
   };
 
