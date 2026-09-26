@@ -763,6 +763,20 @@ describe("M16 041-HELPTRUTH Part A — no agent lists every operator agent's cha
 });
 
 describe("M16 041-HELPTRUTH Part B — the list also carries the channels you RUN", () => {
+  it("a settings row under an ordinary agent's key, or a channel no longer held, is not listed", async () => {
+    const h = await listHarness();
+    const row = (admin: string) => ({
+      access: "public" as const, relays: [RELAY_A, RELAY_B], guidance: "", retention_seconds: 3600,
+      members_visible: false, admin_pubkey: admin,
+    });
+    h.config.set(h.chHex, row(h.a1Hex), Date.now());
+    h.config.set(h.a1Hex, row(h.a1Hex), Date.now()); // the agent's OWN key, as a pre-fix setup left
+    h.config.set("5e".repeat(32), row(h.a1Hex), Date.now()); // a deleted channel: no key held
+    h.setCurrent("Agent One");
+    const res = (await h.handlers.get("cello_channels")!({}, "conn-1")) as { channels: Array<Record<string, unknown>> };
+    expect(res.channels.filter((c) => c.role === "admin").map((c) => c.channel)).toEqual([h.chHex]);
+  });
+
   it("an agent that administers one channel and follows one subscription gets two rows, one per role", async () => {
     const h = await listHarness();
     const followed = "3c".repeat(32);

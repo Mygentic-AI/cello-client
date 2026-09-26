@@ -586,6 +586,10 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     const agentPubkey = deps.loadedAgents.find((a) => a.name === agentName)?.pubkey;
     if (agentPubkey !== undefined) {
       for (const c of channelConfig.listForAdmin(agentPubkey)) {
+        // Only a live channel identity: an ordinary agent's key (a setup mistake) or a deleted
+        // channel's key leaves a settings row behind that is not a channel anyone runs.
+        const holder = deps.loadedAgents.find((a) => a.pubkey.toLowerCase() === c.channel_pubkey.toLowerCase());
+        if (!holder || !deps.isChannelAgent(holder.name)) continue;
         rows.push({
           channel: c.channel_pubkey,
           // The channel identity's display name, looked up by its pubkey (never by name).

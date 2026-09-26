@@ -728,7 +728,7 @@ async function startDaemonHoldingLock(
     getDb: () => sessionNodeManager.getDb(),
     getNode: () => sessionNodeManager.getStandingReceiverNode() ?? null,
     screenOutbound: (content, ctx) => securityGateway.screenOutbound(content, ctx),
-    loadedAgents, keyProviders, resolveAgentId: (agentName) => sessionNodeManager.resolveAgentId(agentName), contactMoniker: (n, pk) => sessionNodeManager.getContactMoniker(n, pk),
+    loadedAgents, keyProviders, resolveAgentId: (agentName) => sessionNodeManager.resolveAgentId(agentName), contactMoniker: (n, pk) => sessionNodeManager.getContactMoniker(n, pk), isChannelAgent: channelAgentLookup(sessionNodeManager, logger),
     resolveCurrentAgent: (connectionId, explicitAgent) =>
       resolveCurrentAgent(perConnectionState.get(connectionId), explicitAgent),
     isAgentOnline: createIsAgentOnlineById({ onlineAgents, explicitlyOfflineAgents, agentNameForId: (id) => sessionNodeManager.agentNameForId(id) }),

@@ -290,13 +290,27 @@ describe("M16 024-CREATE Section C: the config create records is real, and publi
       loadedAgents,
       keyProviders,
       resolveCurrentAgent: (_connectionId, explicitAgent) => explicitAgent ?? "admin",
-      isAgentOnline: () => true,
+      isAgentOnline: () => true, isChannelAgent: (n: string) => n === "channel",
       activeMembers: () => [],
       signalingFor: () => null,
       notify: { channelPosts() {}, channelJoinAnswer() {}, channelJoinRequest() {} },
     });
     return handlers;
   }
+
+  it("setup refuses an ordinary agent's key (not_a_channel), and accepts the channel's own key", async () => {
+    const handlers = wire([RELAY_A, RELAY_B]);
+    const config = handlers.get("cello_channel_config")!;
+    const refused = (await config(
+      { agent: "admin", channel: adminPubkeyHex, access: "public", relays: [RELAY_A, RELAY_B] }, "conn1",
+    )) as Record<string, unknown>;
+    expect(refused["reason"]).toBe("not_a_channel");
+
+    const ok = (await config(
+      { agent: "admin", channel: channelPubkeyHex, access: "public", relays: [RELAY_A, RELAY_B] }, "conn1",
+    )) as Record<string, unknown>;
+    expect(ok["ok"]).toBe(true);
+  });
 
   it("create (separate admin) writes the real channel_config row with the directory's relays; publish is not channel_unknown afterwards", async () => {
     const handlers = wire([RELAY_A, RELAY_B]);
@@ -369,7 +383,7 @@ describe("M16 024-CREATE Section C: the config create records is real, and publi
       ],
       keyProviders: new Map<string, KeyProvider>([["admin", adminKp], ["channel", channelKp]]),
       resolveCurrentAgent: (_c, explicit) => explicit ?? "admin",
-      isAgentOnline: () => true, activeMembers: () => [], signalingFor: () => null,
+      isAgentOnline: () => true, isChannelAgent: (n: string) => n === "channel", activeMembers: () => [], signalingFor: () => null,
       notify: { channelPosts() {}, channelJoinAnswer() {}, channelJoinRequest() {} },
     });
 
@@ -436,7 +450,7 @@ describe("M16 024-CREATE item 6: a failed rollback is logged, not swallowed", ()
       screenOutbound: (content, ctx) => new PassthroughGatewayClient().screenOutbound(content, ctx),
       loadedAgents, keyProviders,
       resolveCurrentAgent: (_c, explicit) => explicit ?? "admin",
-      isAgentOnline: () => true, activeMembers: () => [], signalingFor: () => null,
+      isAgentOnline: () => true, isChannelAgent: (n: string) => n === "channel", activeMembers: () => [], signalingFor: () => null,
       notify: { channelPosts() {}, channelJoinAnswer() {}, channelJoinRequest() {} },
     });
 
@@ -471,7 +485,7 @@ describe("041 fix: the post count of a channel that has never published", () => 
       screenOutbound: (content, ctx) => new PassthroughGatewayClient().screenOutbound(content, ctx),
       loadedAgents: [], keyProviders: new Map<string, KeyProvider>(),
       resolveCurrentAgent: (_c, explicit) => explicit ?? "admin",
-      isAgentOnline: () => true, activeMembers: () => [], signalingFor: () => null,
+      isAgentOnline: () => true, isChannelAgent: (n: string) => n === "channel", activeMembers: () => [], signalingFor: () => null,
       notify: { channelPosts() {}, channelJoinAnswer() {}, channelJoinRequest() {} },
     });
     try {
@@ -527,7 +541,7 @@ describe("M16 024-CREATE item 4: the directory's refusal detail reaches the oper
       ],
       keyProviders: new Map<string, KeyProvider>([["admin", adminKp], ["channel", channelKp]]),
       resolveCurrentAgent: (_c, explicit) => explicit ?? "admin",
-      isAgentOnline: () => true, activeMembers: () => [], signalingFor: () => null,
+      isAgentOnline: () => true, isChannelAgent: (n: string) => n === "channel", activeMembers: () => [], signalingFor: () => null,
       notify: { channelPosts() {}, channelJoinAnswer() {}, channelJoinRequest() {} },
     });
 

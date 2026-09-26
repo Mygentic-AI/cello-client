@@ -52,6 +52,8 @@ export interface ChannelPublishWiringDeps {
   /** Every agent this daemon loaded, read per lookup so one added after boot is publishable. */
   loadedAgents: ReadonlyArray<{ name: string; pubkey: string; keyProvider: KeyProvider }>;
   keyProviders: Map<string, KeyProvider>;
+  /** Whether a loaded agent is a registered CHANNEL identity (not an ordinary agent). */
+  isChannelAgent: (agentName: string) => boolean;
   resolveCurrentAgent: (connectionId: string, explicitAgent?: string) => string | null;
   /** 043-POSTERS: agent name → the stable agent_id the pass and subscription rows are keyed on. */
   resolveAgentId: (agentName: string) => string;
@@ -227,7 +229,16 @@ export function wireChannelPublishing(
     if (channelKeyByPubkey(channelHex) === null) {
       return {
         ok: false, reason: "channel_key_not_held",
-        guidance: "This daemon does not hold that channel's key. A channel is an agent — create it with 'cello create-agent' and use its public key here.",
+        guidance: "This daemon does not hold that channel's key. Create a channel with 'cello channel create <name> <access>'.",
+      };
+    }
+    // An ordinary agent's key is held too, and accepting it stored channel settings under an agent
+    // that is no channel — which then showed in the channel list forever. Only a registered channel.
+    const holder = deps.loadedAgents.find((a) => a.pubkey.toLowerCase() === channelHex.toLowerCase());
+    if (!holder || !deps.isChannelAgent(holder.name)) {
+      return {
+        ok: false, reason: "not_a_channel",
+        guidance: "That key belongs to an agent, not a channel. Create a channel with 'cello channel create <name> <access>'.",
       };
     }
     if (!keyProviders.has(agentName)) {
