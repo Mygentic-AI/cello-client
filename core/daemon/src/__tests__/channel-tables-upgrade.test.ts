@@ -151,6 +151,42 @@ const CHANNEL_SUBSCRIPTION_KEYS_V1_SQL = `
   );
 `;
 
+/** channel_poster_passes (043-POSTERS) — born complete. */
+const CHANNEL_POSTER_PASSES_V1_SQL = `
+  CREATE TABLE IF NOT EXISTS channel_poster_passes (
+    agent_id        TEXT    NOT NULL,
+    channel_pubkey  TEXT    NOT NULL,
+    pass_cbor       BLOB    NOT NULL,
+    issued_at       INTEGER NOT NULL,
+    expires_at      INTEGER NOT NULL,
+    PRIMARY KEY (agent_id, channel_pubkey)
+  );
+`;
+
+/** channel_lane_positions (043-POSTERS) — born complete. */
+const CHANNEL_LANE_POSITIONS_V1_SQL = `
+  CREATE TABLE IF NOT EXISTS channel_lane_positions (
+    agent_id           TEXT    NOT NULL,
+    channel_pubkey     TEXT    NOT NULL,
+    lane_poster        TEXT    NOT NULL,
+    delivered_through  INTEGER NOT NULL DEFAULT 0,
+    processed_through  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (agent_id, channel_pubkey, lane_poster)
+  );
+`;
+
+/** channel_poster_grants (043-POSTERS) — born complete. */
+const CHANNEL_POSTER_GRANTS_V1_SQL = `
+  CREATE TABLE IF NOT EXISTS channel_poster_grants (
+    channel_pubkey  TEXT    NOT NULL,
+    poster_pubkey   TEXT    NOT NULL,
+    issued_at       INTEGER NOT NULL DEFAULT 0,
+    expires_at      INTEGER NOT NULL DEFAULT 0,
+    revoked_at      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (channel_pubkey, poster_pubkey)
+  );
+`;
+
 let dir: string;
 let db: DaemonDatabase;
 
@@ -430,6 +466,10 @@ const BASELINES: Record<string, { firstVersionSql: string; sentinels: string[] }
   channel_state: { firstVersionSql: CHANNEL_STATE_V1_SQL, sentinels: [] },
   channel_log_receipts: { firstVersionSql: CHANNEL_LOG_RECEIPTS_V1_SQL, sentinels: [] },
   channel_subscription_keys: { firstVersionSql: CHANNEL_SUBSCRIPTION_KEYS_V1_SQL, sentinels: [] },
+  // 043-POSTERS: three new tables, each born complete.
+  channel_poster_passes: { firstVersionSql: CHANNEL_POSTER_PASSES_V1_SQL, sentinels: [] },
+  channel_lane_positions: { firstVersionSql: CHANNEL_LANE_POSITIONS_V1_SQL, sentinels: [] },
+  channel_poster_grants: { firstVersionSql: CHANNEL_POSTER_GRANTS_V1_SQL, sentinels: [] },
 };
 
 describe("042-UPGRADE Part C guard: no channel table's CREATE SQL can gain an unhandled column", () => {

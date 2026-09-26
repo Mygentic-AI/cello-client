@@ -384,7 +384,7 @@ export function registerChannelPublishHandlers(deps: ChannelPublishDeps): void {
     if (raw !== undefined && (typeof raw !== "string" || raw.length === 0)) {
       return { ok: false, reason: "bad_relay", guidance: "Pass `relay` as a multiaddr, or leave it out to refill every relay." };
     }
-    const targets = typeof raw === "string" ? [raw] : publisher.relaysFor(channel.channelHex);
+    const targets = typeof raw === "string" ? [raw] : publisher.relaysFor(channel.channelHex, agent.agentName);
     if (targets.length === 0) {
       return {
         ok: false, reason: "channel_unknown",
@@ -407,6 +407,15 @@ export function registerChannelPublishHandlers(deps: ChannelPublishDeps): void {
         return {
           ok: false, reason: "key_unavailable",
           guidance: "This channel has no group key yet, so the relays cannot be told who may read it; admit a member first.",
+        };
+      }
+      // 043-POSTERS: a poster refilling its own lane needs a live pass and its own key.
+      if (result.refused === "no_posting_pass" || result.refused === "key_unavailable") {
+        return {
+          ok: false, reason: result.refused,
+          guidance: result.refused === "no_posting_pass"
+            ? "This agent holds no unexpired posting pass for that channel; the admin renews passes while online."
+            : "This agent's key is not loaded.",
         };
       }
       per.push({ relay: target, deposited: result.deposited });

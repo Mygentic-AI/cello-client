@@ -22,6 +22,10 @@ import { generateGroupKey, wrapGroupKeyFor, deriveFetchKey, decryptBody, encrypt
 import { ChannelMembershipStore } from "./channel-membership-store.js";
 import { ChannelSubscriptionStore } from "./channel-subscription-store.js";
 import { ChannelConfigStore } from "./channel-config-store.js";
+import { ChannelPosterPassStore } from "./channel-poster-pass-store.js";
+import { ChannelLanePositionStore } from "./channel-lane-position-store.js";
+import { ChannelPosterGrantStore } from "./channel-poster-grant-store.js";
+import { createChannelPostingAdmin } from "./channel-posting-admin.js";
 import {
   createChannelJoinExchange, ensureCurrentGroupKey,
   type LocalChannelAdmin, type AdminLookupOutcome,
@@ -44,7 +48,8 @@ type Handler = (params: Record<string, unknown> | undefined, connectionId: strin
  */
 export interface ChannelNotify {
   /** A collect pass advanced this agent's delivered position: `count` new posts, now at `through`. */
-  channelPosts: (agentId: string, channelHex: string, count: number, through: number) => void;
+  /** `posters` (043-POSTERS): who wrote, when the posts came from poster lanes. */
+  channelPosts: (agentId: string, channelHex: string, count: number, through: number, posters?: string[]) => void;
   /** This agent's own join request was answered. */
   channelJoinAnswer: (agentId: string, channelHex: string, outcome: "admitted" | "pending" | "refused", reason?: string) => void;
   /** A new pending request landed on an invite-only channel this agent administers. */
@@ -70,6 +75,10 @@ export interface ChannelMembershipWiringDeps {
   loadedAgents: ReadonlyArray<{ name: string; pubkey: string; keyProvider: KeyProvider }>;
   keyProviders: Map<string, KeyProvider>;
   resolveAgentId: (agentName: string) => string;
+  /** 043-POSTERS: re-deposit a channel's info record (late-bound to the publishing wiring). */
+  depositChannelInfo?: (agentName: string, channelHex: string) => Promise<unknown>;
+  /** 043-POSTERS: this agent's local moniker for a pubkey, or null — how a read names a post's writer. */
+  contactMoniker?: (agentName: string, pubkeyHex: string) => string | null;
   resolveCurrentAgent: (connectionId: string, explicitAgent?: string) => string | null;
   /**
    * 041-HELPTRUTH Part A: is this loaded agent a CHANNEL identity rather than an operator agent? A
@@ -233,6 +242,8 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
   // Reads the `channel_config` table the publish half writes — for `channel info` on a channel this
   // daemon administers (035-INFOCLI item 1). Same table, read-only here.
   const channelConfig = new ChannelConfigStore(deps.getDb(), logger);
+  const posterPasses = new ChannelPosterPassStore(deps.getDb(), logger);
+  const lanePositions = new ChannelLanePositionStore(deps.getDb(), logger);
 
   /**
    * ⚠️ A CHANNEL IS AN AGENT THIS DAEMON HOLDS, looked up BY PUBKEY — the same rule the publisher
@@ -310,6 +321,15 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
   const notifyMembershipEnded = async (
     agentName: string, memberPubkeyHex: string, channelPubkey: Uint8Array, reason: MembershipEndedReason,
   ): Promise<boolean> => {
+    return sendNoticeFrame(agentName, memberPubkeyHex, encodeChannelMembershipEnded({ channel_pubkey: channelPubkey, reason }));
+  };
+
+  /**
+   * Deliver one admin → member frame: ride an OPEN session if this daemon holds one, else open one
+   * and close it again. `false` = the member could not be reached. Shared by the membership-ended
+   * notice and 043's posting passes.
+   */
+  const sendNoticeFrame = async (agentName: string, memberPubkeyHex: string, frame: Uint8Array): Promise<boolean> => {
     let sessionId = openSessionWith(agentName, memberPubkeyHex);
     // ⚠️ A session THIS call opens just to deliver the notice must be CLOSED again — an opened,
     // never-closed session counts against the relay's per-pair cap of 5, and a channel with many
@@ -323,7 +343,7 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
       openedByUs = sessionId !== null;
     }
     if (sessionId === null) return false;
-    await deps.sendInSession(agentName, sessionId, encodeChannelMembershipEnded({ channel_pubkey: channelPubkey, reason }));
+    await deps.sendInSession(agentName, sessionId, frame);
     if (openedByUs) {
       // A normal SEALING close, through the same handler cello_close_session drives — so the notice
       // session is notarized and torn down, not left dangling. Registered at boot; a miss here would
@@ -344,8 +364,24 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     if (admin) deps.notify.channelJoinRequest(admin.agentId, channelHex, subscriberHex);
   };
 
+  // 043-POSTERS: the posting setting, listed posters, passes and their hourly renewal (the lease).
+  const postingAdmin = createChannelPostingAdmin({
+    logger, config: channelConfig, members, grants: new ChannelPosterGrantStore(deps.getDb(), logger),
+    channelKeyFor: (ch) => localChannelAdmin(ch)?.channelKeyProvider ?? null,
+    adminAgentNameFor: (ch) => {
+      const adminHex = members.settings(ch)?.admin_pubkey.toLowerCase();
+      return deps.loadedAgents.find((a) => a.pubkey.toLowerCase() === adminHex)?.name ?? null;
+    },
+    postingChannels: () => channelConfig.postingChannels(),
+    sendFrame: sendNoticeFrame,
+    depositInfo: (agentName, ch) => deps.depositChannelInfo?.(agentName, ch) ?? Promise.resolve(),
+  });
+  postingAdmin.start();
+
   /** Which agent a session belongs to, so the hook's answers go back down the right one. */
   const exchangeFor = (agentName: string) => createChannelJoinExchange({
+    // 043-POSTERS: `members` posting issues a pass the moment someone is admitted.
+    onAdmitted: (ch, sub) => { void postingAdmin.onAdmitted(ch, sub).catch(() => {}); },
     logger,
     members,
     subscriptions,
@@ -360,6 +396,8 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     onMembershipEnded: (agentId, channelHex, reason) => deps.notify.channelMembershipEnded(agentId, channelHex, reason),
     // 038-RETESTFIX Part B: a stored acceptance / public admission collects at once.
     collectNow: (agentId) => deps.collectNow(agentId),
+    // 043-POSTERS: a posting pass from the channel's stored admin is kept here.
+    posterPasses,
   });
 
   /**
@@ -420,6 +458,12 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     logger,
     subscriptions,
     inbox: new ChannelInboxStore(deps.getDb(), logger),
+    // 043-POSTERS: poster lanes are read from their own positions, and each post names its writer.
+    lanePositions,
+    posterName: (agentId, pubkeyHex) => {
+      const agent = deps.loadedAgents.find((a) => deps.resolveAgentId(a.name) === agentId);
+      return agent ? (deps.contactMoniker?.(agent.name, pubkeyHex) ?? null) : null;
+    },
     /**
      * ⚠️ **THE SAME SOURCE THE ADMIN CHECK USES, and the first version used a different one.** It
      * went straight to the directory, so joining a channel THIS daemon administers answered
@@ -525,7 +569,8 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
       delivered_through: s.delivered_through,
       processed_through: s.processed_through,
       // What the operator actually wants to know: how much is waiting.
-      unread: Math.max(0, s.delivered_through - s.processed_through),
+      // 043-POSTERS: the admin lane plus every poster lane.
+      unread: Math.max(0, s.delivered_through - s.processed_through) + lanePositions.unread(agentId, s.channel_pubkey),
       role: "member",
     }));
     // 041-HELPTRUTH Part B: channels this agent RUNS — the config rows whose admin is this agent's
@@ -712,6 +757,8 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
         channel_pubkey: channel.channelHex, member_pubkey: subscriber.toLowerCase(),
       });
     }
+    // 043-POSTERS: an ejected member's posting pass is revoked and never renewed.
+    await postingAdmin.onEjected(channel.channelHex, subscriber.toLowerCase());
 
     return {
       ok: true,
@@ -871,6 +918,34 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     const result = await exchangeFor(agent.agentName).approve(channel.channelHex, subscriber.toLowerCase(), sessionId);
     return result.ok ? { ok: true, channel: channel.channelHex } : { ok: false, reason: result.reason };
   });
+
+  // ─── 043-POSTERS: who may post ───────────────────────────────────────────────────────────────
+  handlers.set("cello_channel_posting", async (params, connectionId) => {
+    const agent = needAgent(deps, params, connectionId);
+    if (!agent.ok) return agent.answer;
+    const channel = needChannel(params);
+    if (!channel.ok) return channel.answer;
+    const lease = params?.["lease_days"];
+    return postingAdmin.setPosting(channel.channelHex, params?.["posting"] as "admin" | "listed" | "members",
+      typeof lease === "number" ? lease : undefined);
+  });
+
+  const posterVerb = async (
+    act: "add" | "remove", params: Record<string, unknown> | undefined, connectionId: string, poster: unknown,
+  ): Promise<unknown> => {
+    const agent = needAgent(deps, params, connectionId);
+    if (!agent.ok) return agent.answer;
+    const channel = needChannel(params);
+    if (!channel.ok) return channel.answer;
+    if (typeof poster !== "string" || !/^[0-9a-fA-F]{64}$/.test(poster)) {
+      return { ok: false, reason: "bad_poster", guidance: "Pass the agent's 64-character hex public key as `poster`." };
+    }
+    return act === "add"
+      ? postingAdmin.addPoster(channel.channelHex, poster.toLowerCase())
+      : postingAdmin.removePoster(channel.channelHex, poster.toLowerCase());
+  };
+  handlers.set("cello_channel_poster_add", (params, connectionId) => posterVerb("add", params, connectionId, params?.["poster"]));
+  handlers.set("cello_channel_poster_remove", (params, connectionId) => posterVerb("remove", params, connectionId, params?.["poster"]));
 
   handlers.set("cello_channel_refuse", async (params, connectionId) => {
     const agent = needAgent(deps, params, connectionId);

@@ -246,7 +246,7 @@ describe("016-CLIENTREWORK — the doubly-signed post", () => {
       ["body_too_large", withSlot(a, 6, new Uint8Array(MAX_BROADCAST_BODY_BYTES + 1))],
       ["bad_supersedes", withSlot(a, 7, a.seq)],
       ["bad_supersedes", withSlot(a, 7, 0)],
-      ["ext_not_null", withSlot(a, 8, 7)],
+      ["bad_ext", withSlot(a, 8, 7)],
       ["bad_signature_shape", withSlot(a, 9, new Uint8Array(63))],
       ["bad_signature_shape", withSlot(a, 10, new Uint8Array(63))],
       ["wrong_shape", floatSeq(a)],

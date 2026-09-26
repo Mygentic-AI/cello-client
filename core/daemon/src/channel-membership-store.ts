@@ -36,6 +36,7 @@ import type { ChannelAccess } from "@cello-protocol/protocol-types";
  * publisher's decisions about its own channel: that is this bug.
  */
 import { CHANNEL_CONFIG_CREATE_SQL, upgradeChannelConfigColumns } from "./channel-config-store.js";
+import { addColumnIfMissing } from "./column-birth.js";
 export { CHANNEL_CONFIG_CREATE_SQL };
 
 export const CHANNEL_MEMBERS_CREATE_SQL = `
@@ -108,6 +109,27 @@ export class ChannelMembershipStore {
     // ChannelConfigStore, so it upgrades the shared table itself — whichever opens first wins.
     upgradeChannelConfigColumns(this.#db, this.#logger);
     this.#db.exec(CHANNEL_MEMBERS_CREATE_SQL);
+    // 043-POSTERS: live daemons already hold channel_members without it.
+    addColumnIfMissing(this.#db, this.#logger, {
+      table: "channel_members", column: "can_post",
+      sql: "ALTER TABLE channel_members ADD COLUMN can_post INTEGER NOT NULL DEFAULT 0",
+    });
+  }
+
+  /** 043-POSTERS: name (or un-name) a member as a poster for `listed` posting. */
+  setCanPost(channelHex: string, subscriberHex: string, canPost: boolean): void {
+    this.#db
+      .prepare(`UPDATE channel_members SET can_post = ? WHERE channel_pubkey = ? AND subscriber_pubkey = ?`)
+      .run(canPost ? 1 : 0, channelHex.toLowerCase(), subscriberHex.toLowerCase());
+  }
+
+  /** 043-POSTERS: the ACTIVE members named as posters. */
+  canPostMembers(channelHex: string): string[] {
+    const rows = this.#db
+      .prepare(`SELECT subscriber_pubkey FROM channel_members
+                 WHERE channel_pubkey = ? AND status = 'active' AND can_post = 1 ORDER BY subscriber_pubkey ASC`)
+      .all(channelHex.toLowerCase()) as Array<{ subscriber_pubkey: string }>;
+    return rows.map((r) => r.subscriber_pubkey);
   }
 
   /** Create or update a channel's settings. Never touches `key_generation` — only an eject does. */

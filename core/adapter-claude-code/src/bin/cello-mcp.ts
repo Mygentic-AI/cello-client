@@ -1197,7 +1197,29 @@ server.tool("cello_channel_eject", "Remove a member and rotate the channel's key
 }, async ({ channel, subscriber, agent }) =>
   jsonText(await proxy.call("cello_channel_eject", { channel, subscriber, ...(agent ? { agent } : {}) })));
 
-server.tool("cello_channel_delete", "Delete a channel you administer, permanently. Every current and pending member is told the channel is gone (their subscription is marked `closed`, and earlier posts they hold stay readable); every post is pruned from BOTH relays; and the channel identity is retired. CANNOT BE UNDONE. The answer names how many members were notified, which were unreachable, and each relay's prune outcome. A member you could not reach is still removed — the channel is gone regardless of who was told.", {
+server.tool("cello_channel_posting", "Set who may post to a channel you administer: `admin` (just the admin — the default), `listed` (members you name with cello_channel_poster_add), or `members` (every active member). Posters receive a signed pass lasting `lease_days` (default 7), renewed by your daemon while it is online; switching to `admin` revokes every pass.", {
+  channel: channelKey(),
+  posting: z.enum(["admin", "listed", "members"]).describe("Who may post"),
+  lease_days: z.number().int().min(1).optional().describe("How long a posting pass lasts, in days (default 7)"),
+  agent: adminAgent(),
+}, async ({ channel, posting, lease_days, agent }) =>
+  jsonText(await proxy.call("cello_channel_posting", { channel, posting, ...(lease_days !== undefined ? { lease_days } : {}), ...(agent ? { agent } : {}) })));
+
+server.tool("cello_channel_poster_add", "Name an active member of a `listed` channel you administer as a poster; they are sent a posting pass. Not for public channels.", {
+  channel: channelKey(),
+  poster: z.string().describe("The member's 64-character hex public key"),
+  agent: adminAgent(),
+}, async ({ channel, poster, agent }) =>
+  jsonText(await proxy.call("cello_channel_poster_add", { channel, poster, ...(agent ? { agent } : {}) })));
+
+server.tool("cello_channel_poster_remove", "Stop an agent posting to a channel you administer: its pass is revoked in the channel's info record, so relays refuse its next post, and it is not renewed.", {
+  channel: channelKey(),
+  poster: z.string().describe("The agent's 64-character hex public key"),
+  agent: adminAgent(),
+}, async ({ channel, poster, agent }) =>
+  jsonText(await proxy.call("cello_channel_poster_remove", { channel, poster, ...(agent ? { agent } : {}) })));
+
+server.tool("cello_channel_delete","Delete a channel you administer, permanently. Every current and pending member is told the channel is gone (their subscription is marked `closed`, and earlier posts they hold stay readable); every post is pruned from BOTH relays; and the channel identity is retired. CANNOT BE UNDONE. The answer names how many members were notified, which were unreachable, and each relay's prune outcome. A member you could not reach is still removed — the channel is gone regardless of who was told.", {
   channel: channelKey(),
   agent: adminAgent(),
 }, async ({ channel, agent }) =>

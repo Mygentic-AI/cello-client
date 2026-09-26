@@ -15,7 +15,7 @@
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
 import { addColumnIfMissing } from "./column-birth.js";
-import type { ChannelAccess } from "@cello-protocol/protocol-types";
+import type { ChannelAccess, ChannelPosting } from "@cello-protocol/protocol-types";
 
 /** Seven days, matching the relay's own default retention. */
 export const DEFAULT_RETENTION_SECONDS = 7 * 24 * 60 * 60;
@@ -44,7 +44,10 @@ export const CHANNEL_CONFIG_CREATE_SQL = `
     -- The AGENT that admits members and answers join requests. Distinct from the channel key: the
     -- channel signs posts and never converses, the admin holds the sessions. Empty until set.
     admin_pubkey       TEXT    NOT NULL DEFAULT '',
-    updated_at         INTEGER NOT NULL
+    updated_at         INTEGER NOT NULL,
+    -- 043-POSTERS: who may post — admin | listed | members — and how long a posting pass lasts.
+    posting            TEXT    NOT NULL DEFAULT 'admin',
+    poster_lease_seconds INTEGER NOT NULL DEFAULT 604800
   );
 `;
 
@@ -74,6 +77,14 @@ export function upgradeChannelConfigColumns(db: DaemonDatabase, logger: Logger):
     table: "channel_config", column: "admin_pubkey",
     sql: "ALTER TABLE channel_config ADD COLUMN admin_pubkey TEXT NOT NULL DEFAULT ''",
   });
+  addColumnIfMissing(db, logger, {
+    table: "channel_config", column: "posting",
+    sql: "ALTER TABLE channel_config ADD COLUMN posting TEXT NOT NULL DEFAULT 'admin'",
+  });
+  addColumnIfMissing(db, logger, {
+    table: "channel_config", column: "poster_lease_seconds",
+    sql: "ALTER TABLE channel_config ADD COLUMN poster_lease_seconds INTEGER NOT NULL DEFAULT 604800",
+  });
 }
 
 export interface ChannelConfig {
@@ -84,6 +95,9 @@ export interface ChannelConfig {
   members_visible?: boolean;
   /** The agent that answers join requests. NOT the channel key — see the column comment. */
   admin_pubkey?: string;
+  /** 043-POSTERS: read-only here — changed only by `setPosting`, so a setup re-run never resets it. */
+  posting?: ChannelPosting;
+  poster_lease_seconds?: number;
 }
 
 export class ChannelConfigStore {
@@ -100,13 +114,13 @@ export class ChannelConfigStore {
   get(channelHex: string): ChannelConfig | null {
     const row = this.#db
       .prepare(
-        `SELECT access, relays, guidance, retention_seconds, members_visible, admin_pubkey
+        `SELECT access, relays, guidance, retention_seconds, members_visible, admin_pubkey, posting, poster_lease_seconds
            FROM channel_config WHERE channel_pubkey = ?`,
       )
       .get(channelHex.toLowerCase()) as
       | {
           access: string; relays: string; guidance: string; retention_seconds: number | bigint;
-          members_visible: number | bigint; admin_pubkey: string;
+          members_visible: number | bigint; admin_pubkey: string; posting: string; poster_lease_seconds: number | bigint;
         }
       | undefined;
     if (!row) return null;
@@ -128,7 +142,25 @@ export class ChannelConfigStore {
       retention_seconds: Number(row.retention_seconds),
       members_visible: Number(row.members_visible) === 1,
       admin_pubkey: row.admin_pubkey,
+      posting: row.posting as ChannelPosting,
+      poster_lease_seconds: Number(row.poster_lease_seconds),
     };
+  }
+
+  /** 043-POSTERS: the posting setting and pass lease. Its own writer, so `set` never resets it. */
+  setPosting(channelHex: string, posting: ChannelPosting, leaseSeconds: number): void {
+    this.#db
+      .prepare(`UPDATE channel_config SET posting = ?, poster_lease_seconds = ? WHERE channel_pubkey = ?`)
+      .run(posting, leaseSeconds, channelHex.toLowerCase());
+    this.#logger.info("channel.posting.set", { channel_pubkey: channelHex, posting, poster_lease_seconds: leaseSeconds });
+  }
+
+  /** 043-POSTERS: every channel whose posting is not `admin` — the ones whose passes are renewed. */
+  postingChannels(): string[] {
+    const rows = this.#db
+      .prepare(`SELECT channel_pubkey FROM channel_config WHERE posting != 'admin' ORDER BY channel_pubkey`)
+      .all() as Array<{ channel_pubkey: string }>;
+    return rows.map((r) => r.channel_pubkey);
   }
 
   /**

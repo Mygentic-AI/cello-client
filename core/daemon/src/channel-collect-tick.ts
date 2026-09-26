@@ -94,6 +94,11 @@ export interface ChannelCollectTickDeps {
   maxBackoffMs?: number;
   /** M16 021-WAKE: random spread on the RETRY path only. Set to 0 in a test that needs determinism. */
   retrySpreadMs?: number;
+  /**
+   * 043-POSTERS Part F: the admin's own channels' poster lanes, collected on this same schedule so
+   * the admin's daemon can ring members for a poster's post. Its failures are its own to log.
+   */
+  adminPass?: () => Promise<void>;
 }
 
 export interface ChannelCollectTicker {
@@ -186,6 +191,7 @@ export function createChannelCollectTicker(deps: ChannelCollectTickDeps): Channe
         inFlight.delete(key);
       }
     }
+    await deps.adminPass?.();
   }
 
   /**

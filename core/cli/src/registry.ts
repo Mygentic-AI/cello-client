@@ -431,6 +431,20 @@ const CHANNEL_DOCS: ReadonlyArray<{
       "starts sending them posts; 'refuse' turns the request down. <member> is their 64-character hex public key.",
   },
   {
+    verbs: [{ name: "posting", summary: "Set who may post: admin (just the admin), listed (members you name), or members (every member)." }],
+    usage: ["cello channel posting <channel> <admin|listed|members> [--lease-days N] [--agent <agent>]"],
+    paragraph:
+      "Choose who may post to a channel you run. A poster is given a signed pass lasting --lease-days (default 7).",
+  },
+  {
+    verbs: [{ name: "poster", summary: "Name (add) or un-name (remove) a member as a poster." }],
+    usage: [
+      "cello channel poster add <channel> <agent-pubkey> [--agent <agent>]",
+      "cello channel poster remove <channel> <agent-pubkey> [--agent <agent>]",
+    ],
+    paragraph: "Name a member of a listed channel as a poster, or remove a poster. <agent-pubkey> is their 64-character hex public key.",
+  },
+  {
     verbs: [{ name: "eject", summary: "Remove a member and rotate the key, so they stop receiving posts." }],
     usage: ["cello channel eject <channel> <member> [--agent <agent>]"],
     paragraph:
@@ -1787,6 +1801,17 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
           channel, access: a, relays: [b, ...rest],
           ...(guidanceFlag !== undefined ? { guidance: guidanceFlag } : {}),
         })));
+      }
+      // 043-POSTERS: who may post, and the listed posters.
+      if (sub === "posting" && channel && a !== undefined) {
+        const leaseDays = b === "--lease-days" ? Number(rest[0]) : undefined;
+        if (b !== undefined && (leaseDays === undefined || !Number.isSafeInteger(leaseDays))) return { stdout: helpForSpec("channel"), stderr: "", exitCode: 1 };
+        return legacy(await channelVerb(ctx.celloDir, "cello_channel_posting", withAgent({
+          channel, posting: a, ...(leaseDays !== undefined ? { lease_days: leaseDays } : {}),
+        })));
+      }
+      if (sub === "poster" && (channel === "add" || channel === "remove") && a !== undefined && b !== undefined) {
+        return legacy(await channelVerb(ctx.celloDir, `cello_channel_poster_${channel}`, withAgent({ channel: a, poster: b })));
       }
       if (sub === "publish" && channel && a !== undefined && b !== undefined) {
         return legacy(await channelVerb(ctx.celloDir, "cello_channel_publish", withAgent({ channel, title: a, body: b })));

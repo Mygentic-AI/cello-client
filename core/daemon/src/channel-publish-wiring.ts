@@ -26,6 +26,12 @@ import { ChannelRelayClient } from "./channel-relay-client.js";
 import { ChannelCollector } from "./channel-collector.js";
 import { createChannelFetchAuth } from "./channel-fetch-auth.js";
 import { ChannelSubscriptionStore } from "./channel-subscription-store.js";
+import { ChannelPosterPassStore } from "./channel-poster-pass-store.js";
+import { ChannelPosterPublisher } from "./channel-poster-publisher.js";
+import { ChannelLanePositionStore } from "./channel-lane-position-store.js";
+import { ChannelPosterGrantStore } from "./channel-poster-grant-store.js";
+import { postingInfoExt } from "./channel-posting-admin.js";
+import { createPosterDoorbell } from "./channel-poster-doorbell.js";
 import { ChannelInboxStore } from "./channel-inbox-store.js";
 import { createChannelCollectTicker } from "./channel-collect-tick.js";
 import { createChannelWakeSender } from "./channel-wake-sender.js";
@@ -47,6 +53,10 @@ export interface ChannelPublishWiringDeps {
   loadedAgents: ReadonlyArray<{ name: string; pubkey: string; keyProvider: KeyProvider }>;
   keyProviders: Map<string, KeyProvider>;
   resolveCurrentAgent: (connectionId: string, explicitAgent?: string) => string | null;
+  /** 043-POSTERS: agent name → the stable agent_id the pass and subscription rows are keyed on. */
+  resolveAgentId: (agentName: string) => string;
+  /** 043-POSTERS: this agent's local moniker for a pubkey, or null. */
+  contactMoniker?: (agentName: string, pubkeyHex: string) => string | null;
   /**
    * M16 019: the channel's current fetch key, signed, or undefined when this daemon holds no group
    * key for it. Injected rather than derived here so the membership half owns the group key and
@@ -86,6 +96,8 @@ export function wireChannelPublishing(
    * null when the log holds nothing. The membership half uses it for the post count on an admin row.
    */
   channelLastSeq: (channelHex: string) => number | null;
+  /** 043-POSTERS: sign and deposit a channel's info record (carrying its posting setting). */
+  depositInfo: (agentName: string, channelHex: string) => Promise<unknown>;
   /**
    * 041-HELPTRUTH Part C: the channel's signed info record as its relays hold it, tried in order and
    * the first that answers. Uses the relay client this half owns; the membership half verifies the
@@ -109,9 +121,28 @@ export function wireChannelPublishing(
     return match ? match.keyProvider : null;
   };
 
+  const grants = new ChannelPosterGrantStore(deps.getDb(), logger);
+  // 043-POSTERS: publishing under a pass, for a channel this daemon does not hold the key to.
+  const posterPublisher = new ChannelPosterPublisher({
+    logger, log,
+    passes: new ChannelPosterPassStore(deps.getDb(), logger),
+    subscriptions: new ChannelSubscriptionStore(deps.getDb(), logger),
+    deposit: (addr, req) => relay.deposit(addr, { post_cbor: req.post_cbor }),
+    resolveAgentId: deps.resolveAgentId,
+    getAgentKey: (name) => keyProviders.get(name) ?? null,
+    screenOutbound: (bytes, ctx) =>
+      deps.screenOutbound(bytes, {
+        direction: "outbound",
+        agentName: ctx.agentName,
+        sessionId: `channel:${ctx.agentName}`,
+        ...(ctx.correlationId !== undefined ? { correlationId: ctx.correlationId } : {}),
+      }),
+  });
+
   const buildPublisher = (agentName: string): ChannelPublisher | null => {
     if (!keyProviders.has(agentName)) return null;
     return new ChannelPublisher({
+      poster: posterPublisher,
       logger,
       log,
       deposit: (addr, req) => relay.deposit(addr, {
@@ -155,6 +186,8 @@ export function wireChannelPublishing(
        */
       encryptBody: deps.encryptBody,
       channelInfo: (channelHex) => config.get(channelHex),
+      // 043-POSTERS: the posting setting and revocations the info record carries.
+      postingExt: (channelHex) => postingInfoExt(config, grants, channelHex),
     });
   };
 
@@ -339,6 +372,9 @@ export function wireChannelPublishing(
     subscriptions,
     inbox,
     fetch: (addr, req) => relay.fetch(addr, req),
+    // 043-POSTERS: every poster lane, each from this member's own position in it.
+    lanes: (addr, req) => relay.lanes(addr, req),
+    lanePositions: new ChannelLanePositionStore(deps.getDb(), logger),
     /**
      * ⚠️ **THE MEMBER PROVES MEMBERSHIP ON EVERY FETCH.** Signs with the fetch key derived from the
      * member's newest held group key, which the relay verifies against the admin's deposited fetch
@@ -365,12 +401,30 @@ export function wireChannelPublishing(
     // M16 032-NOTICES: a collect that advanced the position rings the content-free channel_posts
     // doorbell. 038-RETESTFIX Part C: the collector now hands the COUNT of posts actually delivered
     // (not after − before, which over-counted across a pruned floor) and the new `through` position.
-    onDelivered: (agentId, channelHex, count, through) => deps.notify.channelPosts(agentId, channelHex, count, through),
+    onDelivered: (agentId, channelHex, count, through, posters) => deps.notify.channelPosts(agentId, channelHex, count, through, posters),
+    // 043-POSTERS: a poster's post names its writer — the local moniker, else a short key.
+    posterName: (agentId, pubkeyHex) => {
+      const a = deps.loadedAgents.find((x) => deps.resolveAgentId(x.name) === agentId);
+      return a ? (deps.contactMoniker?.(a.name, pubkeyHex) ?? null) : null;
+    },
   });
 
   const ticker = createChannelCollectTicker({
     logger, collector, subscriptions,
     isAgentOnline: deps.isAgentOnline,
+    // 043-POSTERS Part F: the admin's daemon rings members for its channels' poster posts.
+    adminPass: createPosterDoorbell({
+      logger,
+      collectPosterLanesAsAdmin: (id, ch, view) => collector.collectPosterLanesAsAdmin(id, ch, view),
+      postingChannels: () => config.postingChannels(),
+      channelConfig: (ch) => config.get(ch),
+      adminAgent: (adminHex) => {
+        const a = deps.loadedAgents.find((x) => x.pubkey.toLowerCase() === adminHex.toLowerCase());
+        return a ? { name: a.name, agentId: deps.resolveAgentId(a.name) } : null;
+      },
+      isAgentOnline: deps.isAgentOnline,
+      sendWake: (agentName, ch) => sendWake(agentName, ch),
+    }),
   });
   ticker.start();
 
@@ -402,6 +456,7 @@ export function wireChannelPublishing(
     // 041-HELPTRUTH Part C: fetch the channel's info record from its relays, first that answers. A
     // relay fault on one is not fatal — the next is tried; all silent is `null` (the caller falls
     // back to the stored description).
+    depositInfo: (agentName, channelHex) => depositChannelInfo({ getPublisher: buildPublisher }, agentName, channelHex),
     fetchInfo: async (relays, channelHex) => {
       const channelKey = new Uint8Array(Buffer.from(channelHex, "hex"));
       for (const addr of relays) {

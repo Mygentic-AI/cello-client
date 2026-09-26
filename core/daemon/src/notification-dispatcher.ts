@@ -232,9 +232,11 @@ export class NotificationDispatcher {
    */
 
   /** A collect pass advanced this agent's delivered position: `count` new posts, now `through`. */
-  dispatchChannelPosts(agentName: string, channelHex: string, count: number, through: number): void {
+  dispatchChannelPosts(agentName: string, channelHex: string, count: number, through: number, posters?: string[]): void {
     this.#dispatchToCurrent(agentName, "channel_posts", {
       agent: agentName, type: "channel_posts", channel: channelHex, count, through,
+      // 043-POSTERS: a poster's post names who wrote it (a local moniker or a short key — no content).
+      ...(posters !== undefined && posters.length > 0 ? { posters } : {}),
     });
   }
 

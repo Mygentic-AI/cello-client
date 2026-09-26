@@ -17,6 +17,7 @@ import {
   broadcastPostHash,
   decodeBroadcastArtifact,
   encodeBroadcastArtifact,
+  decodeRelayPostReceipt,
   type BroadcastArtifact,
 } from "@cello-protocol/protocol-types";
 
@@ -89,6 +90,30 @@ export class ChannelInboxStore {
       )
       .all(agentId, channelHex.toLowerCase(), fromSeq, toSeq) as Array<{ seq: number | bigint; post_cbor: Uint8Array }>;
     return rows.map((r) => this.#decode(Number(r.seq), new Uint8Array(r.post_cbor)));
+  }
+
+  /**
+   * 043-POSTERS: posts in [fromSeq, toSeq] with the time the relay RECEIVED each — its signed
+   * receipt's `received_at`, or `collected_at` when the post came without a receipt. This is what a
+   * read merges several lanes by.
+   */
+  rangeTimed(agentId: string, channelHex: string, fromSeq: number, toSeq: number): Array<{ post: BroadcastArtifact; received_at: number }> {
+    const rows = this.#db
+      .prepare(
+        `SELECT seq, post_cbor, receipt_cbor, collected_at FROM channel_inbox
+          WHERE agent_id = ? AND channel_pubkey = ? AND seq BETWEEN ? AND ?
+          ORDER BY seq ASC, post_hash ASC`,
+      )
+      .all(agentId, channelHex.toLowerCase(), fromSeq, toSeq) as Array<{
+        seq: number | bigint; post_cbor: Uint8Array; receipt_cbor: Uint8Array | null; collected_at: number | bigint;
+      }>;
+    return rows.map((r) => {
+      const receipt = r.receipt_cbor ? decodeRelayPostReceipt(new Uint8Array(r.receipt_cbor)) : null;
+      return {
+        post: this.#decode(Number(r.seq), new Uint8Array(r.post_cbor)),
+        received_at: receipt?.ok ? receipt.receipt.received_at : Number(r.collected_at),
+      };
+    });
   }
 
   /** Every version held at one number. Length > 1 is a fork. */

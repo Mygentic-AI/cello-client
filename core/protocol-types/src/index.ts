@@ -42,9 +42,12 @@ export {
   encodeBroadcastArtifact,
   decodeBroadcastArtifact,
   verifyBroadcastArtifact,
+  signPosterPost,
+  posterPassOf,
 } from "./broadcast-artifact.js";
 export type {
   BroadcastArtifact,
+  BroadcastExt,
   BroadcastDecodeReason,
   BroadcastVerifyReason,
   BroadcastVerifyResult,
@@ -395,8 +398,23 @@ export {
   encodeChannelInfo,
   decodeChannelInfo,
   verifyChannelInfo,
+  channelPostingOf,
 } from "./channel-info.js";
-export type { ChannelInfo, ChannelAccess, ChannelInfoDecodeReason } from "./channel-info.js";
+export type {
+  ChannelInfo, ChannelAccess, ChannelInfoDecodeReason, ChannelPosting, ChannelInfoExt, ChannelPosterRevocation,
+} from "./channel-info.js";
+// M16 / 043-POSTERS — the channel-signed, expiring posting pass another agent posts under.
+export {
+  CHANNEL_POSTER_PASS_DOMAIN,
+  buildChannelPosterPassTbs,
+  signChannelPosterPass,
+  encodeChannelPosterPass,
+  decodeChannelPosterPass,
+  verifyPosterPass,
+} from "./channel-poster-pass.js";
+export type {
+  ChannelPosterPass, ChannelPosterPassDecodeReason, ChannelPosterPassVerifyResult,
+} from "./channel-poster-pass.js";
 // M16 019-MEMBERSHIP: the join exchange. These travel inside an ordinary sealed session with the
 // channel's ADMIN — a channel never converses itself.
 export {
@@ -405,13 +423,14 @@ export {
   encodeChannelJoinRefused, decodeChannelJoinRefused,
   encodeChannelRekey, decodeChannelRekey,
   encodeChannelMembershipEnded, decodeChannelMembershipEnded,
+  encodeChannelPosterPassFrame, decodeChannelPosterPassFrame,
   isChannelJoinFrame,
   channelJoinFrameType,
   MAX_JOIN_NOTE_CHARS, MAX_JOIN_GUIDANCE_CHARS, MAX_JOIN_RELAYS, MAX_JOIN_FRAME_BYTES,
-  JOIN_REQUEST_TYPE, JOIN_ACCEPTED_TYPE, JOIN_REFUSED_TYPE, REKEY_TYPE, MEMBERSHIP_ENDED_TYPE,
+  JOIN_REQUEST_TYPE, JOIN_ACCEPTED_TYPE, JOIN_REFUSED_TYPE, REKEY_TYPE, MEMBERSHIP_ENDED_TYPE, POSTER_PASS_FRAME_TYPE,
 } from "./channel-join.js";
 export type {
-  ChannelJoinRequest, ChannelJoinAccepted, ChannelJoinRefused, ChannelRekey, ChannelMembershipEnded,
+  ChannelJoinRequest, ChannelJoinAccepted, ChannelJoinRefused, ChannelRekey, ChannelMembershipEnded, ChannelPosterPassFrame,
   ChannelJoinAccess, ChannelJoinRefusedReason, MembershipEndedReason, JoinDecodeReason, JoinDecodeResult,
 } from "./channel-join.js";
 

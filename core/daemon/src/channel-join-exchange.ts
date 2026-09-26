@@ -25,7 +25,7 @@
  */
 import {
   decodeChannelJoinRequest, decodeChannelJoinAccepted, decodeChannelJoinRefused, decodeChannelRekey,
-  decodeChannelMembershipEnded,
+  decodeChannelMembershipEnded, decodeChannelPosterPassFrame, verifyPosterPass,
   encodeChannelJoinAccepted, encodeChannelJoinRefused, encodeChannelRekey,
   isChannelJoinFrame,
   type ChannelJoinRefusedReason, type MembershipEndedReason,
@@ -37,6 +37,7 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import type { Logger } from "./types.js";
 import type { ChannelMembershipStore } from "./channel-membership-store.js";
 import type { ChannelSubscriptionStore } from "./channel-subscription-store.js";
+import type { ChannelPosterPassStore } from "./channel-poster-pass-store.js";
 import { extractErrorMessage } from "./error-message.js";
 
 /** What this daemon knows about a channel it administers. `null` means it does not administer one. */
@@ -95,6 +96,10 @@ export interface ChannelJoinExchangeDeps {
    * skipped — MUST NOT CHANGE item 2). Optional and additive: absent, the exchange behaves as before.
    */
   collectNow?: (agentId: string) => void;
+  /** 043-POSTERS: a member was admitted (and sent its key) — `members` posting issues it a pass. */
+  onAdmitted?: (channelHex: string, subscriberHex: string) => void;
+  /** 043-POSTERS: where a posting pass from the channel's stored admin is kept. Absent → passes are refused. */
+  posterPasses?: ChannelPosterPassStore;
   now?: () => number;
 }
 
@@ -102,7 +107,7 @@ export type SubscriberJoinResult =
   | { ok: true; channelHex: string; generation: number }
   | {
       ok: false;
-      reason: "not_a_join_frame" | "malformed" | "not_admin_of_channel" | "admin_unresolved" | "key_unwrap_failed" | "no_key_provider" | "refused_by_admin" | "membership_ended" | "not_subscribed";
+      reason: "not_a_join_frame" | "malformed" | "not_admin_of_channel" | "admin_unresolved" | "key_unwrap_failed" | "no_key_provider" | "refused_by_admin" | "membership_ended" | "not_subscribed" | "pass_invalid";
       /**
        * M16 021-WAKE item 21: WHY, when the reason alone cannot say.
        *
@@ -314,7 +319,8 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
       // repeat, so this admits a first-time reader.
       if (settings.access === "open" || settings.access === "public") {
         members.admit(channelHex, namedSubscriber, "active", now());
-        await acceptInto(sessionId, channelHex, namedSubscriber, admin);
+        const accepted = await acceptInto(sessionId, channelHex, namedSubscriber, admin);
+        if (accepted.ok) deps.onAdmitted?.(channelHex, namedSubscriber);
         return { consumed: true };
       }
 
@@ -328,6 +334,36 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
 
     async onSubscriberFrame(agentId, sessionId, counterpartyHex, content): Promise<SubscriberJoinResult> {
       if (!isChannelJoinFrame(content)) return { ok: false, reason: "not_a_join_frame" };
+
+      /**
+       * 043-POSTERS: a POSTING PASS. Same rule as a re-key: ONLY the channel's STORED admin may send
+       * one — the session proves who the peer is, not that they administer the channel. The pass
+       * must also verify against the channel key and name THIS agent; anything else stores nothing.
+       */
+      const passFrame = decodeChannelPosterPassFrame(content);
+      if (passFrame.ok) {
+        const pass = passFrame.frame.pass;
+        const passChannelHex = Buffer.from(pass.channel_pubkey).toString("hex");
+        const sub = subscriptions.get(agentId, passChannelHex);
+        if (sub === null) {
+          logger.warn("channel.poster_pass.refused", { channel_pubkey: passChannelHex, sender: counterpartyHex, reason: "not_subscribed" });
+          return { ok: false, reason: "not_subscribed" };
+        }
+        if (sub.admin_pubkey.toLowerCase() !== counterpartyHex.toLowerCase()) {
+          logger.warn("channel.poster_pass.refused", { channel_pubkey: passChannelHex, sender: counterpartyHex, reason: "not_admin_of_channel" });
+          return { ok: false, reason: "not_admin_of_channel" };
+        }
+        const myKey = deps.keyProviderFor(agentId);
+        const mine = myKey ? Buffer.from(await myKey.getPublicKey()).toString("hex") : null;
+        if (!verifyPosterPass(pass, pass.channel_pubkey).ok || mine !== Buffer.from(pass.poster_pubkey).toString("hex") || !deps.posterPasses) {
+          logger.warn("channel.poster_pass.refused", { channel_pubkey: passChannelHex, sender: counterpartyHex, reason: "pass_invalid" });
+          return { ok: false, reason: "pass_invalid" };
+        }
+        deps.posterPasses.put(agentId, passChannelHex, {
+          pass_cbor: passFrame.frame.pass_cbor, issued_at: pass.issued_at, expires_at: pass.expires_at,
+        });
+        return { ok: true, channelHex: passChannelHex, generation: 0 };
+      }
 
       /**
        * An acceptance OR a re-key. Narrowed into two locals rather than kept as a pair of results,
@@ -513,7 +549,9 @@ export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): Channe
       }
       // The delivery's verdict is the ANSWER. Reporting `ok` regardless told an admin they had
       // admitted somebody who in fact received nothing.
-      return acceptInto(sessionId, channelHex, subscriberHex, admin);
+      const accepted = await acceptInto(sessionId, channelHex, subscriberHex, admin);
+      if (accepted.ok) deps.onAdmitted?.(channelHex, subscriberHex);
+      return accepted;
     },
 
     async refuse(channelHex, subscriberHex, sessionId): Promise<{ ok: true } | { ok: false; reason: string }> {
