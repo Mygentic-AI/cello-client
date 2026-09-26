@@ -42,9 +42,12 @@ export {
   encodeBroadcastArtifact,
   decodeBroadcastArtifact,
   verifyBroadcastArtifact,
+  signPosterPost,
+  posterPassOf,
 } from "./broadcast-artifact.js";
 export type {
   BroadcastArtifact,
+  BroadcastExt,
   BroadcastDecodeReason,
   BroadcastVerifyReason,
   BroadcastVerifyResult,
@@ -395,8 +398,23 @@ export {
   encodeChannelInfo,
   decodeChannelInfo,
   verifyChannelInfo,
+  channelPostingOf,
 } from "./channel-info.js";
-export type { ChannelInfo, ChannelAccess, ChannelInfoDecodeReason } from "./channel-info.js";
+export type {
+  ChannelInfo, ChannelAccess, ChannelInfoDecodeReason, ChannelPosting, ChannelInfoExt, ChannelPosterRevocation,
+} from "./channel-info.js";
+// M16 / 043-POSTERS — the channel-signed, expiring posting pass another agent posts under.
+export {
+  CHANNEL_POSTER_PASS_DOMAIN,
+  buildChannelPosterPassTbs,
+  signChannelPosterPass,
+  encodeChannelPosterPass,
+  decodeChannelPosterPass,
+  verifyPosterPass,
+} from "./channel-poster-pass.js";
+export type {
+  ChannelPosterPass, ChannelPosterPassDecodeReason, ChannelPosterPassVerifyResult,
+} from "./channel-poster-pass.js";
 // M16 019-MEMBERSHIP: the join exchange. These travel inside an ordinary sealed session with the
 // channel's ADMIN — a channel never converses itself.
 export {
