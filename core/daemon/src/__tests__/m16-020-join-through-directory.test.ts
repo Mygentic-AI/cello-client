@@ -437,9 +437,7 @@ describe("M16 046-JOINBELL — joining is records plus a ring, never a session",
     w.setAdminOffline(true);
     await w.joinAs();
     await settle();
-    // The joiner rings ONCE: a backstop tick sends no second ring (the 046 re-ring is gone).
-    await vi.advanceTimersByTimeAsync(NOTICE_BACKSTOP_TICK_MS);
-    await settle();
+    // The joiner rings ONCE (test 16 proves a backstop tick adds no second ring).
     expect(w.joinRings()).toBe(1);
     expect(w.notified.filter((n) => n.event === "request")).toEqual([]);
     // The admin comes back: its reconnect lists the channel's waiting requests and is alerted at once.
@@ -459,6 +457,21 @@ describe("M16 046-JOINBELL — joining is records plus a ring, never a session",
     await settle();
     expect(w.subs.get(SUB_ID, w.channelHex)?.status).toBe("active");
     expect(w.notified.filter((n) => n.event === "answer").map((n) => n.outcome)).toContain("admitted");
+    expect(w.joinRings()).toBe(1);
+    w.close();
+  });
+
+  it("16. 047 an always-online admin whose ring was lost sees the request on the next backstop tick, with no re-ring", async () => {
+    const w = await joinWorld({ access: "invite_only" });
+    await w.publishRelayRecord();
+    w.setAdminOffline(true); // the directory acks the ring but it reaches nobody: the ring is lost
+    await w.joinAs();
+    await settle();
+    w.setAdminOffline(false);
+    expect(w.notified.filter((n) => n.event === "request")).toEqual([]);
+    await vi.advanceTimersByTimeAsync(NOTICE_BACKSTOP_TICK_MS);
+    await settle();
+    expect(w.notified.filter((n) => n.event === "request")).toEqual([{ event: "request", agentId: ADMIN_ID, channel: w.channelHex, subscriber: w.joinerHex }]);
     expect(w.joinRings()).toBe(1);
     w.close();
   });

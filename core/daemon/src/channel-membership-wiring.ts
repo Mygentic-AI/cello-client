@@ -459,6 +459,13 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     };
     try {
       joinAdmin.sweepLapsed(members.administeredChannels());
+      // 047: an always-online admin whose one ring was lost still hears the request — one list per
+      // administered channel per tick, no rings. Skips channels whose admin agent is switched off.
+      const pullable = members.administeredChannels().filter((ch) => {
+        const a = localChannelAdmin(ch);
+        return a !== null && deps.noticeTransport().isAgentOnline(a.agentId);
+      });
+      if (pullable.length > 0) joinAdmin.pullRequests(pullable).catch(tickFailed);
       const agentIds = new Set([...subscriptions.active().map((s) => s.agent_id), ...joinRequests.agentsWithRequests()]);
       for (const agentId of agentIds) {
         if (!deps.noticeTransport().isAgentOnline(agentId)) continue;
