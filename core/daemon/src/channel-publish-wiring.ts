@@ -15,7 +15,7 @@ import type { CelloNode } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { ScreenContext, ScreenVerdict } from "@cello-protocol/gateway";
 import { Buffer } from "node:buffer";
-import { decodeChannelInfo, verifyChannelInfo, type ChannelPosterRevocation } from "@cello-protocol/protocol-types";
+import { buildChannelJoinListTbs, decodeChannelInfo, verifyChannelInfo, type ChannelPosterRevocation } from "@cello-protocol/protocol-types";
 import { registerChannelPublishHandlers, recordChannelConfig, depositChannelInfo } from "./channel-publish-handlers.js";
 import { registerChannelCreateHandler } from "./channel-create-handler.js";
 import { extractErrorMessage } from "./error-message.js";
@@ -116,6 +116,8 @@ export function wireChannelPublishing(
   depositJoin: (relays: string[], record: Uint8Array) => Promise<{ accepted: number; refusals: string[] }>;
   /** 046-JOINBELL: every join slot record the relays hold at a slot. */
   fetchJoins: (relays: string[], slot: Uint8Array) => Promise<Uint8Array[]>;
+  /** 047-JOINPULL: every waiting join record the relays hold for a channel, listed under a channel-key signature. */
+  listJoins: (relays: string[], channelHex: string, sign: (tbs: Uint8Array) => Promise<Uint8Array>) => Promise<Uint8Array[]>;
   /** 045-NOTICEBELL: ring named members about a notice, on the admin agent's own directory stream. */
   ringMembers: (adminAgentName: string, channelHex: string, members: string[]) => Promise<boolean>;
   /** The kill-switch check this half collects under — shared so the notice backstop honours it too. */
@@ -567,6 +569,24 @@ export function wireChannelPublishing(
           if (record !== null) out.push(record);
         } catch {
           // One relay unreachable must not hide a request the other holds.
+        }
+      }
+      return out;
+    },
+    listJoins: async (relays, channelHex, sign) => {
+      const channelPubkey = new Uint8Array(Buffer.from(channelHex, "hex"));
+      const out: Uint8Array[] = [];
+      for (const addr of relays) {
+        try {
+          const challenge = await relay.joinChallenge(addr, channelPubkey);
+          if (!challenge.ok) { logger.warn("channel.join.list_refused", { relay: addr, channel_pubkey: channelHex, reason: challenge.reason }); continue; }
+          const signature = await sign(buildChannelJoinListTbs(channelPubkey, challenge.nonce));
+          const res = await relay.listJoins(addr, { channel_pubkey: channelPubkey, nonce: challenge.nonce, signature });
+          if (res.ok) out.push(...res.records);
+          else logger.warn("channel.join.list_refused", { relay: addr, channel_pubkey: channelHex, reason: res.reason });
+        } catch (err: unknown) {
+          // One relay unreachable must not hide a request the other holds.
+          logger.warn("channel.join.list_failed", { relay: addr, channel_pubkey: channelHex, reason: extractErrorMessage(err) });
         }
       }
       return out;

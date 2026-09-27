@@ -195,6 +195,11 @@ export interface JoinRelays {
   fetchJoin: (relays: string[], slot: Uint8Array) => Promise<Uint8Array[]>;
   /** The channel's info record from its relays, or null. */
   fetchInfo: (relays: string[], channelHex: string) => Promise<Uint8Array | null>;
+  /**
+   * 047-JOINPULL: every waiting join slot record the relays hold for this channel. Each relay issues
+   * a one-time nonce and `sign` signs its preimage with the CHANNEL key. Never throws.
+   */
+  listJoins: (relays: string[], channelHex: string, sign: (tbs: Uint8Array) => Promise<Uint8Array>) => Promise<Uint8Array[]>;
 }
 
 /** The directory, as the joiner sees it. */
@@ -324,19 +329,9 @@ export function createChannelJoiner(deps: ChannelJoinerDeps) {
     return { ok: true };
   }
 
-  /**
-   * The ring is transient: an admin offline at that instant never hears it, and the hashed slot means
-   * it cannot look for one. So every outstanding request is rung again on the backstop tick until it
-   * is answered or lapses. A repeat of the same record is silent at the admin (nagging guard).
-   */
-  async function reRing(agentName: string, agentId: string): Promise<void> {
-    for (const o of deps.requests.forAgent(agentId)) {
-      const rung = await deps.directory.ring(agentName, o.channel_pubkey);
-      if (!rung.ok) logger.warn("channel.join.ring_failed", { channel_pubkey: o.channel_pubkey, reason: rung.reason });
-    }
-  }
-
-  return { join, withdraw, reRing };
+  // 047-JOINPULL: the joiner rings ONCE. An admin offline at that instant lists the channel's waiting
+  // requests itself when it reconnects (`pullRequests` below) — there is no re-ring.
+  return { join, withdraw };
 }
 
 /**
@@ -567,5 +562,39 @@ export function createChannelJoinAdmin(deps: ChannelJoinAdminDeps) {
     }
   }
 
-  return { onBell, approve, refuse, sweepLapsed };
+  /**
+   * 047-JOINPULL: on reconnect, list each channel's waiting join requests from its relays (signed
+   * with the channel key over each relay's nonce), open each one to learn who asked, and handle it
+   * exactly as a ring would. The nagging guard in `onBell` keeps an already-seen request silent.
+   * Never throws.
+   */
+  async function pullRequests(channelHexes: string[]): Promise<void> {
+    for (const channelHex of channelHexes) {
+      const admin = deps.localChannelAdmin(channelHex);
+      const settings = members.settings(channelHex);
+      if (!admin || !settings || settings.relays.length === 0 || !admin.adminKeyProvider.openContentSeal) continue;
+      try {
+        const records = await deps.relays.listJoins(settings.relays, channelHex, (tbs) => admin.channelKeyProvider.sign(tbs));
+        const joiners = new Set<string>();
+        for (const bytes of records) {
+          const d = decodeChannelJoinSlotRecord(bytes);
+          if (!d.ok || hexOf(d.record.channel_pubkey) !== channelHex) { reject(channelHex, "join_slot", d.ok ? "wrong_slot" : d.reason); continue; }
+          const inner = await admin.adminKeyProvider.openContentSeal(d.record.sealed);
+          if (!inner) { reject(channelHex, "join_request", "not_sealed_to_admin"); continue; }
+          const asRequest = decodeChannelJoinRequest(inner);
+          const asWithdrawal = asRequest.ok ? null : decodeChannelJoinWithdrawal(inner);
+          const joiner = asRequest.ok ? asRequest.request.joiner_pubkey : asWithdrawal?.ok ? asWithdrawal.withdrawal.joiner_pubkey : null;
+          if (!joiner) { reject(channelHex, "join_request", asRequest.ok ? "wrong_shape" : asRequest.reason); continue; }
+          joiners.add(hexOf(joiner));
+        }
+        logger.info("channel.join.pulled", { channel_pubkey: channelHex, records: records.length, joiners: joiners.size });
+        // onBell re-reads the joiner's own slot and verifies the signature there — one check path.
+        for (const joinerHex of joiners) await onBell(channelHex, joinerHex);
+      } catch (err: unknown) {
+        logger.warn("channel.join.pull_failed", { channel_pubkey: channelHex, reason: extractErrorMessage(err) });
+      }
+    }
+  }
+
+  return { onBell, approve, refuse, sweepLapsed, pullRequests };
 }

@@ -15,10 +15,11 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { generateKeypair, sealToRecipient, type InMemoryKeyProvider } from "@cello-protocol/crypto";
+import { generateKeypair, sealToRecipient, verify, type InMemoryKeyProvider } from "@cello-protocol/crypto";
 import {
   signBroadcastArtifact, decodeChannelNotice, channelNoticeSlot, signChannelNotice, encodeChannelNotice,
   signChannelInfo, encodeChannelInfo, decodeChannelJoinSlotRecord, signChannelJoinAnswer, encodeChannelJoinAnswer,
+  buildChannelJoinListTbs,
 } from "@cello-protocol/protocol-types";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import type { DaemonDatabase } from "../sqlcipher-db.js";
@@ -93,6 +94,10 @@ async function joinWorld(opts: { access: "open" | "invite_only" | "public"; rete
   let adminOffline = false;
   let relayJoinRefusal: string | null = null;
   const rings: string[] = [];
+  // 047: the joiner's directory stream is down — the admin's ring about its answer reaches nobody.
+  let joinerOffline = false;
+  let joinRingCount = 0;
+  let joinLists = 0;
 
   // ── The two daemons' notify recorders (start empty) ──────────────────────────────────────────
   const notified: Notify[] = [];
@@ -119,10 +124,19 @@ async function joinWorld(opts: { access: "open" | "invite_only" | "public"; rete
       return Promise.resolve({ accepted: 2, refusals: [] });
     },
     fetchJoins: (_r: string[], slot: Uint8Array) => Promise.resolve(joinSlots.has(hex(slot)) ? [joinSlots.get(hex(slot))!] : []),
+    // 047: the relay serves the channel's waiting requests only to a signature by the CHANNEL key
+    // over its fresh nonce — anything else lists nothing.
+    listJoins: async (_r: string[], ch: string, sign: (tbs: Uint8Array) => Promise<Uint8Array>) => {
+      joinLists += 1;
+      const nonce = new Uint8Array(32).map(() => Math.floor(Math.random() * 256));
+      const tbs = buildChannelJoinListTbs(new Uint8Array(Buffer.from(ch, "hex")), nonce);
+      if (!verify(new Uint8Array(Buffer.from(ch, "hex")), tbs, await sign(tbs))) return [];
+      return [...joinSlots.values()].filter((r) => { const d = decodeChannelJoinSlotRecord(r); return d.ok && hex(d.record.channel_pubkey) === ch; });
+    },
     // The admin rings the joiner: the joiner's daemon reads its notices, as its wake does.
     ringMembers: (_agent: string, _ch: string, members: string[]) => {
       rings.push(...members);
-      if (members.includes(joinerHex)) void wiringRef()?.checkNotices(SUB_ID);
+      if (members.includes(joinerHex) && !joinerOffline) void wiringRef()?.checkNotices(SUB_ID);
       return Promise.resolve(true);
     },
     isAgentOnline: () => true,
@@ -180,6 +194,7 @@ async function joinWorld(opts: { access: "open" | "invite_only" | "public"; rete
         else reply({ type: "channel_admin_result", registered: true, channel: true, admin_pubkey: adminHex, ...(relayRecord ? { relay_record: relayRecord } : {}) });
       }
       if (f["type"] === "channel_join_ring") {
+        joinRingCount += 1;
         if (ringRefusal) { reply({ type: "channel_join_ring_error", reason: ringRefusal }); }
         else {
           // The directory rings the admin, naming the joiner it AUTHENTICATED — then acks.
@@ -221,6 +236,9 @@ async function joinWorld(opts: { access: "open" | "invite_only" | "public"; rete
     setRingRefusal: (r: string | null) => { ringRefusal = r; },
     setAdminOffline: (v: boolean) => { adminOffline = v; },
     setRelayJoinRefusal: (r: string | null) => { relayJoinRefusal = r; },
+    setJoinerOffline: (v: boolean) => { joinerOffline = v; },
+    joinRings: () => joinRingCount,
+    joinLists: () => joinLists,
     close: () => { joinerWiring?.stop(); adminWiring.stop(); },
   };
 }
@@ -413,17 +431,43 @@ describe("M16 046-JOINBELL — joining is records plus a ring, never a session",
     w.close();
   });
 
-  it("14. an admin OFFLINE at the first ring still hears the request: the joiner re-rings on its backstop tick", async () => {
-    const w = await joinWorld({ access: "open" });
+  it("14. 047 perfect bad sync: admin offline at the ring, joiner offline at the answer — each side's reconnect completes it, one ring total", async () => {
+    const w = await joinWorld({ access: "invite_only" });
     await w.publishRelayRecord();
     w.setAdminOffline(true);
     await w.joinAs();
     await settle();
-    expect(w.subs.get(SUB_ID, w.channelHex)).toBeNull();
-    w.setAdminOffline(false);
+    // The joiner rings ONCE: a backstop tick sends no second ring (the 046 re-ring is gone).
     await vi.advanceTimersByTimeAsync(NOTICE_BACKSTOP_TICK_MS);
     await settle();
+    expect(w.joinRings()).toBe(1);
+    expect(w.notified.filter((n) => n.event === "request")).toEqual([]);
+    // The admin comes back: its reconnect lists the channel's waiting requests and is alerted at once.
+    w.setAdminOffline(false);
+    w.setJoinerOffline(true);
+    w.adminWiring.onReconnect(ADMIN_NAME);
+    await settle();
+    expect(w.joinLists()).toBe(1);
+    expect(w.notified.filter((n) => n.event === "request")).toEqual([{ event: "request", agentId: ADMIN_ID, channel: w.channelHex, subscriber: w.joinerHex }]);
+    const approved = (await w.adminHandlers.get("cello_channel_approve")!({ channel: w.channelHex, subscriber: w.joinerHex }, "c")) as Record<string, unknown>;
+    expect(approved["ok"]).toBe(true);
+    await settle();
+    expect(w.subs.get(SUB_ID, w.channelHex)?.status ?? null).toBeNull();
+    // The joiner comes back: its reconnect reads its answer slot and it is admitted at once.
+    w.setJoinerOffline(false);
+    w.joinerWiring!.onReconnect(SUB_NAME);
+    await settle();
     expect(w.subs.get(SUB_ID, w.channelHex)?.status).toBe("active");
+    expect(w.notified.filter((n) => n.event === "answer").map((n) => n.outcome)).toContain("admitted");
+    expect(w.joinRings()).toBe(1);
+    w.close();
+  });
+
+  it("15. 047 a reconnect of an agent that administers no channel lists nothing", async () => {
+    const w = await joinWorld({ access: "open" });
+    w.joinerWiring!.onReconnect(SUB_NAME);
+    await settle();
+    expect(w.joinLists()).toBe(0);
     w.close();
   });
 

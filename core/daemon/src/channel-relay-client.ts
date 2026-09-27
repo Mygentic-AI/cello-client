@@ -246,6 +246,24 @@ export class ChannelRelayClient {
     return answer["record"] instanceof Uint8Array ? answer["record"] : null;
   }
 
+  /** 047-JOINPULL: a one-time nonce to sign for a join list, or a refusal. */
+  async joinChallenge(relayAddr: string, channelPubkey: Uint8Array): Promise<{ ok: true; nonce: Uint8Array } | { ok: false; reason: string }> {
+    const answer = await this.request(relayAddr, { type: "channel_join_challenge", channel_pubkey: channelPubkey });
+    if (answer["type"] === "channel_join_challenge_result" && answer["nonce"] instanceof Uint8Array) return { ok: true, nonce: answer["nonce"] };
+    return { ok: false, reason: typeof answer["reason"] === "string" ? answer["reason"] : "unexpected_answer" };
+  }
+
+  /** 047-JOINPULL: every waiting join slot record for a channel, under a channel-key signature over the nonce. */
+  async listJoins(relayAddr: string, req: { channel_pubkey: Uint8Array; nonce: Uint8Array; signature: Uint8Array }): Promise<
+    { ok: true; records: Uint8Array[] } | { ok: false; reason: string }
+  > {
+    const answer = await this.request(relayAddr, { type: "channel_join_list", ...req });
+    if (answer["type"] === "channel_join_list_result" && Array.isArray(answer["records"])) {
+      return { ok: true, records: (answer["records"] as unknown[]).filter((r): r is Uint8Array => r instanceof Uint8Array) };
+    }
+    return { ok: false, reason: typeof answer["reason"] === "string" ? answer["reason"] : "unexpected_answer" };
+  }
+
   /** The channel's info record as this relay holds it, or null. */
   async info(relayAddr: string, channelPubkey: Uint8Array): Promise<Uint8Array | null> {
     const answer = await this.request(relayAddr, { type: "channel_info", channel_pubkey: channelPubkey });

@@ -135,6 +135,8 @@ export interface ChannelMembershipWiringDeps {
     /** 046-JOINBELL: the join slot halves, same relay client. */
     depositJoin: (relays: string[], record: Uint8Array) => Promise<{ accepted: number; refusals: string[] }>;
     fetchJoins: (relays: string[], slot: Uint8Array) => Promise<Uint8Array[]>;
+    /** 047-JOINPULL: the channel's waiting join records, listed under a channel-key signature. */
+    listJoins: (relays: string[], channelHex: string, sign: (tbs: Uint8Array) => Promise<Uint8Array>) => Promise<Uint8Array[]>;
     ringMembers: (adminAgentName: string, channelHex: string, members: string[]) => Promise<boolean>;
     /** The kill switch: the notice ring and backstop skip an agent the operator switched off. */
     isAgentOnline: (agentId: string) => boolean;
@@ -225,6 +227,8 @@ export interface ChannelMembershipWiring {
   checkNotices: (agentId: string) => Promise<void>;
   /** M16 046-JOINBELL: the directory rang this admin: `joinerHex` asked to join `channelHex`. */
   onJoinBell: (channelHex: string, joinerHex: string) => Promise<void>;
+  /** 047-JOINPULL: an agent's directory connection came up — pull join requests (admin) and answers/notices (joiner). */
+  onReconnect: (agentName: string) => void;
   /**
    * The same, from the raw `channel_join_bell` frame. The ring names a channel and a joiner and is
    * trusted for nothing else: a malformed one is dropped, and a forged one reads an empty slot.
@@ -391,6 +395,7 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     depositJoin: (relays: string[], record: Uint8Array) => deps.noticeTransport().depositJoin(relays, record),
     fetchJoin: (relays: string[], slot: Uint8Array) => deps.noticeTransport().fetchJoins(relays, slot),
     fetchInfo: (relays: string[], ch: string) => deps.fetchChannelInfo(relays, ch),
+    listJoins: (relays: string[], ch: string, sign: (tbs: Uint8Array) => Promise<Uint8Array>) => deps.noticeTransport().listJoins(relays, ch, sign),
   };
 
   /** M16 046-JOINBELL — the admin half: a ring names a joiner; read the slot, decide, answer, ring back. */
@@ -458,9 +463,6 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
       for (const agentId of agentIds) {
         if (!deps.noticeTransport().isAgentOnline(agentId)) continue;
         noticeReader.checkNotices(agentId).catch(tickFailed);
-        // 046: re-ring each outstanding join request — an admin offline at the first ring hears this one.
-        const name = deps.loadedAgents.find((a) => deps.resolveAgentId(a.name) === agentId)?.name;
-        if (name) joiner.reRing(name, agentId).catch(tickFailed);
       }
     } catch (err: unknown) {
       tickFailed(err);
@@ -965,6 +967,19 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     // The kill switch holds here too: a ring for a switched-off agent reads nothing.
     checkNotices: (agentId: string) => (deps.noticeTransport().isAgentOnline(agentId) ? noticeReader.checkNotices(agentId) : Promise.resolve()),
     onJoinBell: (channelHex: string, joinerHex: string) => joinAdmin.onBell(channelHex, joinerHex),
+    /**
+     * 047-JOINPULL: this agent's directory connection just came up (first connect or any reconnect).
+     * As joiner: read every followed channel's notices and every pending request's answer slot. As
+     * admin: list each channel it administers for waiting join requests. Never throws.
+     */
+    onReconnect: (agentName: string): void => {
+      const agentId = deps.resolveAgentId(agentName);
+      if (!agentId || !deps.noticeTransport().isAgentOnline(agentId)) return;
+      const failed = (err: unknown): void => { logger.warn("channel.reconnect.check_failed", { reason: extractErrorMessage(err) }); };
+      noticeReader.checkNotices(agentId).catch(failed);
+      const mine = members.administeredChannels().filter((ch) => localChannelAdmin(ch)?.agentId === agentId);
+      if (mine.length > 0) joinAdmin.pullRequests(mine).catch(failed);
+    },
     onJoinBellFrame: (frame: Record<string, unknown>) => {
       const asHex = (v: unknown): string | null => (v instanceof Uint8Array && v.length === 32 ? Buffer.from(v).toString("hex") : null);
       const channelHex = asHex(frame["channel_pubkey"]);

@@ -293,6 +293,7 @@ async function startDaemonHoldingLock(
    */
   let channelCollectNow: ((agentId: string) => void) | null = null;
   let channelJoinBell: ((frame: Record<string, unknown>) => void) | null = null; // 046: late-bound like the collector
+  let channelReconnect: ((agentName: string) => void) | undefined; // 047: late-bound like the join bell
 
   // 040-DAEMONROOT unit 5: per-agent directory signaling → signaling-wiring.ts.
   const {
@@ -322,6 +323,7 @@ async function startDaemonHoldingLock(
     // is not it.)
     getWirePerAgentSessionInbound: () => wirePerAgentSessionInbound,
     getHandleTrustSignalPickup: () => handleTrustSignalPickup, getSweepTrustSignals: () => sweepTrustSignalsAndTick,
+    getOnChannelReconnect: () => channelReconnect,
     // M16 021-WAKE: the doorbell, resolved to the stable agent id the subscriptions are keyed by.
     onChannelWake: (agentName: string) => {
       channelCollectNow?.(sessionNodeManager.resolveAgentId(agentName));
@@ -738,6 +740,7 @@ async function startDaemonHoldingLock(
   });
 
   channelJoinBell = (frame): void => { void channelMembership.onJoinBellFrame(frame); }; // 046: never throws
+  channelReconnect = channelMembership.onReconnect; // 047: each side checks the moment it reconnects
   // M16 021-WAKE: now the collector exists, the doorbell has somewhere to ring.
   channelCollectNow = (agentId: string): void => {
     void channelWiring.collectNow(agentId).catch((err: unknown) => {
