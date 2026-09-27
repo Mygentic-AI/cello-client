@@ -20,8 +20,9 @@ import { encodeCbor, decodeCbor } from "./cbor.js";
 export const CHANNEL_NOTICE_DOMAIN = "cello-channel-notice-v1";
 export const CHANNEL_NOTICE_SLOT_DOMAIN = "cello-channel-notice-slot-v1";
 
-export type ChannelNoticeType = "pass" | "eject" | "group_key";
-export const CHANNEL_NOTICE_TYPES: readonly ChannelNoticeType[] = ["pass", "eject", "group_key"];
+/** `join_answer` (046-JOINBELL): the admin's answer to this agent's join request. */
+export type ChannelNoticeType = "pass" | "eject" | "group_key" | "join_answer";
+export const CHANNEL_NOTICE_TYPES: readonly ChannelNoticeType[] = ["pass", "eject", "group_key", "join_answer"];
 
 /**
  * The fixed maximum size of a notice's SEALED body, per type. A pass carries the member list (32
@@ -31,6 +32,7 @@ export const CHANNEL_NOTICE_MAX_SEALED_BYTES: Readonly<Record<ChannelNoticeType,
   pass: 64 * 1024,
   eject: 256,
   group_key: 1024,
+  join_answer: 2048,
 };
 
 const PUBKEY_BYTES = 32;

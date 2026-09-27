@@ -1,215 +1,114 @@
 /**
- * M16 019-MEMBERSHIP Part B — the join frames.
+ * M16 / 046-JOINBELL — joining a channel is records plus a ring, never a session.
  *
- * A channel never converses, but its ADMIN is an ordinary agent, so joining is a typed exchange
- * inside a normal sealed session with that admin. No new transport, no relay frames — these are the
- * four shapes that travel on the session content channel.
- *
- * Written before the implementation. These cover the FRAMES; the admin-side and subscriber-side
- * decisions they carry are tested against the daemon.
+ * Three records: the joiner's signed request (sealed to the admin, held in a hashed join slot), the
+ * channel-key-signed answer (carried in the joiner's 045 notice slot), and the channel-key-signed
+ * relay record the directory holds so a stranger can find the relays. Strict CBOR everywhere.
+ * Tests are RED-first.
  */
-import { describe, it, expect } from "vitest";
-import {
-  encodeChannelJoinRequest, decodeChannelJoinRequest,
-  encodeChannelJoinAccepted, decodeChannelJoinAccepted,
-  encodeChannelJoinRefused, decodeChannelJoinRefused,
-  isChannelJoinFrame,
-  channelJoinFrameType,
-  MAX_JOIN_NOTE_CHARS,
-  MAX_JOIN_FRAME_BYTES,
-  JOIN_REQUEST_TYPE, JOIN_ACCEPTED_TYPE, JOIN_REFUSED_TYPE,
-} from "../channel-join.js";
+
+import { setupV3Tests, describe, it, expect } from "@claude-flow/testing";
+import { generateKeypair } from "@cello-protocol/crypto";
 import { encodeCbor } from "../cbor.js";
+import {
+  channelJoinSlot, signChannelJoinRequest, encodeChannelJoinRequest, decodeChannelJoinRequest,
+  verifyChannelJoinRequest, encodeChannelJoinSlotRecord, decodeChannelJoinSlotRecord,
+  signChannelJoinAnswer, encodeChannelJoinAnswer, decodeChannelJoinAnswer, verifyChannelJoinAnswer,
+  JOIN_REQUEST_DOMAIN, JOIN_ANSWER_DOMAIN, MAX_JOIN_NOTE_CHARS, MAX_JOIN_SEALED_BYTES,
+} from "../channel-join.js";
+import {
+  signChannelRelayRecord, encodeChannelRelayRecord, decodeChannelRelayRecord, verifyChannelRelayRecord,
+  CHANNEL_RELAY_RECORD_DOMAIN, CHANNEL_DISCOVERY_KEYS,
+} from "../channel-relay-record.js";
+import { CHANNEL_NOTICE_TYPES } from "../channel-notice.js";
 
-const CHANNEL = new Uint8Array(Buffer.alloc(32, 0xa1));
-const SUBSCRIBER = new Uint8Array(Buffer.alloc(32, 0xb2));
-const BUNDLE = new Uint8Array(Buffer.alloc(120, 0xc3));
-const RELAY_A = "/dns4/relay-a.example/tcp/443/tls/ws/p2p/12D3KooWJXHpnWQhGk3jXBJYdXMmeLxEhRqzwZCYd1bxSUh4pg83";
-const RELAY_B = "/dns4/relay-b.example/tcp/443/tls/ws/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X";
+setupV3Tests();
 
-describe("M16 019 Part B — the join frames", () => {
-  it("a join request round-trips, and the note is bounded", () => {
-    const bytes = encodeChannelJoinRequest({
-      channel_pubkey: CHANNEL, subscriber_pubkey: SUBSCRIBER, note: "I work with Andre",
-    });
-    const decoded = decodeChannelJoinRequest(bytes);
-    expect(decoded.ok, decoded.ok ? "" : decoded.reason).toBe(true);
-    if (!decoded.ok) return;
-    expect(Buffer.from(decoded.frame.subscriber_pubkey).equals(Buffer.from(SUBSCRIBER))).toBe(true);
-    expect(decoded.frame.note).toBe("I work with Andre");
+const hex = (b: Uint8Array): string => Buffer.from(b).toString("hex");
 
-    // ⚠️ The note is shown to a human admin deciding whether to admit a stranger. An unbounded one
-    // is a wall of text in a terminal, and control characters can rewrite what they appear to say.
-    const long = "x".repeat(MAX_JOIN_NOTE_CHARS + 1);
-    expect(() => encodeChannelJoinRequest({ channel_pubkey: CHANNEL, subscriber_pubkey: SUBSCRIBER, note: long }))
-      .toThrow(/bad_note/);
-    expect(() => encodeChannelJoinRequest({ channel_pubkey: CHANNEL, subscriber_pubkey: SUBSCRIBER, note: "ab" }))
-      .toThrow(/bad_note/);
+describe("046-JOINBELL join request", () => {
+  it("round-trips, verifies against the joiner key, and a tampered note fails verification", async () => {
+    const joiner = generateKeypair(); const channel = generateKeypair();
+    const req = await signChannelJoinRequest(joiner, { channel_pubkey: await channel.getPublicKey(), note: "hi, it is Ana", signed_at: 5 });
+    const decoded = decodeChannelJoinRequest(encodeChannelJoinRequest(req));
+    expect(decoded.ok && hex(decoded.request.joiner_pubkey)).toBe(hex(await joiner.getPublicKey()));
+    expect(decoded.ok && verifyChannelJoinRequest(decoded.request)).toBe(true);
+    expect(verifyChannelJoinRequest({ ...req, note: "hi, it is Bob" })).toBe(false);
   });
 
-  it("an acceptance carries the key bundle, the relay pair, guidance and retention", () => {
-    const bytes = encodeChannelJoinAccepted({
-      channel_pubkey: CHANNEL, key_bundle: BUNDLE, guidance: "release notes",
-      retention_seconds: 7 * 24 * 3600, access: "invite_only",
-      relays: [RELAY_A, RELAY_B], members_visible: false,
-    });
-    const decoded = decodeChannelJoinAccepted(bytes);
-    expect(decoded.ok, decoded.ok ? "" : decoded.reason).toBe(true);
-    if (!decoded.ok) return;
-    // Everything a subscriber needs to start reading arrives in ONE frame: without the relays it
-    // knows the channel's name and cannot fetch a thing.
-    expect(decoded.frame.relays).toEqual([RELAY_A, RELAY_B]);
-    expect(decoded.frame.retention_seconds).toBe(7 * 24 * 3600);
-    expect(Buffer.from(decoded.frame.key_bundle).equals(Buffer.from(BUNDLE))).toBe(true);
-    expect(decoded.frame.access).toBe("invite_only");
+  it("refuses a note with a control character or over the cap, and a wrong-shape array", async () => {
+    const joiner = generateKeypair(); const channel = generateKeypair();
+    const ch = await channel.getPublicKey();
+    await expect(signChannelJoinRequest(joiner, { channel_pubkey: ch, note: "a\u0007b", signed_at: 1 })).rejects.toThrow(/bad_note/);
+    await expect(signChannelJoinRequest(joiner, { channel_pubkey: ch, note: "x".repeat(MAX_JOIN_NOTE_CHARS + 1), signed_at: 1 })).rejects.toThrow(/bad_note/);
+    const bad = decodeChannelJoinRequest(encodeCbor([JOIN_REQUEST_DOMAIN, ch, ch, "n", 1]));
+    expect(bad.ok ? "ok" : bad.reason).toBe("wrong_shape");
   });
 
-  it("036-PUBLICSUB test 1: a PUBLIC acceptance carries an EMPTY bundle and round-trips; OPEN with an empty bundle is refused", () => {
-    // A public channel's posts are not encrypted, so admission carries no key — the bundle MUST be
-    // empty. The relays, guidance and retention still travel: that is what lets the reader fetch.
-    const bytes = encodeChannelJoinAccepted({
-      channel_pubkey: CHANNEL, key_bundle: new Uint8Array(0), guidance: "the bulletin",
-      retention_seconds: 3600, access: "public", relays: [RELAY_A, RELAY_B], members_visible: true,
-    });
-    const decoded = decodeChannelJoinAccepted(bytes);
-    expect(decoded.ok, decoded.ok ? "" : decoded.reason).toBe(true);
-    if (!decoded.ok) return;
-    expect(decoded.frame.access).toBe("public");
-    expect(decoded.frame.key_bundle.length).toBe(0);
-    expect(decoded.frame.relays).toEqual([RELAY_A, RELAY_B]);
-    expect(decoded.frame.guidance).toBe("the bulletin");
-
-    // ⚠️ The empty bundle is legal ONLY for public. An OPEN or invite-only channel has a key, so an
-    // empty bundle would be an acceptance that admits without one — refused at both encode and decode.
-    expect(() => encodeChannelJoinAccepted({
-      channel_pubkey: CHANNEL, key_bundle: new Uint8Array(0), guidance: "", retention_seconds: 3600,
-      access: "open", relays: [RELAY_A], members_visible: false,
-    })).toThrow(/bad_key_bundle/);
-    const openEmpty = encodeCbor([JOIN_ACCEPTED_TYPE, CHANNEL, new Uint8Array(0), "", 3600, "open", [RELAY_A], false]);
-    expect(decodeChannelJoinAccepted(openEmpty).ok).toBe(false);
+  it("the join slot is the same from both sides, per joiner, and never equals a notice slot's domain", async () => {
+    const joiner = generateKeypair(); const channel = generateKeypair(); const other = generateKeypair();
+    const a = (await channel.staticSharedSecret(await joiner.getPublicKey()))!;
+    const b = (await joiner.staticSharedSecret(await channel.getPublicKey()))!;
+    const c = (await channel.staticSharedSecret(await other.getPublicKey()))!;
+    expect(hex(channelJoinSlot(a))).toBe(hex(channelJoinSlot(b)));
+    expect(hex(channelJoinSlot(a))).not.toBe(hex(channelJoinSlot(c)));
   });
 
-  it("036-PUBLICSUB test 2: a PUBLIC acceptance carrying a NON-EMPTY bundle is refused", () => {
-    // Public posts have no key, so a non-empty bundle on a public acceptance is a key for a channel
-    // that has none — a frame the subscriber must not act on. Refused at encode and at decode.
-    expect(() => encodeChannelJoinAccepted({
-      channel_pubkey: CHANNEL, key_bundle: BUNDLE, guidance: "", retention_seconds: 3600,
-      access: "public", relays: [RELAY_A], members_visible: false,
-    })).toThrow(/bad_key_bundle/);
-    const publicWithKey = encodeCbor([JOIN_ACCEPTED_TYPE, CHANNEL, BUNDLE, "", 3600, "public", [RELAY_A], false]);
-    expect(decodeChannelJoinAccepted(publicWithKey).ok).toBe(false);
-  });
-
-  it("every refusal reason is carried by name", () => {
-    // 038-RETESTFIX Part E: `ejected` STAYS a refusal reason (the admin refusing an ejected member's
-    // re-request). `channel_closed` is gone — a deleted channel is never a refusal; its news is the
-    // directory's revocation plus a ring (045-NOTICEBELL).
-    for (const reason of [
-      "not_admin_of_channel", "pending_approval", "refused_by_admin", "already_member", "ejected",
-    ] as const) {
-      const decoded = decodeChannelJoinRefused(encodeChannelJoinRefused({ channel_pubkey: CHANNEL, reason }));
-      expect(decoded.ok && decoded.frame.reason).toBe(reason);
-    }
-    // `channel_closed` no longer decodes as a refusal — it belongs to the membership-ended frame.
-    expect(decodeChannelJoinRefused(encodeCbor([JOIN_REFUSED_TYPE, CHANNEL, "channel_closed"])).ok,
-      "channel_closed is no longer a refusal reason").toBe(false);
-    // ⚠️ AN UNKNOWN REASON IS REFUSED, not passed through. These are shown to an operator, and a
-    // reason invented by the far side would put its words on our screen.
-    expect(decodeChannelJoinRefused(encodeChannelJoinRefused({
-      channel_pubkey: CHANNEL, reason: "made_up" as "already_member",
-    })).ok).toBe(false);
-  });
-
-  it("a conversation message is NEVER classified as a join frame", () => {
-    /**
-     * ⚠️ THE SAME PROPERTY THE DOCUMENT ROUTER RESTS ON. These frames share the session content
-     * channel with what people actually say, so misclassification in one direction puts CBOR in a
-     * transcript and in the other makes a person's message vanish. A message is UTF-8 by
-     * construction; these frames begin with a CBOR array header, which is not a valid UTF-8 start.
-     */
-    for (const message of ["hello", "Bonjour, ça va?", "مرحبا", "你好", "{\"looks\":\"structured\"}"]) {
-      expect(isChannelJoinFrame(new TextEncoder().encode(message))).toBe(false);
-    }
-    // And the real frames ARE classified.
-    expect(isChannelJoinFrame(encodeChannelJoinRequest({
-      channel_pubkey: CHANNEL, subscriber_pubkey: SUBSCRIBER, note: "",
-    }))).toBe(true);
-  });
-
-  it("garbage never throws and never decodes", () => {
-    for (const junk of [new Uint8Array(0), new Uint8Array([0xff]), new Uint8Array(Buffer.alloc(40, 0x9f))]) {
-      expect(decodeChannelJoinRequest(junk).ok).toBe(false);
-      expect(decodeChannelJoinAccepted(junk).ok).toBe(false);
-      expect(decodeChannelJoinRefused(junk).ok).toBe(false);
-      expect(isChannelJoinFrame(junk)).toBe(false);
-    }
-  });
-
-  it("a frame of one type does not decode as another", () => {
-    // The type is in the frame, so a refusal cannot be read as an acceptance — which would have a
-    // subscriber store a key bundle built from whatever those bytes happened to contain.
-    const refused = encodeChannelJoinRefused({ channel_pubkey: CHANNEL, reason: "refused_by_admin" });
-    expect(decodeChannelJoinAccepted(refused).ok).toBe(false);
-    expect(decodeChannelJoinRequest(refused).ok).toBe(false);
+  it("the slot record round-trips and refuses an oversized sealed body", async () => {
+    const ch = await generateKeypair().getPublicKey();
+    const rec = { channel_pubkey: ch, slot: new Uint8Array(32).fill(3), signed_at: 9, sealed: new Uint8Array(100).fill(1) };
+    const d = decodeChannelJoinSlotRecord(encodeChannelJoinSlotRecord(rec));
+    expect(d.ok && d.record.signed_at).toBe(9);
+    expect(() => encodeChannelJoinSlotRecord({ ...rec, sealed: new Uint8Array(MAX_JOIN_SEALED_BYTES + 1) })).toThrow(/too_large/);
   });
 });
 
-describe("025-JOINSCREEN — channelJoinFrameType is strict, by full decode", () => {
-  // Test 1: each of the four valid frames still classifies to its own type.
-  it("each valid frame classifies to its own type", () => {
-    expect(channelJoinFrameType(encodeChannelJoinRequest({
-      channel_pubkey: CHANNEL, subscriber_pubkey: SUBSCRIBER, note: "hi",
-    }))).toBe(JOIN_REQUEST_TYPE);
-    expect(channelJoinFrameType(encodeChannelJoinAccepted({
-      channel_pubkey: CHANNEL, key_bundle: BUNDLE, guidance: "release notes",
-      retention_seconds: 3600, access: "invite_only", relays: [RELAY_A, RELAY_B], members_visible: false,
-    }))).toBe(JOIN_ACCEPTED_TYPE);
-    expect(channelJoinFrameType(encodeChannelJoinRefused({
-      channel_pubkey: CHANNEL, reason: "refused_by_admin",
-    }))).toBe(JOIN_REFUSED_TYPE);
+describe("046-JOINBELL join answer", () => {
+  it("an acceptance with a sealed key verifies against the channel key; a forged one does not", async () => {
+    const channel = generateKeypair(); const forger = generateKeypair();
+    const ans = await signChannelJoinAnswer(channel, { outcome: "accepted", reason: null, key_bundle: new Uint8Array([1, 2, 3]), signed_at: 7 });
+    const d = decodeChannelJoinAnswer(encodeChannelJoinAnswer(ans));
+    expect(d.ok && d.answer.outcome).toBe("accepted");
+    expect(d.ok && verifyChannelJoinAnswer(d.answer)).toBe(true);
+    const forged = await signChannelJoinAnswer(forger, { outcome: "accepted", reason: null, key_bundle: null, signed_at: 7 });
+    expect(verifyChannelJoinAnswer({ ...forged, channel_pubkey: await channel.getPublicKey() })).toBe(false);
   });
 
-  // Test 2: a valid type string in slot 0 with a body the decoder rejects is NOT a join frame.
-  // Built with encodeCbor directly, because the encoders refuse exactly these bodies. Red before
-  // the rewrite: the loose classifier returned the type on slot 0 alone.
-  it("a valid type in slot 0 with a bad body is not a join frame", () => {
-    // request with a 31-byte channel key
-    expect(channelJoinFrameType(encodeCbor([
-      JOIN_REQUEST_TYPE, new Uint8Array(31).fill(0xa1), SUBSCRIBER, "",
-    ]))).toBeNull();
-    // refused with an invented reason
-    expect(channelJoinFrameType(encodeCbor([
-      JOIN_REFUSED_TYPE, CHANNEL, "made_up",
-    ]))).toBeNull();
-    // accepted naming a PUBLIC channel WITH a key bundle — public posts have no key, so a bundle
-    // here is a key for a channel that has none (036-PUBLICSUB); the decoder rejects it.
-    expect(channelJoinFrameType(encodeCbor([
-      JOIN_ACCEPTED_TYPE, CHANNEL, BUNDLE, "", 3600, "public", [RELAY_A], false,
-    ]))).toBeNull();
+  it("refuses an unknown outcome, an unknown reason, and a key on a refusal", async () => {
+    const channel = generateKeypair(); const ch = await channel.getPublicKey();
+    const sig = new Uint8Array(64);
+    const unknownOutcome = decodeChannelJoinAnswer(encodeCbor([JOIN_ANSWER_DOMAIN, ch, "maybe", null, null, 1, sig]));
+    expect(unknownOutcome.ok ? "ok" : unknownOutcome.reason).toBe("bad_outcome");
+    const unknownReason = decodeChannelJoinAnswer(encodeCbor([JOIN_ANSWER_DOMAIN, ch, "refused", "go away", null, 1, sig]));
+    expect(unknownReason.ok ? "ok" : unknownReason.reason).toBe("bad_reason");
+    const keyed = decodeChannelJoinAnswer(encodeCbor([JOIN_ANSWER_DOMAIN, ch, "refused", "refused_by_admin", new Uint8Array(3), 1, sig]));
+    expect(keyed.ok ? "ok" : keyed.reason).toBe("bad_key_bundle");
   });
 
-  // Test 4: the cap admits the LARGEST legitimate frame. (Test 3 is deliberately not written — see
-  // the order: an "oversized → null" test passes with the cap deleted, so the cap is proven here and
-  // by the reviewer reading that the length check precedes decodeCbor.)
-  it("the cap admits the largest legitimate acceptance", () => {
-    const bigBundle = new Uint8Array(4096).fill(0xc3);
-    const clef = "\u{1D11E}"; // 𝄞 — 4 UTF-8 bytes, one code point
-    const guidance = clef.repeat(2000);
-    const relays = Array.from({ length: 8 }, () => clef.repeat(512));
-    const frame = encodeChannelJoinAccepted({
-      channel_pubkey: CHANNEL, key_bundle: bigBundle, guidance,
-      retention_seconds: 3600, access: "open", relays, members_visible: true,
-    });
-    expect(frame.length).toBeLessThanOrEqual(MAX_JOIN_FRAME_BYTES);
-    expect(channelJoinFrameType(frame)).toBe(JOIN_ACCEPTED_TYPE);
+  it("join_answer is a notice type, so it rides the joiner's 045 notice slot", () => {
+    expect(CHANNEL_NOTICE_TYPES).toContain("join_answer");
+  });
+});
+
+describe("046-JOINBELL channel relay record", () => {
+  it("round-trips as a CBOR map and verifies against the channel key", async () => {
+    const channel = generateKeypair();
+    const rec = await signChannelRelayRecord(channel, { relays: ["/dns4/r1/tcp/1/p2p/A", "/dns4/r2/tcp/1/p2p/B"], signed_at: 11 });
+    const d = decodeChannelRelayRecord(encodeChannelRelayRecord(rec));
+    expect(d.ok && d.record.relays).toEqual(["/dns4/r1/tcp/1/p2p/A", "/dns4/r2/tcp/1/p2p/B"]);
+    expect(d.ok && verifyChannelRelayRecord(d.record)).toBe(true);
+    expect(verifyChannelRelayRecord({ ...rec, relays: ["/dns4/evil/tcp/1/p2p/X"] })).toBe(false);
   });
 
-  // 045-NOTICEBELL: the four notice frames that used to ride a session are gone. Their old type
-  // strings, with a well-formed body, are NOT join frames any more — they would reach the transcript.
-  it("the retired notice frame types are no longer classified as join frames", () => {
-    expect(channelJoinFrameType(encodeCbor(["cello-channel-rekey-v1", CHANNEL, BUNDLE, 2]))).toBeNull();
-    expect(channelJoinFrameType(encodeCbor(["cello-channel-membership-ended-v1", CHANNEL, "ejected"]))).toBeNull();
-    expect(channelJoinFrameType(encodeCbor(["cello-channel-poster-pass-frame-v1", BUNDLE, []]))).toBeNull();
-    expect(channelJoinFrameType(encodeCbor(["cello-channel-poster-removed-v1", CHANNEL]))).toBeNull();
+  it("refuses a record that sets any discovery field, and one with an unknown key", async () => {
+    const channel = generateKeypair(); const ch = await channel.getPublicKey();
+    const base = { domain: CHANNEL_RELAY_RECORD_DOMAIN, channel_pubkey: ch, relays: ["r"], signed_at: 1, signature: new Uint8Array(64) };
+    expect(CHANNEL_DISCOVERY_KEYS).toHaveLength(8);
+    for (const key of CHANNEL_DISCOVERY_KEYS) {
+      const d = decodeChannelRelayRecord(encodeCbor({ ...base, [key]: "x" }));
+      expect(d.ok ? "ok" : d.reason).toBe("discovery_not_supported");
+    }
+    const unknown = decodeChannelRelayRecord(encodeCbor({ ...base, colour: "red" }));
+    expect(unknown.ok ? "ok" : unknown.reason).toBe("wrong_shape");
   });
 });

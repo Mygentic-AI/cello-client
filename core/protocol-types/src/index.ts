@@ -422,21 +422,24 @@ export {
   verifyChannelNotice, encodeNoticePassBody, decodeNoticePassBody, encodeNoticeEjectBody,
 } from "./channel-notice.js";
 export type { ChannelNotice, ChannelNoticeType, ChannelNoticeDecodeReason } from "./channel-notice.js";
-// M16 019-MEMBERSHIP: the join exchange. These travel inside an ordinary sealed session with the
-// channel's ADMIN — a channel never converses itself.
+// M16 046-JOINBELL: joining is signed records plus a directory ring, never a session.
 export {
-  encodeChannelJoinRequest, decodeChannelJoinRequest,
-  encodeChannelJoinAccepted, decodeChannelJoinAccepted,
-  encodeChannelJoinRefused, decodeChannelJoinRefused,
-  isChannelJoinFrame,
-  channelJoinFrameType,
-  MAX_JOIN_NOTE_CHARS, MAX_JOIN_GUIDANCE_CHARS, MAX_JOIN_RELAYS, MAX_JOIN_FRAME_BYTES,
-  JOIN_REQUEST_TYPE, JOIN_ACCEPTED_TYPE, JOIN_REFUSED_TYPE,
+  channelJoinSlot,
+  signChannelJoinRequest, encodeChannelJoinRequest, decodeChannelJoinRequest, verifyChannelJoinRequest,
+  encodeChannelJoinSlotRecord, decodeChannelJoinSlotRecord,
+  signChannelJoinAnswer, encodeChannelJoinAnswer, decodeChannelJoinAnswer, verifyChannelJoinAnswer,
+  MAX_JOIN_NOTE_CHARS, MAX_JOIN_SEALED_BYTES, JOIN_REQUEST_DOMAIN, JOIN_SLOT_DOMAIN, JOIN_ANSWER_DOMAIN,
+  CHANNEL_JOIN_OUTCOMES, CHANNEL_JOIN_REFUSED_REASONS,
 } from "./channel-join.js";
 export type {
-  ChannelJoinRequest, ChannelJoinAccepted, ChannelJoinRefused,
-  ChannelJoinAccess, ChannelJoinRefusedReason, JoinDecodeReason, JoinDecodeResult,
+  ChannelJoinRequest, ChannelJoinSlotRecord, ChannelJoinAnswer, ChannelJoinOutcome,
+  ChannelJoinRefusedReason, JoinDecodeReason,
 } from "./channel-join.js";
+export {
+  signChannelRelayRecord, encodeChannelRelayRecord, decodeChannelRelayRecord, verifyChannelRelayRecord,
+  CHANNEL_RELAY_RECORD_DOMAIN, CHANNEL_DISCOVERY_KEYS, MAX_RELAY_RECORD_RELAYS, MAX_RELAY_RECORD_BYTES,
+} from "./channel-relay-record.js";
+export type { ChannelRelayRecord, ChannelRelayRecordDecodeReason } from "./channel-relay-record.js";
 
 // The channel frames that carry a signature of their own. ONE definition, imported by the client
 // that signs and the relay that verifies — see the header of channel-auth.ts.
