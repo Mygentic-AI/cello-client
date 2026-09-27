@@ -572,7 +572,11 @@ export function createChannelJoinAdmin(deps: ChannelJoinAdminDeps) {
     for (const channelHex of channelHexes) {
       const admin = deps.localChannelAdmin(channelHex);
       const settings = members.settings(channelHex);
-      if (!admin || !settings || settings.relays.length === 0 || !admin.adminKeyProvider.openContentSeal) continue;
+      if (!admin || !settings || settings.relays.length === 0) continue;
+      if (!admin.adminKeyProvider.openContentSeal) {
+        logger.warn("channel.join.pull_skipped", { channel_pubkey: channelHex, reason: "admin_key_cannot_open_seals" });
+        continue;
+      }
       try {
         const records = await deps.relays.listJoins(settings.relays, channelHex, (tbs) => admin.channelKeyProvider.sign(tbs));
         const joiners = new Set<string>();
