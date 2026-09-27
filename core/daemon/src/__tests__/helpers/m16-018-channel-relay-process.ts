@@ -32,6 +32,8 @@ import {
   verifyBroadcastArtifact,
   buildChannelFetchKeyTbs,
   buildChannelFetchAuthTbs,
+  decodeChannelNotice,
+  verifyChannelNotice,
 } from "@cello-protocol/protocol-types";
 import type { Stream } from "@libp2p/interface";
 import { extractErrorMessage } from "../../error-message.js";
@@ -60,6 +62,7 @@ async function main(): Promise<void> {
    * sign with it may, which is what an ejection's re-key takes away.
    */
   const fetchKeys = new Map<string, Uint8Array>();
+  const notices = new Map<string, { issued_at: number; record: Uint8Array }>();
 
   const node = await createNode({ listenAddresses: ["/ip4/127.0.0.1/tcp/0"], keyProvider: relayKey });
   await node.start();
@@ -182,6 +185,22 @@ async function main(): Promise<void> {
         first_held_seq: seqs.length > 0 ? seqs[0] : null,
         last_seq: seqs.length > 0 ? seqs[seqs.length - 1] : null,
       };
+    }
+
+    // 045/046: sealed channel notices by slot — the channel key must sign, newest issued_at wins.
+    if (frame["type"] === "channel_notice_set") {
+      const record = frame["record"];
+      const d = record instanceof Uint8Array ? decodeChannelNotice(record) : null;
+      if (!d?.ok || !verifyChannelNotice(d.notice)) return { type: "channel_notice_set_rejected", reason: "bad_record" };
+      const slotHex = Buffer.from(d.notice.slot).toString("hex");
+      const held = notices.get(slotHex);
+      if (held && held.issued_at >= d.notice.issued_at) return { type: "channel_notice_set_rejected", reason: "stale_notice" };
+      notices.set(slotHex, { issued_at: d.notice.issued_at, record: record as Uint8Array });
+      return { type: "channel_notice_set_ok" };
+    }
+    if (frame["type"] === "channel_notice_get") {
+      const slot = frame["slot"];
+      return { type: "channel_notice_result", record: slot instanceof Uint8Array ? notices.get(Buffer.from(slot).toString("hex"))?.record ?? null : null };
     }
 
     return { type: "channel_frame_rejected", reason: "unknown_frame_type" };
