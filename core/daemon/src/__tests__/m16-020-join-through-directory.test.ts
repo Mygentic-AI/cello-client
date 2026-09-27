@@ -91,7 +91,7 @@ async function joinWorld(opts: { access: "open" | "invite_only" | "public"; rete
   let revoked = false;
   let notAChannel = false;
   // 048-JOINNOTE: what the admin daemon's inbound screen answers; `throws` models a screen that cannot run.
-  let screenAnswer: "allow" | "block" | "transient" | "throws" = "allow";
+  let screenAnswer: "allow" | "redact" | "block" | "transient" | "throws" = "allow";
   const screened: Array<{ text: string; sessionId: string }> = [];
   let ringRefusal: string | null = null;
   // The admin's directory stream is down: the directory acks the ring but reaches nobody.
@@ -182,6 +182,7 @@ async function joinWorld(opts: { access: "open" | "invite_only" | "public"; rete
     notify, collectNow: () => {}, isChannelAgent: (n) => n === CHANNEL_NAME,
     screenInbound: (content: Uint8Array, ctx: { sessionId: string }) => {
       screened.push({ text: new TextDecoder().decode(content), sessionId: ctx.sessionId });
+      if (screenAnswer === "redact") return Promise.resolve({ disposition: "redact" as const, content: new TextEncoder().encode("hi, it is [REDACTED]") });
       if (screenAnswer === "throws") return Promise.reject(new Error("gateway socket closed"));
       if (screenAnswer === "block") return Promise.resolve({ disposition: "block" as const, reason: "inbound_injection_blocked", terminal: true });
       if (screenAnswer === "transient") return Promise.resolve({ disposition: "block" as const, reason: "gateway_unavailable" });
@@ -246,7 +247,7 @@ async function joinWorld(opts: { access: "open" | "invite_only" | "public"; rete
     subs: new ChannelSubscriptionStore(db, silent), adminSubs: new ChannelSubscriptionStore(adminDb, silent),
     setRevoked: (v: boolean) => { revoked = v; },
     setNotAChannel: (v: boolean) => { notAChannel = v; },
-    setScreen: (a: "allow" | "block" | "transient" | "throws") => { screenAnswer = a; },
+    setScreen: (a: "allow" | "redact" | "block" | "transient" | "throws") => { screenAnswer = a; },
     screened,
     setRingRefusal: (r: string | null) => { ringRefusal = r; },
     setAdminOffline: (v: boolean) => { adminOffline = v; },
@@ -527,6 +528,16 @@ describe("M16 046-JOINBELL — joining is records plus a ring, never a session",
       { event: "request", agentId: ADMIN_ID, channel: w.channelHex, subscriber: w.joinerHex, note: "hi, it is Alice" },
     ]);
     expect(w.screened).toEqual([{ text: "hi, it is Alice", sessionId: `channel-join:${w.channelHex}:${w.joinerHex}` }]);
+    w.close();
+  });
+
+  it("048-4. a REDACT verdict delivers the screen's redacted text, never the original", async () => {
+    const w = await joinWorld({ access: "invite_only" });
+    w.setScreen("redact");
+    await w.publishRelayRecord();
+    await w.joinAs();
+    await settle();
+    expect(w.notified.filter((n) => n.event === "request").map((n) => n.note)).toEqual(["hi, it is [REDACTED]"]);
     w.close();
   });
 

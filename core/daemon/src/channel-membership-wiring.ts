@@ -395,9 +395,15 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     // does not administer) means there is nobody here to wake.
     const admin = localChannelAdmin(channelHex);
     if (!admin) return;
-    const name = adminAgentNameFor(channelHex) ?? admin.agentId;
-    void screenJoinNote(name, channelHex, subscriberHex, note)
-      .then((screened) => deps.notify.channelJoinRequest(admin.agentId, channelHex, subscriberHex, screened));
+    // The screen's policy is keyed on the agent's name; with no name there is no policy to screen
+    // under, so the note is withheld rather than screened under a stand-in.
+    const name = adminAgentNameFor(channelHex);
+    const screening = name !== null
+      ? screenJoinNote(name, channelHex, subscriberHex, note)
+      : Promise.resolve(note === "" ? "" : (logger.warn("channel.join.note_withheld", { channel_pubkey: channelHex, subscriber_pubkey: subscriberHex, disposition: "admin_name_unresolved" }), JOIN_NOTE_WITHHELD));
+    void screening
+      .then((screened) => deps.notify.channelJoinRequest(admin.agentId, channelHex, subscriberHex, screened))
+      .catch((err: unknown) => logger.warn("channel.join.request_notify_failed", { channel_pubkey: channelHex, subscriber_pubkey: subscriberHex, reason: extractErrorMessage(err) }));
   };
 
   // 043-POSTERS: the posting setting, listed posters, passes and their hourly renewal (the lease).
