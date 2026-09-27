@@ -89,6 +89,8 @@ async function joinWorld(opts: { access: "open" | "invite_only" | "public"; rete
   let relayRecord: Uint8Array | undefined;
   let revoked = false;
   let ringRefusal: string | null = null;
+  // The admin's directory stream is down: the directory acks the ring but reaches nobody.
+  let adminOffline = false;
   let relayJoinRefusal: string | null = null;
   const rings: string[] = [];
 
@@ -181,7 +183,7 @@ async function joinWorld(opts: { access: "open" | "invite_only" | "public"; rete
         if (ringRefusal) { reply({ type: "channel_join_ring_error", reason: ringRefusal }); }
         else {
           // The directory rings the admin, naming the joiner it AUTHENTICATED — then acks.
-          void adminWiring.onJoinBell(hex(ch), joinerHex);
+          if (!adminOffline) void adminWiring.onJoinBell(hex(ch), joinerHex);
           reply({ type: "channel_join_ring_ack", delivered: true });
         }
       }
@@ -217,6 +219,7 @@ async function joinWorld(opts: { access: "open" | "invite_only" | "public"; rete
     subs: new ChannelSubscriptionStore(db, silent), adminSubs: new ChannelSubscriptionStore(adminDb, silent),
     setRevoked: (v: boolean) => { revoked = v; },
     setRingRefusal: (r: string | null) => { ringRefusal = r; },
+    setAdminOffline: (v: boolean) => { adminOffline = v; },
     setRelayJoinRefusal: (r: string | null) => { relayJoinRefusal = r; },
     close: () => { joinerWiring?.stop(); adminWiring.stop(); },
   };
@@ -331,7 +334,7 @@ describe("M16 046-JOINBELL — joining is records plus a ring, never a session",
     await vi.advanceTimersByTimeAsync(10);
     const left = await w.joinerHandlers.get("cello_channel_leave")!({ channel: w.channelHex }, "c");
     expect(left).toMatchObject({ ok: true, withdrawn: true });
-    await w.adminWiring.onJoinBell(w.channelHex, w.joinerHex);
+    // No manual ring: the withdrawal rings the admin itself.
     await settle();
     expect(w.adminMembers.statusOf(w.channelHex, w.joinerHex)).toBeNull();
     expect(w.notified.filter((n) => n.event === "request")).toHaveLength(1);
@@ -407,6 +410,20 @@ describe("M16 046-JOINBELL — joining is records plus a ring, never a session",
     expect(res.ok).toBe(false);
     expect(String(res.reason)).toContain("not_a_pending_request");
     expect(w.adminMembers.statusOf(w.channelHex, w.joinerHex)).toBe("active");
+    w.close();
+  });
+
+  it("14. an admin OFFLINE at the first ring still hears the request: the joiner re-rings on its backstop tick", async () => {
+    const w = await joinWorld({ access: "open" });
+    await w.publishRelayRecord();
+    w.setAdminOffline(true);
+    await w.joinAs();
+    await settle();
+    expect(w.subs.get(SUB_ID, w.channelHex)).toBeNull();
+    w.setAdminOffline(false);
+    await vi.advanceTimersByTimeAsync(NOTICE_BACKSTOP_TICK_MS);
+    await settle();
+    expect(w.subs.get(SUB_ID, w.channelHex)?.status).toBe("active");
     w.close();
   });
 

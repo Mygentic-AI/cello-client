@@ -306,7 +306,7 @@ export function createChannelJoiner(deps: ChannelJoinerDeps) {
   }
 
   /** Decision 12: take an outstanding request back. The admin's pending list drops it silently. */
-  async function withdraw(agentId: string, channelHex: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+  async function withdraw(agentName: string, agentId: string, channelHex: string): Promise<{ ok: true } | { ok: false; reason: string }> {
     const outstanding = deps.requests.get(agentId, channelHex);
     if (!outstanding) return { ok: false, reason: "not_requested" };
     const myKey = deps.keyProviderFor(agentId);
@@ -317,10 +317,26 @@ export function createChannelJoiner(deps: ChannelJoinerDeps) {
     if (!wrote || wrote.accepted === 0) return { ok: false, reason: "relays_unreachable" };
     deps.requests.remove(agentId, channelHex);
     logger.info("channel.join.withdrawn", { channel_pubkey: channelHex });
+    // Ring, so the admin's pending list drops it now rather than at lapse. A ring that does not go
+    // out leaves the withdrawal on the relays for the admin's next read.
+    const rung = await deps.directory.ring(agentName, channelHex);
+    if (!rung.ok) logger.warn("channel.join.ring_failed", { channel_pubkey: channelHex, reason: rung.reason });
     return { ok: true };
   }
 
-  return { join, withdraw };
+  /**
+   * The ring is transient: an admin offline at that instant never hears it, and the hashed slot means
+   * it cannot look for one. So every outstanding request is rung again on the backstop tick until it
+   * is answered or lapses. A repeat of the same record is silent at the admin (nagging guard).
+   */
+  async function reRing(agentName: string, agentId: string): Promise<void> {
+    for (const o of deps.requests.forAgent(agentId)) {
+      const rung = await deps.directory.ring(agentName, o.channel_pubkey);
+      if (!rung.ok) logger.warn("channel.join.ring_failed", { channel_pubkey: o.channel_pubkey, reason: rung.reason });
+    }
+  }
+
+  return { join, withdraw, reRing };
 }
 
 /**

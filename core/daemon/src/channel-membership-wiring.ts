@@ -450,6 +450,9 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     for (const agentId of agentIds) {
       if (!deps.noticeTransport().isAgentOnline(agentId)) continue;
       void noticeReader.checkNotices(agentId);
+      // 046: re-ring each outstanding join request — an admin offline at the first ring hears this one.
+      const name = deps.loadedAgents.find((a) => deps.resolveAgentId(a.name) === agentId)?.name;
+      if (name) void joiner.reRing(name, agentId);
     }
   }, NOTICE_BACKSTOP_TICK_MS);
   noticeTimer.unref();
@@ -651,7 +654,7 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     // 046-JOINBELL Decision 12: leaving a channel you have only ASKED to join withdraws the request.
     const agentId = deps.resolveAgentId(agent.agentName);
     if (joinRequests.get(agentId, channel.channelHex) && !subscriptions.get(agentId, channel.channelHex)) {
-      const withdrawn = await joiner.withdraw(agentId, channel.channelHex);
+      const withdrawn = await joiner.withdraw(agent.agentName, agentId, channel.channelHex);
       return withdrawn.ok
         ? { ok: true, channel: channel.channelHex, withdrawn: true, guidance: "Your join request was withdrawn." }
         : { ok: false, reason: withdrawn.reason };
