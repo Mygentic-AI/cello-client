@@ -22,7 +22,8 @@ import {
   CHANNEL_NOTICE_TYPES, channelNoticeSlot, signChannelNotice, encodeChannelNotice, decodeChannelNotice,
   verifyChannelNotice, decodeNoticePassBody, decodeChannelPosterPass, verifyPosterPass,
   decodeChannelInfo, verifyChannelInfo, channelPostingOf, decodeCbor,
-  type ChannelNoticeType,
+  decodeChannelJoinAnswer, verifyChannelJoinAnswer,
+  type ChannelNoticeType, type ChannelJoinAnswer,
 } from "@cello-protocol/protocol-types";
 import { sealToRecipient, unwrapGroupKey, type KeyProvider } from "@cello-protocol/crypto";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
@@ -30,6 +31,7 @@ import type { Logger } from "./types.js";
 import type { ChannelSubscriptionStore } from "./channel-subscription-store.js";
 import type { ChannelPosterPassStore } from "./channel-poster-pass-store.js";
 import { extractErrorMessage } from "./error-message.js";
+import type { ChannelJoinRequestStore, OutstandingJoin } from "./channel-join-exchange.js";
 
 const hexOf = (b: Uint8Array): string => Buffer.from(b).toString("hex");
 const bytesOf = (h: string): Uint8Array => new Uint8Array(Buffer.from(h, "hex"));
@@ -120,6 +122,16 @@ export interface ChannelNoticeReaderDeps {
   channelRevoked: (agentId: string, channelHex: string) => Promise<boolean>;
   onMembershipEnded: (agentId: string, channelHex: string, reason: "ejected" | "channel_closed") => void;
   onPosterRemoved: (agentId: string, channelHex: string) => void;
+  /**
+   * 046-JOINBELL: this agent's outstanding join requests, read on the same ring and tick. An answer is
+   * acted on only for a channel with an outstanding request (forged-answer guard).
+   */
+  joins?: {
+    requests: ChannelJoinRequestStore;
+    apply: (outstanding: OutstandingJoin, answer: ChannelJoinAnswer) => Promise<{ outcome: "admitted" | "pending" | "refused"; reason?: string } | null>;
+    onAnswer: (agentId: string, channelHex: string, outcome: "admitted" | "pending" | "refused" | "expired", reason?: string) => void;
+    now?: () => number;
+  };
 }
 
 export interface ChannelNoticeReader {
@@ -216,7 +228,8 @@ export function createChannelNoticeReader(deps: ChannelNoticeReaderDeps): Channe
     const shared = await myKey.staticSharedSecret(bytesOf(channelHex));
     if (!shared) return;
     // Eject first: an ejected member applies nothing else from this channel.
-    for (const type of ["eject", ...CHANNEL_NOTICE_TYPES.filter((t) => t !== "eject")] as ChannelNoticeType[]) {
+    // `join_answer` is read only for an outstanding request (checkJoin), never for a subscription.
+    for (const type of ["eject", ...CHANNEL_NOTICE_TYPES.filter((t) => t !== "eject" && t !== "join_answer")] as ChannelNoticeType[]) {
       const found = await newestValid(channelHex, relays, channelNoticeSlot(shared, type), type);
       // Nagging guard: a repeat or older notice is dropped silently.
       if (!found || found.issued_at <= seen.get(agentId, channelHex, type)) continue;
@@ -232,6 +245,43 @@ export function createChannelNoticeReader(deps: ChannelNoticeReaderDeps): Channe
     await checkPosterRevoked(agentId, channelHex, relays, myHex);
   }
 
+  /**
+   * 046-JOINBELL — the joiner's half. A request older than the channel's retention has expired and
+   * the agent is told so once. Otherwise the newest `join_answer` notice is read, strictly decoded,
+   * verified against THIS channel's key, and applied only when it is newer than the last answer AND
+   * than the last ejection this agent holds from the channel (replayed-acceptance guard).
+   */
+  async function checkJoin(agentId: string, o: OutstandingJoin, myKey: KeyProvider): Promise<void> {
+    const joins = deps.joins!;
+    const ch = o.channel_pubkey;
+    if ((joins.now ?? Date.now)() - o.signed_at > o.retention_seconds * 1000) {
+      joins.requests.remove(agentId, ch);
+      logger.info("channel.join.expired", { channel_pubkey: ch });
+      joins.onAnswer(agentId, ch, "expired");
+      return;
+    }
+    if (!myKey.staticSharedSecret || !myKey.openContentSeal) return;
+    const shared = await myKey.staticSharedSecret(bytesOf(ch));
+    if (!shared) return;
+    const found = await newestValid(ch, o.relays, channelNoticeSlot(shared, "join_answer"), "join_answer");
+    if (!found || found.issued_at <= seen.get(agentId, ch, "join_answer")) return;
+    const body = await myKey.openContentSeal(found.sealed);
+    const decoded = body ? decodeChannelJoinAnswer(body) : null;
+    if (!decoded?.ok || hexOf(decoded.answer.channel_pubkey) !== ch || !verifyChannelJoinAnswer(decoded.answer)) {
+      logger.warn("channel.join.rejected", { channel_pubkey: ch, record: "join_answer", reason: decoded && !decoded.ok ? decoded.reason : "signature_invalid" });
+      return;
+    }
+    if (decoded.answer.signed_at <= seen.get(agentId, ch, "eject")) {
+      logger.warn("channel.join.rejected", { channel_pubkey: ch, record: "join_answer", reason: "older_than_ejection" });
+      return;
+    }
+    const applied = await joins.apply(o, decoded.answer);
+    if (!applied) return;
+    seen.set(agentId, ch, "join_answer", found.issued_at);
+    logger.info("channel.join.answer_applied", { channel_pubkey: ch, outcome: applied.outcome });
+    joins.onAnswer(agentId, ch, applied.outcome, applied.reason);
+  }
+
   return {
     async checkNotices(agentId: string): Promise<void> {
       const myKey = deps.keyProviderFor(agentId);
@@ -245,6 +295,13 @@ export function createChannelNoticeReader(deps: ChannelNoticeReaderDeps): Channe
           await checkChannel(agentId, sub.channel_pubkey, sub.relays, myKey, myHex);
         } catch (err: unknown) {
           logger.warn("channel.notice.check_failed", { channel_pubkey: sub.channel_pubkey, reason: extractErrorMessage(err) });
+        }
+      }
+      for (const o of deps.joins?.requests.forAgent(agentId) ?? []) {
+        try {
+          await checkJoin(agentId, o, myKey);
+        } catch (err: unknown) {
+          logger.warn("channel.notice.check_failed", { channel_pubkey: o.channel_pubkey, reason: extractErrorMessage(err) });
         }
       }
     },

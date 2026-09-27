@@ -73,6 +73,7 @@ export interface SignalingWiringDeps {
    * collector is built in the channel wiring, which is constructed after this one.
    */
   onChannelWake?: (agentName: string) => void;
+  onChannelJoinBell?: (agentName: string, frame: Record<string, unknown>) => void; // 046-JOINBELL: parsed by the membership half
   /** C2, late-bound; built in outbound-sessions. See trust-signal-sweep.ts. */
   getSweepTrustSignals: () => ((n: string, k: KeyProvider, p: string) => Promise<unknown>) | undefined;
   resolveConsortiumRoster: () => Promise<ConsortiumEndpoint[] | null>;
@@ -294,8 +295,7 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
      * explain. The absence is already reported by the directory's own `online_token.failed`.
      */
     /**
-     * M16 021-WAKE — the channel doorbell. A publisher asked a directory to poke this agent, so its
-     * channels are fetched now instead of at the next backstop tick.
+     * M16 021-WAKE — the channel doorbell (and 046's join ring): fetch now, not at the backstop tick.
      *
      * ⚠️ **THE FRAME CARRIES NOTHING AND IS NOT TRUSTED TO.** It names no channel and no sequence,
      * so there is nothing here to forge: the worst a hostile directory can do with it is make this
@@ -303,8 +303,8 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
      * by the fetch — signatures, positions, gaps — exactly as it was before this existed.
      */
     mgr.registerInboundHandler((frame) => {
-      if (frame["type"] !== "channel_wake") return;
-      deps.onChannelWake?.(agentName);
+      if (frame["type"] === "channel_wake") deps.onChannelWake?.(agentName);
+      else if (frame["type"] === "channel_join_bell") deps.onChannelJoinBell?.(agentName, frame); // 046: names only which slot to read
     });
 
     mgr.registerInboundHandler((frame) => {

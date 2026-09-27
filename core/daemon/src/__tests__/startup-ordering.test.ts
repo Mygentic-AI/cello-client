@@ -283,6 +283,10 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // unwired, the join exchange would send frames that vanish from this side's record exactly as
     // before, with nothing failing.
     //
+    // 046-JOINBELL swapped two for two, count unchanged: `createChannelFrameSender` and
+    // `createChannelJoinExchange` are deleted with the session join path, and `createChannelJoiner` /
+    // `createChannelJoinAdmin` (channel-join-exchange.ts) replace them — joining is records and a ring.
+    //
     // 114 → 115 for M16 028-GROUPPUB's `ensureCurrentGroupKey` (channel-join-exchange.ts) — the ONE
     // mint-or-reuse of a channel's group key, reached by BOTH admitting a member and publishing. It
     // matches the `ensure` verb and is called from channel-membership-wiring.ts (the encryptor and

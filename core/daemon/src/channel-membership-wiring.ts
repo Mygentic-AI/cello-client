@@ -2,23 +2,18 @@
  * M16 019-MEMBERSHIP — the join exchange, the eject re-key, and the operator's channel verbs.
  * M16 045-NOTICEBELL — every admin notice (pass, removal, eject, new key, delete) is a signed record
  * plus a directory ring (`channel-notices.ts`); no session is ever opened for one.
+ * M16 046-JOINBELL — joining is the same: a signed request on the relays, a ring, a signed answer
+ * (`channel-join-exchange.ts`). No channel action opens a session.
  *
  * The publishing half is wired next door in `channel-publish-wiring.ts`; this is membership. Both
  * exist because a module registered into nothing is a feature that does not exist — the mistake 017
  * shipped and 018 repeated on its other half.
- *
- * ⚠️ **THE JOIN FRAME HOOK IS SYNCHRONOUS AND THE HANDLING IS NOT.** `setOnChannelJoinFrame` must
- * answer "is this mine" immediately, because the ingest path is deciding whether to write the frame
- * into a transcript as something a person said. The decision is made by CLASSIFYING (a cheap decode)
- * and the work is then queued, exactly as the document layer does. A rejected promise here must not
- * take down the content path, so it is caught and logged.
  */
 import type { Logger } from "./types.js";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import {
-  channelJoinFrameType, buildChannelFetchKeyTbs, encodeNoticeEjectBody, encodeNoticePassBody,
-  JOIN_REQUEST_TYPE,
+  buildChannelFetchKeyTbs, encodeNoticeEjectBody, encodeNoticePassBody, signChannelRelayRecord, encodeChannelRelayRecord,
 } from "@cello-protocol/protocol-types";
 import { generateGroupKey, wrapGroupKeyFor, deriveFetchKey, decryptBody, encryptBody } from "@cello-protocol/crypto";
 import { ChannelMembershipStore } from "./channel-membership-store.js";
@@ -29,11 +24,12 @@ import { ChannelLanePositionStore } from "./channel-lane-position-store.js";
 import { ChannelPosterGrantStore } from "./channel-poster-grant-store.js";
 import { createChannelPostingAdmin } from "./channel-posting-admin.js";
 import {
-  createChannelJoinExchange, ensureCurrentGroupKey,
+  ensureCurrentGroupKey, createChannelJoiner, createChannelJoinAdmin, applyJoinAnswer,
+  ChannelJoinRequestStore, ChannelJoinSeenStore,
   type LocalChannelAdmin, type AdminLookupOutcome,
 } from "./channel-join-exchange.js";
 import {
-  createChannelAdminLookup, type ChannelAdminOutcome, type SignalingLike,
+  createChannelAdminLookup, askDirectoryAboutChannel, type ChannelAdminOutcome, type SignalingLike,
 } from "./channel-admin-lookup.js";
 import { createChannelSubscribe } from "./channel-subscribe.js";
 import { ChannelInboxStore } from "./channel-inbox-store.js";
@@ -42,6 +38,8 @@ import { ChannelNoticeSeenStore, createChannelNoticeReader, writeChannelNotice }
 
 /** 045-NOTICEBELL: how often a member re-reads its notices when no ring arrived (the backstop). */
 export const NOTICE_BACKSTOP_TICK_MS = 60 * 60_000;
+/** 046-JOINBELL: how often an admin checks its channels' relay records are published and current. */
+export const RELAY_RECORD_TICK_MS = 60_000;
 
 type Handler = (params: Record<string, unknown> | undefined, connectionId: string) => Promise<unknown>;
 
@@ -56,8 +54,8 @@ export interface ChannelNotify {
   /** A collect pass advanced this agent's delivered position: `count` new posts, now at `through`. */
   /** `posters` (043-POSTERS): who wrote, when the posts came from poster lanes. */
   channelPosts: (agentId: string, channelHex: string, count: number, through: number, posters?: string[]) => void;
-  /** This agent's own join request was answered. */
-  channelJoinAnswer: (agentId: string, channelHex: string, outcome: "admitted" | "pending" | "refused", reason?: string) => void;
+  /** This agent's own join request was answered — or expired with no answer (046 Decision 11). */
+  channelJoinAnswer: (agentId: string, channelHex: string, outcome: "admitted" | "pending" | "refused" | "expired", reason?: string) => void;
   /** A new pending request landed on an invite-only channel this agent administers. */
   channelJoinRequest: (adminAgentId: string, channelHex: string, subscriberHex: string) => void;
   /**
@@ -76,12 +74,6 @@ export interface ChannelMembershipWiringDeps {
   handlers: Map<string, Handler>;
   logger: Logger;
   getDb: () => DaemonDatabase;
-  /** Route a frame into an open session. The session layer owns delivery. */
-  sendInSession: (agentName: string, sessionId: string, content: Uint8Array) => Promise<void>;
-  /** Register the inbound hook. Separate from the document one — see that field's note. */
-  setOnChannelJoinFrame: (
-    cb: (agentName: string, sessionId: string, content: Uint8Array, senderPubkey: string, correlationId?: string) => { consumed: boolean },
-  ) => void;
   /** Every agent this daemon loaded. A channel IS one of them — looked up by pubkey, never by name. */
   loadedAgents: ReadonlyArray<{ name: string; pubkey: string; keyProvider: KeyProvider }>;
   keyProviders: Map<string, KeyProvider>;
@@ -109,8 +101,6 @@ export interface ChannelMembershipWiringDeps {
    * verifies it against the channel key before showing it.
    */
   fetchChannelInfo: (relays: string[], channelHex: string) => Promise<Uint8Array | null>;
-  /** Open sessions for an agent, so a re-key can ride one this daemon already holds. */
-  activeSessionsFor: (agentName: string) => Array<{ sessionId: string; counterpartyPubkeyHex: string }>;
   /**
    * M16 020-CHANADMIN: an agent's directory connection, by NAME (the daemon's own key for it), or
    * null when it has none. The subscriber asks on ITS OWN authenticated stream — the directory
@@ -118,12 +108,6 @@ export interface ChannelMembershipWiringDeps {
    * the relay's copy of it.
    */
   signalingFor: (agentName: string) => SignalingLike | null;
-  /**
-   * M16 022: open a session as this agent, without an IPC connection. The same path
-   * `cello_initiate_session` takes — `join` needs it because a subscriber has never spoken to the
-   * channel's administrator.
-   */
-  openSessionFor: (agentName: string, opts: { targetPubkey: string }) => Promise<unknown>;
   /** M16 032-NOTICES: the content-free doorbells for a join answer and a new join request. */
   notify: ChannelNotify;
   /**
@@ -148,6 +132,9 @@ export interface ChannelMembershipWiringDeps {
   noticeTransport: () => {
     depositNotice: (relays: string[], record: Uint8Array) => Promise<number>;
     fetchNotices: (relays: string[], slot: Uint8Array) => Promise<Uint8Array[]>;
+    /** 046-JOINBELL: the join slot halves, same relay client. */
+    depositJoin: (relays: string[], record: Uint8Array) => Promise<{ accepted: number; refusals: string[] }>;
+    fetchJoins: (relays: string[], slot: Uint8Array) => Promise<Uint8Array[]>;
     ringMembers: (adminAgentName: string, channelHex: string, members: string[]) => Promise<boolean>;
     /** The kill switch: the notice ring and backstop skip an agent the operator switched off. */
     isAgentOnline: (agentId: string) => boolean;
@@ -236,6 +223,13 @@ function needChannel(params: Record<string, unknown> | undefined):
 export interface ChannelMembershipWiring {
   /** M16 045-NOTICEBELL: read and apply this agent's channel notices — what a ring (the wake) calls. */
   checkNotices: (agentId: string) => Promise<void>;
+  /** M16 046-JOINBELL: the directory rang this admin: `joinerHex` asked to join `channelHex`. */
+  onJoinBell: (channelHex: string, joinerHex: string) => Promise<void>;
+  /**
+   * The same, from the raw `channel_join_bell` frame. The ring names a channel and a joiner and is
+   * trusted for nothing else: a malformed one is dropped, and a forged one reads an empty slot.
+   */
+  onJoinBellFrame: (frame: Record<string, unknown>) => Promise<void>;
   /** Stops the notice backstop tick. */
   stop: () => void;
   /**
@@ -325,11 +319,6 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     return agent ? (deps.keyProviders.get(agent.name) ?? null) : null;
   };
 
-  const openSessionWith = (agentName: string, memberPubkeyHex: string): string | null => {
-    const open = deps.activeSessionsFor(agentName)
-      .find((s) => s.counterpartyPubkeyHex.toLowerCase() === memberPubkeyHex.toLowerCase());
-    return open ? open.sessionId : null;
-  };
 
   // Late-bound: the publishing half (which owns the relay client) is built after this one.
   const noticeRelays = {
@@ -345,7 +334,7 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
    * one member must never stop an eject or a pass round.
    */
   const writeNotice = async (
-    channelHex: string, memberHex: string, type: "pass" | "eject" | "group_key", body: Uint8Array,
+    channelHex: string, memberHex: string, type: "pass" | "eject" | "group_key" | "join_answer", body: Uint8Array,
   ): Promise<boolean> => {
     const admin = localChannelAdmin(channelHex);
     const relays = members.settings(channelHex)?.relays ?? [];
@@ -395,22 +384,42 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
   });
   postingAdmin.start();
 
-  /** Which agent a session belongs to, so the hook's answers go back down the right one. */
-  const exchangeFor = (agentName: string) => createChannelJoinExchange({
+  const joinRequests = new ChannelJoinRequestStore(deps.getDb());
+  const joinRelays = {
+    depositJoin: (relays: string[], record: Uint8Array) => deps.noticeTransport().depositJoin(relays, record),
+    fetchJoin: (relays: string[], slot: Uint8Array) => deps.noticeTransport().fetchJoins(relays, slot),
+    fetchInfo: (relays: string[], ch: string) => deps.fetchChannelInfo(relays, ch),
+  };
+
+  /** M16 046-JOINBELL — the admin half: a ring names a joiner; read the slot, decide, answer, ring back. */
+  const joinAdmin = createChannelJoinAdmin({
+    logger, members, subscriptions, seen: new ChannelJoinSeenStore(deps.getDb()), relays: joinRelays,
+    localChannelAdmin,
+    writeAnswer: (ch, joiner, answer) => writeNotice(ch, joiner, "join_answer", answer),
+    ringJoiner: async (ch, joiner) => {
+      const name = adminAgentNameFor(ch);
+      if (name) await ringMembers(name, ch, [joiner]);
+    },
+    raiseRequest: (ch, joiner) => raiseNotice("channel.join.pending", ch, joiner),
     // 043-POSTERS: `members` posting issues a pass the moment someone is admitted.
     onAdmitted: (ch, sub) => { void postingAdmin.onAdmitted(ch, sub).catch(() => {}); },
-    logger,
-    members,
-    subscriptions,
-    sendInSession: (sessionId, content) => deps.sendInSession(agentName, sessionId, content),
-    localChannelAdmin,
-    profileAdminPubkey,
-    keyProviderFor,
-    raiseNotice,
-    // M16 032-NOTICES: the subscriber's own join answer — admitted / pending / refused (+ reason).
-    onJoinAnswer: (agentId, channelHex, outcome, reason) => deps.notify.channelJoinAnswer(agentId, channelHex, outcome, reason),
-    // 038-RETESTFIX Part B: a stored acceptance / public admission collects at once.
-    collectNow: (agentId) => deps.collectNow(agentId),
+  });
+
+  /** M16 046-JOINBELL — the joiner half: relays from the directory's record, a signed request, a ring. */
+  const joiner = createChannelJoiner({
+    logger, requests: joinRequests, relays: joinRelays, keyProviderFor,
+    directory: {
+      lookup: (agentId, ch) => adminLookup(agentId, ch),
+      ring: async (agentName, ch) => {
+        const signaling = deps.signalingFor(agentName);
+        if (!signaling) return { ok: false, reason: "signaling_unavailable" };
+        const res = await askDirectoryAboutChannel(signaling, { type: "channel_join_ring", channel_pubkey: new Uint8Array(Buffer.from(ch, "hex")) },
+          ["channel_join_ring_ack", "channel_join_ring_error"], ch);
+        if (!res.ok) return res;
+        if (res.frame["type"] === "channel_join_ring_ack") return { ok: true };
+        return { ok: false, reason: typeof res.frame["reason"] === "string" ? res.frame["reason"] : "refused" };
+      },
+    },
   });
 
   /**
@@ -425,9 +434,19 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     channelRevoked: async (agentId, ch) => (await adminLookup(agentId, ch)).kind === "revoked",
     onMembershipEnded: (agentId, ch, reason) => deps.notify.channelMembershipEnded(agentId, ch, reason),
     onPosterRemoved: (agentId, ch) => deps.notify.channelPosterRemoved(agentId, ch),
+    joins: {
+      requests: joinRequests,
+      apply: (o, answer) => applyJoinAnswer({ subscriptions, requests: joinRequests, logger, keyProviderFor }, o, answer),
+      onAnswer: (agentId, ch, outcome, reason) => {
+        deps.notify.channelJoinAnswer(agentId, ch, outcome, reason);
+        // 038-RETESTFIX Part B: a fresh subscription collects the channel's existing posts at once.
+        if (outcome === "admitted") deps.collectNow(agentId);
+      },
+    },
   });
   const noticeTimer = setInterval(() => {
-    const agentIds = new Set(subscriptions.active().map((s) => s.agent_id));
+    joinAdmin.sweepLapsed(members.administeredChannels());
+    const agentIds = new Set([...subscriptions.active().map((s) => s.agent_id), ...joinRequests.agentsWithRequests()]);
     for (const agentId of agentIds) {
       if (!deps.noticeTransport().isAgentOnline(agentId)) continue;
       void noticeReader.checkNotices(agentId);
@@ -435,53 +454,39 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
   }, NOTICE_BACKSTOP_TICK_MS);
   noticeTimer.unref();
 
-  /**
-   * ⚠️ CLASSIFY SYNCHRONOUSLY, HANDLE ASYNCHRONOUSLY. The ingest path needs an immediate answer to
-   * decide whether these bytes are conversation; the admin and subscriber work — key wrapping,
-   * a directory lookup — cannot be done in that window.
-   */
-  deps.setOnChannelJoinFrame((agentName, sessionId, content, senderPubkey, correlationId) => {
-    /**
-     * ⚠️ **ROUTED BY FRAME TYPE, ONCE — trying the admin half first and falling through was a bug
-     * that made joining impossible.** `onAdminFrame` answers `consumed: true` for any join frame it
-     * cannot read as a REQUEST, so an acceptance or a re-key arriving at a SUBSCRIBER was absorbed
-     * there and the subscriber half was never called. A member sent a request, the admin admitted
-     * them and replied with the key, and their daemon appended a leaf and discarded it: no
-     * subscription, no key, and not one line saying anything had gone wrong. Every re-key after an
-     * ejection went the same way. The unit tests missed it because they call the two halves by hand.
-     */
-    const kind = channelJoinFrameType(content);
-    if (kind === null) return { consumed: false };
 
-    const exchange = exchangeFor(agentName);
-    const agentId = deps.resolveAgentId(agentName);
-    void (async () => {
-      if (kind === JOIN_REQUEST_TYPE) {
-        await exchange.onAdminFrame(sessionId, senderPubkey, content);
-        return;
+  /**
+   * M16 046-JOINBELL Decision 10 — publish each administered channel's relay record to the directory,
+   * signed by the channel key, and again whenever its relays change. A stranger finds where to ask to
+   * join ONLY through this record. Checked every RELAY_RECORD_TICK_MS; sends nothing when the relays
+   * last acknowledged in this process are unchanged.
+   */
+  const publishedRelays = new Map<string, string>();
+  const publishRelayRecords = async (): Promise<void> => {
+    for (const channelHex of members.administeredChannels()) {
+      const admin = localChannelAdmin(channelHex);
+      const relays = members.settings(channelHex)?.relays ?? [];
+      const name = adminAgentNameFor(channelHex);
+      const signaling = name ? deps.signalingFor(name) : null;
+      if (!admin || relays.length === 0 || !signaling || publishedRelays.get(channelHex) === relays.join("\n")) continue;
+      try {
+        const record = await signChannelRelayRecord(admin.channelKeyProvider, { relays, signed_at: Date.now() });
+        const res = await askDirectoryAboutChannel(signaling,
+          { type: "channel_relay_record_set", channel_pubkey: record.channel_pubkey, record: encodeChannelRelayRecord(record) },
+          ["channel_relay_record_ack", "channel_relay_record_error"], channelHex);
+        if (res.ok && res.frame["type"] === "channel_relay_record_ack") {
+          publishedRelays.set(channelHex, relays.join("\n"));
+          logger.info("channel.relay_record.published", { channel_pubkey: channelHex, relays: relays.length });
+        } else {
+          logger.warn("channel.relay_record.unpublished", { channel_pubkey: channelHex, reason: res.ok ? String(res.frame["reason"] ?? "refused") : res.reason });
+        }
+      } catch (err: unknown) {
+        logger.warn("channel.relay_record.unpublished", { channel_pubkey: channelHex, reason: extractErrorMessage(err) });
       }
-      // An acceptance, a refusal or a re-key: all answers TO us, all the subscriber's business.
-      const asSubscriber = await exchange.onSubscriberFrame(agentId, sessionId, senderPubkey, content);
-      if (!asSubscriber.ok) {
-        logger.warn("channel.join.refused", {
-          ...(correlationId !== undefined ? { correlationId } : {}),
-          reason: asSubscriber.reason, sender: senderPubkey, frame_type: kind,
-          // ⚠️ THE LINE THE OPERATOR ACTUALLY READS — this is the one carrying correlationId, and
-          // the join path is fire-and-forget so there is no response to inspect either. Dropping
-          // `detail` here left `admin_unresolved` as bare as it was before item 21 fixed it, with
-          // the cause visible only on a second line that shares this event name.
-          ...(asSubscriber.detail !== undefined ? { detail: asSubscriber.detail } : {}),
-        });
-      }
-    })().catch((err: unknown) => {
-      // A rejected promise here must not take down the content path for every other session.
-      logger.error("channel.join.handling_failed", {
-        ...(correlationId !== undefined ? { correlationId } : {}),
-        reason: extractErrorMessage(err),
-      });
-    });
-    return { consumed: true };
-  });
+    }
+  };
+  const relayRecordTimer = setInterval(() => { void publishRelayRecords(); }, RELAY_RECORD_TICK_MS);
+  relayRecordTimer.unref();
 
   // ─── Operator verbs ───────────────────────────────────────────────────────────────────────────
 
@@ -515,45 +520,11 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
       return { kind: "unavailable" as const, reason: found.reason };
     },
     /**
-     * An existing session with the admin, or a new one.
-     *
-     * ⚠️ **IT OPENS ONE IF THERE IS NONE, and that is what makes `join` a single command.** A
-     * subscriber has no reason to already hold a session with a channel's administrator — they have
-     * never spoken. Requiring `cello initiate-session` first would make the verb a two-step dance
-     * whose first step nothing tells you to take.
-     *
-     * It calls the daemon's OWN initiate handler rather than a second path to the same thing: the
-     * brokering, key-binding checks and refusals all belong to that handler and must not be
-     * reimplemented here.
-     */
-    sessionWith: async (agentName, counterpartyHex) => {
-      const existing = openSessionWith(agentName, counterpartyHex);
-      if (existing !== null) return { ok: true, sessionId: existing };
-      /**
-       * ⚠️ **`openSessionFor`, NOT the handlers map — and the first version got BOTH field names
-       * wrong.** It passed `target` where the negotiator reads `target_pubkey`, and read back
-       * `session_id` where the handler returns `sessionId`. So every join refused with
-       * `no_session`, pointing the operator at the counterparty and the network for a bug that was
-       * a field name in this file. The handler's own header names this exact trap.
-       *
-       * `openSessionFor` is the seam built for callers with no IPC connection, and the document
-       * layer already uses it. Going through the handler map also meant inventing a fake
-       * connectionId, which was a seam that proved nothing.
-       */
-      const res = await deps.openSessionFor(agentName, { targetPubkey: counterpartyHex }) as
-        { ok?: boolean; sessionId?: string; reason?: string; guidance?: string };
-      if (res.ok === true && typeof res.sessionId === "string") return { ok: true, sessionId: res.sessionId };
-      // The real refusal travels. Discarding it is what made a payload bug read as a network fault.
-      return { ok: false, reason: res.reason ?? "session_open_failed", guidance: res.guidance };
-    },
-    sendInSession: (agentName, sessionId, content) => deps.sendInSession(agentName, sessionId, content),
-    /**
      * 035-INFOCLI item 1: what THIS daemon knows about a channel it administers — the SAME
      * `channel_config` table the publisher half writes (setup/create), read here for `info`. Reading
      * one table from a second store instance is one source of truth, not two.
      */
     channelConfig: (channelHex) => channelConfig.get(channelHex),
-    agentPubkey: (agentName) => deps.loadedAgents.find((a) => a.name === agentName)?.pubkey ?? null,
     decrypt: (agentId, channelHex, seq, body) => {
       const keys = subscriptions.keysFor(agentId, channelHex);
       const out = decryptBody(keys, new Uint8Array(Buffer.from(channelHex, "hex")), seq, body);
@@ -577,7 +548,7 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     const channel = needChannel(params);
     if (!channel.ok) return channel.answer;
     const note = typeof params?.["note"] === "string" ? (params["note"]) : undefined;
-    return subscribe.join(agent.agentName, deps.resolveAgentId(agent.agentName), channel.channelHex, note);
+    return joiner.join(agent.agentName, deps.resolveAgentId(agent.agentName), channel.channelHex, note);
   });
 
   handlers.set("cello_channel_read", async (params, connectionId) => {
@@ -677,8 +648,16 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     if (!agent.ok) return agent.answer;
     const channel = needChannel(params);
     if (!channel.ok) return channel.answer;
+    // 046-JOINBELL Decision 12: leaving a channel you have only ASKED to join withdraws the request.
+    const agentId = deps.resolveAgentId(agent.agentName);
+    if (joinRequests.get(agentId, channel.channelHex) && !subscriptions.get(agentId, channel.channelHex)) {
+      const withdrawn = await joiner.withdraw(agentId, channel.channelHex);
+      return withdrawn.ok
+        ? { ok: true, channel: channel.channelHex, withdrawn: true, guidance: "Your join request was withdrawn." }
+        : { ok: false, reason: withdrawn.reason };
+    }
     try {
-      subscriptions.markLeft(deps.resolveAgentId(agent.agentName), channel.channelHex);
+      subscriptions.markLeft(agentId, channel.channelHex);
     } catch (err: unknown) {
       return { ok: false, reason: extractErrorMessage(err) };
     }
@@ -917,27 +896,7 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     if (typeof subscriber !== "string" || !/^[0-9a-fA-F]{64}$/.test(subscriber)) {
       return { ok: false, reason: "bad_subscriber" };
     }
-    const sessionId = openSessionWith(agent.agentName, subscriber.toLowerCase());
-    if (sessionId === null) {
-      /**
-       * ⚠️ THIS COMMENT USED TO READ *"The approval is recorded either way: the next request from an
-       * approved member is accepted immediately, so an admin approving somebody who has gone offline
-       * is not wasted work."* — AND THE GUIDANCE BELOW SAID THE SAME THING TO THE OPERATOR. Neither
-       * was true, in either half.
-       *
-       * Nothing is recorded: `members.approve` runs inside `exchange.approve`, BELOW this early
-       * return, so an approval that cannot be delivered leaves the row `pending`. And the member
-       * cannot restart it — a request from a `pending` member is refused `pending_approval`
-       * (channel-join-exchange.ts), and one from an `active` member is refused `already_member`
-       * without re-sending the key. So "approve again when they next ask" was the only true clause,
-       * and the sentence after it sent an admin away believing the work was done.
-       *
-       * Rewritten rather than deleted: this is a comment that asserted a property the code did not
-       * have, sitting directly above the guidance that repeated it to the person relying on it.
-       */
-      return { ok: false, reason: "no_open_session", guidance: "They are not reachable right now and nothing was recorded — they are still pending. Run approve again once they are back online; their own retry cannot restart it." };
-    }
-    const result = await exchangeFor(agent.agentName).approve(channel.channelHex, subscriber.toLowerCase(), sessionId);
+    const result = await joinAdmin.approve(channel.channelHex, subscriber.toLowerCase());
     return result.ok ? { ok: true, channel: channel.channelHex } : { ok: false, reason: result.reason };
   });
 
@@ -978,16 +937,21 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     if (typeof subscriber !== "string" || !/^[0-9a-fA-F]{64}$/.test(subscriber)) {
       return { ok: false, reason: "bad_subscriber" };
     }
-    const sessionId = openSessionWith(agent.agentName, subscriber.toLowerCase());
-    if (sessionId === null) return { ok: false, reason: "no_open_session" };
-    const result = await exchangeFor(agent.agentName).refuse(channel.channelHex, subscriber.toLowerCase(), sessionId);
+    const result = await joinAdmin.refuse(channel.channelHex, subscriber.toLowerCase());
     return result.ok ? { ok: true, channel: channel.channelHex } : { ok: false, reason: result.reason };
   });
 
   return {
     // The kill switch holds here too: a ring for a switched-off agent reads nothing.
     checkNotices: (agentId: string) => (deps.noticeTransport().isAgentOnline(agentId) ? noticeReader.checkNotices(agentId) : Promise.resolve()),
-    stop: () => { clearInterval(noticeTimer); },
+    onJoinBell: (channelHex: string, joinerHex: string) => joinAdmin.onBell(channelHex, joinerHex),
+    onJoinBellFrame: (frame: Record<string, unknown>) => {
+      const asHex = (v: unknown): string | null => (v instanceof Uint8Array && v.length === 32 ? Buffer.from(v).toString("hex") : null);
+      const channelHex = asHex(frame["channel_pubkey"]);
+      const joinerHex = asHex(frame["joiner_pubkey"]);
+      return channelHex && joinerHex ? joinAdmin.onBell(channelHex, joinerHex) : Promise.resolve();
+    },
+    stop: () => { clearInterval(noticeTimer); clearInterval(relayRecordTimer); },
     activeMembers: (channelHex: string) => members.activeMembers(channelHex),
     /**
      * ⚠️ **NO PLAINTEXT FALLBACK, EVER.** No admin key held for this channel, or no group key mint

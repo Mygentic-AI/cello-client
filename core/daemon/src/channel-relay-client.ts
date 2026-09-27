@@ -233,6 +233,19 @@ export class ChannelRelayClient {
     return answer["record"] instanceof Uint8Array ? answer["record"] : null;
   }
 
+  /** 046-JOINBELL: deposit one join slot record. A refusal names its reason (e.g. `join_slot_cap`). */
+  async depositJoin(relayAddr: string, record: Uint8Array): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const answer = await this.request(relayAddr, { type: "channel_join_set", record });
+    if (answer["type"] === "channel_join_set_ok") return { ok: true };
+    return { ok: false, reason: typeof answer["reason"] === "string" ? answer["reason"] : "unexpected_answer" };
+  }
+
+  /** 046-JOINBELL: the join slot record this relay holds at a slot, or null. */
+  async getJoin(relayAddr: string, slot: Uint8Array): Promise<Uint8Array | null> {
+    const answer = await this.request(relayAddr, { type: "channel_join_get", slot });
+    return answer["record"] instanceof Uint8Array ? answer["record"] : null;
+  }
+
   /** The channel's info record as this relay holds it, or null. */
   async info(relayAddr: string, channelPubkey: Uint8Array): Promise<Uint8Array | null> {
     const answer = await this.request(relayAddr, { type: "channel_info", channel_pubkey: channelPubkey });

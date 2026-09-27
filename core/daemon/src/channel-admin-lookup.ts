@@ -31,7 +31,7 @@ export interface SignalingLike {
 
 export type ChannelAdminOutcome =
   /** A registered channel, and the agent the directory says administers it. */
-  | { kind: "admin"; adminPubkeyHex: string }
+  | { kind: "admin"; adminPubkeyHex: string; relayRecord?: Uint8Array }
   /** The directory answered, and this pubkey is not a channel — unregistered, or an ordinary agent. */
   | { kind: "not_a_channel" }
   /**
@@ -178,7 +178,11 @@ export function createChannelAdminLookup(
       }
 
       deps.logger.info("directory.channel.admin.lookup", { channel: channelHex.slice(0, 16), answered: "admin" });
-      return { kind: "admin", adminPubkeyHex };
+      // 046-JOINBELL: the channel-signed relay record, when the admin has published one. The joiner
+      // verifies it against the channel key; nothing here trusts it.
+      const rawRecord = frame["relay_record"];
+      const relayRecord = rawRecord instanceof Uint8Array ? rawRecord : Buffer.isBuffer(rawRecord) ? new Uint8Array(rawRecord) : undefined;
+      return { kind: "admin", adminPubkeyHex, ...(relayRecord ? { relayRecord } : {}) };
     } catch (err: unknown) {
       return { kind: "unavailable", reason: extractErrorMessage(err) };
     } finally {
@@ -186,4 +190,35 @@ export function createChannelAdminLookup(
       unregister();
     }
   };
+}
+
+/**
+ * M16 046-JOINBELL — ask the directory one channel question on this agent's stream and wait for the
+ * answer that ECHOES the same channel (the stream is multiplexed). `unavailable` with the transport's
+ * reason, or `timeout`, when there is no answer — never a guessed one.
+ */
+export async function askDirectoryAboutChannel(
+  signaling: SignalingLike, frame: Record<string, unknown>, replyTypes: readonly string[], channelHex: string, timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<{ ok: true; frame: Record<string, unknown> } | { ok: false; reason: string }> {
+  let resolveFrame!: (f: Record<string, unknown>) => void;
+  const pending = new Promise<Record<string, unknown>>((r) => { resolveFrame = r; });
+  const unregister = signaling.registerInboundHandler((f) => {
+    if (typeof f["type"] !== "string" || !replyTypes.includes(f["type"])) return;
+    if (echoedChannelHex(f) !== channelHex.toLowerCase()) return;
+    resolveFrame(f);
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const sent = await signaling.sendRaw(frame);
+    if (!sent.ok) return { ok: false, reason: sent.reason ?? "signaling_unavailable" };
+    const timeoutP = new Promise<Record<string, unknown>>((r) => { timer = setTimeout(() => r({ type: "__timeout__" }), timeoutMs); });
+    const answer = await Promise.race([pending, timeoutP]);
+    if (answer["type"] === "__timeout__") return { ok: false, reason: "timeout" };
+    return { ok: true, frame: answer };
+  } catch (err: unknown) {
+    return { ok: false, reason: extractErrorMessage(err) };
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    unregister();
+  }
 }

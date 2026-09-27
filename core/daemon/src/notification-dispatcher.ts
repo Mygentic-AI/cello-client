@@ -240,11 +240,11 @@ export class NotificationDispatcher {
     });
   }
 
-  /** This agent's own join request was answered: `admitted` | `pending` | `refused` (+ reason). */
+  /** This agent's own join request was answered: `admitted` | `pending` | `refused` (+ reason) | `expired`. */
   dispatchChannelJoinAnswer(
     agentName: string,
     channelHex: string,
-    outcome: "admitted" | "pending" | "refused",
+    outcome: "admitted" | "pending" | "refused" | "expired",
     reason?: string,
   ): void {
     this.#dispatchToCurrent(agentName, "channel_join_answer", {

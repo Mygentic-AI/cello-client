@@ -16,13 +16,11 @@ import type { Logger } from "../types.js";
 import { ChannelSubscriptionStore } from "../channel-subscription-store.js";
 import { ChannelInboxStore } from "../channel-inbox-store.js";
 import { createChannelSubscribe } from "../channel-subscribe.js";
-import { decodeChannelJoinRequest, signBroadcastArtifact, signChannelInfo, encodeChannelInfo } from "@cello-protocol/protocol-types";
+import { signBroadcastArtifact, signChannelInfo, encodeChannelInfo } from "@cello-protocol/protocol-types";
 import { generateKeypair } from "@cello-protocol/crypto";
 
 const silent: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 const AGENT = "agent-1";
-const AGENT_NAME = "Alice";
-const AGENT_PUBKEY = "a1".repeat(32);
 const CHANNEL = "c1".repeat(32);
 const ADMIN = "ad".repeat(32);
 const RELAY = "/dns4/relay-a.example/tcp/443/tls/ws/p2p/12D3KooWJXHpnWQhGk3jXBJYdXMmeLxEhRqzwZCYd1bxSUh4pg83";
@@ -46,7 +44,6 @@ afterEach(() => {
 });
 
 function build(over: Partial<Parameters<typeof createChannelSubscribe>[0]> = {}) {
-  const sent: Array<{ sessionId: string; content: Uint8Array }> = [];
   const api = createChannelSubscribe({
     logger: silent,
     subscriptions: subs,
@@ -54,15 +51,12 @@ function build(over: Partial<Parameters<typeof createChannelSubscribe>[0]> = {})
     lookupAdmin: () => Promise.resolve({ kind: "admin" as const, adminPubkeyHex: ADMIN }),
     // Default: this daemon administers NO channel. Overridden per-test to prove the administered case.
     channelConfig: () => null,
-    sessionWith: () => Promise.resolve({ ok: true as const, sessionId: "session-1" }),
-    sendInSession: (_a, sessionId, content) => { sent.push({ sessionId, content }); return Promise.resolve(); },
-    agentPubkey: () => AGENT_PUBKEY,
     decrypt: (_a, _c, _s, body) => Promise.resolve(body),
     // 041 Part C: by default no relay holds an info record — the stored description is used.
     fetchInfo: () => Promise.resolve(null),
     ...over,
   });
-  return { api, sent };
+  return { api };
 }
 
 /** A subscription as the join acceptance would have created it — relays included. */
@@ -269,80 +263,6 @@ describe("M16 041-HELPTRUTH Part C — a member's info refreshes the description
       expect(r.guidance).toBe("old stored text");
       expect(r.description_source).toBe("stored");
     }
-  });
-});
-
-describe("M16 022 — join", () => {
-  it("4. sends a join request to the ADMIN the directory named, and NO RELAY is involved", async () => {
-    /**
-     * ⚠️ **THE VERB THAT DID NOT EXIST.** And it takes one argument: relays are the publisher's
-     * choice and arrive on the acceptance, so a subscriber never sees or types one.
-     */
-    const { api, sent } = build();
-    const r = await api.join(AGENT_NAME, AGENT, CHANNEL);
-    expect(r).toEqual({ ok: true, channelHex: CHANNEL, state: "requested" });
-
-    expect(sent).toHaveLength(1);
-    const decoded = decodeChannelJoinRequest(sent[0].content);
-    expect(decoded.ok).toBe(true);
-    if (decoded.ok) {
-      expect(Buffer.from(decoded.frame.channel_pubkey).toString("hex")).toBe(CHANNEL);
-      expect(Buffer.from(decoded.frame.subscriber_pubkey).toString("hex")).toBe(AGENT_PUBKEY);
-    }
-  });
-
-  it("5. IT DOES NOT RECORD A SUBSCRIPTION — asking is not being admitted", async () => {
-    /**
-     * ⚠️ The answer arrives later as a join frame and the EXCHANGE decides, after running the admin
-     * check 020 built. A verb that wrote a subscription on send would make an unanswered request —
-     * or a refused one — look like membership, and would hand the operator a channel they cannot
-     * read.
-     */
-    const { api, sent } = build();
-    await api.join(AGENT_NAME, AGENT, CHANNEL);
-    // Paired with the send, so this cannot pass for an implementation that simply failed earlier.
-    expect(sent, "the request really went out").toHaveLength(1);
-    expect(subs.get(AGENT, CHANNEL)).toBeNull();
-  });
-
-  it("6. a channel the directory does not know is refused before any session is opened", async () => {
-    const sessionWith = vi.fn(() => Promise.resolve({ ok: true as const, sessionId: "session-1" }));
-    const { api } = build({ lookupAdmin: () => Promise.resolve({ kind: "not_a_channel" as const }), sessionWith });
-    const r = await api.join(AGENT_NAME, AGENT, CHANNEL);
-    expect(r.ok).toBe(false);
-    expect(sessionWith, "no session is opened for a channel that does not exist").not.toHaveBeenCalled();
-  });
-
-  it("7. no session with the admin is a named refusal, not a throw", async () => {
-    const { api } = build({
-      sessionWith: () => Promise.resolve({ ok: false as const, reason: "invalid_target_pubkey" }),
-    });
-    const r = await api.join(AGENT_NAME, AGENT, CHANNEL);
-    expect(r.ok).toBe(false);
-    if (!r.ok) {
-      expect(r.reason).toBe("no_session");
-      /**
-       * ⚠️ **THE REAL CAUSE TRAVELS, and the first version threw it away.** It said "could not open
-       * a session with the admin" for everything — including a field name wrong in the caller,
-       * which is what actually shipped. That message points an operator at the counterparty and the
-       * network for a bug in their own daemon.
-       */
-      expect(r.detail).toBe("invalid_target_pubkey");
-    }
-  });
-
-  it("038 Part D — a join to a revoked channel is refused BEFORE any session is opened", async () => {
-    const sessionWith = vi.fn(() => Promise.resolve({ ok: true as const, sessionId: "session-1" }));
-    const { api, sent } = build({ lookupAdmin: () => Promise.resolve({ kind: "revoked" as const }), sessionWith });
-    const r = await api.join(AGENT_NAME, AGENT, CHANNEL);
-    expect(r.ok).toBe(false);
-    if (!r.ok) {
-      expect(r.reason).toBe("channel_deleted");
-      expect(r.guidance).toBe("This channel was deleted by its admin.");
-    }
-    // No session opened, nothing sent — the refusal comes from the directory answer alone.
-    expect(sessionWith, "no session is opened for a deleted channel").not.toHaveBeenCalled();
-    expect(sent).toHaveLength(0);
   });
 });
 

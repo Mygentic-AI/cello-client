@@ -151,6 +151,9 @@ function doorbellText(type: string, data: Record<string, unknown>): string {
           return `✅ CELLO — you're in: channel ${label} admitted you. Its posts will arrive here.`;
         case "pending":
           return `⏳ CELLO — your request to join channel ${label} is waiting for the admin.`;
+        // 046-JOINBELL Decision 11: the request lapsed after the channel's retention period.
+        case "expired":
+          return `⌛ CELLO — your request to join channel ${label} expired with no answer.`;
         case "refused": {
           // 038-RETESTFIX Part E: removal and deletion are no longer refusals — they arrive as
           // `channel_membership_ended` (its own case below). A refusal now answers a would-be

@@ -1,42 +1,51 @@
 /**
- * ChannelJoinExchange — M16 019-MEMBERSHIP Part B, both sides of joining a channel.
+ * M16 046-JOINBELL — joining a channel, both sides, with no session.
  *
- * A channel never converses. Its ADMIN is an ordinary agent, so a join is a typed exchange inside a
- * normal sealed session with that admin — no new transport, no relay frames, no special case in the
- * session layer.
+ * JOINER: the directory lookup returns the channel's relay record (signed by the channel key); the
+ * joiner reads the channel's info record from those relays, writes its request — signed by itself,
+ * sealed to the admin — into a hashed join slot on them, and rings the admin through the directory.
+ * The admin's answer comes back as a `join_answer` notice (045) in the joiner's own notice slot.
  *
- * ─── The two identity checks, and why each is load-bearing ───────────────────────────────────
+ * ADMIN: a ring names the channel and the joiner. The admin's daemon computes the slot, reads the
+ * request, verifies it, and decides exactly as it always has — open and public admit at once,
+ * invite-only waits for the admin agent — then writes the answer and rings the joiner.
  *
- * **ADMIN side: the session counterparty must BE the subscriber the frame names.** The frame says
- * who is joining and the session says who is talking; if they may differ, anyone can enrol a third
- * party — and, worse, receive that third party's key bundle themselves, because the bundle is
- * wrapped for the pubkey in the frame and sent down the session they are holding.
+ * ⚠️ **THE SENDER IS A STRANGER.** A ring for a channel this daemon does not administer reads
+ * nothing; a request is acted on only when it decodes strictly, verifies against the joiner the ring
+ * named, and is newer than the last one from that joiner (one slot per joiner, newest signed time
+ * wins); the admin's agent is alerted only on a NEW or CHANGED request; a withdrawal drops the
+ * request silently; a request older than the channel's retention has lapsed and is dropped.
  *
- * **SUBSCRIBER side: the answering agent must be the admin in the channel's DIRECTORY PROFILE.**
- * The session proves who the counterparty is. It does not prove they are this channel's admin. Drop
- * this check and any agent that can open a session with you hands you a key bundle and a relay pair
- * and becomes your channel: you read their posts believing them to be somebody else's, and the
- * immutable `admin_pubkey` the design rests on protects nobody.
+ * ⚠️ **THE ANSWER IS THE CHANNEL KEY'S WORD.** The joiner accepts an answer only for a channel it
+ * has an outstanding request for, only when the channel key signed it, and only when it is newer
+ * than the last answer and than the last ejection it holds from that channel.
  *
- * ─── What is NOT decided here ────────────────────────────────────────────────────────────────
- *
- * Invite-only admission is the admin AGENT's decision. A request lands as `pending` and raises a
- * notice; nothing in this file approves one. There is no heuristic, no allowlist, no auto-approve.
+ * The join note is free text from a stranger. As before this order, it does not reach the admin's
+ * agent — the doorbell names the channel and the joiner, nothing else.
  */
 import {
-  decodeChannelJoinRequest, decodeChannelJoinAccepted, decodeChannelJoinRefused,
-  encodeChannelJoinAccepted, encodeChannelJoinRefused,
-  isChannelJoinFrame,
-  type ChannelJoinRefusedReason,
+  channelJoinSlot, signChannelJoinRequest, encodeChannelJoinRequest, decodeChannelJoinRequest,
+  verifyChannelJoinRequest, signChannelJoinWithdrawal, encodeChannelJoinWithdrawal,
+  decodeChannelJoinWithdrawal, verifyChannelJoinWithdrawal, encodeChannelJoinSlotRecord,
+  decodeChannelJoinSlotRecord, signChannelJoinAnswer, encodeChannelJoinAnswer,
+  decodeChannelRelayRecord, verifyChannelRelayRecord, decodeChannelInfo, verifyChannelInfo,
+  type ChannelJoinAnswer, type ChannelJoinRefusedReason, type ChannelAccess,
 } from "@cello-protocol/protocol-types";
-import {
-  generateGroupKey, wrapGroupKeyFor, unwrapGroupKey, type GroupKey,
-} from "@cello-protocol/crypto";
-import type { KeyProvider } from "@cello-protocol/crypto";
+import { generateGroupKey, wrapGroupKeyFor, unwrapGroupKey, sealToRecipient, type GroupKey, type KeyProvider } from "@cello-protocol/crypto";
+import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
 import type { ChannelMembershipStore } from "./channel-membership-store.js";
 import type { ChannelSubscriptionStore } from "./channel-subscription-store.js";
 import { extractErrorMessage } from "./error-message.js";
+
+const hexOf = (b: Uint8Array): string => Buffer.from(b).toString("hex");
+const bytesOf = (h: string): Uint8Array => new Uint8Array(Buffer.from(h, "hex"));
+
+/** Decision 9, verbatim: what the joiner's agent is told when a guard refuses it. */
+export const JOIN_THROTTLE_GUIDANCE =
+  "Too many join requests to this channel. Wait before trying again. Repeated attempts are recorded against your agent and can affect its reputation.";
+/** The guard refusals that carry that guidance, from the directory or a relay. */
+const GUARD_REASONS = new Set(["rate_limited", "join_slot_cap", "stale_request"]);
 
 /** What this daemon knows about a channel it administers. `null` means it does not administer one. */
 export interface LocalChannelAdmin {
@@ -46,79 +55,10 @@ export interface LocalChannelAdmin {
   adminKeyProvider: KeyProvider;
 }
 
-/**
- * M16 021-WAKE item 21: the admin, or WHY there isn't one.
- *
- * ⚠️ The refusal is unchanged — anything other than `ok` leaves the join refused, exactly as the
- * bare `null` did. What is new is that the cause travels with it, so `admin_unresolved` stops being
- * a word an operator can do nothing with.
- */
+/** The admin, or WHY there isn't one (021-WAKE item 21). */
 export type AdminLookupOutcome =
   | { ok: true; adminPubkeyHex: string }
   | { ok: false; reason: string };
-
-export interface ChannelJoinExchangeDeps {
-  logger: Logger;
-  members: ChannelMembershipStore;
-  subscriptions: ChannelSubscriptionStore;
-  /** Put a frame on an open session. The session layer owns delivery; this owns the decisions. */
-  sendInSession: (sessionId: string, content: Uint8Array) => Promise<void>;
-  localChannelAdmin: (channelHex: string) => LocalChannelAdmin | null;
-  /**
-   * The channel's admin AS THE DIRECTORY REPORTS IT. `null` means the lookup could not be resolved,
-   * which FAILS CLOSED — an unreachable directory must not become "whoever answered is the admin".
-   */
-  profileAdminPubkey: (channelHex: string, agentId: string) => Promise<AdminLookupOutcome>;
-  keyProviderFor: (agentId: string) => KeyProvider | null;
-  raiseNotice: (event: string, channelHex: string, subscriberHex: string) => void;
-  /**
-   * M16 032-NOTICES: how THIS agent's own join request was answered — `admitted` when an acceptance
-   * is stored, `pending` on a `pending_approval` refusal, `refused` (+ the reason word) on any other
-   * refusal. The wiring turns it into the content-free `channel_join_answer` doorbell. Optional and
-   * additive: an older wiring omits it and the exchange behaves exactly as before. A re-key is NOT
-   * an answer to a join and never rings this — that is out of scope (notices for re-key).
-   */
-  onJoinAnswer?: (agentId: string, channelHex: string, outcome: "admitted" | "pending" | "refused", reason?: string) => void;
-  /**
-   * 038-RETESTFIX Part B: a subscription that has just BECOME ACTIVE — an acceptance stored (open /
-   * invite-only) or a public admission — must collect the channel's existing posts at once, instead
-   * of waiting for the next post's wake or the backstop poll. Wired to the SAME `collectNow` the
-   * wake uses (fire-and-forget, and it keeps its own online check, so a switched-off agent is still
-   * skipped — MUST NOT CHANGE item 2). Optional and additive: absent, the exchange behaves as before.
-   */
-  collectNow?: (agentId: string) => void;
-  /** 043-POSTERS: a member was admitted (and sent its key) — `members` posting issues it a pass. */
-  onAdmitted?: (channelHex: string, subscriberHex: string) => void;
-  now?: () => number;
-}
-
-export type SubscriberJoinResult =
-  | { ok: true; channelHex: string; generation: number }
-  | {
-      ok: false;
-      reason: "not_a_join_frame" | "malformed" | "not_admin_of_channel" | "admin_unresolved" | "key_unwrap_failed" | "no_key_provider" | "refused_by_admin";
-      /**
-       * M16 021-WAKE item 21: WHY, when the reason alone cannot say.
-       *
-       * ⚠️ `admin_unresolved` is an exit-point label. A dead signaling stream, a ten-second timeout
-       * against a directory that has not been rolled, a channel the directory has never heard of
-       * and a database fault all arrive at that one word, and the operator cannot tell which. The
-       * cause survived only in a log line one step upstream, which is not where anyone looks when a
-       * join is refused.
-       */
-      detail?: string;
-    };
-
-export interface ChannelJoinExchange {
-  /** An inbound frame on the ADMIN's daemon. `consumed: false` means it was not a join frame. */
-  onAdminFrame: (sessionId: string, counterpartyHex: string, content: Uint8Array) => Promise<{ consumed: boolean }>;
-  /** An inbound acceptance or refusal on the SUBSCRIBER's daemon. */
-  onSubscriberFrame: (agentId: string, sessionId: string, counterpartyHex: string, content: Uint8Array) => Promise<SubscriberJoinResult>;
-  /** The admin agent's explicit decision on a pending invite-only request. */
-  approve: (channelHex: string, subscriberHex: string, sessionId: string) => Promise<{ ok: true } | { ok: false; reason: string }>;
-  /** Refuse a pending request by name. */
-  refuse: (channelHex: string, subscriberHex: string, sessionId: string) => Promise<{ ok: true } | { ok: false; reason: string }>;
-}
 
 /**
  * The channel's CURRENT group key for its admin: the key at `settings.key_generation`, started at 1
@@ -126,16 +66,9 @@ export interface ChannelJoinExchange {
  * publishing, so a post made before anyone joined is readable by the first member.
  * `undefined` for a public channel or a channel with no membership settings.
  *
- * ⚠️ **THE ADMIN STORES ITS OWN CHANNEL'S GROUP KEY IN THE SAME TABLE ITS SUBSCRIBERS USE**, under
- * its own agent id. A key held only in this process is lost on restart — and then the second member
- * admitted after a restart gets a DIFFERENT key at the same generation, so the two decrypt different
- * halves of the channel and neither can tell why. The admin is a reader of its own channel; storing
- * the key where readers keep keys is the honest place for it.
- *
- * ⚠️ **THE GENERATION COMES FROM SETTINGS, NOT FROM "NEWEST KEY HELD".** `settings.key_generation`,
- * started with `members.startGeneration` when it is still 0 — exactly what admitting a member does.
- * Both the exchange and the publisher reach this ONE function, so a post published before anyone
- * joined and the first member's key are the same bytes at the same generation.
+ * ⚠️ The admin stores its own channel's group key in the same table its subscribers use: a key held
+ * only in this process is lost on restart, and the next member would get a DIFFERENT key at the same
+ * generation. The generation comes from settings, not "newest key held".
  */
 export function ensureCurrentGroupKey(
   deps: { members: ChannelMembershipStore; subscriptions: ChannelSubscriptionStore; now: () => number },
@@ -143,12 +76,9 @@ export function ensureCurrentGroupKey(
   channelHex: string,
 ): GroupKey | undefined {
   const settings = deps.members.settings(channelHex);
-  // No membership settings, or a public channel, has no group key and mints none.
   if (!settings || settings.access === "public") return undefined;
-
   let generation = settings.key_generation;
   if (generation === 0) generation = deps.members.startGeneration(channelHex);
-
   const held = deps.subscriptions.keysFor(adminAgentId, channelHex).find((k) => k.generation === generation);
   if (held) return held;
   const minted = generateGroupKey(generation);
@@ -156,316 +86,470 @@ export function ensureCurrentGroupKey(
   return minted;
 }
 
-export function createChannelJoinExchange(deps: ChannelJoinExchangeDeps): ChannelJoinExchange {
-  const { logger, members, subscriptions } = deps;
-  const now = deps.now ?? (() => Date.now());
+// ─── Stores ──────────────────────────────────────────────────────────────────────────────────────
 
-  async function refuseTo(sessionId: string, channelPubkey: Uint8Array, reason: ChannelJoinRefusedReason): Promise<void> {
-    logger.info("channel.join.refused", {
-      channel_pubkey: Buffer.from(channelPubkey).toString("hex"), reason,
-    });
-    await deps.sendInSession(sessionId, encodeChannelJoinRefused({ channel_pubkey: channelPubkey, reason }));
+const REQUESTS_SQL = `
+  CREATE TABLE IF NOT EXISTS channel_join_requests (
+    agent_id           TEXT    NOT NULL,
+    channel_pubkey     TEXT    NOT NULL,
+    admin_pubkey       TEXT    NOT NULL,
+    access             TEXT    NOT NULL,
+    relays             TEXT    NOT NULL,
+    guidance           TEXT    NOT NULL,
+    retention_seconds  INTEGER NOT NULL,
+    signed_at          INTEGER NOT NULL,
+    PRIMARY KEY (agent_id, channel_pubkey)
+  );
+`;
+
+export interface OutstandingJoin {
+  agent_id: string;
+  channel_pubkey: string;
+  admin_pubkey: string;
+  access: ChannelAccess;
+  relays: string[];
+  guidance: string;
+  retention_seconds: number;
+  signed_at: number;
+}
+
+/** The joiner's outstanding requests. Keyed on agent_id; a row exists only while unanswered. */
+export class ChannelJoinRequestStore {
+  readonly #db: DaemonDatabase;
+
+  constructor(db: DaemonDatabase) {
+    this.#db = db;
+    this.#db.exec(REQUESTS_SQL);
   }
 
-  async function acceptInto(
-    sessionId: string, channelHex: string, subscriberHex: string, admin: LocalChannelAdmin,
-  ): Promise<{ ok: true } | { ok: false; reason: string }> {
-    const settings = members.settings(channelHex);
-    /**
-     * ⚠️ RETURNS A REASON RATHER THAN NOTHING. This used to return silently, and `approve` reported
-     * `ok: true` on top of it — so an admin believed they had admitted somebody who received no key
-     * and no relays, and the member's daemon heard nothing at all.
-     */
-    if (!settings) return { ok: false, reason: "channel_not_configured_for_membership" };
+  put(r: OutstandingJoin): void {
+    this.#db.prepare(`INSERT INTO channel_join_requests
+        (agent_id, channel_pubkey, admin_pubkey, access, relays, guidance, retention_seconds, signed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (agent_id, channel_pubkey) DO UPDATE SET admin_pubkey = excluded.admin_pubkey,
+          access = excluded.access, relays = excluded.relays, guidance = excluded.guidance,
+          retention_seconds = excluded.retention_seconds, signed_at = excluded.signed_at`)
+      .run(r.agent_id, r.channel_pubkey, r.admin_pubkey, r.access, JSON.stringify(r.relays), r.guidance, r.retention_seconds, r.signed_at);
+  }
 
-    const channelPubkeyPublic = await admin.channelKeyProvider.getPublicKey();
-    /**
-     * ⚠️ **A PUBLIC CHANNEL IS ADMITTED WITH NO KEY (036-PUBLICSUB).** Its posts are not encrypted,
-     * so there is nothing to mint or wrap — the acceptance carries the relays, guidance and retention
-     * and an EMPTY bundle. Minting a key here would store bytes nobody uses and that no ejection could
-     * ever bite. The empty bundle is exactly what the frame requires for `access: "public"`.
-     */
-    if (settings.access === "public") {
-      await deps.sendInSession(sessionId, encodeChannelJoinAccepted({
-        channel_pubkey: channelPubkeyPublic,
-        key_bundle: new Uint8Array(0),
-        guidance: settings.guidance,
-        retention_seconds: settings.retention_seconds,
-        access: "public",
-        relays: settings.relays,
-        members_visible: settings.members_visible,
-      }));
-      logger.info("channel.member.joined", {
-        channel_pubkey: channelHex, subscriber_pubkey: subscriberHex, access: "public",
-      });
-      return { ok: true };
+  get(agentId: string, channelHex: string): OutstandingJoin | null {
+    return this.forAgent(agentId).find((r) => r.channel_pubkey === channelHex) ?? null;
+  }
+
+  forAgent(agentId: string): OutstandingJoin[] {
+    const rows = this.#db.prepare(`SELECT * FROM channel_join_requests WHERE agent_id = ?`).all(agentId) as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      agent_id: String(r["agent_id"]), channel_pubkey: String(r["channel_pubkey"]), admin_pubkey: String(r["admin_pubkey"]),
+      access: String(r["access"]) as ChannelAccess, relays: JSON.parse(String(r["relays"])) as string[],
+      guidance: String(r["guidance"]), retention_seconds: Number(r["retention_seconds"]), signed_at: Number(r["signed_at"]),
+    }));
+  }
+
+  agentsWithRequests(): string[] {
+    const rows = this.#db.prepare(`SELECT DISTINCT agent_id FROM channel_join_requests`).all() as Array<{ agent_id: string }>;
+    return rows.map((r) => r.agent_id);
+  }
+
+  remove(agentId: string, channelHex: string): void {
+    this.#db.prepare(`DELETE FROM channel_join_requests WHERE agent_id = ? AND channel_pubkey = ?`).run(agentId, channelHex);
+  }
+}
+
+const SEEN_SQL = `
+  CREATE TABLE IF NOT EXISTS channel_join_seen (
+    channel_pubkey  TEXT    NOT NULL,
+    joiner_pubkey   TEXT    NOT NULL,
+    signed_at       INTEGER NOT NULL,
+    PRIMARY KEY (channel_pubkey, joiner_pubkey)
+  );
+`;
+
+/** The admin's newest signed time per (channel, joiner) — what makes a repeat silent. */
+export class ChannelJoinSeenStore {
+  readonly #db: DaemonDatabase;
+
+  constructor(db: DaemonDatabase) {
+    this.#db = db;
+    this.#db.exec(SEEN_SQL);
+  }
+
+  get(channelHex: string, joinerHex: string): number {
+    const row = this.#db.prepare(`SELECT signed_at FROM channel_join_seen WHERE channel_pubkey = ? AND joiner_pubkey = ?`)
+      .get(channelHex, joinerHex) as { signed_at: number | bigint } | undefined;
+    return row ? Number(row.signed_at) : 0;
+  }
+
+  set(channelHex: string, joinerHex: string, signedAt: number): void {
+    this.#db.prepare(`INSERT INTO channel_join_seen (channel_pubkey, joiner_pubkey, signed_at) VALUES (?, ?, ?)
+        ON CONFLICT (channel_pubkey, joiner_pubkey) DO UPDATE SET signed_at = excluded.signed_at`)
+      .run(channelHex, joinerHex, signedAt);
+  }
+}
+
+// ─── Transport, as this file sees it ────────────────────────────────────────────────────────────
+
+export interface JoinRelays {
+  /** Deposit a join slot record on every relay: how many took it, and every refusal reason. Never throws. */
+  depositJoin: (relays: string[], record: Uint8Array) => Promise<{ accepted: number; refusals: string[] }>;
+  /** Every join slot record the relays hold at this slot. Never throws. */
+  fetchJoin: (relays: string[], slot: Uint8Array) => Promise<Uint8Array[]>;
+  /** The channel's info record from its relays, or null. */
+  fetchInfo: (relays: string[], channelHex: string) => Promise<Uint8Array | null>;
+}
+
+/** The directory, as the joiner sees it. */
+export interface JoinDirectory {
+  /** The channel lookup: the admin and the channel-signed relay record, or why not. */
+  lookup: (agentId: string, channelHex: string) => Promise<
+    | { kind: "admin"; adminPubkeyHex: string; relayRecord?: Uint8Array }
+    | { kind: "not_a_channel" } | { kind: "revoked" } | { kind: "unavailable"; reason: string }
+  >;
+  /** Ring the channel's admin. The directory's answer, including a guard refusal. */
+  ring: (agentName: string, channelHex: string) => Promise<{ ok: true } | { ok: false; reason: string }>;
+}
+
+// ─── The joiner ──────────────────────────────────────────────────────────────────────────────────
+
+export type ChannelJoinResult =
+  | { ok: true; channelHex: string; state: "requested"; rung: boolean }
+  | {
+      ok: false;
+      reason: "not_a_channel" | "unavailable" | "channel_deleted" | "no_relays" | "relay_record_invalid"
+        | "channel_info_unavailable" | "relays_unreachable" | "no_key_provider" | "not_requested"
+        | "rate_limited" | "join_slot_cap" | "stale_request";
+      detail?: string;
+      guidance?: string;
+    };
+
+export interface ChannelJoinerDeps {
+  logger: Logger;
+  requests: ChannelJoinRequestStore;
+  relays: JoinRelays;
+  directory: JoinDirectory;
+  keyProviderFor: (agentId: string) => KeyProvider | null;
+  now?: () => number;
+}
+
+/** Read and verify the channel's info record: what subscription setup needs. Null when none verifies. */
+async function channelFacts(
+  relays: JoinRelays, relayList: string[], channelHex: string,
+): Promise<{ access: ChannelAccess; guidance: string; retention_seconds: number } | null> {
+  const bytes = await relays.fetchInfo(relayList, channelHex).catch(() => null);
+  if (!bytes) return null;
+  const decoded = decodeChannelInfo(bytes);
+  if (!decoded.ok || hexOf(decoded.info.channel_pubkey) !== channelHex || !verifyChannelInfo(decoded.info)) return null;
+  return { access: decoded.info.access, guidance: decoded.info.guidance, retention_seconds: decoded.info.retention_seconds };
+}
+
+/** Seal a joiner-signed record to the admin and write it into the joiner's join slot. */
+async function writeSlot(
+  deps: ChannelJoinerDeps, myKey: KeyProvider, channelHex: string, adminHex: string, relayList: string[],
+  inner: Uint8Array, signedAt: number,
+): Promise<{ accepted: number; refusals: string[] } | null> {
+  if (!myKey.staticSharedSecret) return null;
+  const shared = await myKey.staticSharedSecret(bytesOf(channelHex));
+  if (!shared) return null;
+  const record = encodeChannelJoinSlotRecord({
+    channel_pubkey: bytesOf(channelHex), slot: channelJoinSlot(shared), signed_at: signedAt,
+    sealed: sealToRecipient(bytesOf(adminHex), inner),
+  });
+  return deps.relays.depositJoin(relayList, record);
+}
+
+export function createChannelJoiner(deps: ChannelJoinerDeps) {
+  const { logger } = deps;
+  const now = deps.now ?? (() => Date.now());
+
+  /** Ask to join. Directory → relays → a sealed signed record → a ring. No session, ever. */
+  async function join(agentName: string, agentId: string, channelHex: string, note = ""): Promise<ChannelJoinResult> {
+    const found = await deps.directory.lookup(agentId, channelHex);
+    if (found.kind === "not_a_channel") return { ok: false, reason: "not_a_channel" };
+    if (found.kind === "revoked") return { ok: false, reason: "channel_deleted", guidance: "This channel was deleted by its admin." };
+    if (found.kind === "unavailable") return { ok: false, reason: "unavailable", detail: found.reason };
+    if (!found.relayRecord) {
+      return { ok: false, reason: "no_relays", guidance: "The channel's admin has not published where to ask to join. Try again later." };
+    }
+    const rec = decodeChannelRelayRecord(found.relayRecord);
+    if (!rec.ok || hexOf(rec.record.channel_pubkey) !== channelHex || !verifyChannelRelayRecord(rec.record)) {
+      logger.warn("channel.join.rejected", { channel_pubkey: channelHex, record: "relay_record", reason: rec.ok ? "signature_invalid" : rec.reason });
+      return { ok: false, reason: "relay_record_invalid" };
+    }
+    const relayList = rec.record.relays;
+    const facts = await channelFacts(deps.relays, relayList, channelHex);
+    if (!facts) return { ok: false, reason: "channel_info_unavailable", detail: "no relay served a verified info record" };
+
+    const myKey = deps.keyProviderFor(agentId);
+    if (!myKey) return { ok: false, reason: "no_key_provider" };
+    const signedAt = now();
+    const request = await signChannelJoinRequest(myKey, { channel_pubkey: bytesOf(channelHex), note, signed_at: signedAt });
+    const wrote = await writeSlot(deps, myKey, channelHex, found.adminPubkeyHex, relayList, encodeChannelJoinRequest(request), signedAt);
+    if (!wrote) return { ok: false, reason: "no_key_provider", detail: "this agent's key cannot derive the join slot" };
+    if (wrote.accepted === 0) {
+      const guard = wrote.refusals.find((r) => GUARD_REASONS.has(r));
+      if (guard) return { ok: false, reason: guard as "rate_limited" | "join_slot_cap" | "stale_request", guidance: JOIN_THROTTLE_GUIDANCE };
+      return { ok: false, reason: "relays_unreachable", detail: wrote.refusals.join(", ") || "no relay answered" };
     }
 
-    // The SAME mint-or-reuse the publisher reaches, so a post made before this member joined is
-    // readable with the very key delivered here. `undefined` only for the states settings rules out
-    // above (absent) or a public channel (handled above), so it is defended, not expected.
-    const gk = ensureCurrentGroupKey({ members, subscriptions, now }, admin.agentId, channelHex);
-    if (!gk) return { ok: false, reason: "channel_not_configured_for_membership" };
-    const generation = gk.generation;
-
-    const channelPubkey = await admin.channelKeyProvider.getPublicKey();
-    const bundle = await wrapGroupKeyFor(
-      gk, channelPubkey, new Uint8Array(Buffer.from(subscriberHex, "hex")), admin.adminKeyProvider,
-    );
-    await deps.sendInSession(sessionId, encodeChannelJoinAccepted({
-      channel_pubkey: channelPubkey,
-      key_bundle: bundle,
-      guidance: settings.guidance,
-      retention_seconds: settings.retention_seconds,
-      // `public` cannot reach here — the caller refuses it — and the frame refuses it too.
-      access: settings.access === "invite_only" ? "invite_only" : "open",
-      relays: settings.relays,
-      members_visible: settings.members_visible,
-    }));
-    logger.info("channel.member.joined", {
-      channel_pubkey: channelHex, subscriber_pubkey: subscriberHex, generation,
+    deps.requests.put({
+      agent_id: agentId, channel_pubkey: channelHex, admin_pubkey: found.adminPubkeyHex.toLowerCase(),
+      access: facts.access, relays: relayList, guidance: facts.guidance, retention_seconds: facts.retention_seconds, signed_at: signedAt,
     });
+    logger.info("channel.join.requested", { channel_pubkey: channelHex, relays_ok: wrote.accepted });
+
+    const rung = await deps.directory.ring(agentName, channelHex);
+    if (!rung.ok && GUARD_REASONS.has(rung.reason)) {
+      return { ok: false, reason: rung.reason as "rate_limited", guidance: JOIN_THROTTLE_GUIDANCE };
+    }
+    if (!rung.ok) logger.warn("channel.join.ring_failed", { channel_pubkey: channelHex, reason: rung.reason });
+    // A ring that did not go out is not a failed request: the admin reads it on its next check.
+    return { ok: true, channelHex, state: "requested", rung: rung.ok };
+  }
+
+  /** Decision 12: take an outstanding request back. The admin's pending list drops it silently. */
+  async function withdraw(agentId: string, channelHex: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const outstanding = deps.requests.get(agentId, channelHex);
+    if (!outstanding) return { ok: false, reason: "not_requested" };
+    const myKey = deps.keyProviderFor(agentId);
+    if (!myKey) return { ok: false, reason: "no_key_provider" };
+    const signedAt = Math.max(now(), outstanding.signed_at + 1);
+    const w = await signChannelJoinWithdrawal(myKey, { channel_pubkey: bytesOf(channelHex), signed_at: signedAt });
+    const wrote = await writeSlot(deps, myKey, channelHex, outstanding.admin_pubkey, outstanding.relays, encodeChannelJoinWithdrawal(w), signedAt);
+    if (!wrote || wrote.accepted === 0) return { ok: false, reason: "relays_unreachable" };
+    deps.requests.remove(agentId, channelHex);
+    logger.info("channel.join.withdrawn", { channel_pubkey: channelHex });
     return { ok: true };
   }
 
-  return {
-    async onAdminFrame(sessionId, counterpartyHex, content): Promise<{ consumed: boolean }> {
-      // Not a join frame means somebody is TALKING. Consuming it would make a person's message
-      // vanish instead of reaching the operator — the same rule the document router follows.
-      if (!isChannelJoinFrame(content)) return { consumed: false };
+  return { join, withdraw };
+}
 
-      const decoded = decodeChannelJoinRequest(content);
-      if (!decoded.ok) {
-        /**
-         * ⚠️ LOGGED, because this frame is now GONE. It is consumed — structured traffic, not
-         * conversation — so it never reaches the operator's transcript. Returning silently meant any
-         * counterparty could send a CBOR array whose first element was one of the four type strings
-         * and have it disappear with nothing recorded anywhere. The decoder already produces a
-         * reason and a detail; there is no excuse for discarding them.
-         */
-        logger.warn("channel.join.frame_undecodable", {
-          reason: decoded.reason, detail: decoded.detail, sender: counterpartyHex,
-        });
-        return { consumed: true };
-      }
-
-      const channelPubkey = decoded.frame.channel_pubkey;
-      const channelHex = Buffer.from(channelPubkey).toString("hex");
-      const namedSubscriber = Buffer.from(decoded.frame.subscriber_pubkey).toString("hex");
-      /**
-       * ⚠️ THE COUNTERPARTY, NOT THE FRAME'S CLAIM. `namedSubscriber` is whatever the caller wrote;
-       * logging it before the check below let a prober put an arbitrary pubkey in an operator's log
-       * and make it look like that party had asked to join. The session's counterparty is the only
-       * identity here that anything has proven.
-       */
-      logger.info("channel.join.requested", {
-        channel_pubkey: channelHex, counterparty_pubkey: counterpartyHex,
-      });
-
-      /**
-       * ⚠️ **THE COUNTERPARTY MUST BE THE SUBSCRIBER THE FRAME NAMES.** Otherwise anyone can enrol a
-       * third party — and receive that party's key bundle down the session they are holding.
-       * Refused as `not_admin_of_channel` rather than a more specific reason: to a caller who is not
-       * who they claim, "this is not your join" and "this is not my channel" are the same answer,
-       * and a distinct one would tell a prober which channels this daemon administers.
-       */
-      if (namedSubscriber !== counterpartyHex.toLowerCase()) {
-        await refuseTo(sessionId, channelPubkey, "not_admin_of_channel");
-        return { consumed: true };
-      }
-
-      const admin = deps.localChannelAdmin(channelHex);
-      if (!admin) {
-        await refuseTo(sessionId, channelPubkey, "not_admin_of_channel");
-        return { consumed: true };
-      }
-
-      const settings = members.settings(channelHex);
-      if (!settings) {
-        await refuseTo(sessionId, channelPubkey, "not_admin_of_channel");
-        return { consumed: true };
-      }
-
-      const status = members.statusOf(channelHex, namedSubscriber);
-      if (status === "active") {
-        await refuseTo(sessionId, channelPubkey, "already_member");
-        return { consumed: true };
-      }
-      // ⚠️ AN EJECTED MEMBER CANNOT SIMPLY ASK AGAIN. Re-admitting on request would undo the
-      // ejection the moment they retried — which is exactly why the ejected row is never deleted.
-      if (status === "ejected") {
-        await refuseTo(sessionId, channelPubkey, "ejected");
-        return { consumed: true };
-      }
-      if (status === "pending") {
-        await refuseTo(sessionId, channelPubkey, "pending_approval");
-        return { consumed: true };
-      }
-
-      // Open and public both admit at once — the difference is only the key. A public channel's
-      // posts are not encrypted, so its acceptance carries none; `acceptInto` sends the empty-bundle
-      // frame for it (Andre's Option B, 036-PUBLICSUB). `already_member` above already handled a
-      // repeat, so this admits a first-time reader.
-      if (settings.access === "open" || settings.access === "public") {
-        members.admit(channelHex, namedSubscriber, "active", now());
-        const accepted = await acceptInto(sessionId, channelHex, namedSubscriber, admin);
-        if (accepted.ok) deps.onAdmitted?.(channelHex, namedSubscriber);
-        return { consumed: true };
-      }
-
-      // invite_only: recorded as PENDING and handed to the admin agent. Nothing here approves it.
-      members.admit(channelHex, namedSubscriber, "pending", now());
-      logger.info("channel.join.pending", { channel_pubkey: channelHex, subscriber_pubkey: namedSubscriber });
-      deps.raiseNotice("channel.join.pending", channelHex, namedSubscriber);
-      await refuseTo(sessionId, channelPubkey, "pending_approval");
-      return { consumed: true };
-    },
-
-    async onSubscriberFrame(agentId, sessionId, counterpartyHex, content): Promise<SubscriberJoinResult> {
-      if (!isChannelJoinFrame(content)) return { ok: false, reason: "not_a_join_frame" };
-
-      /**
-       * An acceptance, or a refusal. (045-NOTICEBELL: a re-key, a pass, an ejection and a closure are
-       * no longer session frames — they are sealed notices read by channel-notices.ts.)
-       */
-      const acceptedResult = decodeChannelJoinAccepted(content);
-      const acceptedFrame = acceptedResult.ok ? acceptedResult.frame : null;
-      if (!acceptedFrame) {
-        /**
-         * M16 032-NOTICES: a REFUSAL is the admin's answer to THIS agent's own request. Store
-         * nothing — a refusal grants no key and no subscription — but report the outcome so the
-         * operator is not left silent. `pending_approval` means the request is queued for an
-         * invite-only admin; every other reason is a terminal refusal, and the reason word travels
-         * so the operator knows why (the fixed refusal vocabulary only, never free text).
-         */
-        const refused = decodeChannelJoinRefused(content);
-        if (refused.ok) {
-          const reason = refused.frame.reason;
-          const refusedHex = Buffer.from(refused.frame.channel_pubkey).toString("hex");
-          if (reason === "pending_approval") deps.onJoinAnswer?.(agentId, refusedHex, "pending");
-          else deps.onJoinAnswer?.(agentId, refusedHex, "refused", reason);
-          return { ok: false, reason: "refused_by_admin", detail: reason };
-        }
-        return { ok: false, reason: "malformed" };
-      }
-
-      const channelPubkey = acceptedFrame.channel_pubkey;
-      const channelHex = Buffer.from(channelPubkey).toString("hex");
-
-      /**
-       * ⚠️ **THE ADMIN CHECK, AGAINST THE DIRECTORY PROFILE.** Not against whoever answered: the
-       * session proves identity, not authority. Without this any agent that can open a session with
-       * you becomes your channel, and the immutable admin key protects nobody.
-       *
-       * A lookup that cannot be RESOLVED fails closed. An unreachable directory must never mean
-       * "accept whoever this is" — that would make a network problem into an admission.
-       */
-      const looked: AdminLookupOutcome = await deps.profileAdminPubkey(channelHex, agentId);
-      if (!looked.ok) {
-        // The cause travels with the refusal now. It used to live only in a log line one step
-        // upstream, which is not where anyone looks when a join is refused.
-        logger.warn("channel.join.refused", {
-          channel_pubkey: channelHex, reason: "admin_unresolved", detail: looked.reason,
-        });
-        return { ok: false, reason: "admin_unresolved", detail: looked.reason };
-      }
-      const profileAdmin = looked.adminPubkeyHex;
-      if (profileAdmin.toLowerCase() !== counterpartyHex.toLowerCase()) {
-        logger.warn("channel.join.refused", {
-          channel_pubkey: channelHex, reason: "not_admin_of_channel",
-          answered_by: counterpartyHex, profile_admin: profileAdmin,
-        });
-        return { ok: false, reason: "not_admin_of_channel" };
-      }
-
-      /**
-       * ⚠️ **A PUBLIC ACCEPTANCE CARRIES NO KEY — store the subscription, unwrap nothing (036-PUBLICSUB).**
-       * Reached ONLY after the admin check above, exactly as the keyed path is: the security property
-       * that the answering agent must be the channel's directory admin is identical for public. A
-       * public channel's posts are read in clear, so calling `unwrapGroupKey`/`addKey` here would try
-       * to open an empty bundle and store a phantom key. The upsert records the relays, guidance and
-       * retention the same as `open`; `onJoinAnswer` rings `admitted`, same as any admission.
-       */
-      if (acceptedFrame.access === "public") {
-        subscriptions.upsert({
-          agent_id: agentId,
-          channel_pubkey: channelHex,
-          admin_pubkey: profileAdmin,
-          access: "public",
-          relays: acceptedFrame.relays,
-          guidance: acceptedFrame.guidance,
-          retention_seconds: acceptedFrame.retention_seconds,
-          joined_at: now(),
-        });
-        deps.onJoinAnswer?.(agentId, channelHex, "admitted");
-        // 038-RETESTFIX Part B: the subscription is active NOW — collect the channel's existing posts
-        // at once rather than waiting for the next post's wake. Same seam the wake uses.
-        deps.collectNow?.(agentId);
-        return { ok: true, channelHex, generation: 0 };
-      }
-
-      const myKeys = deps.keyProviderFor(agentId);
-      if (!myKeys) return { ok: false, reason: "no_key_provider" };
-
-      const unwrapped = await unwrapGroupKey(acceptedFrame.key_bundle, channelPubkey, myKeys);
-      if (!unwrapped.ok) {
-        logger.warn("channel.join.refused", { channel_pubkey: channelHex, reason: unwrapped.reason });
-        return { ok: false, reason: "key_unwrap_failed" };
-      }
-
-      subscriptions.upsert({
-          agent_id: agentId,
-          channel_pubkey: channelHex,
-          admin_pubkey: profileAdmin,
-          access: acceptedFrame.access,
-          relays: acceptedFrame.relays,
-          // STORED, not just decoded. What the channel is for and how long its posts last are the
-          // two things a subscriber has no other way to learn.
-          guidance: acceptedFrame.guidance,
-          retention_seconds: acceptedFrame.retention_seconds,
-          joined_at: now(),
-      });
-      subscriptions.addKey(agentId, channelHex, unwrapped.gk, now());
-      // M16 032-NOTICES: an ACCEPTANCE stored means this agent is IN — ring "admitted".
-      deps.onJoinAnswer?.(agentId, channelHex, "admitted");
-      // 038-RETESTFIX Part B: fresh subscription → collect the existing posts now, not on the next wake.
-      deps.collectNow?.(agentId);
-      return { ok: true, channelHex, generation: unwrapped.gk.generation };
-    },
-
-    async approve(channelHex, subscriberHex, sessionId): Promise<{ ok: true } | { ok: false; reason: string }> {
-      const admin = deps.localChannelAdmin(channelHex);
-      if (!admin) return { ok: false, reason: "channel_not_local" };
-      try {
-        members.approve(channelHex, subscriberHex);
-      } catch (err: unknown) {
-        return { ok: false, reason: extractErrorMessage(err) };
-      }
-      // The delivery's verdict is the ANSWER. Reporting `ok` regardless told an admin they had
-      // admitted somebody who in fact received nothing.
-      const accepted = await acceptInto(sessionId, channelHex, subscriberHex, admin);
-      if (accepted.ok) deps.onAdmitted?.(channelHex, subscriberHex);
-      return accepted;
-    },
-
-    async refuse(channelHex, subscriberHex, sessionId): Promise<{ ok: true } | { ok: false; reason: string }> {
-      const admin = deps.localChannelAdmin(channelHex);
-      if (!admin) return { ok: false, reason: "channel_not_local" };
-      const channelPubkey = await admin.channelKeyProvider.getPublicKey();
-      /**
-       * ⚠️ **CONDITIONAL ON `pending`, AND THAT CONDITION IS THE POINT.** This used to upsert
-       * `ejected` unconditionally, so a refusal typed against an existing MEMBER answered `ok`,
-       * marked them ejected, and left them holding the current group key and fetch key — reading
-       * indefinitely while the table said otherwise. Refusing is not ejecting: an eject re-keys the
-       * channel, and a refusal has nothing to re-key because they were never in.
-       */
-      try {
-        members.refusePending(channelHex, subscriberHex);
-      } catch (err: unknown) {
-        return { ok: false, reason: extractErrorMessage(err) };
-      }
-      await refuseTo(sessionId, channelPubkey, "refused_by_admin");
-      return { ok: true };
-    },
+/**
+ * Apply one verified answer on the JOINER's daemon. The notice reader has already checked the
+ * channel key's signature, that a request is outstanding, and that it is newer than the last answer
+ * and ejection. Returns the doorbell outcome, or null when the body is unusable.
+ */
+export async function applyJoinAnswer(
+  deps: {
+    subscriptions: ChannelSubscriptionStore; requests: ChannelJoinRequestStore; logger: Logger;
+    keyProviderFor: (agentId: string) => KeyProvider | null; now?: () => number;
+  },
+  outstanding: OutstandingJoin, answer: ChannelJoinAnswer,
+): Promise<{ outcome: "admitted" | "pending" | "refused"; reason?: string } | null> {
+  const channelHex = outstanding.channel_pubkey;
+  if (answer.outcome === "pending") return { outcome: "pending" };
+  if (answer.outcome === "refused") {
+    deps.requests.remove(outstanding.agent_id, channelHex);
+    return { outcome: "refused", reason: answer.reason ?? "refused_by_admin" };
+  }
+  const base = {
+    agent_id: outstanding.agent_id, channel_pubkey: channelHex, admin_pubkey: outstanding.admin_pubkey,
+    access: outstanding.access, relays: outstanding.relays, guidance: outstanding.guidance,
+    retention_seconds: outstanding.retention_seconds, joined_at: (deps.now ?? Date.now)(),
   };
+  if (outstanding.access === "public") {
+    if (answer.key_bundle !== null) return null;
+    deps.subscriptions.upsert(base);
+  } else {
+    const myKey = deps.keyProviderFor(outstanding.agent_id);
+    if (!myKey || answer.key_bundle === null) return null;
+    const unwrapped = await unwrapGroupKey(answer.key_bundle, bytesOf(channelHex), myKey);
+    if (!unwrapped.ok) {
+      deps.logger.warn("channel.join.rejected", { channel_pubkey: channelHex, record: "join_answer", reason: unwrapped.reason });
+      return null;
+    }
+    deps.subscriptions.upsert(base);
+    deps.subscriptions.addKey(outstanding.agent_id, channelHex, unwrapped.gk, (deps.now ?? Date.now)());
+  }
+  deps.requests.remove(outstanding.agent_id, channelHex);
+  return { outcome: "admitted" };
+}
+
+// ─── The admin ───────────────────────────────────────────────────────────────────────────────────
+
+export interface ChannelJoinAdminDeps {
+  logger: Logger;
+  members: ChannelMembershipStore;
+  subscriptions: ChannelSubscriptionStore;
+  seen: ChannelJoinSeenStore;
+  relays: JoinRelays;
+  localChannelAdmin: (channelHex: string) => LocalChannelAdmin | null;
+  /** Write a `join_answer` notice for the joiner. `true` when a relay holds it. */
+  writeAnswer: (channelHex: string, joinerHex: string, answer: Uint8Array) => Promise<boolean>;
+  /** Ring the joiner about its answer, on the admin agent's stream. */
+  ringJoiner: (channelHex: string, joinerHex: string) => Promise<void>;
+  /** The admin agent's join-request doorbell — a NEW or CHANGED invite-only request only. */
+  raiseRequest: (channelHex: string, joinerHex: string) => void;
+  /** 043-POSTERS: a member was admitted (and sent its key). */
+  onAdmitted?: (channelHex: string, joinerHex: string) => void;
+  now?: () => number;
+}
+
+export function createChannelJoinAdmin(deps: ChannelJoinAdminDeps) {
+  const { logger, members } = deps;
+  const now = deps.now ?? (() => Date.now());
+
+  const reject = (channelHex: string, record: string, reason: string): void => {
+    logger.warn("channel.join.rejected", { channel_pubkey: channelHex, record, reason });
+  };
+
+  async function answer(
+    admin: LocalChannelAdmin, channelHex: string, joinerHex: string,
+    f: { outcome: "accepted" | "refused" | "pending"; reason?: ChannelJoinRefusedReason; key_bundle?: Uint8Array | null },
+  ): Promise<boolean> {
+    const signed = await signChannelJoinAnswer(admin.channelKeyProvider, {
+      outcome: f.outcome, reason: f.outcome === "refused" ? (f.reason ?? "refused_by_admin") : null,
+      key_bundle: f.key_bundle ?? null, signed_at: now(),
+    });
+    const written = await deps.writeAnswer(channelHex, joinerHex, encodeChannelJoinAnswer(signed));
+    if (written) await deps.ringJoiner(channelHex, joinerHex);
+    logger.info("channel.join.answered", { channel_pubkey: channelHex, subscriber_pubkey: joinerHex, outcome: f.outcome, written });
+    return written;
+  }
+
+  /** Admit: the key wrapped for the joiner (none for public), written as an accepted answer. */
+  async function accept(admin: LocalChannelAdmin, channelHex: string, joinerHex: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const settings = members.settings(channelHex);
+    if (!settings) return { ok: false, reason: "channel_not_configured_for_membership" };
+    let bundle: Uint8Array | null = null;
+    if (settings.access !== "public") {
+      const gk = ensureCurrentGroupKey({ members, subscriptions: deps.subscriptions, now }, admin.agentId, channelHex);
+      if (!gk) return { ok: false, reason: "channel_not_configured_for_membership" };
+      bundle = await wrapGroupKeyFor(gk, bytesOf(channelHex), bytesOf(joinerHex), admin.adminKeyProvider);
+    }
+    if (!(await answer(admin, channelHex, joinerHex, { outcome: "accepted", key_bundle: bundle }))) {
+      return { ok: false, reason: "answer_unwritten" };
+    }
+    deps.onAdmitted?.(channelHex, joinerHex);
+    return { ok: true };
+  }
+
+  /** The newest join slot record for this joiner, opened and verified; null when there is nothing to act on. */
+  async function readSlot(admin: LocalChannelAdmin, channelHex: string, joinerHex: string, relayList: string[]):
+    Promise<{ kind: "request" | "withdrawn"; signed_at: number } | null> {
+    if (!admin.channelKeyProvider.staticSharedSecret || !admin.adminKeyProvider.openContentSeal) return null;
+    const shared = await admin.channelKeyProvider.staticSharedSecret(bytesOf(joinerHex));
+    if (!shared) { reject(channelHex, "join_request", "joiner_key_invalid"); return null; }
+    const slot = channelJoinSlot(shared);
+    let newest: { signed_at: number; sealed: Uint8Array } | null = null;
+    for (const bytes of await deps.relays.fetchJoin(relayList, slot)) {
+      const d = decodeChannelJoinSlotRecord(bytes);
+      if (!d.ok) { reject(channelHex, "join_slot", d.reason); continue; }
+      if (hexOf(d.record.channel_pubkey) !== channelHex || hexOf(d.record.slot) !== hexOf(slot)) { reject(channelHex, "join_slot", "wrong_slot"); continue; }
+      if (!newest || d.record.signed_at > newest.signed_at) newest = { signed_at: d.record.signed_at, sealed: d.record.sealed };
+    }
+    if (!newest) return null;
+    const inner = await admin.adminKeyProvider.openContentSeal(newest.sealed);
+    if (!inner) { reject(channelHex, "join_request", "not_sealed_to_admin"); return null; }
+    const asRequest = decodeChannelJoinRequest(inner);
+    if (asRequest.ok) {
+      const r = asRequest.request;
+      if (hexOf(r.channel_pubkey) !== channelHex || hexOf(r.joiner_pubkey) !== joinerHex || r.signed_at !== newest.signed_at || !verifyChannelJoinRequest(r)) {
+        reject(channelHex, "join_request", "signature_invalid"); return null;
+      }
+      return { kind: "request", signed_at: r.signed_at };
+    }
+    const asWithdrawal = decodeChannelJoinWithdrawal(inner);
+    if (asWithdrawal.ok) {
+      const w = asWithdrawal.withdrawal;
+      if (hexOf(w.channel_pubkey) !== channelHex || hexOf(w.joiner_pubkey) !== joinerHex || w.signed_at !== newest.signed_at || !verifyChannelJoinWithdrawal(w)) {
+        reject(channelHex, "join_withdrawal", "signature_invalid"); return null;
+      }
+      return { kind: "withdrawn", signed_at: w.signed_at };
+    }
+    reject(channelHex, "join_request", asRequest.reason);
+    return null;
+  }
+
+  /** Drop a pending request without telling the admin's agent (a withdrawal, or a lapse). */
+  const dropPending = (channelHex: string, joinerHex: string, why: "withdrawn" | "lapsed"): void => {
+    if (members.statusOf(channelHex, joinerHex) === "pending") members.dropPending(channelHex, joinerHex);
+    logger.info(`channel.join.${why}`, { channel_pubkey: channelHex, subscriber_pubkey: joinerHex });
+  };
+
+  /**
+   * A ring: someone asked to join `channelHex`. Never throws. Non-member guard: a channel this
+   * daemon does not administer reads nothing.
+   */
+  async function onBell(channelHexRaw: string, joinerHexRaw: string): Promise<void> {
+    const channelHex = channelHexRaw.toLowerCase();
+    const joinerHex = joinerHexRaw.toLowerCase();
+    const admin = deps.localChannelAdmin(channelHex);
+    const settings = members.settings(channelHex);
+    if (!admin || !settings || settings.relays.length === 0) return;
+    try {
+      const found = await readSlot(admin, channelHex, joinerHex, settings.relays);
+      // Nagging guard: a repeat or older record is dropped silently.
+      if (!found || found.signed_at <= deps.seen.get(channelHex, joinerHex)) return;
+      deps.seen.set(channelHex, joinerHex, found.signed_at);
+      if (found.kind === "withdrawn") { dropPending(channelHex, joinerHex, "withdrawn"); return; }
+      // Decision 11: a request older than the channel's retention has lapsed.
+      if (now() - found.signed_at > settings.retention_seconds * 1000) { dropPending(channelHex, joinerHex, "lapsed"); return; }
+
+      logger.info("channel.join.requested", { channel_pubkey: channelHex, subscriber_pubkey: joinerHex });
+      const status = members.statusOf(channelHex, joinerHex);
+      if (status === "active") { await answer(admin, channelHex, joinerHex, { outcome: "refused", reason: "already_member" }); return; }
+      // An ejected member cannot simply ask again: re-admitting on request would undo the ejection.
+      if (status === "ejected") { await answer(admin, channelHex, joinerHex, { outcome: "refused", reason: "ejected" }); return; }
+      if (settings.access === "open" || settings.access === "public") {
+        members.admit(channelHex, joinerHex, "active", now());
+        await accept(admin, channelHex, joinerHex);
+        return;
+      }
+      // invite_only: pending, and handed to the admin agent. Nothing here approves it. A newer
+      // request from someone already pending is a CHANGED request, so it alerts again.
+      members.admit(channelHex, joinerHex, "pending", now());
+      deps.raiseRequest(channelHex, joinerHex);
+      await answer(admin, channelHex, joinerHex, { outcome: "pending" });
+    } catch (err: unknown) {
+      logger.warn("channel.join.handling_failed", { channel_pubkey: channelHex, reason: extractErrorMessage(err) });
+    }
+  }
+
+  /** The admin agent's explicit decision on a pending request. */
+  async function approve(channelHex: string, joinerHex: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const admin = deps.localChannelAdmin(channelHex);
+    if (!admin) return { ok: false, reason: "channel_not_local" };
+    const settings = members.settings(channelHex);
+    const since = deps.seen.get(channelHex, joinerHex);
+    if (settings && since > 0 && now() - since > settings.retention_seconds * 1000) {
+      dropPending(channelHex, joinerHex, "lapsed");
+      return { ok: false, reason: "request_lapsed" };
+    }
+    try {
+      members.approve(channelHex, joinerHex);
+    } catch (err: unknown) {
+      return { ok: false, reason: extractErrorMessage(err) };
+    }
+    return accept(admin, channelHex, joinerHex);
+  }
+
+  /** Refuse a pending request. Conditional on `pending` — refusing is not ejecting. */
+  async function refuse(channelHex: string, joinerHex: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const admin = deps.localChannelAdmin(channelHex);
+    if (!admin) return { ok: false, reason: "channel_not_local" };
+    try {
+      members.refusePending(channelHex, joinerHex);
+    } catch (err: unknown) {
+      return { ok: false, reason: extractErrorMessage(err) };
+    }
+    await answer(admin, channelHex, joinerHex, { outcome: "refused", reason: "refused_by_admin" });
+    return { ok: true };
+  }
+
+  /**
+   * Decision 11, the admin's half: a pending request older than the channel's retention drops off the
+   * pending list with no ring needed. Run on the backstop tick for every channel this daemon runs.
+   */
+  function sweepLapsed(channelHexes: string[]): void {
+    for (const channelHex of channelHexes) {
+      const settings = members.settings(channelHex);
+      if (!settings) continue;
+      for (const joinerHex of members.pendingMembers(channelHex)) {
+        const since = deps.seen.get(channelHex, joinerHex);
+        if (since > 0 && now() - since > settings.retention_seconds * 1000) dropPending(channelHex, joinerHex, "lapsed");
+      }
+    }
+  }
+
+  return { onBell, approve, refuse, sweepLapsed };
 }

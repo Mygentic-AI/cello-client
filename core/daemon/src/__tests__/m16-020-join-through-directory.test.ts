@@ -1,5 +1,5 @@
 /**
- * M16 020-CHANADMIN tests 13 and 14 — joining somebody else's channel, END TO END.
+ * M16 020-CHANADMIN / 046-JOINBELL — joining somebody else's channel, END TO END, with no session.
  *
  * ⚠️ **THIS IS THE TEST THE ORDER ASKED FOR, AND THE FIRST ATTEMPT WAS AT THE WRONG LAYER.** The
  * other 020 tests inject a fake at or above `createProfileAdminPubkey`, which means the seam this
@@ -11,12 +11,15 @@
  * So this drives `wireChannelMembership` itself. The only fakes are the things outside the daemon:
  * the directory's answer, and the session the frame arrives on.
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { generateKeypair, generateGroupKey, wrapGroupKeyFor, type InMemoryKeyProvider } from "@cello-protocol/crypto";
-import { encodeChannelJoinAccepted, signBroadcastArtifact, decodeChannelNotice, channelNoticeSlot } from "@cello-protocol/protocol-types";
+import { generateKeypair, sealToRecipient, type InMemoryKeyProvider } from "@cello-protocol/crypto";
+import {
+  signBroadcastArtifact, decodeChannelNotice, channelNoticeSlot, signChannelNotice, encodeChannelNotice,
+  signChannelInfo, encodeChannelInfo, decodeChannelJoinSlotRecord, signChannelJoinAnswer, encodeChannelJoinAnswer,
+} from "@cello-protocol/protocol-types";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import type { DaemonDatabase } from "../sqlcipher-db.js";
 import type { Logger } from "../types.js";
@@ -24,7 +27,11 @@ import { ChannelSubscriptionStore } from "../channel-subscription-store.js";
 import { ChannelMembershipStore } from "../channel-membership-store.js";
 import { ChannelConfigStore } from "../channel-config-store.js";
 import { ChannelLogStore } from "../channel-log-store.js";
-import { wireChannelMembership, type ChannelMembershipWiringDeps } from "../channel-membership-wiring.js";
+import {
+  wireChannelMembership, RELAY_RECORD_TICK_MS, NOTICE_BACKSTOP_TICK_MS, type ChannelMembershipWiringDeps,
+} from "../channel-membership-wiring.js";
+import { ChannelNoticeSeenStore } from "../channel-notices.js";
+import { JOIN_THROTTLE_GUIDANCE, ensureCurrentGroupKey } from "../channel-join-exchange.js";
 import type { SignalingLike } from "../channel-admin-lookup.js";
 
 type Handler = (params: Record<string, unknown> | undefined, connectionId: string) => Promise<unknown>;
@@ -51,198 +58,361 @@ afterEach(() => {
 });
 
 /**
- * A daemon holding ONE agent — the subscriber. The channel and its admin belong to somebody else
- * entirely, which is the whole point: before 020 this daemon had no way to learn who administers a
- * channel it does not publish, so the join was refused however genuine it was.
+ * M16 046-JOINBELL — TWO daemons' wirings, the joiner's and the admin's, joined only by what sits
+ * between two machines: a fake relay pair (notice slots, join slots, info records) and a fake
+ * directory (the channel lookup with its relay record, the relay-record publish, the join ring).
+ * There is no session layer in either wiring any more, so "no session" is structural; what these
+ * prove is that the join COMPLETES without one, and that each stranger guard holds.
  */
-async function harness(opts: {
-  /**
-   * Whether the directory knows this channel. `false` is the "not a channel" answer — a settled
-   * negative, not an outage.
-   */
-  registered: boolean;
-}) {
-  const subscriberKp = generateKeypair() as InMemoryKeyProvider;
+const ADMIN_NAME = "Publisher's Agent";
+const ADMIN_ID = "agent-admin-1";
+const CHANNEL_NAME = "test-channel";
+
+type Notify = { event: string; agentId: string; channel: string; outcome?: string; reason?: string; subscriber?: string };
+
+async function joinWorld(opts: { access: "open" | "invite_only" | "public"; retentionSeconds?: number } = { access: "open" }) {
+  const joinerKp = generateKeypair() as InMemoryKeyProvider;
   const channelKp = generateKeypair() as InMemoryKeyProvider;
   const adminKp = generateKeypair() as InMemoryKeyProvider;
-  const strangerKp = generateKeypair() as InMemoryKeyProvider;
-  const subscriberHex = hex(await subscriberKp.getPublicKey());
+  const joinerHex = hex(await joinerKp.getPublicKey());
   const channelHex = hex(await channelKp.getPublicKey());
   const adminHex = hex(await adminKp.getPublicKey());
-  const strangerHex = hex(await strangerKp.getPublicKey());
+  const retention = opts.retentionSeconds ?? 7 * 24 * 3600;
 
-  const asked: string[] = [];
-  /**
-   * A directory connection for the subscriber. It answers `channel_admin_query` the way a rolled
-   * directory does, echoing the channel it was asked about.
-   */
-  const signaling: SignalingLike = {
-    registerInboundHandler(h) {
-      handlers.add(h);
-      return () => handlers.delete(h);
-    },
-    async sendRaw(frame: unknown) {
-      const sent = frame as Record<string, unknown>;
-      const askedHex = Buffer.from(sent["channel_pubkey"] as Uint8Array).toString("hex");
-      asked.push(askedHex);
-      // Registered only for THIS harness's channel, and only when asked for.
-      const known = opts.registered && askedHex === channelHex;
-      queueMicrotask(() => {
-        for (const h of handlers) {
-          h({
-            type: "channel_admin_result",
-            channel_pubkey: new Uint8Array(Buffer.from(askedHex, "hex")),
-            registered: known,
-            channel: known,
-            admin_pubkey: known ? adminHex : "",
-          });
-        }
-      });
-      return { ok: true as const };
-    },
+  // ── Between the machines ─────────────────────────────────────────────────────────────────────
+  const noticeSlots = new Map<string, Uint8Array>();
+  const joinSlots = new Map<string, Uint8Array>();
+  const info = encodeChannelInfo(await signChannelInfo(channelKp, {
+    access: opts.access, admin_pubkey: await adminKp.getPublicKey(), relays: [RELAY_A, RELAY_B],
+    guidance: "release notes", retention_seconds: retention, updated_at: 1, ext: null,
+  }));
+  let relayRecord: Uint8Array | undefined;
+  let revoked = false;
+  let ringRefusal: string | null = null;
+  let relayJoinRefusal: string | null = null;
+  const rings: string[] = [];
+
+  // ── The two daemons' notify recorders (start empty) ──────────────────────────────────────────
+  const notified: Notify[] = [];
+  const notify = {
+    channelPosts() {},
+    channelJoinAnswer: (agentId: string, channel: string, outcome: string, reason?: string) => { notified.push({ event: "answer", agentId, channel, outcome, ...(reason ? { reason } : {}) }); },
+    channelJoinRequest: (agentId: string, channel: string, subscriber: string) => { notified.push({ event: "request", agentId, channel, subscriber }); },
+    channelMembershipEnded() {}, channelPosterRemoved() {},
   };
-  const handlers = new Set<(f: Record<string, unknown>) => void>();
 
-  let onJoinFrame: ChannelMembershipWiringDeps["setOnChannelJoinFrame"] extends (cb: infer C) => void ? C : never;
-  const signalingAskedFor: string[] = [];
-
-  wireChannelMembership({
-    handlers: new Map(),
-    logger: silent,
-    getDb: () => db,
-    sendInSession: () => Promise.resolve(),
-    setOnChannelJoinFrame: (cb) => { onJoinFrame = cb; },
-    loadedAgents: [{ name: SUB_NAME, pubkey: subscriberHex, keyProvider: subscriberKp }],
-    keyProviders: new Map([[SUB_NAME, subscriberKp as unknown as InMemoryKeyProvider]]),
-    // ⚠️ The ID is NOT the name, deliberately. The join path carries the ID and `signalingFor` is
-    // keyed by the name; a seam that confused them would find no connection and refuse everything.
-    resolveAgentId: (agentName) => (agentName === SUB_NAME ? SUB_ID : `id-of-${agentName}`),
-    resolveCurrentAgent: () => SUB_NAME,
-    activeSessionsFor: () => [],
-    signalingFor: (agentName) => {
-      signalingAskedFor.push(agentName);
-      return agentName === SUB_NAME ? signaling : null;
+  const relayHalves = (wiringRef: () => ReturnType<typeof wireChannelMembership> | null) => ({
+    depositNotice: (_r: string[], record: Uint8Array) => {
+      const d = decodeChannelNotice(record);
+      if (!d.ok) return Promise.resolve(0);
+      noticeSlots.set(hex(d.notice.slot), record);
+      return Promise.resolve(2);
     },
-    notify: { channelPosts() {}, channelJoinAnswer() {}, channelJoinRequest() {} },
+    fetchNotices: (_r: string[], slot: Uint8Array) => Promise.resolve(noticeSlots.has(hex(slot)) ? [noticeSlots.get(hex(slot))!] : []),
+    depositJoin: (_r: string[], record: Uint8Array) => {
+      if (relayJoinRefusal) return Promise.resolve({ accepted: 0, refusals: [relayJoinRefusal, relayJoinRefusal] });
+      const d = decodeChannelJoinSlotRecord(record);
+      if (!d.ok) return Promise.resolve({ accepted: 0, refusals: ["bad_record"] });
+      joinSlots.set(hex(d.record.slot), record);
+      return Promise.resolve({ accepted: 2, refusals: [] });
+    },
+    fetchJoins: (_r: string[], slot: Uint8Array) => Promise.resolve(joinSlots.has(hex(slot)) ? [joinSlots.get(hex(slot))!] : []),
+    // The admin rings the joiner: the joiner's daemon reads its notices, as its wake does.
+    ringMembers: (_agent: string, _ch: string, members: string[]) => {
+      rings.push(...members);
+      if (members.includes(joinerHex)) void wiringRef()?.checkNotices(SUB_ID);
+      return Promise.resolve(true);
+    },
+    isAgentOnline: () => true,
   });
 
-  /** A genuine acceptance, wrapped to the subscriber's real key — no shortcuts through the crypto. */
-  async function acceptanceFrame(): Promise<Uint8Array> {
-    const groupKey = generateGroupKey(1);
-    const bundle = await wrapGroupKeyFor(
-      groupKey,
-      new Uint8Array(Buffer.from(channelHex, "hex")),
-      new Uint8Array(Buffer.from(subscriberHex, "hex")),
-      adminKp,
-    );
-    return encodeChannelJoinAccepted({
-      channel_pubkey: new Uint8Array(Buffer.from(channelHex, "hex")),
-      access: "invite_only",
-      relays: [RELAY_A, RELAY_B],
-      guidance: "release notes",
-      retention_seconds: 7 * 24 * 3600,
-      members_visible: false,
-      key_bundle: bundle,
-    });
-  }
+  // ── The admin's daemon ───────────────────────────────────────────────────────────────────────
+  // Its own file per world; left open (the tmp dir is removed after each test) because the posting
+  // admin's lease timer, which `stop()` does not own, may still tick against it.
+  const adminDb = openTestDb(join(dir, `admin-${channelHex.slice(0, 8)}.db`));
+  const adminMembers = new ChannelMembershipStore(adminDb, silent);
+  adminMembers.putSettings(channelHex, {
+    access: opts.access, members_visible: false, guidance: "release notes",
+    retention_seconds: retention, relays: [RELAY_A, RELAY_B], admin_pubkey: adminHex,
+  });
+  const adminInbound = new Set<(f: Record<string, unknown>) => void>();
+  const adminSignaling: SignalingLike = {
+    registerInboundHandler(cb) { adminInbound.add(cb); return () => adminInbound.delete(cb); },
+    sendRaw(frame: unknown) {
+      const f = frame as Record<string, unknown>;
+      if (f["type"] === "channel_relay_record_set") {
+        relayRecord = f["record"] as Uint8Array;
+        queueMicrotask(() => { for (const cb of adminInbound) cb({ type: "channel_relay_record_ack", channel_pubkey: f["channel_pubkey"] }); });
+      }
+      return Promise.resolve({ ok: true as const });
+    },
+  };
+  const adminHandlers = new Map<string, Handler>();
+  let joinerWiring: ReturnType<typeof wireChannelMembership> | null = null;
+  const adminWiring = wireChannelMembership({
+    handlers: adminHandlers, logger: silent, getDb: () => adminDb,
+    loadedAgents: [
+      { name: ADMIN_NAME, pubkey: adminHex, keyProvider: adminKp },
+      { name: CHANNEL_NAME, pubkey: channelHex, keyProvider: channelKp },
+    ],
+    keyProviders: new Map<string, InMemoryKeyProvider>([[ADMIN_NAME, adminKp], [CHANNEL_NAME, channelKp]]),
+    resolveAgentId: (n) => (n === ADMIN_NAME ? ADMIN_ID : `id-of-${n}`),
+    resolveCurrentAgent: () => ADMIN_NAME,
+    signalingFor: (n) => (n === ADMIN_NAME ? adminSignaling : null),
+    notify, collectNow: () => {}, isChannelAgent: (n) => n === CHANNEL_NAME,
+    channelLastSeq: () => null, fetchChannelInfo: () => Promise.resolve(info),
+    pruneAllPosts: () => Promise.resolve({ pruned: 0, relays: [] }),
+    noticeTransport: () => relayHalves(() => joinerWiring),
+  } as ChannelMembershipWiringDeps);
+
+  // ── The joiner's daemon ──────────────────────────────────────────────────────────────────────
+  const joinerInbound = new Set<(f: Record<string, unknown>) => void>();
+  const joinerSignaling: SignalingLike = {
+    registerInboundHandler(cb) { joinerInbound.add(cb); return () => joinerInbound.delete(cb); },
+    sendRaw(frame: unknown) {
+      const f = frame as Record<string, unknown>;
+      const ch = f["channel_pubkey"] as Uint8Array;
+      const reply = (r: Record<string, unknown>): void => { queueMicrotask(() => { for (const cb of joinerInbound) cb({ channel_pubkey: ch, ...r }); }); };
+      if (f["type"] === "channel_admin_query") {
+        if (revoked) reply({ type: "channel_admin_result", registered: false, channel: false, revoked: true, admin_pubkey: "" });
+        else reply({ type: "channel_admin_result", registered: true, channel: true, admin_pubkey: adminHex, ...(relayRecord ? { relay_record: relayRecord } : {}) });
+      }
+      if (f["type"] === "channel_join_ring") {
+        if (ringRefusal) { reply({ type: "channel_join_ring_error", reason: ringRefusal }); }
+        else {
+          // The directory rings the admin, naming the joiner it AUTHENTICATED — then acks.
+          void adminWiring.onJoinBell(hex(ch), joinerHex);
+          reply({ type: "channel_join_ring_ack", delivered: true });
+        }
+      }
+      return Promise.resolve({ ok: true as const });
+    },
+  };
+  const joinerHandlers = new Map<string, Handler>();
+  joinerWiring = wireChannelMembership({
+    handlers: joinerHandlers, logger: silent, getDb: () => db,
+    loadedAgents: [{ name: SUB_NAME, pubkey: joinerHex, keyProvider: joinerKp }],
+    keyProviders: new Map([[SUB_NAME, joinerKp]]),
+    resolveAgentId: (n) => (n === SUB_NAME ? SUB_ID : `id-of-${n}`),
+    resolveCurrentAgent: () => SUB_NAME,
+    signalingFor: (n) => (n === SUB_NAME ? joinerSignaling : null),
+    notify, collectNow: () => {}, isChannelAgent: () => false,
+    channelLastSeq: () => null, fetchChannelInfo: () => Promise.resolve(info),
+    pruneAllPosts: () => Promise.resolve({ pruned: 0, relays: [] }),
+    noticeTransport: () => relayHalves(() => joinerWiring),
+  } as ChannelMembershipWiringDeps);
+
+  const publishRelayRecord = async (): Promise<void> => {
+    // The admin publishes on its relay-record tick; tests advance that tick rather than reach inside.
+    await vi.advanceTimersByTimeAsync(RELAY_RECORD_TICK_MS);
+  };
+  const joinAs = (params: Record<string, unknown> = {}) =>
+    joinerHandlers.get("cello_channel_join")!({ channel: channelHex, note: "hi, it is Alice", ...params }, "c") as Promise<Record<string, unknown>>;
+  const slotOfAnswer = async (): Promise<string> =>
+    hex(channelNoticeSlot((await channelKp.staticSharedSecret(new Uint8Array(Buffer.from(joinerHex, "hex"))))!, "join_answer"));
 
   return {
-    onJoinFrame: onJoinFrame!, acceptanceFrame, asked, signalingAskedFor,
-    channelHex, adminHex, subscriberHex, strangerHex,
-    subs: new ChannelSubscriptionStore(db, silent),
+    joinerKp, channelKp, adminKp, joinerHex, channelHex, adminHex, adminMembers, adminHandlers, joinerHandlers,
+    adminWiring, joinerWiring, notified, rings, noticeSlots, joinSlots, publishRelayRecord, joinAs, slotOfAnswer,
+    subs: new ChannelSubscriptionStore(db, silent), adminSubs: new ChannelSubscriptionStore(adminDb, silent),
+    setRevoked: (v: boolean) => { revoked = v; },
+    setRingRefusal: (r: string | null) => { ringRefusal = r; },
+    setRelayJoinRefusal: (r: string | null) => { relayJoinRefusal = r; },
+    close: () => { joinerWiring?.stop(); adminWiring.stop(); },
   };
 }
 
-/** The hook is synchronous by contract; the work it queues is not. Let it settle. */
-const settle = (): Promise<void> => new Promise((r) => setTimeout(r, 20));
+/** Let queued microtasks and fire-and-forget promises settle under fake timers. */
+const settle = async (): Promise<void> => { for (let i = 0; i < 20; i++) await vi.advanceTimersByTimeAsync(5); };
 
-describe("M16 020 — joining a channel this daemon does not administer", () => {
-  it("13. the directory names the admin, that admin answers, and the join COMPLETES", async () => {
-    const h2 = await harness({ registered: true });
-    const frame = await h2.acceptanceFrame();
+describe("M16 046-JOINBELL — joining is records plus a ring, never a session", () => {
+  beforeEach(() => { vi.useFakeTimers({ toFake: ["setInterval", "setTimeout", "Date"] }); vi.setSystemTime(1_800_000_000_000); });
+  afterEach(() => { vi.useRealTimers(); });
 
-    const verdict = h2.onJoinFrame(SUB_NAME, "session-1", frame, h2.adminHex, "corr-1");
-    expect(verdict.consumed, "a join frame is never transcript content").toBe(true);
+  it("1. an OPEN channel: the joiner is admitted with the key, told 'admitted', and the admin's agent is not alerted", async () => {
+    const w = await joinWorld({ access: "open" });
+    await w.publishRelayRecord();
+    const res = await w.joinAs();
+    expect(res).toMatchObject({ ok: true, state: "requested", rung: true });
     await settle();
 
-    /**
-     * ⚠️ **THE SUBSCRIPTION IS THE PROOF.** Before 020 this row was never written for a channel
-     * published elsewhere: the admin could not be resolved, so the join was refused however genuine
-     * it was. Nobody could follow anybody else's channel — or their own, from a second device.
-     */
-    const sub = h2.subs.get(SUB_ID, h2.channelHex);
-    expect(sub, "the subscription exists").not.toBeNull();
-    expect(sub?.admin_pubkey).toBe(h2.adminHex);
+    const sub = w.subs.get(SUB_ID, w.channelHex);
+    expect(sub?.access).toBe("open");
     expect(sub?.relays).toEqual([RELAY_A, RELAY_B]);
-    expect(h2.subs.keysFor(SUB_ID, h2.channelHex).map((k) => k.generation)).toEqual([1]);
-
-    // And the seam actually ran: the lookup went out on the SUBSCRIBER'S connection, found by
-    // resolving its agent ID back to the name the daemon keys connections by.
-    expect(h2.asked).toEqual([h2.channelHex]);
-    expect(h2.signalingAskedFor).toContain(SUB_NAME);
+    expect(sub?.guidance).toBe("release notes");
+    expect(w.subs.keysFor(SUB_ID, w.channelHex).map((k) => k.generation)).toEqual([1]);
+    expect(w.notified.filter((n) => n.event === "answer")).toEqual([{ event: "answer", agentId: SUB_ID, channel: w.channelHex, outcome: "admitted" }]);
+    expect(w.notified.filter((n) => n.event === "request")).toEqual([]);
+    expect(w.adminMembers.statusOf(w.channelHex, w.joinerHex)).toBe("active");
+    w.close();
   });
 
-  it("14. the directory names one admin and somebody ELSE answers — refused, and nothing is stored", async () => {
-    /**
-     * ⚠️ **THE HOLE THE CHECK EXISTS TO CLOSE.** The session proves who the counterparty is and says
-     * nothing about their authority. Without this, any agent that can open a session with you hands
-     * you a key bundle and a relay pair and becomes your channel — and every post you then read is
-     * theirs, signed by a channel key you never verified against anything.
-     *
-     * The acceptance here is cryptographically perfect. The only thing wrong with it is who sent it.
-     */
-    const h2 = await harness({ registered: true });
-    const frame = await h2.acceptanceFrame();
-
-    h2.onJoinFrame(SUB_NAME, "session-1", frame, h2.strangerHex, "corr-1");
+  it("2. INVITE-ONLY: pending, the admin's agent is alerted ONCE (a repeat ring is silent), and approve admits", async () => {
+    const w = await joinWorld({ access: "invite_only" });
+    await w.publishRelayRecord();
+    await w.joinAs();
     await settle();
+    expect(w.notified.filter((n) => n.event === "request")).toEqual([{ event: "request", agentId: ADMIN_ID, channel: w.channelHex, subscriber: w.joinerHex }]);
+    expect(w.notified.filter((n) => n.event === "answer").map((n) => n.outcome)).toEqual(["pending"]);
 
-    expect(h2.subs.get(SUB_ID, h2.channelHex), "no subscription was created").toBeNull();
-    expect(h2.subs.keysFor(SUB_ID, h2.channelHex), "and no key was kept").toEqual([]);
+    // The same record rung again — the nagging guard.
+    await w.adminWiring.onJoinBell(w.channelHex, w.joinerHex);
+    await settle();
+    expect(w.notified.filter((n) => n.event === "request")).toHaveLength(1);
+
+    const approved = await w.adminHandlers.get("cello_channel_approve")!({ channel: w.channelHex, subscriber: w.joinerHex }, "c");
+    expect(approved).toEqual({ ok: true, channel: w.channelHex });
+    await settle();
+    expect(w.subs.get(SUB_ID, w.channelHex)?.status).toBe("active");
+    expect(w.notified.filter((n) => n.event === "answer").map((n) => n.outcome)).toEqual(["pending", "admitted"]);
+    w.close();
   });
 
-  it("21. the refusal NAMES the cause, so admin_unresolved is not a dead end", async () => {
-    /**
-     * ⚠️ **`admin_unresolved` IS AN EXIT-POINT LABEL.** A dead signaling stream, a ten-second
-     * timeout against a directory that has not been rolled, a channel nobody has registered and a
-     * database fault all arrive at that one word. The cause used to survive only in a log line one
-     * step upstream — which is not where anyone looks when a join is refused.
-     *
-     * This drives the exchange directly, because the refusal is what carries the detail and the
-     * wiring test above can only see that nothing was stored.
-     */
-    const { createChannelJoinExchange } = await import("../channel-join-exchange.js");
-    const h2 = await harness({ registered: false });
-    const frame = await h2.acceptanceFrame();
-
-    const exchange = createChannelJoinExchange({
-      logger: silent,
-      members: new (await import("../channel-membership-store.js")).ChannelMembershipStore(db, silent),
-      subscriptions: h2.subs,
-      sendInSession: () => Promise.resolve(),
-      localChannelAdmin: () => null,
-      profileAdminPubkey: () => Promise.resolve({ ok: false as const, reason: "signaling_unavailable" }),
-      keyProviderFor: () => null,
-      raiseNotice: () => {},
+  it("3. a FORGED answer (not signed by the channel key) is dropped; nothing is stored", async () => {
+    const w = await joinWorld({ access: "invite_only" });
+    await w.publishRelayRecord();
+    await w.joinAs();
+    await settle();
+    // A forger writes an 'accepted' answer into the joiner's answer slot, naming the real channel.
+    const forger = generateKeypair() as InMemoryKeyProvider;
+    const slot = new Uint8Array(Buffer.from(await w.slotOfAnswer(), "hex"));
+    const answer = await signChannelJoinAnswer(forger, { outcome: "accepted", reason: null, key_bundle: new Uint8Array(40).fill(1), signed_at: Date.now() + 10 });
+    const notice = await signChannelNotice(forger, {
+      slot, type: "join_answer", issued_at: Date.now() + 10,
+      sealed: sealToRecipient(await w.joinerKp.getPublicKey(), encodeChannelJoinAnswer({ ...answer, channel_pubkey: new Uint8Array(Buffer.from(w.channelHex, "hex")) })),
     });
+    w.noticeSlots.set(hex(slot), encodeChannelNotice({ ...notice, channel_pubkey: new Uint8Array(Buffer.from(w.channelHex, "hex")) }));
+    await w.joinerWiring!.checkNotices(SUB_ID);
+    expect(w.subs.get(SUB_ID, w.channelHex)).toBeNull();
+    expect(w.notified.filter((n) => n.outcome === "admitted")).toEqual([]);
+    w.close();
+  });
 
-    const result = await exchange.onSubscriberFrame(SUB_ID, "session-1", h2.adminHex, frame);
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.reason).toBe("admin_unresolved");
-      expect(result.detail, "the cause travels with the refusal").toBe("signaling_unavailable");
+  it("4. a genuine answer for a channel this agent never asked to join is ignored", async () => {
+    const w = await joinWorld({ access: "open" });
+    // The admin writes an acceptance nobody requested (no join, so no outstanding request).
+    const slot = new Uint8Array(Buffer.from(await w.slotOfAnswer(), "hex"));
+    const answer = await signChannelJoinAnswer(w.channelKp, { outcome: "accepted", reason: null, key_bundle: null, signed_at: Date.now() });
+    const notice = await signChannelNotice(w.channelKp, { slot, type: "join_answer", issued_at: Date.now(), sealed: sealToRecipient(await w.joinerKp.getPublicKey(), encodeChannelJoinAnswer(answer)) });
+    w.noticeSlots.set(hex(slot), encodeChannelNotice(notice));
+    await w.joinerWiring!.checkNotices(SUB_ID);
+    expect(w.subs.get(SUB_ID, w.channelHex)).toBeNull();
+    w.close();
+  });
+
+  it("5. a replayed acceptance older than the latest ejection this agent holds is dropped", async () => {
+    const w = await joinWorld({ access: "open" });
+    await w.publishRelayRecord();
+    const oldAnswer = await signChannelJoinAnswer(w.channelKp, { outcome: "accepted", reason: null, key_bundle: null, signed_at: Date.now() - 60_000 });
+    // This agent holds an ejection from the channel, newer than that answer.
+    new ChannelNoticeSeenStore(db).set(SUB_ID, w.channelHex, "eject", Date.now() - 1_000);
+    w.setRingRefusal("rate_limited"); // keep the admin out of it: only the replay is in the slot
+    await w.joinAs();
+    w.setRingRefusal(null);
+    const slot = new Uint8Array(Buffer.from(await w.slotOfAnswer(), "hex"));
+    const notice = await signChannelNotice(w.channelKp, { slot, type: "join_answer", issued_at: Date.now(), sealed: sealToRecipient(await w.joinerKp.getPublicKey(), encodeChannelJoinAnswer(oldAnswer)) });
+    w.noticeSlots.set(hex(slot), encodeChannelNotice(notice));
+    await w.joinerWiring!.checkNotices(SUB_ID);
+    expect(w.subs.get(SUB_ID, w.channelHex)).toBeNull();
+    w.close();
+  });
+
+  it("6. WITHDRAW: leaving a pending request drops it from the admin's list, and the admin's agent is not alerted again", async () => {
+    const w = await joinWorld({ access: "invite_only" });
+    await w.publishRelayRecord();
+    await w.joinAs();
+    await settle();
+    expect(w.adminMembers.statusOf(w.channelHex, w.joinerHex)).toBe("pending");
+    await vi.advanceTimersByTimeAsync(10);
+    const left = await w.joinerHandlers.get("cello_channel_leave")!({ channel: w.channelHex }, "c");
+    expect(left).toMatchObject({ ok: true, withdrawn: true });
+    await w.adminWiring.onJoinBell(w.channelHex, w.joinerHex);
+    await settle();
+    expect(w.adminMembers.statusOf(w.channelHex, w.joinerHex)).toBeNull();
+    expect(w.notified.filter((n) => n.event === "request")).toHaveLength(1);
+    w.close();
+  });
+
+  it("7. LAPSE: after the channel's retention the joiner is told 'expired' and the admin's pending list drops it", async () => {
+    const w = await joinWorld({ access: "invite_only", retentionSeconds: 60 });
+    await w.publishRelayRecord();
+    await w.joinAs();
+    await settle();
+    expect(w.adminMembers.statusOf(w.channelHex, w.joinerHex)).toBe("pending");
+    vi.setSystemTime(Date.now() + 61_000);
+    await w.joinerWiring!.checkNotices(SUB_ID);
+    expect(w.notified.filter((n) => n.event === "answer").map((n) => n.outcome)).toEqual(["pending", "expired"]);
+    await vi.advanceTimersByTimeAsync(NOTICE_BACKSTOP_TICK_MS);
+    expect(w.adminMembers.statusOf(w.channelHex, w.joinerHex)).toBeNull();
+    w.close();
+  });
+
+  it("8. a guard refusal is TOLD with the guidance — the directory's rate limit and the relay's slot cap", async () => {
+    const w = await joinWorld({ access: "open" });
+    await w.publishRelayRecord();
+    w.setRingRefusal("rate_limited");
+    expect(await w.joinAs()).toEqual({ ok: false, reason: "rate_limited", guidance: JOIN_THROTTLE_GUIDANCE });
+    w.setRingRefusal(null);
+    w.setRelayJoinRefusal("join_slot_cap");
+    expect(await w.joinAs()).toEqual({ ok: false, reason: "join_slot_cap", guidance: JOIN_THROTTLE_GUIDANCE });
+    w.close();
+  });
+
+  it("10. a PUBLIC channel admits with NO key — an active subscription with the relays, nothing to unwrap", async () => {
+    const w = await joinWorld({ access: "public" });
+    await w.publishRelayRecord();
+    await w.joinAs();
+    await settle();
+    expect(w.subs.get(SUB_ID, w.channelHex)?.access).toBe("public");
+    expect(w.subs.keysFor(SUB_ID, w.channelHex)).toEqual([]);
+    w.close();
+  });
+
+  it("11. already_member and ejected are refused BY NAME, and an ejected member stays out", async () => {
+    for (const status of ["active", "ejected"] as const) {
+      const w = await joinWorld({ access: "open" });
+      await w.publishRelayRecord();
+      w.adminMembers.admit(w.channelHex, w.joinerHex, status, 1000);
+      await w.joinAs();
+      await settle();
+      expect(w.notified.filter((n) => n.event === "answer")).toEqual([{
+        event: "answer", agentId: SUB_ID, channel: w.channelHex, outcome: "refused", reason: status === "active" ? "already_member" : "ejected",
+      }]);
+      expect(w.adminMembers.statusOf(w.channelHex, w.joinerHex)).toBe(status);
+      w.close();
     }
   });
 
-  it("14b. a directory that answers 'not a channel' refuses the join too", async () => {
-    // Nothing to check the answerer against, so there is no admission to make.
-    const h2 = await harness({ registered: false });
-    const frame = await h2.acceptanceFrame();
-
-    h2.onJoinFrame(SUB_NAME, "session-1", frame, h2.adminHex, "corr-1");
+  it("12. a member admitted AFTER a post receives the very key that post was encrypted with (028)", async () => {
+    const w = await joinWorld({ access: "open" });
+    const minted = ensureCurrentGroupKey({ members: w.adminMembers, subscriptions: w.adminSubs, now: () => Date.now() }, ADMIN_ID, w.channelHex);
+    await w.publishRelayRecord();
+    await w.joinAs();
     await settle();
+    const keys = w.subs.keysFor(SUB_ID, w.channelHex);
+    expect(keys.map((k) => k.generation)).toEqual([minted!.generation]);
+    expect(Buffer.from(keys[0]!.key).equals(Buffer.from(minted!.key))).toBe(true);
+    w.close();
+  });
 
-    expect(h2.subs.get(SUB_ID, h2.channelHex)).toBeNull();
+  it("13. REFUSING is not ejecting: it cannot remove an existing member", async () => {
+    const w = await joinWorld({ access: "invite_only" });
+    w.adminMembers.admit(w.channelHex, w.joinerHex, "active", 1000);
+    const res = await w.adminHandlers.get("cello_channel_refuse")!({ channel: w.channelHex, subscriber: w.joinerHex }, "c") as Record<string, unknown>;
+    expect(res.ok).toBe(false);
+    expect(String(res.reason)).toContain("not_a_pending_request");
+    expect(w.adminMembers.statusOf(w.channelHex, w.joinerHex)).toBe("active");
+    w.close();
+  });
+
+  it("9. a deleted channel is refused channel_deleted, and a channel with no relay record no_relays — nothing is written", async () => {
+    const w = await joinWorld({ access: "open" });
+    expect(await w.joinAs()).toMatchObject({ ok: false, reason: "no_relays" });
+    await w.publishRelayRecord();
+    w.setRevoked(true);
+    expect(await w.joinAs()).toMatchObject({ ok: false, reason: "channel_deleted" });
+    expect(w.joinSlots.size).toBe(0);
+    w.close();
   });
 });
 
@@ -250,10 +420,6 @@ describe("M16 020 — joining a channel this daemon does not administer", () => 
 //
 // A daemon that HOLDS a channel and its admin agent. The only fakes are outside the daemon: the
 // sessions a frame rides, the session-opener, the relay prune, and the retire path.
-
-const ADMIN_NAME = "Publisher's Agent";
-const ADMIN_ID = "agent-admin-1";
-const CHANNEL_NAME = "test-channel";
 
 async function adminHarness() {
   const adminKp = generateKeypair() as InMemoryKeyProvider;
@@ -271,8 +437,6 @@ async function adminHarness() {
   });
 
   // Recorders — start empty, so a test cannot pass on a value that was never produced.
-  const sent: Array<{ agentName: string; sessionId: string; content: Uint8Array }> = [];
-  const openedSessionsFor: string[] = [];
   const prunedChannels: string[] = [];
   const removedAgents: string[] = [];
   const closedSessions: Array<{ session_id: string; agent: string }> = [];
@@ -285,12 +449,6 @@ async function adminHarness() {
     warn: (event, ctx) => { logs.push({ level: "warn", event, ctx }); },
     error: (event, ctx) => { logs.push({ level: "error", event, ctx }); },
   };
-  // 040-CLEANUP Part A: session ids whose send THROWS — so a re-key delivery can fail mid-loop.
-  let sendThrowSessions = new Set<string>();
-  // Configurable: which member pubkeys this daemon holds an OPEN session with.
-  let openSessions: Array<{ sessionId: string; counterpartyPubkeyHex: string }> = [];
-  // Configurable: whether openSessionFor succeeds, and the session it yields.
-  let openSessionForResult: { ok: boolean; sessionId?: string; reason?: string } = { ok: false, reason: "offline" };
   // Configurable: whether the fake retire path succeeds.
   let removeAgentResult: { ok: boolean; reason?: string } = { ok: true };
   // Configurable: the admin's directory connection. Null by default (this daemon administers the
@@ -321,12 +479,6 @@ async function adminHarness() {
     handlers,
     logger: capLogger,
     getDb: () => db,
-    sendInSession: (agentName, sessionId, content) => {
-      if (sendThrowSessions.has(sessionId)) return Promise.reject(new Error("relay_send_failed"));
-      sent.push({ agentName, sessionId, content });
-      return Promise.resolve();
-    },
-    setOnChannelJoinFrame: () => {},
     loadedAgents: [
       { name: ADMIN_NAME, pubkey: adminHex, keyProvider: adminKp },
       { name: CHANNEL_NAME, pubkey: channelHex, keyProvider: channelKp },
@@ -334,12 +486,7 @@ async function adminHarness() {
     keyProviders: new Map<string, InMemoryKeyProvider>([[ADMIN_NAME, adminKp], [CHANNEL_NAME, channelKp]]),
     resolveAgentId: (agentName) => (agentName === ADMIN_NAME ? ADMIN_ID : `id-of-${agentName}`),
     resolveCurrentAgent: () => ADMIN_NAME,
-    activeSessionsFor: (agentName) => (agentName === ADMIN_NAME ? openSessions : []),
     signalingFor: (agentName) => (agentName === ADMIN_NAME ? signaling : null),
-    openSessionFor: (agentName, opts) => {
-      openedSessionsFor.push(opts.targetPubkey);
-      return Promise.resolve(openSessionForResult);
-    },
     notify: { channelPosts() {}, channelJoinAnswer() {}, channelJoinRequest() {} },
     pruneAllPosts: (agentName, chHex) => {
       prunedChannels.push(chHex);
@@ -359,6 +506,8 @@ async function adminHarness() {
         return Promise.resolve(2);
       },
       fetchNotices: () => Promise.resolve([]),
+      depositJoin: () => Promise.resolve({ accepted: 0, refusals: [] }),
+      fetchJoins: () => Promise.resolve([]),
       ringMembers: (agent, channel, ringed) => {
         // Whether the retire (the directory revocation) had already run when this ring went out.
         rings.push({ agent, channel, members: ringed, afterRetire: removedAgents.length > 0 });
@@ -373,13 +522,10 @@ async function adminHarness() {
     hex(channelNoticeSlot((await channelKp.staticSharedSecret(new Uint8Array(Buffer.from(memberHex, "hex"))))!, type));
 
   return {
-    handlers, members, adminKp, channelKp, adminHex, channelHex, sent, openedSessionsFor,
+    handlers, members, adminKp, channelKp, adminHex, channelHex,
     prunedChannels, removedAgents, closedSessions, logs, notices, rings, slotFor,
     setRefusedSlots: (slots: string[]) => { refusedSlots = new Set(slots); },
     setRingOk: (ok: boolean) => { ringOk = ok; },
-    setSendThrows: (ids: string[]) => { sendThrowSessions = new Set(ids); },
-    setOpenSessions: (s: typeof openSessions) => { openSessions = s; },
-    setOpenSessionForResult: (r: typeof openSessionForResult) => { openSessionForResult = r; },
     setRemoveAgentResult: (r: typeof removeAgentResult) => { removeAgentResult = r; },
     setSignaling: (s: SignalingLike | null) => { signaling = s; },
     subs: new ChannelSubscriptionStore(db, silent),
@@ -401,8 +547,6 @@ describe("M16 034-LIFECYCLE — admin side: eject tells the member, delete remov
     expect(res.member_notified, "the eject notice reached the relays").toBe(true);
     expect(h.notices.map((n) => ({ type: n.type, slot: n.slot }))).toEqual([{ type: "eject", slot: await h.slotFor(memberHex, "eject") }]);
     expect(h.rings).toEqual([{ agent: ADMIN_NAME, channel: h.channelHex, members: [memberHex], afterRetire: false }]);
-    expect(h.sent, "no session frame").toEqual([]);
-    expect(h.openedSessionsFor, "no session opened").toEqual([]);
   });
 
   it("2. eject when no relay takes the notice → ok, member_notified false, and the ejection still holds", async () => {
@@ -418,7 +562,6 @@ describe("M16 034-LIFECYCLE — admin side: eject tells the member, delete remov
 
     expect(res.ok).toBe(true);
     expect(res.member_notified).toBe(false);
-    expect(h.sent).toHaveLength(0);
     expect(h.members.statusOf(h.channelHex, memberHex)).toBe("ejected");
   });
 
@@ -444,7 +587,6 @@ describe("M16 034-LIFECYCLE — admin side: eject tells the member, delete remov
     // One ring: the ejected member and every remaining member that has a new key to read.
     expect(h.rings).toHaveLength(1);
     expect([...h.rings[0]!.members].sort()).toEqual([ejectHex, m1, m3].sort());
-    expect(h.sent).toEqual([]);
   });
 
   it("4. cello_channels lists an ejected subscription with status ejected, hides left, and shows unread", async () => {
@@ -488,8 +630,6 @@ describe("M16 034-LIFECYCLE — admin side: eject tells the member, delete remov
     expect(res.members_unreached).toEqual([]);
     // The ring goes out only after the revocation, so a rung member's first check reads "deleted".
     expect(h.rings).toEqual([{ agent: ADMIN_NAME, channel: h.channelHex, members: [activeHex, pendingHex], afterRetire: true }]);
-    expect(h.sent).toEqual([]);
-    expect(h.openedSessionsFor).toEqual([]);
     expect(h.prunedChannels).toEqual([h.channelHex]);
     expect(res.relays).toEqual([{ relay: RELAY_A, ok: true }, { relay: RELAY_B, ok: true }]);
     expect(h.removedAgents).toEqual([CHANNEL_NAME]);
@@ -506,7 +646,6 @@ describe("M16 034-LIFECYCLE — admin side: eject tells the member, delete remov
 
     expect(res.ok).toBe(false);
     expect(res.reason).toBe("channel_not_local");
-    expect(h.sent, "no member was told").toHaveLength(0);
     expect(h.prunedChannels, "nothing was pruned").toEqual([]);
     expect(h.removedAgents, "no identity was retired").toEqual([]);
   });
@@ -530,8 +669,6 @@ describe("M16 034-LIFECYCLE — admin side: eject tells the member, delete remov
 
     const rungForMember = h.rings.filter((r) => r.members.includes(memberHex)).length;
     expect(rungForMember).toBe(6);
-    expect(h.openedSessionsFor, "no session was ever opened").toEqual([]);
-    expect(h.sent, "no frame rode any session").toEqual([]);
     expect(h.closedSessions).toEqual([]);
   });
 
@@ -583,8 +720,6 @@ describe("M16 034-LIFECYCLE — admin side: eject tells the member, delete remov
     expect(h.members.settings(h.channelHex), "settings present before delete").not.toBeNull();
     expect(config.get(h.channelHex), "config present before delete").not.toBeNull();
 
-    h.setOpenSessions([]);
-    h.setOpenSessionForResult({ ok: true, sessionId: "s-opened" });
     const res = (await h.handlers.get("cello_channel_delete")!({ channel: h.channelHex }, "conn-1")) as Record<string, unknown>;
     expect(res.ok).toBe(true);
     expect(res.retired, "the retire succeeded, so the local rows are forgotten").toBe(true);
@@ -602,7 +737,6 @@ describe("M16 034-LIFECYCLE — admin side: eject tells the member, delete remov
     const memberKp = generateKeypair() as InMemoryKeyProvider;
     const memberHex = hex(await memberKp.getPublicKey());
     h.members.admit(h.channelHex, memberHex, "active", 1000);
-    h.setOpenSessions([{ sessionId: "s-member", counterpartyPubkeyHex: memberHex }]);
     h.setRemoveAgentResult({ ok: false, reason: "agent_not_found" });
 
     const res = (await h.handlers.get("cello_channel_delete")!({ channel: h.channelHex }, "conn-1")) as Record<string, unknown>;
@@ -642,7 +776,6 @@ describe("M16 034-LIFECYCLE — admin side: eject tells the member, delete remov
     h.setSignaling(signaling);
 
     // Delete with a successful retire — this forgets the local settings and config rows.
-    h.setOpenSessions([]);
     const del = (await h.handlers.get("cello_channel_delete")!({ channel: h.channelHex }, "conn-1")) as Record<string, unknown>;
     expect(del.retired).toBe(true);
 
@@ -683,8 +816,6 @@ async function listHarness(): Promise<{
 
   wireChannelMembership({
     handlers, logger: silent, getDb: () => db,
-    sendInSession: () => Promise.resolve(),
-    setOnChannelJoinFrame: () => {},
     loadedAgents: [
       { name: "Agent One", pubkey: a1Hex, keyProvider: a1kp },
       { name: "Agent Two", pubkey: a2Hex, keyProvider: a2kp },
@@ -694,9 +825,7 @@ async function listHarness(): Promise<{
     resolveAgentId: (agentName) => `id-of-${agentName}`,
     // Null when nothing is selected and nothing was named — the exact case Part A answers.
     resolveCurrentAgent: (_c, explicit) => explicit ?? current,
-    activeSessionsFor: () => [],
     signalingFor: () => null,
-    openSessionFor: () => Promise.resolve({ ok: false }),
     notify: { channelPosts() {}, channelJoinAnswer() {}, channelJoinRequest() {} },
     pruneAllPosts: () => Promise.resolve({ pruned: 0, relays: [] }),
     // 041 Part A: a channel identity is not an operator agent, so it is not one of the grouped rows.

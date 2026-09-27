@@ -20,7 +20,6 @@ import type { SessionRecords } from "./session-records.js";
 import type { SessionTree, WritableSessionTreeLeafKind } from "./session-tree.js";
 import type { SentAuthorship } from "./session-node-types.js";
 import { extractErrorMessage } from "./error-message.js";
-import { channelJoinFrameType } from "@cello-protocol/protocol-types";
 
 /**
  * One piece of content held behind an ordering gap.
@@ -285,15 +284,6 @@ export class HeldContent {
           released++;
           this.#ctx.logger.info("session.content.released", {
             sessionId, sequenceNumber: nextExpected, leafKind: "doc", correlationId: entry.correlationId,
-          });
-          if (held.size === 0) { this.#ctx.heldContent.delete(key); break; }
-          continue;
-        }
-        if (channelJoinFrameType(entry.content) !== null) {
-          released++;
-          this.#ctx.logger.info("session.content.released", {
-            sessionId, sequenceNumber: nextExpected, leafKind: "msg", frame: "channel_join",
-            correlationId: entry.correlationId,
           });
           if (held.size === 0) { this.#ctx.heldContent.delete(key); break; }
           continue;

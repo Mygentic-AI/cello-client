@@ -56,7 +56,6 @@ import { wireChannelPublishing } from "./channel-publish-wiring.js";
 import { createIsAgentOnlineById } from "./agent-online.js";
 import { ChannelSubscriptionStore } from "./channel-subscription-store.js";
 import { wireChannelMembership, type ChannelNotify } from "./channel-membership-wiring.js";
-import { createChannelFrameSender } from "./channel-frame-send.js";
 import { registerStatusHandler } from "./status-handler.js";
 import { registerBackupRestoreHandlers } from "./backup-restore-handlers.js";
 import { wireDocumentGate } from "./document-gate-wiring.js";
@@ -293,6 +292,7 @@ async function startDaemonHoldingLock(
    * subscriber nothing, because the backstop poll is what guarantees delivery.
    */
   let channelCollectNow: ((agentId: string) => void) | null = null;
+  let channelJoinBell: ((frame: Record<string, unknown>) => void) | null = null; // 046: late-bound like the collector
 
   // 040-DAEMONROOT unit 5: per-agent directory signaling → signaling-wiring.ts.
   const {
@@ -326,6 +326,7 @@ async function startDaemonHoldingLock(
     onChannelWake: (agentName: string) => {
       channelCollectNow?.(sessionNodeManager.resolveAgentId(agentName));
     },
+    onChannelJoinBell: (_agentName: string, frame: Record<string, unknown>) => { channelJoinBell?.(frame); },
   });
 
   // CELLO-M7-CONN-001 (DOD-CONN-1, code-review HIGH): in PRODUCTION, bring up EACH loaded agent's OWN
@@ -698,23 +699,14 @@ async function startDaemonHoldingLock(
   const channelMembership = wireChannelMembership({
     handlers, logger, notify: channelNotify,
     getDb: () => sessionNodeManager.getDb(),
-    // 027-JOINSEQ: the join-frame sender commits its own leaf after the send, exactly as every other
-    // sender does — extracted so it is testable; the old inline body discarded the send result and
-    // left this side's tree one leaf short, deadlocking every later message behind the gap.
-    sendInSession: createChannelFrameSender({ sessions: sessionNodeManager, logger }),
-    setOnChannelJoinFrame: (cb) => { sessionNodeManager.setOnChannelJoinFrame(cb); },
     loadedAgents, keyProviders,
     resolveAgentId: (agentName) => sessionNodeManager.resolveAgentId(agentName), contactMoniker: (n, pk) => sessionNodeManager.getContactMoniker(n, pk),
     resolveCurrentAgent: (connectionId, explicitAgent) =>
       resolveCurrentAgent(perConnectionState.get(connectionId), explicitAgent),
     // 041-HELPTRUTH: isChannelAgent (Part A), channelLastSeq (Part B) and fetchChannelInfo (Part C, both late-bound to channelWiring below) — full contracts on channel-membership-wiring.ts.
     isChannelAgent: channelAgentLookup(sessionNodeManager, logger),
-    activeSessionsFor: (agentName) => sessionNodeManager.getSessionsForAgent(agentName)
-      .filter((s) => s.status === "active")
-      .map((s) => ({ sessionId: s.session_id, counterpartyPubkeyHex: s.counterparty_pubkey })),
     // M16 020-CHANADMIN: the subscriber asks the directory who administers a channel; no stream, no join.
     signalingFor: (agentName) => signalingFor(agentName) ?? null,
-    openSessionFor: (agentName, opts) => openSessionFor(agentName, opts),
     pruneAllPosts: (agentName, channelHex) => channelWiring.pruneAllPosts(agentName, channelHex),
     channelLastSeq: (channelHex) => channelWiring.channelLastSeq(channelHex),
     fetchChannelInfo: (relays, channelHex) => channelWiring.fetchInfo(relays, channelHex),
@@ -744,6 +736,7 @@ async function startDaemonHoldingLock(
     signalingFor: (agentName) => signalingFor(agentName) ?? null,
   });
 
+  channelJoinBell = (frame): void => { void channelMembership.onJoinBellFrame(frame); }; // 046: never throws
   // M16 021-WAKE: now the collector exists, the doorbell has somewhere to ring.
   channelCollectNow = (agentId: string): void => {
     void channelWiring.collectNow(agentId).catch((err: unknown) => {

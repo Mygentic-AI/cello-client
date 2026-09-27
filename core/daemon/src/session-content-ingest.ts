@@ -18,7 +18,7 @@
  */
 import * as lp from "it-length-prefixed";
 import { decode } from "cbor-x";
-import { decodeStructure1, channelJoinFrameType } from "@cello-protocol/protocol-types";
+import { decodeStructure1 } from "@cello-protocol/protocol-types";
 import { openSessionContent } from "@cello-protocol/crypto";
 import { CELLO_CONTENT_PROTOCOL_ID, type CelloNode } from "@cello-protocol/transport";
 import { GATEWAY_UNAVAILABLE, GOVERNANCE_TIMEOUT, type SecurityGatewayClient } from "@cello-protocol/gateway";
@@ -646,16 +646,6 @@ export class SessionContentIngest {
     // signed envelope destroys it), and language/injection judge a UTF-8 decode of binary. Size stays
     // bounded twice (MAX_DOCUMENT_FRAME_BYTES at classify, the gate's own cap).
     //
-    // DOD-M16-JOIN-1: a channel JOIN frame skips the screen for the SAME reason. It is CBOR, so the
-    // injection model reads a UTF-8 decode of those bytes as prose — measured on the first live
-    // channel test, an admin's refusal scored 99 and blocked, a join request 86–89, so joining could
-    // not work. The frame reaches no agent (consumed below into a `msg` leaf, no transcript row, no
-    // doorbell; the note is dropped, guidance/relays stored but never listed), so screening it as
-    // text protects nothing. WHAT IS SKIPPED: only frames `channelJoinFrameType` accepts by a FULL
-    // strict decode — a join type in slot 0 with a body that fails decode is NOT skipped, it is
-    // screened and lands in a transcript (the safe direction). Size is bounded at classify:
-    // `channelJoinFrameType` rejects anything over MAX_JOIN_FRAME_BYTES before it decodes.
-    //
     // WHAT IS TRADED, stated plainly: the screen skipped here is fail-CLOSED (a gateway that is down
     // returns a transient block, and the frame is held un-acked for redelivery). Its replacement —
     // the gate's in-process rules, then the semantic screen at `document-inbound.ts` step 7a-bis —
@@ -672,18 +662,7 @@ export class SessionContentIngest {
         correlationId,
       });
     }
-    // A channel join frame skips the screen too — recognised by the SAME strict classifier the join
-    // router uses, so "skipped the screen" and "routed as a join" can never disagree.
-    const joinFrameType = isDocFrame ? null : channelJoinFrameType(content);
-    if (joinFrameType !== null) {
-      this.#ctx.logger.info("session.content.screen.skipped_channel_join_frame", {
-        sessionId,
-        agentName,
-        correlationId,
-        frameType: joinFrameType,
-      });
-    }
-    const inboundVerdict: Awaited<ReturnType<SecurityGatewayClient["screenInbound"]>> = isDocFrame || joinFrameType !== null
+    const inboundVerdict: Awaited<ReturnType<SecurityGatewayClient["screenInbound"]>> = isDocFrame
       ? { disposition: "allow", content }
       : await this.#ctx.securityGateway.screenInbound(content, {
           direction: "inbound",
@@ -1403,40 +1382,6 @@ export class SessionContentIngest {
         dispatch: "queued",
         verdictEvent: "document.frame.refused",
         correlationId,
-      });
-      return { leafIndex };
-    }
-
-    /**
-     * M16 019 — CHANNEL JOIN FRAMES, the sibling of the document branch above and deliberately its
-     * own hook rather than a second job for that one.
-     *
-     * They take the same three-way split for the same reasons: a LEAF is appended (the exchange is
-     * inside the sealed transcript, which is what makes "you admitted me" provable), no TRANSCRIPT
-     * entry (a key bundle is not something a person said, and `cello_receive` would hand it to an
-     * agent as if it were), and no DOORBELL (a join needs no agent's attention at the moment it
-     * arrives; the admin is raised a notice instead).
-     *
-     * ⚠️ The leaf kind is `msg`, not a new one. A leaf kind is what a VERIFIER renders a leaf by,
-     * and inventing a third would make every existing verifier unable to read a transcript that
-     * carries a join — for a distinction no verifier needs to draw.
-     */
-    const joinRouted = this.#ctx.onChannelJoinFrame?.(
-      agentName,
-      sessionId,
-      // THE PEER'S BYTES, not the sanitized ones — same reason as the document branch.
-      originalContent ?? content,
-      senderPubkey,
-      correlationId,
-    );
-    if (joinRouted?.consumed === true) {
-      const { leafIndex } = this.#ctx.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, correlationId);
-      // Drop the witness, exactly as both other branches do once their leaf is committed. The
-      // document branch records what leaving it behind cost: a session that carried structured
-      // traffic could never seal again.
-      this.#ctx.witnessedSeq.get(this.#ctx.sessionKey(agentName, sessionId))?.delete(contentHashHex);
-      this.#ctx.logger.info("session.channel_join.received", {
-        sessionId, senderPubkey, sequenceNumber: leafIndex, dispatch: "queued", correlationId,
       });
       return { leafIndex };
     }

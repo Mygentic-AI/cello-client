@@ -48,9 +48,6 @@ import {
   encodeDocumentUpdateEnvelope,
   DOCUMENT_UPDATE_ENCODING_V1,
   type DocumentUpdateEnvelope,
-  encodeChannelJoinRequest,
-  encodeCbor,
-  JOIN_REQUEST_TYPE,
 } from "@cello-protocol/protocol-types";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { DOCUMENTS_FLAG_ENV } from "../document-flag.js";
@@ -302,69 +299,4 @@ describe("074-DOCSFLAG — an inbound document frame with the layer OFF", () => 
       .get("sess-off-msg") as { n: number };
     expect(rows.n, "an ordinary message never reached the operator's conversation history").toBe(1);
   }, 120_000);
-
-  /**
-   * 025-JOINSCREEN — a join frame is recognised BEFORE the screen and skips the injection model,
-   * exactly as a document frame does. The model reads a UTF-8 decode of bytes, so a CBOR join frame
-   * scores as prose (a live test measured 86–99 and blocked the exchange). A frame that only LOOKS
-   * like a join — a join type in slot 0 but a body the decoder rejects — must still be screened.
-   */
-  describe("025-JOINSCREEN — a join frame skips the injection model", () => {
-    const CHANNEL = new Uint8Array(32).fill(0xa1);
-    const SUBSCRIBER = new Uint8Array(32).fill(0xb2);
-
-    // Test 5.
-    it("OFF: a valid join request is NOT screened and IS consumed", async () => {
-      const h = await start("off");
-      events = [];
-      screened.length = 0;
-      const frame = encodeChannelJoinRequest({
-        channel_pubkey: CHANNEL, subscriber_pubkey: SUBSCRIBER, note: "test subscriber",
-      });
-      await ingestFrame(h, "sess-join-1", frame, "corr-join-1");
-
-      // The model never saw it — the whole point.
-      expect(screened.length, "a join frame was handed to the injection model").toBe(0);
-      const skip = events.find((e) => e.event === "session.content.screen.skipped_channel_join_frame");
-      expect(skip, "the skip was not logged, so the screen was not forked").toBeDefined();
-      expect(skip?.fields["frameType"]).toBe(JOIN_REQUEST_TYPE);
-      expect(skip?.fields["correlationId"]).toBe("corr-join-1");
-      // And it reached the join branch — consumed, not filed as conversation.
-      expect(
-        events.find((e) => e.event === "session.channel_join.received"),
-        "the join frame was not consumed by the join branch",
-      ).toBeDefined();
-    }, 120_000);
-
-    // Test 6.
-    it("OFF: a join-typed frame with a bad body IS screened and is NOT consumed", async () => {
-      const h = await start("off");
-      events = [];
-      screened.length = 0;
-      // A request type in slot 0, but a 31-byte channel key — the decoder rejects it, so it is not a
-      // join frame. encodeCbor directly, because encodeChannelJoinRequest refuses this body.
-      const bad = encodeCbor([JOIN_REQUEST_TYPE, new Uint8Array(31).fill(0xa1), SUBSCRIBER, ""]);
-      await ingestFrame(h, "sess-join-bad", bad, "corr-join-bad");
-
-      expect(screened.length, "a frame that fails strict decode must be screened").toBe(1);
-      expect(Buffer.from(screened[0]!).equals(Buffer.from(bad)), "the screened bytes are not the frame").toBe(true);
-      expect(
-        events.find((e) => e.event === "session.content.screen.skipped_channel_join_frame"),
-        "a frame that failed decode was wrongly skipped on slot 0",
-      ).toBeUndefined();
-      expect(
-        events.find((e) => e.event === "session.channel_join.received"),
-        "a frame that failed decode was wrongly consumed as a join",
-      ).toBeUndefined();
-    }, 120_000);
-
-    // Test 7.
-    it("OFF: an ordinary text message is still screened", async () => {
-      const h = await start("off");
-      events = [];
-      screened.length = 0;
-      await ingestFrame(h, "sess-join-text", new TextEncoder().encode("hello"), "corr-join-text");
-      expect(screened.length, "an ordinary message was not screened").toBe(1);
-    }, 120_000);
-  });
 });

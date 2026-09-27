@@ -151,6 +151,14 @@ export class ChannelMembershipStore {
       );
   }
 
+  /** 046-JOINBELL: every channel with a recorded admin — the ones this daemon may administer. */
+  administeredChannels(): string[] {
+    const rows = this.#db
+      .prepare(`SELECT channel_pubkey FROM channel_config WHERE admin_pubkey != ''`)
+      .all() as Array<{ channel_pubkey: string }>;
+    return rows.map((r) => r.channel_pubkey);
+  }
+
   settings(channelHex: string): ChannelSettings | null {
     const row = this.#db
       .prepare(
@@ -257,6 +265,16 @@ export class ChannelMembershipStore {
     this.#logger.info("channel.join.refused", {
       channel_pubkey: channelHex, subscriber_pubkey: subscriberHex, reason: "refused_by_admin",
     });
+  }
+
+  /**
+   * 046-JOINBELL: forget a PENDING request that was withdrawn or lapsed. Not a refusal — the joiner
+   * was never refused, and a later request starts fresh. Conditional on `pending`; a no-op otherwise.
+   */
+  dropPending(channelHex: string, subscriberHex: string): void {
+    this.#db
+      .prepare(`DELETE FROM channel_members WHERE channel_pubkey = ? AND subscriber_pubkey = ? AND status = 'pending'`)
+      .run(channelHex.toLowerCase(), subscriberHex.toLowerCase());
   }
 
   statusOf(channelHex: string, subscriberHex: string): MemberStatus | null {

@@ -5,16 +5,11 @@
  * and `encodeChannelJoinRequest` was called by nothing outside a test. This is what starts a
  * subscription and what reads it back.
  *
- * ⚠️ **A SUBSCRIBER NEVER HANDLES A RELAY.** Relays are the publisher's choice and the publisher's
- * problem. Every entry point here takes a channel's public key and nothing else: the directory says
- * who administers it, a session with that admin carries the request, and the ACCEPTANCE supplies
- * the relays, access, guidance and the group key. An earlier draft of the order had `info` taking a
- * relay argument — wrong, and contradicted by the frame 019 already shipped.
+ * Every entry point here takes a channel's public key and nothing else. Joining lives in
+ * `channel-join-exchange.ts` (046-JOINBELL: records plus a ring, never a session).
  */
 import type { Logger } from "./types.js";
-import {
-  encodeChannelJoinRequest, decodeChannelInfo, verifyChannelInfo, type ChannelAccess,
-} from "@cello-protocol/protocol-types";
+import { decodeChannelInfo, verifyChannelInfo, type ChannelAccess } from "@cello-protocol/protocol-types";
 import type { ChannelSubscriptionStore } from "./channel-subscription-store.js";
 import type { ChannelInboxStore } from "./channel-inbox-store.js";
 import type { ChannelLanePositionStore } from "./channel-lane-position-store.js";
@@ -41,12 +36,6 @@ export type ChannelInfoResult =
   // OR this member holds a local subscription marked `closed` (it received the channel_closed notice).
   // `status: "closed"` rides only the local-subscription case.
   | { ok: false; reason: "not_a_channel" | "unavailable" | "channel_deleted"; detail?: string; guidance?: string; status?: "closed" };
-
-export type ChannelJoinResult =
-  | { ok: true; channelHex: string; state: "requested" }
-  // 038-RETESTFIX Part D: `channel_deleted` — a join to a revoked channel is refused BEFORE any
-  // session is opened.
-  | { ok: false; reason: "not_a_channel" | "unavailable" | "no_session" | "send_failed" | "channel_deleted"; detail?: string; guidance?: string };
 
 export interface ReadPost {
   seq: number;
@@ -78,18 +67,11 @@ export interface ChannelSubscribeDeps {
     | { kind: "revoked" }
     | { kind: "unavailable"; reason: string }
   >;
-  /** An open session with that agent, opening one if needed. Null when it cannot be reached. */
-  sessionWith: (agentName: string, counterpartyHex: string) => Promise<
-    { ok: true; sessionId: string } | { ok: false; reason: string; guidance?: string }
-  >;
-  sendInSession: (agentName: string, sessionId: string, content: Uint8Array) => Promise<void>;
   /**
    * What THIS daemon has decided about a channel it administers (the config store `create`/`setup`
    * write), or null when it holds no config for that channel. Read-only — `info` never writes it.
    */
   channelConfig: (channelHex: string) => { access: ChannelAccess; guidance: string; relays: string[] } | null;
-  /** This agent's own public key — the subscriber identity the request names. */
-  agentPubkey: (agentName: string) => string | null;
   /** Decrypt one stored post body for this subscription, or null if no key fits. */
   decrypt: (agentId: string, channelHex: string, seq: number, body: Uint8Array) => Promise<Uint8Array | null>;
   /**
@@ -194,59 +176,6 @@ export function createChannelSubscribe(deps: ChannelSubscribeDeps) {
   }
 
   /**
-   * Ask to join. Directory → admin → session → request.
-   *
-   * ⚠️ **THIS ONLY ASKS.** The answer arrives asynchronously as a join frame and is handled by the
-   * exchange (019), which runs the admin check (020) before accepting any key. Nothing here may
-   * shortcut that: a verb that recorded a subscription on send would make an unanswered request
-   * look like membership.
-   */
-  async function join(agentName: string, agentId: string, channelHex: string, note?: string): Promise<ChannelJoinResult> {
-    const found = await deps.lookupAdmin(agentId, channelHex);
-    if (found.kind === "not_a_channel") return { ok: false, reason: "not_a_channel" };
-    // 038-RETESTFIX Part D: refuse a join to a revoked channel BEFORE any session is opened — the
-    // directory has said the channel is gone, so there is no admin to ask and nothing to join.
-    if (found.kind === "revoked") {
-      return { ok: false, reason: "channel_deleted", guidance: "This channel was deleted by its admin." };
-    }
-    if (found.kind === "unavailable") return { ok: false, reason: "unavailable", detail: found.reason };
-
-    /**
-     * ⚠️ **THIS VERB DOES NOT BRANCH ON ACCESS, AND MUST NOT.** The directory's answer carries
-     * `registered`, `channel` and `admin_pubkey` and says nothing about access, so this side cannot
-     * know whether a channel is public, open or invite-only. It sends the same join request either
-     * way; the admin's half decides. Since 036-PUBLICSUB the admin ADMITS a public join (with an
-     * empty-bundle acceptance carrying the relays) rather than refusing it, so a public subscription
-     * now completes through the ordinary path.
-     */
-    const subscriberHex = deps.agentPubkey(agentName);
-    if (subscriberHex === null) return { ok: false, reason: "no_session", detail: "agent_unknown" };
-
-    const opened = await deps.sessionWith(agentName, found.adminPubkeyHex);
-    if (!opened.ok) {
-      // ⚠️ THE REAL REFUSAL TRAVELS. The first version discarded it and said "could not open a
-      // session with the admin", which pointed at the counterparty and the network for what was a
-      // field name in the caller.
-      return { ok: false, reason: "no_session", detail: opened.reason };
-    }
-    const sessionId = opened.sessionId;
-
-    try {
-      const frame = encodeChannelJoinRequest({
-        channel_pubkey: new Uint8Array(Buffer.from(channelHex, "hex")),
-        subscriber_pubkey: new Uint8Array(Buffer.from(subscriberHex, "hex")),
-        note: note ?? "",
-      });
-      await deps.sendInSession(agentName, sessionId, frame);
-    } catch (err: unknown) {
-      return { ok: false, reason: "send_failed", detail: extractErrorMessage(err) };
-    }
-
-    deps.logger.info("channel.join.requested", { channel_pubkey: channelHex, admin: found.adminPubkeyHex.slice(0, 16) });
-    return { ok: true, channelHex, state: "requested" };
-  }
-
-  /**
    * Read posts after the read position, oldest first, and advance it.
    *
    * ⚠️ **TWO POSITIONS, AND THIS TOUCHES ONLY THE SECOND.** `delivered_through` is how far the
@@ -347,5 +276,5 @@ export function createChannelSubscribe(deps: ChannelSubscribeDeps) {
     }
   }
 
-  return { info, join, read };
+  return { info, read };
 }
