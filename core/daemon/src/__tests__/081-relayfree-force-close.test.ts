@@ -105,4 +105,71 @@ describe("081-RELAYFREE: a force-close tells the relay to let go", () => {
       "the close answer must echo that the relay still holds the slot",
     ).toMatch(/relay|slot|cap/i);
   }, 60_000);
+
+  it("★★★ a relay-less session does NOT warn about a held slot — there was never a slot", async () => {
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-081c-" });
+    const { snm } = fx;
+    // No `{ relay: true }` — this session has no relay client, so relayAbandon returns no_relay.
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+
+    const client = await fx.connectAs("alice");
+    const res = (await client.send("cello_close_session", { session_id: SID, force: true })) as Record<string, unknown>;
+
+    expect(res.ok).toBe(true);
+    expect(res.status).toBe("abandoned");
+    expect(snm.getSessionRecord("alice", SID)!.status).toBe("abandoned");
+
+    expect(
+      fx.eventsNamed("session.relay.abandon.failed").length,
+      "no relay means no slot was ever held — warning that one is held for 24h is a false alarm",
+    ).toBe(0);
+    expect(
+      fx.eventsNamed("session.relay.abandon.no_slot").length,
+      "the no-relay case is its own quiet info line",
+    ).toBe(1);
+    expect(
+      String(res.guidance ?? ""),
+      "the guidance must not claim the slot is held for 24h",
+    ).not.toContain("24 hours");
+    expect(String(res.guidance ?? "")).toMatch(/no relay/i);
+  }, 60_000);
+
+  it("★★★ a relay that never answers cannot hold up the local abandon past the cap", async () => {
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-081d-" });
+    const { snm } = fx;
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER, { relay: true });
+
+    // A relay client whose relayAbandon NEVER answers within the test — a genuinely hung relay, not a
+    // synchronous short-circuit. The force branch caps the whole relay step, so the local abandon must
+    // complete regardless.
+    const recorder: { calls: number } = { calls: 0 };
+    const target = {
+      relayAbandon() {
+        recorder.calls += 1;
+        return new Promise(() => { /* never resolves — the relay is down */ });
+      },
+    } as Record<string, unknown>;
+    const hung = new Proxy(target, {
+      get(t, prop: string) { return prop in t ? t[prop] : () => undefined; },
+    }) as unknown as AgentRelayClient;
+    snm.patchRelayClientForTest("alice", SID, hung, Buffer.from(SID, "hex"));
+
+    const client = await fx.connectAs("alice");
+    const started = Date.now();
+    const res = (await client.send("cello_close_session", { session_id: SID, force: true })) as Record<string, unknown>;
+    const elapsed = Date.now() - started;
+
+    expect(res.ok, "the escape hatch must not depend on a reachable relay").toBe(true);
+    expect(res.status).toBe("abandoned");
+    expect(snm.getSessionRecord("alice", SID)!.status).toBe("abandoned");
+    expect(recorder.calls, "the abandon was attempted").toBe(1);
+    expect(
+      elapsed,
+      "a down relay must never hold the local abandon past the ~2s cap (plus IPC overhead)",
+    ).toBeLessThan(6_000);
+
+    const failed = fx.eventsNamed("session.relay.abandon.failed");
+    expect(failed.length, "a capped-out relay step is a logged failure").toBe(1);
+    expect(failed[0]!.ctx["reason"]).toBe("relay_timeout");
+  }, 60_000);
 });
