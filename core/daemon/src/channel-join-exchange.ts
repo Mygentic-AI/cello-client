@@ -44,6 +44,12 @@ const bytesOf = (h: string): Uint8Array => new Uint8Array(Buffer.from(h, "hex"))
 /** Decision 9, verbatim: what the joiner's agent is told when a guard refuses it. */
 export const JOIN_THROTTLE_GUIDANCE =
   "Too many join requests to this channel. Wait before trying again. Repeated attempts are recorded against your agent and can affect its reputation.";
+/**
+ * 048-JOINNOTE Decision 3, verbatim: a key the directory does not know as a channel. A channel made
+ * in another region moments ago has not replicated here yet, so the bare reason reads as a verdict.
+ */
+export const NOT_A_CHANNEL_GUIDANCE =
+  "No channel with that key. If it was created in the last minute, it may not have reached every directory yet — try again shortly.";
 /** The guard refusals that carry that guidance, from the directory or a relay. */
 const GUARD_REASONS = new Set(["rate_limited", "join_slot_cap", "stale_request"]);
 
@@ -268,7 +274,7 @@ export function createChannelJoiner(deps: ChannelJoinerDeps) {
   /** Ask to join. Directory → relays → a sealed signed record → a ring. No session, ever. */
   async function join(agentName: string, agentId: string, channelHex: string, note = ""): Promise<ChannelJoinResult> {
     const found = await deps.directory.lookup(agentId, channelHex);
-    if (found.kind === "not_a_channel") return { ok: false, reason: "not_a_channel" };
+    if (found.kind === "not_a_channel") return { ok: false, reason: "not_a_channel", guidance: NOT_A_CHANNEL_GUIDANCE };
     if (found.kind === "revoked") return { ok: false, reason: "channel_deleted", guidance: "This channel was deleted by its admin." };
     if (found.kind === "unavailable") return { ok: false, reason: "unavailable", detail: found.reason };
     if (!found.relayRecord) {

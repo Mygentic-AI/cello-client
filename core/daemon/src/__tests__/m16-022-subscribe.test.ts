@@ -16,6 +16,7 @@ import type { Logger } from "../types.js";
 import { ChannelSubscriptionStore } from "../channel-subscription-store.js";
 import { ChannelInboxStore } from "../channel-inbox-store.js";
 import { createChannelSubscribe } from "../channel-subscribe.js";
+import { NOT_A_CHANNEL_GUIDANCE } from "../channel-join-exchange.js";
 import { signBroadcastArtifact, signChannelInfo, encodeChannelInfo } from "@cello-protocol/protocol-types";
 import { generateKeypair } from "@cello-protocol/crypto";
 
@@ -122,6 +123,9 @@ describe("M16 022 — info", () => {
     const r = await api.info(AGENT, CHANNEL);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe("not_a_channel");
+    // 048-JOINNOTE Decision 3: a channel made in the last minute may not have replicated yet.
+    if (!r.ok) expect(r.guidance).toBe(NOT_A_CHANNEL_GUIDANCE);
+    expect(NOT_A_CHANNEL_GUIDANCE).toBe("No channel with that key. If it was created in the last minute, it may not have reached every directory yet — try again shortly.");
   });
 
   it("3. an unreachable directory is UNAVAILABLE and carries why", async () => {

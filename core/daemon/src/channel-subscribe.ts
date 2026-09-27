@@ -14,6 +14,7 @@ import type { ChannelSubscriptionStore } from "./channel-subscription-store.js";
 import type { ChannelInboxStore } from "./channel-inbox-store.js";
 import type { ChannelLanePositionStore } from "./channel-lane-position-store.js";
 import { extractErrorMessage } from "./error-message.js";
+import { NOT_A_CHANNEL_GUIDANCE } from "./channel-join-exchange.js";
 
 export type ChannelInfoResult =
   | {
@@ -112,7 +113,7 @@ export function createChannelSubscribe(deps: ChannelSubscribeDeps) {
         ...(sub?.status === "closed" ? { status: "closed" as const } : {}),
       };
     }
-    if (found.kind === "not_a_channel") return { ok: false, reason: "not_a_channel" };
+    if (found.kind === "not_a_channel") return { ok: false, reason: "not_a_channel", guidance: NOT_A_CHANNEL_GUIDANCE };
     if (found.kind === "unavailable") return { ok: false, reason: "unavailable", detail: found.reason };
 
     const base = { ok: true as const, channelHex, adminPubkeyHex: found.adminPubkeyHex };
