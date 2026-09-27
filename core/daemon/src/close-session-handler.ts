@@ -43,6 +43,13 @@ import { isLocalCredentialRefusal } from "./session-relay-client.js";
 const ABANDON_NOTICE_DEADLINE_MS = 3_000;
 
 /**
+ * 081-RELAYFREE — what it costs when a force-close cannot tell the relay to let go. Named once so the
+ * warn log's `impact` and the close answer's guidance state the same consequence.
+ */
+const RELAY_SLOT_HELD_IMPACT =
+  "the relay still counts this session against the pair's cap until it is swept after 24 hours idle";
+
+/**
  * What a failed SEAL-leaf submit means, by reason. `seal_stale` used to share the "local and
  * temporary" text, which sent an operator to agent startup and relay reachability while every retry
  * failed the same way: the relay was refusing because it holds a message this side never recorded.
@@ -608,6 +615,34 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         });
       }
       const told = notice.told;
+      // 081-RELAYFREE: TELL THE RELAY TO LET GO, and BEFORE the local abandon — `abandonSession` tears
+      // the session node down, and after that there is no active-node entry to resolve the relay
+      // client from (the same reason the counterparty notice above runs first). Best-effort by
+      // construction: a force-abandon is the operator's escape hatch and must never fail on, or wait
+      // for, the relay. Without this the relay keeps counting the session against SESSION_CAP_PER_PAIR
+      // for up to 24 hours, and repeated force-closes between one pair fill the cap and start refusing
+      // new sessions (`session_tuple_cap_exceeded`).
+      let relayReleased = false;
+      let relayAbandonReason = "not_attempted";
+      try {
+        const r = await sessionNodeManager.relayAbandon(record.agent_name, sessionId);
+        if ("released" in r && r.released) {
+          relayReleased = true;
+        } else {
+          relayAbandonReason = "refused" in r ? r.refused : "failed" in r ? r.failed : "not_released";
+        }
+      } catch (err: unknown) {
+        relayAbandonReason = extractErrorMessage(err);
+      }
+      if (relayReleased) {
+        logger.info("session.relay.abandon.released", { agentName: record.agent_name, sessionId, correlationId });
+      } else {
+        logger.warn("session.relay.abandon.failed", {
+          agentName: record.agent_name, sessionId, correlationId,
+          reason: relayAbandonReason,
+          impact: RELAY_SLOT_HELD_IMPACT,
+        });
+      }
       await sessionNodeManager.abandonSession(record.agent_name, sessionId);
       /**
        * FORGET ANY SEAL FAILURE — review MEDIUM-5.
@@ -645,7 +680,12 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
               : ` They were NOT told (${notice.reason}), so their half stays open: they may go on retrying delivery and re-dialling this session until they give up. If connection attempts keep arriving from them, that is why.`) +
           (mayHaveSealed
             ? ` This session had reached a seal attempt (prior status: ${record.status}), so if the counterparty did notarize it, this side's half is now PERMANENTLY forfeited and cannot be recovered from here. Their copy, if it exists, is the only remaining one — ask them for their sealed_root and record it with the operator.`
-            : ""),
+            : "") +
+          // 081-RELAYFREE: say whether the relay was told to free the slot, so an operator who hits
+          // the per-pair cap knows whether this close helped or whether the slot is still held.
+          (relayReleased
+            ? ` The relay was told to release this session's slot immediately.`
+            : ` The relay could NOT be told to release this session's slot (${relayAbandonReason}), so ${RELAY_SLOT_HELD_IMPACT}.`),
       };
     }
 

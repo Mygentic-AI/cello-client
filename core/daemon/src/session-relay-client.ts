@@ -773,6 +773,12 @@ export class AgentRelayClient {
    */
   #pendingRelease: ((released: boolean) => void) | null = null;
   /**
+   * 081-RELAYFREE — the in-flight `session_abandon`. At most one, serialized on the shared stream
+   * like `#pendingRelease`: the ack carries no session id, so a second in flight could not be matched
+   * to its question. A force-close is rare, so this never contends.
+   */
+  #pendingAbandon: ((result: { released: boolean } | { refused: string }) => void) | null = null;
+  /**
    * DOD-M15-AWAYSCOPE-1 — in-flight liveness queries, keyed `sessionIdHex:counterpartyHex`.
    *
    * ⚠️ A MAP, NOT A SLOT, and the first version was a slot. One `AgentRelayClient` serves EVERY
@@ -1382,6 +1388,17 @@ export class AgentRelayClient {
       // release of a slot we never had is a true `false`, not a failure, and the caller says so.
       const r = this.#pendingRelease; this.#pendingRelease = null;
       if (r) r(frame["released"] === true);
+    } else if (type === "session_abandon_ok") {
+      // 081-RELAYFREE. `released` is the relay's own answer to "did I hold this session?" — a false
+      // is a truthful "I never held it / already let go", not a failure, and the caller says so.
+      const r = this.#pendingAbandon; this.#pendingAbandon = null;
+      if (r) r({ released: frame["released"] === true });
+    } else if (type === "session_abandon_refused") {
+      // 081-RELAYFREE. Should not happen for a real participant — we ARE one — but carry the reason
+      // through so the caller can log it rather than treating silence as success.
+      const reason = typeof frame["reason"] === "string" ? (frame["reason"] as string) : "refused";
+      const r = this.#pendingAbandon; this.#pendingAbandon = null;
+      if (r) r({ refused: reason });
     } else if (type === "assignment_ok") {
       // The relay verified + recorded our client-presented assignment.
       const r = this.#pendingRecord; this.#pendingRecord = null; this.#pendingRecordSessionHex = null; if (r) r("ok");
@@ -2186,6 +2203,44 @@ export class AgentRelayClient {
     } finally {
       clearTimeout(timer);
       if (this.#pendingRelease === resolveRel) this.#pendingRelease = null;
+    }
+  }
+
+  /**
+   * 081-RELAYFREE — tell this relay to let go of a session at once (a force-close), so its slot stops
+   * counting against `SESSION_CAP_PER_PAIR` instead of waiting out the 24h idle sweep.
+   *
+   * BEST-EFFORT, and modelled on `releaseReservation`: it (re)connects if needed, sends the frame,
+   * and waits briefly for the ack — but every failure path returns `{ failed }` rather than throwing,
+   * because the caller (a force-abandon) is the operator's escape hatch and must never depend on the
+   * relay being reachable. A timeout is NOT a stream reset, for the same reason a release timeout is
+   * not: the frame is not ordered against anything, and the reader clears the resolver, so tearing the
+   * shared stream down would cost sibling sessions their in-flight submits for a tidy-up.
+   */
+  async relayAbandon(node: CelloNode, sessionId: Uint8Array): Promise<{ released: boolean } | { refused: string } | { failed: string }> {
+    if (this.#closed) return { failed: "closed" };
+    if (!(await this.#ensureConnected(node))) return { failed: "not_connected" };
+    const stream = this.#stream;
+    if (!stream) return { failed: "not_connected" };
+
+    let resolveAb!: (r: { released: boolean } | { refused: string }) => void;
+    const abPromise = new Promise<{ released: boolean } | { refused: string }>((r) => { resolveAb = r; });
+    this.#pendingAbandon = resolveAb;
+    try {
+      stream.send(lp.encode.single(encodeCbor({ type: "session_abandon", session_id: sessionId })));
+    } catch {
+      if (this.#pendingAbandon === resolveAb) this.#pendingAbandon = null;
+      return { failed: "send" };
+    }
+    let timer!: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<"timeout">((r) => { timer = setTimeout(() => r("timeout"), HASH_SUBMIT_TIMEOUT_MS); });
+    try {
+      const result = await Promise.race([abPromise, timeout]);
+      if (result === "timeout") return { failed: "no_reply" };
+      return result;
+    } finally {
+      clearTimeout(timer);
+      if (this.#pendingAbandon === resolveAb) this.#pendingAbandon = null;
     }
   }
 
