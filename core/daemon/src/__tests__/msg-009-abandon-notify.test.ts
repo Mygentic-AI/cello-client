@@ -6,12 +6,8 @@
  * re-establish — forever, because nothing would ever answer. That is what produced the 2026-08-17
  * "notification storm": the operator saw connection requests from agents nobody was driving.
  *
- * THE NOTICE RETIRES THE TRANSPORT, NOT THE SESSION. The first build flipped the receiver's status
- * to `abandoned`, which handed the abandoning party a button that denies its counterparty a
- * receipt: the unilateral seal exists for exactly "they never co-closed" and produces a notarized
- * certificate after a grace period, but a close refuses an `abandoned` session outright. Going
- * silent is what the unilateral seal was built to survive, so hanging up must not be worse than
- * going silent. The notice stops us calling them and leaves the session sealable.
+ * THE NOTICE ENDS THE SESSION HERE TOO — abandoned, no seal, transcript kept. Left open, it counted
+ * against the per-sender cap, so five force-closes from one caller locked that caller out.
  *
  * Best-effort by construction, and the answer says WHICH of the three things happened — most
  * often that this side had already torn its own session down, which is not a network fault and
@@ -21,6 +17,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
 import { encodeCbor } from "@cello-protocol/protocol-types";
 import * as lp from "it-length-prefixed";
+import { ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER } from "../session-node-manager.js";
 
 const SID = "ab".repeat(32);
 const PEER = "12D3KooWQYV9dGMFoRzNStwpXztXaBUjtPqi6aMghfATmPnRAENn";
@@ -47,10 +44,10 @@ describe("DOD-M12B-ABANDON-NOTIFY-1: a force-abandon reaches the counterparty", 
     await wait(400);
     expect(snm.counterpartyAbandonedAt("alice", SID), "the marker must survive the teardown").not.toBeNull();
 
-    // NOT terminal: the unilateral seal is still available. Losing that is a bigger harm than the
-    // storm this fixes, and it would be a harm the counterparty could inflict for free.
+    // TERMINAL: the counterparty ended it, so it leaves the open list and stops counting against
+    // the per-sender cap. Five force-closes used to lock the caller out for good.
     const status = snm.getSessionRecord("alice", SID)!.status;
-    expect(status, `a hung-up session must stay sealable (got ${status})`).not.toBe("abandoned");
+    expect(status, `a hung-up session must leave the open list (got ${status})`).toBe("abandoned");
 
     expect(fx.eventsNamed("session.counterparty.abandoned").length).toBe(1);
   }, 60_000);
@@ -69,6 +66,7 @@ describe("DOD-M12B-ABANDON-NOTIFY-1: a force-abandon reaches the counterparty", 
     // narrows — and without pinning, it could hang up a session it is not party to.
     await snm.handleContentFrameForTest("alice", SID, frame(SID), OTHER_PEER);
     expect(snm.counterpartyAbandonedAt("alice", SID), "a stranger must not be able to end this session").toBeNull();
+    expect(snm.getSessionRecord("alice", SID)!.status, "a stranger's notice changes nothing").toBe("active");
     expect(fx.eventsNamed("session.content.peer_mismatch").length).toBe(1);
 
     // RIGHT PEER, WRONG SESSION. The frame names its session and the handler is bound to one.
@@ -139,6 +137,23 @@ describe("DOD-M12B-ABANDON-NOTIFY-1: a force-abandon reaches the counterparty", 
     expect(await snm.retireOnCounterpartyAbandon("alice", LIVE, "corr")).toBe(true);
     expect(await snm.retireOnCounterpartyAbandon("alice", LIVE, "corr")).toBe(false);
     expect(fx.eventsNamed("session.counterparty.abandoned").length).toBe(1);
+  }, 60_000);
+
+  it("a counterparty's hang-ups stop counting against its per-sender cap", async () => {
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-msg009g-" });
+    const { snm } = fx;
+    const sid = (n: number): string => (0x10 + n).toString(16).repeat(32);
+    for (let i = 0; i < ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER; i++) {
+      await fx.createSession(sid(i), "alice", "bobpubkeyhex", PEER);
+    }
+    expect(snm.checkUnknownSenderAcceptanceBound("alice", "bobpubkeyhex").ok, "precondition: at the cap").toBe(false);
+
+    await snm.retireOnCounterpartyAbandon("alice", sid(0), "corr");
+    await wait(200);
+    expect(
+      snm.checkUnknownSenderAcceptanceBound("alice", "bobpubkeyhex").ok,
+      "a session the caller hung up must not keep counting against it",
+    ).toBe(true);
   }, 60_000);
 
   it("an unknown session is refused, not created", async () => {
