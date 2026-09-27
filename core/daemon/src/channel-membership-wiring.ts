@@ -232,6 +232,8 @@ export interface ChannelMembershipWiring {
   onJoinBellFrame: (frame: Record<string, unknown>) => Promise<void>;
   /** Stops the notice backstop tick. */
   stop: () => void;
+  /** M16 046-JOINBELL: publish relay records now, so a channel just created is joinable at once. */
+  publishRelayRecordsNow: () => void;
   /**
    * The channel's CURRENT fetch key, signed, or undefined when this daemon holds no group key for
    * it. Handed to the publishing half so a re-key reaches the relays on the very next post — which
@@ -970,6 +972,12 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
       return channelHex && joinerHex ? joinAdmin.onBell(channelHex, joinerHex) : Promise.resolve();
     },
     stop: () => { clearInterval(noticeTimer); clearInterval(relayRecordTimer); },
+    /** 046-JOINBELL: publish relay records now — a channel just created is joinable at once, not a tick later. */
+    publishRelayRecordsNow: (): void => {
+      publishRelayRecords().catch((err: unknown) => {
+        logger.warn("channel.relay_record.tick_failed", { reason: extractErrorMessage(err) });
+      });
+    },
     activeMembers: (channelHex: string) => members.activeMembers(channelHex),
     /**
      * ⚠️ **NO PLAINTEXT FALLBACK, EVER.** No admin key held for this channel, or no group key mint

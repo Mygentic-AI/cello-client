@@ -41,6 +41,8 @@ type Handler = (params: Record<string, unknown> | undefined, connectionId: strin
 
 export interface ChannelPublishWiringDeps {
   handlers: Map<string, Handler>;
+  /** 046-JOINBELL: a channel's relays were just set — publish its relay record now, not at the next tick. */
+  onChannelConfigured?: (channelHex: string) => void;
   logger: Logger;
   getDb: () => DaemonDatabase;
   /** M16 021-WAKE: who a post's doorbell is rung for. From the membership half, which owns the list. */
@@ -265,6 +267,7 @@ export function wireChannelPublishing(
      */
     const adminAgent = deps.loadedAgents.find((a) => a.name === agentName);
     config.set(channelHex, { ...cfg, admin_pubkey: adminAgent?.pubkey ?? "" }, Date.now());
+    deps.onChannelConfigured?.(channelHex);
     return { ok: true };
   };
 

@@ -716,6 +716,7 @@ async function startDaemonHoldingLock(
   });
 
   const channelWiring = wireChannelPublishing({
+    onChannelConfigured: () => channelMembership.publishRelayRecordsNow(),
     handlers, logger, notify: channelNotify,
     getDb: () => sessionNodeManager.getDb(),
     getNode: () => sessionNodeManager.getStandingReceiverNode() ?? null,

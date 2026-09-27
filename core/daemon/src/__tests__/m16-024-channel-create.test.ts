@@ -294,9 +294,25 @@ describe("M16 024-CREATE Section C: the config create records is real, and publi
       activeMembers: () => [],
       signalingFor: () => null,
       notify: { channelPosts() {}, channelJoinAnswer() {}, channelJoinRequest() {} },
+      onChannelConfigured: (ch: string) => { configured.push(ch); },
     });
     return handlers;
   }
+  const configured: string[] = [];
+
+  it("046: setting a channel's relays publishes its relay record at once — joinable immediately, not a tick later", async () => {
+    configured.length = 0;
+    const handlers = wire([RELAY_A, RELAY_B]);
+    const refused = (await handlers.get("cello_channel_config")!(
+      { agent: "admin", channel: adminPubkeyHex, access: "public", relays: [RELAY_A, RELAY_B] }, "conn1",
+    )) as Record<string, unknown>;
+    expect(refused["reason"]).toBe("not_a_channel");
+    expect(configured, "a refused setup publishes nothing").toEqual([]);
+    await handlers.get("cello_channel_config")!(
+      { agent: "admin", channel: channelPubkeyHex, access: "public", relays: [RELAY_A, RELAY_B] }, "conn1",
+    );
+    expect(configured).toEqual([channelPubkeyHex]);
+  });
 
   it("setup refuses an ordinary agent's key (not_a_channel), and accepts the channel's own key", async () => {
     const handlers = wire([RELAY_A, RELAY_B]);
