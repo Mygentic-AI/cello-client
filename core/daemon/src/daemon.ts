@@ -1293,7 +1293,7 @@ async function startDaemonHoldingLock(
       // stopAllSignaling() stops the shared manager AND every per-agent manager (best-effort). Do
       // not add a separate per-agent stop loop beside it: it would be redundant, and an unguarded
       // second stop() that throws would abort the rest of shutdown.
-      trustSignalSweepTicker.stopAll(); channelWiring.stop(); await stopAllSignaling();
+      trustSignalSweepTicker.stopAll(); channelWiring.stop(); channelMembership.stop(); await stopAllSignaling();
       // Gracefully mark active sessions interrupted (AC-009) before stopping IPC
       await sessionNodeManager.gracefulShutdown();
       await ipcServer.stop();

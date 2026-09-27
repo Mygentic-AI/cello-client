@@ -445,14 +445,23 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     },
   });
   const noticeTimer = setInterval(() => {
-    joinAdmin.sweepLapsed(members.administeredChannels());
-    const agentIds = new Set([...subscriptions.active().map((s) => s.agent_id), ...joinRequests.agentsWithRequests()]);
-    for (const agentId of agentIds) {
-      if (!deps.noticeTransport().isAgentOnline(agentId)) continue;
-      void noticeReader.checkNotices(agentId);
-      // 046: re-ring each outstanding join request — an admin offline at the first ring hears this one.
-      const name = deps.loadedAgents.find((a) => deps.resolveAgentId(a.name) === agentId)?.name;
-      if (name) void joiner.reRing(name, agentId);
+    // A throw inside a timer callback is an uncaught exception and takes the daemon down, and the
+    // two async calls would otherwise reject unhandled — so every failure here is a log line.
+    const tickFailed = (err: unknown): void => {
+      logger.warn("channel.notice.tick_failed", { reason: extractErrorMessage(err) });
+    };
+    try {
+      joinAdmin.sweepLapsed(members.administeredChannels());
+      const agentIds = new Set([...subscriptions.active().map((s) => s.agent_id), ...joinRequests.agentsWithRequests()]);
+      for (const agentId of agentIds) {
+        if (!deps.noticeTransport().isAgentOnline(agentId)) continue;
+        noticeReader.checkNotices(agentId).catch(tickFailed);
+        // 046: re-ring each outstanding join request — an admin offline at the first ring hears this one.
+        const name = deps.loadedAgents.find((a) => deps.resolveAgentId(a.name) === agentId)?.name;
+        if (name) joiner.reRing(name, agentId).catch(tickFailed);
+      }
+    } catch (err: unknown) {
+      tickFailed(err);
     }
   }, NOTICE_BACKSTOP_TICK_MS);
   noticeTimer.unref();
@@ -488,7 +497,13 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
       }
     }
   };
-  const relayRecordTimer = setInterval(() => { void publishRelayRecords(); }, RELAY_RECORD_TICK_MS);
+  const relayRecordTimer = setInterval(() => {
+    // The channel list is read outside the per-channel try, so a failure there (a closed database)
+    // would otherwise escape as an unhandled rejection.
+    publishRelayRecords().catch((err: unknown) => {
+      logger.warn("channel.relay_record.tick_failed", { reason: extractErrorMessage(err) });
+    });
+  }, RELAY_RECORD_TICK_MS);
   relayRecordTimer.unref();
 
   // ─── Operator verbs ───────────────────────────────────────────────────────────────────────────
