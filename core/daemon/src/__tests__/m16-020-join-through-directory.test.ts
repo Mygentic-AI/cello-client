@@ -301,7 +301,8 @@ describe("M16 046-JOINBELL — joining is records plus a ring, never a session",
   });
 
   it("5. a replayed acceptance older than the latest ejection this agent holds is dropped", async () => {
-    const w = await joinWorld({ access: "open" });
+    // PUBLIC, so the replayed acceptance needs no key and would otherwise be applied as it stands.
+    const w = await joinWorld({ access: "public" });
     await w.publishRelayRecord();
     const oldAnswer = await signChannelJoinAnswer(w.channelKp, { outcome: "accepted", reason: null, key_bundle: null, signed_at: Date.now() - 60_000 });
     // This agent holds an ejection from the channel, newer than that answer.
@@ -314,6 +315,10 @@ describe("M16 046-JOINBELL — joining is records plus a ring, never a session",
     w.noticeSlots.set(hex(slot), encodeChannelNotice(notice));
     await w.joinerWiring!.checkNotices(SUB_ID);
     expect(w.subs.get(SUB_ID, w.channelHex)).toBeNull();
+    // Control: with no ejection held, the very same answer IS applied — so the ejection is what refused it.
+    new ChannelNoticeSeenStore(db).set(SUB_ID, w.channelHex, "eject", 0);
+    await w.joinerWiring!.checkNotices(SUB_ID);
+    expect(w.subs.get(SUB_ID, w.channelHex)?.access).toBe("public");
     w.close();
   });
 
