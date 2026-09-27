@@ -122,6 +122,8 @@ export interface ChannelNoticeReaderDeps {
   channelRevoked: (agentId: string, channelHex: string) => Promise<boolean>;
   onMembershipEnded: (agentId: string, channelHex: string, reason: "ejected" | "channel_closed") => void;
   onPosterRemoved: (agentId: string, channelHex: string) => void;
+  /** 048: runs the one re-check after a no-change ring. Defaults to an unref'd setTimeout. */
+  scheduleRetry?: (fn: () => void, ms: number) => void;
   /**
    * 046-JOINBELL: this agent's outstanding join requests, read on the same ring and tick. An answer is
    * acted on only for a channel with an outstanding request (forged-answer guard).
@@ -137,7 +139,15 @@ export interface ChannelNoticeReaderDeps {
 export interface ChannelNoticeReader {
   /** Read, verify and apply every notice for this agent's subscribed channels. Never throws. */
   checkNotices: (agentId: string) => Promise<void>;
+  /**
+   * 048: what a RING calls. Checks now; when that changes nothing, checks ONCE more ~30 s later —
+   * the ring can beat the deletion's replication to the member's home directory. Never a loop.
+   */
+  onRing: (agentId: string, stillAllowed?: () => boolean) => Promise<void>;
 }
+
+/** 048: how long after a no-change ring the one re-check runs. */
+export const RING_RECHECK_MS = 30_000;
 
 export function createChannelNoticeReader(deps: ChannelNoticeReaderDeps): ChannelNoticeReader {
   const { logger, subscriptions, seen } = deps;
@@ -198,35 +208,38 @@ export function createChannelNoticeReader(deps: ChannelNoticeReaderDeps): Channe
   }
 
   /** A held pass that the channel's own info record now revokes (or posting closed) is dropped and surfaced. */
-  async function checkPosterRevoked(agentId: string, channelHex: string, relays: string[], myHex: string): Promise<void> {
+  async function checkPosterRevoked(agentId: string, channelHex: string, relays: string[], myHex: string): Promise<boolean> {
     const held = deps.posterPasses.get(agentId, channelHex);
-    if (!held) return;
+    if (!held) return false;
     const bytes = await deps.fetchInfo(relays, channelHex);
-    if (!bytes) return;
+    if (!bytes) return false;
     const decoded = decodeChannelInfo(bytes);
     if (!decoded.ok || hexOf(decoded.info.channel_pubkey) !== channelHex || !verifyChannelInfo(decoded.info)) {
       reject(channelHex, "info", decoded.ok ? "signature_invalid" : decoded.reason);
-      return;
+      return false;
     }
     const ext = channelPostingOf(decoded.info);
     const revoked = ext.posting === "admin"
       || ext.revoked.some((r) => hexOf(r.poster_pubkey) === myHex && r.revoked_at >= held.issued_at);
-    if (!revoked) return;
+    if (!revoked) return false;
     deps.posterPasses.remove(agentId, channelHex);
     logger.info("channel.poster_removed", { channel_pubkey: channelHex });
     deps.onPosterRemoved(agentId, channelHex);
+    return true;
   }
 
-  async function checkChannel(agentId: string, channelHex: string, relays: string[], myKey: KeyProvider, myHex: string): Promise<void> {
+  /** True when anything changed for this channel (closed, a notice applied, a pass dropped). */
+  async function checkChannel(agentId: string, channelHex: string, relays: string[], myKey: KeyProvider, myHex: string): Promise<boolean> {
     if (await deps.channelRevoked(agentId, channelHex)) {
       subscriptions.markClosed(agentId, channelHex);
       deps.posterPasses.remove(agentId, channelHex);
       deps.onMembershipEnded(agentId, channelHex, "channel_closed");
-      return;
+      return true;
     }
-    if (!myKey.staticSharedSecret || !myKey.openContentSeal) return;
+    if (!myKey.staticSharedSecret || !myKey.openContentSeal) return false;
     const shared = await myKey.staticSharedSecret(bytesOf(channelHex));
-    if (!shared) return;
+    if (!shared) return false;
+    let changed = false;
     // Eject first: an ejected member applies nothing else from this channel.
     // `join_answer` is read only for an outstanding request (checkJoin), never for a subscription.
     for (const type of ["eject", ...CHANNEL_NOTICE_TYPES.filter((t) => t !== "eject" && t !== "join_answer")] as ChannelNoticeType[]) {
@@ -240,9 +253,10 @@ export function createChannelNoticeReader(deps: ChannelNoticeReaderDeps): Channe
       }
       seen.set(agentId, channelHex, type, found.issued_at);
       logger.info("channel.notice.applied", { channel_pubkey: channelHex, type, issued_at: found.issued_at });
-      if (type === "eject") return;
+      changed = true;
+      if (type === "eject") return true;
     }
-    await checkPosterRevoked(agentId, channelHex, relays, myHex);
+    return (await checkPosterRevoked(agentId, channelHex, relays, myHex)) || changed;
   }
 
   /**
@@ -282,17 +296,18 @@ export function createChannelNoticeReader(deps: ChannelNoticeReaderDeps): Channe
     joins.onAnswer(agentId, ch, applied.outcome, applied.reason);
   }
 
-  return {
-    async checkNotices(agentId: string): Promise<void> {
+  /** One pass over the agent's channels and join requests. True when anything changed. */
+  async function checkAll(agentId: string): Promise<boolean> {
+      let changed = false;
       const myKey = deps.keyProviderFor(agentId);
-      if (!myKey) return;
+      if (!myKey) return false;
       const myHex = hexOf(await myKey.getPublicKey());
       // Non-member guard: only channels this agent is subscribed to. A ring for anything else
       // fetches nothing and tells no one.
       for (const sub of subscriptions.active()) {
         if (sub.agent_id !== agentId) continue;
         try {
-          await checkChannel(agentId, sub.channel_pubkey, sub.relays, myKey, myHex);
+          if (await checkChannel(agentId, sub.channel_pubkey, sub.relays, myKey, myHex)) changed = true;
         } catch (err: unknown) {
           logger.warn("channel.notice.check_failed", { channel_pubkey: sub.channel_pubkey, reason: extractErrorMessage(err) });
         }
@@ -304,6 +319,22 @@ export function createChannelNoticeReader(deps: ChannelNoticeReaderDeps): Channe
           logger.warn("channel.notice.check_failed", { channel_pubkey: o.channel_pubkey, reason: extractErrorMessage(err) });
         }
       }
+      return changed;
+  }
+
+  const schedule = deps.scheduleRetry ?? ((fn: () => void, ms: number): void => { setTimeout(fn, ms).unref(); });
+  const retryPending = new Set<string>();
+
+  return {
+    async checkNotices(agentId: string): Promise<void> { await checkAll(agentId); },
+    async onRing(agentId: string, stillAllowed: () => boolean = () => true): Promise<void> {
+      if (await checkAll(agentId) || retryPending.has(agentId)) return;
+      retryPending.add(agentId);
+      schedule(() => {
+        retryPending.delete(agentId);
+        if (!stillAllowed()) return; // the kill switch holds for the re-check too
+        checkAll(agentId).catch((err: unknown) => { logger.warn("channel.notice.check_failed", { reason: extractErrorMessage(err) }); });
+      }, RING_RECHECK_MS);
     },
   };
 }

@@ -972,7 +972,9 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
 
   return {
     // The kill switch holds here too: a ring for a switched-off agent reads nothing.
-    checkNotices: (agentId: string) => (deps.noticeTransport().isAgentOnline(agentId) ? noticeReader.checkNotices(agentId) : Promise.resolve()),
+    // 048: a ring whose check finds no change is re-checked once, ~30 s later (see onRing).
+    checkNotices: (agentId: string) => (deps.noticeTransport().isAgentOnline(agentId) ? noticeReader.onRing(agentId, () => deps.noticeTransport().isAgentOnline(agentId))
+      : Promise.resolve()),
     onJoinBell: (channelHex: string, joinerHex: string) => joinAdmin.onBell(channelHex, joinerHex),
     /**
      * 047-JOINPULL, the admin half: this agent's directory connection just came up (first connect or

@@ -41,7 +41,7 @@ afterEach(() => {
 
 type InfoFor = (channel: InMemoryKeyProvider, admin: InMemoryKeyProvider, member: InMemoryKeyProvider) => Promise<Uint8Array>;
 
-async function harness(opts: { subscribed?: boolean; revoked?: boolean; info?: InfoFor } = {}) {
+async function harness(opts: { subscribed?: boolean; revoked?: boolean | (() => boolean); info?: InfoFor; scheduleRetry?: (fn: () => void, ms: number) => void } = {}) {
   const channel = generateKeypair() as InMemoryKeyProvider;
   const admin = generateKeypair() as InMemoryKeyProvider;
   const member = generateKeypair() as InMemoryKeyProvider;
@@ -79,7 +79,8 @@ async function harness(opts: { subscribed?: boolean; revoked?: boolean; info?: I
     logger, subscriptions: subs, posterPasses: passes, seen: new ChannelNoticeSeenStore(db), relays,
     keyProviderFor: (id) => (id === MEMBER_ID ? member : null),
     fetchInfo: () => Promise.resolve(info),
-    channelRevoked: () => Promise.resolve(opts.revoked === true),
+    channelRevoked: () => Promise.resolve(typeof opts.revoked === "function" ? opts.revoked() : opts.revoked === true),
+    ...(opts.scheduleRetry ? { scheduleRetry: opts.scheduleRetry } : {}),
     onMembershipEnded: (_id, ch, reason) => { ended.push({ ch, reason }); },
     onPosterRemoved: (_id, ch) => { removed.push(ch); },
   });
@@ -221,5 +222,64 @@ describe("045-NOTICEBELL — the member reads its notices; no session anywhere",
     await h.reader.checkNotices(MEMBER_ID);
     expect(h.passes.get(MEMBER_ID, h.channelHex)?.issued_at).toBe(700);
     expect(h.removed).toEqual([]);
+  });
+});
+
+/**
+ * Live 2026-09-27: the delete ring reached the member before the deletion had replicated to her
+ * home directory, so the ring's check found nothing and the channel stayed active. A ring whose
+ * check changes nothing is checked ONCE more ~30 s later — one retry, never a loop.
+ */
+describe("048 — a ring that finds no change is checked once more, ~30 s later", () => {
+  function scheduler() {
+    const pending: Array<{ fn: () => void; ms: number }> = [];
+    return { pending, schedule: (fn: () => void, ms: number): void => { pending.push({ fn, ms }); } };
+  }
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+
+  it("1. no change on the ring → one retry at ~30 s; the deletion that landed meanwhile is applied", async () => {
+    let deleted = false;
+    const sch = scheduler();
+    const h = await harness({ revoked: () => deleted, scheduleRetry: sch.schedule });
+    await h.reader.onRing(MEMBER_ID);
+    expect(h.ended).toEqual([]);
+    expect(sch.pending.map((p) => p.ms)).toEqual([30_000]);
+    deleted = true;
+    sch.pending[0]!.fn(); await flush();
+    expect(h.ended).toEqual([{ ch: h.channelHex, reason: "channel_closed" }]);
+  });
+
+  it("2. the retry that still finds no change schedules NOTHING more", async () => {
+    const sch = scheduler();
+    const h = await harness({ scheduleRetry: sch.schedule });
+    await h.reader.onRing(MEMBER_ID);
+    sch.pending[0]!.fn(); await flush();
+    expect(sch.pending).toHaveLength(1);
+  });
+
+  it("3. a ring whose check changed something schedules no retry", async () => {
+    const sch = scheduler();
+    const h = await harness({ revoked: true, scheduleRetry: sch.schedule });
+    await h.reader.onRing(MEMBER_ID);
+    expect(h.ended).toHaveLength(1);
+    expect(sch.pending).toEqual([]);
+  });
+
+  it("4. a second ring while a retry is pending does not add another", async () => {
+    const sch = scheduler();
+    const h = await harness({ scheduleRetry: sch.schedule });
+    await h.reader.onRing(MEMBER_ID);
+    await h.reader.onRing(MEMBER_ID);
+    expect(sch.pending).toHaveLength(1);
+  });
+
+  it("5. an agent switched off before the re-check runs reads nothing", async () => {
+    let deleted = false;
+    const sch = scheduler();
+    const h = await harness({ revoked: () => deleted, scheduleRetry: sch.schedule });
+    await h.reader.onRing(MEMBER_ID, () => false);
+    deleted = true;
+    sch.pending[0]!.fn(); await flush();
+    expect(h.ended).toEqual([]);
   });
 });
