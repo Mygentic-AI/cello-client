@@ -453,9 +453,9 @@ describe("M16 046-JOINBELL — joining is records plus a ring, never a session",
     expect(approved["ok"]).toBe(true);
     await settle();
     expect(w.subs.get(SUB_ID, w.channelHex)?.status ?? null).toBeNull();
-    // The joiner comes back: its reconnect reads its answer slot and it is admitted at once.
+    // The joiner comes back: the daemon's reconnect hook runs checkNotices, which reads its answer slot.
     w.setJoinerOffline(false);
-    w.joinerWiring!.onReconnect(SUB_NAME);
+    void w.joinerWiring!.checkNotices(SUB_ID);
     await settle();
     expect(w.subs.get(SUB_ID, w.channelHex)?.status).toBe("active");
     expect(w.notified.filter((n) => n.event === "answer").map((n) => n.outcome)).toContain("admitted");

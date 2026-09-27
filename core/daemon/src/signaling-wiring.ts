@@ -76,8 +76,6 @@ export interface SignalingWiringDeps {
   onChannelJoinBell?: (agentName: string, frame: Record<string, unknown>) => void; // 046-JOINBELL: parsed by the membership half
   /** C2, late-bound; built in outbound-sessions. See trust-signal-sweep.ts. */
   getSweepTrustSignals: () => ((n: string, k: KeyProvider, p: string) => Promise<unknown>) | undefined;
-  /** 047-JOINPULL: the channel half's reconnect check — built after this wiring, hence a getter. */
-  getOnChannelReconnect: () => ((agentName: string) => void) | undefined;
   resolveConsortiumRoster: () => Promise<ConsortiumEndpoint[] | null>;
   failoverEndpointResolver: (() => Promise<DirectoryEndpoint | null>) | undefined;
   /** Wired onto each new manager so a seal that arrives on it is heard. */
@@ -106,7 +104,7 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
     verifiedManifestVersion, getPersistence, onSignalingConnected, resolveConsortiumRoster,
     failoverEndpointResolver, getFailoverEndpoint, sealFailures, submissionRetries,
     challengeVerifier, directoryEndpointResolver, registerSealListeners,
-    getWirePerAgentSessionInbound, getHandleTrustSignalPickup, getSweepTrustSignals, getOnChannelReconnect,
+    getWirePerAgentSessionInbound, getHandleTrustSignalPickup, getSweepTrustSignals,
   } = deps;
 
   const registerPickupListener = createPickupListenerRegistrar(getHandleTrustSignalPickup);
@@ -216,8 +214,6 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
         submissionRetries.onSignalingConnected(agentName);
         // C2: background, never awaited; the catch LOGS — silence is what hid this bug for weeks.
         void getSweepTrustSignals()?.(agentName, agentKeyProvider, agentPubkeyHex)?.catch((e: unknown) => logger.warn("trust_signal.sweep.failed", { agentName, reason: extractErrorMessage(e) }));
-        // 047-JOINPULL: waiting join requests (as admin) and join answers and notices (as joiner). Never throws.
-        getOnChannelReconnect()?.(agentName);
       },
     });
     const entry: AgentSignaling = { signaling: mgr, getNode: () => nodeRef };

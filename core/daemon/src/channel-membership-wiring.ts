@@ -227,7 +227,7 @@ export interface ChannelMembershipWiring {
   checkNotices: (agentId: string) => Promise<void>;
   /** M16 046-JOINBELL: the directory rang this admin: `joinerHex` asked to join `channelHex`. */
   onJoinBell: (channelHex: string, joinerHex: string) => Promise<void>;
-  /** 047-JOINPULL: an agent's directory connection came up — pull join requests (admin) and answers/notices (joiner). */
+  /** 047-JOINPULL: an agent's directory connection came up — list its channels' waiting join requests. */
   onReconnect: (agentName: string) => void;
   /**
    * The same, from the raw `channel_join_bell` frame. The ring names a channel and a joiner and is
@@ -968,15 +968,14 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     checkNotices: (agentId: string) => (deps.noticeTransport().isAgentOnline(agentId) ? noticeReader.checkNotices(agentId) : Promise.resolve()),
     onJoinBell: (channelHex: string, joinerHex: string) => joinAdmin.onBell(channelHex, joinerHex),
     /**
-     * 047-JOINPULL: this agent's directory connection just came up (first connect or any reconnect).
-     * As joiner: read every followed channel's notices and every pending request's answer slot. As
-     * admin: list each channel it administers for waiting join requests. Never throws.
+     * 047-JOINPULL, the admin half: this agent's directory connection just came up (first connect or
+     * any reconnect) — list each channel it administers for waiting join requests. The joiner half
+     * (notices and answer slots) rides the same event through the daemon's collect-now. Never throws.
      */
     onReconnect: (agentName: string): void => {
       const agentId = deps.resolveAgentId(agentName);
       if (!agentId || !deps.noticeTransport().isAgentOnline(agentId)) return;
       const failed = (err: unknown): void => { logger.warn("channel.reconnect.check_failed", { reason: extractErrorMessage(err) }); };
-      noticeReader.checkNotices(agentId).catch(failed);
       const mine = members.administeredChannels().filter((ch) => localChannelAdmin(ch)?.agentId === agentId);
       if (mine.length > 0) joinAdmin.pullRequests(mine).catch(failed);
     },

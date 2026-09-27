@@ -312,7 +312,8 @@ async function startDaemonHoldingLock(
      */
     onSignalingConnected: async (agentName: string) => {
       await onSignalingConnected(agentName);
-      channelCollectNow?.(sessionNodeManager.resolveAgentId(agentName));
+      channelCollectNow?.(sessionNodeManager.resolveAgentId(agentName)); // posts, notices and join answers (047 joiner half)
+      channelReconnect?.(agentName); // 047-JOINPULL admin half: list each administered channel's waiting join requests
     },
     failoverEndpointResolver, getFailoverEndpoint, sealFailures, submissionRetries,
     registerSealListeners, challengeVerifier, directoryEndpointResolver,
@@ -323,7 +324,6 @@ async function startDaemonHoldingLock(
     // is not it.)
     getWirePerAgentSessionInbound: () => wirePerAgentSessionInbound,
     getHandleTrustSignalPickup: () => handleTrustSignalPickup, getSweepTrustSignals: () => sweepTrustSignalsAndTick,
-    getOnChannelReconnect: () => channelReconnect,
     // M16 021-WAKE: the doorbell, resolved to the stable agent id the subscriptions are keyed by.
     onChannelWake: (agentName: string) => {
       channelCollectNow?.(sessionNodeManager.resolveAgentId(agentName));
