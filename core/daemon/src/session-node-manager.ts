@@ -2508,6 +2508,23 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
   }
 
   /**
+   * 081-RELAYFREE — tell the session's assigned relay to let go of it (a force-close), so its slot
+   * stops counting against the per-pair cap immediately instead of after the 24h idle sweep.
+   *
+   * BEST-EFFORT. Returns `{ failed: "no_relay" }` when this session has no relay behind it (direct /
+   * legacy / already torn down) — the caller treats every non-`released` outcome as "the relay still
+   * holds the slot" and never fails the close on it. Resolved through the session's OWN active-node
+   * entry, keyed on the relay session id the relay client registered it under — the same way
+   * `queryRelayLiveness` is — so it MUST be called while that entry still exists, i.e. before
+   * `abandonSession` tears the node down (mirroring `notifyCounterpartyAbandon`).
+   */
+  async relayAbandon(agentName: string, sessionId: string): Promise<{ released: boolean } | { refused: string } | { failed: string }> {
+    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
+    if (!entry?.relayClient || !entry.relaySessionIdBytes) return { failed: "no_relay" };
+    return entry.relayClient.relayAbandon(entry.node, entry.relaySessionIdBytes);
+  }
+
+  /**
    * 079-CAPREASON — the relay's reason and counts if it refused THIS session's assignment, else null.
    *
    * Resolved through the session's own relay record, the same way `queryRelayLiveness` above is: the

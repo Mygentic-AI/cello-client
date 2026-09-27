@@ -454,7 +454,11 @@ export default [
     // a second capture site on the delivery path plus the anchor lookup, and the refusal notes on
     // both — which differ, because a refusal costs OUR send its witness and must not cost THEIRS
     // its delivery.
-    rules: { "max-lines": ["error", { max: 3214, skipBlankLines: false, skipComments: false }] },
+    // 3,214 → 3,269 (081-RELAYFREE, +55): `relayAbandon` — the best-effort `session_abandon` a
+    // force-close sends so the relay frees the slot at once — plus its `#pendingAbandon` slot and the
+    // two dispatch branches that settle it. It belongs beside `releaseReservation`, whose ack shape
+    // and timeout reasoning it mirrors exactly, so there is nothing to extract to a module here.
+    rules: { "max-lines": ["error", { max: 3269, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/session-views.ts"],
