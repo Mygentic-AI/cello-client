@@ -427,12 +427,13 @@ export {
   channelJoinSlot,
   signChannelJoinRequest, encodeChannelJoinRequest, decodeChannelJoinRequest, verifyChannelJoinRequest,
   encodeChannelJoinSlotRecord, decodeChannelJoinSlotRecord,
+  signChannelJoinWithdrawal, encodeChannelJoinWithdrawal, decodeChannelJoinWithdrawal, verifyChannelJoinWithdrawal, JOIN_WITHDRAWN_DOMAIN,
   signChannelJoinAnswer, encodeChannelJoinAnswer, decodeChannelJoinAnswer, verifyChannelJoinAnswer,
   MAX_JOIN_NOTE_CHARS, MAX_JOIN_SEALED_BYTES, JOIN_REQUEST_DOMAIN, JOIN_SLOT_DOMAIN, JOIN_ANSWER_DOMAIN,
   CHANNEL_JOIN_OUTCOMES, CHANNEL_JOIN_REFUSED_REASONS,
 } from "./channel-join.js";
 export type {
-  ChannelJoinRequest, ChannelJoinSlotRecord, ChannelJoinAnswer, ChannelJoinOutcome,
+  ChannelJoinRequest, ChannelJoinSlotRecord, ChannelJoinAnswer, ChannelJoinWithdrawal, ChannelJoinOutcome,
   ChannelJoinRefusedReason, JoinDecodeReason,
 } from "./channel-join.js";
 export {

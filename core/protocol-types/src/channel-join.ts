@@ -5,6 +5,8 @@
  *                                           channel's relays in a hashed join slot
  *   ChannelJoinSlotRecord  what the relay holds: the channel, the slot, the signed time, the sealed
  *                                           request. The relay cannot read who is asking.
+ *   ChannelJoinWithdrawal  joiner → admin   signed by the JOINER; overwrites its own join slot
+ *                                           (newest signed time wins) — the request is dropped
  *   ChannelJoinAnswer      admin → joiner   signed by the CHANNEL key, sealed to the joiner, carried
  *                                           in the joiner's 045 notice slot (type `join_answer`)
  *
@@ -28,6 +30,7 @@ export const MAX_JOIN_SEALED_BYTES = 2048;
 export const JOIN_REQUEST_DOMAIN = "cello-channel-join-request-v1";
 export const JOIN_SLOT_DOMAIN = "cello-channel-join-slot-v1";
 export const JOIN_ANSWER_DOMAIN = "cello-channel-join-answer-v1";
+export const JOIN_WITHDRAWN_DOMAIN = "cello-channel-join-withdrawn-v1";
 
 const PUBKEY_BYTES = 32;
 const SLOT_BYTES = 32;
@@ -166,6 +169,54 @@ export function decodeChannelJoinRequest(bytes: Uint8Array): { ok: true; request
 /** Signed by the joiner the request names. Whether that is the EXPECTED joiner is the caller's. */
 export function verifyChannelJoinRequest(r: ChannelJoinRequest): boolean {
   return verify(r.joiner_pubkey, requestTbs(r), r.signature);
+}
+
+// ─── Withdrawal ─────────────────────────────────────────────────────────────────────────────────
+
+/** Decision 12: the joiner takes its request back. Same slot, same sealing, a newer signed time. */
+export interface ChannelJoinWithdrawal {
+  channel_pubkey: Uint8Array;
+  joiner_pubkey: Uint8Array;
+  signed_at: number;
+  signature: Uint8Array;
+}
+
+function withdrawalTbs(w: Omit<ChannelJoinWithdrawal, "signature">): Uint8Array {
+  return encodeCbor([JOIN_WITHDRAWN_DOMAIN, w.channel_pubkey, w.joiner_pubkey, w.signed_at]);
+}
+
+export async function signChannelJoinWithdrawal(
+  joinerKey: KeyProvider, f: { channel_pubkey: Uint8Array; signed_at: number },
+): Promise<ChannelJoinWithdrawal> {
+  if (!isBytes(f.channel_pubkey, PUBKEY_BYTES)) throw new RangeError("bad_channel_pubkey: must be 32 bytes");
+  if (badTime(f.signed_at)) throw new RangeError("bad_signed_at: a safe integer >= 1 (ms)");
+  const unsigned = { channel_pubkey: f.channel_pubkey, joiner_pubkey: await joinerKey.getPublicKey(), signed_at: f.signed_at };
+  return { ...unsigned, signature: await joinerKey.sign(withdrawalTbs(unsigned)) };
+}
+
+export function encodeChannelJoinWithdrawal(w: ChannelJoinWithdrawal): Uint8Array {
+  return encodeCbor([JOIN_WITHDRAWN_DOMAIN, w.channel_pubkey, w.joiner_pubkey, w.signed_at, w.signature]);
+}
+
+/** Validates every field and never throws. Does NOT verify the signature. */
+export function decodeChannelJoinWithdrawal(bytes: Uint8Array): { ok: true; withdrawal: ChannelJoinWithdrawal } | Failure {
+  const raw = decodeArray(bytes, JOIN_WITHDRAWN_DOMAIN, 5);
+  if (!raw.ok) return raw;
+  const [, channel_pubkey, joiner_pubkey, signed_at, signature] = raw.slots;
+  if (!isBytes(channel_pubkey, PUBKEY_BYTES)) return { ok: false, reason: "bad_channel_pubkey", detail: "must be 32 bytes" };
+  if (!isBytes(joiner_pubkey, PUBKEY_BYTES)) return { ok: false, reason: "bad_joiner_pubkey", detail: "must be 32 bytes" };
+  if (badTime(signed_at)) return { ok: false, reason: "bad_signed_at", detail: "a safe integer >= 1 (ms)" };
+  if (!isBytes(signature, SIGNATURE_BYTES)) return { ok: false, reason: "bad_signature_shape", detail: "must be 64 bytes" };
+  const withdrawal: ChannelJoinWithdrawal = {
+    channel_pubkey: new Uint8Array(channel_pubkey), joiner_pubkey: new Uint8Array(joiner_pubkey),
+    signed_at: signed_at as number, signature: new Uint8Array(signature),
+  };
+  if (!bytesEqual(encodeChannelJoinWithdrawal(withdrawal), bytes)) return { ok: false, reason: "wrong_shape", detail: "non-canonical encoding" };
+  return { ok: true, withdrawal };
+}
+
+export function verifyChannelJoinWithdrawal(w: ChannelJoinWithdrawal): boolean {
+  return verify(w.joiner_pubkey, withdrawalTbs(w), w.signature);
 }
 
 // ─── The slot record the relay holds ─────────────────────────────────────────────────────────────

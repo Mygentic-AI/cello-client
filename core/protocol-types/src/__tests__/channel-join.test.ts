@@ -14,6 +14,7 @@ import {
   channelJoinSlot, signChannelJoinRequest, encodeChannelJoinRequest, decodeChannelJoinRequest,
   verifyChannelJoinRequest, encodeChannelJoinSlotRecord, decodeChannelJoinSlotRecord,
   signChannelJoinAnswer, encodeChannelJoinAnswer, decodeChannelJoinAnswer, verifyChannelJoinAnswer,
+  signChannelJoinWithdrawal, encodeChannelJoinWithdrawal, decodeChannelJoinWithdrawal, verifyChannelJoinWithdrawal,
   JOIN_REQUEST_DOMAIN, JOIN_ANSWER_DOMAIN, MAX_JOIN_NOTE_CHARS, MAX_JOIN_SEALED_BYTES,
 } from "../channel-join.js";
 import {
@@ -60,6 +61,19 @@ describe("046-JOINBELL join request", () => {
     const d = decodeChannelJoinSlotRecord(encodeChannelJoinSlotRecord(rec));
     expect(d.ok && d.record.signed_at).toBe(9);
     expect(() => encodeChannelJoinSlotRecord({ ...rec, sealed: new Uint8Array(MAX_JOIN_SEALED_BYTES + 1) })).toThrow(/too_large/);
+  });
+});
+
+describe("046-JOINBELL withdrawal (Decision 12)", () => {
+  it("a withdrawal round-trips, verifies against the joiner, and is not decodable as a request", async () => {
+    const joiner = generateKeypair(); const ch = await generateKeypair().getPublicKey();
+    const w = await signChannelJoinWithdrawal(joiner, { channel_pubkey: ch, signed_at: 8 });
+    const bytes = encodeChannelJoinWithdrawal(w);
+    const d = decodeChannelJoinWithdrawal(bytes);
+    expect(d.ok && verifyChannelJoinWithdrawal(d.withdrawal)).toBe(true);
+    expect(verifyChannelJoinWithdrawal({ ...w, signed_at: 9 })).toBe(false);
+    const asRequest = decodeChannelJoinRequest(bytes);
+    expect(asRequest.ok ? "ok" : asRequest.reason).toBe("wrong_shape");
   });
 });
 
