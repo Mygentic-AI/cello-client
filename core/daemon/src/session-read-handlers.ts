@@ -566,6 +566,12 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
               : {}),
           }
         : {}),
+      ...(row.counterparty_abandoned_at != null
+        ? {
+            counterpartyAbandoned: true as const,
+            counterpartyAbandonedGuidance: "The other side left. Close it to get a one-sided receipt.",
+          }
+        : {}),
       // Review HIGH-2: present only while a ceremony is actually in flight, so it stays a signal.
       ...(isSealing(row.agent_name, row.session_id) ? { sealing: true } : {}),
       messageCount,

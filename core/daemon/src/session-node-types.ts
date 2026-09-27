@@ -342,10 +342,13 @@ export const CAP_INTERRUPTED_TTL_MS = Number(process.env["CELLO_CAP_INTERRUPTED_
  */
 export const CAP_COUNTS = (alias = ""): string => {
   const p = alias ? `${alias}.` : "";
-  return `(${p}status = 'active'
-           OR (${p}status = 'interrupted'
-               AND COALESCE(${p}interrupted_by, 'counterparty') != 'local'
-               AND ${p}updated_at >= ?))`;
+  // A session the counterparty hung up on stays sealable but holds no slot: left counted, five
+  // force-closes from one caller locked that caller out for good.
+  return `(${p}counterparty_abandoned_at IS NULL
+           AND (${p}status = 'active'
+                OR (${p}status = 'interrupted'
+                    AND COALESCE(${p}interrupted_by, 'counterparty') != 'local'
+                    AND ${p}updated_at >= ?)))`;
 };
 export const CAP_COUNT_SQL = (where: string): string =>
   `SELECT COUNT(*) AS n FROM sessions WHERE ${where} AND ${CAP_COUNTS()}`;

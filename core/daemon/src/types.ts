@@ -672,6 +672,8 @@ export interface SessionRecord {
    */
   content_encrypted?: boolean;
   content_encryption_reason?: ContentEncryptionReason;
+  /** Epoch ms the counterparty's abandon notice arrived; null/absent if it never did. */
+  counterparty_abandoned_at?: number | null;
   session_id: string;
   /**
    * The STABLE key this row is scoped by. Every `sessions` query joins on this, never on
@@ -760,6 +762,9 @@ export interface SessionListEntry {
   contentEncrypted?: false;
   /** What that means for the operator. Never a bare code — a bare code is not an affordance. */
   contentEncryptionGuidance?: string;
+  /** Present ONLY when the counterparty sent an abandon notice. The session stays sealable. */
+  counterpartyAbandoned?: true;
+  counterpartyAbandonedGuidance?: string;
   sessionId: string;
   agentName: string;
   counterpartyPubkey: string;

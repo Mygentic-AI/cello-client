@@ -1029,19 +1029,32 @@ export class SessionLifecycle {
       });
       return false;
     }
-    // The counterparty ended it, so it is terminal here too: abandoned, no seal. Left `active`, it
-    // stayed in the open list and kept counting against the per-sender cap, so five force-closes
-    // from one caller locked that caller out for good. The transcript and tree are kept.
+    // THE TRANSPORT IS RETIRED. THE SESSION IS NOT.
+    //
+    // The first build flipped the status to `abandoned`, and that was wrong twice over. It handed
+    // the abandoning party a button that DENIES US OUR RECEIPT: the unilateral seal exists for
+    // exactly this case — "the counterparty never co-closes" — and produces a notarized certificate
+    // after a grace period, but `cello_close_session` refuses an `abandoned` session outright. So
+    // one frame from them destroyed a recovery path that already existed, remotely and for free.
+    // Today the abandoner can only go silent, and going silent is what the unilateral seal was
+    // built to survive.
+    //
+    // What the DoD actually asks for is that we stop calling them. That is a transport concern:
+    // mark it, stop re-dialling, stop retrying delivery — and leave the session sealable.
     const marked = this.#ctx.queries.markCounterpartyAbandoned(agentName, sessionId);
     if (!marked) return false;
     // The addresses go, so the demand-driven re-dial has nothing to dial. This is the storm.
-    this.#ctx.counterpartyAddrs.delete(this.#ctx.sessionKey(agentName, sessionId));
+    const key = this.#ctx.sessionKey(agentName, sessionId);
+    this.#ctx.counterpartyAddrs.delete(key);
     this.#ctx.logger.warn("session.counterparty.abandoned", {
       agentName, sessionId, priorStatus: record.status, correlationId,
-      impact: "abandoned by the other party, no seal — the session is closed on this side and the transcript is kept",
+      impact: "the counterparty ended this session on their side, so nothing more will arrive and replies cannot reach them — this side stops calling. The session is NOT terminal: a unilateral seal is still available, and the transcript is intact",
     });
-    // Status flip plus node retire in one step — the same path the local force-abandon uses.
-    await this.abandonSession(agentName, sessionId);
+    // AWAITED, and `retireSessionNode` NOT `destroySessionNode`. The latter writes the status back
+    // — `error` maps to `interrupted` — a few hundred milliseconds later, which silently undid the
+    // whole unit; the former is the method that tears a node down without touching the status, and
+    // it is what the local force-abandon path already uses.
+    await this.retireSessionNode(agentName, sessionId);
     return true;
   }
 
