@@ -225,8 +225,8 @@ export class NotificationDispatcher {
    *
    * INV-CONTENTFREE holds, the same rule `dispatchCelloMessage` states. What travels is the channel
    * KEY, a COUNT, and OUTCOME WORDS drawn from a fixed vocabulary — never a post title or body, never
-   * a join note. Those are counterparty content and reach the agent only through `cello_channel_read`
-   * (a subscriber's posts) or the operator's own decision (a join request's note), which is screened.
+   * a join note UNSCREENED. Posts reach the agent only through `cello_channel_read`; a join request's
+   * note rides its doorbell only after the inbound screen (048-JOINNOTE).
    * A count of stored posts and the words `admitted`/`pending`/`refused` say that SOMETHING happened,
    * not WHAT was said.
    */
@@ -253,10 +253,15 @@ export class NotificationDispatcher {
     });
   }
 
-  /** A new pending request landed on an invite-only channel this agent administers. */
-  dispatchChannelJoinRequest(agentName: string, channelHex: string, subscriberHex: string): void {
+  /**
+   * A new pending request landed on an invite-only channel this agent administers. 048-JOINNOTE: the
+   * one channel doorbell that carries counterparty text — the joiner's note, already through the
+   * inbound screen (or replaced by "(note withheld by screening)"). Omitted when the joiner left none.
+   */
+  dispatchChannelJoinRequest(agentName: string, channelHex: string, subscriberHex: string, note: string): void {
     this.#dispatchToCurrent(agentName, "channel_join_request", {
       agent: agentName, type: "channel_join_request", channel: channelHex, subscriber: subscriberHex,
+      ...(note !== "" ? { note } : {}),
     });
   }
 

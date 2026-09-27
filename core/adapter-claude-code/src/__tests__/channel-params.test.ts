@@ -297,6 +297,14 @@ describe("M16 032-NOTICES: channel doorbells render and ask for an action", () =
     expect(refused.meta.wake_action).toBe("read_inbox");
   });
 
+  it("048-JOINNOTE: channel_join_request shows the joiner's (already screened) note, quoted, and omits it when absent", () => {
+    const SUB = "cd".repeat(32);
+    const withNote = buildChannelParams({ type: "channel_join_request", channel: CH, subscriber: SUB, note: "hi, it is Alice" }, "channel_join_request");
+    expect(withNote.content).toContain(`Their note: "hi, it is Alice"`);
+    const without = buildChannelParams({ type: "channel_join_request", channel: CH, subscriber: SUB }, "channel_join_request");
+    expect(without.content).not.toContain("Their note");
+  });
+
   it("5c. channel_join_request names the subscriber (shortened) and the approve/refuse verbs", () => {
     const SUB = "cd".repeat(32);
     const { content, meta } = buildChannelParams({ type: "channel_join_request", channel: CH, subscriber: SUB }, "channel_join_request");

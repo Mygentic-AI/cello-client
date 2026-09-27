@@ -20,8 +20,9 @@
  * has an outstanding request for, only when the channel key signed it, and only when it is newer
  * than the last answer and than the last ejection it holds from that channel.
  *
- * The join note is free text from a stranger. As before this order, it does not reach the admin's
- * agent — the doorbell names the channel and the joiner, nothing else.
+ * The join note is free text from a stranger. 048-JOINNOTE: it rides the admin's join-request
+ * doorbell, but only after the membership wiring runs it through the inbound screen; a note the
+ * screen does not allow (or cannot judge) is replaced by JOIN_NOTE_WITHHELD and the request stands.
  */
 import {
   channelJoinSlot, signChannelJoinRequest, encodeChannelJoinRequest, decodeChannelJoinRequest,
@@ -50,6 +51,8 @@ export const JOIN_THROTTLE_GUIDANCE =
  */
 export const NOT_A_CHANNEL_GUIDANCE =
   "No channel with that key. If it was created in the last minute, it may not have reached every directory yet — try again shortly.";
+/** 048-JOINNOTE Decision 2, verbatim: what the admin's agent sees in place of a note the screen did not allow. */
+export const JOIN_NOTE_WITHHELD = "(note withheld by screening)";
 /** The guard refusals that carry that guidance, from the directory or a relay. */
 const GUARD_REASONS = new Set(["rate_limited", "join_slot_cap", "stale_request"]);
 
@@ -394,8 +397,11 @@ export interface ChannelJoinAdminDeps {
   writeAnswer: (channelHex: string, joinerHex: string, answer: Uint8Array) => Promise<boolean>;
   /** Ring the joiner about its answer, on the admin agent's stream. */
   ringJoiner: (channelHex: string, joinerHex: string) => Promise<void>;
-  /** The admin agent's join-request doorbell — a NEW or CHANGED invite-only request only. */
-  raiseRequest: (channelHex: string, joinerHex: string) => void;
+  /**
+   * The admin agent's join-request doorbell — a NEW or CHANGED invite-only request only. `note` is
+   * the joiner's free text, UNSCREENED here: the receiver screens it before any agent sees it.
+   */
+  raiseRequest: (channelHex: string, joinerHex: string, note: string) => void;
   /** 043-POSTERS: a member was admitted (and sent its key). */
   onAdmitted?: (channelHex: string, joinerHex: string) => void;
   now?: () => number;
@@ -442,7 +448,7 @@ export function createChannelJoinAdmin(deps: ChannelJoinAdminDeps) {
 
   /** The newest join slot record for this joiner, opened and verified; null when there is nothing to act on. */
   async function readSlot(admin: LocalChannelAdmin, channelHex: string, joinerHex: string, relayList: string[]):
-    Promise<{ kind: "request" | "withdrawn"; signed_at: number } | null> {
+    Promise<{ kind: "request"; signed_at: number; note: string } | { kind: "withdrawn"; signed_at: number } | null> {
     if (!admin.channelKeyProvider.staticSharedSecret || !admin.adminKeyProvider.openContentSeal) return null;
     const shared = await admin.channelKeyProvider.staticSharedSecret(bytesOf(joinerHex));
     if (!shared) { reject(channelHex, "join_request", "joiner_key_invalid"); return null; }
@@ -463,7 +469,7 @@ export function createChannelJoinAdmin(deps: ChannelJoinAdminDeps) {
       if (hexOf(r.channel_pubkey) !== channelHex || hexOf(r.joiner_pubkey) !== joinerHex || r.signed_at !== newest.signed_at || !verifyChannelJoinRequest(r)) {
         reject(channelHex, "join_request", "signature_invalid"); return null;
       }
-      return { kind: "request", signed_at: r.signed_at };
+      return { kind: "request", signed_at: r.signed_at, note: r.note };
     }
     const asWithdrawal = decodeChannelJoinWithdrawal(inner);
     if (asWithdrawal.ok) {
@@ -515,7 +521,7 @@ export function createChannelJoinAdmin(deps: ChannelJoinAdminDeps) {
       // invite_only: pending, and handed to the admin agent. Nothing here approves it. A newer
       // request from someone already pending is a CHANGED request, so it alerts again.
       members.admit(channelHex, joinerHex, "pending", now());
-      deps.raiseRequest(channelHex, joinerHex);
+      deps.raiseRequest(channelHex, joinerHex, found.note);
       await answer(admin, channelHex, joinerHex, { outcome: "pending" });
     } catch (err: unknown) {
       logger.warn("channel.join.handling_failed", { channel_pubkey: channelHex, reason: extractErrorMessage(err) });

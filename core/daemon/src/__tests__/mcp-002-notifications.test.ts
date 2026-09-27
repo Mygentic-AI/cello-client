@@ -745,7 +745,7 @@ describe("MCP-002: notification routing", () => {
     dispatcher.dispatchChannelPosts("alice", CH, 3, 3);
     dispatcher.dispatchChannelJoinAnswer("alice", CH, "refused", "ejected");
     dispatcher.dispatchChannelJoinAnswer("alice", CH, "admitted");
-    dispatcher.dispatchChannelJoinRequest("alice", CH, SUB);
+    dispatcher.dispatchChannelJoinRequest("alice", CH, SUB, "");
 
     // Only alice's connection was rung, once per dispatch — bob's never.
     expect(captured.map((c) => c.connectionId)).toEqual(
@@ -771,6 +771,11 @@ describe("MCP-002: notification routing", () => {
     expect(captured[3].notification.notification).toBe("channel_join_request");
     expect(captured[3].notification.data).toEqual(
       { agent: "alice", type: "channel_join_request", channel: CH, subscriber: SUB },
+    );
+    // 048-JOINNOTE: a screened note rides the doorbell; an empty one is omitted (above).
+    dispatcher.dispatchChannelJoinRequest("alice", CH, SUB, "hi, it is Alice");
+    expect(captured[4].notification.data).toEqual(
+      { agent: "alice", type: "channel_join_request", channel: CH, subscriber: SUB, note: "hi, it is Alice" },
     );
   });
 

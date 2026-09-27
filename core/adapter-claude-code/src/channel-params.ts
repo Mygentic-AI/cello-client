@@ -192,7 +192,9 @@ function doorbellText(type: string, data: Record<string, unknown>): string {
       // the meta attributes. Full keys also mean no ellipsis before a full stop (F33).
       const chan = String(data["channel"] ?? "");
       const sub = String(data["subscriber"] ?? "");
-      return `🙋 CELLO — ${sub} asked to join channel ${chan}. Run cello_channel_approve ${chan} ${sub} (or cello_channel_refuse).`;
+      // 048-JOINNOTE: the daemon screened the note before it rode this doorbell (or withheld it).
+      const note = typeof data["note"] === "string" && data["note"] !== "" ? ` Their note: "${data["note"]}"` : "";
+      return `🙋 CELLO — ${sub} asked to join channel ${chan}.${note} Run cello_channel_approve ${chan} ${sub} (or cello_channel_refuse).`;
     }
     case "agent_state_changed":
       return `CELLO: agent ${String(data["agent"] ?? "your agent")} is now ${String(data["state"] ?? "changed")}.`;

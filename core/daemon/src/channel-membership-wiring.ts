@@ -25,7 +25,7 @@ import { ChannelPosterGrantStore } from "./channel-poster-grant-store.js";
 import { createChannelPostingAdmin } from "./channel-posting-admin.js";
 import {
   ensureCurrentGroupKey, createChannelJoiner, createChannelJoinAdmin, applyJoinAnswer,
-  ChannelJoinRequestStore, ChannelJoinSeenStore,
+  ChannelJoinRequestStore, ChannelJoinSeenStore, JOIN_NOTE_WITHHELD,
   type LocalChannelAdmin, type AdminLookupOutcome,
 } from "./channel-join-exchange.js";
 import {
@@ -34,6 +34,7 @@ import {
 import { createChannelSubscribe } from "./channel-subscribe.js";
 import { ChannelInboxStore } from "./channel-inbox-store.js";
 import { extractErrorMessage } from "./error-message.js";
+import type { ScreenContext, ScreenVerdict } from "@cello-protocol/gateway";
 import { ChannelNoticeSeenStore, createChannelNoticeReader, writeChannelNotice } from "./channel-notices.js";
 
 /** 045-NOTICEBELL: how often a member re-reads its notices when no ring arrived (the backstop). */
@@ -56,8 +57,11 @@ export interface ChannelNotify {
   channelPosts: (agentId: string, channelHex: string, count: number, through: number, posters?: string[]) => void;
   /** This agent's own join request was answered — or expired with no answer (046 Decision 11). */
   channelJoinAnswer: (agentId: string, channelHex: string, outcome: "admitted" | "pending" | "refused" | "expired", reason?: string) => void;
-  /** A new pending request landed on an invite-only channel this agent administers. */
-  channelJoinRequest: (adminAgentId: string, channelHex: string, subscriberHex: string) => void;
+  /**
+   * A new pending request landed on an invite-only channel this agent administers. `note` is the
+   * joiner's note AFTER the inbound screen — or JOIN_NOTE_WITHHELD. Never the raw text.
+   */
+  channelJoinRequest: (adminAgentId: string, channelHex: string, subscriberHex: string, note: string) => void;
   /**
    * 038-RETESTFIX Part E: this agent's membership ENDED — it was ejected, or the channel was deleted.
    * Its own doorbell (rendered with the shortened key), not a refused join answer.
@@ -89,6 +93,11 @@ export interface ChannelMembershipWiringDeps {
    * agents only — the same agents/channels partition 033-CHANNELVIEW draws on every other surface.
    */
   isChannelAgent: (agentName: string) => boolean;
+  /**
+   * 048-JOINNOTE: the daemon's inbound screen — the same one an incoming session message passes. A
+   * join note is a stranger's text headed for the admin's agent, so it goes through this first.
+   */
+  screenInbound: (content: Uint8Array, ctx: ScreenContext) => Promise<ScreenVerdict>;
   /**
    * 041-HELPTRUTH Part B: the last published seq for a channel this agent administers, or null when
    * the log is empty / this daemon holds no key. From the publishing half, which owns the log — so
@@ -359,14 +368,36 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     return deps.loadedAgents.find((a) => a.pubkey.toLowerCase() === adminHex)?.name ?? null;
   };
 
-  const raiseNotice = (event: string, channelHex: string, subscriberHex: string): void => {
-    logger.info(event, { channel_pubkey: channelHex, subscriber_pubkey: subscriberHex });
-    // M16 032-NOTICES: a pending request was a log line nobody reads. Ring the admin's join-request
-    // doorbell too — the admin agent is resolved from the channel, since the notice carries only the
-    // channel and the subscriber. No local admin (a channel this daemon does not administer) means
-    // there is nobody here to wake, which the getter below simply skips.
+  /**
+   * 048-JOINNOTE: screen a join note before it reaches the admin's agent. `allow` delivers the text,
+   * `redact` delivers the redacted text; every other verdict — a block, a gateway that is down, a
+   * screen that throws — withholds it, logged by name. Never delivered unscreened. The screen wants
+   * a session id and a join has none, so it gets a synthetic context id naming channel and joiner.
+   */
+  const screenJoinNote = async (adminAgentName: string, channelHex: string, joinerHex: string, note: string): Promise<string> => {
+    if (note === "") return "";
+    const sessionId = `channel-join:${channelHex}:${joinerHex}`;
+    try {
+      const verdict = await deps.screenInbound(new TextEncoder().encode(note), { direction: "inbound", agentName: adminAgentName, sessionId });
+      if ((verdict.disposition === "allow" || verdict.disposition === "redact") && verdict.content !== undefined) {
+        return new TextDecoder().decode(verdict.content);
+      }
+      logger.warn("channel.join.note_withheld", { channel_pubkey: channelHex, subscriber_pubkey: joinerHex, disposition: verdict.disposition, reason: verdict.reason });
+    } catch (err: unknown) {
+      logger.warn("channel.join.note_withheld", { channel_pubkey: channelHex, subscriber_pubkey: joinerHex, disposition: "screen_failed", reason: extractErrorMessage(err) });
+    }
+    return JOIN_NOTE_WITHHELD;
+  };
+
+  const raiseRequest = (channelHex: string, subscriberHex: string, note: string): void => {
+    logger.info("channel.join.pending", { channel_pubkey: channelHex, subscriber_pubkey: subscriberHex });
+    // M16 032-NOTICES: ring the admin's join-request doorbell. No local admin (a channel this daemon
+    // does not administer) means there is nobody here to wake.
     const admin = localChannelAdmin(channelHex);
-    if (admin) deps.notify.channelJoinRequest(admin.agentId, channelHex, subscriberHex);
+    if (!admin) return;
+    const name = adminAgentNameFor(channelHex) ?? admin.agentId;
+    void screenJoinNote(name, channelHex, subscriberHex, note)
+      .then((screened) => deps.notify.channelJoinRequest(admin.agentId, channelHex, subscriberHex, screened));
   };
 
   // 043-POSTERS: the posting setting, listed posters, passes and their hourly renewal (the lease).
@@ -407,7 +438,7 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
       const name = adminAgentNameFor(ch);
       if (name) await ringMembers(name, ch, [joiner]);
     },
-    raiseRequest: (ch, joiner) => raiseNotice("channel.join.pending", ch, joiner),
+    raiseRequest,
     // 043-POSTERS: `members` posting issues a pass the moment someone is admitted.
     onAdmitted: (ch, sub) => { void postingAdmin.onAdmitted(ch, sub).catch(() => {}); },
   });

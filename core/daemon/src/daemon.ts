@@ -693,13 +693,14 @@ async function startDaemonHoldingLock(
   const channelNotify: ChannelNotify = {
     channelPosts: (id, ch, count, through, posters) => { const n = named(id); if (n !== null) notificationDispatcher.dispatchChannelPosts(n, ch, count, through, posters); },
     channelJoinAnswer: (id, ch, outcome, reason) => { const n = named(id); if (n !== null) notificationDispatcher.dispatchChannelJoinAnswer(n, ch, outcome, reason); },
-    channelJoinRequest: (id, ch, sub) => { const n = named(id); if (n !== null) notificationDispatcher.dispatchChannelJoinRequest(n, ch, sub); },
+    channelJoinRequest: (id, ch, sub, note) => { const n = named(id); if (n !== null) notificationDispatcher.dispatchChannelJoinRequest(n, ch, sub, note); },
     channelMembershipEnded: (id, ch, reason) => { const n = named(id); if (n !== null) notificationDispatcher.dispatchChannelMembershipEnded(n, ch, reason); },
     channelPosterRemoved: (id, ch) => { const n = named(id); if (n !== null) notificationDispatcher.dispatchChannelPosterRemoved(n, ch); },
   };
 
   const channelMembership = wireChannelMembership({
     handlers, logger, notify: channelNotify,
+    screenInbound: (content, ctx) => securityGateway.screenInbound(content, ctx), // 048-JOINNOTE: join notes
     getDb: () => sessionNodeManager.getDb(),
     loadedAgents, keyProviders,
     resolveAgentId: (agentName) => sessionNodeManager.resolveAgentId(agentName), contactMoniker: (n, pk) => sessionNodeManager.getContactMoniker(n, pk),
