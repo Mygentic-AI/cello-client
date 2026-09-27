@@ -449,8 +449,10 @@ export {
   buildChannelPruneTbs,
   buildChannelReaderCountsTbs,
   buildChannelFetchKeyTbs,
+  buildChannelJoinListTbs,
   CHANNEL_FETCH_AUTH_DOMAIN,
   CHANNEL_PRUNE_DOMAIN,
   CHANNEL_READER_COUNTS_DOMAIN,
   CHANNEL_FETCH_KEY_DOMAIN,
+  CHANNEL_JOIN_LIST_DOMAIN,
 } from "./channel-auth.js";

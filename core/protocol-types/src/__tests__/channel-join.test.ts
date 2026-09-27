@@ -126,3 +126,19 @@ describe("046-JOINBELL channel relay record", () => {
     expect(unknown.ok ? "ok" : unknown.reason).toBe("wrong_shape");
   });
 });
+
+describe("047-JOINPULL the join-list challenge preimage", () => {
+  it("is domain-separated, binds the channel and the one-time nonce, and cannot be a prune preimage", async () => {
+    const { buildChannelJoinListTbs, buildChannelPruneTbs, CHANNEL_JOIN_LIST_DOMAIN } = await import("../channel-auth.js");
+    expect(CHANNEL_JOIN_LIST_DOMAIN).toBe("CELLO-CHANNEL-JOIN-LIST-v1");
+    const ch = new Uint8Array(32).fill(7);
+    const other = new Uint8Array(32).fill(8);
+    const nonce = new Uint8Array(32).fill(1);
+    const a = buildChannelJoinListTbs(ch, nonce);
+    expect(a.length).toBe(32);
+    expect(hex(buildChannelJoinListTbs(ch, nonce))).toBe(hex(a));
+    expect(hex(buildChannelJoinListTbs(other, nonce))).not.toBe(hex(a));
+    expect(hex(buildChannelJoinListTbs(ch, new Uint8Array(32).fill(2)))).not.toBe(hex(a));
+    expect(hex(buildChannelPruneTbs(ch, 0, 0))).not.toBe(hex(a));
+  });
+});

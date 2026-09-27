@@ -21,6 +21,7 @@ export const CHANNEL_FETCH_AUTH_DOMAIN = "CELLO-CHANNEL-FETCH-AUTH-v1";
 export const CHANNEL_PRUNE_DOMAIN = "CELLO-CHANNEL-PRUNE-v1";
 export const CHANNEL_READER_COUNTS_DOMAIN = "CELLO-CHANNEL-READER-COUNTS-v1";
 export const CHANNEL_FETCH_KEY_DOMAIN = "CELLO-CHANNEL-FETCH-KEY-v1";
+export const CHANNEL_JOIN_LIST_DOMAIN = "CELLO-CHANNEL-JOIN-LIST-v1";
 
 function domainTbs(domain: string, channelPubkey: Uint8Array, parts: number[], timeMs: number): Uint8Array {
   const h = createHash("sha256").update(domain, "utf8").update(Buffer.from(channelPubkey));
@@ -60,5 +61,18 @@ export function buildChannelFetchKeyTbs(channelPubkey: Uint8Array, fetchPubkey: 
     .update(Buffer.from(channelPubkey))
     .update(Buffer.from(fetchPubkey))
     .update(Buffer.from(String(timeMs), "utf8"));
+  return new Uint8Array(h.digest());
+}
+
+/**
+ * 047-JOINPULL: what the admin signs with the CHANNEL key to list its channel's waiting join
+ * requests. The nonce is the relay's one-time challenge, so a captured list request cannot be
+ * replayed. The domain string keeps the relay from getting a prune or fetch-key signature out of it.
+ */
+export function buildChannelJoinListTbs(channelPubkey: Uint8Array, nonce: Uint8Array): Uint8Array {
+  const h = createHash("sha256")
+    .update(CHANNEL_JOIN_LIST_DOMAIN, "utf8")
+    .update(Buffer.from(channelPubkey))
+    .update(Buffer.from(nonce));
   return new Uint8Array(h.digest());
 }
