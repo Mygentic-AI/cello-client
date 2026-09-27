@@ -101,45 +101,20 @@ describe("M16 018-PUBCOLLECT: the channel verbs on a live daemon", () => {
     }
   });
 
-  it("33. M16 022 — join REACHES the session layer, and a failure to open one says what happened", async () => {
+  it("33. M16 046 — join on a real daemon opens NO session and says what stopped it", async () => {
     /**
-     * ⚠️ **THE TEST THAT WOULD HAVE CAUGHT THE FIRST CUT OF THIS VERB, and did not exist.** Every
-     * unit test stubbed the daemon seam, so all thirteen were green while `join` could never
-     * succeed: it passed `target` where the negotiator reads `target_pubkey` and read back
-     * `session_id` where the handler returns `sessionId`. Both were invisible from either side
-     * alone and obvious the moment a real daemon was asked to do the thing.
-     *
-     * There is no directory here, so the join cannot complete — that is fine and is the point. What
-     * this asserts is that the verb runs through the REAL socket, reaches the REAL session path,
-     * and comes back with a reason that names what actually stopped it. A field-name bug produced
-     * `no_session` with a detail about "the admin", which pointed at the counterparty for a fault
-     * in the caller.
-     */
-    /**
-     * ⚠️ **SET UP FIRST, AND THAT IS WHAT GIVES THIS TEETH.** With no channel recorded, the admin
-     * lookup fails before the session path is ever reached, and the test passes whatever the
-     * session code does — which is exactly how the first version of this test failed to catch the
-     * bug it was written for. A channel this daemon holds resolves its admin LOCALLY, so `join`
-     * runs all the way to opening a session.
+     * 046-JOINBELL: a join is a signed record on the relays plus a directory ring. There is no
+     * directory in this harness, so the lookup cannot answer — the verb must say so by name
+     * (`unavailable` with the transport's reason) and must never reach for a session.
      */
     await call("cello_channel_config", {
       agent: "alice", channel: channelHex, access: "open", relays: [RELAY_A, RELAY_B],
     });
-
-    const answer = await call("cello_channel_join", {
-      agent: "alice", channel: channelHex,
-    }) as { ok: boolean; reason?: string; detail?: string };
-
-    expect(answer.ok, "there is no counterparty to admit it in this harness").toBe(false);
-    // It reached the SESSION path — not the lookup, and not a caller that never got that far.
-    expect(answer.reason, `unexpected refusal ${String(answer.reason)}`).toBe("no_session");
-    /**
-     * ⚠️ And the detail is the SESSION LAYER'S OWN reason. The bug this catches passed `target`
-     * where the negotiator reads `target_pubkey`, so it came back `invalid_target_pubkey` — a
-     * fault in the caller, reported as though the counterparty were unreachable.
-     */
-    expect(answer.detail, "the session layer's real reason, not a summary").toBeDefined();
-    expect(answer.detail).not.toBe("invalid_target_pubkey");
+    const answer = await call("cello_channel_join", { agent: "alice", channel: channelHex }) as { ok: boolean; reason?: string; detail?: string };
+    expect(answer.ok).toBe(false);
+    expect(answer.reason).toBe("unavailable");
+    expect(answer.detail, "the transport's own reason travels").toBeDefined();
+    expect(answer.reason).not.toBe("no_session");
   });
 
   it("34. M16 022 — read on a channel this agent does not follow is refused by name", async () => {

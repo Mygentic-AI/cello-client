@@ -174,6 +174,31 @@ const CHANNEL_NOTICE_SEEN_V1_SQL = `
   );
 `;
 
+/** channel_join_requests (046-JOINBELL) — the joiner's outstanding requests, born complete. */
+const CHANNEL_JOIN_REQUESTS_V1_SQL = `
+  CREATE TABLE IF NOT EXISTS channel_join_requests (
+    agent_id           TEXT    NOT NULL,
+    channel_pubkey     TEXT    NOT NULL,
+    admin_pubkey       TEXT    NOT NULL,
+    access             TEXT    NOT NULL,
+    relays             TEXT    NOT NULL,
+    guidance           TEXT    NOT NULL,
+    retention_seconds  INTEGER NOT NULL,
+    signed_at          INTEGER NOT NULL,
+    PRIMARY KEY (agent_id, channel_pubkey)
+  );
+`;
+
+/** channel_join_seen (046-JOINBELL) — the admin's newest request per joiner, born complete. */
+const CHANNEL_JOIN_SEEN_V1_SQL = `
+  CREATE TABLE IF NOT EXISTS channel_join_seen (
+    channel_pubkey  TEXT    NOT NULL,
+    joiner_pubkey   TEXT    NOT NULL,
+    signed_at       INTEGER NOT NULL,
+    PRIMARY KEY (channel_pubkey, joiner_pubkey)
+  );
+`;
+
 /** channel_lane_positions (043-POSTERS) — born complete. */
 const CHANNEL_LANE_POSITIONS_V1_SQL = `
   CREATE TABLE IF NOT EXISTS channel_lane_positions (
@@ -483,6 +508,9 @@ const BASELINES: Record<string, { firstVersionSql: string; sentinels: string[] }
   channel_poster_grants: { firstVersionSql: CHANNEL_POSTER_GRANTS_V1_SQL, sentinels: [] },
   // 045-NOTICEBELL: the newest notice each agent applied, per (channel, type) — born complete.
   channel_notice_seen: { firstVersionSql: CHANNEL_NOTICE_SEEN_V1_SQL, sentinels: [] },
+  // 046-JOINBELL: joiner requests and admin seen-times — both born complete.
+  channel_join_requests: { firstVersionSql: CHANNEL_JOIN_REQUESTS_V1_SQL, sentinels: [] },
+  channel_join_seen: { firstVersionSql: CHANNEL_JOIN_SEEN_V1_SQL, sentinels: [] },
 };
 
 describe("042-UPGRADE Part C guard: no channel table's CREATE SQL can gain an unhandled column", () => {
