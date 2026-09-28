@@ -194,9 +194,14 @@ BUSY_RETRY_DELAY_SECONDS = 2.0
 # OVER - a send can NEVER succeed on it, so an owed-reply reminder must be cleared rather than left
 # armed. session_closed is a sealed or closed session (session-closed.ts SESSION_CLOSED_REASON) -
 # the live [[WRAP]] case. session_terminal / session_identity_lost come from reviveIfNeededForSend
-# (session-lifecycle.ts) when the session cannot be revived to send. ANY OTHER ok:false (e.g.
-# governance_warn, a hold) keeps the reminder armed: that reply is still owed.
-SESSION_ENDED_SEND_REASONS = ("session_closed", "session_terminal", "session_identity_lost")
+# (session-lifecycle.ts) when the session cannot be revived to send. session_not_found is returned
+# when the daemon holds no record of the session at all (session-content-handlers.ts, the no-record
+# branch) - also unanswerable. ANY OTHER ok:false (e.g. governance_warn, a hold) keeps it armed:
+# that reply is still owed. (A counterparty-refusal's variable, free-form reason is deliberately NOT
+# listed - out of scope; see the order's Newly discovered.)
+SESSION_ENDED_SEND_REASONS = (
+    "session_closed", "session_terminal", "session_identity_lost", "session_not_found",
+)
 
 # Bound on the wake backlog. Unbounded, a daemon that pushed faster than the agent could answer
 # would grow this without limit inside the gateway process. Overflow DROPS the newest wake and

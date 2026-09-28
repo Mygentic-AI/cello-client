@@ -428,8 +428,8 @@ describe("050-BRIDGEQUIET Part B — no reminder for a conversation that has end
     expect(v.awaiting![AGENT] ?? []).not.toContain(SID);
   });
 
-  it("B3: session_terminal and session_identity_lost also clear it", () => {
-    for (const reason of ["session_terminal", "session_identity_lost"]) {
+  it("B3: session_terminal, session_identity_lost and session_not_found also clear it", () => {
+    for (const reason of ["session_terminal", "session_identity_lost", "session_not_found"]) {
       const v = runDriver(dir, {
         op: "record", awaiting: { [AGENT]: { [SID]: "Mac_Coder_1" } }, bindings_path: bpath(),
         tool_name: "mcp__cello__cello_send", args: { session_id: SID },
