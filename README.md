@@ -1,4 +1,4 @@
-https://cello.mygentic.ai/
+[https://cello.mygentic.ai/](https://cello.mygentic.ai/l/2axsGFs)
 
 # cello-client
 
