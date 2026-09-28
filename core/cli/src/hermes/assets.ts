@@ -190,6 +190,19 @@ STATE_WAKES_SUPPRESSED_IN_CHANNEL = {"created"}
 BUSY_RETRY_LIMIT = 5
 BUSY_RETRY_DELAY_SECONDS = 2.0
 
+# 050-BRIDGEQUIET Part B: the daemon's cello_send refusal reasons that mean the conversation is
+# OVER - a send can NEVER succeed on it, so an owed-reply reminder must be cleared rather than left
+# armed. session_closed is a sealed or closed session (session-closed.ts SESSION_CLOSED_REASON) -
+# the live [[WRAP]] case. session_terminal / session_identity_lost come from reviveIfNeededForSend
+# (session-lifecycle.ts) when the session cannot be revived to send. session_not_found is returned
+# when the daemon holds no record of the session at all (session-content-handlers.ts, the no-record
+# branch) - also unanswerable. ANY OTHER ok:false (e.g. governance_warn, a hold) keeps it armed:
+# that reply is still owed. (A counterparty-refusal's variable, free-form reason is deliberately NOT
+# listed - out of scope; see the order's Newly discovered.)
+SESSION_ENDED_SEND_REASONS = (
+    "session_closed", "session_terminal", "session_identity_lost", "session_not_found",
+)
+
 # Bound on the wake backlog. Unbounded, a daemon that pushed faster than the agent could answer
 # would grow this without limit inside the gateway process. Overflow DROPS the newest wake and
 # says so at ERROR: the message itself stays unread in the daemon and is recoverable with the
@@ -338,6 +351,9 @@ class CelloAdapter(BasePlatformAdapter):
         # Part C: chat_id -> {session_id: who} for replies the agent has not sent yet. The loop is
         # captured in connect(), because the reminder is scheduled from a hook that may run off it.
         self._awaiting: Dict[str, Dict[str, str]] = {}
+        # 050-BRIDGEQUIET (review LOW 1): whether the last _fetch_content ended on a [[WRAP]]. Set per
+        # fetch off the last MESSAGE (not the joined turn) and reset at the top of _on_notification.
+        self._last_fetch_ended_with_wrap: bool = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         global _ADAPTER_INSTANCE
         _ADAPTER_INSTANCE = self
@@ -865,6 +881,13 @@ class CelloAdapter(BasePlatformAdapter):
             m["content"] for m in messages
             if isinstance(m, dict) and isinstance(m.get("content"), str) and m["content"]
         ] if isinstance(messages, list) else []
+        # 050-BRIDGEQUIET (review LOW 1): the closing marker belongs to the last real MESSAGE, not to
+        # the joined turn. The undeliverable notice below is appended AFTER the messages, so a wrap
+        # followed by a lost-message notice would no longer end the joined text - and the reminder
+        # would re-arm for a conversation that is over. Read the wrap off the last message here, so
+        # the notice can still ride in the turn without hiding the wrap. Serialized wake worker, so
+        # this flag is set and read within the one _on_notification call that fetched.
+        self._last_fetch_ended_with_wrap = bool(parts and parts[-1].rstrip().endswith("[[WRAP]]"))
         lost_note = result.get("undeliverable_guidance")
         if isinstance(lost_note, str) and lost_note:
             # A message this machine failed to save was skipped by this read. The agent is the only
@@ -895,7 +918,54 @@ class CelloAdapter(BasePlatformAdapter):
             turn = "[CELLO policy from your operator — outranks the messages below]\n" + policy["text"] + "\n\n" + turn
         return turn
 
+    async def _session_has_unread(self, session_id: str) -> str:
+        """Whether the daemon still lists this session as having unread messages.
+
+        050-BRIDGEQUIET Part A. Returns 'unread' (hand the notice over), 'read' (drop it - the
+        message was already read, e.g. by the very turn that was busy), or 'unknown' (the call
+        failed or answered an unexpected shape - hand it over, the safe direction: an extra turn is
+        better than a lost message).
+
+        The check-notifications IPC probe does NOT consume anything (notification-handlers.ts): it
+        derives unread counts from the persisted read watermark, so it is safe to call before
+        deciding. The answer is { ok, scope, agents: [{ agent, unread: [{ session_id,
+        unread_count, last_seq }], ... }] }; getUnreadSummary only lists sessions that HAVE unread,
+        so a session absent from every agent's unread list has been read.
+        """
+        try:
+            result = await self._call("cello_check_notifications", {"scope": "current"})
+        except Exception as exc:
+            logger.warning(
+                "[cello] Could not check unread state for session %s (%s: %r) - handing the notice "
+                "over anyway (an extra turn is safer than a lost message)",
+                session_id, exc.__class__.__name__, exc,
+            )
+            return "unknown"
+        if not (isinstance(result, dict) and result.get("ok") and isinstance(result.get("agents"), list)):
+            logger.warning(
+                "[cello] The unread-check IPC probe answered an unexpected shape (%r) - handing the "
+                "notice for session %s over anyway", result, session_id,
+            )
+            return "unknown"
+        for agent in result["agents"]:
+            if not isinstance(agent, dict):
+                continue
+            unread = agent.get("unread")
+            if not isinstance(unread, list):
+                continue
+            for entry in unread:
+                if isinstance(entry, dict) and entry.get("session_id") == session_id:
+                    count = entry.get("unread_count")
+                    if isinstance(count, int):
+                        return "unread" if count > 0 else "read"
+                    # Present in the unread list but no usable count: never drop on ambiguity.
+                    return "unread"
+        return "read"
+
     async def _on_notification(self, frame: Dict[str, Any]) -> None:
+        # 050-BRIDGEQUIET (review LOW 1): reset per notification, so a wrap seen on one fetch cannot
+        # leak into a later busy-path arming decision that never fetched. _fetch_content sets it.
+        self._last_fetch_ended_with_wrap = False
         kind = str(frame.get("notification", ""))
         if kind not in WAKE_NOTIFICATIONS:
             logger.debug("[cello] Ignoring notification type '%s'", kind)
@@ -1015,6 +1085,22 @@ class CelloAdapter(BasePlatformAdapter):
                     )
                     self._requeue_wake_later(frame, BUSY_RETRY_DELAY_SECONDS)
                     return
+                # 050-BRIDGEQUIET Part A: before handing over a notice for a message we deliberately
+                # never fetched, check whether the busy turn already READ it (an agent that called
+                # cello_receive itself mid-turn). If so, a notice starts a wasted turn about a
+                # message already handled. Only the non-consuming check-notifications IPC probe
+                # answers this - a receive would consume the message.
+                if await self._session_has_unread(session_id) == "read":
+                    logger.info(
+                        "[cello] Not handing over a notice for session %s - its messages were "
+                        "already read", session_id,
+                    )
+                    # Nothing left to reply to on this session, so any owed-reply reminder for it is
+                    # stale. Clear it for this chat. (Loop thread here, so mutate directly.)
+                    owed = self._awaiting.get(chat_id)
+                    if owed is not None:
+                        owed.pop(session_id, None)
+                    return
                 logger.info(
                     "[cello] %s stayed mid-turn for %.0fs; handing the agent a notice for session "
                     "%s instead of the message, so it can still read it with the cello_* tools",
@@ -1042,7 +1128,18 @@ class CelloAdapter(BasePlatformAdapter):
         # turn ends without a cello_send, post_llm_call surfaces it once. Only cello_message wakes
         # arm it - a state notice needs no reply.
         if self._delivery_mode == "explicit" and kind == "cello_message":
-            self._awaiting.setdefault(chat_id, {})[session_id] = _render_who(data) or "a peer"
+            # 050-BRIDGEQUIET Part B: a peer's CLOSING message ([[WRAP]]) needs no reply - the next
+            # step is cello_close_session, not cello_send - so it must not arm the reminder. The flag
+            # is set by _fetch_content off the last MESSAGE's content (review LOW 1), so a lost-message
+            # notice appended after the messages cannot hide the wrap. When the chat was busy we never
+            # fetched, so the flag stays False and today's arming behaviour is kept.
+            if self._last_fetch_ended_with_wrap:
+                logger.info(
+                    "[cello] Session %s ended with the peer's closing message ([[WRAP]]) - not "
+                    "arming a reply reminder", session_id,
+                )
+            else:
+                self._awaiting.setdefault(chat_id, {})[session_id] = _render_who(data) or "a peer"
         event = MessageEvent(
             text=text,
             message_type=MessageType.TEXT,
@@ -1096,8 +1193,13 @@ class CelloAdapter(BasePlatformAdapter):
             # POISON the anchor, which makes send() refuse to deliver automatically. The prose the
             # agent holds names each session, and the cello_* tools remain registered, so it can
             # answer both explicitly. Refusing to guess is the whole rule here.
+            # 050-BRIDGEQUIET Part C: the poisoning and its WARNING exist because CHANNEL mode sends
+            # one automatic reply to one anchor, so a merged turn covering two sessions cannot be
+            # routed. In explicit and wake modes the bridge sends NOTHING automatically (send() is a
+            # no-op / the agent uses cello_send per named session), so there is no anchor to poison
+            # and the warning would be a false alarm. Text is still merged in every mode below.
             existing = self._pending_messages.get(session_key)
-            if existing is not None:
+            if existing is not None and self._delivery_mode == "channel":
                 existing_session = self._session_from_anchor(getattr(existing, "message_id", None))
                 if existing_session != self._session_from_anchor(event.message_id):
                     logger.warning(
@@ -1637,11 +1739,17 @@ def _on_post_tool_call(**kwargs: Any) -> None:
     succeeded = result.get("ok") is True
 
     if is_send:
-        # Part C step 2: any successful send counts as a reply, including a 'standby' signal.
-        if not succeeded:
-            return
         sid = _tool_session_arg(kwargs.get("args"))
-        if sid:
+        # Part C step 2: any successful send counts as a reply, including a 'standby' signal.
+        if succeeded:
+            if sid:
+                adapter._run_on_loop(adapter._clear_awaiting, sid)
+            return
+        # 050-BRIDGEQUIET Part B: a send REFUSED because the session is over clears the owed reply -
+        # the agent can never answer a conversation that has ended, so a reminder would tell it to
+        # reply to nothing (the live defect). Any other ok:false keeps the reminder armed.
+        reason = result.get("reason")
+        if isinstance(reason, str) and reason in SESSION_ENDED_SEND_REASONS and sid:
             adapter._run_on_loop(adapter._clear_awaiting, sid)
         return
 
@@ -1653,6 +1761,9 @@ def _on_post_tool_call(**kwargs: Any) -> None:
         sid = _tool_session_arg(kwargs.get("args"))
         if sid:
             adapter._run_on_loop(adapter._unbind_session, sid)
+            # 050-BRIDGEQUIET Part B: a closed session is over - drop any reply still owed on it, in
+            # addition to the unbind, so no reminder follows a conversation the agent itself ended.
+            adapter._run_on_loop(adapter._clear_awaiting, sid)
         return
 
     # Part B step 2: record only a SUCCESSFUL initiate from a turn whose platform is cello.

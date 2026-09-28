@@ -110,7 +110,9 @@ adapter._retry_tasks = set()
 # Part B/C state (049-BRIDGEREPLY). __new__ skips __init__, so the driver seeds these too.
 adapter._bindings = dict(spec.get("bindings") or {})
 adapter._bindings_path = spec.get("bindings_path", "/tmp/cello-test-bindings.json")
-adapter._awaiting = {}
+# Seedable so a test can prove a stale owed-reply is CLEARED (050-BRIDGEQUIET Parts A & B): the
+# clear paths remove a session from _awaiting, so the set must be able to start non-empty.
+adapter._awaiting = {k: dict(v) for k, v in (spec.get("awaiting") or {}).items()}
 adapter._loop = None
 # The recording/reminder hooks reach the adapter through this module global (set in __init__).
 m._ADAPTER_INSTANCE = None if spec.get("no_adapter") else adapter
@@ -137,6 +139,14 @@ async def fake_call(method, params=None, timeout=None):
                 return {"ok": True, "content": None}
             return {"ok": True, "count": len(batch), "messages": batch}
         return receive_result
+    if method == "cello_check_notifications":
+        # 050-BRIDGEQUIET Part A: the non-consuming unread probe. "raise" simulates a dead socket;
+        # otherwise the test supplies the exact daemon shape ({ok, scope, agents:[{agent, unread:[
+        # {session_id, unread_count, last_seq}]}]}). Absent -> {"ok": True} with no agents array,
+        # i.e. an UNEXPECTED shape, so the adapter hands the notice over (the safe direction).
+        if spec.get("check_notifications") == "raise":
+            raise ConnectionError("socket died")
+        return spec.get("check_notifications", {"ok": True})
     if method == "cello_send":
         return spec.get("send_result") or {"ok": True}
     if method == "cello_list_sessions":
@@ -210,6 +220,7 @@ async def main():
         }
         out["bindings"] = adapter._bindings
         out["awaiting"] = {k: list(v.keys()) for k, v in adapter._awaiting.items()}
+        out["logs"] = _log_records
     elif op == "record":
         # Part B/C recording via the module-level post_tool_call hook. The hook marshals every state
         # mutation onto the loop with call_soon_threadsafe (finding 3), so capture the loop and give
