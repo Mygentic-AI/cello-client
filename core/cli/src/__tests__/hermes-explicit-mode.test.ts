@@ -487,5 +487,10 @@ describe("050-BRIDGEQUIET Part C — the 'merged' WARNING only in channel mode",
     const anchor = Object.values(v.pending_anchors!)[0]!;
     expect(anchor.startsWith("cello-ambiguous-")).toBe(false);
     expect(anchor.startsWith("cello-wake-")).toBe(true); // a real, routable anchor is kept
+    // review LOW 3: skipping the poison must NOT skip the merge — both sessions' text survives, so
+    // neither peer's notice is lost when the agent answers each with cello_send.
+    const merged = Object.values(v.pending!)[0]!;
+    expect(merged).toContain(SID);
+    expect(merged).toContain(SID2);
   });
 });
