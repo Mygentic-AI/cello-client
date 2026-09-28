@@ -751,7 +751,7 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "README.md",
     claim: "sealed-receipt: 'the notarized seal'",
-    excerpts: ["— the notarized seal"],
+    excerpts: ["a closed session's notarized receipt"],
     enforcedBy: "directory",
     verdict: "corrected",
     evidence:
@@ -873,21 +873,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   },
   {
     surface: "README.md",
-    claim: "'A session name is private to you — never sent to the counterparty, the relay, or the directory'",
-    excerpts: ["**private to you** — never sent to the counterparty"],
-    enforcedBy: "structural",
-    verdict: "true",
-    evidence:
-      "Verified STRUCTURALLY rather than by inspection of send sites, which is what makes it hold " +
-      "against future edits: `session_name` appears in no wire type in `core/protocol-types/src`, " +
-      "so there is no field for it to travel in. It is a local column on the sessions table " +
-      "(`session-node-manager.ts`), documented as never entering a frame, the transcript, the seal " +
-      "or a Merkle leaf. Re-confirmed here rather than inherited from the earlier prose ledger row.",
-  },
-  {
-    surface: "README.md",
     claim: "contact set-moniker: 'YOUR pet name for THEM (they cannot spoof it)'",
-    excerpts: ["YOUR pet name for THEM (they cannot spoof it)"],
+    excerpts: ["your own name for them (they cannot change it)"],
     enforcedBy: "daemon-local",
     verdict: "true",
     evidence:
