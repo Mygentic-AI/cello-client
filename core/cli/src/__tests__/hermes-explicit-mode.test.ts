@@ -296,3 +296,179 @@ describe("049-BRIDGEREPLY Part C — a turn that ends without a reply gets one r
     expect(reminders(v)).toHaveLength(0);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// 050-BRIDGEQUIET — no turn for a message already read, no reminder for a conversation over.
+// All tests EXECUTE the real Python through the shared driver. Hook results use the EXACT Hermes
+// envelope (json.dumps({"result": json.dumps({...})})) — the shape production sends (049 live).
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+describe("050-BRIDGEQUIET Part A — a held notice is dropped if its message was already read", () => {
+  let dir: string;
+  beforeAll(async () => {
+    dir = await mkdtemp(join(tmpdir(), "hermes-quiet-a-"));
+    await installHermesDriver(dir);
+  });
+  afterAll(async () => { await rm(dir, { recursive: true, force: true }); });
+
+  const AGENT = "Ms_Chelly_Hermes";
+  const SID = "645dc477a1b2c3d4e5f6a7b8c9d0e1f2";
+  const PUB = "77d0c806".repeat(8);
+  const MSG = { session_id: SID, from: PUB, who: "Coder_H1", whoKnown: true };
+  const logMsgs = (v: Verdict) => (v.logs ?? []).map((l) => `${l.level} ${l.msg}`);
+
+  it("A1: a held notice whose session reads unread_count 0 is DROPPED — no turn, INFO log, awaiting cleared", () => {
+    const v = runDriver(dir, {
+      op: "notify", kind: "cello_message", data: MSG, busy: AGENT, busy_retries: 99,
+      awaiting: { [AGENT]: { [SID]: "Coder_H1" } },
+      check_notifications: { ok: true, scope: "current", agents: [{ agent: AGENT, unread: [{ session_id: SID, unread_count: 0, last_seq: 4 }], total_unread: 0 }] },
+    });
+    expect(v.delivered).toHaveLength(0);                 // no wasted turn
+    expect(Object.keys(v.pending ?? {})).toHaveLength(0); // and not queued as a notice
+    expect(logMsgs(v).some((m) => m.includes("were already read"))).toBe(true);
+    expect(v.awaiting![AGENT] ?? []).not.toContain(SID);  // nothing left to reply to
+  });
+
+  it("A1: a session ABSENT from the unread list is also dropped", () => {
+    const v = runDriver(dir, {
+      op: "notify", kind: "cello_message", data: MSG, busy: AGENT, busy_retries: 99,
+      awaiting: { [AGENT]: { [SID]: "Coder_H1" } },
+      check_notifications: { ok: true, scope: "current", agents: [{ agent: AGENT, unread: [], total_unread: 0 }] },
+    });
+    expect(v.delivered).toHaveLength(0);
+    expect(v.awaiting![AGENT] ?? []).not.toContain(SID);
+  });
+
+  it("A2: a held notice whose session is still unread is HANDED OVER as today", () => {
+    const v = runDriver(dir, {
+      op: "notify", kind: "cello_message", data: MSG, busy: AGENT, busy_retries: 99,
+      check_notifications: { ok: true, scope: "current", agents: [{ agent: AGENT, unread: [{ session_id: SID, unread_count: 1, last_seq: 4 }], total_unread: 1 }] },
+    });
+    expect(Object.values(v.pending!)[0]).toContain("CELLO wake"); // the manual-path notice
+    expect(v.awaiting![AGENT]).toContain(SID);                    // a reply is still owed
+  });
+
+  it("A2: the drop path never CONSUMES — cello_receive is never called", () => {
+    const v = runDriver(dir, {
+      op: "notify", kind: "cello_message", data: MSG, busy: AGENT, busy_retries: 99,
+      awaiting: { [AGENT]: { [SID]: "Coder_H1" } },
+      check_notifications: { ok: true, scope: "current", agents: [{ agent: AGENT, unread: [], total_unread: 0 }] },
+    });
+    expect(v.calls.find((c) => c.method === "cello_receive")).toBeUndefined();
+    expect(v.calls.find((c) => c.method === "cello_check_notifications")).toBeDefined();
+  });
+
+  it("A3: a cello_check_notifications failure HANDS THE NOTICE OVER and logs a WARNING", () => {
+    const v = runDriver(dir, {
+      op: "notify", kind: "cello_message", data: MSG, busy: AGENT, busy_retries: 99,
+      check_notifications: "raise",
+    });
+    expect(Object.values(v.pending!)[0]).toContain("CELLO wake");
+    expect(logMsgs(v).some((m) => m.startsWith("WARNING") && m.includes("check unread"))).toBe(true);
+  });
+});
+
+describe("050-BRIDGEQUIET Part B — no reminder for a conversation that has ended", () => {
+  let dir: string;
+  beforeAll(async () => {
+    dir = await mkdtemp(join(tmpdir(), "hermes-quiet-b-"));
+    await installHermesDriver(dir);
+  });
+  afterAll(async () => { await rm(dir, { recursive: true, force: true }); });
+
+  const AGENT = "Ms_Chelly_Hermes";
+  const SID = "0279cbcca1b2c3d4e5f6a7b8c9d0e1f2";
+  const PUB = "77d0c806".repeat(8);
+  const MSG = { session_id: SID, from: PUB, who: "Mac_Coder_1", whoKnown: true };
+  function envelope(inner: Record<string, unknown>): string {
+    return JSON.stringify({ result: JSON.stringify(inner) });
+  }
+  function bpath(): string { return join(dir, `b-${Math.random().toString(36).slice(2)}.json`); }
+
+  it("B1: a fetched message ending [[WRAP]] does NOT arm the reminder", () => {
+    const v = runDriver(dir, {
+      op: "notify", kind: "cello_message", data: MSG, delivery_mode: "explicit",
+      receive_result: { ok: true, count: 1, messages: [{ sequence: 0, content: "All done, sealing now. [[WRAP]]" }] },
+    });
+    expect(v.delivered).toHaveLength(1);                 // the closing message is still shown
+    expect(v.awaiting![AGENT] ?? []).not.toContain(SID); // but no reply is owed
+  });
+
+  it("B2: a fetched message ending [[OVER]] still arms the reminder", () => {
+    const v = runDriver(dir, {
+      op: "notify", kind: "cello_message", data: MSG, delivery_mode: "explicit",
+      receive_result: { ok: true, count: 1, messages: [{ sequence: 0, content: "Your turn. [[OVER]]" }] },
+    });
+    expect(v.awaiting![AGENT]).toContain(SID);
+  });
+
+  it("B3: a cello_send refused with session_closed clears the owed reply (real Hermes envelope)", () => {
+    const v = runDriver(dir, {
+      op: "record", awaiting: { [AGENT]: { [SID]: "Mac_Coder_1" } }, bindings_path: bpath(),
+      tool_name: "mcp__cello__cello_send", args: { session_id: SID },
+      hook_result: envelope({ ok: false, reason: "session_closed", guidance: "This session is closed." }),
+    });
+    expect(v.awaiting![AGENT] ?? []).not.toContain(SID);
+  });
+
+  it("B3: session_terminal and session_identity_lost also clear it", () => {
+    for (const reason of ["session_terminal", "session_identity_lost"]) {
+      const v = runDriver(dir, {
+        op: "record", awaiting: { [AGENT]: { [SID]: "Mac_Coder_1" } }, bindings_path: bpath(),
+        tool_name: "mcp__cello__cello_send", args: { session_id: SID },
+        hook_result: envelope({ ok: false, reason }),
+      });
+      expect(v.awaiting![AGENT] ?? []).not.toContain(SID);
+    }
+  });
+
+  it("B4: a cello_send refused for another reason (governance_warn) KEEPS it", () => {
+    const v = runDriver(dir, {
+      op: "record", awaiting: { [AGENT]: { [SID]: "Mac_Coder_1" } }, bindings_path: bpath(),
+      tool_name: "mcp__cello__cello_send", args: { session_id: SID },
+      hook_result: envelope({ ok: false, reason: "governance_warn", guidance: "held for a decision" }),
+    });
+    expect(v.awaiting![AGENT]).toContain(SID);
+  });
+
+  it("B5: a successful cello_close_session clears the owed reply (and unbinds)", () => {
+    const v = runDriver(dir, {
+      op: "record", awaiting: { [AGENT]: { [SID]: "Mac_Coder_1" } }, bindings: { [SID]: AGENT },
+      bindings_path: bpath(), tool_name: "mcp__cello__cello_close_session", args: { session_id: SID },
+      hook_result: envelope({ ok: true }),
+    });
+    expect(v.awaiting![AGENT] ?? []).not.toContain(SID);
+    expect(v.bindings![SID]).toBeUndefined();
+  });
+});
+
+describe("050-BRIDGEQUIET Part C — the 'merged' WARNING only in channel mode", () => {
+  let dir: string;
+  beforeAll(async () => {
+    dir = await mkdtemp(join(tmpdir(), "hermes-quiet-c-"));
+    await installHermesDriver(dir);
+  });
+  afterAll(async () => { await rm(dir, { recursive: true, force: true }); });
+
+  const AGENT = "Ms_Chelly_Hermes";
+  const SID = "aabbccdd11223344";
+  const PUB = "77d0c806".repeat(8);
+  const MSG = { session_id: SID, from: PUB };
+  const SID2 = "beef9999";
+  const PUB2 = "99ff88ee".repeat(8);
+
+  it("C1: explicit mode — two sessions merged log NO 'merged' WARNING and poison NO anchor", () => {
+    const v = runDriver(dir, {
+      op: "notify", delivery_mode: "explicit", busy: AGENT, busy_retries: 99,
+      frames: [
+        { kind: "cello_message", data: MSG },
+        { kind: "cello_message", data: { session_id: SID2, from: PUB2 } },
+      ],
+    });
+    const logs = (v.logs ?? []).map((l) => l.msg);
+    expect(logs.some((m) => m.includes("merged into one pending turn"))).toBe(false);
+    const anchor = Object.values(v.pending_anchors!)[0]!;
+    expect(anchor.startsWith("cello-ambiguous-")).toBe(false);
+    expect(anchor.startsWith("cello-wake-")).toBe(true); // a real, routable anchor is kept
+  });
+});
