@@ -139,19 +139,6 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
     evidence: "Same walk as the setup skill's row: PolicyStore.#walk, policy-008-store.test.ts clauses 4–5.",
   },
   {
-    surface: "core/cli/src/registry.ts (operator-facing strings)",
-    claim: "policy approve: an agent cannot approve its own proposal",
-    excerpts: ["so an agent cannot approve its own proposal."],
-    enforcedBy: "daemon-local",
-    verdict: "true",
-    evidence:
-      "No MCP approve tool exists (policy-008-mcp.test.ts clause 17); the daemon refuses " +
-      "cello_policy_approve/decline from any connection not handshaken as `cli` " +
-      "(policy_approve_terminal_only, policy-008-daemon.test.ts); the CLI asks only at a TTY and " +
-      "answers not_a_tty otherwise, with no --yes (policy-008-cli.test.ts clause 24). Daemon-local: " +
-      "an operator's own rewritten client can bypass it, which is the operator's choice, not a peer's.",
-  },
-  {
     surface: "SECURITY.md",
     claim: "Conversation content is end-to-end encrypted and the nodes never hold plaintext",
     /**

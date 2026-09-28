@@ -535,7 +535,9 @@ const POLICY_DOCS: ReadonlyArray<{ verb: string; usage: string; paragraph: strin
     paragraph:
       "Show a pending change — level, type, cadence, the text in force (was:) and the proposed text (now:) — " +
       "and ask Apply it? [y/N]. y puts it in force; n discards it. With no id it walks every pending change " +
-      "in turn. It needs an interactive terminal and has no --yes flag, so an agent cannot approve its own proposal.",
+      "in turn. It needs an interactive terminal and has no --yes flag: the agent's MCP tools are refused, and a " +
+      "command an agent runs through its shell tool normally has no terminal to answer. It raises the bar; it " +
+      "does not stop an agent that already controls your machine.",
     examples: ["cello policy approve", "cello policy approve p3"],
   },
   {
