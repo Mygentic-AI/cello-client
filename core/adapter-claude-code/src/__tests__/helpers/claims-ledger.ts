@@ -666,19 +666,52 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
 
   {
     surface: "README.md",
-    claim: "Headline: 'relayed as encrypted blobs the relay cannot read'",
-    excerpts: ["relayed as encrypted blobs the relay cannot read"],
+    claim: "Intro and Security & governance: an agent identity cannot be forged or reset",
+    excerpts: [
+      "Every agent has an identity that cannot be",
+      "**Identities that cannot be forged or reset.**",
+      "Because an identity cannot be reset",
+    ],
+    enforcedBy: "directory",
+    verdict: "true",
+    evidence:
+      "The identity is the FROST group key from the agent's DKG with the directory nodes; signing " +
+      "needs T = majority(N) nodes, so no single node (ours included) can produce the agent's " +
+      "signature. The pubkey IS the identity: there is no rename-to-reset path — retiring an agent " +
+      "and registering again yields a new key with no history, which is the property claimed.",
+  },
+  {
+    surface: "README.md",
+    claim: "Security & governance: 'a verified phone and email' trust signals",
+    excerpts: ["a verified phone and email"],
+    enforcedBy: "directory",
+    verdict: "true",
+    evidence:
+      "Phone is verified by the Telegram OTP at registration and email by the portal OTP; both are " +
+      "minted as portal-issued trust signals whose hash the directory notarizes (the live 008-POLICY " +
+      "smoke on 2026-09-28 showed both badges `verified: true` on a real knock).",
+  },
+  {
+    surface: "README.md",
+    claim: "Security & governance: inbound messages are 'screened on your machine' before the agent reads them",
+    excerpts: ["Inbound messages are screened on"],
+    enforcedBy: "daemon-local",
+    verdict: "true",
+    evidence:
+      "The gateway's inbound path (sanitizer, then the optional layer-2 classifier) runs in the " +
+      "daemon before a message is written where cello_receive reads it. Scope as written: the " +
+      "classifier is optional and flags rather than blocks (m16/026-NOBLOCK), and the sentence says so.",
+  },
+  {
+    surface: "README.md",
+    claim: "Security & governance: 'CELLO's servers see hashes, never content.'",
+    excerpts: ["CELLO's servers see hashes, never content."],
     enforcedBy: "structural",
     verdict: "true",
     evidence:
-      "The relay is a blind witness by construction, not by policy. It is bound to a session with " +
-      "both participants' pubkeys and receives signed content HASHES, and verifying a signature " +
-      "against a known pubkey never requires reading content — which is why the corroboration work " +
-      "in `DOD-M15-CORROBORATE-1` can be added without weakening this. Live content additionally " +
-      "travels inside libp2p's Noise session, so the relay is carrying ciphertext it holds no key " +
-      "for. Scope kept honest: this says the relay cannot read CONTENT. It does see who talks to " +
-      "whom, when, how often and how big — disclosed as a bounded property by `DOD-M15-DISCLOSE-1` " +
-      "rather than left for a reader to discover.",
+      "Directory nodes receive signed leaf HASHES and seal roots, never message bodies; the relay " +
+      "carries Noise-encrypted content it holds no key for and is given content hashes only. " +
+      "Metadata (who, when, how big) is visible and is not what this sentence claims.",
   },
   {
     surface: "README.md",

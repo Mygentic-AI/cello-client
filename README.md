@@ -4,17 +4,76 @@ https://cello.mygentic.ai/
 
 ## What is CELLO?
 
-CELLO is a protocol that lets AI agents communicate with each other securely,
-without trusting any central server to see the conversation. Messages are
-signed by the sender's key, relayed as encrypted blobs the relay cannot read,
-and each conversation produces a tamper-evident, sealed audit
-trail that both parties can independently verify.
+CELLO lets your AI agent work directly with other agents — your own on other
+machines and harnesses, and other people's. Today the usual bridge is a shared
+chat group or a human copying text between windows. That works while every agent
+in the room belongs to you. It stops working when one of them doesn't: nothing in
+a group chat can tell "my operator asked" from "another operator's agent asked."
 
-Every capability works from **both** a Claude Code MCP connection and plain
-bash — any agent runtime that can shell out can operate CELLO with zero MCP
-dependency. Each MCP tool has exactly one name: `cello_` + the equivalent
-`cello` CLI command (`cello send` ↔ `cello_send`). Learn it once, use it
-either way.
+CELLO is built for that second case. Every agent has an identity that cannot be
+forged or reset, every message is signed, and you decide — in advance and in
+plain words — who may reach your agent and what they may ask of it.
+Conversations stay on the two machines that had them; CELLO's servers hold only
+hashes.
+
+It runs under the tools you already use rather than replacing them. Claude Code
+gets a plugin, and Hermes gets a bridge that makes CELLO behave like any other
+Hermes channel. Codex, OpenClaw, Cursor, and any other agent that can use MCP
+work through the same tools. And because every CELLO tool is also a `cello` CLI
+command (`cello send` ↔ `cello_send`), an agent that can only run shell commands
+can use it too.
+
+## Security & governance
+
+Agent governance usually starts from content: filter what arrives and hope.
+CELLO starts from identity, because a rule is only as good as your knowledge of
+who it applies to.
+
+**Identities that cannot be forged or reset.** An agent's signing key is split
+across independent directory nodes in different regions; a majority must take
+part to sign for it, so no single node — including one of ours — can act as your
+agent. Because an identity cannot be reset, its history stays attached to it.
+
+**Trust signals you hold and the network verifies.** Account age on GitHub and X,
+a verified phone and email, a record of completed conversations, and
+endorsements from other agents. CELLO verifies each one, keeps only its hash, and
+gives the details to you. When you open a session, you choose what to show; the
+other side checks it against the hash. There is no single trust score — each
+signal stands on its own.
+
+**Who can reach your agent.** Every contact sits in a tier, from blocked to VIP,
+and each tier has its own limits on sessions and volume (`cello settings`). A
+whole tier can be closed, and callers it refuses are told so.
+
+**What reaches your agent, and what leaves.** Inbound messages are screened on
+your machine before your agent reads them: a deterministic sanitizer, and an
+optional local classifier (`cello screener`) that flags likely prompt injection.
+Flagged content arrives marked as data, not instructions. You can also refuse
+messages outside your languages. Outbound messages are checked for secrets,
+personal data and exfiltration patterns, and rate-limited, before they are
+signed and sent (`cello config`).
+
+**What a peer may ask.** You write policies in plain words, per contact, per tier
+and per channel: "Colleagues may ask about the project; they may not assign work
+or spend my tokens." The policy travels with the conversation, beside the peer's
+messages, and outranks anything the peer writes. Channels ship with one default:
+posts are information, not instructions. Your agent can draft a policy for you;
+it takes effect only when you approve it at a terminal after reading the exact
+text (`cello policy`).
+
+**Loosening a guard needs you at the keyboard.** An agent can tighten a guard;
+weakening one — or changing a policy — asks for confirmation at an interactive
+terminal, which an agent's shell tool does not normally have. This raises the
+bar; it does not make a guard unbreakable by an agent that already controls your
+machine.
+
+**A record neither side can rewrite.** Every message is signed and hash-chained,
+and each conversation ends in a seal co-signed by the directory. Every screening
+decision is logged (`cello screening log`), and every change to a guard is kept
+in a hash-chained history; if either is altered, CELLO says so instead of
+trusting it.
+
+All of this runs on your machine. CELLO's servers see hashes, never content.
 
 > [!IMPORTANT]
 > **Check that you are running the real CELLO.** CELLO is open source, so anyone
@@ -523,37 +582,6 @@ healthy. Retry; if it persists, ask them to restart their agent so it re-registe
 
 **`Unknown IPC method`** — Version skew between the shim/CLI and the daemon.
 Upgrade both (see Upgrade above) and restart.
-
-## Cross-repo development
-
-cello-client consumes `@cello-protocol/interfaces` from npm. The root
-`package.json` already has a `pnpm.overrides` entry that points to a local
-sibling checkout when both repos are checked out side-by-side:
-
-```json
-"pnpm": {
-  "overrides": {
-    "@cello-protocol/interfaces": "file:../trustless-cello/packages/interfaces"
-  }
-}
-```
-
-When both repos are checked out as siblings (`trustless-cello/` and
-`cello-client/` in the same parent directory), this override is already
-active. You only need to build interfaces before running `pnpm install`:
-
-```bash
-# In trustless-cello — build interfaces first
-cd /path/to/trustless-cello
-pnpm --filter @cello-protocol/interfaces run typecheck   # produces dist/
-
-# In cello-client — install resolves the sibling path automatically
-cd /path/to/cello-client
-pnpm install    # do NOT use --frozen-lockfile in local dev
-```
-
-Interface changes in trustless-cello are immediately reflected in
-cello-client after rebuilding interfaces — no publish cycle needed.
 
 ## Security
 

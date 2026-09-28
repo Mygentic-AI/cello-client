@@ -201,7 +201,7 @@ const UNADJUDICATED_BASELINE: Record<string, number> = {
   // deliberately: it is false today (`DOD-M15-SEALWIRE-1` is what makes it true) and its
   // replacement wording is outward-facing copy, which is Andre's call under M15-PROCEDURE §2f.
   // Adjudicating it now would be exactly the laundering this file's own note below warns about.
-  "README.md": 2,
+  "README.md": 0,
   "core/adapter-claude-code/SKILL.md": 30,
   // Paid down 37 → 3 by `DOD-M15-LEDGER-1` (→ Entry S1). The three that remain are held on
   // purpose, each for a reason that would make adjudicating them laundering rather than auditing:
