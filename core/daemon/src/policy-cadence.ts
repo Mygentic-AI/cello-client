@@ -51,6 +51,13 @@ export class PolicyCadence {
 export const sessionCadenceKey = (agentId: string, sessionId: string): string => `s:${agentId}:${sessionId}`;
 export const channelCadenceKey = (agentId: string, channelHex: string): string => `c:${agentId}:${channelHex.toLowerCase()}`;
 
+/** Forget a sealed/abandoned session. A retired agent has no id to resolve; that is logged, not thrown. */
+export function dropSessionCadence(c: PolicyCadence, agentId: () => string, agentName: string, sessionId: string, logger: Logger): void {
+  try { c.drop(sessionCadenceKey(agentId(), sessionId)); } catch (err: unknown) {
+    logger.warn("policy.cadence.drop_failed", { agentName, sessionId, reason: extractErrorMessage(err) });
+  }
+}
+
 const field = (r: ResolvedPolicy): { policy: PolicyField } => ({ policy: { type: r.type, level: r.level, text: r.text } });
 
 function failed(logger: Logger, agentId: string, type: PolicyType, err: unknown): { policy_error: string } {

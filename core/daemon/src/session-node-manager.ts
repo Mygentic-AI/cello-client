@@ -23,8 +23,7 @@
 // `wireContentHash` is gone from this file on purpose: its ONE use was the receive-path cross-check,
 // which now goes through `contentHashFor` so the comparison runs under the algorithm the sender
 // named. A direct call here would be a hash computed without asking what the frame said (part B1).
-import { PolicyStore } from "./policy-store.js";
-import { PolicyCadence, sessionCadenceKey } from "./policy-cadence.js";
+import { PolicyStore } from "./policy-store.js"; import { PolicyCadence, dropSessionCadence } from "./policy-cadence.js";
 import { type ContentHashAlg } from "./wire-content-hash.js";
 import { CAPACITY_REASONS, type CapacityReason } from "./refusal-reasons.js";
 import { ownSaltFrame, type SaltAgreementFrame } from "./session-salt-agreement.js";
@@ -144,10 +143,7 @@ export class SessionNodeManager {
   #relayReceiptStore: RelayReceiptStore | null = null;
   /** FED-OPTIONB-SEAL-001: the per-session leaf log (both parties) carried at a unilateral seal. */
   #sealLeafStore: SessionSealLeafStore | null = null;
-  /** 008-POLICY: the operator's policies, and the in-memory record of when each was last attached. */
-  #policyStore: PolicyStore | null = null;
-  getPolicyStore(): PolicyStore { return (this.#policyStore ??= new PolicyStore(this.getDb(), this.#logger)); }
-  readonly policyCadence = new PolicyCadence();
+  #policyStore: PolicyStore | null = null; /** 008-POLICY: the operator's policies, and when each was last attached. */ getPolicyStore(): PolicyStore { return (this.#policyStore ??= new PolicyStore(this.getDb(), this.#logger)); } readonly policyCadence = new PolicyCadence();
   #channelLogStore: ChannelLogStore | null = null; /** M16 007-PUBLOG: every artifact a local channel published, beside the seal-leaf log. */ getChannelLogStore(): ChannelLogStore { return (this.#channelLogStore ??= new ChannelLogStore(this.getDb(), this.#logger)); }
   /** `DOD-M15-SELFCHAIN-1` — this agent's own last message per session, so the next one links to it. */
   #ownChainStore: SessionOwnChainStore | null = null;
@@ -1503,12 +1499,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       get autoNatProbers() { return mgr.#autoNatProbers; },
       get onSessionStateChanged() { return mgr.#onSessionStateChanged; },
       get onSessionTerminal() { return mgr.#onSessionTerminal; },
-      dropPolicyCadence: (a, sid) => {
-        // A retired agent has no id to resolve; its cadence entry is then unreachable and harmless.
-        try { this.policyCadence.drop(sessionCadenceKey(this.resolveAgentId(a), sid)); } catch (err: unknown) {
-          this.#logger.warn("policy.cadence.drop_failed", { agentName: a, sessionId: sid, reason: extractErrorMessage(err) });
-        }
-      },
+      dropPolicyCadence: (a, sid) => dropSessionCadence(this.policyCadence, () => this.resolveAgentId(a), a, sid, this.#logger),
       get retryDrainHook() { return mgr.#retryDrainHook; },
 
       sessionKey: (a, sid) => this.#k(a, sid),
