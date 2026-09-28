@@ -401,7 +401,26 @@ class CelloAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[cello] Could not persist session bindings to %s: %s", path, exc)
 
+    def _run_on_loop(self, fn: Any, *args: Any) -> None:
+        """Marshal a mutation of adapter state onto the captured event loop.
+
+        The post_tool_call / post_llm_call hooks run on the tool worker thread, which is NOT the
+        loop that _on_notification runs on. Two threads mutating _bindings / _awaiting can raise
+        'dictionary changed size during iteration'. So every mutation from a hook is scheduled here
+        with call_soon_threadsafe, and the loop thread is the SOLE writer.
+        """
+        loop = self._loop
+        if loop is None:
+            logger.error(
+                "[cello] No event loop captured; dropping a %s update (adapter not connected yet)",
+                getattr(fn, "__name__", "state"),
+            )
+            return
+        loop.call_soon_threadsafe(fn, *args)
+
     def _bind_session(self, session_id: str, chat_id: str) -> None:
+        """Store a binding and persist. MUST run on the loop thread - callers from a hook go through
+        _run_on_loop."""
         self._bindings[session_id] = chat_id
         self._persist_bindings()
         logger.info("[cello] Bound session %s to chat %s", session_id, chat_id)
@@ -1223,7 +1242,11 @@ class CelloAdapter(BasePlatformAdapter):
         await self.handle_message(event)
 
     def _clear_awaiting(self, session_id: str) -> None:
-        """Part C step 2: a reply went out on this session - drop it from every chat's awaiting set."""
+        """Part C step 2: a reply went out on this session - drop it from every chat's awaiting set.
+
+        MUST run on the loop thread. The cello_send hook that triggers it runs on the tool worker
+        thread and marshals through _run_on_loop, so this iteration never races _on_notification's
+        writes (which would raise 'dictionary changed size during iteration')."""
         for chat, sessions in self._awaiting.items():
             sessions.pop(session_id, None)
 
@@ -1547,7 +1570,8 @@ def _tool_session_arg(args: Any) -> Optional[str]:
 def _on_post_tool_call(**kwargs: Any) -> None:
     """Bind a session on a successful cello_initiate_session, unbind on a successful
     cello_close_session, and clear an owed reply on a successful cello_send (049-BRIDGEREPLY Parts
-    B & C). MCP tools reach hooks as mcp__<server>__<tool>, so match by SUFFIX."""
+    B & C). MCP tools reach hooks as mcp__<server>__<tool>, so match by SUFFIX. Every state mutation
+    is marshalled onto the adapter's event loop (finding 3): this runs on the tool worker thread."""
     tool_name = kwargs.get("tool_name")
     if not isinstance(tool_name, str):
         return
@@ -1574,7 +1598,7 @@ def _on_post_tool_call(**kwargs: Any) -> None:
             return
         sid = _tool_session_arg(kwargs.get("args"))
         if sid:
-            adapter._clear_awaiting(sid)
+            adapter._run_on_loop(adapter._clear_awaiting, sid)
         return
 
     if is_close:
@@ -1584,7 +1608,7 @@ def _on_post_tool_call(**kwargs: Any) -> None:
             return
         sid = _tool_session_arg(kwargs.get("args"))
         if sid:
-            adapter._unbind_session(sid)
+            adapter._run_on_loop(adapter._unbind_session, sid)
         return
 
     # Part B step 2: record only a SUCCESSFUL initiate from a turn whose platform is cello.
@@ -1604,7 +1628,7 @@ def _on_post_tool_call(**kwargs: Any) -> None:
             "to guess a chat, so this session is not bound (session %s)", sid,
         )
         return
-    adapter._bind_session(sid, chat_id)
+    adapter._run_on_loop(adapter._bind_session, sid, chat_id)
 
 
 def _on_post_llm_call(**kwargs: Any) -> None:

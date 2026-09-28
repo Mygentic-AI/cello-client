@@ -202,8 +202,11 @@ async def main():
         out["bindings"] = adapter._bindings
         out["awaiting"] = {k: list(v.keys()) for k, v in adapter._awaiting.items()}
     elif op == "record":
-        # Part B/C recording via the module-level post_tool_call hook.
+        # Part B/C recording via the module-level post_tool_call hook. The hook marshals every state
+        # mutation onto the loop with call_soon_threadsafe (finding 3), so capture the loop and give
+        # it a tick to run the scheduled callback before reading the result.
         import os as _os
+        adapter._loop = asyncio.get_running_loop()
         if "chat_env" in spec:
             _os.environ["HERMES_SESSION_CHAT_ID"] = spec["chat_env"]
         else:
@@ -212,6 +215,7 @@ async def main():
         m._on_post_tool_call(
             tool_name=spec["tool_name"], args=spec.get("args") or {}, result=spec.get("hook_result")
         )
+        await asyncio.sleep(0.05)
         out["bindings"] = adapter._bindings
         out["awaiting"] = {k: list(v.keys()) for k, v in adapter._awaiting.items()}
     elif op == "prune":
