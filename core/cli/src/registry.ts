@@ -1918,7 +1918,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
     summary: "Bridge CELLO into a third-party agent runtime (Hermes, OpenClaw, …).",
     help:
       "Usage: cello bridge <runtime> --agent <name> [--hermes-home <path>]\n" +
-      "                                [--delivery-mode channel|wake] [--session-scope agent|peer]\n" +
+      "                                [--delivery-mode explicit|channel|wake] [--session-scope agent|peer]\n" +
       "  Wires the local CELLO daemon into a third-party agent runtime so that agent can use CELLO.\n" +
       "  Supported runtimes: hermes  (more coming).\n" +
       "\n" +
@@ -1932,9 +1932,10 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "  Then restart the gateway, or the running process keeps the old code in memory:\n" +
       "      hermes gateway restart\n" +
       "\n" +
-      "  --delivery-mode  channel (default) CELLO behaves like a normal chat channel: the peer's\n" +
-      "                                     message arrives as a message and your reply is sent\n" +
-      "                                     back automatically.\n" +
+      "  --delivery-mode  explicit (default) the peer's message arrives as a message, already read;\n" +
+      "                                     nothing is sent back unless the agent calls cello_send.\n" +
+      "                   channel           the peer's message arrives as a message and whatever the\n" +
+      "                                     agent writes is sent back automatically, as it appears.\n" +
       "                   wake              content-free notices only; the agent reads with\n" +
       "                                     cello_receive and replies with cello_send itself.\n" +
       "  --session-scope  agent   (default) one conversation per CELLO agent — calling the same\n" +
