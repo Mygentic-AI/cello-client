@@ -67,8 +67,10 @@ describe("F1: usage string lists every command", () => {
         // `contact` and `agents` already use. It replaces `cello channel list`.
         "channels",
         "channel",
+        // Security & governance (008-POLICY: `screening` is the renamed screening log)
+        "policy", "settings", "config", "screening",
         // Other
-        "settings", "moniker", "telegram", "bridge", "config", "policy",
+        "moniker", "telegram", "bridge",
       ].sort(),
     );
   });

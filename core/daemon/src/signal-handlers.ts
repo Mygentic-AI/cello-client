@@ -129,9 +129,8 @@ export function registerSignalHandlers(deps: SignalHandlerDeps): void {
        * nothing.
        *
        * `issuer_kind` reads like it answers this and does not: it says `"agent"` or `"portal"`, a
-       * category. Elsewhere a field literally named `issuer` holds `"peer-claimed"` /
-       * `"platform-verified"` — also a category. Two fields whose names promise identity, neither
-       * carrying it.
+       * category, and its name promises an identity it does not carry. (The incoming-session badges
+       * name the author in `summary`; this listing names it here.)
        *
        * It also unblocks an investigation this omission stalled: four endorsements in a wallet all
        * read `same_operator: true`, and **nothing in the response could say whether the stranger's

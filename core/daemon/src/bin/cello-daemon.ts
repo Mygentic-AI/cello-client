@@ -81,7 +81,7 @@ const version = process.env.CELLO_VERSION || "0.0.1";
  *
  * Fail-closed, never passthrough (M9B-D12): if the sidecar cannot be spawned, the client is STILL
  * the enforcing one. It fails closed on every call (`gateway_unavailable`, INV-6), the failure is
- * announced, and the daemon stays up so the operator can run `cello config` / `cello policy log`
+ * announced, and the daemon stays up so the operator can run `cello config` / `cello screening log`
  * against it and find out why. A dead agent with a cryptic startup error diagnoses nothing, and a
  * silent downgrade to passthrough is the original bug wearing a hat.
  */

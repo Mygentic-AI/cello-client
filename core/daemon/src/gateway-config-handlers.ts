@@ -46,7 +46,7 @@
  * during the restart the per-call handle IS the last one. Do not soften the rule below on the
  * strength of the correction — "only sometimes destroys the audit trail" is not a design.
  *
- * So `cello policy log` and `cello config list` — the surfaces that exist to show what the layer
+ * So `cello screening log` and `cello config list` — the surfaces that exist to show what the layer
  * did — were silently destroying the record of what it did next. Holding the handle open means no
  * connection ever performs the last-connection close while the sidecar is alive, which is the
  * event that removes the WAL. The handles are deliberately not closed per call; process exit
@@ -328,7 +328,7 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): G
   // the rule that fired. This reads that record. Deliberately a list, not a dashboard.
   //
   // Newest first, because the question is almost always "what just happened".
-  handlers.set("cello_policy_log", async (params) => {
+  handlers.set("cello_screening_log", async (params) => {
     const rawLimit = params?.limit;
     const limit = typeof rawLimit === "number" && Number.isFinite(rawLimit) && rawLimit > 0
       ? Math.min(Math.floor(rawLimit), 500)

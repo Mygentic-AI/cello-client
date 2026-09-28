@@ -24,7 +24,7 @@
  *
  * ONE TYPED REASON PER FAILURE CLASS. A lib0 string like "Integer out of Range" describes where
  * the decoder gave up, not what the peer did wrong, so it travels as `detail` and never as the
- * reason an operator or a policy log sees.
+ * reason an operator or a screening log sees.
  */
 
 import * as Y from "yjs";

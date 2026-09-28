@@ -458,10 +458,18 @@ contact <pubkey> set-away <message>      — what THIS peer hears when you are a
 contact <pubkey> set-moniker <name>      — YOUR pet name for THEM (they cannot spoof it)
 ```
 
-**Settings and identity**
+**Security & governance**
+```
+policy               — your rules for what peers and channels may ask of your agent
+                       (propose / pending / list; approve is CLI-only, at a terminal)
+settings get / set   — how reachable your agent is: limits per trust tier, away messages
+config               — the security layer's guards: screening, redaction, rate limits
+screening log        — what the security layer did to your messages, newest first
+```
+
+**Identity**
 ```
 moniker <name>         — the name others see when you contact them (like caller ID)
-settings get / set     — reachability policy (per-tier limits, away messages)
 ```
 
 **Bridging into other agent runtimes**

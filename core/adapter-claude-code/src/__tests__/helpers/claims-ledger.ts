@@ -107,6 +107,50 @@ export function countClaimWords(text: string): number {
 }
 
 export const ADJUDICATED: AdjudicatedClaim[] = [
+  // ── 008-POLICY ────────────────────────────────────────────────────────────────────────────────
+  {
+    surface: "plugins/cello/skills/setup/SKILL.md",
+    claim: "Step 7: the policy rides beside the peer's messages, never inside them",
+    excerpts: ["beside the peer's messages, never"],
+    enforcedBy: "daemon-local",
+    verdict: "true",
+    evidence:
+      "The operator's daemon attaches `policy` as a top-level field of the cello_receive / " +
+      "cello_await_session / cello_inbox / cello_channel_read payload (policy-cadence.ts " +
+      "attachConductPolicy / admissionPolicyField / attachChannelPolicy); no path writes it into a " +
+      "message's `content`. policy-008-daemon.test.ts clause 9 asserts no messages[i].content contains it.",
+  },
+  {
+    surface: "plugins/cello/skills/setup/SKILL.md",
+    claim: "Step 7: the most specific level wins, never combined",
+    excerpts: ["the most specific one wins, never combined"],
+    enforcedBy: "daemon-local",
+    verdict: "true",
+    evidence:
+      "PolicyStore.#walk returns the first SET level's text and stops; NONE stops the walk. " +
+      "policy-008-store.test.ts clause 4 (contact + tier + default → contact text only) and 5.",
+  },
+  {
+    surface: "core/cli/src/registry.ts (operator-facing strings)",
+    claim: "policy help: the most specific rule wins, never combined",
+    excerpts: ["the most specific one wins, never combined"],
+    enforcedBy: "daemon-local",
+    verdict: "true",
+    evidence: "Same walk as the setup skill's row: PolicyStore.#walk, policy-008-store.test.ts clauses 4–5.",
+  },
+  {
+    surface: "core/cli/src/registry.ts (operator-facing strings)",
+    claim: "policy approve: an agent cannot approve its own proposal",
+    excerpts: ["so an agent cannot approve its own proposal."],
+    enforcedBy: "daemon-local",
+    verdict: "true",
+    evidence:
+      "No MCP approve tool exists (policy-008-mcp.test.ts clause 17); the daemon refuses " +
+      "cello_policy_approve/decline from any connection not handshaken as `cli` " +
+      "(policy_approve_terminal_only, policy-008-daemon.test.ts); the CLI asks only at a TTY and " +
+      "answers not_a_tty otherwise, with no --yes (policy-008-cli.test.ts clause 24). Daemon-local: " +
+      "an operator's own rewritten client can bypass it, which is the operator's choice, not a peer's.",
+  },
   {
     surface: "SECURITY.md",
     claim: "Conversation content is end-to-end encrypted and the nodes never hold plaintext",
@@ -1154,7 +1198,7 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   },
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
-    claim: "policy log: 'Every screened message and what happened to it: clean, redacted, blocked or warned… chainValid: false means the log itself was tampered with'",
+    claim: "screening log: 'Every screened message and what happened to it: clean, redacted, blocked or warned… chainValid: false means the log itself was tampered with'",
     excerpts: ["Every screened message and what happened to it"],
     enforcedBy: "daemon-local",
     verdict: "true",

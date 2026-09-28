@@ -36,7 +36,7 @@ describe("DOD-M9C-SCREENBASE-1 — language no longer refuses ordinary mail", ()
   it("with NO classifier installed the agent is told NOTHING screened it — in the delivered text", async () => {
     // Asserted on what the agent READS, not on the internal events array. The first version of this
     // test passed while the note was built and thrown away: `screen()` filtered it out of the wrap,
-    // the daemon logged nothing, and the policy log recorded the message as a clean pass. An event
+    // the daemon logged nothing, and the screening log recorded the message as a clean pass. An event
     // with no consumer is not a warning.
     const v = await new InboundScreener().screen(enc(RUSSIAN));
     const delivered = new TextDecoder().decode(v.content);

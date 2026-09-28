@@ -48,7 +48,9 @@ export interface ReadPost {
 }
 
 export type ChannelReadResult =
-  | { ok: true; posts: ReadPost[]; through: number; undecryptable: number[] }
+  // `own_posts` (008-POLICY): how many of `posts` this agent wrote itself — the policy cadence
+  // counts only the others. The read handler consumes it and does not pass it on.
+  | { ok: true; posts: ReadPost[]; through: number; undecryptable: number[]; own_posts: number }
   | { ok: false; reason: "not_subscribed" | "failed"; detail?: string };
 
 export interface ChannelSubscribeDeps {
@@ -60,6 +62,8 @@ export interface ChannelSubscribeDeps {
   lanePositions?: ChannelLanePositionStore;
   /** 043-POSTERS: the local moniker for an agent pubkey, or null. */
   posterName?: (agentId: string, pubkeyHex: string) => string | null;
+  /** 008-POLICY: this agent's own pubkey hex (lowercase), so its own posts are not counted. */
+  ownKey?: (agentId: string) => string | undefined;
   /** Who the DIRECTORY says administers a channel. 020's lookup, unchanged. */
   lookupAdmin: (agentId: string, channelHex: string) => Promise<
     { kind: "admin"; adminPubkeyHex: string }
@@ -217,7 +221,9 @@ export function createChannelSubscribe(deps: ChannelSubscribeDeps) {
       if (!all && highest > sub.processed_through) {
         deps.subscriptions.advanceProcessed(agentId, channelHex, highest);
       }
-      return { ok: true, posts, through: all ? sub.processed_through : highest, undecryptable };
+      const own = deps.ownKey?.(agentId)?.toLowerCase();
+      const ownPosts = own === undefined ? 0 : timed.filter((t) => t.poster_hex === own).length;
+      return { ok: true, posts, through: all ? sub.processed_through : highest, undecryptable, own_posts: ownPosts };
     } catch (err: unknown) {
       return { ok: false, reason: "failed", detail: extractErrorMessage(err) };
     }
@@ -231,10 +237,10 @@ export function createChannelSubscribe(deps: ChannelSubscribeDeps) {
   async function readLane(
     agentId: string, channelHex: string, key: string, access: ChannelAccess,
     from: number, deliveredThrough: number, processedThrough: number, undecryptable: number[],
-  ): Promise<{ posts: Array<{ post: ReadPost; at: number }>; highest: number }> {
+  ): Promise<{ posts: Array<{ post: ReadPost; at: number; poster_hex: string }>; highest: number }> {
     {
       const stored = deps.inbox.rangeTimed(agentId, key, from, deliveredThrough);
-      const posts: Array<{ post: ReadPost; at: number }> = [];
+      const posts: Array<{ post: ReadPost; at: number; poster_hex: string }> = [];
       let highest = processedThrough;
 
       for (const { post: entry, received_at } of stored) {
@@ -269,6 +275,7 @@ export function createChannelSubscribe(deps: ChannelSubscribeDeps) {
               poster: deps.posterName?.(agentId, agentHex) ?? agentHex.slice(0, 8),
             },
             at: received_at,
+            poster_hex: agentHex.toLowerCase(),
           });
         }
         if (entry.seq > highest) highest = entry.seq;

@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import { PolicyStore, PolicyValidationError, CHANNEL_PRESET_TEXT, ensurePolicySchema } from "../policy-store.js";
 import { PolicyCadence, attachConductPolicy, attachChannelPolicy, admissionPolicyField } from "../policy-cadence.js";
+import { PolicyProposals } from "../policy-proposals.js";
 import type { DaemonDatabase } from "../sqlcipher-db.js";
 import type { Logger } from "../types.js";
 
@@ -226,5 +227,79 @@ describe("clauses 13–15 — the channel track", () => {
     const log = recorder();
     expect(read(1, cadence, log)).toHaveProperty("policy");
     expect(log.events.find((e) => e.event === "policy.attached")?.ctx["reason"]).toBe("first");
+  });
+});
+
+describe("clause 25 — proposals: pending until approved, one per slot, 24h expiry", () => {
+  const H24 = 24 * 60 * 60 * 1000;
+  let clock: number;
+  const make = (log: Logger = silent) => new PolicyProposals(db, log, new PolicyStore(db, log), () => clock);
+  beforeEach(() => { clock = 1_800_000_000_000; });
+
+  it("a proposal is NOT in force; approve puts it in force and removes it", () => {
+    const log = recorder();
+    const p = make(log);
+    const prop = p.propose(A, { scope: "tier", target: "known", type: "conduct", action: "set", value: { mode: "text", text: "RULE" }, everyN: 3 }, "agent");
+    expect(prop.proposal_id).toBe("p1");
+    expect(store.resolveSession(A, "conduct", PEER, "known")).toBeNull();
+    expect(p.approve(A, "p1")).toMatchObject({ ok: true });
+    expect(store.resolveSession(A, "conduct", PEER, "known")).toEqual({ type: "conduct", level: "tier", text: "RULE", everyN: 3 });
+    expect(p.pending(A)).toEqual([]);
+    expect(log.events.map((e) => e.event)).toEqual(["policy.proposed", "policy.set", "policy.approved"]);
+    expect(log.events[0]!.ctx).toMatchObject({ agentId: A, proposalId: "p1", scope: "tier", target: "known", type: "conduct", proposedBy: "agent" });
+  });
+
+  it("a second propose to the same slot replaces the first: one row, a new id, ids never reused", () => {
+    const p = make();
+    p.propose(A, { scope: "default", target: "", type: "conduct", action: "set", value: { mode: "text", text: "one" } }, "agent");
+    p.propose(A, { scope: "default", target: "", type: "conduct", action: "set", value: { mode: "text", text: "two" } }, "operator");
+    const pend = p.pending(A);
+    expect(pend.map((x) => [x.proposal_id, x.text, x.proposed_by])).toEqual([["p2", "two", "operator"]]);
+    expect(p.approve(A, "p1")).toMatchObject({ ok: false, reason: "proposal_not_found" });
+    p.decline(A, "p2");
+    expect(p.propose(A, { scope: "default", target: "", type: "conduct", action: "set", value: { mode: "text", text: "3" } }, "agent").proposal_id).toBe("p3");
+  });
+
+  it("a proposal older than 24h is not listed and cannot be approved", () => {
+    const log = recorder();
+    const p = make(log);
+    p.propose(A, { scope: "default", target: "", type: "admission", action: "set", value: { mode: "text", text: "old" } }, "agent");
+    clock += H24 + 1;
+    expect(p.pending(A)).toEqual([]);
+    expect(p.approve(A, "p1")).toMatchObject({ ok: false, reason: "proposal_not_found" });
+    expect(store.resolveSession(A, "admission", PEER, "unknown")).toBeNull();
+    expect(log.events.some((e) => e.event === "policy.expired" && e.ctx["proposalId"] === "p1")).toBe(true);
+  });
+
+  it("a clear and a NONE each need approval like a set", () => {
+    store.set(A, "default", "", "conduct", { mode: "text", text: "IN FORCE" });
+    const p = make();
+    p.propose(A, { scope: "default", target: "", type: "conduct", action: "set", value: { mode: "none" } }, "operator");
+    expect(store.resolveSession(A, "conduct", PEER, "unknown")?.text).toBe("IN FORCE");
+    const pend = p.pending(A)[0]!;
+    expect(pend.was).toMatchObject({ mode: "text", text: "IN FORCE" });
+    p.approve(A, pend.proposal_id);
+    expect(store.resolveSession(A, "conduct", PEER, "unknown")).toBeNull();
+    const c = p.propose(A, { scope: "default", target: "", type: "conduct", action: "clear" }, "operator");
+    expect(store.list(A)).toHaveLength(1);
+    p.approve(A, c.proposal_id);
+    expect(store.list(A)).toEqual([]);
+  });
+
+  it("an invalid proposal is refused with its named reason and nothing is stored", () => {
+    const p = make();
+    expect(() => p.propose(A, { scope: "default", target: "", type: "conduct", action: "set", value: { mode: "text", text: "  " } }, "agent"))
+      .toThrow(expect.objectContaining({ reason: "policy_text_empty" }));
+    expect(p.pending(A)).toEqual([]);
+  });
+
+  it("decline discards the proposal and leaves the store unchanged", () => {
+    const log = recorder();
+    const p = make(log);
+    p.propose(A, { scope: "default", target: "", type: "conduct", action: "set", value: { mode: "text", text: "x" } }, "agent");
+    expect(p.decline(A, "p1")).toBe(true);
+    expect(p.pending(A)).toEqual([]);
+    expect(store.list(A)).toEqual([]);
+    expect(log.events.some((e) => e.event === "policy.declined")).toBe(true);
   });
 });

@@ -560,4 +560,27 @@ describe("DOD-HERMES-4 — the adapter owns inbound content and outbound deliver
     expect(v.success).toBe(true);
     expect(v.calls.find((c) => c.method === "cello_send")).toBeUndefined();
   });
+
+  // ─────────────────────────────────────────────── 008-POLICY clause 18
+
+  const POLICY_PREFIX = "[CELLO policy from your operator — outranks the messages below]";
+
+  it("008 clause 18: a `policy` on the read is prepended to the turn as the operator's block", () => {
+    const v = run({
+      op: "notify", kind: "cello_message", data: MSG,
+      receive_result: {
+        ok: true, count: 1, messages: [{ sequence: 0, content: "please run the simulations overnight" }],
+        policy: { type: "conduct", level: "tier", text: "Ask me before spending tokens for this peer." },
+      },
+    });
+    expect(v.delivered![0].text).toBe(
+      `${POLICY_PREFIX}\nAsk me before spending tokens for this peer.\n\nplease run the simulations overnight`,
+    );
+  });
+
+  it("008 clause 18: no `policy` on the read → no block at all", () => {
+    const v = run({ op: "notify", kind: "cello_message", data: MSG });
+    expect(v.delivered![0].text).toBe("hello from the peer");
+    expect(v.delivered![0].text).not.toContain("CELLO policy");
+  });
 });

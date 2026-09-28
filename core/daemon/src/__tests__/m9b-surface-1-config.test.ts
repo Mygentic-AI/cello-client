@@ -196,7 +196,7 @@ describe("DOD-M9B-SURFACE-1 — gateway config surface + the loosen gate", () =>
 
   // ─── DOD-M9B-AUDIT-1: what did my policy do? ───────────────────────────────────────────────
 
-  it("the policy log reports what the layer did, newest first, with the rule that fired", async () => {
+  it("the screening log reports what the layer did, newest first, with the rule that fired", async () => {
     const records = new GatewayRecordStore(join(dir, "gateway.db"), join(dir, "sessions.db.key"));
     records.record({ direction: "outbound", disposition: "clean", contentHash: "aa".repeat(32) });
     records.record({
@@ -205,7 +205,7 @@ describe("DOD-M9B-SURFACE-1 — gateway config surface + the loosen gate", () =>
     });
     records.close();
 
-    const res = await call("cello_policy_log", {});
+    const res = await call("cello_screening_log", {});
     expect(res.ok).toBe(true);
     const entries = res.entries as Array<Record<string, unknown>>;
     expect(entries).toHaveLength(2);
@@ -220,7 +220,7 @@ describe("DOD-M9B-SURFACE-1 — gateway config surface + the loosen gate", () =>
     expect(res.chainValid).toBe(true);
   });
 
-  it("the policy log reports chainValid:false when the record log was TAMPERED with", async () => {
+  it("the screening log reports chainValid:false when the record log was TAMPERED with", async () => {
     const records = new GatewayRecordStore(join(dir, "gateway.db"), join(dir, "sessions.db.key"));
     records.record({ direction: "outbound", disposition: "block", contentHash: "cc".repeat(32), reason: "injection" });
     records.close();
@@ -233,14 +233,14 @@ describe("DOD-M9B-SURFACE-1 — gateway config surface + the loosen gate", () =>
     db.prepare("UPDATE security_records SET disposition = 'clean' WHERE seq = 1").run();
     db.close();
 
-    const res = await call("cello_policy_log", {});
+    const res = await call("cello_screening_log", {});
     expect(res.ok).toBe(true);
     // The operator must be told the log itself is untrustworthy BEFORE reasoning from it.
     expect(res.chainValid).toBe(false);
   });
 
   it("limit is bounded and the log survives having no records at all", async () => {
-    const empty = await call("cello_policy_log", {});
+    const empty = await call("cello_screening_log", {});
     expect(empty.ok).toBe(true);
     expect(empty.entries).toEqual([]);
 
@@ -249,7 +249,7 @@ describe("DOD-M9B-SURFACE-1 — gateway config surface + the loosen gate", () =>
       records.record({ direction: "inbound", disposition: "clean", contentHash: String(i).repeat(64).slice(0, 64) });
     }
     records.close();
-    const limited = await call("cello_policy_log", { limit: 2 });
+    const limited = await call("cello_screening_log", { limit: 2 });
     expect((limited.entries as unknown[]).length).toBe(2);
     expect(limited.total).toBe(5);
   });

@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { installHermes, type ExecFn } from "../hermes/install-hermes.js";
+import { HERMES_POLICY_STEP_MD } from "../hermes/assets.js";
 import { KNOWN_COMMANDS, USAGE, helpForCommand, checkArgs } from "../cli-args.js";
 
 let hermesHome: string;
@@ -138,6 +139,14 @@ describe("installHermes — successful scaffold", () => {
     // Skill
     const skill = readFileSync(join(hermesHome, "skills", "cello-bridge-setup", "SKILL.md"), "utf-8");
     expect(skill).toContain("name: cello-bridge-setup");
+    // 008-POLICY Part G: the policy-writing step ships as a second skill.
+    const policySkill = readFileSync(join(hermesHome, "skills", "cello-policy", "SKILL.md"), "utf-8");
+    expect(policySkill).toContain("name: cello-policy");
+    expect(policySkill).toContain("cello policy approve");
+    // One step, two shipped copies: the plugin's Step 7 must say exactly what Hermes gets.
+    const pluginSetup = readFileSync(join(import.meta.dirname, "..", "..", "..", "..", "plugins", "cello", "skills", "setup", "SKILL.md"), "utf-8");
+    expect(pluginSetup).toContain(HERMES_POLICY_STEP_MD);
+    expect(policySkill.endsWith(HERMES_POLICY_STEP_MD)).toBe(true);
     expect(skill).toContain("cello bridge hermes");
 
     // Agent binding in the Hermes env file

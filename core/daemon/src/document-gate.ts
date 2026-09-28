@@ -280,7 +280,7 @@ export class DocumentGate {
       Y.applyUpdate(shadow, update);
     } catch (err: unknown) {
       // (g) ONE typed reason per throw. The decoder string is useful and travels as detail —
-      // it is simply not a reason an operator or a policy log can key on.
+      // it is simply not a reason an operator or a screening log can key on.
       return this.#quarantine(context, update, {
         admit: false,
         reason: "document_update_malformed",

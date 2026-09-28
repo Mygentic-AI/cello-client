@@ -285,7 +285,7 @@ async function main(): Promise<void> {
       // The conclusion does not change, and the real reason is sharper than the wrong one:
       // `restartSecurityGateway` SIGTERMs this process on every successful `cello config set`, so
       // during that window this sidecar is DEAD and a per-call daemon handle is the last one open.
-      // That is how the live defect happened — `cello policy log` under-reporting for the rest of
+      // That is how the live defect happened — `cello screening log` under-reporting for the rest of
       // that daemon's life while still reporting chainValid:true, and the next write through the
       // stale handle returning ok on a SQLITE_CORRUPT store.
       //

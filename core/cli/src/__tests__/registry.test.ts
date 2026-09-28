@@ -280,3 +280,58 @@ describe("M16 041-HELPTRUTH — channel help is one paragraph per verb, and each
     }
   });
 });
+
+describe("008-POLICY Part H — screening rename, Security & governance, nested policy help", () => {
+  it("26: `screening log` exists; the old screening verb is gone from `policy`", () => {
+    expect(findCommand("screening")).toBeDefined();
+    expect(helpForCommand("screening", ["log"])).toContain("cello screening log");
+    expect(findCommand("policy")!.help).not.toContain(["policy", "log"].join(" "));
+    expect(helpForCommand("policy", ["log"])).toBe(findCommand("policy")!.help);
+  });
+
+  it("27: `cello -h` shows Security & governance with policy, settings, config, screening in that order", () => {
+    const table = renderCommandsTable();
+    expect(table).not.toMatch(/^Security:$/m);
+    const sec = table.slice(table.indexOf("Security & governance:"));
+    const section = sec.slice(0, sec.indexOf("\n\n") === -1 ? undefined : sec.indexOf("\n\n"));
+    const names = section.split("\n").slice(1).map((l) => l.trim().split(/\s+/)[0]);
+    expect(names).toEqual(["policy", "settings", "config", "screening"]);
+    const other = table.slice(table.indexOf("Other:"));
+    expect(other).not.toMatch(/^\s+settings\s/m);
+    expect(COMMANDS.filter((c) => c.group === "Other").map((c) => c.name).sort()).toEqual(["bridge", "moniker", "telegram"]);
+  });
+
+  const policy = findCommand("policy")!;
+  const VERBS = ["list", "pending", "approve", "propose"];
+
+  it("28: every policy verb has its own blank-line-separated paragraph on the page", () => {
+    const paras = policy.help.split("\n\n").filter((b) => b.startsWith("  ") && b.includes(" — "));
+    for (const v of VERBS) {
+      expect(paras.some((b) => b.slice(2, b.indexOf(" — ")).trim() === v), `no paragraph for '${v}'`).toBe(true);
+    }
+    expect(policy.help.startsWith("Usage: cello policy <list|pending|approve|propose> [--agent <name>]")).toBe(true);
+    for (const ex of [
+      'cello policy propose tier known conduct --text "..." [--every 10]',
+      "cello policy propose channel <pubkey> conduct --none",
+      "cello policy propose tier known conduct --clear",
+      "cello policy pending", "cello policy approve p3", "cello policy list",
+    ]) expect(policy.help).toContain(ex);
+  });
+
+  it("28: `cello policy approve -h` has approve's usage and not propose's", () => {
+    const h = helpForCommand("policy", ["approve"]);
+    expect(h).toContain("cello policy approve [p<n>]");
+    expect(h).not.toContain("cello policy propose");
+    expect(h.length).toBeLessThan(policy.help.length);
+  });
+
+  it("28: `cello policy -h` equals the assembled page, and every verb's usage line is on it", () => {
+    expect(helpForCommand("policy", [])).toBe(policy.help);
+    for (const v of VERBS) {
+      const usage = helpForCommand("policy", [v]).split("\n").find((l) => l.startsWith("Usage: "))!.slice("Usage: ".length);
+      expect(policy.help, `${v} usage`).toContain(usage);
+    }
+    expect(helpForCommand("screening", [])).toBe(findCommand("screening")!.help);
+    expect(helpForCommand("screening", ["log"]).startsWith("Usage: cello screening log")).toBe(true);
+  });
+});

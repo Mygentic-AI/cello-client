@@ -654,22 +654,161 @@ async function confirmAtTty(question: string): Promise<ConfirmAnswer> {
 }
 
 /**
- * `cello policy log` → cello_policy_log (DOD-M9B-AUDIT-1, policy D-11).
+ * `cello screening log` → cello_screening_log (DOD-M9B-AUDIT-1, policy D-11).
  *
  * Ships with the enforcement flip by decision: it is the answer to "did this new error come from
  * the security layer or from my own change?" — a lookup instead of a guess.
  */
-export function policyLog(
+export function screeningLog(
   celloDir: string,
   opts: ParityOptions & { limit?: number; sinceMs?: number },
 ): Promise<CliOutput> {
   return ipcCommand(
     celloDir,
-    "cello_policy_log",
+    "cello_screening_log",
     defined({ limit: opts.limit, since_ms: opts.sinceMs }),
     opts,
     false,
   );
+}
+
+// ─── 008-POLICY: the operator's policies — propose, pending, approve (TTY only), list ─────────────
+
+/** Scopes as the operator types them → the daemon's scope names. */
+const POLICY_SCOPE_ARG: Record<string, string> = {
+  default: "default", tier: "tier", contact: "contact", channel: "channel", "channel-default": "channel_default",
+};
+const POLICY_TARGETED = new Set(["tier", "contact", "channel"]);
+
+/**
+ * A policy belongs to an agent identity, not to a running agent: the operator may write one before
+ * bringing the agent online. So these commands name the agent in the params (`--agent`, else the
+ * `use-agent` selection) instead of replaying `cello_use_agent`, which refuses an offline agent.
+ */
+async function policyCall(celloDir: string, method: string, params: Record<string, unknown>, opts: ParityOptions): Promise<CliOutput> {
+  const agent = opts.agent ?? (await readCurrentAgent(celloDir));
+  return ipcCommand(celloDir, method, defined({ ...params, agent }), opts, false);
+}
+
+/**
+ * `cello policy propose <scope> [target] <admission|conduct> (--text "<t>" | --none | --clear) [--every N]`
+ * → cello_policy_propose. The proposal is pending; nothing is in force until `cello policy approve`.
+ */
+export function policyPropose(celloDir: string, args: readonly string[], opts: ParityOptions): Promise<CliOutput> {
+  const rest = [...args];
+  const flag = (name: string): string | undefined => {
+    const i = rest.indexOf(name);
+    if (i === -1) return undefined;
+    const v = rest[i + 1];
+    rest.splice(i, 2);
+    return v;
+  };
+  const bool = (name: string): boolean => {
+    const i = rest.indexOf(name);
+    if (i !== -1) rest.splice(i, 1);
+    return i !== -1;
+  };
+  const text = flag("--text");
+  const every = flag("--every");
+  const none = bool("--none");
+  const clear = bool("--clear");
+  const scopeArg = rest[0] ?? "";
+  const scope = POLICY_SCOPE_ARG[scopeArg] ?? scopeArg;
+  const targeted = POLICY_TARGETED.has(scopeArg);
+  const target = targeted ? rest[1] : undefined;
+  const type = rest[targeted ? 2 : 1];
+  if ([text !== undefined, none, clear].filter(Boolean).length !== 1) {
+    return Promise.resolve(emitTransportError(
+      "policy_value_missing",
+      'Give exactly one of --text "<rule>", --none (send no policy at this level) or --clear (unset the level). See: cello policy propose -h',
+      opts,
+    ));
+  }
+  if (every !== undefined && !/^\d+$/.test(every)) {
+    return Promise.resolve(emitTransportError("policy_every_n_invalid", `--every takes a whole number of at least 1, got '${every}'.`, opts));
+  }
+  return policyCall(celloDir, "cello_policy_propose", defined({
+    // Pubkeys arrive in mixed case; the store keys on lowercase hex.
+    scope, target: target?.toLowerCase(), type,
+    ...(clear ? { action: "clear" } : { action: "set", ...(none ? { none: true } : { text }) }),
+    every_n: every !== undefined ? Number(every) : undefined,
+  }), opts);
+}
+
+/** `cello policy pending` → cello_policy_pending. */
+export function policyPending(celloDir: string, opts: ParityOptions): Promise<CliOutput> {
+  return policyCall(celloDir, "cello_policy_pending", {}, opts);
+}
+
+/** `cello policy list` → cello_policy_list: what is in force, and which level wins per tier and channel. */
+export function policyList(celloDir: string, opts: ParityOptions): Promise<CliOutput> {
+  return policyCall(celloDir, "cello_policy_list", {}, opts);
+}
+
+interface PendingProposal {
+  proposal_id: string; scope: string; target: string; type: string; action: string;
+  mode: string | null; text: string | null; every_n: number | null; proposed_by: string; age_ms: number;
+  was: { mode: string; text: string | null; every_n: number } | null;
+}
+
+const policyValueText = (mode: string | null | undefined, text: string | null | undefined): string =>
+  mode === "none" ? "NONE (no policy is sent at this level)" : (text ?? "");
+
+/**
+ * `cello policy approve [p<n>]` — THE human step that puts a policy in force (008 amendment).
+ *
+ * The same mechanism as `gatewayConfigSet`: a prompt at an interactive terminal, `not_a_tty` —
+ * never `declined` — when stdin is not one, and no `--yes` flag. No argument walks every pending
+ * proposal in turn. `y` approves; `n` discards the proposal.
+ */
+export function policyApprove(
+  celloDir: string,
+  proposalId: string | undefined,
+  opts: ParityOptions,
+  prompt: (question: string) => Promise<ConfirmAnswer> = confirmAtTty,
+): Promise<CliOutput> {
+  return withDaemon(celloDir, opts, false, async (client) => {
+    const agent = opts.agent ?? (await readCurrentAgent(celloDir));
+    const who = agent !== undefined ? { agent } : {};
+    const listed = (await client.send("cello_policy_pending", who)) as Record<string, unknown>;
+    if (listed.ok !== true) return listed;
+    const all = (listed.pending ?? []) as PendingProposal[];
+    const todo = proposalId === undefined ? all : all.filter((p) => p.proposal_id === proposalId);
+    if (proposalId !== undefined && todo.length === 0) {
+      return { ok: false, reason: "proposal_not_found", guidance: `No pending proposal '${proposalId}' (it may have expired after 24 hours). See: cello policy pending` };
+    }
+    const results: Array<{ proposal_id: string; outcome: "approved" | "declined" }> = [];
+    for (const p of todo) {
+      const level = p.target === "" ? p.scope.replace("_", "-") : `${p.scope} ${p.target}`;
+      const cadence = p.type === "conduct" && p.action === "set" ? `every ${p.every_n ?? 10} messages` : "once per session notice";
+      const now = p.action === "clear"
+        ? "(unset — the next broader level applies)"
+        : policyValueText(p.mode, p.text);
+      const answer = await prompt(
+        `Policy change ${p.proposal_id} (proposed by ${p.proposed_by}, ${Math.round(p.age_ms / 60000)} min ago)\n` +
+          `  level:   ${level}\n` +
+          `  type:    ${p.type}\n` +
+          `  cadence: ${cadence}\n` +
+          `  was:     ${p.was ? policyValueText(p.was.mode, p.was.text) : "(unset)"}\n` +
+          `  now:     ${now}\n` +
+          `Apply it?`,
+      );
+      if (answer === "no_tty") {
+        return {
+          ok: false,
+          reason: "not_a_tty",
+          ...(results.length > 0 ? { results } : {}),
+          guidance:
+            "Approving a policy needs a human at a terminal, and this session has no interactive input. " +
+            `Nothing was changed. Run it yourself in a terminal: cello policy approve ${p.proposal_id}`,
+        };
+      }
+      const r = (await client.send(answer === "yes" ? "cello_policy_approve" : "cello_policy_decline", { ...who, proposal_id: p.proposal_id })) as Record<string, unknown>;
+      if (r.ok !== true) return { ...r, ...(results.length > 0 ? { results } : {}) };
+      results.push({ proposal_id: p.proposal_id, outcome: answer === "yes" ? "approved" : "declined" });
+    }
+    return { ok: true, results, ...(todo.length === 0 ? { guidance: "Nothing is pending." } : {}) };
+  });
 }
 
 /** `cello moniker set <name>` / `cello moniker clear` → cello_set_moniker. Null clears the override.

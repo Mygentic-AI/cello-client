@@ -73,7 +73,7 @@ export function operatorCanRun(guard: AdjustableGuard, argHint: string): string 
   return (
     `${AFFORDANCE_PREFIX} IF THIS IS WRONG, relay this to your operator to run in their terminal. DO NOT run it ` +
     `yourself and do not try to work around the guard:\n  cello config set ${guard} ${argHint}\n` +
-    `It asks them to confirm once. To see exactly what fired: cello policy log`
+    `It asks them to confirm once. To see exactly what fired: cello screening log`
   );
 }
 
@@ -81,6 +81,6 @@ export function operatorCanRun(guard: AdjustableGuard, argHint: string): string 
 export function noOperatorOverride(what: string): string {
   return (
     `${AFFORDANCE_PREFIX} This guard is not adjustable — there is no setting that turns it off, deliberately. ${what} ` +
-    `To see exactly what fired: cello policy log`
+    `To see exactly what fired: cello screening log`
   );
 }

@@ -1,12 +1,9 @@
 /**
  * DOD-CONSUME-1 — verified signals reach the LLM as the JSON projection.
  *
- * The projection is framed by issuer_kind:
- *   - portal → "platform-verified" (platform attested this fact)
- *   - agent  → "peer-claimed" (counterparty claims this; not independently verified)
- *
- * Unknown types flow through with generic framing (INV-TYPE-CARRY).
- * The self-describing payload is decoded from CBOR and included as `claim`.
+ * 008-POLICY Part A: the projection is `trust_badges` only, one per signal presented this session:
+ *   - portal → `verified: true`, summary from the payload's own short line
+ *   - agent  → `verified: false`, summary names the author, never quotes the claim
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -104,121 +101,51 @@ describe("DOD-CONSUME-1 — trust signal projection to LLM", () => {
     return hashHex;
   }
 
-  it("projects portal-attested signals as 'platform-verified'", () => {
-    storeSignal("phone", "portal", { claim: "has verified phone", phone_stub: "abc123" });
-
-    const received = store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY });
-    expect(received).toHaveLength(1);
-    expect(received[0].issuerKind).toBe("portal");
-    // The projection the LLM sees: issuer framing is "platform-verified"
-    const projected = projectSignals(received);
-    expect(projected[0].issuer).toBe("platform-verified");
-    expect(projected[0].type).toBe("phone");
-    expect(projected[0].claim).toEqual({ claim: "has verified phone", phone_stub: "abc123" });
+  it("projects a portal-attested signal as a verified, independent badge (clause 1)", () => {
+    const h = storeSignal("phone", "portal", { claim: "has verified phone", phone_stub: "abc123" });
+    const out = projectTrustSignals(store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY }), new Set([h]))!;
+    expect(out.trust_badges).toEqual([{ type: "phone", summary: "has verified phone", independent: true, verified: true }]);
   });
 
-  it("projects agent-issued signals as 'peer-claimed'", () => {
-    storeSignal("endorsement", "agent", { endorsement: "Bob vouches for Alice" });
-
-    const received = store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY });
-    const projected = projectSignals(received);
-    expect(projected[0].issuer).toBe("peer-claimed");
-    expect(projected[0].type).toBe("endorsement");
+  it("projects an agent-issued signal as verified:false with its author in the summary (clause 1)", () => {
+    const h = storeSignal("endorsement", "agent", { endorsement: "Bob vouches for Alice" });
+    const [b] = projectTrustSignals(store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY }), new Set([h]))!.trust_badges;
+    expect(b.verified).toBe(false);
+    expect(b.summary).toBe("by aabb");
+    // The peer's own words never become the summary — the badge is a pointer, not a quotation.
+    expect(b.summary).not.toMatch(/vouches/);
   });
 
-  it("unknown types flow through with generic framing (INV-TYPE-CARRY / INV-ZERO-BUMP)", () => {
-    storeSignal("future_type_never_seen", "portal", { arbitrary: "data", nested: [1, 2, 3] });
-
-    const received = store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY });
-    const projected = projectSignals(received);
-    expect(projected[0].type).toBe("future_type_never_seen");
-    expect(projected[0].issuer).toBe("platform-verified");
-    expect(projected[0].claim).toEqual({ arbitrary: "data", nested: [1, 2, 3] });
+  it("the payload's key set is trust_badges ONLY — the old verbose fields are gone (clause 1)", () => {
+    const h = storeSignal("endorsement", "agent", { statement: "x" }, true);
+    const out = projectTrustSignals(store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY }), new Set([h]))!;
+    expect(Object.keys(out)).toEqual(["trust_badges"]);
+    expect(Object.keys(out.trust_badges[0]).sort()).toEqual(["independent", "summary", "type", "verified"]);
+    const json = JSON.stringify(out);
+    for (const gone of ["claim", "framing", "same_operator_framing", "directory_attestation", "currency_checked_this_session"]) {
+      expect(json).not.toContain(gone);
+    }
+    expect(out.trust_badges[0].independent, "same operator → not independent").toBe(false);
   });
 
-  it("only active-verdict signals are projected (revoked/superseded are excluded)", () => {
-    storeSignal("phone", "portal", { claim: "phone" });
-    // Store a second signal with revoked verdict
-    const payload2 = encodeCbor({ claim: "revoked-thing" }) as Uint8Array;
-    const env2 = {
-      subject_kind: "agent" as const,
-      subject: "agent-2",
-      issuer_kind: "portal" as const,
-      issuer_pubkey: "aabb",
-      type: "email",
-      schema_version: 1,
-      payload: payload2,
-      issued_at: 1_768_000_000,
-      expires_at: null,
-      supersedes_hash: null,
-      same_operator: false,
-    };
-    const hash2 = Buffer.from(hashTrustSignalEnvelope(env2)).toString("hex");
+  it("carried-over signals are absent — only those presented THIS session are badged (clause 1)", () => {
+    const fresh = storeSignal("phone", "portal", { claim: "has verified phone" });
+    storeSignal("email", "portal", { claim: "has verified email" });
+    const out = projectTrustSignals(store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY }), new Set([fresh]))!;
+    expect(out.trust_badges.map((b) => b.type)).toEqual(["phone"]);
+    expect(projectTrustSignals(store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY }), new Set())).toBeUndefined();
+  });
+
+  it("a malformed payload still yields a badge (never blocks the projection)", () => {
+    const badPayload = new Uint8Array([0xff, 0xfe, 0xfd]);
     store.putReceivedSignal({
-      agentId: aliceId,
-      contactPubkey: CONTACT_PUBKEY,
-      signalHash: hash2,
-      subjectKind: "agent",
-      subject: "agent-2",
-      issuerKind: "portal",
-      issuerPubkey: "aabb",
-      type: "email",
-      schemaVersion: 1,
-      payload: payload2,
-      issuedAt: 1_768_000_000,
-      expiresAt: null,
-      supersedesHash: null,
-      verifiedAt: 1_768_000_100_000,
-      verdict: "revoked",
+      agentId: aliceId, contactPubkey: CONTACT_PUBKEY, signalHash: "12".repeat(32), subjectKind: "agent",
+      subject: "agent-1", issuerKind: "portal", issuerPubkey: "aabb", type: "broken", schemaVersion: 1,
+      payload: badPayload, issuedAt: 1_768_000_000, expiresAt: null, supersedesHash: null,
+      verifiedAt: 1_768_000_100_000, verdict: "active",
     });
-
-    const received = store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY });
-    const projected = projectSignals(received);
-    // Only the active one
-    expect(projected).toHaveLength(1);
-    expect(projected[0].type).toBe("phone");
-  });
-
-  it("a malformed payload decodes as null (never blocks the projection)", () => {
-    // Store a signal with invalid CBOR payload directly
-    const badPayload = new Uint8Array([0xff, 0xfe, 0xfd]); // not valid CBOR
-    const env = {
-      subject_kind: "agent" as const,
-      subject: "agent-1",
-      issuer_kind: "portal" as const,
-      issuer_pubkey: "aabb",
-      type: "broken",
-      schema_version: 1,
-      payload: badPayload,
-      issued_at: 1_768_000_000,
-      expires_at: null,
-      supersedes_hash: null,
-      same_operator: false,
-    };
-    const hashHex = Buffer.from(hashTrustSignalEnvelope(env)).toString("hex");
-    store.putReceivedSignal({
-      agentId: aliceId,
-      contactPubkey: CONTACT_PUBKEY,
-      signalHash: hashHex,
-      subjectKind: "agent",
-      subject: "agent-1",
-      issuerKind: "portal",
-      issuerPubkey: "aabb",
-      type: "broken",
-      schemaVersion: 1,
-      payload: badPayload,
-      issuedAt: 1_768_000_000,
-      expiresAt: null,
-      supersedesHash: null,
-      verifiedAt: 1_768_000_100_000,
-      verdict: "active",
-    });
-
-    const received = store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY });
-    const projected = projectSignals(received);
-    expect(projected).toHaveLength(1);
-    expect(projected[0].claim).toBeNull();
-    expect(projected[0].type).toBe("broken");
+    const out = projectTrustSignals(store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY }), new Set(["12".repeat(32)]))!;
+    expect(out.trust_badges).toEqual([{ type: "broken", summary: "verified", independent: true, verified: true }]);
   });
 
   // ── DOD-END-COUNT-1 THROUGH THE REAL STORE PATH ─────────────────────────────────────────────────
@@ -263,139 +190,9 @@ describe("DOD-CONSUME-1 — trust signal projection to LLM", () => {
       expect(verdict.excluded_same_operator).toBe(10);
     });
 
-    it("the recipient's PROJECTION surfaces co-ownership with its own framing", () => {
-      // DOD-END-JOURNEY-1 case (b) requires the recipient to SEE the fact, not merely have it
-      // silently discounted. A consuming model cannot read the statement correctly without it: the
-      // same sentence is a stranger's assessment or an operator's claim about their own fleet.
-      storeSignal("endorsement", "agent", { statement: "her agent never drops a session" }, true);
-      const projected = projectSignals(store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY }));
-      const sig = projected[0] as unknown as { same_operator?: boolean; same_operator_framing?: string };
-      expect(sig.same_operator, "the flag reaches the LLM-facing JSON").toBe(true);
-      expect(String(sig.same_operator_framing), "and says it does not count toward a minimum").toMatch(/does NOT count/i);
-    });
-
-    it("a third-party endorsement OMITS the flag entirely rather than sending false", () => {
-      // Absent, not `false`: a field present on every signal teaches a reader nothing, and its
-      // appearance is what carries the meaning.
-      storeSignal("endorsement", "agent", { statement: "she shipped it clean" }, false);
-      const projected = projectSignals(store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY }));
-      expect(Object.keys(projected[0])).not.toContain("same_operator");
-    });
   });
 
-
-  // ── THE ATTESTATION MUST MATCH THE MIXED SET IT DESCRIBES ───────────────────────────────────────
-  // Two parties check two different things: this daemon re-hashes each envelope (INTEGRITY), and the
-  // DIRECTORY checks status against its ledger at session establishment (CURRENCY,
-  // `checkPresentedSignals` → `signal_records_effective`), stripping non-active ones.
-  //
-  // The subtlety that made two earlier versions of this string WRONG, in opposite directions: the
-  // projection lists every signal ever received from a contact, but the directory only checked the
-  // ones presented in THIS session. Claiming no currency check happened was false; claiming it
-  // covered "each signal below" was also false. It is a MIXED set, and the wording plus the
-  // per-signal flag have to say so.
-  it("names both checks and scopes currency to the signals presented THIS session", () => {
-    const fresh = storeSignal("phone", "portal", { claim: "has verified phone" });
-    const carried = storeSignal("email", "portal", { claim: "has verified email" });
-    const out = projectTrustSignals(
-      store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY }),
-      new Set([fresh]),
-    )!;
-
-    expect(out.directory_attestation, "the local integrity check").toMatch(/re-hashes to signal_hash/i);
-    expect(out.directory_attestation, "the directory's currency check").toMatch(/notary ledger when a session is established/i);
-    expect(out.directory_attestation, "scoped to THIS session, not to everything listed").toMatch(/only the signals presented in THIS session/i);
-    expect(out.directory_attestation, "points the reader at the per-signal flag").toMatch(/currency_checked_this_session/);
-    expect(out.directory_attestation, "and names the consequence for carried-over copies").toMatch(/revoked or withdrawn since/i);
-    expect(out.directory_attestation, "never a claim about truth").toMatch(/check of\s+TRUTH/i);
-    // Must NOT claim the agent itself re-queried the ledger — it never does.
-    expect(out.directory_attestation).not.toMatch(/this agent (has )?re-?quer/i);
-
-    // The per-signal split is the load-bearing part.
-    const bySig = new Map(out.trust_signals.map((x) => [x.signal_hash, x]));
-    expect(bySig.get(fresh)!.currency_checked_this_session, "presented now → checked").toBe(true);
-    expect(bySig.get(carried)!.currency_checked_this_session, "carried over → NOT checked").toBe(false);
-    expect(out.currency_checked_this_session_count, "a count, because the set is mixed").toBe(1);
-  });
-
-  it("marks EVERY signal unchecked when the session presented none", () => {
-    // The default that matters: a session with no presented signals must not let stored rows inherit
-    // "checked". Passing an empty set is the honest answer, and `?? false` is what enforces it.
-    storeSignal("phone", "portal", { claim: "has verified phone" });
-    const out = projectTrustSignals(
-      store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY }),
-      new Set(),
-    )!;
-    expect(out.trust_signals[0].currency_checked_this_session).toBe(false);
-    expect(out.currency_checked_this_session_count).toBe(0);
-  });
 
 });
 
-// Test the PRODUCTION projection function, not a local mirror.
 import { projectTrustSignals } from "../inbound-sessions.js";
-import type { ReceivedSignalRow } from "../trust-signal-store.js";
-
-function projectSignals(received: ReceivedSignalRow[]): Array<{ type: string; issuer: string; signal_hash: string; directory_verified: boolean; claim: unknown }> {
-  const result = projectTrustSignals(received);
-  return result?.trust_signals ?? [];
-}
-
-/**
- * M10B / `M10B-D13` — the framing SPLITS on issuer_kind, and the wrapper matters as much as the
- * payload.
- *
- * The projection previously wrapped every signal in one sentence — "each verified by the CELLO
- * directory… confirmed active" — with `directory_verified: true`, regardless of author. For a
- * portal-issued fact that is accurate. For an agent-issued endorsement it launders authority: the
- * directory checked that the HASH is notarized, and nothing about whether the claim is true.
- *
- * D13 states the trap precisely: the payload split alone does NOT satisfy INV-UNTRUSTED. A live
- * journey asserting only on fields nested inside `claim` would pass while a stranger's sentence
- * reached the model under CELLO's authority.
- */
-describe("M10B-D13 — peer-claimed content is framed as peer-claimed", () => {
-  const sig = (issuerKind: string, payload: Record<string, unknown>) => ({
-    type: "endorsement",
-    issuerKind,
-    payload: encodeCbor(payload),
-    verdict: "active",
-    signalHash: "ab".repeat(32),
-  });
-
-  it("does NOT tell a model that peer-claimed content was verified by CELLO", () => {
-    const out = projectTrustSignals([sig("agent", { claim: "x", statement: "Alice is great" })])!;
-    // The attestation must not claim the directory verified the SIGNAL — only its provenance.
-    expect(out.directory_attestation).not.toMatch(/each verified by the CELLO directory/i);
-    expect(out.directory_attestation).toMatch(/check of\s+TRUTH/i);
-    // And it must warn about the peer-claimed one specifically.
-    expect(out.directory_attestation).toMatch(/peer-claimed/i);
-  });
-
-  it("marks a peer-claimed signal and tells the model how to treat it", () => {
-    const [s] = projectTrustSignals([sig("agent", { statement: "Alice is great" })])!.trust_signals;
-    expect(s.issuer).toBe("peer-claimed");
-    expect(s.content_is_peer_claimed).toBe(true);
-    expect(String(s.framing)).toMatch(/did NOT verify|does not vouch/i);
-    expect(String(s.framing)).toMatch(/quote and attribute|never restate/i);
-  });
-
-  it("leaves PORTAL-issued facts framed as platform-verified — not 'warn about everything'", () => {
-    // The counterpart. Without it, satisfying the above by flagging every signal would pass, and a
-    // caveat that fires on the normal case teaches a model to ignore it.
-    const [s] = projectTrustSignals([sig("portal", { claim: "verified phone" })])!.trust_signals;
-    expect(s.issuer).toBe("platform-verified");
-    expect(s.content_is_peer_claimed).toBe(false);
-    expect(s.framing, "a portal fact needs no untrusted-content warning").toBeUndefined();
-    // And with no peer-claimed signal present, the attestation carries no peer-claimed caveat.
-    const out = projectTrustSignals([sig("portal", { claim: "verified phone" })])!;
-    expect(out.directory_attestation).not.toMatch(/peer-claimed/i);
-  });
-
-  it("still reports the hash as notarized for both — that check IS real", () => {
-    // `directory_verified` is hash-level and true either way; what differs is what it means about
-    // the CONTENT. Collapsing the two would be the opposite error.
-    expect(projectTrustSignals([sig("agent", {})])!.trust_signals[0].directory_verified).toBe(true);
-    expect(projectTrustSignals([sig("portal", {})])!.trust_signals[0].directory_verified).toBe(true);
-  });
-});

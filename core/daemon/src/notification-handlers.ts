@@ -14,7 +14,7 @@ import { REFUSAL_COUNT_GUIDANCE, REFUSAL_GUIDANCE, REFUSAL_KIND_GUIDANCE, type R
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { Logger } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
-import type { InboundSessionEvent, ExpiredSessionRequest, RefusedSessionRequest } from "./inbound-sessions.js";
+import { admissionPolicyFor, type InboundSessionEvent, type ExpiredSessionRequest, type RefusedSessionRequest } from "./inbound-sessions.js";
 import { resolveNamedAgent } from "./resolve-named-agent.js";
 import { TIER } from "./contacts-tier-migration.js";
 import { screeningSessionNotice } from "./screening-status.js";
@@ -357,6 +357,7 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
         session_id: e.sessionIdHex,
         from: e.counterpartyPubkeyHex,
         accepted: true,
+        ...admissionPolicyFor(sessionNodeManager, logger, agent, e.counterpartyPubkeyHex),
       }));
       // M8C-TTL-1: expired requests stay VISIBLE (not silently dropped) — the operator can see
       // what they missed rather than a request just vanishing from the pending list.

@@ -21,7 +21,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 
-import { HERMES_PLUGIN_YAML, HERMES_PLUGIN_INIT_PY, HERMES_SKILL_MD } from "./assets.js";
+import { HERMES_PLUGIN_YAML, HERMES_PLUGIN_INIT_PY, HERMES_SKILL_MD, HERMES_POLICY_SKILL_MD } from "./assets.js";
 
 export interface ExecResult {
   code: number;
@@ -162,6 +162,11 @@ export async function installHermes(
   mkdirSync(skillDir, { recursive: true });
   writeFileSync(join(skillDir, "SKILL.md"), HERMES_SKILL_MD);
   out.push(`Wrote skill:  ${skillDir}/SKILL.md`);
+  // 008-POLICY Part G: the policy-writing step, as its own skill.
+  const policySkillDir = join(hermesHome, "skills", "cello-policy");
+  mkdirSync(policySkillDir, { recursive: true });
+  writeFileSync(join(policySkillDir, "SKILL.md"), HERMES_POLICY_SKILL_MD);
+  out.push(`Wrote skill:  ${policySkillDir}/SKILL.md`);
 
   // 3. Agent binding + behaviour settings. All three are written on every run, so re-running the
   //    installer without a flag RESETS that flag to its default rather than silently inheriting

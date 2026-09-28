@@ -326,7 +326,11 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // 120 → 121 for M16 045-NOTICEBELL's `createChannelNoticeReader` (channel-notices.ts). Unwired, a
     // member never reads an eject, a new group key, a pass or a removal — every suite green. It is
     // called from channel-membership-wiring.ts, so it lands in `checked`, not EXEMPT.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(121);
+    // 121 → 125 for 008-POLICY: `registerPolicyHandlers` (daemon.ts), `ensurePolicySchema`
+    // (session-schema.ts), `attachConductPolicy` (session-content-handlers.ts) and
+    // `attachChannelPolicy` (channel-membership-wiring.ts). Unwired, the operator's policy is stored
+    // and never reaches the agent.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(125);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",

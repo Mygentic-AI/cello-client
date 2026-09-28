@@ -193,7 +193,7 @@ describe("DOD-M9B-GATE-1 — the SHIPPED daemon runs the security layer", () => 
     }
   }, 60_000);
 
-  it("the sidecar the SHIPPED daemon spawned really screens, and its records reach the policy log", async () => {
+  it("the sidecar the SHIPPED daemon spawned really screens, and its records reach the screening log", async () => {
     // What this proves, stated precisely so it is not read as more than it is: the socket the boot
     // line advertises is REAL and the process behind it screens. The daemon spawned that gateway
     // itself from its own composition root; this test is a CLIENT of it, not an injection into the
@@ -235,7 +235,7 @@ describe("DOD-M9B-GATE-1 — the SHIPPED daemon runs the security layer", () => 
     const ipc = await connectToDaemon(join(dir, "daemon.sock"));
     try {
       await ipc.send("ipc.connect", { clientType: "cli" });
-      const log = (await ipc.send("cello_policy_log", {})) as Record<string, unknown>;
+      const log = (await ipc.send("cello_screening_log", {})) as Record<string, unknown>;
       expect(log.ok).toBe(true);
       const entries = log.entries as Array<Record<string, unknown>>;
       // Written by the SIDECAR, read by the daemon — the two halves share one encrypted store.
@@ -251,7 +251,7 @@ describe("DOD-M9B-GATE-1 — the SHIPPED daemon runs the security layer", () => 
     // THE REGRESSION THIS EXISTS FOR. Screening worked on Andre's daemon while security_records
     // stayed empty. Cause: the daemon opened the store per call and CLOSED it, and that close
     // unlinks `-wal`/`-shm` out from under the live sidecar — every record the sidecar wrote
-    // afterwards landed in an orphaned file that no reader would ever see. So `cello policy log`,
+    // afterwards landed in an orphaned file that no reader would ever see. So `cello screening log`,
     // the surface whose whole job is showing what the layer did, silently destroyed the record of
     // what it did next.
     //
@@ -276,7 +276,7 @@ describe("DOD-M9B-GATE-1 — the SHIPPED daemon runs the security layer", () => 
     try {
       await ipc.send("ipc.connect", { clientType: "cli" });
       const total = async (): Promise<number> =>
-        ((await ipc.send("cello_policy_log", {})) as Record<string, unknown>).total as number;
+        ((await ipc.send("cello_screening_log", {})) as Record<string, unknown>).total as number;
 
       expect(await screenOnce(1)).toBe("redact");
       expect(await total()).toBe(1);          // the read that used to unlink the WAL
@@ -292,7 +292,7 @@ describe("DOD-M9B-GATE-1 — the SHIPPED daemon runs the security layer", () => 
     // daemon's own reads from unlinking the WAL — but the SIDECAR was still closing its handles on
     // SIGTERM, and `cello config set` restarts the sidecar on every success. Any close unlinks
     // `-wal`/`-shm` for every process sharing the file, so the daemon's held handle went stale and
-    // `cello policy log` under-reported for the rest of that daemon's life, while still reporting
+    // `cello screening log` under-reported for the rest of that daemon's life, while still reporting
     // chainValid:true. The sidecar now checkpoints instead of closing.
     booted = await bootDaemon(dir, "security.gateway.spawned");
     await new Promise((r) => setTimeout(r, 1_500));
@@ -313,7 +313,7 @@ describe("DOD-M9B-GATE-1 — the SHIPPED daemon runs the security layer", () => 
     try {
       await ipc.send("ipc.connect", { clientType: "cli" });
       const log = async (): Promise<Record<string, unknown>> =>
-        (await ipc.send("cello_policy_log", {})) as Record<string, unknown>;
+        (await ipc.send("cello_screening_log", {})) as Record<string, unknown>;
 
       expect(await screenOnce(1)).toBe("redact");
       expect((await log()).total).toBe(1);

@@ -30,6 +30,8 @@ import { extractErrorMessage } from "./error-message.js";
 import { SESSION_CLOSED_GUIDANCE, SESSION_CLOSED_REASON, SESSION_SEALING_IMPACT, closedSessionImpact, isClosedStatus } from "./session-closed.js";
 import { replyLag, type ReplyLag } from "./reply-lag.js";
 import { callerTextForRefusal } from "./counterparty-refusal.js";
+import { attachConductPolicy, POLICY_ERROR_TEXT } from "./policy-cadence.js";
+import { settableTierName } from "./agent-settings-keys.js";
 
 /** Whether the other side's latest replies were written before they saw this side's newest message. */
 function replyLagFor(snm: { getDb(): import("./sqlcipher-db.js").DaemonDatabase; resolveAgentId(n: string): string }, agentName: string, sessionId: string): ReplyLag | undefined {
@@ -273,6 +275,22 @@ export function sentAuthorship(
    * failure member too, so read it off whichever shape arrived.
    */
   return r.authorship;
+}
+
+/** 008-POLICY — resolve and cadence-gate the conduct policy for one `cello_receive` delivery. */
+function conductPolicyFor(
+  snm: SessionNodeManager, logger: Logger, agentName: string, sessionId: string, peer: string, count: number, correlationId: string,
+): ReturnType<typeof attachConductPolicy> {
+  try {
+    const tierName = settableTierName(snm.getTier(agentName, peer.toLowerCase())) ?? "unknown";
+    return attachConductPolicy({
+      store: snm.getPolicyStore(), cadence: snm.policyCadence, logger, agentId: snm.resolveAgentId(agentName),
+      sessionId, peerPubkeyHex: peer, tierName, count, correlationId,
+    });
+  } catch (err: unknown) {
+    logger.warn("policy.resolve.failed", { agentName, type: "conduct", reason: extractErrorMessage(err) });
+    return { policy_error: POLICY_ERROR_TEXT };
+  }
 }
 
 export interface SessionContentDeps {
@@ -1311,6 +1329,8 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         ...refusalsField(sessionNodeManager, agentName, sessionId, connectionId),
         attendance: attendingNow(agentName),
         ...(signalGuidance !== undefined ? { guidance: signalGuidance } : {}),
+        // 008-POLICY: the operator's conduct rule, beside the messages and never inside them.
+        ...(from !== null ? conductPolicyFor(sessionNodeManager, logger, agentName, sessionId, from, unread.length, correlationId) : {}),
       };
     };
 

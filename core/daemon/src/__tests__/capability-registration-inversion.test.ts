@@ -44,6 +44,10 @@ const EXEMPT = new Map<string, string>([
   ["cello_refresh_shares", "recovery plumbing invoked by the restore flow, never an operator verb"],
   ["cello_get_relay_receipts", "diagnostic read used by support tooling, not surfaced to operators"],
   ["cello_telegram_set_token", "credential entry — deliberately terminal-only, never over MCP"],
+  // 008-POLICY: the agent may propose, never approve. The daemon also refuses these from any
+  // connection that did not handshake as `cli`, and the CLI asks only at an interactive terminal.
+  ["cello_policy_approve", "puts a policy in force — deliberately terminal-only, never over MCP"],
+  ["cello_policy_decline", "operator's answer to a proposal — deliberately terminal-only, never over MCP"],
   /**
    * M16 018-PUBCOLLECT. All four ARE reachable — `cello channel publish|info-set|prune|resend` —
    * and are deliberately absent from MCP. Publishing puts the operator's own name on a post that

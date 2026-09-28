@@ -9,6 +9,9 @@
  * exist because a module registered into nothing is a feature that does not exist — the mistake 017
  * shipped and 018 repeated on its other half.
  */
+import { randomUUID } from "node:crypto";
+import { PolicyStore } from "./policy-store.js";
+import { PolicyCadence, attachChannelPolicy } from "./policy-cadence.js";
 import type { Logger } from "./types.js";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { KeyProvider } from "@cello-protocol/crypto";
@@ -560,12 +563,15 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
    * M16 022-SUBSCRIBE — the three verbs that make the other eleven mean anything. Until this, no
    * production code sent a join request and nothing read a post back out.
    */
+  const policyStore = new PolicyStore(deps.getDb(), logger);
+  const channelCadence = new PolicyCadence();
   const subscribe = createChannelSubscribe({
     logger,
     subscriptions,
     inbox: new ChannelInboxStore(deps.getDb(), logger),
     // 043-POSTERS: poster lanes are read from their own positions, and each post names its writer.
     lanePositions,
+    ownKey: (agentId) => deps.loadedAgents.find((a) => deps.resolveAgentId(a.name) === agentId)?.pubkey,
     posterName: (agentId, pubkeyHex) => {
       const agent = deps.loadedAgents.find((a) => deps.resolveAgentId(a.name) === agentId);
       return agent ? (deps.contactMoniker?.(agent.name, pubkeyHex) ?? null) : null;
@@ -622,7 +628,19 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
     if (!agent.ok) return agent.answer;
     const channel = needChannel(params);
     if (!channel.ok) return channel.answer;
-    return subscribe.read(deps.resolveAgentId(agent.agentName), channel.channelHex, params?.["all"] === true);
+    const agentId = deps.resolveAgentId(agent.agentName);
+    const r = await subscribe.read(agentId, channel.channelHex, params?.["all"] === true);
+    if (!r.ok) return r;
+    // 008-POLICY: the operator's rule for this channel, beside the posts. The admin's `guidance`
+    // column is NOT consulted — it is a remote party's text, not the operator's policy.
+    const { own_posts, ...rest } = r;
+    return {
+      ...rest,
+      ...attachChannelPolicy({
+        store: policyStore, cadence: channelCadence, logger, agentId, channelHex: channel.channelHex,
+        foreignCount: rest.posts.length - own_posts, correlationId: randomUUID(),
+      }),
+    };
   });
 
   /**

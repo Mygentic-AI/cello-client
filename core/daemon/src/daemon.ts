@@ -37,7 +37,7 @@ import { acquireSingletonLock, type SingletonLock } from "./singleton-lock.js";
 import { type IpcHandler } from "./ipc-server.js";
 import { SealFailureStore } from "./seal-failure-store.js";
 import { SessionNodeManager } from "./session-node-manager.js";
-import { registerGatewayConfigHandlers } from "./gateway-config-handlers.js";
+import { registerGatewayConfigHandlers } from "./gateway-config-handlers.js"; import { registerPolicyHandlers } from "./policy-handlers.js";
 import { NonceDedupStore } from "./nonce-dedup.js";
 import { NotificationDispatcher } from "./notification-dispatcher.js";
 import { DbIdentityStore, channelAgentLookup } from "./db-identity-store.js";
@@ -939,6 +939,7 @@ async function startDaemonHoldingLock(
     ...(config.restartSecurityGateway ? { restartSecurityGateway: config.restartSecurityGateway } : {}),
   });
 
+  registerPolicyHandlers({ handlers, logger, sessionNodeManager, getConnState: (id) => perConnectionState.get(id), resolveCurrentAgent, NO_CURRENT_AGENT_RESPONSE, getClientType: (id) => perConnectionState.get(id)?.clientType }); // 008-POLICY
   // The session READ surface (session-read-handlers.ts): sealed receipt, transcript, list, name.
   // All four read the PERSISTED store, so they survive a restart and a fresh connection.
   registerSessionReadHandlers({

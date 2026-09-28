@@ -331,7 +331,7 @@ export class OutboundScreener {
           `  cello config list                          # FIRST — 'set' REPLACES the whitelist\n` +
           `  cello config set pii_whitelist <existing,values,plus,new>\n` +
           `  cello config set autonomous_override true  # or: let agents clear their own flags\n` +
-          `Either prompts them to confirm once. To see exactly what fired: cello policy log`,
+          `Either prompts them to confirm once. To see exactly what fired: cello screening log`,
         redact: [], allowOnce: [], whitelistAddRequested: [],
       };
     }

@@ -10,8 +10,9 @@
  * merged. `NONE` is a value, not an absence: it stops the walk and sends nothing, even when a
  * broader level has text. Nothing set anywhere on the session track means no policy at all.
  *
- * Writes come only from the operator at the terminal (`cello policy set|clear`); the IPC handlers
- * refuse any other surface, so a hijacked agent cannot relax its own policy.
+ * Writes come only through approval (`policy-proposals.ts`): anyone may propose, and only
+ * `cello policy approve` at a terminal puts a change in force, so a hijacked agent cannot relax its
+ * own policy.
  *
  * Keyed on `agent_id` and pubkey hex — never on the mutable agent name.
  */
@@ -57,6 +58,29 @@ export function ensurePolicySchema(db: DaemonDatabase): void {
       PRIMARY KEY (agent_id, scope, target, type)
     )
   `);
+  // Pending changes (008 amendment): nothing here is in force until `cello policy approve` at a TTY.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS agent_policy_proposals (
+      agent_id    TEXT    NOT NULL,
+      proposal_id TEXT    NOT NULL,
+      scope       TEXT    NOT NULL, target TEXT NOT NULL DEFAULT '', type TEXT NOT NULL,
+      action      TEXT    NOT NULL CHECK (action IN ('set','clear')),
+      mode        TEXT    CHECK (mode IN ('text','none')),
+      text        TEXT,
+      every_n     INTEGER CHECK (every_n IS NULL OR every_n >= 1),
+      proposed_by TEXT    NOT NULL CHECK (proposed_by IN ('agent','operator')),
+      created_at  INTEGER NOT NULL,
+      PRIMARY KEY (agent_id, proposal_id),
+      UNIQUE (agent_id, scope, target, type)
+    )
+  `);
+  // The last `p<n>` handed out per agent, so an id is never reused after its row is deleted.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS agent_policy_proposal_seq (
+      agent_id TEXT    PRIMARY KEY,
+      last     INTEGER NOT NULL
+    )
+  `);
 }
 
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -64,9 +88,35 @@ const HEX64 = /^[0-9a-f]{64}$/;
 export class PolicyStore {
   constructor(private readonly db: DaemonDatabase, private readonly logger: Logger) {}
 
+  /** Approval-internal: only `PolicyProposals.approve` calls this (008 amendment). */
   set(agentId: string, scope: PolicyScope, target: string, type: PolicyType, value: PolicyValue, everyN?: number): void {
+    const { target: t, text, everyN: n } = this.validate(scope, target, type, value, everyN);
+    this.db.prepare(
+      `INSERT INTO agent_policies (agent_id, scope, target, type, mode, text, every_n, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (agent_id, scope, target, type) DO UPDATE SET
+         mode = excluded.mode, text = excluded.text, every_n = excluded.every_n, updated_at = excluded.updated_at`,
+    ).run(agentId, scope, t, type, value.mode, text, n, Date.now());
+    this.logger.info("policy.set", { agentId, scope, target: t, type, mode: value.mode });
+  }
+
+  /** The row in force at one slot, or null. */
+  get(agentId: string, scope: PolicyScope, target: string, type: PolicyType): PolicyRow | null {
+    return (this.db.prepare(
+      "SELECT scope, target, type, mode, text, every_n, updated_at FROM agent_policies WHERE agent_id = ? AND scope = ? AND target = ? AND type = ?",
+    ).get(agentId, scope, target, type) as PolicyRow | undefined) ?? null;
+  }
+
+  /**
+   * Every Part B refusal, with its named reason. A proposal is validated here at propose time, so
+   * an invalid one is refused then rather than at approval. Omit `value` to check a slot only.
+   */
+  validate(
+    scope: PolicyScope, target: string, type: PolicyType, value?: PolicyValue, everyN?: number,
+  ): { target: string; text: string | null; everyN: number } {
     const t = this.#validateKey(scope, target, type);
     let text: string | null = null;
+    if (value === undefined) return { target: t, text, everyN: POLICY_EVERY_N_DEFAULT };
     if (value.mode === "text") {
       if (value.text.trim() === "") {
         throw new PolicyValidationError("policy_text_empty", "The policy text is empty. Use NONE (--none) to send nothing.");
@@ -82,16 +132,10 @@ export class PolicyStore {
     if (!Number.isInteger(n) || n < 1) {
       throw new PolicyValidationError("policy_every_n_invalid", `every_n must be an integer of at least 1, got ${String(everyN)}.`);
     }
-    this.db.prepare(
-      `INSERT INTO agent_policies (agent_id, scope, target, type, mode, text, every_n, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT (agent_id, scope, target, type) DO UPDATE SET
-         mode = excluded.mode, text = excluded.text, every_n = excluded.every_n, updated_at = excluded.updated_at`,
-    ).run(agentId, scope, t, type, value.mode, text, n, Date.now());
-    this.logger.info("policy.set", { agentId, scope, target: t, type, mode: value.mode });
+    return { target: t, text, everyN: n };
   }
 
-  /** Removes the row; the level becomes unset and the walk falls through it again. */
+  /** Approval-internal. Removes the row; the level becomes unset and the walk falls through it again. */
   clear(agentId: string, scope: PolicyScope, target: string, type: PolicyType): boolean {
     const t = this.#validateKey(scope, target, type);
     const r = this.db.prepare(

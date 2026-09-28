@@ -138,7 +138,12 @@ const ALWAYS_ON_VERBS: readonly DualSurfaceVerb[] = [
   { mcp: "cello_config_get", cli: "cello config get" },
   { mcp: "cello_config_set", cli: "cello config set" },
   // DOD-M9B-AUDIT-1 — read-only on both surfaces.
-  { mcp: "cello_policy_log", cli: "cello policy log" },
+  { mcp: "cello_screening_log", cli: "cello screening log" },
+  // 008-POLICY. Approval is deliberately NOT here: `cello policy approve` is terminal-only, and
+  // there is no MCP approve tool, ever.
+  { mcp: "cello_policy_list", cli: "cello policy list" },
+  { mcp: "cello_policy_pending", cli: "cello policy pending" },
+  { mcp: "cello_policy_propose", cli: "cello policy propose" },
 ];
 
 /**
