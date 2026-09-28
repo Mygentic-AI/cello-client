@@ -340,6 +340,10 @@ class CelloAdapter(BasePlatformAdapter):
         # escalation opened before a restart still has its answer routed home.
         self._bindings_path: Path = BINDINGS_PATH
         self._bindings: Dict[str, str] = self._load_bindings()
+        # Part C: chat_id -> {session_id: who} for replies the agent has not sent yet. The loop is
+        # captured in connect(), because the reminder is scheduled from a hook that may run off it.
+        self._awaiting: Dict[str, Dict[str, str]] = {}
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
         global _ADAPTER_INSTANCE
         _ADAPTER_INSTANCE = self
 
@@ -474,6 +478,9 @@ class CelloAdapter(BasePlatformAdapter):
             )
             return False
         self._closing = False
+        # Part C: the reminder is injected from post_llm_call, which may run off this loop, so it is
+        # scheduled with run_coroutine_threadsafe against the loop captured here.
+        self._loop = asyncio.get_running_loop()
         try:
             await self._establish()
         except Exception as exc:
@@ -974,6 +981,12 @@ class CelloAdapter(BasePlatformAdapter):
                     text = self._explicit_prefix(session_id, data) + text
         if text is None:
             text = self._wake_prompt(kind, data)
+
+        # Part C step 1: in explicit mode, handing a peer message to a chat arms a reminder. If the
+        # turn ends without a cello_send, post_llm_call surfaces it once. Only cello_message wakes
+        # arm it - a state notice needs no reply.
+        if self._delivery_mode == "explicit" and kind == "cello_message":
+            self._awaiting.setdefault(chat_id, {})[session_id] = _render_who(data) or "a peer"
         event = MessageEvent(
             text=text,
             message_type=MessageType.TEXT,
@@ -1180,6 +1193,68 @@ class CelloAdapter(BasePlatformAdapter):
             source=source,
             raw_message={"governance_hold": True, "session_id": session_id},
             message_id="cello-governance-" + uuid.uuid4().hex[:8],
+            internal=True,
+        )
+        await self.handle_message(event)
+
+    def _clear_awaiting(self, session_id: str) -> None:
+        """Part C step 2: a reply went out on this session - drop it from every chat's awaiting set."""
+        for chat, sessions in self._awaiting.items():
+            sessions.pop(session_id, None)
+
+    def _schedule_reminder(self, chat_id: str) -> None:
+        """Part C step 4: post_llm_call may run off the event loop, so schedule onto the captured one.
+
+        run_coroutine_threadsafe submits without blocking (safe even from the loop thread); the
+        coroutine then injects at most one reminder for this chat.
+        """
+        if self._loop is None:
+            logger.error("[cello] No event loop captured; cannot surface an unanswered-reply reminder")
+            return
+        asyncio.run_coroutine_threadsafe(self._remind_if_awaiting(chat_id), self._loop)
+
+    async def _remind_if_awaiting(self, chat_id: str) -> None:
+        """Part C step 3: if this chat has replies still owed, inject ONE reminder, then clear it.
+
+        Cleared unconditionally so the reminder cannot re-arm itself - the injected turn carries no
+        anchor and is not a cello_message, so nothing re-adds to the set until a new peer message.
+        """
+        if self._delivery_mode != "explicit":
+            return
+        owed = self._awaiting.get(chat_id)
+        if not owed:
+            return
+        lines = [
+            "- " + who + " on session " + sid
+            for sid, who in owed.items()
+        ]
+        self._awaiting[chat_id] = {}
+        if not self._message_handler:
+            logger.error(
+                "[cello] %d reply(ies) are owed on chat %s and there is no gateway handler to "
+                "remind the agent - the peer(s) are still waiting.", len(lines), chat_id,
+            )
+            return
+        body = (
+            "You have not replied yet to:\n"
+            + "\n".join(lines)
+            + "\nReply with cello_send on the named session, or send signal \"standby\" if you "
+            "need more time."
+        )
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_name="CELLO",
+            chat_type="dm",
+            user_id="cello-daemon",
+            user_name="CELLO",
+        )
+        # NO anchor: an adapter-authored turn, so the agent's answer to it must not auto-deliver.
+        event = MessageEvent(
+            text=body,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message={"cello_reminder": True},
+            message_id="cello-reminder-" + uuid.uuid4().hex[:8],
             internal=True,
         )
         await self.handle_message(event)
@@ -1435,12 +1510,15 @@ def _parse_tool_result(result: Any) -> Optional[Dict[str, Any]]:
 
 
 def _on_post_tool_call(**kwargs: Any) -> None:
-    """Records a session binding on a successful cello_initiate_session (049-BRIDGEREPLY Part B).
-    MCP tools reach hooks as mcp__<server>__<tool>, so match by SUFFIX."""
+    """Records a session binding on a successful cello_initiate_session, and clears an owed reply on
+    a successful cello_send (049-BRIDGEREPLY Parts B & C). MCP tools reach hooks as
+    mcp__<server>__<tool>, so match by SUFFIX."""
     tool_name = kwargs.get("tool_name")
     if not isinstance(tool_name, str):
         return
-    if not tool_name.endswith("cello_initiate_session"):
+    is_initiate = tool_name.endswith("cello_initiate_session")
+    is_send = tool_name.endswith("cello_send")
+    if not (is_initiate or is_send):
         return
     if tool_name not in _LOGGED_TOOL_NAMES:
         _LOGGED_TOOL_NAMES.add(tool_name)
@@ -1452,6 +1530,16 @@ def _on_post_tool_call(**kwargs: Any) -> None:
         return
 
     result = _parse_tool_result(kwargs.get("result"))
+
+    if is_send:
+        # Part C step 2: any successful send counts as a reply, including a 'standby' signal.
+        if not (isinstance(result, dict) and result.get("ok") is True):
+            return
+        args = kwargs.get("args")
+        sid = args.get("session_id") if isinstance(args, dict) else None
+        if isinstance(sid, str) and sid:
+            adapter._clear_awaiting(sid)
+        return
 
     # Part B step 2: record only a SUCCESSFUL initiate from a turn whose platform is cello.
     if get_session_env("HERMES_SESSION_PLATFORM", "") != "cello":
@@ -1471,6 +1559,20 @@ def _on_post_tool_call(**kwargs: Any) -> None:
         )
         return
     adapter._bind_session(sid, chat_id)
+
+
+def _on_post_llm_call(**kwargs: Any) -> None:
+    """Part C step 3: at the end of a cello turn, if a reply is still owed for the current chat,
+    surface one reminder."""
+    adapter = _ADAPTER_INSTANCE
+    if adapter is None:
+        return
+    if kwargs.get("platform") != "cello":
+        return
+    chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+    if not chat_id:
+        return
+    adapter._schedule_reminder(chat_id)
 
 
 def register(ctx) -> None:
@@ -1517,8 +1619,9 @@ def register(ctx) -> None:
             "you, never when a peer has sent you a message and is waiting on a reply."
         ),
     )
-    # 049-BRIDGEREPLY Part B: bind a CELLO session to the Hermes chat that opened it.
+    # 049-BRIDGEREPLY Parts B & C: bind sessions the agent opens, and remind on an unanswered turn.
     ctx.register_hook("post_tool_call", _on_post_tool_call)
+    ctx.register_hook("post_llm_call", _on_post_llm_call)
 `;
 
 /** The setup skill — `~/.hermes/skills/cello-bridge-setup/SKILL.md`. */

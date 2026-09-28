@@ -215,6 +215,29 @@ async def main():
         fresh = m.CelloAdapter.__new__(m.CelloAdapter)
         fresh._bindings_path = spec["bindings_path"]
         out["bindings"] = fresh._load_bindings()
+    elif op == "cflow":
+        # Part C: arm an awaiting reply by delivering peer messages, then drive the post_* hooks.
+        import os as _os
+        adapter._loop = asyncio.get_running_loop()
+        _os.environ["HERMES_SESSION_PLATFORM"] = "cello"
+        for frame in spec.get("frames") or []:
+            await adapter._on_notification({"notification": frame["kind"], "data": frame["data"]})
+        for hook in spec.get("hooks") or []:
+            if hook["type"] == "send":
+                m._on_post_tool_call(
+                    tool_name="mcp__cello__cello_send",
+                    args={"session_id": hook["session_id"]},
+                    result=hook.get("result") or {"ok": True},
+                )
+            elif hook["type"] == "llm":
+                _os.environ["HERMES_SESSION_CHAT_ID"] = hook["chat_id"]
+                m._on_post_llm_call(platform=hook.get("platform", "cello"), session_id=hook.get("session_id", ""))
+        await asyncio.sleep(0.15)
+        out["delivered"] = [
+            {"text": e.text, "chat_id": getattr(e.source, "chat_id", None), "message_id": e.message_id}
+            for e in adapter.delivered
+        ]
+        out["awaiting"] = {k: list(v.keys()) for k, v in adapter._awaiting.items()}
     elif op == "connect":
         # The REAL connect() mode-agreement check. hint_mode is what register() baked into the
         # standing instructions (env, read once); _delivery_mode is what this adapter runs.

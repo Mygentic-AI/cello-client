@@ -22,6 +22,7 @@ import { tmpdir } from "node:os";
 import {
   installHermesDriver,
   runDriver,
+  type Verdict,
 } from "./helpers/hermes-python-driver.js";
 
 describe("049-BRIDGEREPLY Part B — a session the agent opens belongs to the chat that opened it", () => {
@@ -130,5 +131,74 @@ describe("049-BRIDGEREPLY Part B — a session the agent opens belongs to the ch
       receive_queue: [],
     });
     expect(v.delivered ?? []).toHaveLength(0);
+  });
+});
+
+describe("049-BRIDGEREPLY Part C — a turn that ends without a reply gets one reminder", () => {
+  let dir: string;
+  beforeAll(async () => {
+    dir = await mkdtemp(join(tmpdir(), "hermes-explicit-c-"));
+    await installHermesDriver(dir);
+  });
+  afterAll(async () => { await rm(dir, { recursive: true, force: true }); });
+
+  const AGENT = "Ms_Chelly_Hermes";
+  const SID = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6";
+  const PUB = "77d0c806".repeat(8);
+  const MSG = { session_id: SID, from: PUB, who: "Coder_H1", whoKnown: true };
+
+  function reminders(v: Verdict): string[] {
+    return (v.delivered ?? []).map((d) => d.text).filter((t) => t.includes("have not replied"));
+  }
+
+  it("C1: a turn that ends with no cello_send gets exactly one reminder naming peer and session", () => {
+    const v = runDriver(dir, {
+      op: "cflow", delivery_mode: "explicit", bindings_path: join(dir, "c1.json"),
+      frames: [{ kind: "cello_message", data: MSG }],
+      hooks: [{ type: "llm", chat_id: AGENT }],
+    });
+    const rem = reminders(v);
+    expect(rem).toHaveLength(1);
+    expect(rem[0]).toContain(SID);
+    expect(rem[0]).toContain("Coder_H1");
+  });
+
+  it("C2: a standby send counts as a reply — no reminder", () => {
+    const v = runDriver(dir, {
+      op: "cflow", delivery_mode: "explicit", bindings_path: join(dir, "c2.json"),
+      frames: [{ kind: "cello_message", data: MSG }],
+      hooks: [
+        { type: "send", session_id: SID, result: { ok: true } },
+        { type: "llm", chat_id: AGENT },
+      ],
+    });
+    expect(reminders(v)).toHaveLength(0);
+  });
+
+  it("C3: the reminder does not trigger a second reminder", () => {
+    const v = runDriver(dir, {
+      op: "cflow", delivery_mode: "explicit", bindings_path: join(dir, "c3.json"),
+      frames: [{ kind: "cello_message", data: MSG }],
+      hooks: [{ type: "llm", chat_id: AGENT }, { type: "llm", chat_id: AGENT }],
+    });
+    expect(reminders(v)).toHaveLength(1);
+  });
+
+  it("C4: no reminder in channel mode", () => {
+    const v = runDriver(dir, {
+      op: "cflow", delivery_mode: "channel", bindings_path: join(dir, "c4a.json"),
+      frames: [{ kind: "cello_message", data: MSG }],
+      hooks: [{ type: "llm", chat_id: AGENT }],
+    });
+    expect(reminders(v)).toHaveLength(0);
+  });
+
+  it("C4: no reminder in wake mode", () => {
+    const v = runDriver(dir, {
+      op: "cflow", delivery_mode: "wake", bindings_path: join(dir, "c4b.json"),
+      frames: [{ kind: "cello_message", data: MSG }],
+      hooks: [{ type: "llm", chat_id: AGENT }],
+    });
+    expect(reminders(v)).toHaveLength(0);
   });
 });
