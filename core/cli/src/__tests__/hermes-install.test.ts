@@ -77,11 +77,11 @@ describe("installHermes — argument and environment validation", () => {
     expect(execCalls).toHaveLength(0);
   });
 
-  it("defaults to channel + agent when neither flag is given", async () => {
+  it("defaults to explicit + agent when neither flag is given", async () => {
     const res = await installHermes({ agentName: "alice", hermesHome, exec: okExec });
     expect(res.exitCode).toBe(0);
     const env = readFileSync(join(hermesHome, ".env"), "utf-8");
-    expect(env).toContain("CELLO_DELIVERY_MODE=channel");
+    expect(env).toContain("CELLO_DELIVERY_MODE=explicit");
     expect(env).toContain("CELLO_SESSION_SCOPE=agent");
   });
 
@@ -103,7 +103,7 @@ describe("installHermes — argument and environment validation", () => {
     const env = readFileSync(join(hermesHome, ".env"), "utf-8");
     // The alternative — inheriting the previous value — leaves an operator running a mode that
     // appears nowhere in the command they just typed, and upsertEnvLine keeps exactly one line.
-    expect(env).toContain("CELLO_DELIVERY_MODE=channel");
+    expect(env).toContain("CELLO_DELIVERY_MODE=explicit");
     expect(env).not.toContain("CELLO_DELIVERY_MODE=wake");
   });
 

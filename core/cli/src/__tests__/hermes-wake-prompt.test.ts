@@ -35,6 +35,9 @@ class SendResult:
     def __init__(self, success=False): self.success = success
 def merge_pending_message_event(*a, **k): pass
 def build_session_key(*a, **k): return "k"
+def get_session_env(name, default=""):
+    import os as _os
+    return _os.environ.get(name, default)
 `;
 
 /** Builds one wake prompt by calling the real function on a bare instance. */
@@ -65,6 +68,7 @@ describe("DOD-HERMES-3 — the Hermes wake prompt names the counterparty", () =>
     await writeFile(join(gw, "__init__.py"), "");
     await writeFile(join(gw, "config.py"), GATEWAY_STUB);
     await writeFile(join(gw, "session.py"), GATEWAY_STUB);
+    await writeFile(join(gw, "session_context.py"), GATEWAY_STUB);
     await writeFile(join(gw, "platforms", "__init__.py"), "");
     await writeFile(join(gw, "platforms", "base.py"), GATEWAY_STUB);
   });

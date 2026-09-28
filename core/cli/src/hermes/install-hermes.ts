@@ -32,9 +32,9 @@ export interface ExecResult {
 export type ExecFn = (cmd: string, args: string[]) => Promise<ExecResult>;
 
 /** DOD-HERMES-4 — the two per-agent behaviour settings, and their defaults. */
-export const DELIVERY_MODES = ["channel", "wake"] as const;
+export const DELIVERY_MODES = ["explicit", "channel", "wake"] as const;
 export const SESSION_SCOPES = ["agent", "peer"] as const;
-export const DEFAULT_DELIVERY_MODE: (typeof DELIVERY_MODES)[number] = "channel";
+export const DEFAULT_DELIVERY_MODE: (typeof DELIVERY_MODES)[number] = "explicit";
 export const DEFAULT_SESSION_SCOPE: (typeof SESSION_SCOPES)[number] = "agent";
 
 export interface InstallHermesOptions {
@@ -127,8 +127,9 @@ export async function installHermes(
         output:
           `Invalid ${flag} '${value}'. Expected one of: ${allowed.join(", ")}.\n` +
           (flag === "--delivery-mode"
-            ? "  channel — CELLO behaves like a normal chat channel (default)\n" +
-              "  wake    — content-free notices only; the agent reads and replies via cello_* tools"
+            ? "  explicit — inbound arrives as a message; nothing is sent unless the agent calls cello_send (default)\n" +
+              "  channel  — CELLO behaves like a normal chat channel; the agent's reply is sent automatically\n" +
+              "  wake     — content-free notices only; the agent reads and replies via cello_* tools"
             : "  agent   — one conversation per CELLO agent (default)\n" +
               "  peer    — one conversation per counterparty, for a support desk"),
       };
