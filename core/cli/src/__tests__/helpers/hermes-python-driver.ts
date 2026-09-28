@@ -77,8 +77,17 @@ def get_session_env(name, default=""):
  * adapter attempts is visible, including ones it should NOT make.
  */
 export const DRIVER = `
-import asyncio, json, sys
+import asyncio, json, sys, logging
 import cello_plugin as m
+
+# Capture the plugin's log records so a test can assert the loud error on an unparseable result.
+_log_records = []
+class _CaptureHandler(logging.Handler):
+    def emit(self, record):
+        _log_records.append({"level": record.levelname, "msg": record.getMessage()})
+_cello_logger = logging.getLogger("cello_plugin")
+_cello_logger.addHandler(_CaptureHandler())
+_cello_logger.setLevel(logging.DEBUG)
 
 spec = json.loads(sys.argv[1])
 
@@ -218,6 +227,7 @@ async def main():
         await asyncio.sleep(0.05)
         out["bindings"] = adapter._bindings
         out["awaiting"] = {k: list(v.keys()) for k, v in adapter._awaiting.items()}
+        out["logs"] = _log_records
     elif op == "prune":
         # Finding 1(b): the connect/reconnect prune drops links the daemon no longer lists as open.
         await adapter._prune_bindings()
@@ -301,6 +311,7 @@ export interface Verdict {
   elapsed?: number;
   bindings?: Record<string, string>;
   awaiting?: Record<string, string[]>;
+  logs?: Array<{ level: string; msg: string }>;
   calls: Array<{ method: string; params: Record<string, unknown> }>;
 }
 

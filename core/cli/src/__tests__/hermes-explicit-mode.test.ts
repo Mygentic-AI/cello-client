@@ -36,21 +36,52 @@ describe("049-BRIDGEREPLY Part B — a session the agent opens belongs to the ch
   const AGENT = "Ms_Chelly_Hermes";
   const SID = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"; // 32 hex, the real initiate shape
   const PUB = "77d0c806".repeat(8);
-  // The captured real initiate result shape (Newly discovered, 2026-09-28): the field is sessionId,
-  // and under Hermes the MCP tool result reaches the hook as a JSON STRING.
-  const INITIATE_RESULT = JSON.stringify({
-    ok: true, sessionId: SID, transportMode: "relay", correlationId: "abc123",
-  });
+
+  // THE EXACT HERMES ENVELOPE (verified 2026-09-28, mcp_tool.py:5027-5041). Hermes wraps every MCP
+  // tool result before a hook sees it: the hook gets json.dumps({"result": <text>}), where <text>
+  // is the cello tool's OWN JSON string. A hook test that fed a bare dict/string tested a shape
+  // production never sends — which is why Part B looked green and failed live.
+  function envelope(inner: Record<string, unknown>): string {
+    return JSON.stringify({ result: JSON.stringify(inner) });
+  }
+  // The structuredContent variant: some tools return machine JSON as structuredContent (a real
+  // object), with the text half a human summary. The parser must prefer the object.
+  function structuredEnvelope(inner: Record<string, unknown>): string {
+    return JSON.stringify({ result: "human-readable summary", structuredContent: inner });
+  }
+  const INITIATE_RESULT = envelope({ ok: true, sessionId: SID, transportMode: "relay", correlationId: "abc123" });
 
   function bpath(): string { return join(dir, `b-${Math.random().toString(36).slice(2)}.json`); }
 
-  it("B1: a successful initiate from a cello turn stores the binding", () => {
+  it("B1: a successful initiate from a cello turn stores the binding (real Hermes envelope)", () => {
     const p = bpath();
     const v = runDriver(dir, {
       op: "record", bindings_path: p, chat_env: "caller-chat-42", platform_env: "cello",
       tool_name: "mcp__cello__cello_initiate_session", hook_result: INITIATE_RESULT,
     });
     expect(v.bindings![SID]).toBe("caller-chat-42");
+  });
+
+  it("B1: the structuredContent envelope variant also binds", () => {
+    const p = bpath();
+    const v = runDriver(dir, {
+      op: "record", bindings_path: p, chat_env: "caller-chat-42", platform_env: "cello",
+      tool_name: "mcp__cello__cello_initiate_session",
+      hook_result: structuredEnvelope({ ok: true, sessionId: SID }),
+    });
+    expect(v.bindings![SID]).toBe("caller-chat-42");
+  });
+
+  it("B1: a result that does not unwrap to an ok-dict logs an ERROR and records nothing", () => {
+    const v = runDriver(dir, {
+      op: "record", bindings_path: bpath(), chat_env: "caller-chat-42", platform_env: "cello",
+      tool_name: "mcp__cello__cello_initiate_session",
+      hook_result: JSON.stringify({ result: "not json at all" }),
+    });
+    expect(Object.keys(v.bindings ?? {})).toHaveLength(0);
+    const errs = (v.logs ?? []).filter((l) => l.level === "ERROR");
+    expect(errs.length).toBeGreaterThan(0);
+    expect(errs.some((l) => l.msg.includes("cello_initiate_session") && l.msg.includes("did not parse"))).toBe(true);
   });
 
   it("B2: an inbound message on a bound session goes to the BOUND chat, not the sender's own", () => {
@@ -94,18 +125,19 @@ describe("049-BRIDGEREPLY Part B — a session the agent opens belongs to the ch
       op: "record", bindings: { [SID]: "caller-chat-42" }, bindings_path: bpath(),
       platform_env: "desktop",
       tool_name: "mcp__cello__cello_close_session",
-      args: { cello_session_id: SID }, hook_result: JSON.stringify({ ok: true }),
+      args: { cello_session_id: SID }, hook_result: envelope({ ok: true }),
     });
     expect(v.bindings![SID]).toBeUndefined();
   });
 
-  it("B5a: a FAILED close leaves the binding in place", () => {
+  it("B5a: a FAILED close leaves the binding in place, and logs no error (ok:false parses fine)", () => {
     const v = runDriver(dir, {
       op: "record", bindings: { [SID]: "caller-chat-42" }, bindings_path: bpath(),
       tool_name: "mcp__cello__cello_close_session",
-      args: { cello_session_id: SID }, hook_result: JSON.stringify({ ok: false, reason: "seal_in_progress" }),
+      args: { cello_session_id: SID }, hook_result: envelope({ ok: false, reason: "seal_in_progress" }),
     });
     expect(v.bindings![SID]).toBe("caller-chat-42");
+    expect((v.logs ?? []).filter((l) => l.level === "ERROR")).toHaveLength(0);
   });
 
   it("B5b: the prune drops a link the daemon no longer lists as open, keeps one it does", () => {
@@ -159,7 +191,7 @@ describe("049-BRIDGEREPLY Part B — a session the agent opens belongs to the ch
     const failed = runDriver(dir, {
       op: "record", bindings_path: bpath(), chat_env: "caller-chat-42",
       tool_name: "mcp__cello__cello_initiate_session",
-      hook_result: JSON.stringify({ ok: false, reason: "no_relay" }),
+      hook_result: envelope({ ok: false, reason: "no_relay" }),
     });
     expect(Object.keys(failed.bindings ?? {})).toHaveLength(0);
 
@@ -204,6 +236,11 @@ describe("049-BRIDGEREPLY Part C — a turn that ends without a reply gets one r
   const PUB = "77d0c806".repeat(8);
   const MSG = { session_id: SID, from: PUB, who: "Coder_H1", whoKnown: true };
 
+  // The real Hermes envelope, as Part B's helper builds it — the send hook sees the same wrapping.
+  function envelope(inner: Record<string, unknown>): string {
+    return JSON.stringify({ result: JSON.stringify(inner) });
+  }
+
   function reminders(v: Verdict): string[] {
     return (v.delivered ?? []).map((d) => d.text).filter((t) => t.includes("have not replied"));
   }
@@ -225,7 +262,7 @@ describe("049-BRIDGEREPLY Part C — a turn that ends without a reply gets one r
       op: "cflow", delivery_mode: "explicit", bindings_path: join(dir, "c2.json"),
       frames: [{ kind: "cello_message", data: MSG }],
       hooks: [
-        { type: "send", session_id: SID, result: { ok: true } },
+        { type: "send", session_id: SID, result: envelope({ ok: true }) },
         { type: "llm", chat_id: AGENT },
       ],
     });
