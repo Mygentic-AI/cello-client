@@ -335,3 +335,22 @@ describe("008-POLICY Part H — screening rename, Security & governance, nested 
     expect(helpForCommand("screening", ["log"]).startsWith("Usage: cello screening log")).toBe(true);
   });
 });
+
+describe("008-POLICY — every flag the policy and screening help documents is accepted", () => {
+  it("policy's documented flags pass checkArgs (live smoke found them refused)", () => {
+    for (const argv of [
+      ["propose", "tier", "known", "conduct", "--text", "x", "--every", "2", "--agent", "bob"],
+      ["propose", "channel-default", "conduct", "--none"],
+      ["propose", "tier", "known", "conduct", "--clear"],
+      ["pending", "--agent", "bob"], ["approve", "p1", "--agent", "bob"], ["list", "--agent", "bob"],
+    ]) expect(checkArgs("policy", argv), argv.join(" ")).toEqual({ kind: "ok" });
+  });
+
+  it("a --text value that looks like a flag is a value, not a flag", () => {
+    expect(checkArgs("policy", ["propose", "default", "conduct", "--text", "--bogus"])).toEqual({ kind: "ok" });
+  });
+
+  it("screening log's documented --limit and --since pass checkArgs", () => {
+    expect(checkArgs("screening", ["log", "--limit", "20", "--since", "0"])).toEqual({ kind: "ok" });
+  });
+});

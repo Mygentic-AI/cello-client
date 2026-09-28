@@ -1706,6 +1706,13 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
     summary: "Your rules for what peers and channels may ask of your agent.",
     help: policyHelpPage(),
     subHelp: POLICY_VERB_HELP,
+    flags: [
+      { name: "--agent", consumesValue: true },
+      { name: "--text", consumesValue: true },
+      { name: "--every", consumesValue: true },
+      { name: "--none" },
+      { name: "--clear" },
+    ],
     jsonOut: true,
     async run(ctx, args) {
       const { pretty, agent, positional } = parityOpts(args);
@@ -1800,6 +1807,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
     summary: "What the security layer did to your messages — newest first.",
     help: SCREENING_HELP,
     subHelp: { log: SCREENING_HELP },
+    flags: [{ name: "--limit", consumesValue: true }, { name: "--since", consumesValue: true }],
     jsonOut: true,
     async run(ctx, args) {
       const { pretty, positional } = parityOpts(args);
