@@ -658,14 +658,15 @@ describe("DOD-M15-STALEROSTER-1: the background sweep uses the PATIENT probe", (
       }) as unknown as typeof fetch,
     } as never);
 
-    // Exactly how the daemon calls it for the background sweep: no budget argument, so the
-    // module default (PERSISTENT_PROBE) applies.
-    await routing.resolveConsortiumRoster();
+    // Exactly how the daemon calls it for the background sweep: PERSISTENT_PROBE, explicitly. The
+    // default is FAST_PROBE since 2026-09-28, because every other caller is a ceremony someone is
+    // waiting on; the wiring test below proves the sweep still passes the patient budget.
+    await routing.resolveConsortiumRoster(PERSISTENT_PROBE);
     const patientAttempts = attempts;
 
     attempts = 0;
     const { FAST_PROBE } = await import("../directory-bootstrap.js");
-    await routing.resolveConsortiumRoster(FAST_PROBE);
+    await routing.resolveConsortiumRoster();
     const fastAttempts = attempts;
 
     expect(

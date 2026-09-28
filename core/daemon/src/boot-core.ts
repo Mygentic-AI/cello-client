@@ -26,7 +26,7 @@ import { SessionNodeManager } from "./session-node-manager.js";
 import { DbManifestVersionStore } from "./manifest-version-store-db.js";
 import { verifyStartupManifest, createConsortiumRouting } from "./consortium-bootstrap.js";
 import { startManifestValidityWatch, type ManifestOrigin } from "./manifest-validity.js";
-import { resolveDirectoryUrl } from "./directory-bootstrap.js";
+import { resolveDirectoryUrl, PERSISTENT_PROBE } from "./directory-bootstrap.js";
 import type { RosterFreshness } from "./roster-freshness.js";
 import type { IManifestVersionStore } from "@cello-protocol/transport";
 import type { DaemonConfig, Logger } from "./types.js";
@@ -299,7 +299,7 @@ export async function startBootCore(deps: BootCoreDeps) {
                 "unprompted log line on a transition.",
             });
           }
-          return resolveConsortiumRoster();
+          return resolveConsortiumRoster(PERSISTENT_PROBE);
         },
         logger,
         // REVIEW F4: the failure reaches the agent's response, not just the log. Without this a

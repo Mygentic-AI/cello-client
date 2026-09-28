@@ -36,6 +36,30 @@ import type { SignalingSeam } from "./registration-context.js";
 import type { Logger } from "./types.js";
 import { extractErrorMessage } from "./error-message.js";
 
+/** A seal ceremony that ends with no signature and no refusal is tried this many times in all. */
+export const SEAL_CEREMONY_ATTEMPTS = 3;
+export const SEAL_CEREMONY_RETRY_DELAY_MS = 3_000;
+
+/**
+ * Run the seal ceremony until it yields a signature, a holder refuses, or the attempts run out.
+ * A refusal is a verdict and is never retried; an attempt that simply got no signature is.
+ */
+export async function runSealCeremonyWithRetry(
+  participate: () => Promise<{ ok: true; signature: Uint8Array } | { ok: false }>,
+  refused: () => boolean,
+  onAttempt: (ok: boolean, attempt: number) => void,
+  delayMs: number = SEAL_CEREMONY_RETRY_DELAY_MS,
+): Promise<Uint8Array | null> {
+  for (let attempt = 1; attempt <= SEAL_CEREMONY_ATTEMPTS; attempt++) {
+    const result = await participate();
+    onAttempt(result.ok, attempt);
+    if (result.ok) return new Uint8Array(result.signature);
+    if (refused() || attempt === SEAL_CEREMONY_ATTEMPTS) return null;
+    await new Promise((r) => setTimeout(r, delayMs));
+  }
+  return null;
+}
+
 /**
  * WIRE-002: answer the directory's `session_offer` on a per-agent signaling stream. When an
  * initiator's session_request names this agent as the target, the directory sends a
@@ -799,9 +823,16 @@ export function wireSealCeremonyHandler(deps: CeremonyWiringDeps): () => void {
       try {
         // The initiator COORDINATES the seal FROST ceremony (its signer drives the
         // /cello/frost round-trips with the directory's K_server shares via directoryNodeStubs).
-        const result = await signer.participateInCeremony(`seal:${sidHex}`, tbs, "cello-frost-seal-v1" as FrostContext);
-        frostSignature = result.ok ? new Uint8Array(result.signature) : null;
-        deps.logger.info("session.seal.ceremony.participated", { agentName: deps.agentName, sessionId: sidHex, ok: result.ok });
+        //
+        // RETRIED when no holder refused. On 2026-09-28 a seal failed because the one reachable
+        // holder's connection opened 2 s after the ceremony gave up, and nothing ever asked again:
+        // the directory sat holding the certificate, waiting for a signature that never came. A
+        // refusal is a verdict and is not retried; silence is not.
+        frostSignature = await runSealCeremonyWithRetry(
+          () => signer.participateInCeremony(`seal:${sidHex}`, tbs, "cello-frost-seal-v1" as FrostContext),
+          () => cosignRefusals.size > 0,
+          (ok, attempt) => deps.logger.info("session.seal.ceremony.participated", { agentName: deps.agentName, sessionId: sidHex, ok, attempt }),
+        );
       } catch (err: unknown) {
         deps.logger.warn("session.seal.ceremony.failed", {
           agentName: deps.agentName,

@@ -258,7 +258,7 @@ export interface ConsortiumRouting {
    * load-bearing: null means "single-node ceremony, M6/M7 back-compat"; [] means "a consortium
    * whose nodes are all unreachable", which the ceremony layer must refuse.
    */
-  resolveConsortiumRoster: () => Promise<ConsortiumEndpoint[] | null>;
+  resolveConsortiumRoster: (budget?: ProbeBudget) => Promise<ConsortiumEndpoint[] | null>;
   /**
    * Roster-aware failover over the injected primary resolver (FINDING-4, the bootstrap SPOF).
    * ONE instance, so signaling and ceremonies share sticky state and fail over TOGETHER — they
@@ -310,7 +310,11 @@ export function createConsortiumRouting(deps: ConsortiumRoutingDeps): Consortium
    */
   let unresolvedStartedAtMs = deps.initialUnresolvedSweptAt ? Date.parse(deps.initialUnresolvedSweptAt) : 0;
 
-  const resolveConsortiumRoster = async (budget?: ProbeBudget): Promise<ConsortiumEndpoint[] | null> => {
+  // FAST_PROBE by default: every caller but the background sweep is a ceremony someone is waiting
+  // on. The patient probe (up to 20 s) held a seal on 2026-09-28 for 18 s waiting on two slow
+  // nodes while the third had answered, and the ceremony then missed it. The sweep passes
+  // PERSISTENT_PROBE explicitly.
+  const resolveConsortiumRoster = async (budget: ProbeBudget = FAST_PROBE): Promise<ConsortiumEndpoint[] | null> => {
     const m = manifestProvider?.getCurrentManifest();
     if (!m) {
       // DOD-M15-STALEROSTER-1 review F13: this returns before the write and used to return before
@@ -342,7 +346,7 @@ export function createConsortiumRouting(deps: ConsortiumRoutingDeps): Consortium
       logger,
       fetchFn,
       onNodeUnresolved: (f) => failures.push(f),
-      ...(budget ? { probeBudget: budget } : {}),
+      probeBudget: budget,
     });
     if (startedAtMs >= unresolvedStartedAtMs) {
       unresolvedNodes = failures;
