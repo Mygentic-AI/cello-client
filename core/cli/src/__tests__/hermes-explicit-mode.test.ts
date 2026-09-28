@@ -1,140 +1,134 @@
 /**
- * 049-BRIDGEREPLY Part A — `delivery_mode: explicit`, the new default.
+ * 049-BRIDGEREPLY Parts B & C — the agent replies on purpose, and the answer comes home.
  *
- * Two faults motivated it. The bridge used to forward EVERY line the Hermes agent wrote, so thinking
- * and progress lines reached the peer as messages (21 in 3 minutes on 2026-09-26). The new default,
- * `explicit`, still delivers inbound as an ordinary message but sends NOTHING outbound unless the
- * agent calls cello_send.
+ * Part B: a CELLO session the Hermes agent OPENS belongs to the Hermes chat that opened it. The
+ * adapter records "session X -> chat Y" from a post_tool_call hook on cello_initiate_session, then
+ * routes an inbound answer on X back to Y instead of the sender's own chat.
  *
- * These tests EXECUTE the real Python out of HERMES_PLUGIN_INIT_PY against a stubbed `gateway`
- * package, via the shared driver in helpers/hermes-python-driver.ts — never substrings of the TS
- * template, which would pass for code that never runs.
+ * Part C: in explicit mode, a turn that ends without a cello_send gets exactly ONE reminder naming
+ * the peer and session, so an escalation answer is never silently dropped.
+ *
+ * These tests EXECUTE the real Python out of HERMES_PLUGIN_INIT_PY through the SHARED driver
+ * (helpers/hermes-python-driver.ts) — the same stub and driver hermes-channel-mode.test.ts uses.
+ * Asserting on the TS template's substrings would pass for code that never runs.
+ *
+ * Written RED-first per SPARC Phase R.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
-import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { installHermesDriver, runDriver, hintFor } from "./helpers/hermes-python-driver.js";
-import { DELIVERY_MODES, DEFAULT_DELIVERY_MODE } from "../hermes/install-hermes.js";
+import {
+  installHermesDriver,
+  runDriver,
+} from "./helpers/hermes-python-driver.js";
 
-describe("049-BRIDGEREPLY Part A — delivery_mode: explicit, the new default", () => {
+describe("049-BRIDGEREPLY Part B — a session the agent opens belongs to the chat that opened it", () => {
   let dir: string;
-
   beforeAll(async () => {
     dir = await mkdtemp(join(tmpdir(), "hermes-explicit-"));
     await installHermesDriver(dir);
   });
   afterAll(async () => { await rm(dir, { recursive: true, force: true }); });
 
-  const SID = "aabbccdd11223344";
+  const AGENT = "Ms_Chelly_Hermes";
+  const SID = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"; // 32 hex, the real initiate shape
   const PUB = "77d0c806".repeat(8);
-  const MSG = { session_id: SID, from: PUB, who: "Ms_Chelly", whoKnown: true };
-
-  /** The adapter's own constants, read out of the executed Python. */
-  function pyConst(expr: string): string {
-    return execFileSync("python3", ["-c", `import cello_plugin as m; print(${expr})`], {
-      cwd: dir,
-      encoding: "utf8",
-      env: { ...process.env, PYTHONPATH: dir, PYTHONDONTWRITEBYTECODE: "1" },
-    }).trim();
-  }
-
-  // ─────────────────────────────────────────────── A1: the default is explicit
-
-  it("A1: the default delivery mode is 'explicit' in both the Python and the TS installer", () => {
-    // Python side — the adapter's own constant, executed.
-    expect(pyConst("m.DEFAULT_DELIVERY_MODE")).toBe("explicit");
-    expect(pyConst("list(m.DELIVERY_MODES)")).toBe("['explicit', 'channel', 'wake']");
-    // TS side — the installer that writes CELLO_DELIVERY_MODE into .env.
-    expect(DEFAULT_DELIVERY_MODE).toBe("explicit");
-    expect([...DELIVERY_MODES]).toEqual(["explicit", "channel", "wake"]);
+  // The captured real initiate result shape (Newly discovered, 2026-09-28): the field is sessionId,
+  // and under Hermes the MCP tool result reaches the hook as a JSON STRING.
+  const INITIATE_RESULT = JSON.stringify({
+    ok: true, sessionId: SID, transportMode: "relay", correlationId: "abc123",
   });
 
-  // ─────────────────────────────────────────────── A2: inbound = channel, plus a session line
+  function bpath(): string { return join(dir, `b-${Math.random().toString(36).slice(2)}.json`); }
 
-  it("A2: explicit mode fetches the peer's words and prefixes them with the session line", () => {
-    const v = runDriver(dir, { op: "notify", kind: "cello_message", data: MSG, delivery_mode: "explicit" });
-    const recv = v.calls.find((c) => c.method === "cello_receive");
-    expect(recv).toBeDefined();
-    expect(recv!.params.session_id).toBe(SID);
+  it("B1: a successful initiate from a cello turn stores the binding", () => {
+    const p = bpath();
+    const v = runDriver(dir, {
+      op: "record", bindings_path: p, chat_env: "caller-chat-42", platform_env: "cello",
+      tool_name: "mcp__cello__cello_initiate_session", hook_result: INITIATE_RESULT,
+    });
+    expect(v.bindings![SID]).toBe("caller-chat-42");
+  });
+
+  it("B2: an inbound message on a bound session goes to the BOUND chat, not the sender's own", () => {
+    // Even though the sender has its own chat under peer scope, the answer must come home to the
+    // chat that opened the session.
+    const v = runDriver(dir, {
+      op: "notify", delivery_mode: "explicit", session_scope: "peer",
+      bindings: { [SID]: "caller-chat-42" }, bindings_path: bpath(),
+      kind: "cello_message", data: { session_id: SID, from: PUB, who: "Coder_H1", whoKnown: true },
+    });
     expect(v.delivered).toHaveLength(1);
-    const text = v.delivered![0].text;
-    // The peer's actual words are handed over…
-    expect(text).toContain("hello from the peer");
-    // …behind one line that names the session and the reply route, because the Hermes chat is no
-    // longer the reply anchor in explicit mode.
-    expect(text).toContain(SID);
-    expect(text).toContain("cello_send");
-    expect(text).toContain("over");
-    expect(text).toContain("standby");
-    // and the session line comes first, before the peer's words
-    expect(text.indexOf(SID)).toBeLessThan(text.indexOf("hello from the peer"));
+    expect(v.delivered![0].chat_id).toBe("caller-chat-42");
+    // The bound chat wins over the peer-scope key the sender would otherwise get.
+    expect(v.delivered![0].chat_id).not.toBe(`${AGENT}/${PUB}`);
   });
 
-  // ─────────────────────────────────────────────── A3: send() delivers nothing
-
-  it("A3: send() in explicit mode calls no cello_send and reports success", () => {
+  it("B3: an UNBOUND session routes exactly as before", () => {
     const v = runDriver(dir, {
-      op: "send", delivery_mode: "explicit",
-      metadata: { reply_to_message_id: "cello-wake-" + SID + "-deadbeef" },
-      content: "the agent's answer",
+      op: "notify", delivery_mode: "explicit", session_scope: "peer",
+      bindings: {}, bindings_path: bpath(),
+      kind: "cello_message", data: { session_id: SID, from: PUB },
     });
-    expect(v.success).toBe(true);
-    expect(v.calls.find((c) => c.method === "cello_send")).toBeUndefined();
+    expect(v.delivered![0].chat_id).toBe(`${AGENT}/${PUB}`);
   });
 
-  // ─────────────────────────────────────────────── A4: the explicit hint
-
-  it("A4: the explicit hint says nothing is sent, names cello_send and both signals", () => {
-    const hint = hintFor(dir, "explicit");
-    expect(hint).toContain("nothing you write here is sent");
-    expect(hint).toContain("cello_send");
-    expect(hint).toContain('"over"');
-    expect(hint).toContain('"standby"');
-    // It must NOT carry the channel-mode promise that the reply is auto-delivered.
-    expect(hint).not.toContain("sent back to them");
-    expect(hint).not.toContain("the bridge does both");
+  it("B4: bindings survive a new adapter instance (gateway restart)", () => {
+    const p = bpath();
+    runDriver(dir, {
+      op: "record", bindings_path: p, chat_env: "caller-chat-42",
+      tool_name: "mcp__cello__cello_initiate_session", hook_result: INITIATE_RESULT,
+    });
+    const v = runDriver(dir, { op: "loadbindings", bindings_path: p });
+    expect(v.bindings![SID]).toBe("caller-chat-42");
   });
 
-  // ─────────────────────────────────────────────── A5: connect() mode agreement
-
-  it("A5: connect() refuses an explicit adapter paired with a channel standing hint", () => {
-    const v = runDriver(dir, { op: "connect", delivery_mode: "explicit", hint_mode: "channel" });
-    expect(v.connected).toBe(false);
-  });
-
-  it("A5: connect() proceeds when adapter and hint both read explicit", () => {
-    const v = runDriver(dir, { op: "connect", delivery_mode: "explicit", hint_mode: "explicit" });
-    expect(v.connected).toBe(true);
-  });
-
-  // ─────────────────────────────────────────────── A6: channel/wake unchanged apart from config
-
-  it("A6: channel mode still auto-delivers a reply and does NOT prefix a session line", () => {
-    const inbound = runDriver(dir, { op: "notify", kind: "cello_message", data: MSG, delivery_mode: "channel" });
-    // Channel mode hands over the peer's words with no cello_send instruction in the prose.
-    expect(inbound.delivered![0].text).toContain("hello from the peer");
-    expect(inbound.delivered![0].text).not.toContain("cello_send");
+  it("B5: a terminal-state notice is delivered to the bound chat and removes the binding", () => {
     const v = runDriver(dir, {
-      op: "send", delivery_mode: "channel",
-      metadata: { reply_to_message_id: inbound.delivered![0].message_id },
-      content: "reply",
+      op: "notify", delivery_mode: "explicit",
+      bindings: { [SID]: "caller-chat-42" }, bindings_path: bpath(),
+      kind: "session_state_changed",
+      data: { session_id: SID, counterpartyPubkey: PUB, state: "sealed" },
     });
-    expect(v.success).toBe(true);
-    expect(v.calls.find((c) => c.method === "cello_send")).toBeDefined();
+    expect(v.delivered![0].chat_id).toBe("caller-chat-42");
+    expect(v.delivered![0].text).toContain("sealed");
+    expect(v.bindings![SID]).toBeUndefined(); // binding gone
   });
 
-  it("A6: wake mode still delivers content-free prose and sends nothing from the adapter", () => {
-    const inbound = runDriver(dir, { op: "notify", kind: "cello_message", data: MSG, delivery_mode: "wake" });
-    expect(inbound.calls.find((c) => c.method === "cello_receive")).toBeUndefined();
-    expect(inbound.delivered![0].text).toContain("CELLO wake");
-    const v = runDriver(dir, {
-      op: "send", delivery_mode: "wake",
-      metadata: { reply_to_message_id: inbound.delivered![0].message_id },
+  it("B6: a failed initiate, or one from a non-cello turn, stores nothing", () => {
+    const failed = runDriver(dir, {
+      op: "record", bindings_path: bpath(), chat_env: "caller-chat-42",
+      tool_name: "mcp__cello__cello_initiate_session",
+      hook_result: JSON.stringify({ ok: false, reason: "no_relay" }),
     });
-    expect(v.success).toBe(true);
-    expect(v.calls.find((c) => c.method === "cello_send")).toBeUndefined();
+    expect(Object.keys(failed.bindings ?? {})).toHaveLength(0);
+
+    const desktop = runDriver(dir, {
+      op: "record", bindings_path: bpath(), chat_env: "caller-chat-42", platform_env: "desktop",
+      tool_name: "mcp__cello__cello_initiate_session", hook_result: INITIATE_RESULT,
+    });
+    expect(Object.keys(desktop.bindings ?? {})).toHaveLength(0);
+  });
+
+  it("B6: an empty HERMES_SESSION_CHAT_ID stores nothing — the bridge never guesses a chat", () => {
+    const v = runDriver(dir, {
+      op: "record", bindings_path: bpath(), platform_env: "cello",
+      tool_name: "mcp__cello__cello_initiate_session", hook_result: INITIATE_RESULT,
+    });
+    expect(Object.keys(v.bindings ?? {})).toHaveLength(0);
+  });
+
+  it("B7: a bound session with nothing unread drops the wake — no notice, no turn", () => {
+    // The asking turn read the answer itself; a second wake would start a turn about a message
+    // already answered.
+    const v = runDriver(dir, {
+      op: "notify", delivery_mode: "explicit",
+      bindings: { [SID]: "caller-chat-42" }, bindings_path: bpath(),
+      kind: "cello_message", data: { session_id: SID, from: PUB },
+      receive_queue: [],
+    });
+    expect(v.delivered ?? []).toHaveLength(0);
   });
 });

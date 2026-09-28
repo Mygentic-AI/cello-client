@@ -61,6 +61,12 @@ def build_session_key(source, **kw):
     # never match anything in production. The stub must not assert the identity the code under
     # test is being checked for.
     return "agent:main:cello:dm:" + str(getattr(source, "chat_id", "?"))
+def get_session_env(name, default=""):
+    # Real signature from gateway/session_context.py:363. The real one reads a ContextVar carried
+    # into the tool worker thread; here the driver sets HERMES_SESSION_CHAT_ID / _PLATFORM in the
+    # process env, so reading os.environ mirrors what the hook sees inside a Hermes turn.
+    import os as _os
+    return _os.environ.get(name, default)
 `;
 
 /**
@@ -92,6 +98,13 @@ adapter.config = m.PlatformConfig(extra={})
 adapter._wake_queue = None
 adapter._wake_task = None
 adapter._retry_tasks = set()
+# Part B/C state (049-BRIDGEREPLY). __new__ skips __init__, so the driver seeds these too.
+adapter._bindings = dict(spec.get("bindings") or {})
+adapter._bindings_path = spec.get("bindings_path", "/tmp/cello-test-bindings.json")
+adapter._awaiting = {}
+adapter._loop = None
+# The recording/reminder hooks reach the adapter through this module global (set in __init__).
+m._ADAPTER_INSTANCE = None if spec.get("no_adapter") else adapter
 # Stub the busy-retry timer: the test asserts THAT a retry was scheduled, not that asyncio can
 # sleep. Leaving the real one in would make every busy case cost BUSY_RETRY_DELAY_SECONDS.
 retry_scheduled = {"v": False}
@@ -182,6 +195,26 @@ async def main():
         out["pending_anchors"] = {
             k: getattr(v, "message_id", None) for k, v in adapter._pending_messages.items()
         }
+        out["bindings"] = adapter._bindings
+        out["awaiting"] = {k: list(v.keys()) for k, v in adapter._awaiting.items()}
+    elif op == "record":
+        # Part B/C recording via the module-level post_tool_call hook.
+        import os as _os
+        if "chat_env" in spec:
+            _os.environ["HERMES_SESSION_CHAT_ID"] = spec["chat_env"]
+        else:
+            _os.environ.pop("HERMES_SESSION_CHAT_ID", None)
+        _os.environ["HERMES_SESSION_PLATFORM"] = spec.get("platform_env", "cello")
+        m._on_post_tool_call(
+            tool_name=spec["tool_name"], args=spec.get("args") or {}, result=spec.get("hook_result")
+        )
+        out["bindings"] = adapter._bindings
+        out["awaiting"] = {k: list(v.keys()) for k, v in adapter._awaiting.items()}
+    elif op == "loadbindings":
+        # Part B4: a brand-new adapter instance must recover bindings from disk (restart).
+        fresh = m.CelloAdapter.__new__(m.CelloAdapter)
+        fresh._bindings_path = spec["bindings_path"]
+        out["bindings"] = fresh._load_bindings()
     elif op == "connect":
         # The REAL connect() mode-agreement check. hint_mode is what register() baked into the
         # standing instructions (env, read once); _delivery_mode is what this adapter runs.
@@ -231,6 +264,8 @@ export interface Verdict {
   connected?: boolean;
   reached_establish?: boolean;
   elapsed?: number;
+  bindings?: Record<string, string>;
+  awaiting?: Record<string, string[]>;
   calls: Array<{ method: string; params: Record<string, unknown> }>;
 }
 
@@ -243,6 +278,7 @@ export async function installHermesDriver(dir: string): Promise<void> {
   await writeFile(join(gw, "__init__.py"), "");
   await writeFile(join(gw, "config.py"), GATEWAY_STUB);
   await writeFile(join(gw, "session.py"), GATEWAY_STUB);
+  await writeFile(join(gw, "session_context.py"), GATEWAY_STUB);
   await writeFile(join(gw, "platforms", "__init__.py"), "");
   await writeFile(join(gw, "platforms", "base.py"), GATEWAY_STUB);
 }

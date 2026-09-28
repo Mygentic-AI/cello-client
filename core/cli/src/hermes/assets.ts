@@ -118,6 +118,7 @@ from gateway.platforms.base import (
     merge_pending_message_event,
 )
 from gateway.session import build_session_key
+from gateway.session_context import get_session_env
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +133,24 @@ DELIVERY_MODES = ("explicit", "channel", "wake")
 SESSION_SCOPES = ("agent", "peer")
 DEFAULT_DELIVERY_MODE = "explicit"
 DEFAULT_SESSION_SCOPE = "agent"
+
+# Terminal session states (049-BRIDGEREPLY Part B step 5): when a bound session reaches one of
+# these, the notice is delivered to the bound chat and the binding is dropped - nothing follows a
+# terminal state, so the mapping is dead weight after it and would misroute a later reused id.
+TERMINAL_STATES = {"sealed", "abandoned", "closed"}
+
+# Where the CELLO-session -> Hermes-chat bindings are persisted (049-BRIDGEREPLY Part B step 1).
+# An escalation in flight loses its answer if this does not survive a gateway restart.
+BINDINGS_PATH = Path.home() / ".hermes" / "cello" / "session-bindings.json"
+
+# The post_tool_call / post_llm_call hooks are module-level functions (Hermes calls them by name),
+# so they reach the bound adapter through this global, set in CelloAdapter.__init__. One gateway
+# binds one CELLO agent, so a single instance is correct; if it is unset when a hook fires, the
+# hook logs and returns rather than guessing.
+_ADAPTER_INSTANCE = None
+# Log the exact tool_name the first time a cello_* tool is seen in a hook, so a Hermes naming change
+# (mcp__cello__ -> something else) is visible instead of silently matching nothing.
+_LOGGED_TOOL_NAMES: set = set()
 
 # The inbound message_id doubles as the reply anchor: the Hermes gateway threads it back to
 # send() as metadata["reply_to_message_id"], which is how an outbound reply learns WHICH CELLO
@@ -317,6 +336,12 @@ class CelloAdapter(BasePlatformAdapter):
         self._pending: Dict[str, asyncio.Future] = {}
         self._next_id = 1
         self._closing = False
+        # 049-BRIDGEREPLY Part B: CELLO-session -> Hermes-chat bindings, recovered from disk so an
+        # escalation opened before a restart still has its answer routed home.
+        self._bindings_path: Path = BINDINGS_PATH
+        self._bindings: Dict[str, str] = self._load_bindings()
+        global _ADAPTER_INSTANCE
+        _ADAPTER_INSTANCE = self
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -340,6 +365,52 @@ class CelloAdapter(BasePlatformAdapter):
             "[CELLO] " + who + " on session " + session_id + " - reply with cello_send on this "
             "session (signal \"over\", or \"standby\" if you need more time).\n\n"
         )
+
+    # ------------------------------------------------------------------ session bindings (Part B)
+
+    def _load_bindings(self) -> Dict[str, str]:
+        """Recover the session->chat bindings from disk, or an empty map if absent/corrupt.
+
+        A corrupt file must not take the adapter down: the worst case is that an in-flight
+        escalation's answer routes to the sender's own chat (the pre-Part-B behaviour), which is
+        recoverable, whereas raising here would stop the whole platform from loading.
+        """
+        try:
+            raw = Path(self._bindings_path).read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return {}
+        except Exception as exc:
+            logger.error("[cello] Could not read session bindings at %s: %s", self._bindings_path, exc)
+            return {}
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            logger.error("[cello] Session bindings file %s is corrupt (%s) - starting empty", self._bindings_path, exc)
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): str(v) for k, v in data.items() if isinstance(v, str)}
+
+    def _persist_bindings(self) -> None:
+        """Write the bindings atomically (temp file + os.replace) so a crash never truncates them."""
+        path = Path(self._bindings_path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(self._bindings), encoding="utf-8")
+            os.replace(str(tmp), str(path))
+        except Exception as exc:
+            logger.error("[cello] Could not persist session bindings to %s: %s", path, exc)
+
+    def _bind_session(self, session_id: str, chat_id: str) -> None:
+        self._bindings[session_id] = chat_id
+        self._persist_bindings()
+        logger.info("[cello] Bound session %s to chat %s", session_id, chat_id)
+
+    def _unbind_session(self, session_id: str) -> None:
+        if session_id in self._bindings:
+            del self._bindings[session_id]
+            self._persist_bindings()
 
     def _invalid_settings(self) -> Optional[str]:
         """Return a complaint about delivery_mode/session_scope, or None if both are legal.
@@ -812,7 +883,10 @@ class CelloAdapter(BasePlatformAdapter):
             return
 
         counterparty = self._counterparty_of(kind, data)
-        chat_id = self._chat_id_for(counterparty)
+        # Part B step 3: a session THIS agent opened comes home to the chat that opened it, ahead of
+        # the sender-based routing. The source's user_id stays the real counterparty below.
+        bound_chat = self._bindings.get(session_id)
+        chat_id = bound_chat if bound_chat is not None else self._chat_id_for(counterparty)
         if chat_id is None:
             # peer scope with nothing to attribute this to. A MESSAGE must be dropped: bucketing
             # it under a placeholder would put one customer's words in another's context, which is
@@ -885,6 +959,15 @@ class CelloAdapter(BasePlatformAdapter):
                 )
             else:
                 text = await self._fetch_content(session_id)
+                if text is None and session_id in self._bindings:
+                    # Part B step 4: a bound session with nothing unread means the asking turn (it
+                    # was inside cello_receive on this session) already read the answer. Waking here
+                    # would start a second turn about a message already handled. Drop it.
+                    logger.debug(
+                        "[cello] Nothing unread on bound session %s; the waiting turn already read "
+                        "it - not waking the chat", session_id,
+                    )
+                    return
                 if text is not None and self._delivery_mode == "explicit":
                     # Explicit mode: the agent replies with cello_send on this session, so the turn
                     # must name it. Channel mode auto-sends, so it needs no anchor in the prose.
@@ -903,6 +986,16 @@ class CelloAdapter(BasePlatformAdapter):
             internal=True,
         )
         await self.handle_message(event)
+
+        # Part B step 5: a bound session that has reached a terminal state is delivered above (to the
+        # bound chat) and then forgotten - nothing follows a terminal state, and keeping the mapping
+        # would misroute a later session that happens to reuse the id.
+        if (
+            kind == "session_state_changed"
+            and _safe_scalar(data.get("state")) in TERMINAL_STATES
+            and session_id in self._bindings
+        ):
+            self._unbind_session(session_id)
 
     def _session_key_for(self, source: Any) -> str:
         """The gateway's session key for a source, built exactly as handle_message builds it.
@@ -1327,6 +1420,59 @@ def interactive_setup() -> None:
     print_info("Restart the gateway for changes to take effect: hermes gateway restart")
 
 
+def _parse_tool_result(result: Any) -> Optional[Dict[str, Any]]:
+    """A tool result as a dict. Under Hermes an MCP tool result reaches a hook as a JSON STRING
+    (captured 2026-09-28), so parse it; a dict is passed straight through; anything else is None."""
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        try:
+            parsed = json.loads(result)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _on_post_tool_call(**kwargs: Any) -> None:
+    """Records a session binding on a successful cello_initiate_session (049-BRIDGEREPLY Part B).
+    MCP tools reach hooks as mcp__<server>__<tool>, so match by SUFFIX."""
+    tool_name = kwargs.get("tool_name")
+    if not isinstance(tool_name, str):
+        return
+    if not tool_name.endswith("cello_initiate_session"):
+        return
+    if tool_name not in _LOGGED_TOOL_NAMES:
+        _LOGGED_TOOL_NAMES.add(tool_name)
+        logger.info("[cello] post_tool_call sees a CELLO tool as %r", tool_name)
+
+    adapter = _ADAPTER_INSTANCE
+    if adapter is None:
+        logger.error("[cello] post_tool_call fired for %r but no CelloAdapter is bound", tool_name)
+        return
+
+    result = _parse_tool_result(kwargs.get("result"))
+
+    # Part B step 2: record only a SUCCESSFUL initiate from a turn whose platform is cello.
+    if get_session_env("HERMES_SESSION_PLATFORM", "") != "cello":
+        # A turn started elsewhere (e.g. the desktop app) needs the manual bind, not in this order.
+        return
+    if not (isinstance(result, dict) and result.get("ok") is True):
+        return
+    sid = result.get("sessionId")
+    if not (isinstance(sid, str) and sid):
+        logger.error("[cello] cello_initiate_session succeeded but carried no sessionId (%r)", result)
+        return
+    chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+    if not chat_id:
+        logger.error(
+            "[cello] cello_initiate_session succeeded but HERMES_SESSION_CHAT_ID is empty - refusing "
+            "to guess a chat, so this session is not bound (session %s)", sid,
+        )
+        return
+    adapter._bind_session(sid, chat_id)
+
+
 def register(ctx) -> None:
     """Plugin entry point - called by the Hermes plugin system."""
     ctx.register_platform(
@@ -1371,6 +1517,8 @@ def register(ctx) -> None:
             "you, never when a peer has sent you a message and is waiting on a reply."
         ),
     )
+    # 049-BRIDGEREPLY Part B: bind a CELLO session to the Hermes chat that opened it.
+    ctx.register_hook("post_tool_call", _on_post_tool_call)
 `;
 
 /** The setup skill — `~/.hermes/skills/cello-bridge-setup/SKILL.md`. */
