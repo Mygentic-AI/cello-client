@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { runSealCeremonyWithRetry, SEAL_CEREMONY_ATTEMPTS } from "../session-ceremony.js";
+import { sealCeremonyWithRetry, SEAL_CEREMONY_ATTEMPTS } from "../session-ceremony.js";
 
 /**
  * 2026-09-28: a seal failed because the one reachable holder's connection opened 2 s after the
@@ -21,7 +21,7 @@ describe("seal ceremony retry", () => {
   it("a ceremony that got no signature is tried again, and the later signature is used", async () => {
     const s = scripted([false, true]);
     const attempts: number[] = [];
-    const sig = await runSealCeremonyWithRetry(s.participate, () => false, (_ok, a) => attempts.push(a), 0);
+    const sig = await sealCeremonyWithRetry(s.participate, () => false, (_ok, a) => attempts.push(a), 0);
     expect(sig).toEqual(SIG);
     expect(s.calls()).toBe(2);
     expect(attempts).toEqual([1, 2]);
@@ -29,14 +29,14 @@ describe("seal ceremony retry", () => {
 
   it("a holder's refusal is a verdict and is never retried", async () => {
     const s = scripted([false, true]);
-    const sig = await runSealCeremonyWithRetry(s.participate, () => true, () => {}, 0);
+    const sig = await sealCeremonyWithRetry(s.participate, () => true, () => {}, 0);
     expect(sig).toBeNull();
     expect(s.calls()).toBe(1);
   });
 
   it("gives up after the last attempt", async () => {
     const s = scripted([]);
-    const sig = await runSealCeremonyWithRetry(s.participate, () => false, () => {}, 0);
+    const sig = await sealCeremonyWithRetry(s.participate, () => false, () => {}, 0);
     expect(sig).toBeNull();
     expect(s.calls()).toBe(SEAL_CEREMONY_ATTEMPTS);
   });

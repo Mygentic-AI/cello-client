@@ -44,7 +44,7 @@ export const SEAL_CEREMONY_RETRY_DELAY_MS = 3_000;
  * Run the seal ceremony until it yields a signature, a holder refuses, or the attempts run out.
  * A refusal is a verdict and is never retried; an attempt that simply got no signature is.
  */
-export async function runSealCeremonyWithRetry(
+export async function sealCeremonyWithRetry(
   participate: () => Promise<{ ok: true; signature: Uint8Array } | { ok: false }>,
   refused: () => boolean,
   onAttempt: (ok: boolean, attempt: number) => void,
@@ -828,7 +828,7 @@ export function wireSealCeremonyHandler(deps: CeremonyWiringDeps): () => void {
         // holder's connection opened 2 s after the ceremony gave up, and nothing ever asked again:
         // the directory sat holding the certificate, waiting for a signature that never came. A
         // refusal is a verdict and is not retried; silence is not.
-        frostSignature = await runSealCeremonyWithRetry(
+        frostSignature = await sealCeremonyWithRetry(
           () => signer.participateInCeremony(`seal:${sidHex}`, tbs, "cello-frost-seal-v1" as FrostContext),
           () => cosignRefusals.size > 0,
           (ok, attempt) => deps.logger.info("session.seal.ceremony.participated", { agentName: deps.agentName, sessionId: sidHex, ok, attempt }),
