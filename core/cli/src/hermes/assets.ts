@@ -449,11 +449,11 @@ class CelloAdapter(BasePlatformAdapter):
             logger.warning("[cello] Could not list sessions to prune bindings (%s: %r) - keeping all", exc.__class__.__name__, exc)
             return
         if not (isinstance(result, dict) and result.get("ok")):
-            logger.warning("[cello] cello_list_sessions did not answer ok - keeping all bindings")
+            logger.warning("[cello] The session list did not answer ok - keeping all bindings")
             return
         sessions = result.get("sessions")
         if not isinstance(sessions, list):
-            logger.warning("[cello] cello_list_sessions carried no sessions list - keeping all bindings")
+            logger.warning("[cello] The session list carried no sessions array - keeping all bindings")
             return
         open_ids = {s.get("sessionId") for s in sessions if isinstance(s, dict)}
         stale = [sid for sid in list(self._bindings) if sid not in open_ids]
