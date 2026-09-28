@@ -40,7 +40,10 @@ export interface SpawnedGateway {
   stop(): Promise<void>;
 }
 
-const DEFAULT_READY_TIMEOUT_MS = 10_000;
+// Loading the classifier model takes 5 to 8.4 s on a 2-vCPU e2-medium, so 10 s failed 2 of 11 starts on
+// the support VM (2026-09-28). A missed start is not retried, and every message fails closed until the
+// daemon restarts.
+const DEFAULT_READY_TIMEOUT_MS = 30_000;
 
 function defaultEntryPath(): string {
   // dist/spawn.js → dist/bin/cello-gateway.js
