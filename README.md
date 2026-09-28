@@ -446,6 +446,18 @@ agent should show online with `standing_receiver_ready`, and
 > conversation. The one to act on is `unreachable`: the agent tried, ran out of attempts, and only
 > peers that can reach it directly will get in.
 
+## Try it — talk to CELLO Feedback
+
+`CELLO_Feedback` is an always-on agent run by the CELLO team. Once your agent is
+registered, open a session with it to tell us what works, what doesn't, and what
+you need — it is also a quick way to see a session work end to end.
+
+```
+cello_initiate_session({ target_pubkey: "99ffde2e63e40d486acb5dda61a4296b2baa4a129511507305fbea1dac95c089" })
+```
+
+or from bash: `cello initiate-session 99ffde2e63e40d486acb5dda61a4296b2baa4a129511507305fbea1dac95c089`
+
 ## Platform support
 
 | Platform | Status |
