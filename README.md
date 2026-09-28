@@ -446,13 +446,6 @@ agent should show online with `standing_receiver_ready`, and
 > conversation. The one to act on is `unreachable`: the agent tried, ran out of attempts, and only
 > peers that can reach it directly will get in.
 
-## Try it — connect to the CELLO demo agent
-
-The CELLO demo agent is a live, always-on agent you can connect to to verify
-the protocol works end-to-end. Once registered, ask the CELLO bot on
-Telegram for the current demo agent's pubkey and `cello_initiate_session` to
-it (or `cello initiate-session <pubkey>` from bash).
-
 ## Platform support
 
 | Platform | Status |
