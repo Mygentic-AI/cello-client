@@ -134,11 +134,6 @@ SESSION_SCOPES = ("agent", "peer")
 DEFAULT_DELIVERY_MODE = "explicit"
 DEFAULT_SESSION_SCOPE = "agent"
 
-# Terminal session states (049-BRIDGEREPLY Part B step 5): when a bound session reaches one of
-# these, the notice is delivered to the bound chat and the binding is dropped - nothing follows a
-# terminal state, so the mapping is dead weight after it and would misroute a later reused id.
-TERMINAL_STATES = {"sealed", "abandoned", "closed"}
-
 # Where the CELLO-session -> Hermes-chat bindings are persisted (049-BRIDGEREPLY Part B step 1).
 # An escalation in flight loses its answer if this does not survive a gateway restart.
 BINDINGS_PATH = Path.home() / ".hermes" / "cello" / "session-bindings.json"
@@ -412,9 +407,42 @@ class CelloAdapter(BasePlatformAdapter):
         logger.info("[cello] Bound session %s to chat %s", session_id, chat_id)
 
     def _unbind_session(self, session_id: str) -> None:
+        """Drop a binding and persist. MUST run on the loop thread - see _bind_session."""
         if session_id in self._bindings:
             del self._bindings[session_id]
             self._persist_bindings()
+            logger.info("[cello] Unbound session %s (closed)", session_id)
+
+    async def _prune_bindings(self) -> None:
+        """Drop links whose session the daemon no longer lists as open (active or interrupted).
+
+        Runs on connect and reconnect, over the adapter's own IPC socket. On ANY failure the links
+        are KEPT - a transient list failure must never wipe an in-flight escalation's route home.
+        Runs on the loop thread (connect/reconnect are loop coroutines), so it mutates directly.
+        """
+        if not self._bindings:
+            return
+        try:
+            # Default filter is 'open' = live/resumable (active + interrupted), which is exactly the
+            # set a still-routable binding may point at. sessionId is the id field (session-read-handlers).
+            result = await self._call("cello_list_sessions", {})
+        except Exception as exc:
+            logger.warning("[cello] Could not list sessions to prune bindings (%s: %r) - keeping all", exc.__class__.__name__, exc)
+            return
+        if not (isinstance(result, dict) and result.get("ok")):
+            logger.warning("[cello] cello_list_sessions did not answer ok - keeping all bindings")
+            return
+        sessions = result.get("sessions")
+        if not isinstance(sessions, list):
+            logger.warning("[cello] cello_list_sessions carried no sessions list - keeping all bindings")
+            return
+        open_ids = {s.get("sessionId") for s in sessions if isinstance(s, dict)}
+        stale = [sid for sid in list(self._bindings) if sid not in open_ids]
+        if stale:
+            for sid in stale:
+                del self._bindings[sid]
+            self._persist_bindings()
+            logger.info("[cello] Pruned %d stale session binding(s) not open on the daemon", len(stale))
 
     def _invalid_settings(self) -> Optional[str]:
         """Return a complaint about delivery_mode/session_scope, or None if both are legal.
@@ -498,6 +526,7 @@ class CelloAdapter(BasePlatformAdapter):
             await self._teardown_socket()
             return False
         self._mark_connected()
+        await self._prune_bindings()
         logger.info(
             "[cello] Connected to the CELLO daemon; bound to agent '%s'",
             self._agent_name,
@@ -651,6 +680,7 @@ class CelloAdapter(BasePlatformAdapter):
                 delay = min(delay * 2, RECONNECT_MAX_DELAY)
                 continue
             self._mark_connected()
+            await self._prune_bindings()
             logger.info(
                 "[cello] Reconnected to the CELLO daemon; agent '%s' re-bound",
                 self._agent_name,
@@ -999,16 +1029,11 @@ class CelloAdapter(BasePlatformAdapter):
             internal=True,
         )
         await self.handle_message(event)
-
-        # Part B step 5: a bound session that has reached a terminal state is delivered above (to the
-        # bound chat) and then forgotten - nothing follows a terminal state, and keeping the mapping
-        # would misroute a later session that happens to reuse the id.
-        if (
-            kind == "session_state_changed"
-            and _safe_scalar(data.get("state")) in TERMINAL_STATES
-            and session_id in self._bindings
-        ):
-            self._unbind_session(session_id)
+        # A bound session's state notice (including counterparty_closing) is routed to the bound
+        # chat above and the link is KEPT: session_state_changed never carries a state that means
+        # "this side is done" (only created / interrupted / counterparty_closing), so a notice is
+        # not the signal to unbind. Removal happens on a successful cello_close_session (the hook)
+        # and on the connect/reconnect prune - both against the daemon's own view of what is open.
 
     def _session_key_for(self, source: Any) -> str:
         """The gateway's session key for a source, built exactly as handle_message builds it.
@@ -1509,16 +1534,27 @@ def _parse_tool_result(result: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _tool_session_arg(args: Any) -> Optional[str]:
+    """The session id a cello tool call carried. The MCP SURFACE names it 'cello_session_id' (the
+    shim renames it to 'session_id' only on the IPC hop), so a hook sees 'cello_session_id'; the
+    'session_id' fallback covers any caller that passes the IPC spelling."""
+    if not isinstance(args, dict):
+        return None
+    sid = args.get("cello_session_id") or args.get("session_id")
+    return sid if isinstance(sid, str) and sid else None
+
+
 def _on_post_tool_call(**kwargs: Any) -> None:
-    """Records a session binding on a successful cello_initiate_session, and clears an owed reply on
-    a successful cello_send (049-BRIDGEREPLY Parts B & C). MCP tools reach hooks as
-    mcp__<server>__<tool>, so match by SUFFIX."""
+    """Bind a session on a successful cello_initiate_session, unbind on a successful
+    cello_close_session, and clear an owed reply on a successful cello_send (049-BRIDGEREPLY Parts
+    B & C). MCP tools reach hooks as mcp__<server>__<tool>, so match by SUFFIX."""
     tool_name = kwargs.get("tool_name")
     if not isinstance(tool_name, str):
         return
     is_initiate = tool_name.endswith("cello_initiate_session")
+    is_close = tool_name.endswith("cello_close_session")
     is_send = tool_name.endswith("cello_send")
-    if not (is_initiate or is_send):
+    if not (is_initiate or is_close or is_send):
         return
     if tool_name not in _LOGGED_TOOL_NAMES:
         _LOGGED_TOOL_NAMES.add(tool_name)
@@ -1530,22 +1566,32 @@ def _on_post_tool_call(**kwargs: Any) -> None:
         return
 
     result = _parse_tool_result(kwargs.get("result"))
+    succeeded = isinstance(result, dict) and result.get("ok") is True
 
     if is_send:
         # Part C step 2: any successful send counts as a reply, including a 'standby' signal.
-        if not (isinstance(result, dict) and result.get("ok") is True):
+        if not succeeded:
             return
-        args = kwargs.get("args")
-        sid = args.get("session_id") if isinstance(args, dict) else None
-        if isinstance(sid, str) and sid:
+        sid = _tool_session_arg(kwargs.get("args"))
+        if sid:
             adapter._clear_awaiting(sid)
+        return
+
+    if is_close:
+        # Finding 1(a): a successful close ends the session, so its link is dead. This applies from
+        # ANY turn and ANY platform - the session may have been closed from the desktop app.
+        if not succeeded:
+            return
+        sid = _tool_session_arg(kwargs.get("args"))
+        if sid:
+            adapter._unbind_session(sid)
         return
 
     # Part B step 2: record only a SUCCESSFUL initiate from a turn whose platform is cello.
     if get_session_env("HERMES_SESSION_PLATFORM", "") != "cello":
         # A turn started elsewhere (e.g. the desktop app) needs the manual bind, not in this order.
         return
-    if not (isinstance(result, dict) and result.get("ok") is True):
+    if not succeeded:
         return
     sid = result.get("sessionId")
     if not (isinstance(sid, str) and sid):

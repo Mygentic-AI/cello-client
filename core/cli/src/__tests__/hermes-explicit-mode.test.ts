@@ -86,16 +86,73 @@ describe("049-BRIDGEREPLY Part B — a session the agent opens belongs to the ch
     expect(v.bindings![SID]).toBe("caller-chat-42");
   });
 
-  it("B5: a terminal-state notice is delivered to the bound chat and removes the binding", () => {
+  it("B5a: a successful cello_close_session removes the binding, from any platform", () => {
+    // The daemon never pushes a terminal state on session_state_changed (only created / interrupted
+    // / counterparty_closing), so a notice can't be the unbind signal. A successful close is.
+    // Applies from a non-cello turn too — the session may be closed from the desktop app.
+    const v = runDriver(dir, {
+      op: "record", bindings: { [SID]: "caller-chat-42" }, bindings_path: bpath(),
+      platform_env: "desktop",
+      tool_name: "mcp__cello__cello_close_session",
+      args: { cello_session_id: SID }, hook_result: JSON.stringify({ ok: true }),
+    });
+    expect(v.bindings![SID]).toBeUndefined();
+  });
+
+  it("B5a: a FAILED close leaves the binding in place", () => {
+    const v = runDriver(dir, {
+      op: "record", bindings: { [SID]: "caller-chat-42" }, bindings_path: bpath(),
+      tool_name: "mcp__cello__cello_close_session",
+      args: { cello_session_id: SID }, hook_result: JSON.stringify({ ok: false, reason: "seal_in_progress" }),
+    });
+    expect(v.bindings![SID]).toBe("caller-chat-42");
+  });
+
+  it("B5b: the prune drops a link the daemon no longer lists as open, keeps one it does", () => {
+    const OPEN = SID;
+    const GONE = "ffff0000".repeat(4);
+    const v = runDriver(dir, {
+      op: "prune", bindings: { [OPEN]: "chat-open", [GONE]: "chat-gone" }, bindings_path: bpath(),
+      sessions_result: { ok: true, sessions: [{ sessionId: OPEN, status: "active", category: "open" }] },
+    });
+    expect(v.bindings![OPEN]).toBe("chat-open");
+    expect(v.bindings![GONE]).toBeUndefined();
+  });
+
+  it("B5b: an interrupted session still counts as open — its link survives the prune", () => {
+    const v = runDriver(dir, {
+      op: "prune", bindings: { [SID]: "chat-open" }, bindings_path: bpath(),
+      sessions_result: { ok: true, sessions: [{ sessionId: SID, status: "interrupted", category: "open" }] },
+    });
+    expect(v.bindings![SID]).toBe("chat-open");
+  });
+
+  it("B5b: a failed cello_list_sessions KEEPS every binding — never wipes on error", () => {
+    const raised = runDriver(dir, {
+      op: "prune", bindings: { [SID]: "chat-open" }, bindings_path: bpath(),
+      sessions_result: "raise",
+    });
+    expect(raised.bindings![SID]).toBe("chat-open");
+
+    const notOk = runDriver(dir, {
+      op: "prune", bindings: { [SID]: "chat-open" }, bindings_path: bpath(),
+      sessions_result: { ok: false, reason: "no_current_agent" },
+    });
+    expect(notOk.bindings![SID]).toBe("chat-open");
+  });
+
+  it("B8: a counterparty_closing notice routes to the bound chat and KEEPS the link", () => {
+    // counterparty_closing means THIS side still has to close, so the session is not over — the
+    // binding must survive so the agent's close/reply still routes home.
     const v = runDriver(dir, {
       op: "notify", delivery_mode: "explicit",
       bindings: { [SID]: "caller-chat-42" }, bindings_path: bpath(),
       kind: "session_state_changed",
-      data: { session_id: SID, counterpartyPubkey: PUB, state: "sealed" },
+      data: { session_id: SID, counterpartyPubkey: PUB, state: "counterparty_closing" },
     });
     expect(v.delivered![0].chat_id).toBe("caller-chat-42");
-    expect(v.delivered![0].text).toContain("sealed");
-    expect(v.bindings![SID]).toBeUndefined(); // binding gone
+    expect(v.delivered![0].text).toContain("counterparty_closing");
+    expect(v.bindings![SID]).toBe("caller-chat-42"); // link kept
   });
 
   it("B6: a failed initiate, or one from a non-cello turn, stores nothing", () => {

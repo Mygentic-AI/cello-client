@@ -130,6 +130,10 @@ async def fake_call(method, params=None, timeout=None):
         return receive_result
     if method == "cello_send":
         return spec.get("send_result") or {"ok": True}
+    if method == "cello_list_sessions":
+        if spec.get("sessions_result") == "raise":
+            raise ConnectionError("socket died")
+        return spec.get("sessions_result", {"ok": True, "sessions": []})
     return {"ok": True}
 
 adapter._call = fake_call
@@ -210,6 +214,10 @@ async def main():
         )
         out["bindings"] = adapter._bindings
         out["awaiting"] = {k: list(v.keys()) for k, v in adapter._awaiting.items()}
+    elif op == "prune":
+        # Finding 1(b): the connect/reconnect prune drops links the daemon no longer lists as open.
+        await adapter._prune_bindings()
+        out["bindings"] = adapter._bindings
     elif op == "loadbindings":
         # Part B4: a brand-new adapter instance must recover bindings from disk (restart).
         fresh = m.CelloAdapter.__new__(m.CelloAdapter)
