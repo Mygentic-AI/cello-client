@@ -346,6 +346,9 @@ class CelloAdapter(BasePlatformAdapter):
         # Part C: chat_id -> {session_id: who} for replies the agent has not sent yet. The loop is
         # captured in connect(), because the reminder is scheduled from a hook that may run off it.
         self._awaiting: Dict[str, Dict[str, str]] = {}
+        # 050-BRIDGEQUIET (review LOW 1): whether the last _fetch_content ended on a [[WRAP]]. Set per
+        # fetch off the last MESSAGE (not the joined turn) and reset at the top of _on_notification.
+        self._last_fetch_ended_with_wrap: bool = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         global _ADAPTER_INSTANCE
         _ADAPTER_INSTANCE = self
@@ -873,6 +876,13 @@ class CelloAdapter(BasePlatformAdapter):
             m["content"] for m in messages
             if isinstance(m, dict) and isinstance(m.get("content"), str) and m["content"]
         ] if isinstance(messages, list) else []
+        # 050-BRIDGEQUIET (review LOW 1): the closing marker belongs to the last real MESSAGE, not to
+        # the joined turn. The undeliverable notice below is appended AFTER the messages, so a wrap
+        # followed by a lost-message notice would no longer end the joined text - and the reminder
+        # would re-arm for a conversation that is over. Read the wrap off the last message here, so
+        # the notice can still ride in the turn without hiding the wrap. Serialized wake worker, so
+        # this flag is set and read within the one _on_notification call that fetched.
+        self._last_fetch_ended_with_wrap = bool(parts and parts[-1].rstrip().endswith("[[WRAP]]"))
         lost_note = result.get("undeliverable_guidance")
         if isinstance(lost_note, str) and lost_note:
             # A message this machine failed to save was skipped by this read. The agent is the only
@@ -948,6 +958,9 @@ class CelloAdapter(BasePlatformAdapter):
         return "read"
 
     async def _on_notification(self, frame: Dict[str, Any]) -> None:
+        # 050-BRIDGEQUIET (review LOW 1): reset per notification, so a wrap seen on one fetch cannot
+        # leak into a later busy-path arming decision that never fetched. _fetch_content sets it.
+        self._last_fetch_ended_with_wrap = False
         kind = str(frame.get("notification", ""))
         if kind not in WAKE_NOTIFICATIONS:
             logger.debug("[cello] Ignoring notification type '%s'", kind)
@@ -1048,9 +1061,6 @@ class CelloAdapter(BasePlatformAdapter):
         # not provide is worse than no check. Computed once here and reused below.
         session_key = self._session_key_for(source)
         text = None
-        # 050-BRIDGEQUIET Part B: the RAW fetched content (before any explicit prefix), so the
-        # arming check below can see a closing [[WRAP]] the daemon placed at the end of the turn.
-        fetched: Optional[str] = None
         if self._delivers_content() and kind == "cello_message":
             if session_key in self._active_sessions:
                 # BUSY: wait for the turn rather than downgrading on the spot. Immediately falling
@@ -1092,8 +1102,7 @@ class CelloAdapter(BasePlatformAdapter):
                     session_key, BUSY_RETRY_LIMIT * BUSY_RETRY_DELAY_SECONDS, session_id,
                 )
             else:
-                fetched = await self._fetch_content(session_id)
-                text = fetched
+                text = await self._fetch_content(session_id)
                 if text is None and session_id in self._bindings:
                     # Part B step 4: a bound session with nothing unread means the asking turn (it
                     # was inside cello_receive on this session) already read the answer. Waking here
@@ -1115,13 +1124,11 @@ class CelloAdapter(BasePlatformAdapter):
         # arm it - a state notice needs no reply.
         if self._delivery_mode == "explicit" and kind == "cello_message":
             # 050-BRIDGEQUIET Part B: a peer's CLOSING message ([[WRAP]]) needs no reply - the next
-            # step is cello_close_session, not cello_send - so it must not arm the reminder. The
-            # daemon places the turn marker at the end of the last message's content
-            # (session-content-handlers.ts), and _fetch_content joins the batch in order, so the
-            # marker lands at the end of the joined text. Checked on the RAW fetched content only:
-            # when the chat was busy we never fetched (fetched is None), so we cannot know and keep
-            # today's behaviour of arming.
-            if isinstance(fetched, str) and fetched.rstrip().endswith("[[WRAP]]"):
+            # step is cello_close_session, not cello_send - so it must not arm the reminder. The flag
+            # is set by _fetch_content off the last MESSAGE's content (review LOW 1), so a lost-message
+            # notice appended after the messages cannot hide the wrap. When the chat was busy we never
+            # fetched, so the flag stays False and today's arming behaviour is kept.
+            if self._last_fetch_ended_with_wrap:
                 logger.info(
                     "[cello] Session %s ended with the peer's closing message ([[WRAP]]) - not "
                     "arming a reply reminder", session_id,

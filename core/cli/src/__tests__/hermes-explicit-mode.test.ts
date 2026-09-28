@@ -394,6 +394,23 @@ describe("050-BRIDGEQUIET Part B — no reminder for a conversation that has end
     expect(v.awaiting![AGENT] ?? []).not.toContain(SID); // but no reply is owed
   });
 
+  it("B1: a [[WRAP]] message plus an undeliverable notice still does NOT arm — the notice must not hide the wrap", () => {
+    // review LOW 1: undeliverable_guidance is appended AFTER the messages, so the JOINED turn no
+    // longer ends with [[WRAP]]. The wrap must be read off the last MESSAGE, so a lost-message
+    // notice riding in the turn cannot re-arm the reminder for a conversation that is over.
+    const v = runDriver(dir, {
+      op: "notify", kind: "cello_message", data: MSG, delivery_mode: "explicit",
+      receive_result: {
+        ok: true, count: 1,
+        messages: [{ sequence: 0, content: "All done, sealing now. [[WRAP]]" }],
+        undeliverable_guidance: "A message could not be saved to this machine and was skipped.",
+      },
+    });
+    expect(v.delivered).toHaveLength(1);
+    expect(v.delivered![0].text).toContain("[CELLO notice]"); // the notice still rides in the turn
+    expect(v.awaiting![AGENT] ?? []).not.toContain(SID);        // yet the wrap is not hidden
+  });
+
   it("B2: a fetched message ending [[OVER]] still arms the reminder", () => {
     const v = runDriver(dir, {
       op: "notify", kind: "cello_message", data: MSG, delivery_mode: "explicit",
