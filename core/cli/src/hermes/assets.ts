@@ -1544,17 +1544,42 @@ def interactive_setup() -> None:
 
 
 def _parse_tool_result(result: Any) -> Optional[Dict[str, Any]]:
-    """A tool result as a dict. Under Hermes an MCP tool result reaches a hook as a JSON STRING
-    (captured 2026-09-28), so parse it; a dict is passed straight through; anything else is None."""
-    if isinstance(result, dict):
-        return result
+    """The cello tool's own result dict, unwrapped from the Hermes MCP envelope.
+
+    Hermes wraps EVERY MCP tool result before a hook sees it (verified 2026-09-28,
+    ~/code/hermes-agent/tools/mcp_tool.py:5027-5041). The hook receives, as a JSON STRING, one of:
+      {"result": "<text>"}                                (text-only tool output)
+      {"result": "<text>", "structuredContent": {...}}    (both present)
+      {"result": {...}}                                   (structured-only)
+    where <text> is the cello tool's OWN JSON string, e.g. '{"ok":true,"sessionId":"..."}'. So one
+    peel of the envelope is not enough - the earlier code returned {"result": "..."}, whose .get("ok")
+    is None, and every branch fell through silently. Here: prefer structuredContent when it is a
+    dict, else take 'result' (a dict as-is, a JSON string parsed). An already-bare cello dict (no
+    'result' key) is used directly, for any caller that hands the unwrapped result straight in.
+    """
+    # The envelope reaches the hook as a JSON STRING; a dict is tolerated for direct callers.
     if isinstance(result, str):
         try:
-            parsed = json.loads(result)
+            result = json.loads(result)
         except json.JSONDecodeError:
             return None
-        return parsed if isinstance(parsed, dict) else None
-    return None
+    if not isinstance(result, dict):
+        return None
+    if "result" in result:
+        structured = result.get("structuredContent")
+        if isinstance(structured, dict):
+            return structured
+        inner = result.get("result")
+        if isinstance(inner, dict):
+            return inner
+        if isinstance(inner, str):
+            try:
+                parsed = json.loads(inner)
+            except json.JSONDecodeError:
+                return None
+            return parsed if isinstance(parsed, dict) else None
+        return None
+    return result
 
 
 def _tool_session_arg(args: Any) -> Optional[str]:
@@ -1590,7 +1615,19 @@ def _on_post_tool_call(**kwargs: Any) -> None:
         return
 
     result = _parse_tool_result(kwargs.get("result"))
-    succeeded = isinstance(result, dict) and result.get("ok") is True
+    if not (isinstance(result, dict) and "ok" in result):
+        # The result did not unwrap to a cello result dict with an 'ok' field. That is a real fault
+        # (a changed envelope, a non-JSON body) and it breaks binding/unbinding/clearing silently -
+        # exactly the 2026-09-28 live failure - so it is LOUD, naming the tool and the raw head. A
+        # tool that answered ok:false is parsed fine and returns quietly in its branch below.
+        raw = kwargs.get("result")
+        raw_head = (raw if isinstance(raw, str) else repr(raw))[:200]
+        logger.error(
+            "[cello] %s result did not parse to a dict with an 'ok' field - not recording. "
+            "Raw (first 200 chars): %s", tool_name, raw_head,
+        )
+        return
+    succeeded = result.get("ok") is True
 
     if is_send:
         # Part C step 2: any successful send counts as a reply, including a 'standby' signal.
