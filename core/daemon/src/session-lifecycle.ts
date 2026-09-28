@@ -101,6 +101,8 @@ export interface SessionLifecycleContext {
     | ((agentName: string, sessionId: string, state: string, counterpartyPubkey: string | null) => void)
     | null;
   readonly onSessionTerminal: ((sessionId: string, terminalStatus: "sealed" | "abandoned") => void) | null;
+  /** 008-POLICY: forget when this session's policy was last attached — the session is over. */
+  readonly dropPolicyCadence: (agentName: string, sessionId: string) => void;
   readonly retryDrainHook: ((agentName: string, sessionId: string) => void) | null;
 
   // ── Calls back into the manager ─────────────────────────────────────────────────────────────
@@ -1848,6 +1850,7 @@ export class SessionLifecycle {
         // reports `lost: 0`: a success message for content that has just become permanently
         // unreadable. The annex is the store built for exactly this shape.
         this.#ctx.held.annexHeldContentOnTerminal(agentName, sessionId, status);
+        this.#ctx.dropPolicyCadence(agentName, sessionId);
         try {
           this.#ctx.onSessionTerminal?.(sessionId, status);
         } catch (hookErr: unknown) {

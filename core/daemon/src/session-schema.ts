@@ -24,6 +24,7 @@ import { migrateContactsAddTierMetadata } from "./contacts-tier-migration.js";
 import { migrateCborBlobsToCanonical } from "./cbor-blob-migration.js";
 import { foldContactPubkeyCase } from "./contact-pubkey-case.js";
 import { ensureTrustSignalSchema } from "./trust-signal-store.js";
+import { ensurePolicySchema } from "./policy-store.js";
 import { extractErrorMessage } from "./error-message.js";
 
 /**
@@ -958,6 +959,9 @@ export function ensureSessionSchema(
       PRIMARY KEY (agent_id, key)
     )
   `);
+
+  // 008-POLICY: the operator's written policies, beside the reachability settings, on agent_id.
+  ensurePolicySchema(db);
 
   // M10 / DOD-STORE-CLIENT-1: the two trust-signal tables (wallet + received). Created HERE and
   // deliberately last: `contact_trust_signals` carries a composite FK to `contacts(agent_id,
