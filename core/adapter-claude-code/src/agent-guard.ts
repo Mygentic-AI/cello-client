@@ -31,9 +31,8 @@ async function roster(proxy: ToolProxy): Promise<RosterEntry[]> {
   const out = (await proxy.call("cello_list_agents")) as { agents?: unknown } | undefined;
   if (!Array.isArray(out?.agents)) throw new RosterUnavailable(out);
   const list = out.agents as Array<Record<string, unknown>>;
-  return list
-    .filter((a) => typeof a["name"] === "string" && typeof a["pubkey"] === "string")
-    .map((a) => ({ name: a["name"] as string, pubkey: (a["pubkey"] as string).toLowerCase() }));
+  if (!list.every((a) => typeof a["name"] === "string" && typeof a["pubkey"] === "string")) throw new RosterUnavailable(out);
+  return list.map((a) => ({ name: a["name"] as string, pubkey: (a["pubkey"] as string).toLowerCase() }));
 }
 
 /** Startup: turn the operator's names-or-pubkeys into a set of identities, or fail naming what is wrong. */
@@ -73,7 +72,12 @@ export async function resolvePermittedAgents(
 /** The daemon methods whose `name` param names an AGENT; every other tool carries an optional `agent`. */
 const NAME_KEYED_AGENT_METHODS = new Set(["cello_start_agent", "cello_set_agent_offline", "cello_use_agent"]);
 
-export function guardProxy(inner: ToolProxy, permitted: ReadonlySet<string> | "all", log: LogFn = logEvent): ToolProxy {
+export function guardProxy(
+  inner: ToolProxy,
+  permitted: ReadonlySet<string> | "all",
+  log: LogFn = logEvent,
+  currentAgent: () => string | null = () => null,
+): ToolProxy {
   if (permitted === "all") return inner as ToolProxy;
 
   const refuse = async (asked: string, method: string): Promise<Record<string, unknown>> => {
@@ -82,22 +86,26 @@ export function guardProxy(inner: ToolProxy, permitted: ReadonlySet<string> | "a
     return {
       ok: false,
       reason: "agent_not_permitted",
-      guidance: `This endpoint serves only: ${names.join(", ") || "(none currently)"}. "${asked}" is not one of them; the endpoint's operator chose that list at startup and it cannot be widened from here. Use one of the listed agents.`,
+      guidance: `This endpoint serves only: ${names.join(", ") || "(the agent list could not be read just now)"}. "${asked}" is not one of them; the endpoint's operator chose that list at startup and it cannot be widened from here. Use one of the listed agents.`,
     };
   };
 
   return {
     async call(method, params) {
       const key = NAME_KEYED_AGENT_METHODS.has(method) ? "name" : "agent";
-      const asked = params?.[key];
-      if (typeof asked === "string") {
+      const given = params?.[key];
+      if (given !== undefined && typeof given !== "string") return refuse(String(given), method);
+      // With no agent named, the daemon acts as this connection's current agent — check that one.
+      const asked = typeof given === "string" ? given : currentAgent();
+      if (asked !== null) {
         try {
-          const hit = (await roster(inner)).find((a) => a.name === asked || a.pubkey === asked.toLowerCase());
-          if (!hit || !permitted.has(hit.pubkey)) return await refuse(asked, method);
+          const matches = (await roster(inner)).filter((a) => a.name === asked || a.pubkey === asked.toLowerCase());
+          // Every roster entry the name could mean must be permitted; none, or an ambiguous one, is refused.
+          if (matches.length === 0 || matches.some((a) => !permitted.has(a.pubkey))) return await refuse(asked, method);
         } catch (e) {
-          // No roster means no identity to compare: refuse, and hand back the daemon's own answer
-          // (daemon_not_running + its recovery) rather than masking it as a permission failure.
-          if (e instanceof RosterUnavailable) return e.raw;
+          // No readable roster means no identity to compare: refuse. A daemon that is down answers
+          // with its own recovery text, which is returned as-is rather than masked as a permission failure.
+          if (e instanceof RosterUnavailable) return rosterFailureAnswer(e.raw);
           throw e;
         }
       }
@@ -114,26 +122,46 @@ export function guardProxy(inner: ToolProxy, permitted: ReadonlySet<string> | "a
   };
 }
 
+function rosterFailureAnswer(raw: unknown): unknown {
+  if (raw && typeof raw === "object" && (raw as { ok?: unknown }).ok === false) return raw;
+  return {
+    ok: false,
+    reason: "agent_roster_unreadable",
+    guidance:
+      "The daemon's agent list was not in the shape this endpoint expects, so it cannot tell which agent this call concerns and sent nothing. " +
+      "Run `cello status` on the machine and make sure the daemon and cello-mcp-http are on matching versions.",
+  };
+}
+
 /**
- * A synchronous predicate for daemon doorbell frames, backed by a name→identity map taken from the
- * roster. A frame about an agent not in the map — or with no agent — is dropped (fail closed); the
- * recovery for a dropped doorbell is the inbox, which is how a missed push is recovered everywhere.
+ * A predicate for daemon doorbell frames, checked against a FRESH roster each time so an agent
+ * renamed or created after the session began is judged on what it is now. A frame about an agent not
+ * permitted, with no agent, or that cannot be checked (roster unreadable) is dropped and the cause is
+ * logged; the recovery for a dropped doorbell is the inbox, as for any missed push.
  */
-export async function makeNotificationPermit(
+export function makeNotificationPermit(
   proxy: ToolProxy,
   permitted: ReadonlySet<string>,
   log: LogFn = logEvent,
-): Promise<(frame: Record<string, unknown>) => boolean> {
-  const entries = await roster(proxy).catch((e: unknown) => {
-    if (e instanceof RosterUnavailable) return [] as RosterEntry[];
-    throw e;
-  });
-  const allowedNames = new Set(entries.filter((a) => permitted.has(a.pubkey)).map((a) => a.name));
-  return (frame) => {
+): (frame: Record<string, unknown>) => Promise<boolean> {
+  return async (frame) => {
     const data = (frame as { data?: Record<string, unknown> }).data ?? {};
     const agent = data["agent"];
-    const ok = typeof agent === "string" && allowedNames.has(agent);
-    if (!ok) log("mcp.http.notification.dropped", { agent: typeof agent === "string" ? agent : null });
-    return ok;
+    if (typeof agent !== "string") {
+      log("mcp.http.notification.dropped", { agent: null, cause: "no_agent_in_frame" });
+      return false;
+    }
+    try {
+      const matches = (await roster(proxy)).filter((a) => a.name === agent || a.pubkey === agent.toLowerCase());
+      const ok = matches.length > 0 && matches.every((a) => permitted.has(a.pubkey));
+      if (!ok) log("mcp.http.notification.dropped", { agent, cause: "not_permitted" });
+      return ok;
+    } catch (e) {
+      if (e instanceof RosterUnavailable) {
+        log("mcp.http.notification.dropped", { agent, cause: "roster_unreadable" });
+        return false;
+      }
+      throw e;
+    }
   };
 }

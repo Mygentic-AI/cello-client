@@ -106,7 +106,7 @@ const EXEMPT = new Map<string, string>([
 /** Handlers that are not capabilities at all. */
 const isInternal = (name: string): boolean => !name.startsWith("cello_") && !name.startsWith("wallet_");
 
-const SHIM = readFileSync(join(here, "..", "..", "..", "adapter-claude-code", "src", "bin", "cello-mcp.ts"), "utf8");
+const SHIM = readFileSync(join(here, "..", "..", "..", "adapter-claude-code", "src", "cello-tools.ts"), "utf8");
 const CLI = readdirSync(join(here, "..", "..", "..", "cli", "src"))
   .filter((f) => f.endsWith(".ts"))
   .map((f) => readFileSync(join(here, "..", "..", "..", "cli", "src", f), "utf8"))

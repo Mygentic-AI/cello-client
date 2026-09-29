@@ -40,7 +40,7 @@ async function freePort(): Promise<number> {
 }
 
 function run(args: string[], env: Record<string, string> = {}): { child: ChildProcess; out: () => string; exited: Promise<number | null> } {
-  const child = spawn(process.execPath, [BIN, ...args], { env: { ...process.env, CELLO_DIR: dir, ...env }, stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(process.execPath, [BIN, ...args], { env: { ...process.env, CELLO_DIR: dir, CELLO_DOCUMENTS: "", ...env }, stdio: ["ignore", "pipe", "pipe"] });
   proc = child;
   let text = "";
   child.stdout!.on("data", (c: Buffer) => (text += c.toString()));

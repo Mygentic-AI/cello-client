@@ -128,7 +128,7 @@ export async function startMcpHttpServer(opts: McpHttpOptions): Promise<McpHttpH
     if (s.idle) clearTimeout(s.idle);
     if (id !== undefined) sessions.delete(id);
     s.proxy.close();
-    void s.server.close().catch(() => {});
+    s.server.close().catch((e: unknown) => log("mcp.http.session.close_failed", { sessionId: id, error: e instanceof Error ? e.message : String(e) }));
     log("mcp.http.session.closed", { sessionId: id });
   };
 
@@ -143,14 +143,23 @@ export async function startMcpHttpServer(opts: McpHttpOptions): Promise<McpHttpH
 
   async function newSession(): Promise<Session> {
     const proxy = new IpcProxy(opts.socketPath, { clientType: "mcp" });
+    try {
+      return await buildSession(proxy);
+    } catch (e) {
+      proxy.close();
+      throw e;
+    }
+  }
+
+  async function buildSession(proxy: IpcProxy): Promise<Session> {
     await installDaemonGate(proxy, "cello-mcp-http");
-    const guarded = guardProxy(proxy, permitted, log);
+    const guarded = guardProxy(proxy, permitted, log, () => proxy.currentAgent);
     const server = new McpServer(
       { name: "cello", version: opts.version },
       { capabilities: { experimental: { "claude/channel": {} } } },
     );
     registerCelloTools(filteringSink(server, allowed), guarded);
-    const permit = permitted === "all" ? undefined : await makeNotificationPermit(proxy, permitted, log);
+    const permit = permitted === "all" ? undefined : makeNotificationPermit(proxy, permitted, log);
     forwardDaemonNotifications(proxy, server, permit);
 
     let id: string | undefined;

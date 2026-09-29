@@ -14,7 +14,7 @@ import { logEvent } from "./shim-log.js";
 export function forwardDaemonNotifications(
   proxy: IpcProxy,
   server: McpServer,
-  permitAgent: (frame: Record<string, unknown>) => boolean = () => true,
+  permitAgent: (frame: Record<string, unknown>) => boolean | Promise<boolean> = () => true,
 ): void {
 // ─── Channel stage 1 (CELLO-M8C-WAKE-001): forward daemon notifications ──────────
 // The daemon's NotificationDispatcher pushes content-free doorbell frames over IPC
@@ -31,8 +31,20 @@ export function forwardDaemonNotifications(
 // that it is back. Without it, `cello logout && cello login` left the agent holding a ⚠️ "daemon
 // stopped" notice forever, and the agent_current_changed from the handshake replay was the only
 // hint anything had recovered.
+// A restricted endpoint must not name an agent it does not serve, on the reconnect notice either.
 proxy.onReconnect(() => {
   const agent = proxy.currentAgent;
+  if (agent) {
+    const verdict = permitAgent({ data: { agent } });
+    if (verdict !== true) {
+      void Promise.resolve(verdict).then((ok) => { if (ok) announceReconnect(agent); });
+      return;
+    }
+  }
+  announceReconnect(agent);
+});
+
+function announceReconnect(agent: string | null): void {
   const data: Record<string, unknown> = agent ? { agent } : {};
   const params = buildChannelParams(data, "daemon_reconnected");
   server.server
@@ -42,10 +54,17 @@ proxy.onReconnect(() => {
       const message = err instanceof Error ? err.message : String(err);
       logEvent("notification.push.failed", { type: "daemon_reconnected", agent, error: message });
     });
+}
+
+// Frames are forwarded in arrival order even when the permit check is asynchronous.
+let forwarding: Promise<void> = Promise.resolve();
+proxy.onNotification((frame) => {
+  const verdict = permitAgent(frame);
+  if (verdict === true) return forward(frame);
+  forwarding = forwarding.then(async () => { if (await verdict) forward(frame); });
 });
 
-proxy.onNotification((frame) => {
-  if (!permitAgent(frame)) return;
+function forward(frame: Record<string, unknown>): void {
   // The daemon frame's `data` blob is content-free (agent, type, agentName, sessionId, state,
   // counterpartyPubkey) — no message content ever rides a push (INV-CONTENTFREE / SI-001).
   const data = (frame as { data?: Record<string, unknown> }).data ?? {};
@@ -71,5 +90,5 @@ proxy.onNotification((frame) => {
       const message = err instanceof Error ? err.message : String(err);
       logEvent("notification.push.failed", { type, agent, error: message });
     });
-});
+}
 }

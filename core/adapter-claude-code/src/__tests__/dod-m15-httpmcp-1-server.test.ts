@@ -4,7 +4,7 @@
  * real Unix socket (newline-delimited JSON, the IpcProxy wire). Nothing is stubbed between the
  * client and the daemon socket.
  */
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import { mkdtemp, rm, writeFile, chmod } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -51,7 +51,12 @@ async function connect(token = TOKEN): Promise<Client> {
 
 const text = (r: unknown) => JSON.parse(((r as { content: Array<{ text: string }> }).content[0]!).text) as Record<string, unknown>;
 
+beforeEach(() => {
+  vi.stubEnv("CELLO_DOCUMENTS", "");
+});
+
 afterEach(async () => {
+  vi.unstubAllEnvs();
   for (const c of clients.splice(0)) await c.close().catch(() => {});
   await handle?.close().catch(() => {});
   handle = undefined;
@@ -81,6 +86,18 @@ describe("082 parity with the stdio shim", () => {
   });
 });
 
+describe("082 parity with the stdio shim — documents gate on", () => {
+  it("with CELLO_DOCUMENTS on, the HTTP list is the docs-on stdio snapshot minus DEFAULT_DENIED_TOOLS", async () => {
+    vi.stubEnv("CELLO_DOCUMENTS", "1");
+    await setup(); await boot();
+    const c = await connect();
+    const got = norm((await c.listTools()).tools as unknown as Snap);
+    const stdio = norm(pre("stdio-tools-list.pre-082.docs.json"));
+    expect(got).toEqual(stdio.filter((t) => !DEFAULT_DENIED_TOOLS.includes(t.name)));
+    expect(got.filter((t) => t.name.startsWith("cello_doc_")).length).toBe(14);
+  });
+});
+
 describe("082 tools allowlist over the wire", () => {
   it("a tools file limits tools/list to exactly its names", async () => {
     await setup(); await boot({ toolsFileText: "cello_agents\ncello_inbox\n" });
@@ -97,6 +114,25 @@ describe("082 tools allowlist over the wire", () => {
     expect(fake.calls.map((x) => x.method)).not.toContain("cello_send");
     const ev = events.find((e) => e.event === "mcp.http.tool.refused");
     expect(ev?.ctx["tool"]).toBe("cello_send");
+  });
+
+  it("an excluded tool inside a JSON-RPC batch is refused too, and the allowed one in the same batch still runs", async () => {
+    await setup(); await boot({ toolsFileText: "cello_agents\n" });
+    const c = await connect();
+    const sid = transports.get(c)!.sessionId!;
+    const res = await fetch(handle!.url, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${TOKEN}`, "content-type": "application/json", accept: "application/json, text/event-stream", "mcp-session-id": sid, "mcp-protocol-version": "2025-03-26" },
+      body: JSON.stringify([
+        { jsonrpc: "2.0", id: 101, method: "tools/call", params: { name: "cello_send", arguments: { cello_session_id: "s", content: "x", signal: "over" } } },
+        { jsonrpc: "2.0", id: 102, method: "tools/call", params: { name: "cello_agents", arguments: {} } },
+      ]),
+    });
+    const body = await res.text();
+    expect(res.status).toBe(200);
+    expect(body).toContain("tool_not_permitted");
+    expect(fake.calls.map((x) => x.method)).not.toContain("cello_send");
+    expect(fake.calls.map((x) => x.method)).toContain("cello_list_agents");
   });
 
   it("an allowed tool proxies with the caller's parameters unchanged", async () => {

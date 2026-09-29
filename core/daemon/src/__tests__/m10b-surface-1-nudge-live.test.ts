@@ -210,7 +210,7 @@ describe("DOD-ONBOARD-HELP-1 §2b — every declared tool has a handler behind i
     // Some verbs are served by a differently-named IPC method (the wallet_* family predates the
     // vocabulary), so the assertion is that SOMETHING serves each — via its own name or a mapping
     // the MCP shim performs. Only names the daemon is expected to answer directly are checked here.
-    const proxied = readFileSync(resolve(srcDir, "../../adapter-claude-code/src/bin/cello-mcp.ts"), "utf8");
+    const proxied = readFileSync(resolve(srcDir, "../../adapter-claude-code/src/cello-tools.ts"), "utf8");
     const missing: string[] = [];
     for (const { mcp } of DUAL_SURFACE_VERBS) {
       const at = proxied.indexOf(`server.tool("${mcp}"`);

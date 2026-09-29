@@ -23,7 +23,7 @@ describe("DOD-END-SURFACE-1 — consent verb parameters reach the handler", () =
   // handler READS, and it lives in a different package from the code it reads — so a move that runs
   // only the daemon package's tests leaves it red and the parity unchecked.
   const daemon = readFileSync(resolve(repo, "core/daemon/src/signal-handlers.ts"), "utf8");
-  const mcp = readFileSync(resolve(repo, "core/adapter-claude-code/src/bin/cello-mcp.ts"), "utf8");
+  const mcp = readFileSync(resolve(repo, "core/adapter-claude-code/src/cello-tools.ts"), "utf8");
   const cli = readFileSync(resolve(repo, "core/cli/src/parity-commands.ts"), "utf8");
 
   /** The params a handler actually reads: every `params?.<name>` inside its handler body. */

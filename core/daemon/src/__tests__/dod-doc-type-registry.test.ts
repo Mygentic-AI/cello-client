@@ -156,7 +156,7 @@ describe("what the MCP tool ADVERTISES matches what the daemon admits", () => {
   // exactly the shape that just drifted between two files. This audit is the substitute for the
   // import: the description is READ and checked against the registry.
   const here = fileURLToPath(new URL(".", import.meta.url));
-  const SHIM = readFileSync(join(here, "..", "..", "..", "adapter-claude-code", "src", "bin", "cello-mcp.ts"), "utf8");
+  const SHIM = readFileSync(join(here, "..", "..", "..", "adapter-claude-code", "src", "cello-tools.ts"), "utf8");
 
   it("the document_type description names every admitted type", () => {
     const line = SHIM.split("\n").find((l) => l.includes("document_type: z.string()"));

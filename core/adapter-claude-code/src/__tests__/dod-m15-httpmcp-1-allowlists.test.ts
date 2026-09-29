@@ -6,7 +6,8 @@
  * Agent guard: any agent a caller names is resolved to an IDENTITY (pubkey) and refused before the
  * daemon is called unless permitted.
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+import { registerCelloTools, type ToolSink } from "../cello-tools.js";
 import {
   DEFAULT_DENIED_TOOLS,
   ToolsFileError,
@@ -15,6 +16,7 @@ import {
 } from "../tool-allowlist.js";
 import { guardProxy, makeNotificationPermit, resolvePermittedAgents } from "../agent-guard.js";
 
+vi.stubEnv("CELLO_DOCUMENTS", "");
 const ALL = collectToolNames();
 
 describe("082 tool allowlist", () => {
@@ -185,12 +187,76 @@ describe("082 agent guard", () => {
     expect(guardProxy(inner, "all")).toBe(inner);
   });
 
-  it("notifications about a non-permitted or unknown agent are dropped; permitted ones pass", async () => {
-    const { inner } = recorder(R);
-    const permit = await makeNotificationPermit(inner, new Set([A]));
-    expect(permit({ data: { agent: "alice" } })).toBe(true);
-    expect(permit({ data: { agent: "bob" } })).toBe(false);
-    expect(permit({ data: { agent: "ghost" } })).toBe(false);
-    expect(permit({ data: {} })).toBe(false);
+  it("a NAME-keyed agent tool is one of exactly the three the guard checks under `name`", () => {
+    const shapes = new Map<string, string[]>();
+    registerCelloTools({ tool: (n: string, _d: string, shape: Record<string, unknown>) => { shapes.set(n, Object.keys(shape)); } } as unknown as ToolSink, { call: async () => undefined });
+    const withName = [...shapes].filter(([, keys]) => keys.includes("name")).map(([n]) => n).sort();
+    // cello_channel_create's `name` is a channel name, not an agent; any NEW tool with `name` must be decided here.
+    expect(withName).toEqual(["cello_channel_create", "cello_set_agent_offline", "cello_start_agent", "cello_use_agent"]);
+    for (const [n, keys] of shapes) {
+      const agentish = keys.filter((k) => /agent/i.test(k) && k !== "agent");
+      expect(agentish, `${n} names an agent under a key the guard does not check`).toEqual([]);
+    }
+  });
+
+  it("with no agent named, the connection's current agent is checked: an unpermitted current agent is refused", async () => {
+    const { inner, calls } = recorder(R);
+    const bad = guardProxy(inner, new Set([A]), () => {}, () => "bob");
+    const out = (await bad.call("cello_send", { session_id: "s" })) as Record<string, unknown>;
+    expect(out["reason"]).toBe("agent_not_permitted");
+    expect(calls.map((c) => c.method)).not.toContain("cello_send");
+    const good = guardProxy(inner, new Set([A]), () => {}, () => "alice");
+    await good.call("cello_send", { session_id: "s" });
+    expect(calls.map((c) => c.method)).toContain("cello_send");
+  });
+
+  it("an `agent` that is not a string is refused, not forwarded", async () => {
+    const { inner, calls } = recorder(R);
+    const g = guardProxy(inner, new Set([A]));
+    for (const bad of [42, { name: "alice" }, ["alice"], null]) {
+      const out = (await g.call("cello_contact_list", { agent: bad })) as Record<string, unknown>;
+      expect(out["reason"], JSON.stringify(bad)).toBe("agent_not_permitted");
+    }
+    expect(calls.map((c) => c.method)).not.toContain("cello_contact_list");
+  });
+
+  it("a name two roster entries share is refused unless BOTH are permitted", async () => {
+    const dup = () => roster([{ name: "alice", pubkey: A }, { name: "alice", pubkey: C }]);
+    const { inner, calls } = recorder(dup);
+    const out = (await guardProxy(inner, new Set([A])).call("cello_use_agent", { name: "alice" })) as Record<string, unknown>;
+    expect(out["reason"]).toBe("agent_not_permitted");
+    expect(calls.map((c) => c.method)).not.toContain("cello_use_agent");
+  });
+
+  it("a roster row missing its pubkey stops the call with a named reason; nothing is forwarded", async () => {
+    const { inner, calls } = recorder(() => ({ agents: [{ name: "alice" }] }));
+    const out = (await guardProxy(inner, new Set([A])).call("cello_use_agent", { name: "alice" })) as Record<string, unknown>;
+    expect(out["reason"]).toBe("agent_roster_unreadable");
+    expect(String(out["guidance"])).toContain("cello status");
+    expect(calls.map((c) => c.method)).not.toContain("cello_use_agent");
+  });
+
+  it("a daemon that is down answers with its own recovery, not a permission refusal", async () => {
+    const down = { ok: false, reason: "daemon_not_running", guidance: "start it" };
+    const { inner } = recorder(() => down);
+    const out = (await guardProxy(inner, new Set([A])).call("cello_use_agent", { name: "alice" })) as Record<string, unknown>;
+    expect(out["reason"]).toBe("daemon_not_running");
+  });
+
+  it("notifications: judged on a FRESH roster; not-permitted, no-agent and unreadable-roster frames are dropped with their cause", async () => {
+    let live = R();
+    const logged: Array<Record<string, unknown>> = [];
+    const { inner } = recorder(() => live);
+    const permit = makeNotificationPermit(inner, new Set([A]), (_e, ctx) => logged.push(ctx ?? {}));
+    expect(await permit({ data: { agent: "alice" } })).toBe(true);
+    expect(await permit({ data: { agent: "bob" } })).toBe(false);
+    expect(await permit({ data: { agent: "ghost" } })).toBe(false);
+    expect(await permit({ data: {} })).toBe(false);
+    live = roster([{ name: "carol", pubkey: A }]);
+    expect(await permit({ data: { agent: "carol" } }), "a permitted agent renamed after the session began").toBe(true);
+    expect(await permit({ data: { agent: "alice" } }), "the old name no longer means the permitted agent").toBe(false);
+    live = { agents: "nope" } as never;
+    expect(await permit({ data: { agent: "carol" } })).toBe(false);
+    expect(logged.map((l) => l["cause"])).toEqual(["not_permitted", "not_permitted", "no_agent_in_frame", "not_permitted", "roster_unreadable"]);
   });
 });
