@@ -6,6 +6,8 @@ export function jsonText(value: unknown): { content: [{ type: "text"; text: stri
 
 // Structured diagnostics. The shims hold no injected logger (they are thin proxies), so they write
 // `domain.noun.verb` events as JSON to stderr — never console.log.
+export type LogFn = (event: string, context?: Record<string, unknown>) => void;
+
 export function logEvent(event: string, context: Record<string, unknown> = {}): void {
   process.stderr.write(JSON.stringify({ event, ...context }) + "\n");
 }

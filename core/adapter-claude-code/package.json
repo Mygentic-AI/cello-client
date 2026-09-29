@@ -10,7 +10,8 @@
     "access": "public"
   },
   "bin": {
-    "cello-mcp": "./dist/bin/cello-mcp.js"
+    "cello-mcp": "./dist/bin/cello-mcp.js",
+    "cello-mcp-http": "./dist/bin/cello-mcp-http.js"
   },
   "files": [
     "dist/",

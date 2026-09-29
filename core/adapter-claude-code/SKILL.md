@@ -599,6 +599,30 @@ so a counterparty who does not already have your address never learns it.
 | `CELLO_DIR` | `~/.cello` | Home for the daemon socket, key material, and the encrypted database. Set it to run a second, isolated identity. |
 | `CELLO_DIRECTORY_URL` | *(baked in)* | Directory endpoint. Override for staging or self-hosted deployments. |
 
+## For clients that only speak remote HTTPS: `cello-mcp-http`
+
+Some MCP clients do not start local processes and accept only an HTTPS URL. `cello-mcp-http` serves
+the same tools, with the same parameters, over MCP Streamable HTTP, and talks to your own local daemon
+exactly as `cello-mcp` does.
+
+```
+cello-mcp-http --port 8787 --token-file ~/.cello/mcp-http.token \
+               [--agents alice,bob] [--tools-file ~/.cello/mcp-http.tools]
+```
+
+- **Token:** required. Put it in a file readable by your user alone (`chmod 600`), or set `CELLO_MCP_HTTP_TOKEN`.
+  The client sends it as `Authorization: Bearer <token>`.
+- **`--agents`:** the agents the endpoint will serve, by name or pubkey. At least one; each must exist.
+  Omit it to serve every agent.
+- **`--tools-file`:** one tool name per line; `*` means every tool; `-name` removes one; `#` starts a
+  comment. Omit it to expose every tool except `cello_config_set`, `cello_settings_set`,
+  `cello_set_agent_offline` and `cello_contact_set_tier`. A file you give replaces that default.
+- **TLS is yours.** It listens on `127.0.0.1` by default. Put your own TLS in front, or pass
+  `--tls-cert` and `--tls-key`; any other `--host` requires them.
+
+The two lists limit what this endpoint will do. They do not limit other programs on your machine that
+can open the daemon socket.
+
 ## Troubleshooting
 
 **`daemon_not_running`**

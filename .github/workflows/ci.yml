@@ -776,7 +776,7 @@ jobs:
             [ "$i" = "12" ] && { echo "FAIL: could not install published packages after retries"; exit 1; }
           done
           # Bin files must be non-trivial (an empty publish ships package.json only → no/0-byte bins)
-          for b in @cello-protocol/daemon/dist/bin/cello-daemon.js @cello-protocol/cli/dist/bin/cello.js @cello-protocol/connect/dist/bin/cello-mcp.js; do
+          for b in @cello-protocol/daemon/dist/bin/cello-daemon.js @cello-protocol/cli/dist/bin/cello.js @cello-protocol/connect/dist/bin/cello-mcp.js @cello-protocol/connect/dist/bin/cello-mcp-http.js; do
             test -s "node_modules/$b" || { echo "FAIL: node_modules/$b is missing or empty — package published without dist"; exit 1; }
             echo "OK: node_modules/$b present"
           done

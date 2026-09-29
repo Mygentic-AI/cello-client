@@ -126,6 +126,7 @@ function reachFrom(roots) {
 const appBins = [
   join(nameToSrc.get("@cello-protocol/daemon") ?? "", "bin/cello-daemon.ts"),
   join(nameToSrc.get("@cello-protocol/connect") ?? "", "bin/cello-mcp.ts"),
+  join(nameToSrc.get("@cello-protocol/connect") ?? "", "bin/cello-mcp-http.ts"),
   join(nameToSrc.get("@cello-protocol/cli") ?? "", "bin/cello.ts"),
   join(nameToSrc.get("@cello-protocol/gateway") ?? "", "bin/cello-gateway.ts"),
 ].filter((f) => existsSync(f));
