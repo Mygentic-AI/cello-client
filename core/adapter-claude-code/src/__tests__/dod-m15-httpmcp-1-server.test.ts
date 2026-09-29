@@ -5,7 +5,6 @@
  * client and the daemon socket.
  */
 import { describe, it, expect, afterEach } from "vitest";
-import { createServer, type Server, type Socket } from "node:net";
 import { mkdtemp, rm, writeFile, chmod } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -15,60 +14,13 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { startMcpHttpServer, type McpHttpHandle } from "../http-server.js";
 import { DEFAULT_DENIED_TOOLS } from "../tool-allowlist.js";
 import { readTokenFile } from "../http-config.js";
+import { fakeDaemon, type Fake } from "./helpers/fake-daemon.js";
 
 const TOKEN = "t".repeat(40);
-const A = "aa".repeat(32);
-const B = "bb".repeat(32);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 async function waitFor(cond: () => boolean, ms = 5000) {
   const end = Date.now() + ms;
   while (!cond() && Date.now() < end) await sleep(10);
-}
-
-interface Rec { method: string; params: Record<string, unknown> | undefined; conn: number }
-interface Fake {
-  path: string;
-  calls: Rec[];
-  closedConns: Set<number>;
-  connCount: () => number;
-  roster: Array<{ name: string; pubkey: string; state: string }>;
-  close(): Promise<void>;
-}
-
-async function fakeDaemon(dir: string): Promise<Fake> {
-  const path = join(dir, "daemon.sock");
-  const calls: Rec[] = [];
-  const closedConns = new Set<number>();
-  const sockets: Socket[] = [];
-  const fake: Fake = {
-    path, calls, closedConns,
-    connCount: () => sockets.length,
-    roster: [
-      { name: "alice", pubkey: A, state: "online" },
-      { name: "bob", pubkey: B, state: "online" },
-    ],
-    close: async () => { for (const s of sockets) s.destroy(); await new Promise<void>((r) => server.close(() => r())); },
-  };
-  const server: Server = createServer((socket) => {
-    const conn = sockets.push(socket);
-    let buf = "";
-    socket.on("data", (c: Buffer) => {
-      buf += c.toString("utf-8");
-      let i: number;
-      while ((i = buf.indexOf("\n")) !== -1) {
-        const line = buf.slice(0, i); buf = buf.slice(i + 1);
-        if (!line.trim()) continue;
-        const req = JSON.parse(line) as { id: string; method: string; params?: Record<string, unknown> };
-        calls.push({ method: req.method, params: req.params, conn });
-        const result = req.method === "cello_list_agents" ? { agents: fake.roster } : { ok: true, method: req.method };
-        socket.write(JSON.stringify({ id: req.id, result }) + "\n");
-      }
-    });
-    socket.on("close", () => closedConns.add(conn));
-    socket.on("error", () => {});
-  });
-  await new Promise<void>((r) => server.listen(path, () => r()));
-  return fake;
 }
 
 let dir: string;
