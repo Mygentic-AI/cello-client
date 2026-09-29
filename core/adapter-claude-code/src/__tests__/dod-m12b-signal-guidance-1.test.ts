@@ -85,7 +85,7 @@ describe("DOD-M12B-SIGNAL-GUIDANCE-1: the NEXT refusal on the same path", () => 
 });
 
 describe("DOD-M12B-SIGNAL-GUIDANCE-1: the shim is wired to the shared constants", () => {
-  const SHIM_SRC = join(import.meta.dirname, "..", "bin", "cello-mcp.ts");
+  const SHIM_SRC = join(import.meta.dirname, "..", "cello-tools.ts");
   const source = readFileSync(SHIM_SRC, "utf8");
 
   /**

@@ -6,7 +6,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-const SRC = readFileSync(join(import.meta.dirname, "..", "bin", "cello-mcp.ts"), "utf8");
+const SRC = readFileSync(join(import.meta.dirname, "..", "cello-tools.ts"), "utf8");
 
 function tools(): Map<string, string> {
   const out = new Map<string, string>();

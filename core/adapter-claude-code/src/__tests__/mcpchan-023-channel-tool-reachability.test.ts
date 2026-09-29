@@ -26,7 +26,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const SHIM_SRC = readFileSync(join(here, "..", "bin", "cello-mcp.ts"), "utf8");
+const SHIM_SRC = readFileSync(join(here, "..", "cello-tools.ts"), "utf8");
 const DAEMON_SRC = join(here, "..", "..", "..", "daemon", "src");
 
 /**

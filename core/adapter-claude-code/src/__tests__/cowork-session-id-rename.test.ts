@@ -23,7 +23,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const source = readFileSync(join(here, "..", "bin", "cello-mcp.ts"), "utf8");
+const source = readFileSync(join(here, "..", "cello-tools.ts"), "utf8");
 
 /** Every tool that takes a session id. All eight were dead through the bridge. */
 const SESSION_ID_TOOLS = [

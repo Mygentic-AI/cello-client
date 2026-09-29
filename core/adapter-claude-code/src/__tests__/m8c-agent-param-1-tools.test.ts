@@ -18,7 +18,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const source = readFileSync(join(here, "..", "bin", "cello-mcp.ts"), "utf8");
+const source = readFileSync(join(here, "..", "cello-tools.ts"), "utf8");
 
 /** MCP tool name → the daemon method it proxies to (they differ on four of them). */
 const SESSION_TOOLS: Array<[tool: string, method: string]> = [

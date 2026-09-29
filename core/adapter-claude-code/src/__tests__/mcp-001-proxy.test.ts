@@ -267,7 +267,7 @@ describe("DAEMON-004: IpcProxy forwards session_id verbatim (real proxy wire sha
   });
 
   it("cello-mcp.ts forwards the snake_case session_id field for all three session tools", () => {
-    const src = readFileSync(join(import.meta.dirname, "..", "bin", "cello-mcp.ts"), "utf8");
+    const src = readFileSync(join(import.meta.dirname, "..", "cello-tools.ts"), "utf8");
     // The defect this guards is a CAMEL-CASE key on the wire: the daemon reads snake_case, so a
     // `sessionId` here produces missing_params on every real invocation. Assert the key each call
     // carries, not the literal expression building it — the payloads now compose optional keys
@@ -291,7 +291,7 @@ describe("DAEMON-004: IpcProxy forwards session_id verbatim (real proxy wire sha
   });
 
   it("cello_send signal feature: token appended, missing-signal returns SIGNAL_ERROR", () => {
-    const src = readFileSync(join(import.meta.dirname, "..", "bin", "cello-mcp.ts"), "utf8");
+    const src = readFileSync(join(import.meta.dirname, "..", "cello-tools.ts"), "utf8");
     // The three token literals must be present in the source — the append path for each value.
     expect(src).toContain('"[[OVER]]"');
     expect(src).toContain('"[[WRAP]]"');

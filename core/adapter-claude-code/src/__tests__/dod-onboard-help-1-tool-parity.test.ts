@@ -37,7 +37,7 @@ import { dirname, join, relative } from "node:path";
 import { DUAL_SURFACE_VERBS, MCP_ONLY_TOOLS, knownToolNames } from "@cello-protocol/daemon";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const SHIM_SRC = join(here, "..", "bin", "cello-mcp.ts");
+const SHIM_SRC = join(here, "..", "cello-tools.ts");
 const source = readFileSync(SHIM_SRC, "utf8");
 
 /**

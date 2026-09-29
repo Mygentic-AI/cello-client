@@ -35,7 +35,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
-const SURFACE_PATH = join(import.meta.dirname, "..", "bin", "cello-mcp.ts");
+const SURFACE_PATH = join(import.meta.dirname, "..", "cello-tools.ts");
 
 /**
  * Every tool description on the surface.
