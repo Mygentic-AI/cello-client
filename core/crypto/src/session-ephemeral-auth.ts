@@ -132,8 +132,6 @@ export const EPHEMERAL_AUTH_REFUSALS = {
   PQ_SIGNATURE_MISSING: "ephemeral_pq_signature_missing",
   /** The ML-DSA signature did not verify against the counterparty's registered ML-DSA key. */
   PQ_SIGNATURE_MISMATCH: "ephemeral_pq_signature_mismatch",
-  /** A `mlkem_ciphertext` from the side that is not the encapsulator. */
-  PQ_ROLE_VIOLATION: "ephemeral_pq_role_violation",
   /** This machine holds no verified ML-DSA key for the counterparty — a LOCAL fault, never the peer's. */
   PQ_PEER_KEYS_UNKNOWN: "ephemeral_pq_peer_keys_unknown",
 } as const;

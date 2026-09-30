@@ -320,7 +320,7 @@ export class SessionEphemerals {
     }
     const peerX25519 = frame.ephemeralPublic!;
     const peerMlKem = frame.mlkemPublic!;
-    const peerCt = frame.mlkemCiphertext;
+    let peerCt = frame.mlkemCiphertext;
 
     const ownEphemeral = this.sessionEphemeralFor(agentName, sessionId);
     if (!ownEphemeral) {
@@ -338,14 +338,20 @@ export class SessionEphemerals {
      * either side can swap the order.
      */
     const weEncapsulate = lexLess(ownEphemeral.publicKey, peerX25519);
+    /**
+     * A CIPHERTEXT FROM THE DECAPSULATOR IS STALE, NOT HOSTILE. It was a freeze, and an honest peer
+     * hit it on about one restart in four (-m9d.5 CI): the old encapsulator re-sends the ciphertext it
+     * remembers, this side re-keys to a LOWER X25519 key and becomes the encapsulator, and the two
+     * announces cross. The frame verified against the counterparty's keys above, so nothing forged
+     * reaches here. Ignoring it and encapsulating as our role says converges both sides on one key.
+     */
     if (weEncapsulate && peerCt !== undefined) {
-      await this.#refuseKey(
-        agentName, sessionId, EPHEMERAL_AUTH_REFUSALS.PQ_ROLE_VIOLATION,
-        "the peer sent a post-quantum ciphertext, but its session key sorts higher than ours, so it is the side that must NOT encapsulate. Two ciphertexts would leave the two sides on different keys.",
-        correlationId,
-      );
-      return;
+      this.#ctx.logger.debug("session.key.stale_pq_ciphertext_ignored", { agentName, sessionId, correlationId });
+      peerCt = undefined;
     }
+    // The decapsulator owns no ciphertext: drop one remembered from before a re-key swapped the
+    // roles, or every later announce re-sends it.
+    if (!weEncapsulate) this.#ownCiphertexts.delete(key);
 
     /**
      * ALREADY AGREED WITH **THIS** PEER HALF — idempotence keyed on the WHOLE half: X25519 key, ML-KEM

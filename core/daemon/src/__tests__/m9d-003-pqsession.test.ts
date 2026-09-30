@@ -159,8 +159,15 @@ describe("003 test 10 (D10) — a re-announce with a new ct under an unchanged X
   });
 });
 
-describe("003 test 11 — a ciphertext from the decapsulator is a role violation", () => {
-  it("refused as ephemeral_pq_role_violation and the session is frozen", async () => {
+describe("003 test 11 — a ciphertext from the decapsulator is STALE, never a reason to freeze", () => {
+  /**
+   * Revised 2026-09-30 after the -m9d.5 CI failure. This was a freeze (`ephemeral_pq_role_violation`),
+   * and an honest peer triggered it on about one restart in four: the old encapsulator re-sends the
+   * ciphertext it remembers, the peer re-keys to a LOWER X25519 key and becomes the encapsulator, and
+   * the two announces cross. The frame is signed by the counterparty, so nothing forged reaches this
+   * branch — the ciphertext is ignored, and this side encapsulates as its role says.
+   */
+  it("ignored: no freeze, nothing derived from it, and agreement still completes", async () => {
     const { A, B } = await agreedPair(true); // B is the decapsulator
     const b = B.eph.sessionEphemeralPublicsForTest(B.name, SID)!;
     const { sig, pqSig } = await signSessionEphemeral(B.kLocal, B.mlDsa, SID_BYTES, b.x25519, b.mlKem, new Uint8Array(ML_KEM_CIPHERTEXT_BYTES).fill(9));
@@ -168,9 +175,12 @@ describe("003 test 11 — a ciphertext from the decapsulator is a role violation
       ephemeralPublic: b.x25519, mlkemPublic: b.mlKem, mlkemCiphertext: new Uint8Array(ML_KEM_CIPHERTEXT_BYTES).fill(9),
       signature: sig, pqSignature: pqSig,
     }, "t");
-    expect(A.frozen).toContain("ephemeral_pq_role_violation");
-    expect(A.events.some((e) => e.event === "session.key.refused" && e.ctx["reason"] === "ephemeral_pq_role_violation")).toBe(true);
-    expect(keyOf(A)).toBeNull();
+    expect(A.frozen, "a stale ciphertext from a signed peer froze the session").toEqual([]);
+    expect(A.events.some((e) => e.event === "session.key.stale_pq_ciphertext_ignored")).toBe(true);
+    // A treated the frame as B's half WITHOUT the ciphertext: it encapsulated, and B agrees with it.
+    await pump(A, B);
+    expect(keyOf(B)).not.toBeNull();
+    expect(hex(keyOf(A)!)).toBe(hex(keyOf(B)!));
   });
 });
 
@@ -208,6 +218,25 @@ describe("003 test 12 — re-key on either side", () => {
     expect(keyOf(B)).not.toBeNull();
     expect(hex(keyOf(A)!)).toBe(hex(keyOf(B)!));
     expect(hex(keyOf(A)!)).not.toBe(before);
+  });
+
+  it("★ the re-key SWAPS the roles and the stale announce crosses: no freeze, both agree (-m9d.5 CI)", async () => {
+    // A encapsulates and remembers its ciphertext. B re-keys LOWER, so B is now the encapsulator —
+    // and A announces BEFORE it has seen B's new half, still carrying the old ciphertext.
+    const { A, B } = await agreedPair(true);
+    await A.eph.sendEphemeralFrame(A.name, SID); await B.eph.sendEphemeralFrame(B.name, SID); await pump(A, B);
+    const before = hex(keyOf(A)!);
+    await rekey(B, A, true);
+    await A.eph.sendEphemeralFrame(A.name, SID);
+    await B.eph.sendEphemeralFrame(B.name, SID);
+    await pump(A, B);
+    expect([...A.frozen, ...B.frozen], "an honest restart froze the session").toEqual([]);
+    expect(keyOf(A)).not.toBeNull();
+    expect(hex(keyOf(A)!)).toBe(hex(keyOf(B)!));
+    expect(hex(keyOf(A)!)).not.toBe(before);
+    // A is now the decapsulator: it must stop re-sending the ciphertext it no longer owns.
+    await A.eph.sendEphemeralFrame(A.name, SID);
+    expect((await unframe(A.outbox.shift()!))["mlkem_ciphertext"], "A still re-sends its stale ciphertext").toBeUndefined();
   });
 });
 
