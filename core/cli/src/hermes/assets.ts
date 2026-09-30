@@ -1985,7 +1985,7 @@ Trigger: /cello-bridge-setup, or "install the CELLO bridge".
        cello bridge hermes --agent <name>
 
    Pass \`--hermes-home <path>\` only if Hermes does not live at ~/.hermes.
-4. **Choose how this agent should behave** (both optional, both per-agent):
+4. **Choose how this agent should behave** (all optional, all per-agent):
 
    | \`--delivery-mode\` | inbound | outbound |
    |---|---|---|
@@ -1998,6 +1998,14 @@ Trigger: /cello-bridge-setup, or "install the CELLO bridge".
 
    Use \`--session-scope peer\` for anything customer-facing: under \`agent\` scope every
    caller shares one conversation, so two customers' problems land in one context.
+
+       --channel-notifications on    a new post on a channel you follow wakes you (DEFAULT)
+       --channel-notifications off   channel doorbells are ignored; you read channels when you look
+
+   With \`on\` the wake is a short notice, not the post: read it with \`cello_channel_read\`. If one
+   channel turns out to be noisy, quiet just that one with \`cello channel notify <channel> pull\`
+   (or the \`cello_channel_notify\` tool) and read it on a schedule with \`cello channel read <channel>\`,
+   for example from a cron job. Use \`off\` only to stop every channel waking you.
    Omitting a flag on a re-run RESETS it to the default — it does not keep the old value.
 5. **Restart the gateway:** \`hermes gateway restart\`.
 6. **Verify.** Call the \`cello_status\` MCP tool and report the bound agent's state,
