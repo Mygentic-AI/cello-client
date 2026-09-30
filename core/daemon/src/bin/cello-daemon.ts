@@ -131,7 +131,11 @@ async function startSecurityLayer(correlationId?: string): Promise<{ client: Loc
     const backend = sidecar.layer2.startsWith("active:") ? sidecar.layer2.slice(7) : "off";
     logger.info("security.gateway.layer2.backend", {
       backend,
-      reason: backend === "off" ? sidecar.layer2.replace(/^off:/, "") : `${backend} passed its self-check`,
+      reason: backend === "off"
+        ? sidecar.layer2.replace(/^off:/, "")
+        : backend === "wasm"
+          ? `native failed its self-check (${JSON.stringify(sidecar.selfChecks.find((c) => c["backend"] === "native") ?? {})}); wasm passed`
+          : "native passed its self-check",
       ...(correlationId !== undefined ? { correlationId } : {}),
     });
     recordGatewayLayer2(sidecar.layer2);
