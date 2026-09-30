@@ -82,6 +82,10 @@ describe("SCREENINSTALL: cello screener", () => {
       // 080-SCREENERCPU: an install proves the bytes, not the scores — "2 of 2" is the gateway's to claim.
       expect(r.stdout).toContain("installed and verified");
       expect(r.stdout).not.toContain("2 of 2");
+      // 087 Part B: a running gateway loads the weights only at start, so the install ends by saying so.
+      expect(r.stdout.trimEnd().split("\n").at(-1)).toBe(
+        "Restart the daemon with  cello logout && cello login  to load it.",
+      );
     });
 
     it("is a no-op when everything is already installed and verified", async () => {
@@ -137,6 +141,8 @@ describe("SCREENINSTALL: cello screener", () => {
       const r = await screenerInstallCommand({ dir, runtimePresent: false, assumeYes: false, interactive: false });
       expect(r.exitCode).toBe(1);
       expect(r.stdout).toContain("--yes");
+      // 087 Part C: a stop, not a failure — nothing installed, nothing went wrong.
+      expect(r.stdout).toContain("Nothing was installed and nothing went wrong");
     });
   });
 

@@ -223,7 +223,8 @@ export async function screenerInstallCommand(opts: ScreenerInstallOptions): Prom
     if (!opts.interactive) {
       // A prompt with nobody to answer it is a hang, and a hung install reads as a broken one.
       return {
-        stdout: consentPrompt() + "\nNo terminal to ask at. Run `cello screener install --yes` to proceed.\n",
+        // 087 Part C: exit 1 because it stopped without consent, not because anything failed.
+        stdout: consentPrompt() + "\nNothing was installed and nothing went wrong: there is no terminal here to ask. To install without a person at the keyboard, run `cello screener install --yes`.\n",
         stderr: "", exitCode: 1,
       };
     }
@@ -291,5 +292,10 @@ export async function screenerInstallCommand(opts: ScreenerInstallOptions): Prom
     return { stdout: "", stderr: `Install did not complete: ${describeScreenerState(after)}\n`, exitCode: 1 };
   }
   log?.info("screener.install.complete", { correlationId, dir, revision: after.revision, filesVerified: after.model.filesPresent });
-  return { stdout: `${describeScreenerState(after)}\nModel directory: ${dir}\n`, stderr: "", exitCode: 0 };
+  // 087 Part B: a running gateway loads the weights once, at start, and reports its Layer 2 state then —
+  // so the daemon keeps its old verdict until it restarts. Say so rather than leave it stale.
+  return {
+    stdout: `${describeScreenerState(after)}\nModel directory: ${dir}\nRestart the daemon with  cello logout && cello login  to load it.\n`,
+    stderr: "", exitCode: 0,
+  };
 }
