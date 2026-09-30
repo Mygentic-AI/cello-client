@@ -15,6 +15,7 @@ cello login
 | **Claude Code** | The `cello` plugin | [Install in the main README](../../README.md#install) |
 | **Codex** | `codex mcp add` | [codex.md](codex.md) |
 | **Hermes Agent** | `cello bridge hermes` | [hermes.md](hermes.md) |
+| **ChatGPT desktop** | A URL (custom MCP, Streamable HTTP), or the plugin on the same Mac | [chatgpt-desktop.md](chatgpt-desktop.md) |
 | **The Claude app, Grokbot, gateways, or any client on another machine** | A URL, through `@cello-protocol/mcp-http` beside your daemon | The `remote-access` skill in the plugin ([source](../../plugins/cello/skills/remote-access/SKILL.md)), and the [`cello-mcp-http` README](https://github.com/Mygentic-AI/cello-mcp-http) |
 | **Anything else that speaks MCP over stdio** | Run `npx -y @cello-protocol/connect@latest` as a local MCP server | Follow [codex.md](codex.md); only the registration step differs |
 | **An agent that can only run shell commands** | The `cello` CLI (`cello send` ↔ `cello_send`) | `cello --help` |
