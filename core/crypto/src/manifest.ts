@@ -4,13 +4,13 @@
  * Provides canonical serialization and threshold signature verification for
  * ConsortiumManifest instances. The verification logic:
  *
- * 1. Computes the canonical body bytes (all fields except `signatures`,
- *    object keys sorted lexicographically at every nesting level, no whitespace,
- *    UTF-8 encoded).
- * 2. For each signature entry, verifies it against the officer key at the
- *    specified index.
+ * 1. Computes the canonical body bytes (all fields except `signatures` and
+ *    `pq_signatures`, object keys sorted lexicographically at every nesting level,
+ *    no whitespace, UTF-8 encoded).
+ * 2. Verifies the Ed25519 officer set, then the ML-DSA officer set (M9D 004), each
+ *    entry against the root key at its index.
  * 3. Counts only unique valid officer indices — duplicates count once.
- * 4. Returns ok: true if unique valid count >= threshold.
+ * 4. Returns ok: true only if BOTH sets reach their thresholds.
  *
  * Security properties:
  * - Out-of-bounds officer indices are silently skipped (AC-008).
@@ -76,6 +76,7 @@ export type ManifestVerifyReason =
   | "manifest_pq_signatures_missing"
   | "manifest_pq_signatures_below_threshold"
   | "manifest_node_mldsa_pubkey_invalid"
+  | "manifest_intake_key_invalid"
   | "manifest_mlkem_intake_key_invalid";
 
 export type ManifestVerifyResult =
@@ -218,6 +219,18 @@ export async function verifyManifest(
     }
     seenMlDsa.add(k);
   }
+  // The ML-KEM key is bound to `intake_key.key_id` by sitting beside it, so it means nothing without
+  // a well-formed `intake_key`. Required here, so a verified manifest can always seal a submission.
+  const intake = manifest["intake_key"] as { key_id?: unknown; pubkey?: unknown } | undefined;
+  if (!intake || typeof intake.key_id !== "string" || intake.key_id.length === 0 ||
+      typeof intake.pubkey !== "string" || !ED25519_PUBKEY_HEX.test(intake.pubkey)) {
+    return {
+      ok: false,
+      reason: "manifest_intake_key_invalid",
+      detail: "intake_key is missing or malformed (expected a non-empty key_id and a 64-lowercase-hex Ed25519 pubkey)",
+      diagnostics: { threshold, validOfficers: [], skippedEntries: [] },
+    };
+  }
   const kem = manifest["mlkem_intake_key"];
   if (typeof kem !== "string" || !MLKEM_INTAKE_KEY_HEX.test(kem)) {
     return {
@@ -334,7 +347,8 @@ export async function verifyManifest(
 }
 
 const MLDSA_PUBKEY_HEX = new RegExp("^[0-9a-f]{" + ML_DSA_PUBLIC_KEY_BYTES * 2 + "}$");
-const MLKEM_INTAKE_KEY_HEX = new RegExp("^[0-9a-f]{" + ML_KEM_PUBLIC_KEY_BYTES * 2 + "}$");
+const ED25519_PUBKEY_HEX = /^[0-9a-f]{64}$/;
+const MLKEM_INTAKE_KEY_HEX =new RegExp("^[0-9a-f]{" + ML_KEM_PUBLIC_KEY_BYTES * 2 + "}$");
 
 // ─── Internal helpers ────────────────────────────────────────────────────────
 

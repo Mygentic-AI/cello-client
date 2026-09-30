@@ -10,7 +10,6 @@
  * AC-007: 3 entries all officerIndex: 0 → only 1 unique → { ok: false }.
  * AC-008: officerIndex: 99 → silently skipped, no RangeError.
  * AC-009: Malformed hex → silently handled, no throw.
- * AC-010: CONSORTIUM_ROOT_KEYS is readonly tuple of 5 hex(64), CONSORTIUM_THRESHOLD=3.
  * AC-011: TEST_CONSORTIUM_ROOT_KEYS separate from production, test privkeys not in public exports.
  * AC-012: makeTestManifest produces valid manifests that pass verifyManifest.
  * AC-013: Ceremony output verifies; rogue key signature fails.
@@ -21,7 +20,8 @@
  *
  * SI-001: Duplicate officer index → only 1 unique counts.
  * SI-002: Canonical serialization is insertion-order independent.
- * SI-003: Test keys and production keys are completely disjoint sets.
+ * M9D 004: every case verifies under BOTH officer sets; tests 1–6 at the end cover the PQ set.
+ * (AC-010 and SI-003 tested the all-zero placeholder roots, which 004 deleted.)
  *
  * Crypto reference: RFC 8032 (Ed25519).
  */
@@ -31,10 +31,10 @@ import { ed25519 } from "@noble/curves/ed25519.js";
 import {
   canonicalManifestBody,
   verifyManifest,
-  CONSORTIUM_ROOT_KEYS,
-  CONSORTIUM_THRESHOLD,
   TEST_CONSORTIUM_ROOT_KEYS,
   TEST_CONSORTIUM_THRESHOLD,
+  TEST_CONSORTIUM_PQ_THRESHOLD,
+  testConsortiumRootKeysPq,
   makeTestManifest,
 } from "../index.js";
 import type { ConsortiumManifestInput } from "../manifest.js";
@@ -60,6 +60,27 @@ function makeNodes(): TestConsortiumNode[] {
   ];
 }
 
+/**
+ * M9D 004: a manifest that passes every structural and post-quantum check, with NO Ed25519
+ * signatures — so the Ed25519 cases below exercise exactly the Ed25519 path. The PQ set stays valid
+ * because both sets sign a body that excludes both signature fields.
+ */
+async function edUnsigned(nodes: TestConsortiumNode[]): Promise<ConsortiumManifestInput> {
+  const m = await makeTestManifest(nodes, { expires: "2027-01-01T00:00:00Z" });
+  m.signatures = [];
+  return m;
+}
+
+/** Verify under the test roots: Ed25519 threshold 3, the test ML-DSA officers at their threshold. */
+async function verify(m: ConsortiumManifestInput) {
+  return verifyManifest(m, {
+    rootKeys: TEST_OFFICER_PUBKEYS,
+    threshold: TEST_CONSORTIUM_THRESHOLD,
+    rootKeysPq: await testConsortiumRootKeysPq(),
+    pqThreshold: TEST_CONSORTIUM_PQ_THRESHOLD,
+  });
+}
+
 function signManifest(manifest: ConsortiumManifestInput, officerIndices: number[]): { officerIndex: number; signature: string }[] {
   const body = canonicalManifestBody(manifest);
   return officerIndices.map((idx) => ({
@@ -71,7 +92,7 @@ function signManifest(manifest: ConsortiumManifestInput, officerIndices: number[
 // ─── AC-003: canonicalManifestBody determinism ───────────────────────────────
 
 describe("AC-003: canonicalManifestBody determinism", () => {
-  it("produces identical bytes regardless of object property insertion order", () => {
+  it("produces identical bytes regardless of object property insertion order", async () => {
     const nodes = makeNodes();
 
     // Forward key order
@@ -98,7 +119,7 @@ describe("AC-003: canonicalManifestBody determinism", () => {
     expect(toHex(bodyForward)).toBe(toHex(bodyReverse));
   });
 
-  it("produces identical bytes regardless of node property insertion order", () => {
+  it("produces identical bytes regardless of node property insertion order", async () => {
     const nodeForward: TestConsortiumNode = { nodeId: "n1", pubkey: "a".repeat(64), region: "us-east-1", provider: "aws", endpoint: "https://a.com" };
     const nodeReverse = { endpoint: "https://a.com", provider: "aws" as const, region: "us-east-1", pubkey: "a".repeat(64), nodeId: "n1" };
 
@@ -108,7 +129,7 @@ describe("AC-003: canonicalManifestBody determinism", () => {
     expect(toHex(canonicalManifestBody(m1))).toBe(toHex(canonicalManifestBody(m2)));
   });
 
-  it("signatures field is excluded from canonical body", () => {
+  it("signatures field is excluded from canonical body", async () => {
     const nodes = makeNodes();
     const m1: ConsortiumManifestInput = { version: 1, not_before: "2026-01-01T00:00:00Z", expires: "2027-01-01T00:00:00Z", nodes, signatures: [] };
     const m2: ConsortiumManifestInput = { version: 1, not_before: "2026-01-01T00:00:00Z", expires: "2027-01-01T00:00:00Z", nodes, signatures: [{ officerIndex: 0, signature: "f".repeat(128) }] };
@@ -116,14 +137,14 @@ describe("AC-003: canonicalManifestBody determinism", () => {
     expect(toHex(canonicalManifestBody(m1))).toBe(toHex(canonicalManifestBody(m2)));
   });
 
-  it("returns a Uint8Array (UTF-8 encoded bytes)", () => {
+  it("returns a Uint8Array (UTF-8 encoded bytes)", async () => {
     const manifest: ConsortiumManifestInput = { version: 1, not_before: "2026-01-01T00:00:00Z", expires: "2027-01-01T00:00:00Z", nodes: [], signatures: [] };
     const body = canonicalManifestBody(manifest);
     expect(body).toBeInstanceOf(Uint8Array);
     expect(body.length).toBeGreaterThan(0);
   });
 
-  it("output is valid JSON with sorted keys and exactly the expected fields", () => {
+  it("output is valid JSON with sorted keys and exactly the expected fields", async () => {
     const manifest: ConsortiumManifestInput = { version: 2, not_before: "2026-06-01T00:00:00Z", expires: "2027-06-01T00:00:00Z", nodes: makeNodes(), signatures: [] };
     const body = canonicalManifestBody(manifest);
     const json = new TextDecoder().decode(body);
@@ -137,7 +158,7 @@ describe("AC-003: canonicalManifestBody determinism", () => {
     expect(parsed).not.toHaveProperty("signatures");
   });
 
-  it("extra fields on manifest input are included in canonical body", () => {
+  it("extra fields on manifest input are included in canonical body", async () => {
     const manifest: ConsortiumManifestInput = {
       version: 1,
       not_before: "2026-01-01T00:00:00Z",
@@ -163,7 +184,7 @@ describe("AC-003: canonicalManifestBody determinism", () => {
 // ─── AC-003 (continued): deeply nested object key sorting ───────────────────
 
 describe("AC-003: deeply nested object key sorting", () => {
-  it("sorts object keys at three levels of nesting", () => {
+  it("sorts object keys at three levels of nesting", async () => {
     const nodeWithMeta = {
       nodeId: "n1",
       pubkey: "a".repeat(64),
@@ -190,7 +211,7 @@ describe("AC-003: deeply nested object key sorting", () => {
 // ─── SI-002: Canonical serialization is insertion-order independent ──────────
 
 describe("SI-002: canonical serialization is insertion-order independent", () => {
-  it("deeply nested objects are sorted at every level", () => {
+  it("deeply nested objects are sorted at every level", async () => {
     const node1: TestConsortiumNode = { nodeId: "n1", pubkey: "a".repeat(64), region: "us-east-1", provider: "aws", endpoint: "https://a.com" };
     // Same node but properties in reverse order
     const node2 = { endpoint: "https://a.com", provider: "aws" as const, region: "us-east-1", pubkey: "a".repeat(64), nodeId: "n1" };
@@ -205,18 +226,18 @@ describe("SI-002: canonical serialization is insertion-order independent", () =>
 // ─── AC-004: 3 valid signatures → ok: true ──────────────────────────────────
 
 describe("AC-004: threshold verification — 3 valid signatures", () => {
-  it("3 valid signatures → { ok: true, signerCount: 3 }", () => {
+  it("3 valid signatures → { ok: true, signerCount: 3 }", async () => {
     const nodes = makeNodes();
-    const manifest: ConsortiumManifestInput = { version: 1, not_before: "2026-01-01T00:00:00Z", expires: "2027-01-01T00:00:00Z", nodes, signatures: [] };
+    const manifest = await edUnsigned(nodes);
     manifest.signatures = signManifest(manifest, [0, 1, 2]);
 
-    const result = verifyManifest(manifest, TEST_OFFICER_PUBKEYS, 3);
-    expect(result).toEqual({ ok: true, signerCount: 3 });
+    const result = await verify(manifest);
+    expect(result).toEqual({ ok: true, signerCount: 3, pqSignerCount: 3 });
   });
 
-  it("corrupting any single byte in a signature → { ok: false }", () => {
+  it("corrupting any single byte in a signature → { ok: false }", async () => {
     const nodes = makeNodes();
-    const manifest: ConsortiumManifestInput = { version: 1, not_before: "2026-01-01T00:00:00Z", expires: "2027-01-01T00:00:00Z", nodes, signatures: [] };
+    const manifest = await edUnsigned(nodes);
     manifest.signatures = signManifest(manifest, [0, 1, 2]);
 
     // Corrupt first byte of first signature
@@ -229,26 +250,26 @@ describe("AC-004: threshold verification — 3 valid signatures", () => {
       ...manifest.signatures.slice(1),
     ];
 
-    const result = verifyManifest(corrupted, TEST_OFFICER_PUBKEYS, 3);
+    const result = await verify(corrupted);
     expect(result.ok).toBe(false);
   });
 
-  it("4 valid signatures → { ok: true, signerCount: 4 }", () => {
+  it("4 valid signatures → { ok: true, signerCount: 4 }", async () => {
     const nodes = makeNodes();
-    const manifest: ConsortiumManifestInput = { version: 1, not_before: "2026-01-01T00:00:00Z", expires: "2027-01-01T00:00:00Z", nodes, signatures: [] };
+    const manifest = await edUnsigned(nodes);
     manifest.signatures = signManifest(manifest, [0, 1, 2, 3]);
 
-    const result = verifyManifest(manifest, TEST_OFFICER_PUBKEYS, 3);
-    expect(result).toEqual({ ok: true, signerCount: 4 });
+    const result = await verify(manifest);
+    expect(result).toEqual({ ok: true, signerCount: 4, pqSignerCount: 3 });
   });
 });
 
 // ─── AC-005: 1 corrupted → 2 valid → below threshold ────────────────────────
 
 describe("AC-005: 1 corrupted signature leaves 2 valid (below threshold 3)", () => {
-  it("returns { ok: false } with detail containing '2 valid' and '3 required'", () => {
+  it("returns { ok: false } with detail containing '2 valid' and '3 required'", async () => {
     const nodes = makeNodes();
-    const manifest: ConsortiumManifestInput = { version: 1, not_before: "2026-01-01T00:00:00Z", expires: "2027-01-01T00:00:00Z", nodes, signatures: [] };
+    const manifest = await edUnsigned(nodes);
     manifest.signatures = signManifest(manifest, [0, 1, 2]);
 
     // Corrupt the first signature
@@ -260,7 +281,7 @@ describe("AC-005: 1 corrupted signature leaves 2 valid (below threshold 3)", () 
       ...manifest.signatures.slice(1),
     ];
 
-    const result = verifyManifest(manifest, TEST_OFFICER_PUBKEYS, 3);
+    const result = await verify(manifest);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toBe("manifest_signature_invalid");
@@ -273,12 +294,12 @@ describe("AC-005: 1 corrupted signature leaves 2 valid (below threshold 3)", () 
 // ─── AC-006: Only 2 valid sigs → below threshold ────────────────────────────
 
 describe("AC-006: only 2 valid signatures → below threshold", () => {
-  it("2 valid signatures with threshold 3 → { ok: false }", () => {
+  it("2 valid signatures with threshold 3 → { ok: false }", async () => {
     const nodes = makeNodes();
-    const manifest: ConsortiumManifestInput = { version: 1, not_before: "2026-01-01T00:00:00Z", expires: "2027-01-01T00:00:00Z", nodes, signatures: [] };
+    const manifest = await edUnsigned(nodes);
     manifest.signatures = signManifest(manifest, [0, 1]);
 
-    const result = verifyManifest(manifest, TEST_OFFICER_PUBKEYS, 3);
+    const result = await verify(manifest);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toBe("manifest_signature_invalid");
@@ -291,9 +312,9 @@ describe("AC-006: only 2 valid signatures → below threshold", () => {
 // ─── AC-007 / SI-001: Duplicate officer index ────────────────────────────────
 
 describe("AC-007 / SI-001: duplicate officerIndex — only 1 unique counts", () => {
-  it("3 entries all officerIndex: 0 → only 1 unique → { ok: false }", () => {
+  it("3 entries all officerIndex: 0 → only 1 unique → { ok: false }", async () => {
     const nodes = makeNodes();
-    const manifest: ConsortiumManifestInput = { version: 1, not_before: "2026-01-01T00:00:00Z", expires: "2027-01-01T00:00:00Z", nodes, signatures: [] };
+    const manifest = await edUnsigned(nodes);
     const body = canonicalManifestBody(manifest);
     const sig = toHex(ed25519.sign(body, TEST_OFFICER_SEEDS[0]));
 
@@ -303,7 +324,7 @@ describe("AC-007 / SI-001: duplicate officerIndex — only 1 unique counts", () 
       { officerIndex: 0, signature: sig },
     ];
 
-    const result = verifyManifest(manifest, TEST_OFFICER_PUBKEYS, 3);
+    const result = await verify(manifest);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.detail).toContain("1 valid");
@@ -315,84 +336,84 @@ describe("AC-007 / SI-001: duplicate officerIndex — only 1 unique counts", () 
 // ─── AC-008: Out-of-bounds officerIndex → silently skipped ───────────────────
 
 describe("AC-008: out-of-bounds officerIndex is silently skipped", () => {
-  it("officerIndex: 99 → no RangeError, silently skipped", () => {
+  it("officerIndex: 99 → no RangeError, silently skipped", async () => {
     const nodes = makeNodes();
-    const manifest: ConsortiumManifestInput = { version: 1, not_before: "2026-01-01T00:00:00Z", expires: "2027-01-01T00:00:00Z", nodes, signatures: [] };
+    const manifest = await edUnsigned(nodes);
     manifest.signatures = signManifest(manifest, [0, 1, 2]);
 
     // Add an out-of-bounds entry
     manifest.signatures = [...manifest.signatures, { officerIndex: 99, signature: "f".repeat(128) }];
 
     // Should NOT throw — the out-of-bounds entry is silently skipped
-    const result = verifyManifest(manifest, TEST_OFFICER_PUBKEYS, 3);
-    expect(result).toEqual({ ok: true, signerCount: 3 });
+    const result = await verify(manifest);
+    expect(result).toEqual({ ok: true, signerCount: 3, pqSignerCount: 3 });
   });
 
-  it("negative officerIndex → silently skipped", () => {
+  it("negative officerIndex → silently skipped", async () => {
     const nodes = makeNodes();
-    const manifest: ConsortiumManifestInput = { version: 1, not_before: "2026-01-01T00:00:00Z", expires: "2027-01-01T00:00:00Z", nodes, signatures: [] };
+    const manifest = await edUnsigned(nodes);
     manifest.signatures = signManifest(manifest, [0, 1, 2]);
     manifest.signatures = [...manifest.signatures, { officerIndex: -1, signature: "f".repeat(128) }];
 
-    const result = verifyManifest(manifest, TEST_OFFICER_PUBKEYS, 3);
-    expect(result).toEqual({ ok: true, signerCount: 3 });
+    const result = await verify(manifest);
+    expect(result).toEqual({ ok: true, signerCount: 3, pqSignerCount: 3 });
   });
 });
 
 // ─── AC-009: Malformed hex → silently handled ────────────────────────────────
 
 describe("AC-009: malformed hex signature is silently handled", () => {
-  it("non-hex characters → no throw, signature not counted", () => {
+  it("non-hex characters → no throw, signature not counted", async () => {
     const nodes = makeNodes();
-    const manifest: ConsortiumManifestInput = { version: 1, not_before: "2026-01-01T00:00:00Z", expires: "2027-01-01T00:00:00Z", nodes, signatures: [] };
+    const manifest = await edUnsigned(nodes);
     manifest.signatures = signManifest(manifest, [1, 2]);
 
     // Add a malformed hex entry for officer 0
     manifest.signatures = [{ officerIndex: 0, signature: "zzzz" + "f".repeat(124) }, ...manifest.signatures];
 
-    const result = verifyManifest(manifest, TEST_OFFICER_PUBKEYS, 3);
+    const result = await verify(manifest);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.detail).toContain("2 valid");
     }
   });
 
-  it("empty string signature → no throw", () => {
+  it("empty string signature → no throw", async () => {
     const nodes = makeNodes();
-    const manifest: ConsortiumManifestInput = { version: 1, not_before: "2026-01-01T00:00:00Z", expires: "2027-01-01T00:00:00Z", nodes, signatures: [] };
+    const manifest = await edUnsigned(nodes);
     manifest.signatures = [
       { officerIndex: 0, signature: "" },
       ...signManifest(manifest, [1, 2]),
     ];
 
     // Should not throw
-    const result = verifyManifest(manifest, TEST_OFFICER_PUBKEYS, 3);
+    const result = await verify(manifest);
     expect(result.ok).toBe(false);
   });
 
-  it("odd-length hex → no throw", () => {
+  it("odd-length hex → no throw", async () => {
     const nodes = makeNodes();
-    const manifest: ConsortiumManifestInput = { version: 1, not_before: "2026-01-01T00:00:00Z", expires: "2027-01-01T00:00:00Z", nodes, signatures: [] };
+    const manifest = await edUnsigned(nodes);
     manifest.signatures = [
       { officerIndex: 0, signature: "abc" }, // odd-length
       ...signManifest(manifest, [1, 2]),
     ];
 
-    const result = verifyManifest(manifest, TEST_OFFICER_PUBKEYS, 3);
+    const result = await verify(manifest);
     expect(result.ok).toBe(false);
   });
 
-  it("partially-invalid hex ('0g'.repeat) → classified as malformed_signature, not verification_failed", () => {
+  it("partially-invalid hex ('0g'.repeat) → classified as malformed_signature, not verification_failed", async () => {
     // parseInt("0g", 16) === 0 (not NaN) — naive NaN check would accept this as valid hex.
     // The strict /^[0-9a-fA-F]+$/ regex guard must reject it as malformed_signature.
     const nodes = makeNodes();
-    const manifest: ConsortiumManifestInput = { version: 1, not_before: "2026-01-01T00:00:00Z", expires: "2027-01-01T00:00:00Z", nodes, signatures: [] };
+    const manifest = await edUnsigned(nodes);
     manifest.signatures = [
       { officerIndex: 0, signature: "0g".repeat(64) }, // 128 chars, correct length, invalid hex
       ...signManifest(manifest, [1, 2]),
     ];
 
-    const result = verifyManifest(manifest, TEST_OFFICER_PUBKEYS, 3);
+    const result = await verify(manifest);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       const entry = result.diagnostics.skippedEntries.find((e) => e.index === 0);
@@ -401,33 +422,10 @@ describe("AC-009: malformed hex signature is silently handled", () => {
   });
 });
 
-// ─── AC-010: CONSORTIUM_ROOT_KEYS ────────────────────────────────────────────
-
-describe("AC-010: CONSORTIUM_ROOT_KEYS constants", () => {
-  it("CONSORTIUM_ROOT_KEYS is an array of 5 hex strings, each 64 chars", () => {
-    expect(CONSORTIUM_ROOT_KEYS).toHaveLength(5);
-    for (const key of CONSORTIUM_ROOT_KEYS) {
-      expect(key).toHaveLength(64);
-      expect(key).toMatch(/^[0-9a-f]{64}$/);
-    }
-  });
-
-  it("CONSORTIUM_THRESHOLD equals 3", () => {
-    expect(CONSORTIUM_THRESHOLD).toBe(3);
-  });
-
-  it("CONSORTIUM_ROOT_KEYS is readonly (placeholder zeros)", () => {
-    // Placeholder keys are all zeros
-    for (const key of CONSORTIUM_ROOT_KEYS) {
-      expect(key).toBe("0".repeat(64));
-    }
-  });
-});
-
 // ─── AC-011: TEST_CONSORTIUM_ROOT_KEYS ───────────────────────────────────────
 
 describe("AC-011: TEST_CONSORTIUM_ROOT_KEYS separate from production", () => {
-  it("TEST_CONSORTIUM_ROOT_KEYS is an array of 5 hex strings, each 64 chars", () => {
+  it("TEST_CONSORTIUM_ROOT_KEYS is an array of 5 hex strings, each 64 chars", async () => {
     expect(TEST_CONSORTIUM_ROOT_KEYS).toHaveLength(5);
     for (const key of TEST_CONSORTIUM_ROOT_KEYS) {
       expect(key).toHaveLength(64);
@@ -435,68 +433,58 @@ describe("AC-011: TEST_CONSORTIUM_ROOT_KEYS separate from production", () => {
     }
   });
 
-  it("TEST_CONSORTIUM_THRESHOLD equals 3", () => {
+  it("TEST_CONSORTIUM_THRESHOLD equals 3", async () => {
     expect(TEST_CONSORTIUM_THRESHOLD).toBe(3);
   });
 
-  it("test keys are real public keys (not zeros)", () => {
+  it("test keys are real public keys (not zeros)", async () => {
     for (const key of TEST_CONSORTIUM_ROOT_KEYS) {
       expect(key).not.toBe("0".repeat(64));
     }
   });
 
-  it("test keys are all distinct", () => {
+  it("test keys are all distinct", async () => {
     const unique = new Set(TEST_CONSORTIUM_ROOT_KEYS);
     expect(unique.size).toBe(5);
-  });
-});
-
-// ─── SI-003: Test keys and production keys are disjoint ──────────────────────
-
-describe("SI-003: test keys and production keys are completely disjoint sets", () => {
-  it("no overlap between CONSORTIUM_ROOT_KEYS and TEST_CONSORTIUM_ROOT_KEYS", () => {
-    const prodSet = new Set(CONSORTIUM_ROOT_KEYS);
-    for (const testKey of TEST_CONSORTIUM_ROOT_KEYS) {
-      expect(prodSet.has(testKey)).toBe(false);
-    }
   });
 });
 
 // ─── AC-012: makeTestManifest produces valid manifests ───────────────────────
 
 describe("AC-012: makeTestManifest produces valid manifests", () => {
-  it("default manifest passes verifyManifest with TEST_CONSORTIUM_ROOT_KEYS", () => {
-    const manifest = makeTestManifest(makeNodes());
-    const result = verifyManifest(manifest, TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD);
-    expect(result).toEqual({ ok: true, signerCount: 3 });
+  it("default manifest passes verifyManifest with TEST_CONSORTIUM_ROOT_KEYS", async () => {
+    const manifest = await makeTestManifest(makeNodes());
+    const result = await verify(manifest);
+    expect(result).toEqual({ ok: true, signerCount: 3, pqSignerCount: 3 });
   });
 
-  it("accepts optional version override", () => {
-    const manifest = makeTestManifest(makeNodes(), { version: 42 });
+  it("accepts optional version override", async () => {
+    const manifest = await makeTestManifest(makeNodes(), { version: 42 });
     expect(manifest.version).toBe(42);
-    const result = verifyManifest(manifest, TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD);
+    const result = await verify(manifest);
     expect(result.ok).toBe(true);
   });
 
-  it("accepts optional notBefore and expires overrides", () => {
-    const manifest = makeTestManifest(makeNodes(), {
+  it("accepts optional notBefore and expires overrides", async () => {
+    const manifest = await makeTestManifest(makeNodes(), {
       notBefore: "2025-01-01T00:00:00Z",
       expires: "2028-12-31T23:59:59Z",
     });
     expect(manifest.not_before).toBe("2025-01-01T00:00:00Z");
     expect(manifest.expires).toBe("2028-12-31T23:59:59Z");
-    const result = verifyManifest(manifest, TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD);
+    const result = await verify(manifest);
     expect(result.ok).toBe(true);
   });
 
-  it("manifest contains the provided nodes", () => {
+  it("manifest contains the provided nodes", async () => {
     const nodes = makeNodes();
-    const manifest = makeTestManifest(nodes);
-    expect(manifest.nodes).toEqual(nodes);
+    const manifest = await makeTestManifest(nodes);
+    // The fixture fills each node's mldsa_pubkey; every field the test supplied is carried as given.
+    expect(manifest.nodes).toMatchObject(nodes);
   });
 
-  it("manifest has exactly 3 signatures (threshold)", () => {
-    const manifest = makeTestManifest(makeNodes());
+  it("manifest has exactly 3 signatures (threshold)", async () => {
+    const manifest = await makeTestManifest(makeNodes());
     expect(manifest.signatures).toHaveLength(3);
     expect(manifest.signatures[0].officerIndex).toBe(0);
     expect(manifest.signatures[1].officerIndex).toBe(1);
@@ -507,33 +495,33 @@ describe("AC-012: makeTestManifest produces valid manifests", () => {
 // ─── M12 ROLE-MANIFEST-1: role-bearing manifests + replica-only rejection ─────
 
 describe("M12 ROLE-MANIFEST-1: verifyManifest and node roles", () => {
-  it("rejects a node with NO role — the verifier requires one", () => {
-    const manifest = makeTestManifest(makeNodes());
+  it("rejects a node with NO role — the verifier requires one", async () => {
+    const manifest = await makeTestManifest(makeNodes());
     const unsigned = { ...manifest, nodes: manifest.nodes.map((n, i) => {
       if (i !== 1) return n;
       const rest = { ...(n as Record<string, unknown>) };
       delete rest["role"];
       return rest;
     }) };
-    const result = verifyManifest(unsigned, TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD);
+    const result = await verify(unsigned);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.detail).toContain("unknown role");
   });
 
-  it("rejects a node with NO peerId — the client checks it against the /bootstrap probe", () => {
-    const manifest = makeTestManifest(makeNodes());
+  it("rejects a node with NO peerId — the client checks it against the /bootstrap probe", async () => {
+    const manifest = await makeTestManifest(makeNodes());
     const stripped = { ...manifest, nodes: manifest.nodes.map((n, i) => {
       if (i !== 0) return n;
       const rest = { ...(n as Record<string, unknown>) };
       delete rest["peerId"];
       return rest;
     }) };
-    const result = verifyManifest(stripped, TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD);
+    const result = await verify(stripped);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.detail).toContain("no peerId");
   });
 
-  it("GOLDEN: a node canonicalizes to fixed bytes with role and peerId inside the signed body", () => {
+  it("GOLDEN: a node canonicalizes to fixed bytes with role and peerId inside the signed body", async () => {
     // Pins canonicalManifestBody so any change to it — which would silently invalidate every
     // signed manifest — goes red.
     const manifest = {
@@ -554,37 +542,37 @@ describe("M12 ROLE-MANIFEST-1: verifyManifest and node roles", () => {
     expect(new TextDecoder().decode(canonicalManifestBody(manifest))).toBe(golden);
   });
 
-  it("rejects a node with an unknown role string (closes the domain — F1)", () => {
+  it("rejects a node with an unknown role string (closes the domain — F1)", async () => {
     const nodes = makeNodes();
     (nodes[1] as { role?: string }).role = "Replica"; // capital R — a tooling typo
-    const manifest = makeTestManifest(nodes);
-    const result = verifyManifest(manifest, TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD);
+    const manifest = await makeTestManifest(nodes);
+    const result = await verify(manifest);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.detail).toContain("unknown role");
     }
   });
 
-  it("a mixed validator/replica manifest verifies and the role is inside the signed body", () => {
+  it("a mixed validator/replica manifest verifies and the role is inside the signed body", async () => {
     const nodes = makeNodes();
     nodes[2] = { ...nodes[2], role: "replica", peerId: "12D3KooWReplica" };
-    const manifest = makeTestManifest(nodes);
+    const manifest = await makeTestManifest(nodes);
     // Signed successfully over the canonical body that now includes role/peerId:
-    const result = verifyManifest(manifest, TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD);
+    const result = await verify(manifest);
     expect(result.ok).toBe(true);
     // Tamper: flipping the replica to a validator must break the signature (role is signed).
     const tampered = {
       ...manifest,
       nodes: manifest.nodes.map((n, i) => (i === 2 ? { ...n, role: "validator" } : n)),
     };
-    const t = verifyManifest(tampered, TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD);
+    const t = await verify(tampered);
     expect(t.ok).toBe(false);
   });
 
-  it("a replica-only manifest is rejected loudly even with valid signatures", () => {
+  it("a replica-only manifest is rejected loudly even with valid signatures", async () => {
     const nodes = makeNodes().map((n) => ({ ...n, role: "replica" as const }));
-    const manifest = makeTestManifest(nodes);
-    const result = verifyManifest(manifest, TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD);
+    const manifest = await makeTestManifest(nodes);
+    const result = await verify(manifest);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toBe("manifest_signature_invalid");
@@ -592,10 +580,10 @@ describe("M12 ROLE-MANIFEST-1: verifyManifest and node roles", () => {
     }
   });
 
-  it("one validator among replicas is enough to pass the validator-count gate", () => {
+  it("one validator among replicas is enough to pass the validator-count gate", async () => {
     const nodes = makeNodes().map((n, i) => ({ ...n, role: (i === 0 ? "validator" : "replica") as "validator" | "replica" }));
-    const manifest = makeTestManifest(nodes);
-    const result = verifyManifest(manifest, TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD);
+    const manifest = await makeTestManifest(nodes);
+    const result = await verify(manifest);
     expect(result.ok).toBe(true);
   });
 });
@@ -603,9 +591,9 @@ describe("M12 ROLE-MANIFEST-1: verifyManifest and node roles", () => {
 // ─── AC-013: Ceremony output verifies; rogue key fails ──────────────────────
 
 describe("AC-013: ceremony verification — rogue key fails", () => {
-  it("signature from a key not in the root key set fails verification", () => {
+  it("signature from a key not in the root key set fails verification", async () => {
     const nodes = makeNodes();
-    const manifest: ConsortiumManifestInput = { version: 1, not_before: "2026-01-01T00:00:00Z", expires: "2027-01-01T00:00:00Z", nodes, signatures: [] };
+    const manifest = await edUnsigned(nodes);
     const body = canonicalManifestBody(manifest);
 
     // Sign with a rogue key (not in the test root keys)
@@ -617,7 +605,7 @@ describe("AC-013: ceremony verification — rogue key fails", () => {
       ...signManifest(manifest, [1, 2]),
     ];
 
-    const result = verifyManifest(manifest, TEST_OFFICER_PUBKEYS, 3);
+    const result = await verify(manifest);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.detail).toContain("2 valid");
@@ -628,12 +616,12 @@ describe("AC-013: ceremony verification — rogue key fails", () => {
 // ─── AC-014: Error distinctness ──────────────────────────────────────────────
 
 describe("AC-014: every failure path produces a unique, diagnosable error", () => {
-  it("all failure results include reason and detail", () => {
+  it("all failure results include reason and detail", async () => {
     const nodes = makeNodes();
-    const manifest: ConsortiumManifestInput = { version: 1, not_before: "2026-01-01T00:00:00Z", expires: "2027-01-01T00:00:00Z", nodes, signatures: [] };
+    const manifest = await edUnsigned(nodes);
     manifest.signatures = signManifest(manifest, [0]); // only 1 valid
 
-    const result = verifyManifest(manifest, TEST_OFFICER_PUBKEYS, 3);
+    const result = await verify(manifest);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toBe("manifest_signature_invalid");
@@ -642,15 +630,15 @@ describe("AC-014: every failure path produces a unique, diagnosable error", () =
     }
   });
 
-  it("detail differs between 0-valid and 2-valid failures", () => {
+  it("detail differs between 0-valid and 2-valid failures", async () => {
     const nodes = makeNodes();
 
-    const manifest0: ConsortiumManifestInput = { version: 1, not_before: "2026-01-01T00:00:00Z", expires: "2027-01-01T00:00:00Z", nodes, signatures: [] };
-    const manifest2: ConsortiumManifestInput = { version: 1, not_before: "2026-01-01T00:00:00Z", expires: "2027-01-01T00:00:00Z", nodes, signatures: [] };
+    const manifest0 = await edUnsigned(nodes);
+    const manifest2 = await edUnsigned(nodes);
     manifest2.signatures = signManifest(manifest2, [0, 1]);
 
-    const result0 = verifyManifest(manifest0, TEST_OFFICER_PUBKEYS, 3);
-    const result2 = verifyManifest(manifest2, TEST_OFFICER_PUBKEYS, 3);
+    const result0 = await verify(manifest0);
+    const result2 = await verify(manifest2);
 
     expect(result0.ok).toBe(false);
     expect(result2.ok).toBe(false);
@@ -663,11 +651,11 @@ describe("AC-014: every failure path produces a unique, diagnosable error", () =
 // ─── AC-017: Empty signatures array ─────────────────────────────────────────
 
 describe("AC-017: empty signatures array", () => {
-  it("empty signatures → { ok: false, detail: '0 valid of 3 required' }", () => {
+  it("empty signatures → { ok: false, detail: '0 valid of 3 required' }", async () => {
     const nodes = makeNodes();
-    const manifest: ConsortiumManifestInput = { version: 1, not_before: "2026-01-01T00:00:00Z", expires: "2027-01-01T00:00:00Z", nodes, signatures: [] };
+    const manifest = await edUnsigned(nodes);
 
-    const result = verifyManifest(manifest, TEST_OFFICER_PUBKEYS, 3);
+    const result = await verify(manifest);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toBe("manifest_signature_invalid");
@@ -680,7 +668,7 @@ describe("AC-017: empty signatures array", () => {
 // ─── Empty nodes guard ───────────────────────────────────────────────────────
 
 describe("verifyManifest: empty nodes array", () => {
-  it("manifest with nodes: [] → { ok: false, detail: 'manifest contains no nodes' }", () => {
+  it("manifest with nodes: [] → { ok: false, detail: 'manifest contains no nodes' }", async () => {
     const manifest: ConsortiumManifestInput = {
       version: 1,
       not_before: "2026-01-01T00:00:00Z",
@@ -689,7 +677,7 @@ describe("verifyManifest: empty nodes array", () => {
       signatures: [],
     };
 
-    const result = verifyManifest(manifest, TEST_OFFICER_PUBKEYS, 3);
+    const result = await verify(manifest);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toBe("manifest_signature_invalid");
@@ -697,7 +685,7 @@ describe("verifyManifest: empty nodes array", () => {
     }
   });
 
-  it("empty nodes → { ok: false } even when threshold signatures are present", () => {
+  it("empty nodes → { ok: false } even when threshold signatures are present", async () => {
     const manifest: ConsortiumManifestInput = {
       version: 1,
       not_before: "2026-01-01T00:00:00Z",
@@ -706,7 +694,7 @@ describe("verifyManifest: empty nodes array", () => {
       signatures: signManifest({ version: 1, not_before: "2026-01-01T00:00:00Z", expires: "2027-01-01T00:00:00Z", nodes: [], signatures: [] }, [0, 1, 2]),
     };
 
-    const result = verifyManifest(manifest, TEST_OFFICER_PUBKEYS, 3);
+    const result = await verify(manifest);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.detail).toBe("manifest contains no nodes");
@@ -717,23 +705,17 @@ describe("verifyManifest: empty nodes array", () => {
 // ─── AC-018: All malformed entries → processes all, no early exit ─────────────
 
 describe("AC-018: all malformed entries processed — no early exit", () => {
-  it("all entries malformed → returns { ok: false }, processes every entry", () => {
-    const nodes = makeNodes();
-    const manifest: ConsortiumManifestInput = {
-      version: 1,
-      not_before: "2026-01-01T00:00:00Z",
-      expires: "2027-01-01T00:00:00Z",
-      nodes,
-      signatures: [
-        { officerIndex: 0, signature: "zz".repeat(64) },
-        { officerIndex: 1, signature: "not-hex-at-all!" },
-        { officerIndex: 2, signature: "" },
-        { officerIndex: 3, signature: "abc" },
-        { officerIndex: 99, signature: "f".repeat(128) },
-      ],
-    };
+  it("all entries malformed → returns { ok: false }, processes every entry", async () => {
+    const manifest = await edUnsigned(makeNodes());
+    manifest.signatures = [
+      { officerIndex: 0, signature: "zz".repeat(64) },
+      { officerIndex: 1, signature: "not-hex-at-all!" },
+      { officerIndex: 2, signature: "" },
+      { officerIndex: 3, signature: "abc" },
+      { officerIndex: 99, signature: "f".repeat(128) },
+    ];
 
-    const result = verifyManifest(manifest, TEST_OFFICER_PUBKEYS, 3);
+    const result = await verify(manifest);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.detail).toContain("0 valid");
@@ -854,5 +836,19 @@ describe("004 — both signature sets are required", () => {
     await signBoth(kem, [0, 1, 2], [{ idx: 0, seedByte: ROOT_PQ_SEED }]);
     const r3 = await verifyManifest(kem, await opts());
     expect(r3.ok === false && r3.reason).toBe("manifest_mlkem_intake_key_invalid");
+  });
+
+  it("intake_key is required: absent, or with a malformed pubkey → manifest_intake_key_invalid", async () => {
+    const absent = await pqManifest();
+    delete (absent as Record<string, unknown>)["intake_key"];
+    await signBoth(absent, [0, 1, 2], [{ idx: 0, seedByte: ROOT_PQ_SEED }]);
+    const r1 = await verifyManifest(absent, await opts());
+    expect(r1.ok === false && r1.reason).toBe("manifest_intake_key_invalid");
+
+    const bad = await pqManifest();
+    bad["intake_key"] = { key_id: "intake-0", pubkey: "D".repeat(64) };
+    await signBoth(bad, [0, 1, 2], [{ idx: 0, seedByte: ROOT_PQ_SEED }]);
+    const r2 = await verifyManifest(bad, await opts());
+    expect(r2.ok === false && r2.reason).toBe("manifest_intake_key_invalid");
   });
 });

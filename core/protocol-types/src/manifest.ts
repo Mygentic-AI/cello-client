@@ -34,6 +34,8 @@ export interface ConsortiumNode {
    * by the client against the node's /bootstrap probe. Required, inside the signed body.
    */
   peerId: string;
+  /** M9D 004: the node's ML-DSA-44 public key — 2,624 lowercase hex chars (1,312 bytes), unique. */
+  mldsa_pubkey: string;
 }
 
 /**
@@ -68,9 +70,8 @@ export interface OfficerSignature {
 /**
  * The portal's intake encryption key, as published in the manifest (M10B-D11).
  *
- * OPTIONAL, and a daemon that does not find it must REFUSE to submit and name the reason — never
- * fall back to sending unsealed (§5a ABSENT IS NOT FINE). An unsealed submission hands the directory
- * every endorsement in the clear, which is the one property the sealed queue exists to provide.
+ * REQUIRED since M9D 004: `verifyManifest` refuses a manifest without a well-formed one, so a
+ * verified manifest always carries it and a submission can always be sealed.
  */
 export interface ManifestIntakeKey {
   /** Which key this is. Recorded on every queue row, so a rotated-out private key can be retained
@@ -89,19 +90,22 @@ export interface ConsortiumManifest {
   expires: string;
   nodes: ConsortiumNode[];
   signatures: OfficerSignature[];
+  /** M9D 004: the ML-DSA officer signatures, over the same canonical body as `signatures`. */
+  pq_signatures: OfficerSignature[];
   /**
-   * M10B-D11 — the portal's intake key. Additive and optional: manifests written before it still
-   * verify byte-for-byte, because `canonicalManifestBody` builds the signed body from
-   * `Object.keys(manifest)` minus `signatures`, an OPEN field set. So a new top-level field is
-   * automatically covered by the officer signatures — which is the whole reason the manifest is the
-   * right channel for a SEALING key. An unauthenticated channel (a `/bootstrap` route, client
-   * config) is not a shortcut here: a substituted intake key means every endorsement is sealed to
-   * the attacker.
+   * M10B-D11 — the portal's intake key. `canonicalManifestBody` builds the signed body from
+   * `Object.keys(manifest)` minus both signature sets, so every top-level field is covered by the
+   * officer signatures — which is the whole reason the manifest is the right channel for a SEALING
+   * key. An unauthenticated channel (a `/bootstrap` route, client config) is not a shortcut here: a
+   * substituted intake key means every endorsement is sealed to the attacker.
    *
    * Rotation is a manifest version bump the daemon's existing poll rolls forward, under its
    * `manifest_version_rollback` guard.
    */
-  intake_key?: ManifestIntakeKey;
+  intake_key: ManifestIntakeKey;
+  /** M9D 004: the portal's ML-KEM-768 intake public key, 2,368 lowercase hex chars. It shares
+   *  `intake_key.key_id` by sitting beside it; there is no second key id. */
+  mlkem_intake_key: string;
 }
 
 /** Distinct error codes for manifest verification failures. */
