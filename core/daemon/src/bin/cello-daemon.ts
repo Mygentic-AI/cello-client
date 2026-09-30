@@ -139,6 +139,8 @@ async function startSecurityLayer(correlationId?: string): Promise<{ client: Loc
       // No auto-restart (M9B-D14). Every subsequent screen fails closed with a real cause; this
       // line is how the operator learns the screening process died rather than inferring it from
       // a wall of blocked sends.
+      // Screening is dead now; `cello status` must stop saying 2 of 2.
+      recordGatewayLayer2(`off:the security gateway process exited (code ${code ?? -1}, signal ${signal ?? "none"})`);
       logger.error("security.gateway.exited", { code: code ?? -1, signal: signal ?? "none", ...(correlationId !== undefined ? { correlationId } : {}) });
     });
   } catch (err: unknown) {
