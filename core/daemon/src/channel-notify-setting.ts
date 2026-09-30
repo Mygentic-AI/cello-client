@@ -8,7 +8,10 @@
  * about the agent's own membership, not about how busy the channel is.
  */
 import type { ChannelNotify } from "./channel-membership-wiring.js";
-import type { ChannelNotifyMode, ChannelSubscription } from "./channel-subscription-store.js";
+import { ChannelSubscriptionStore, type ChannelNotifyMode, type ChannelSubscription } from "./channel-subscription-store.js";
+import type { NotificationDispatcher } from "./notification-dispatcher.js";
+import type { DaemonDatabase } from "./sqlcipher-db.js";
+import type { Logger } from "./types.js";
 
 type Handler = (params: Record<string, unknown> | undefined, connectionId: string) => Promise<unknown>;
 
@@ -80,4 +83,57 @@ export function registerChannelNotifyHandler(handlers: Map<string, Handler>, dep
         : "This agent is told when new posts arrive.",
     });
   });
+}
+
+/**
+ * The daemon's real channel doorbells: each maps the agent id to its current display name and dispatches
+ * only when one is current (a retired agent has nobody to wake). INV-CONTENTFREE lives in the dispatcher;
+ * this only routes. The dispatcher is passed as a GETTER: the composition root declares it after these
+ * are built, so it is read at ring time and never at construction.
+ */
+export function dispatcherNotify(dispatcher: () => NotificationDispatcher, named: (agentId: string) => string | null): ChannelNotify {
+  return {
+    channelPosts: (id, ch, count, through, posters) => { const n = named(id); if (n !== null) dispatcher().dispatchChannelPosts(n, ch, count, through, posters); },
+    channelJoinAnswer: (id, ch, outcome, reason) => { const n = named(id); if (n !== null) dispatcher().dispatchChannelJoinAnswer(n, ch, outcome, reason); },
+    channelJoinRequest: (id, ch, sub, note) => { const n = named(id); if (n !== null) dispatcher().dispatchChannelJoinRequest(n, ch, sub, note); },
+    channelMembershipEnded: (id, ch, reason) => { const n = named(id); if (n !== null) dispatcher().dispatchChannelMembershipEnded(n, ch, reason); },
+    channelPosterRemoved: (id, ch) => { const n = named(id); if (n !== null) dispatcher().dispatchChannelPosterRemoved(n, ch); },
+  };
+}
+
+export interface WireChannelNotifyDeps {
+  /** The daemon's real doorbells; the returned object rings through these unless a channel is `pull`. */
+  base: ChannelNotify;
+  handlers: Map<string, Handler>;
+  getDb: () => DaemonDatabase;
+  logger: Logger;
+  resolveCurrentAgent: (connectionId: string, explicitAgent?: string) => string | null;
+  resolveAgentId: (agentName: string) => string;
+}
+
+/**
+ * The composition the daemon uses: registers `cello_channel_set_notify` and returns the doorbells with
+ * the pull gate on. Both read the setting from the same store, read live at ring time so a change takes
+ * effect on the next post.
+ *
+ * One store per database handle. Constructing one runs CREATE TABLE IF NOT EXISTS and a column check,
+ * which is too much for every new-post doorbell; the handle can change, so the store is cached against
+ * the handle and not built once for good.
+ */
+export function wireChannelNotify(deps: WireChannelNotifyDeps): ChannelNotify {
+  let cache: { db: unknown; store: ChannelSubscriptionStore } | null = null;
+  const subs = (): ChannelSubscriptionStore => {
+    const db = deps.getDb();
+    if (cache === null || cache.db !== db) cache = { db, store: new ChannelSubscriptionStore(db, deps.logger) };
+    return cache.store;
+  };
+  registerChannelNotifyHandler(deps.handlers, {
+    resolveCurrentAgent: deps.resolveCurrentAgent,
+    resolveAgentId: deps.resolveAgentId,
+    subscriptions: {
+      get: (agentId, channelHex) => subs().get(agentId, channelHex),
+      setNotify: (agentId, channelHex, mode) => { subs().setNotify(agentId, channelHex, mode); },
+    },
+  });
+  return gateChannelNotify(deps.base, { notifyFor: (agentId, channelHex) => subs().notifyFor(agentId, channelHex) });
 }

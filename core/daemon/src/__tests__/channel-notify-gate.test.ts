@@ -106,3 +106,44 @@ describe("cello_channel_set_notify", () => {
     expect(await call({ channel: A, mode: "pull" }, "conn-1")).toMatchObject({ ok: false, reason: "no_current_agent" });
   });
 });
+
+describe("wireChannelNotify — the composition the daemon uses, against a real store", () => {
+  it("the handler flips the setting and the very next new-post doorbell obeys it", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { openTestDb } = await import("./helpers/encrypted-db.js");
+    const { ChannelSubscriptionStore } = await import("../channel-subscription-store.js");
+    const { wireChannelNotify } = await import("../channel-notify-setting.js");
+
+    const dir = mkdtempSync(join(tmpdir(), "cello-wire-notify-"));
+    const db = openTestDb(join(dir, "sessions.db"));
+    try {
+      const silent = { debug() {}, info() {}, warn() {}, error() {} };
+      new ChannelSubscriptionStore(db, silent).upsert({
+        agent_id: "id-alice", channel_pubkey: A, admin_pubkey: "bb".repeat(32), access: "invite_only", relays: ["/dns4/r/tcp/1"],
+      });
+      const { calls, base } = recorder();
+      const handlers = new Map<string, (p: Record<string, unknown> | undefined, c: string) => Promise<unknown>>();
+      const notify = wireChannelNotify({
+        base, handlers, getDb: () => db, logger: silent,
+        resolveCurrentAgent: (_c, explicit) => explicit ?? "alice",
+        resolveAgentId: (name) => `id-${name}`,
+      });
+
+      notify.channelPosts("id-alice", A, 1, 1);
+      expect(calls).toEqual(["posts id-alice aa 1"]);
+
+      expect(await handlers.get("cello_channel_set_notify")!({ channel: A, mode: "pull" }, "conn")).toMatchObject({ ok: true, notify: "pull" });
+      notify.channelPosts("id-alice", A, 2, 3);
+      expect(calls).toEqual(["posts id-alice aa 1"]); // the second one was withheld
+
+      await handlers.get("cello_channel_set_notify")!({ channel: A, mode: "push" }, "conn");
+      notify.channelPosts("id-alice", A, 4, 7);
+      expect(calls).toEqual(["posts id-alice aa 1", "posts id-alice aa 4"]);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
