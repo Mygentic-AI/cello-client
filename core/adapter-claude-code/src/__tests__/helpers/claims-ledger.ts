@@ -822,7 +822,7 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
       "drained), which is evidence the gate fires in production rather than only in tests.",
   },
   {
-    surface: "README.md",
+    surface: "docs/setup/hermes.md",
     claim: "'the cello_* tools remain available for the things a conversation cannot do'",
     excerpts: ["the things a conversation cannot do"],
     enforcedBy: "daemon-local",
@@ -837,7 +837,7 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
       "SKILL.md once already.",
   },
   {
-    surface: "README.md",
+    surface: "docs/setup/hermes.md",
     claim: "Bridge: 'the daemon's security gateway screens inbound content on the same path either way… not whether they are screened.'",
     excerpts: ["The bridge changes which door the screened bytes", "not whether they are screened."],
     enforcedBy: "daemon-local",
@@ -858,7 +858,7 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
       "ledger exists to prevent — a row whose premise is false is a row nobody can re-check.",
   },
   {
-    surface: "README.md",
+    surface: "docs/setup/hermes.md",
     claim: "session_scope peer: 'two customers must never end up in one context'",
     excerpts: ["two customers must never end up in one"],
     enforcedBy: "daemon-local",
@@ -872,7 +872,7 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
       "the default `agent` scope deliberately shares one conversation and the text says so.",
   },
   {
-    surface: "README.md",
+    surface: "docs/setup/hermes.md",
     claim: "'a setting you cannot see in the command you just typed is a setting you will be surprised by later'",
     excerpts: ["a setting you cannot see in the command you just"],
     enforcedBy: "daemon-local",

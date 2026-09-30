@@ -132,6 +132,10 @@ function shippedSurfaces(): string[] {
   const plugins = join(ROOT, "plugins");
   if (existsSync(plugins)) walkMarkdown(plugins, out);
 
+  // Per-client setup guides moved out of the README: operator-facing prose, so it is scanned like it.
+  const setupDocs = join(ROOT, "docs", "setup");
+  if (existsSync(setupDocs)) walkMarkdown(setupDocs, out);
+
   return [...out].sort();
 }
 
