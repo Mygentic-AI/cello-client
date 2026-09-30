@@ -48,6 +48,10 @@ export const CHANNEL_SUBSCRIPTION_CREATE_SQL = `
     processed_through  INTEGER NOT NULL DEFAULT 0,
     joined_at          INTEGER NOT NULL DEFAULT 0,
     status             TEXT    NOT NULL DEFAULT 'active',
+    -- 'push' rings the agent when posts arrive; 'pull' stores them and keeps the unread count but
+    -- sends no doorbell, so the agent (or a cron job) reads with \`cello channel read\`. A new
+    -- subscription pushes. Existing tables get it from the constructor's addColumnIfMissing.
+    notify             TEXT    NOT NULL DEFAULT 'push',
     PRIMARY KEY (agent_id, channel_pubkey)
   );
 `;
@@ -95,7 +99,11 @@ export interface ChannelSubscription {
    * is a new value, not a migration.
    */
   status: "active" | "left" | "ejected" | "closed";
+  /** Whether a new post rings this agent. `pull` still stores the post and counts it as unread. */
+  notify: ChannelNotifyMode;
 }
+
+export type ChannelNotifyMode = "push" | "pull";
 
 export type ChannelSubscriptionErrorCode = "subscription_unknown" | "position_regression";
 
@@ -121,6 +129,7 @@ interface Row {
   delivered_through: number | bigint;
   processed_through: number | bigint;
   status: string;
+  notify: string;
 }
 
 export class ChannelSubscriptionStore {
@@ -140,6 +149,12 @@ export class ChannelSubscriptionStore {
     addColumnIfMissing(this.#db, this.#logger, {
       table: "channel_subscriptions", column: "guidance_updated_at",
       sql: "ALTER TABLE channel_subscriptions ADD COLUMN guidance_updated_at INTEGER NOT NULL DEFAULT 0",
+    });
+    // Same reason for `notify`: a daemon that followed channels before push/pull existed has the table
+    // without it, and every SELECT below names it.
+    addColumnIfMissing(this.#db, this.#logger, {
+      table: "channel_subscriptions", column: "notify",
+      sql: "ALTER TABLE channel_subscriptions ADD COLUMN notify TEXT NOT NULL DEFAULT 'push'",
     });
     this.#db.exec(CHANNEL_SUBSCRIPTION_KEYS_CREATE_SQL);
   }
@@ -185,7 +200,7 @@ export class ChannelSubscriptionStore {
   get(agentId: string, channelPubkeyHex: string): ChannelSubscription | null {
     const row = this.#db
       .prepare(
-        `SELECT agent_id, channel_pubkey, admin_pubkey, access, relays, moniker, guidance, guidance_updated_at, retention_seconds, delivered_through, processed_through, status
+        `SELECT agent_id, channel_pubkey, admin_pubkey, access, relays, moniker, guidance, guidance_updated_at, retention_seconds, delivered_through, processed_through, status, notify
            FROM channel_subscriptions WHERE agent_id = ? AND channel_pubkey = ?`,
       )
       .get(agentId, channelPubkeyHex.toLowerCase()) as Row | undefined;
@@ -196,7 +211,7 @@ export class ChannelSubscriptionStore {
   active(): ChannelSubscription[] {
     const rows = this.#db
       .prepare(
-        `SELECT agent_id, channel_pubkey, admin_pubkey, access, relays, moniker, guidance, guidance_updated_at, retention_seconds, delivered_through, processed_through, status
+        `SELECT agent_id, channel_pubkey, admin_pubkey, access, relays, moniker, guidance, guidance_updated_at, retention_seconds, delivered_through, processed_through, status, notify
            FROM channel_subscriptions WHERE status = 'active' ORDER BY channel_pubkey ASC, agent_id ASC`,
       )
       .all() as Row[];
@@ -212,7 +227,7 @@ export class ChannelSubscriptionStore {
   listedFor(agentId: string): ChannelSubscription[] {
     const rows = this.#db
       .prepare(
-        `SELECT agent_id, channel_pubkey, admin_pubkey, access, relays, moniker, guidance, guidance_updated_at, retention_seconds, delivered_through, processed_through, status
+        `SELECT agent_id, channel_pubkey, admin_pubkey, access, relays, moniker, guidance, guidance_updated_at, retention_seconds, delivered_through, processed_through, status, notify
            FROM channel_subscriptions WHERE agent_id = ? AND status != 'left' ORDER BY channel_pubkey ASC`,
       )
       .all(agentId) as Row[];
@@ -369,6 +384,27 @@ export class ChannelSubscriptionStore {
   }
 
   /**
+   * Choose whether new posts ring this agent. Local only: the publisher and the other members are not
+   * told. Rejoining does not reset it, because `upsert` never writes this column.
+   */
+  setNotify(agentId: string, channelPubkeyHex: string, mode: ChannelNotifyMode): void {
+    this.#db
+      .prepare(`UPDATE channel_subscriptions SET notify = ? WHERE agent_id = ? AND channel_pubkey = ?`)
+      .run(mode, agentId, channelPubkeyHex.toLowerCase());
+  }
+
+  /**
+   * Does this channel ring this agent? `push` for a channel the agent does not follow, so a lookup miss
+   * can never silence anything.
+   */
+  notifyFor(agentId: string, channelPubkeyHex: string): ChannelNotifyMode {
+    const row = this.#db
+      .prepare(`SELECT notify FROM channel_subscriptions WHERE agent_id = ? AND channel_pubkey = ?`)
+      .get(agentId, channelPubkeyHex.toLowerCase()) as { notify: string } | undefined;
+    return row?.notify === "pull" ? "pull" : "push";
+  }
+
+  /**
    * Is this pubkey a channel this agent subscribes to?
    *
    * ⚠️ **TRUE FOR `left` AND `ejected` TOO, and that is deliberate.** The one caller is the
@@ -406,6 +442,8 @@ export class ChannelSubscriptionStore {
       delivered_through: Number(row.delivered_through),
       processed_through: Number(row.processed_through),
       status: row.status as "active" | "left" | "ejected" | "closed",
+      // Anything but an explicit `pull` is `push`: an unrecognised value must not silence a channel.
+      notify: row.notify === "pull" ? "pull" : "push",
     };
   }
 }
