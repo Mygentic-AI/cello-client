@@ -9,7 +9,7 @@
  * tests, which is where the direction round-trip is now covered too.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, rename, writeFile } from "node:fs/promises";
 import { existsSync, statSync } from "node:fs";
 import { createServer, type Server } from "node:net";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -231,21 +231,28 @@ describe("084-GATEWAYSOCK: a gateway never deletes a socket it does not own", ()
     expect(v.disposition).toBe("allow");
   });
 
-  it("NOT OURS at stop: stop() leaves a socket a different inode has taken over", async () => {
+  it("NOT OURS at stop: stop() never unlinks a socket a different inode has taken over", async () => {
     const events: string[] = [];
     const logger: GatewayLogger = { info: (e) => events.push(e), warn: () => {}, error: () => {} };
     const h = await createGatewayServer({ socketPath: sockPath, logger });
 
-    // Replace the file at the path with a DIFFERENT inode — as a racing successor gateway would.
-    await unlink(sockPath);
-    await writeFile(sockPath, "not-our-socket");
-    const inoBefore = statSync(sockPath).ino;
+    // Move OUR socket aside and drop a DIFFERENT inode at the path, as a racing successor gateway
+    // would after taking over. Aside (not unlinked) so we can restore it and stop A cleanly below.
+    const asidePath = `${sockPath}.aside`;
+    await rename(sockPath, asidePath);
+    await writeFile(sockPath, "successor-socket");
+    const successorIno = statSync(sockPath).ino;
 
     await h.stop();
 
-    // The replacement is left exactly where it was — same inode, still on disk.
+    // The successor's file is left EXACTLY as it was — never unlinked, same inode — and we said so.
     expect(existsSync(sockPath)).toBe(true);
-    expect(statSync(sockPath).ino).toBe(inoBefore);
+    expect(statSync(sockPath).ino).toBe(successorIno);
     expect(events).toContain("security.gateway.socket.not_ours");
+
+    // Cleanup: restore our own socket so a second stop() closes A's listener without leaking it.
+    await rm(sockPath, { force: true });
+    await rename(asidePath, sockPath);
+    await h.stop();
   });
 });

@@ -15,7 +15,7 @@
  * fail-closed `screen_error` block.
  */
 import { createServer, connect, type Server, type Socket } from "node:net";
-import { rm, rename, stat } from "node:fs/promises";
+import { rm, stat } from "node:fs/promises";
 import { FrameDecoder, encodeFrame, SCREEN_OUTBOUND } from "./protocol.js";
 import type { WireScreenRequest, WireScreenResponse } from "./protocol.js";
 import type { ScreenDirection, ScreenVerdict, GovernanceDecision } from "./types.js";
@@ -119,6 +119,12 @@ export async function createGatewayServer(opts: GatewayServerOptions): Promise<G
   // 084-GATEWAYSOCK: never delete a socket another gateway is LIVE on. A stale file from a crashed
   // prior run makes listen() fail with EADDRINUSE and must be removed; a live peer's socket must be
   // left alone — deleting it is exactly the race a losing daemon's gateway used to run.
+  //
+  // This probe→rm→listen sequence is NOT atomic, and it does not need to be: another gateway could
+  // in principle bind between the probe and the listen() below. What actually guarantees only one
+  // gateway starts per CELLO_DIR at a time is Part B — the daemon takes its singleton lock BEFORE it
+  // spawns any gateway, so two gateways for one directory never reach this point concurrently. This
+  // probe only handles the steady-state case: a gateway that is already up is left untouched.
   const existing = await probeExistingSocket(socketPath, SOCKET_PROBE_TIMEOUT_MS);
   if (existing === "live") {
     logger.info("security.gateway.socket.in_use", { socketPath });
@@ -232,29 +238,22 @@ export async function createGatewayServer(opts: GatewayServerOptions): Promise<G
       for (const s of sockets) s.destroy();
       sockets.clear();
 
-      // server.close() unlinks the bound path UNCONDITIONALLY at the libuv level — including a
-      // socket another gateway has since bound there, which is the deletion this fix exists to stop.
-      // So decide ownership BEFORE closing: when the file is not ours, move it aside across the close
-      // so libuv's unlink hits an empty name, then restore it untouched.
-      const ours = await socketStillOurs();
-      if (ours) {
+      // Decide ownership BEFORE closing. server.close() unlinks the bound path UNCONDITIONALLY at
+      // the libuv level, so it may run ONLY while the file at our path is still the inode we created.
+      if (await socketStillOurs()) {
         await new Promise<void>((resolve) => server.close(() => resolve()));
         await rm(socketPath, { force: true });
         return;
       }
 
+      // NOT OURS: a different inode holds this path — a successor gateway has taken it over. Do NOT
+      // call server.close(): libuv would unlink the bound path and delete the SUCCESSOR's socket,
+      // which is the 084 bug over again. Do NOT touch the file either. We simply drop our listener by
+      // letting the process exit — stop() runs only on the daemon's way out — and the kernel then
+      // closes our fd WITHOUT unlinking, leaving the successor's socket exactly as it is. Part B (the
+      // daemon takes its singleton lock BEFORE spawning a gateway) makes this branch unreachable in
+      // production: a losing daemon never binds here at all. It survives only as defence.
       logger.info("security.gateway.socket.not_ours", { socketPath });
-      let stashed: string | undefined;
-      try {
-        stashed = `${socketPath}.notours.${process.pid}`;
-        await rename(socketPath, stashed);
-      } catch {
-        stashed = undefined; // the path is already gone: nothing to protect
-      }
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      if (stashed) {
-        try { await rename(stashed, socketPath); } catch { /* best-effort restore */ }
-      }
     },
   };
 }
