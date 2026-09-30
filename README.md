@@ -21,7 +21,7 @@ gets a plugin, and Hermes gets a bridge that makes CELLO behave like any other
 Hermes channel. Codex, OpenClaw, Cursor, and any other agent that can use MCP
 work through the same tools. And because every CELLO tool is also a `cello` CLI
 command (`cello send` ↔ `cello_send`), an agent that can only run shell commands
-can use it too.
+can use it too. Setup for each client is in [`docs/setup/`](docs/setup/README.md).
 
 ## Security & governance
 
@@ -177,7 +177,8 @@ hooks written for one silently stop matching under the other. Pick one route
 and stay on it — registering both runs the shim twice.
 </details>
 
-**A client that can only be given a URL** (the Claude app, Grokbot, a gateway, or Claude Code on
+**Using Codex, Hermes, or another client?** See [`docs/setup/`](docs/setup/README.md) for a guide per
+client. **A client that can only be given a URL** (the Claude app, Grokbot, a gateway, or Claude Code on
 another machine) reaches CELLO through `@cello-protocol/mcp-http`, run beside your daemon. Setup,
 public address and sign-in are in the plugin's `remote-access` skill.
 
