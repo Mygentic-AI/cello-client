@@ -330,7 +330,12 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // (session-schema.ts), `attachConductPolicy` (session-content-handlers.ts) and
     // `attachChannelPolicy` (channel-membership-wiring.ts). Unwired, the operator's policy is stored
     // and never reaches the agent.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(125);
+    // 125 → 127 for channel push/pull (channel-notify-setting.ts): `wireChannelNotify` (daemon.ts) and
+    // `registerChannelNotifyHandler` (called by it). Unwired, the pull gate never wraps the doorbells
+    // and `cello channel notify` answers method_not_found — a channel set to pull would keep ringing
+    // the agent while the operator believes it is quiet, every suite green. Both land in `checked`,
+    // not EXEMPT.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(127);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",
