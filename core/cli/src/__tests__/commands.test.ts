@@ -551,6 +551,9 @@ describe("cli commands", () => {
           if (req.method === "cello_register") {
             socket.write(JSON.stringify({ id: req.id, result: { ok: true, agent_id: "id-1", primary_pubkey: "pk-1" } }) + "\n");
           }
+          if (req.method === "cello_list_agents") {
+            socket.write(JSON.stringify({ id: req.id, result: { agents: [{ name: "bob", pubkey: "pk-bob" }, { name: "alice", pubkey: "local-pk" }] } }) + "\n");
+          }
         });
       });
       await new Promise<void>((resolve) => server.listen(socketPath, resolve));
@@ -571,7 +574,22 @@ describe("cli commands", () => {
         expect(
           result.output,
           "stdout must be the JSON result and NOTHING else — a consumer parses this",
-        ).toBe(JSON.stringify({ ok: true, agent_id: "id-1", primary_pubkey: "pk-1" }, null, 2));
+        ).toBe(JSON.stringify({
+          ok: true,
+          share_this_pubkey: "local-pk",
+          directory_agent_id: "id-1",
+          directory_primary_pubkey: "pk-1",
+          agent_id: "id-1",
+          primary_pubkey: "pk-1",
+        }, null, 2));
+
+        // 087 Part A: the key to hand out is the one `cello agents` lists for THIS agent, not the
+        // directory's group key — and the old fields stay for anything that reads them.
+        const parsed = JSON.parse(result.output) as Record<string, unknown>;
+        expect(Object.keys(parsed)[1]).toBe("share_this_pubkey");
+        expect(parsed["share_this_pubkey"]).toBe("local-pk");
+        expect(parsed["agent_id"]).toBe("id-1");
+        expect(parsed["primary_pubkey"]).toBe("pk-1");
 
         // The hint is KEPT. Same four cues, now asserted on the stream they belong to.
         const guidance = result.guidance ?? "";
@@ -582,6 +600,8 @@ describe("cli commands", () => {
         expect(guidance).toContain("online");            // state legibility (ready state)
         expect(guidance).toContain("connected");         // directory_signaling ready
         expect(guidance).toContain("cello login");       // recovery hint
+        // 087 Part A: the guidance names the key to give to others.
+        expect(guidance).toContain("Give this key to others: local-pk");
       } finally {
         await new Promise<void>((resolve) => server.close(() => resolve()));
       }

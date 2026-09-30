@@ -517,13 +517,22 @@ export async function register(
   }
 
   try {
-    const result = (await withIpc(lock.socketPath, (client) => client.send("cello_register", { agent, preAuthToken, phoneStub }))) as {
-      ok: boolean;
-      reason?: string;
-      guidance?: string;
-      agent_id?: string;
-      primary_pubkey?: string;
-    };
+    // 087 Part A: the directory answers with ITS record — `agent_id` is the directory's id and
+    // `primary_pubkey` the threshold (FROST group) key the directory co-signs with. The key a person
+    // hands to others is the agent's own K_local key, which is what `cello agents` lists. Read it
+    // from the same list, over the same connection, so the two outputs can never disagree.
+    const { result, sharePubkey } = await withIpc(lock.socketPath, async (client) => {
+      const reg = (await client.send("cello_register", { agent, preAuthToken, phoneStub })) as {
+        ok: boolean;
+        reason?: string;
+        guidance?: string;
+        agent_id?: string;
+        primary_pubkey?: string;
+      };
+      if (!reg.ok) return { result: reg, sharePubkey: undefined };
+      const list = (await client.send("cello_list_agents")) as { agents?: Array<{ name: string; pubkey?: string }> };
+      return { result: reg, sharePubkey: list.agents?.find((a) => a.name === agent)?.pubkey };
+    });
 
     if (!result.ok) {
       return {
@@ -534,7 +543,15 @@ export async function register(
     return {
       exitCode: 0,
       output: JSON.stringify(
-        { ok: true, agent_id: result.agent_id, primary_pubkey: result.primary_pubkey },
+        {
+          ok: true,
+          share_this_pubkey: sharePubkey,
+          directory_agent_id: result.agent_id,
+          directory_primary_pubkey: result.primary_pubkey,
+          // Kept, unchanged, for anything that already reads them. They are the directory's record.
+          agent_id: result.agent_id,
+          primary_pubkey: result.primary_pubkey,
+        },
         null,
         2,
       ),
@@ -545,6 +562,8 @@ export async function register(
       // both streams and loses nothing; a script gets parseable output. This text used to make
       // `register-agent` unparseable on its SUCCESS path.
       guidance:
+        `Give this key to others: ${sharePubkey ?? "(run  cello agents  to see it)"}\n` +
+        `  • it is the key  cello agents  lists. directory_primary_pubkey is the directory's own record, not the key to share.\n` +
         `Next: run  cello status  to confirm '${agent}' is registered.\n` +
         `  • it's normal for this to take a minute or two while registration settles.\n` +
         `  • ready = the agent shows state 'online' and directory_signaling 'connected'.\n` +
