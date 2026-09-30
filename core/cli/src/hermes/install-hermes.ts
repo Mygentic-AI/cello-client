@@ -36,6 +36,8 @@ export const DELIVERY_MODES = ["explicit", "channel", "wake"] as const;
 export const SESSION_SCOPES = ["agent", "peer"] as const;
 export const DEFAULT_DELIVERY_MODE: (typeof DELIVERY_MODES)[number] = "explicit";
 export const DEFAULT_SESSION_SCOPE: (typeof SESSION_SCOPES)[number] = "agent";
+export const CHANNEL_NOTIFICATIONS = ["on", "off"] as const;
+export const DEFAULT_CHANNEL_NOTIFICATIONS: (typeof CHANNEL_NOTIFICATIONS)[number] = "on";
 
 export interface InstallHermesOptions {
   agentName: string;
@@ -45,6 +47,8 @@ export interface InstallHermesOptions {
   deliveryMode?: string;
   /** `agent` (default): one conversation per agent. `peer`: one per counterparty. */
   sessionScope?: string;
+  /** `on` (default): a new post on a followed channel wakes the agent. `off`: channel doorbells are ignored. */
+  channelNotifications?: string;
   /** Injectable for tests; defaults to a spawn-based runner. */
   exec?: ExecFn;
 }
@@ -117,9 +121,11 @@ export async function installHermes(
   // still looking at the command they just typed.
   const deliveryMode = (opts.deliveryMode ?? DEFAULT_DELIVERY_MODE).trim().toLowerCase();
   const sessionScope = (opts.sessionScope ?? DEFAULT_SESSION_SCOPE).trim().toLowerCase();
+  const channelNotifications = (opts.channelNotifications ?? DEFAULT_CHANNEL_NOTIFICATIONS).trim().toLowerCase();
   for (const [flag, value, allowed] of [
     ["--delivery-mode", deliveryMode, DELIVERY_MODES],
     ["--session-scope", sessionScope, SESSION_SCOPES],
+    ["--channel-notifications", channelNotifications, CHANNEL_NOTIFICATIONS],
   ] as const) {
     if (!(allowed as readonly string[]).includes(value)) {
       return {
@@ -130,8 +136,11 @@ export async function installHermes(
             ? "  explicit — inbound arrives as a message; nothing is sent unless the agent calls cello_send (default)\n" +
               "  channel  — CELLO behaves like a normal chat channel; the agent's reply is sent automatically\n" +
               "  wake     — content-free notices only; the agent reads and replies via cello_* tools"
-            : "  agent   — one conversation per CELLO agent (default)\n" +
-              "  peer    — one conversation per counterparty, for a support desk"),
+            : flag === "--channel-notifications"
+              ? "  on   — a new post on a followed channel wakes the agent with a notice to read it (default)\n" +
+                "  off  — channel doorbells are ignored; the agent reads channels only when it looks"
+              : "  agent   — one conversation per CELLO agent (default)\n" +
+                "  peer    — one conversation per counterparty, for a support desk"),
       };
     }
   }
@@ -175,9 +184,11 @@ export async function installHermes(
   upsertEnvLine(envPath, "CELLO_AGENT_NAME", agentName);
   upsertEnvLine(envPath, "CELLO_DELIVERY_MODE", deliveryMode);
   upsertEnvLine(envPath, "CELLO_SESSION_SCOPE", sessionScope);
+  upsertEnvLine(envPath, "CELLO_CHANNEL_NOTIFICATIONS", channelNotifications);
   out.push(`Bound agent:  CELLO_AGENT_NAME=${agentName} (${envPath})`);
   out.push(`Delivery:     CELLO_DELIVERY_MODE=${deliveryMode}`);
   out.push(`Scope:        CELLO_SESSION_SCOPE=${sessionScope}`);
+  out.push(`Channels:     CELLO_CHANNEL_NOTIFICATIONS=${channelNotifications}`);
 
   // 4. Register through Hermes' own CLI. A failure here is loud: the files are in
   // place, so we print exactly what remains to be run by hand.

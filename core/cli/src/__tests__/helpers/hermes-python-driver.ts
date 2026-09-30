@@ -95,6 +95,7 @@ adapter = m.CelloAdapter.__new__(m.CelloAdapter)
 adapter._agent_name = spec.get("agent", "Ms_Chelly_Hermes")
 adapter._delivery_mode = spec.get("delivery_mode", "explicit")
 adapter._session_scope = spec.get("session_scope", "agent")
+adapter._channel_notifications = spec.get("channel_notifications", m.DEFAULT_CHANNEL_NOTIFICATIONS)
 adapter._runtime_session = "default"
 adapter._writer = object()          # send()/receive must believe the socket is up
 adapter._message_handler = lambda *a, **k: None

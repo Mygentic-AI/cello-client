@@ -2057,11 +2057,13 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
     help:
       "Usage: cello bridge <runtime> --agent <name> [--hermes-home <path>]\n" +
       "                                [--delivery-mode explicit|channel|wake] [--session-scope agent|peer]\n" +
+      "                                [--channel-notifications on|off]\n" +
       "  Wires the local CELLO daemon into a third-party agent runtime so that agent can use CELLO.\n" +
       "  Supported runtimes: hermes  (more coming).\n" +
       "\n" +
       "  hermes: scaffolds the CELLO plugin into the Hermes home (default ~/.hermes), writes\n" +
-      "  CELLO_AGENT_NAME, CELLO_DELIVERY_MODE and CELLO_SESSION_SCOPE into its .env, and\n" +
+      "  CELLO_AGENT_NAME, CELLO_DELIVERY_MODE, CELLO_SESSION_SCOPE and CELLO_CHANNEL_NOTIFICATIONS\n" +
+      "  into its .env, and\n" +
       "  registers via 'hermes plugins enable cello' + 'hermes mcp add cello'.\n" +
       "\n" +
       "  RE-RUN THIS AFTER EVERY CELLO UPGRADE. The plugin is a COPY inside the Hermes home, not\n" +
@@ -2080,8 +2082,13 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "                                     agent twice continues it.\n" +
       "                   peer              one conversation per counterparty — for a support desk,\n" +
       "                                     where two customers must never share a context.\n" +
+      "  --channel-notifications  on (default) a new post on a channel the agent follows wakes it with a\n" +
+      "                                     short notice to read it with cello_channel_read.\n" +
+      "                   off               channel doorbells are ignored; the agent reads channels only\n" +
+      "                                     when it looks, or from a scheduled job. To quiet ONE channel\n" +
+      "                                     and keep the rest, run: cello channel notify <channel> pull\n" +
       "\n" +
-      "  Both settings are per-agent and are REWRITTEN on every run: omitting a flag resets it to\n" +
+      "  These settings are per-agent and are REWRITTEN on every run: omitting a flag resets it to\n" +
       "  its default rather than keeping a value from a previous install.\n" +
       "\n" +
       "  Example:  cello bridge hermes --agent alice\n" +
@@ -2091,6 +2098,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       { name: "--hermes-home" },
       { name: "--delivery-mode" },
       { name: "--session-scope" },
+      { name: "--channel-notifications" },
     ],
     async run(_ctx, args) {
       // A flag present with no value is NOT the same as an absent flag. Mapping it to undefined
@@ -2111,7 +2119,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       // Every flag consumes a value, so a positional is one that is neither a flag nor any
       // flag's value — that is what lets `cello bridge --agent alice hermes` still find `hermes`.
       const valueIndexes = new Set(
-        ["--agent", "--hermes-home", "--delivery-mode", "--session-scope"]
+        ["--agent", "--hermes-home", "--delivery-mode", "--session-scope", "--channel-notifications"]
           .map((f) => args.indexOf(f))
           .filter((i) => i !== -1)
           .map((i) => i + 1),
@@ -2125,6 +2133,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
         hermesHome: valueOf("--hermes-home"),
         deliveryMode: valueOf("--delivery-mode"),
         sessionScope: valueOf("--session-scope"),
+        channelNotifications: valueOf("--channel-notifications"),
       };
       if (missingValue.length > 0) {
         return {
