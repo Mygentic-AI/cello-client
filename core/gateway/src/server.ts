@@ -14,8 +14,8 @@
  * daemon cannot act on a verdict the gateway never recorded, and a record-write throw becomes a
  * fail-closed `screen_error` block.
  */
-import { createServer, type Server, type Socket } from "node:net";
-import { rm } from "node:fs/promises";
+import { createServer, connect, type Server, type Socket } from "node:net";
+import { rm, rename, stat } from "node:fs/promises";
 import { FrameDecoder, encodeFrame, SCREEN_OUTBOUND } from "./protocol.js";
 import type { WireScreenRequest, WireScreenResponse } from "./protocol.js";
 import type { ScreenDirection, ScreenVerdict, GovernanceDecision } from "./types.js";
@@ -62,13 +62,68 @@ export interface GatewayServerHandle {
 
 const ALLOW_ALL: GatewayScreenFn = () => ({ disposition: "allow" });
 
+/**
+ * 084-GATEWAYSOCK: another gateway is already listening on THIS path. Distinct from a spawn or store
+ * fault so the caller can leave the live gateway strictly alone rather than tear it down.
+ */
+export class GatewaySocketInUseError extends Error {
+  readonly socketPath: string;
+  constructor(socketPath: string) {
+    super(`another gateway is already listening on ${socketPath}`);
+    this.name = "GatewaySocketInUseError";
+    this.socketPath = socketPath;
+  }
+}
+
+/** How long the start-up probe waits to learn whether a live gateway holds the socket. */
+const SOCKET_PROBE_TIMEOUT_MS = 1000;
+
+/**
+ * Is a gateway LIVE on `socketPath` right now, or is the file stale?
+ *
+ * We connect rather than trust the file's existence — a crashed prior run leaves a socket file with
+ * nothing behind it. Connect succeeds → a live peer holds it (do not touch). `ECONNREFUSED`/`ENOENT`
+ * → nothing is listening, the file is stale (safe to remove). Any other error is NOT a verdict: we
+ * refuse to guess and let the caller fail naming the real cause.
+ */
+async function probeExistingSocket(socketPath: string, timeoutMs: number): Promise<"live" | "stale"> {
+  return new Promise<"live" | "stale">((resolve, reject) => {
+    const socket = connect(socketPath);
+    let settled = false;
+    const finish = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.removeAllListeners();
+      socket.destroy();
+      fn();
+    };
+    const timer = setTimeout(
+      () => finish(() => reject(new Error(`timed out after ${timeoutMs}ms probing whether a gateway is live on ${socketPath}`))),
+      timeoutMs,
+    );
+    socket.once("connect", () => finish(() => resolve("live")));
+    socket.once("error", (err: NodeJS.ErrnoException) => {
+      if (err.code === "ECONNREFUSED" || err.code === "ENOENT") finish(() => resolve("stale"));
+      else finish(() => reject(err));
+    });
+  });
+}
+
 /** Start the gateway server on its socket. Resolves once it is listening. */
 export async function createGatewayServer(opts: GatewayServerOptions): Promise<GatewayServerHandle> {
   const screen = opts.screen ?? ALLOW_ALL;
   const logger = opts.logger ?? NOOP_LOGGER;
   const { socketPath } = opts;
 
-  // A stale socket file from a crashed prior run makes listen() fail with EADDRINUSE. Remove it.
+  // 084-GATEWAYSOCK: never delete a socket another gateway is LIVE on. A stale file from a crashed
+  // prior run makes listen() fail with EADDRINUSE and must be removed; a live peer's socket must be
+  // left alone — deleting it is exactly the race a losing daemon's gateway used to run.
+  const existing = await probeExistingSocket(socketPath, SOCKET_PROBE_TIMEOUT_MS);
+  if (existing === "live") {
+    logger.info("security.gateway.socket.in_use", { socketPath });
+    throw new GatewaySocketInUseError(socketPath);
+  }
   await rm(socketPath, { force: true });
 
   // Track live connections so stop() can close them. net.Server.close() stops accepting but
@@ -149,14 +204,57 @@ export async function createGatewayServer(opts: GatewayServerOptions): Promise<G
     });
   });
 
+  // 084-GATEWAYSOCK: identify the socket WE just created (inode + device), so stop() deletes only
+  // this one. If a successor gateway replaces the file at this path while we run, its inode differs
+  // and we must not unlink it. Best-effort: if we cannot stat our own socket, stop() leaves the path.
+  let ownSocketId: { ino: number; dev: number } | undefined;
+  try {
+    const st = await stat(socketPath);
+    ownSocketId = { ino: st.ino, dev: st.dev };
+  } catch {
+    ownSocketId = undefined;
+  }
+
+  const socketStillOurs = async (): Promise<boolean> => {
+    if (!ownSocketId) return false;
+    try {
+      const st = await stat(socketPath);
+      return st.ino === ownSocketId.ino && st.dev === ownSocketId.dev;
+    } catch {
+      return false;
+    }
+  };
+
   return {
     socketPath,
     async stop(): Promise<void> {
       // Close live connections first — otherwise server.close() waits for them forever.
       for (const s of sockets) s.destroy();
       sockets.clear();
+
+      // server.close() unlinks the bound path UNCONDITIONALLY at the libuv level — including a
+      // socket another gateway has since bound there, which is the deletion this fix exists to stop.
+      // So decide ownership BEFORE closing: when the file is not ours, move it aside across the close
+      // so libuv's unlink hits an empty name, then restore it untouched.
+      const ours = await socketStillOurs();
+      if (ours) {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        await rm(socketPath, { force: true });
+        return;
+      }
+
+      logger.info("security.gateway.socket.not_ours", { socketPath });
+      let stashed: string | undefined;
+      try {
+        stashed = `${socketPath}.notours.${process.pid}`;
+        await rename(socketPath, stashed);
+      } catch {
+        stashed = undefined; // the path is already gone: nothing to protect
+      }
       await new Promise<void>((resolve) => server.close(() => resolve()));
-      await rm(socketPath, { force: true });
+      if (stashed) {
+        try { await rename(stashed, socketPath); } catch { /* best-effort restore */ }
+      }
     },
   };
 }

@@ -67,7 +67,7 @@ export {
 export type { ScreenMethod, WireScreenRequest, WireScreenResponse } from "./protocol.js";
 
 // The gateway server (the separate program) + the screen-function and logger seams.
-export { createGatewayServer } from "./server.js";
+export { createGatewayServer, GatewaySocketInUseError } from "./server.js";
 export type {
   GatewayScreenFn,
   GatewayServerOptions,

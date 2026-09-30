@@ -9,11 +9,13 @@
  * tests, which is where the direction round-trip is now covered too.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
+import { existsSync, statSync } from "node:fs";
 import { createServer, type Server } from "node:net";
+import { spawn, type ChildProcess } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createGatewayServer, type GatewayServerHandle } from "../server.js";
+import { createGatewayServer, GatewaySocketInUseError, type GatewayServerHandle, type GatewayLogger } from "../server.js";
 import { LocalSidecarGatewayClient } from "../client.js";
 import type { ScreenContext } from "../types.js";
 import { AFFORDANCE_PREFIX } from "../screen/affordance.js";
@@ -153,5 +155,97 @@ describe("gateway sidecar: server + LocalSidecarGatewayClient over a real Unix s
     const v = await withTimeout(client.screenOutbound(new TextEncoder().encode("after"), ctx()), 1_000);
     expect(v.disposition).toBe("block");
     expect(v.reason).toBe("gateway_unavailable");
+  });
+});
+
+/**
+ * 084-GATEWAYSOCK Part A — the gateway never deletes a socket it does not own.
+ *
+ * The reported failure: two `cello login` runs raced, the loser's gateway started before its daemon
+ * knew it had lost, `rm`'d the WINNER's socket on the way in and again on the way out, and left the
+ * winner's gateway alive with nothing at its path — every send failed `gateway_unavailable` for two
+ * minutes. Two guards close it here: refuse to bind over a LIVE socket, and at stop delete only the
+ * socket THIS instance created.
+ */
+describe("084-GATEWAYSOCK: a gateway never deletes a socket it does not own", () => {
+  let tempDir: string;
+  let sockPath: string;
+  const servers: GatewayServerHandle[] = [];
+  const clients: LocalSidecarGatewayClient[] = [];
+  const children: ChildProcess[] = [];
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "cello-gw-own-"));
+    sockPath = join(tempDir, "g.sock");
+  });
+  afterEach(async () => {
+    for (const c of children) { try { c.kill("SIGKILL"); } catch { /* ignore */ } }
+    for (const c of clients) { try { await c.close(); } catch { /* ignore */ } }
+    for (const s of servers) { try { await s.stop(); } catch { /* ignore */ } }
+    clients.length = 0; servers.length = 0; children.length = 0;
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  const enc = (s: string): Uint8Array => new TextEncoder().encode(s);
+  const trackServer = (h: GatewayServerHandle): GatewayServerHandle => { servers.push(h); return h; };
+  const makeClient = (): LocalSidecarGatewayClient => {
+    const c = new LocalSidecarGatewayClient({ socketPath: sockPath, deadlineMs: 5_000 });
+    clients.push(c);
+    return c;
+  };
+
+  it("LIVE socket: a second gateway REFUSES, and the first keeps answering on an intact path", async () => {
+    // Gateway A is live on the path.
+    trackServer(await createGatewayServer({ socketPath: sockPath }));
+
+    // Gateway B on the SAME path must refuse — never rm, never bind over A.
+    await expect(createGatewayServer({ socketPath: sockPath })).rejects.toBeInstanceOf(GatewaySocketInUseError);
+
+    // A is untouched: the path still exists and A still answers.
+    expect(existsSync(sockPath)).toBe(true);
+    const v = await makeClient().screenOutbound(enc("hello"), ctx());
+    expect(v.disposition).toBe("allow");
+  });
+
+  it("STALE socket: a new gateway removes a dead socket file and listens", async () => {
+    // A real socket file with nothing listening: a child binds it, then is SIGKILLed so the OS
+    // never unlinks it (the crashed-prior-run case). connect() to it yields ECONNREFUSED = stale.
+    const child = spawn(
+      process.execPath,
+      ["-e", "const net=require('node:net');const s=net.createServer();s.listen(process.env.P,()=>process.stdout.write('listening\\n'));setInterval(()=>{},1000);"],
+      { env: { ...process.env, P: sockPath }, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    children.push(child);
+    await new Promise<void>((resolve, reject) => {
+      child.stdout!.on("data", (c: Buffer) => { if (c.toString().includes("listening")) resolve(); });
+      child.on("exit", () => reject(new Error("stale-socket child exited before binding")));
+      setTimeout(() => reject(new Error("stale-socket child never bound")), 10_000);
+    });
+    child.kill("SIGKILL");
+    await new Promise<void>((r) => child.on("exit", () => r()));
+    expect(existsSync(sockPath)).toBe(true); // the stale file is present
+
+    // A fresh gateway must remove it and come up answering.
+    trackServer(await createGatewayServer({ socketPath: sockPath }));
+    const v = await makeClient().screenOutbound(enc("x"), ctx());
+    expect(v.disposition).toBe("allow");
+  });
+
+  it("NOT OURS at stop: stop() leaves a socket a different inode has taken over", async () => {
+    const events: string[] = [];
+    const logger: GatewayLogger = { info: (e) => events.push(e), warn: () => {}, error: () => {} };
+    const h = await createGatewayServer({ socketPath: sockPath, logger });
+
+    // Replace the file at the path with a DIFFERENT inode — as a racing successor gateway would.
+    await unlink(sockPath);
+    await writeFile(sockPath, "not-our-socket");
+    const inoBefore = statSync(sockPath).ino;
+
+    await h.stop();
+
+    // The replacement is left exactly where it was — same inode, still on disk.
+    expect(existsSync(sockPath)).toBe(true);
+    expect(statSync(sockPath).ino).toBe(inoBefore);
+    expect(events).toContain("security.gateway.socket.not_ours");
   });
 });
