@@ -56,6 +56,7 @@ import { wireChannelPublishing } from "./channel-publish-wiring.js";
 import { createIsAgentOnlineById } from "./agent-online.js";
 import { ChannelSubscriptionStore } from "./channel-subscription-store.js";
 import { wireChannelMembership, type ChannelNotify } from "./channel-membership-wiring.js";
+import { gateChannelNotify, registerChannelNotifyHandler } from "./channel-notify-setting.js";
 import { registerStatusHandler } from "./status-handler.js";
 import { registerBackupRestoreHandlers } from "./backup-restore-handlers.js";
 import { wireDocumentGate } from "./document-gate-wiring.js";
@@ -690,13 +691,26 @@ async function startDaemonHoldingLock(
   // Each channel doorbell maps the agent id to its current display name (a channel notice routes like
   // cello_message) and dispatches only when a name is current; the null-check is shared here.
   const named = (id: string): string | null => sessionNodeManager.agentNameForId(id);
-  const channelNotify: ChannelNotify = {
+  // A channel set to `pull` still collects and counts its posts, but its new-post doorbell is withheld
+  // here, at the one place every wiring rings through. Read live, at ring time: the setting can change.
+  const channelNotify: ChannelNotify = gateChannelNotify({
     channelPosts: (id, ch, count, through, posters) => { const n = named(id); if (n !== null) notificationDispatcher.dispatchChannelPosts(n, ch, count, through, posters); },
     channelJoinAnswer: (id, ch, outcome, reason) => { const n = named(id); if (n !== null) notificationDispatcher.dispatchChannelJoinAnswer(n, ch, outcome, reason); },
     channelJoinRequest: (id, ch, sub, note) => { const n = named(id); if (n !== null) notificationDispatcher.dispatchChannelJoinRequest(n, ch, sub, note); },
     channelMembershipEnded: (id, ch, reason) => { const n = named(id); if (n !== null) notificationDispatcher.dispatchChannelMembershipEnded(n, ch, reason); },
     channelPosterRemoved: (id, ch) => { const n = named(id); if (n !== null) notificationDispatcher.dispatchChannelPosterRemoved(n, ch); },
-  };
+  }, {
+    notifyFor: (agentId, channelHex) => new ChannelSubscriptionStore(sessionNodeManager.getDb(), logger).notifyFor(agentId, channelHex),
+  });
+
+  registerChannelNotifyHandler(handlers, {
+    resolveCurrentAgent: (connectionId, explicitAgent) => resolveCurrentAgent(perConnectionState.get(connectionId), explicitAgent),
+    resolveAgentId: (agentName) => sessionNodeManager.resolveAgentId(agentName),
+    subscriptions: {
+      get: (agentId, channelHex) => new ChannelSubscriptionStore(sessionNodeManager.getDb(), logger).get(agentId, channelHex),
+      setNotify: (agentId, channelHex, mode) => new ChannelSubscriptionStore(sessionNodeManager.getDb(), logger).setNotify(agentId, channelHex, mode),
+    },
+  });
 
   const channelMembership = wireChannelMembership({
     handlers, logger, notify: channelNotify,

@@ -384,6 +384,15 @@ const CHANNEL_DOCS: ReadonlyArray<{
       "and goes nowhere — the publisher and the other members do not see it.",
   },
   {
+    verbs: [{ name: "notify", summary: "Choose push or pull for a channel's new posts. Local — nothing is sent." }],
+    usage: ["cello channel notify <channel> <push|pull> [--agent <agent>]"],
+    paragraph:
+      "Choose whether you are told when new posts arrive on a channel you follow. push, the default, rings " +
+      "your agent as posts arrive. pull still collects every post and counts it as unread, but sends no " +
+      "notification, so you or a scheduled job read them with `cello channel read`. Use pull for a busy " +
+      "channel; switch back to push any time. The setting stays on this machine and nobody else is told.",
+  },
+  {
     verbs: [{ name: "leave", summary: "Stop receiving a channel's posts. Local — nothing is sent." }],
     usage: ["cello channel leave <channel> [--agent <agent>]"],
     paragraph:
@@ -1993,6 +2002,14 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       // ─── M16 019: the SUBSCRIBER's side, and the admin's membership decisions ───
       if (sub === "name" && channel && a !== undefined) {
         return legacy(await channelVerb(ctx.celloDir, "cello_channel_set_moniker", withAgent({ channel, moniker: a })));
+      }
+      if (sub === "notify" && channel) {
+        // Exactly push or pull: any other word is refused with the usage, so a typo cannot silently
+        // leave a channel in the wrong mode.
+        if (a !== "push" && a !== "pull") {
+          return { stdout: helpForSpec("channel"), stderr: "", exitCode: 1 };
+        }
+        return legacy(await channelVerb(ctx.celloDir, "cello_channel_set_notify", withAgent({ channel, mode: a })));
       }
       if (sub === "leave" && channel) {
         return legacy(await channelVerb(ctx.celloDir, "cello_channel_leave", withAgent({ channel })));

@@ -932,6 +932,12 @@ server.tool("cello_channel_read", "Read the posts collected on a channel since t
 }, async ({ channel, all, agent }) =>
   jsonText(await proxy.call("cello_channel_read", { channel, ...(all === undefined ? {} : { all }), ...(agent ? { agent } : {}) })));
 
+server.tool("cello_channel_notify", "Choose whether this agent is told when new posts arrive on a channel it follows. `push` (the default) rings the agent as new posts arrive. `pull` still collects every post and counts it as unread, but sends no notification, so the agent, or a scheduled job, reads them with cello_channel_read. Use pull for a busy channel. It can be changed back at any time. The setting is stored on this machine: the publisher and the other members are not told.", {
+  channel: channelKey(),
+  mode: z.enum(["push", "pull"]).describe("push = be told as posts arrive; pull = collect them and read them yourself"),
+  agent: channelAgent(),
+}, async ({ channel, mode, agent }) =>
+  jsonText(await proxy.call("cello_channel_set_notify", { channel, mode, ...(agent ? { agent } : {}) })));
 server.tool("cello_channel_name", "Give a channel a label so it can be told apart from its public key. The label is stored on this machine and goes nowhere — the publisher and the other members do not see it.", {
   channel: channelKey(),
   moniker: z.string().describe("What to call this channel locally"),

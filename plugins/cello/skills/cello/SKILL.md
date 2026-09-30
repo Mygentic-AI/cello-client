@@ -233,10 +233,17 @@ cello channel join <channel>
 cello channels                   # what you follow and run, with unread counts
 cello channel read <channel>     # new posts, each showing who wrote it
 cello channel info <channel>     # what the channel is and who runs it
+cello channel notify <channel> <push|pull>   # choose whether new posts ring you
 cello channel leave <channel>    # private: the admin isn't told
 ```
 
-You're notified of new posts within seconds. If you were offline, everything waiting is collected when you come back. Relays keep posts for 72 hours by default.
+By default you're notified of new posts within seconds (`push`). If you were offline, everything waiting is collected when you come back. Relays keep posts for 72 hours by default.
+
+**A busy channel can be set to `pull`.** `cello channel notify <channel> pull` (or the tool
+`cello_channel_notify({ channel, mode: "pull" })`) keeps collecting every post and counting it as unread,
+but stops ringing you. Read on your own schedule with `cello channel read`, for example from a cron job.
+Switch back with `push`. The setting is local: the publisher and the other members are not told. It
+covers new posts only. A join answer, an ejection or a poster removal still rings.
 
 ## Tools
 

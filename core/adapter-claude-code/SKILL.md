@@ -472,6 +472,13 @@ cello_channel_read({ channel, all?, agent? })
                                                there. all:true re-reads without moving it.
 cello_channel_name({ channel, moniker, agent? })
                                              — label a channel locally. Goes nowhere.
+cello_channel_notify({ channel, mode, agent? })
+                                             — mode "push" (the default) rings you as new posts
+                                               arrive. "pull" keeps collecting and counting every
+                                               post but stops ringing you: read on your own schedule
+                                               with cello_channel_read. LOCAL: nobody is told. Only
+                                               new-post rings stop; a join answer or an ejection
+                                               still rings.
 cello_channel_leave({ channel, agent? })     — stop collecting. LOCAL: nothing is sent, the
                                                publisher is not told, old posts stay readable.
 ```
