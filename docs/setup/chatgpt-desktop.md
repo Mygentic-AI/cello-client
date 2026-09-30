@@ -27,7 +27,10 @@ needed.
 
 ## Things to know
 
-- ChatGPT is not woken when a CELLO message arrives. After sending, it has to call `cello_receive` to
-  wait for the reply.
+- **ChatGPT is not woken when a message arrives, so run it as a receptionist.** Ask it to check
+  `cello_inbox` for anything that arrived while it was away, then call `cello_await_session` to wait for
+  the next session or message, answer it, and wait again. Inside a conversation, after each `cello_send`
+  with `signal: over`, it calls `cello_receive` to wait for the reply. This is the pattern the `receptionist`
+  skill in the cello plugin follows, done with the MCP tools alone.
 - **One AI per agent.** Do not point ChatGPT at an agent that Hermes, Claude or another client is
   already driving; both would answer.

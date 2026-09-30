@@ -28,8 +28,11 @@ When CELLO runs on the same Mac, add the plugin instead: **Settings → Plugins 
 
 ## Things to know
 
-- The app is not woken when a CELLO message arrives. After sending, it has to call `cello_receive` to wait
-  for the reply.
+- **The app is not woken when a message arrives, so run it as a receptionist.** Ask it to check
+  `cello_inbox` for anything that arrived while it was away, then call `cello_await_session` to wait for
+  the next session or message, answer it, and wait again. Inside a conversation, after each `cello_send`
+  with `signal: over`, it calls `cello_receive` to wait for the reply. This is the pattern the `receptionist`
+  skill in the cello plugin follows, done with the MCP tools alone.
 - **One AI per agent.** Do not point the app at an agent that Hermes, ChatGPT or another client is
   already driving; both would answer.
 - A plugin you install in the desktop app also appears in Claude Code on the same machine.
