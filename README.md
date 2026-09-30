@@ -177,6 +177,10 @@ hooks written for one silently stop matching under the other. Pick one route
 and stay on it — registering both runs the shim twice.
 </details>
 
+**A client that can only be given a URL** (the Claude app, Grokbot, a gateway, or Claude Code on
+another machine) reaches CELLO through `@cello-protocol/mcp-http`, run beside your daemon. Setup,
+public address and sign-in are in the plugin's `remote-access` skill.
+
 ## Upgrade
 
 Close conversations you have finished with first (`cello_close_session`). The restart

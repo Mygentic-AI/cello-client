@@ -107,6 +107,20 @@ export function countClaimWords(text: string): number {
 }
 
 export const ADJUDICATED: AdjudicatedClaim[] = [
+  // ── 083-HTTPOAUTH ─────────────────────────────────────────────────────────────────────────────
+  {
+    surface: "plugins/cello/skills/remote-access/SKILL.md",
+    claim: "Tailscale Funnel: only your machine can read the traffic; Tailscale's servers pass the encrypted stream through",
+    excerpts: ["Tailscale's servers pass the encrypted stream through"],
+    enforcedBy: "structural",
+    verdict: "true",
+    evidence:
+      "Funnel's public ingress forwards the TLS stream by SNI and TLS terminates in tailscaled on the " +
+      "operator's node (Tailscale Funnel docs, 'Introducing Tailscale Funnel'). Observed on the Hermes box " +
+      "2026-09-30: `tailscale funnel status` shows `https://ip-172-31-88-62.tail7f6559.ts.net (Funnel on) " +
+      "|-- / proxy http://127.0.0.1:8787` — the certificate is served by the local tailscaled, which then " +
+      "proxies to the endpoint on loopback. The claim is about Tailscale's servers, not the local daemon.",
+  },
   // ── 008-POLICY ────────────────────────────────────────────────────────────────────────────────
   {
     surface: "plugins/cello/skills/setup/SKILL.md",
