@@ -17,9 +17,10 @@
  *                     the node itself, never accepted from the request".
  *   INV-CONSENT     — the plaintext is sealed to the intake key before it ever reaches the
  *                     directory, so a node operator learns nothing about who endorsed whom.
- *   §5a ABSENT      — a missing OR malformed intake key REFUSES, with the reason named. There is no
- *                     code path here that emits an unsealed submission; that is a structural
- *                     property of this file, not a policy someone remembered to apply.
+ *   §5a ABSENT      — a missing OR malformed intake key never reaches this file: `verifyManifest`
+ *                     refuses the manifest (`manifest_intake_key_invalid`, M9D 004), and no manifest
+ *                     is held unverified. There is no code path here that emits an unsealed
+ *                     submission; that is a structural property of this file.
  *
  * Crypto: Ed25519 → RFC 8032, CBOR → RFC 8949, SHA-256 → FIPS 180-4.
  */
@@ -40,21 +41,16 @@ import type { Logger } from "./types.js";
 /** The wire version this daemon emits. Signed, so it cannot be downgraded in flight. */
 const SUBMISSION_VERSION = 1;
 
-/** Ed25519 public keys are 32 bytes — 64 lowercase hex characters. */
-const INTAKE_PUBKEY_RE = /^[0-9a-f]{64}$/;
-
 /**
  * Why a submission was refused BEFORE anything was sealed or sent.
  *
  * Each names a cause, never an exit point (§5b). `submission_refused` would tell an operator only
- * that something went wrong; these tell them which subsystem to look at — and for the intake-key
- * cases the answer is "the consortium manifest", which they would never guess.
+ * that something went wrong; these tell them which subsystem to look at — and for both the answer
+ * is "the consortium manifest", which they would never guess.
  */
 export type SubmissionRefusalReason =
   | "manifest_unavailable"
-  | "manifest_expired"
-  | "intake_key_absent"
-  | "intake_key_malformed";
+  | "manifest_expired";
 
 export type ComposeSubmissionResult =
   | {
@@ -187,44 +183,12 @@ export async function composeSealedSubmission(
     };
   }
 
+  // The intake key is PRESENT and WELL-FORMED here by construction: since M9D 004 `verifyManifest`
+  // refuses a manifest whose `intake_key` is missing, has an empty key_id, or a pubkey that is not
+  // 64 lowercase hex (`manifest_intake_key_invalid`), and every manifest this daemon holds came
+  // through it. The daemon's own absent/malformed checks were removed with that change — one gate,
+  // at the boundary, instead of a second copy that could drift from it.
   const intakeKey = manifest.intake_key;
-  if (!intakeKey) {
-    logger.warn("signal.submission.refused", {
-      reason: "intake_key_absent",
-      manifestVersion: manifest.version,
-      op: opts.op,
-    });
-    return {
-      ok: false,
-      reason: "intake_key_absent",
-      guidance:
-        `Consortium manifest v${manifest.version} publishes no portal intake key, so this submission ` +
-        "cannot be sealed. It is NOT sent unsealed — the directory must not be able to read it. " +
-        "This needs a manifest that carries `intake_key`.",
-    };
-  }
-
-  // Malformed is refused for the same reason absent is. Sealing to a non-key produces a blob nobody
-  // can open, which reaches the portal as unattributable POISON with no reply possible (M10B-D22b) —
-  // so the operator would watch the submission vanish with no error anywhere. Uppercase hex is
-  // refused rather than lowercased: the key_id/pubkey pair comes from a SIGNED document, and quietly
-  // repairing a signed value hides a manifest-generation bug instead of surfacing it.
-  if (!intakeKey.key_id || !INTAKE_PUBKEY_RE.test(intakeKey.pubkey ?? "")) {
-    logger.warn("signal.submission.refused", {
-      reason: "intake_key_malformed",
-      manifestVersion: manifest.version,
-      keyId: intakeKey.key_id,
-      op: opts.op,
-    });
-    return {
-      ok: false,
-      reason: "intake_key_malformed",
-      guidance:
-        `Consortium manifest v${manifest.version} carries an unusable intake key ` +
-        `(key_id: ${JSON.stringify(intakeKey.key_id)}) — the pubkey must be a 32-byte Ed25519 key as ` +
-        "64 lowercase hex characters. Refusing rather than sealing to an unopenable value.",
-    };
-  }
 
   // INV-ATTRIBUTION: taken from the signer, never from a parameter.
   const submitterPubkey = Buffer.from(await keyProvider.getPublicKey()).toString("hex");

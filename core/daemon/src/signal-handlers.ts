@@ -357,8 +357,8 @@ export function registerSignalHandlers(deps: SignalHandlerDeps): void {
         issuedAt: Math.floor(Date.now() / 1000), logger,
       });
       if (!composed.ok) {
-        // ERRORS NAME THEIR CAUSE: manifest_unavailable / manifest_expired / intake_key_absent /
-        // intake_key_malformed each say WHICH check refused, and that survives rather than
+        // ERRORS NAME THEIR CAUSE: manifest_unavailable / manifest_expired each say WHICH check
+        // refused, and that survives rather than
         // collapsing into a generic send failure that points at the network.
         return { queued: false, reason: composed.reason, guidance: `${context} ${composed.guidance}` };
       }

@@ -7,6 +7,7 @@
  */
 
 import type {
+  ConsortiumRoots,
   IManifestProvider,
   IManifestVersionStore,
   IManifestPollScheduler,
@@ -24,6 +25,7 @@ export type { SecurityGatewayClient };
 
 // Re-export manifest interfaces for consumers of the daemon package
 export type {
+  ConsortiumRoots,
   IManifestProvider,
   IManifestVersionStore,
   IManifestPollScheduler,
@@ -356,21 +358,14 @@ export interface DaemonConfig {
    * When provided, startDaemon() calls manifestProvider.loadAndVerify() at startup.
    * When absent, manifest loading is skipped.
    *
-   * Production: requires manifestRootKeys (non-empty array) and manifestThreshold (>= 1).
-   * The bundled consortium-manifest.json is NOT shipped in the npm package — operators
-   * must supply their own manifest path via FileManifestProvider(path).
+   * Requires manifestRoots, with both root sets non-empty and both thresholds >= 1.
    */
   manifestProvider?: IManifestProvider;
   /**
-   * Officer root keys for manifest signature verification.
+   * The officer roots the manifest is verified against — Ed25519 and ML-DSA (M9D 004), one value.
    * Required when manifestProvider is provided.
    */
-  manifestRootKeys?: readonly string[];
-  /**
-   * Officer threshold for manifest signature verification.
-   * Required when manifestProvider is provided.
-   */
-  manifestThreshold?: number;
+  manifestRoots?: ConsortiumRoots;
   /**
    * Version store for monotonicity enforcement.
    * When absent, monotonicity check is skipped.

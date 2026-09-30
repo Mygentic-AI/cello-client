@@ -104,8 +104,8 @@ describe("FINDING-4: bundled consortium manifest constant", () => {
   });
 
   it("carries the intake key, so a cold-boot daemon can seal its first submission", () => {
-    // Without this the signature test is the only thing standing between a v1 manifest and every
-    // trust-signal submission refusing with `intake_key_absent` — and that test fails with
+    // Without this the signature test is the only thing standing between a manifest with no intake
+    // key and every trust-signal submission being impossible — and that test fails with
     // "expected false to be true", which names nothing. This one names the field.
     const intake = (BUNDLED_CONSORTIUM_MANIFEST as unknown as {
       intake_key?: { key_id?: string; pubkey?: string };

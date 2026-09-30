@@ -18,10 +18,12 @@
  */
 import type { Logger } from "./types.js";
 import type { ConsortiumManifest } from "@cello-protocol/protocol-types";
-import type {
-  IManifestProvider,
-  IManifestVersionStore,
-  IManifestPollScheduler,
+import {
+  consortiumRootsUsable,
+  type ConsortiumRoots,
+  type IManifestProvider,
+  type IManifestVersionStore,
+  type IManifestPollScheduler,
 } from "@cello-protocol/transport";
 import { randomUUID } from "node:crypto";
 import { startHttpManifestPoll } from "./http-manifest-poll.js";
@@ -39,8 +41,7 @@ import { extractErrorMessage } from "./error-message.js";
 
 export interface ManifestGateDeps {
   manifestProvider?: IManifestProvider;
-  manifestRootKeys?: readonly string[];
-  manifestThreshold?: number;
+  manifestRoots?: ConsortiumRoots;
   manifestVersionStore: IManifestVersionStore;
   logger: Logger;
   /** Injectable fetch, threaded to the /bootstrap probes. Defaults to global fetch. */
@@ -101,7 +102,7 @@ export interface ManifestGateResult {
  * the refuse-to-start decision, because only it can release what a refusal must release.
  */
 export async function verifyStartupManifest(deps: ManifestGateDeps): Promise<ManifestGateResult> {
-  const { manifestProvider, manifestRootKeys, manifestThreshold, manifestVersionStore, logger, fetchFn } = deps;
+  const { manifestProvider, manifestRoots, manifestVersionStore, logger, fetchFn } = deps;
 
   let manifestVerified = false;
   let verifiedManifestVersion = 0;
@@ -110,12 +111,12 @@ export async function verifyStartupManifest(deps: ManifestGateDeps): Promise<Man
   const unresolvedNodes: NodeResolveFailure[] = [];
   let unresolvedSweptAt: string | null = null;
 
-  if (!manifestProvider || !manifestRootKeys || manifestThreshold === undefined) {
+  if (!manifestProvider || !manifestRoots) {
     return { manifestVerified, verifiedManifestVersion, consortiumEndpoints, verifiedManifest, unresolvedNodes, unresolvedSweptAt };
   }
 
   try {
-    const manifest = await manifestProvider.loadAndVerify(manifestRootKeys, manifestThreshold);
+    const manifest = await manifestProvider.loadAndVerify(manifestRoots);
 
     /**
      * DOD-M15-EXPIRY-CONSUMER-POLICY-1 — THIS GATE HAD THE NaN HOLE ITS OWN CLASSIFIER WAS WRITTEN
@@ -234,8 +235,7 @@ export async function verifyStartupManifest(deps: ManifestGateDeps): Promise<Man
 
 export interface ConsortiumRoutingDeps {
   manifestProvider?: IManifestProvider;
-  manifestRootKeys?: readonly string[];
-  manifestThreshold?: number;
+  manifestRoots?: ConsortiumRoots;
   manifestVersionStore: IManifestVersionStore;
   manifestPollScheduler?: IManifestPollScheduler;
   directoryHttpUrl?: string;
@@ -287,7 +287,7 @@ export interface ConsortiumRouting {
 
 export function createConsortiumRouting(deps: ConsortiumRoutingDeps): ConsortiumRouting {
   const {
-    manifestProvider, manifestRootKeys, manifestThreshold, manifestVersionStore,
+    manifestProvider, manifestRoots, manifestVersionStore,
     manifestPollScheduler, directoryHttpUrl, directoryEndpointResolver, logger, fetchFn,
   } = deps;
 
@@ -460,12 +460,16 @@ export function createConsortiumRouting(deps: ConsortiumRoutingDeps): Consortium
    * supplied nothing to verify with. Only the second refuses.
    */
   if (manifestPollScheduler && manifestProvider) {
-    const keyCount = manifestRootKeys?.length ?? 0;
-    if (keyCount === 0 || !manifestThreshold || manifestThreshold < 1) {
-      const detail = `rootKeys=${String(keyCount)} threshold=${String(manifestThreshold ?? 0)}`;
+    if (!consortiumRootsUsable(manifestRoots)) {
+      const keyCount = manifestRoots?.rootKeys.length ?? 0;
+      const pqKeyCount = manifestRoots?.rootKeysPq.length ?? 0;
+      const detail = `rootKeys=${String(keyCount)} threshold=${String(manifestRoots?.threshold ?? 0)} ` +
+        `rootKeysPq=${String(pqKeyCount)} pqThreshold=${String(manifestRoots?.pqThreshold ?? 0)}`;
       logger.error("directory.manifest.poll.misconfigured", {
         rootKeyCount: keyCount,
-        threshold: manifestThreshold ?? 0,
+        threshold: manifestRoots?.threshold ?? 0,
+        pqRootKeyCount: pqKeyCount,
+        pqThreshold: manifestRoots?.pqThreshold ?? 0,
         impact:
           "the manifest poll is wired but has no key set to verify against, so it would adopt " +
           "manifests unverified or never adopt one at all — refusing at startup instead of running " +
@@ -474,14 +478,13 @@ export function createConsortiumRouting(deps: ConsortiumRoutingDeps): Consortium
       throw new Error(`directory_manifest_poll_misconfigured: ${detail}`);
     }
   }
-  if (manifestPollScheduler && manifestProvider && manifestRootKeys && manifestRootKeys.length > 0 && manifestThreshold && manifestThreshold >= 1) {
+  if (manifestPollScheduler && manifestProvider && manifestRoots && consortiumRootsUsable(manifestRoots)) {
     stopHttpManifestPoll = startHttpManifestPoll({
       scheduler: manifestPollScheduler,
       directoryUrl: directoryHttpUrl ?? resolveDirectoryUrl(process.env),
       manifestProvider,
       manifestVersionStore,
-      rootKeys: manifestRootKeys,
-      threshold: manifestThreshold,
+      roots: manifestRoots,
       logger,
       mintCorrelationId: () => randomUUID(),
     });

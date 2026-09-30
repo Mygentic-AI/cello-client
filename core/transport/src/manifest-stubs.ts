@@ -17,6 +17,7 @@ import type {
   IManifestPollScheduler,
   DirectoryKeyProvider,
   DirectoryManifestStore,
+  ConsortiumRoots,
 } from "./manifest-interfaces.js";
 
 // ─── IManifestVersionStore ───────────────────────────────────────────────────
@@ -53,7 +54,7 @@ export class TestManifestProvider implements IManifestProvider {
     this.#manifest = manifest;
   }
 
-  async loadAndVerify(_rootKeys: readonly string[], _threshold: number): Promise<ConsortiumManifest> {
+  async loadAndVerify(_roots: ConsortiumRoots): Promise<ConsortiumManifest> {
     this.#loaded = this.#manifest;
     return this.#manifest;
   }

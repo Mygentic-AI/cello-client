@@ -17,9 +17,9 @@
  * Crypto reference: RFC 8032 (Ed25519 threshold verification via verifyManifest).
  */
 
-import { verifyManifest, type ConsortiumManifestInput } from "@cello-protocol/crypto";
+import { verifyManifest, type ConsortiumManifestInput, type ManifestVerifyReason } from "@cello-protocol/crypto";
 import type { ConsortiumManifest } from "@cello-protocol/protocol-types";
-import type { IManifestProvider, IManifestVersionStore, IManifestPollScheduler } from "@cello-protocol/transport";
+import type { ConsortiumRoots, IManifestProvider, IManifestVersionStore, IManifestPollScheduler } from "@cello-protocol/transport";
 import { extractErrorMessage } from "./error-message.js";
 
 /** Minimal structural logger — events use the `domain.noun.verb` taxonomy. */
@@ -32,9 +32,8 @@ export interface ManifestPollLogger {
 export interface ManifestAdoptDeps {
   manifestProvider: IManifestProvider;
   manifestVersionStore: IManifestVersionStore;
-  /** Locally-pinned officer root keys (CELLO_CONSORTIUM_ROOT_KEYS). */
-  rootKeys: readonly string[];
-  threshold: number;
+  /** Locally-pinned officer roots — Ed25519 AND ML-DSA (M9D 004). */
+  roots: ConsortiumRoots;
   logger: ManifestPollLogger;
 }
 
@@ -42,7 +41,8 @@ export type ManifestPollFailureReason =
   | "manifest_http_unreachable"
   | "manifest_malformed"
   | "manifest_threshold_invalid"
-  | "manifest_signature_invalid"
+  // Every verifier refusal keeps its own name — a failed post-quantum set is not an Ed25519 failure.
+  | ManifestVerifyReason
   | "manifest_not_yet_valid"
   | "manifest_expired"
   | "manifest_version_rollback"
@@ -74,8 +74,7 @@ export async function pollManifestOverHttp(
     correlationId,
     manifestProvider,
     manifestVersionStore,
-    rootKeys,
-    threshold,
+    roots,
     logger,
   } = opts;
   const manifestUrl = `${directoryUrl.replace(/\/$/, "")}/manifest`;
@@ -118,21 +117,21 @@ export async function pollManifestOverHttp(
     return { ok: false, reason: "manifest_malformed" };
   }
 
-  // 3. Defense-in-depth: never adopt against a 0/missing threshold (verifyManifest would
-  //    accept an unsigned manifest at threshold 0). The composition root rejects
-  //    threshold < 1 before wiring, but guard the policy directly too.
-  if (threshold < 1) {
-    logger.error("directory.auth.manifest.poll.failed", { reason: "manifest_threshold_invalid", threshold, correlationId });
+  // 3. Defense-in-depth: never adopt against a 0 threshold on EITHER set (verifyManifest would
+  //    accept an unsigned set at threshold 0). The composition root rejects that before wiring,
+  //    but guard the policy directly too.
+  if (roots.threshold < 1 || roots.pqThreshold < 1) {
+    logger.error("directory.auth.manifest.poll.failed", { reason: "manifest_threshold_invalid", threshold: roots.threshold, pqThreshold: roots.pqThreshold, correlationId });
     return { ok: false, reason: "manifest_threshold_invalid" };
   }
 
-  // 4. Threshold signature (RFC 8032) against locally-pinned root keys.
-  const verifyResult = verifyManifest(manifest as unknown as ConsortiumManifestInput, rootKeys, threshold);
+  // 4. Both officer signature sets (RFC 8032, FIPS 204) against the locally-pinned roots.
+  const verifyResult = await verifyManifest(manifest as unknown as ConsortiumManifestInput, roots);
   if (!verifyResult.ok) {
     // Distinct security event (a rogue/compromised directory served a forged manifest) — kept as its
     // own name so alarms can key on it separately from ordinary poll failures. DOD-AUTH-2.
-    logger.warn("directory.auth.manifest.signature.invalid", { reason: "manifest_signature_invalid", manifestVersion: manifest.version, detail: verifyResult.reason, correlationId });
-    return { ok: false, reason: "manifest_signature_invalid" };
+    logger.warn("directory.auth.manifest.signature.invalid", { reason: verifyResult.reason, manifestVersion: manifest.version, detail: verifyResult.detail, correlationId });
+    return { ok: false, reason: verifyResult.reason };
   }
 
   // 5. Validity window.
@@ -184,7 +183,7 @@ export function startHttpManifestPoll(
     mintCorrelationId?: () => string;
   } & ManifestAdoptDeps,
 ): () => void {
-  const { scheduler, directoryUrl, fetchFn, mintCorrelationId, manifestProvider, manifestVersionStore, rootKeys, threshold, logger } = opts;
+  const { scheduler, directoryUrl, fetchFn, mintCorrelationId, manifestProvider, manifestVersionStore, roots, logger } = opts;
   let stopped = false;
 
   const tick = async (): Promise<void> => {
@@ -195,8 +194,7 @@ export function startHttpManifestPoll(
       correlationId: mintCorrelationId?.(),
       manifestProvider,
       manifestVersionStore,
-      rootKeys,
-      threshold,
+      roots,
       logger,
     }).catch((err: unknown) => {
       // pollManifestOverHttp is designed never to throw (all failures return a reason). If it ever

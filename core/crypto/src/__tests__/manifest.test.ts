@@ -845,10 +845,21 @@ describe("004 — both signature sets are required", () => {
     const r1 = await verifyManifest(absent, await opts());
     expect(r1.ok === false && r1.reason).toBe("manifest_intake_key_invalid");
 
-    const bad = await pqManifest();
-    bad["intake_key"] = { key_id: "intake-0", pubkey: "D".repeat(64) };
-    await signBoth(bad, [0, 1, 2], [{ idx: 0, seedByte: ROOT_PQ_SEED }]);
-    const r2 = await verifyManifest(bad, await opts());
-    expect(r2.ok === false && r2.reason).toBe("manifest_intake_key_invalid");
+    // Moved here from the daemon's submission test: sealing to a non-key produces a blob nobody can
+    // open, which reaches the portal as unattributable poison. Uppercase is refused rather than
+    // lowercased — repairing a signed value hides a manifest-generation bug. An empty key_id breaks
+    // the portal's rotation bookkeeping.
+    const good = "d".repeat(64);
+    for (const intake of [
+      { key_id: "intake-0", pubkey: "" }, { key_id: "intake-0", pubkey: "not-hex" },
+      { key_id: "intake-0", pubkey: "aabb" }, { key_id: "intake-0", pubkey: "D".repeat(64) },
+      { key_id: "intake-0", pubkey: good + "00" }, { key_id: "", pubkey: good },
+    ]) {
+      const bad = await pqManifest();
+      bad["intake_key"] = intake;
+      await signBoth(bad, [0, 1, 2], [{ idx: 0, seedByte: ROOT_PQ_SEED }]);
+      const r2 = await verifyManifest(bad, await opts());
+      expect(r2.ok === false && r2.reason, JSON.stringify(intake)).toBe("manifest_intake_key_invalid");
+    }
   });
 });

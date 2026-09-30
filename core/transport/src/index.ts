@@ -63,7 +63,9 @@ export type {
   IManifestPollScheduler,
   DirectoryKeyProvider,
   DirectoryManifestStore,
+  ConsortiumRoots,
 } from "./manifest-interfaces.js";
+export { consortiumRootsUsable } from "./manifest-interfaces.js";
 
 // M7-MANIFEST-002: manifest stubs (for test use)
 export {

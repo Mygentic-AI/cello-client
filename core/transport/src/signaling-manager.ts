@@ -71,7 +71,9 @@ import type {
   IManifestPollScheduler,
   IManifestVersionStore,
   IManifestProvider,
+  ConsortiumRoots,
 } from "./manifest-interfaces.js";
+import { consortiumRootsUsable } from "./manifest-interfaces.js";
 export type { ChallengeVerifyResult } from "./manifest-interfaces.js";
 
 // ─── Logger interface ─────────────────────────────────────────────────────────
@@ -196,8 +198,8 @@ export interface SignalingManagerOptions {
   manifestVersionStore?: IManifestVersionStore;
   manifestProvider?: IManifestProvider;
   correlationId?: string;
-  rootKeys?: readonly string[];
-  threshold?: number;
+  /** M9D 004: both officer sets. Absent → a polled manifest is never adopted. */
+  roots?: ConsortiumRoots;
   /** M8C-RELAYWAKE-1: fired every time this manager reaches 'connected' — the FIRST connect and
    *  every reconnect after a drop. Lets a caller re-check relay-parked content on "wakeup"
    *  without the manager needing to know anything about relays/content itself. Best-effort —
@@ -263,8 +265,7 @@ export class SignalingManager {
   private readonly _manifestVersionStore: IManifestVersionStore | undefined;
   private readonly _manifestProvider: IManifestProvider | undefined;
   private readonly _correlationId: string;
-  private readonly _rootKeys: readonly string[];
-  private readonly _threshold: number;
+  private readonly _roots: ConsortiumRoots | undefined;
   // M8C-RELAYWAKE-1
   private readonly _onConnected: (() => void) | undefined;
   // Per-poll-cycle correlation id, minted at dispatch and threaded through to the
@@ -288,8 +289,7 @@ export class SignalingManager {
     this._manifestVersionStore = opts.manifestVersionStore;
     this._manifestProvider = opts.manifestProvider;
     this._correlationId = opts.correlationId ?? "";
-    this._rootKeys = opts.rootKeys ?? [];
-    this._threshold = opts.threshold ?? 0;
+    this._roots = opts.roots;
     this._onConnected = opts.onConnected;
 
     // Begin connection immediately — status starts as 'reconnecting'
@@ -521,23 +521,21 @@ export class SignalingManager {
     // or rolled-back manifest. Rescheduling is NOT done here — the poll loop is driven
     // from the dispatch side (#schedulePoll) so a lost/ignored response can't stall it.
 
-    // Defense-in-depth: never adopt against a 0/missing threshold (verifyManifest would
-    // pass an unsigned manifest at threshold 0). The daemon composition root already
-    // rejects threshold < 1 before wiring poll deps; this guards the manager directly.
-    if (this._threshold < 1) {
+    // Defense-in-depth: never adopt against missing roots or a 0 threshold on EITHER set
+    // (verifyManifest would pass an unsigned set at threshold 0). The daemon composition root
+    // already rejects that before wiring poll deps; this guards the manager directly.
+    const roots = this._roots;
+    if (!roots || !consortiumRootsUsable(roots)) {
       this._logger.error("directory.auth.manifest.threshold.invalid", {
         correlationId,
         manifestVersion: manifest.version,
-        threshold: this._threshold,
+        threshold: roots?.threshold ?? 0,
+        pqThreshold: roots?.pqThreshold ?? 0,
       });
       return;
     }
 
-    const verifyResult = verifyManifest(
-      manifest as unknown as ConsortiumManifestInput,
-      this._rootKeys,
-      this._threshold,
-    );
+    const verifyResult = await verifyManifest(manifest as unknown as ConsortiumManifestInput, roots);
     if (!verifyResult.ok) {
       this._logger.error("directory.auth.manifest.signature.invalid", {
         correlationId,

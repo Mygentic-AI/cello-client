@@ -18,12 +18,15 @@ import {
   type IDirectoryChallengeVerifier,
   type IManifestVersionStore,
   type IManifestPollScheduler,
+  type ConsortiumRoots,
 } from "@cello-protocol/transport";
 import { FileManifestProvider, EmbeddedManifestProvider } from "./file-manifest-provider.js";
 import {
   BUNDLED_CONSORTIUM_MANIFEST,
   BUNDLED_CONSORTIUM_ROOT_KEYS,
   BUNDLED_CONSORTIUM_THRESHOLD,
+  BUNDLED_CONSORTIUM_ROOT_KEYS_PQ,
+  BUNDLED_CONSORTIUM_PQ_THRESHOLD,
 } from "./bundled-consortium-manifest.js";
 import { resolveDirectoryUrl } from "./directory-bootstrap.js";
 import { RandomizedPollScheduler } from "./manifest-poll-scheduler.js";
@@ -42,8 +45,7 @@ const BUNDLED_ENDPOINTS = new Set(
 
 export interface ManifestDeps {
   manifestProvider?: IManifestProvider;
-  manifestRootKeys?: readonly string[];
-  manifestThreshold?: number;
+  manifestRoots?: ConsortiumRoots;
   challengeVerifier?: IDirectoryChallengeVerifier;
   manifestVersionStore?: IManifestVersionStore;
   manifestPollScheduler?: IManifestPollScheduler;
@@ -53,8 +55,12 @@ export interface ManifestDeps {
  * Build the consortium-manifest deps.
  *
  *   CELLO_CONSORTIUM_MANIFEST    absolute path to an override manifest JSON (opt-in)
- *   CELLO_CONSORTIUM_ROOT_KEYS   comma-separated officer root pubkeys (hex) — override path only
- *   CELLO_CONSORTIUM_THRESHOLD   minimum officer signatures (integer) — override path only
+ *   CELLO_CONSORTIUM_ROOT_KEYS      comma-separated Ed25519 officer root pubkeys (hex) — override only
+ *   CELLO_CONSORTIUM_THRESHOLD      minimum Ed25519 officer signatures (integer) — override only
+ *   CELLO_CONSORTIUM_ROOT_KEYS_PQ   comma-separated ML-DSA officer root pubkeys (hex) — override only
+ *   CELLO_CONSORTIUM_PQ_THRESHOLD   minimum ML-DSA officer signatures (integer) — override only
+ *   (M9D 004: the PQ pair is both-or-neither, and the override needs it — a manifest is verified
+ *   under both sets or not at all.)
  *   CELLO_MANIFEST_POLL_MIN_MS / _MAX_MS   optional background poll window — override path only
  *
  * The single manifestProvider instance is shared between startDaemon's loadAndVerify call and the
@@ -139,23 +145,47 @@ export function buildManifestDeps(logger: Logger): ManifestDeps {
       nodeCount: BUNDLED_CONSORTIUM_MANIFEST.nodes.length,
       rootKeyCount: BUNDLED_CONSORTIUM_ROOT_KEYS.length,
       threshold: BUNDLED_CONSORTIUM_THRESHOLD,
+      pqRootKeyCount: BUNDLED_CONSORTIUM_ROOT_KEYS_PQ.length,
+      pqThreshold: BUNDLED_CONSORTIUM_PQ_THRESHOLD,
     });
     return {
       manifestProvider,
-      manifestRootKeys: BUNDLED_CONSORTIUM_ROOT_KEYS,
-      manifestThreshold: BUNDLED_CONSORTIUM_THRESHOLD,
+      manifestRoots: {
+        rootKeys: BUNDLED_CONSORTIUM_ROOT_KEYS,
+        threshold: BUNDLED_CONSORTIUM_THRESHOLD,
+        rootKeysPq: BUNDLED_CONSORTIUM_ROOT_KEYS_PQ,
+        pqThreshold: BUNDLED_CONSORTIUM_PQ_THRESHOLD,
+      },
       challengeVerifier,
     };
   }
 
-  const rootKeysRaw = process.env.CELLO_CONSORTIUM_ROOT_KEYS ?? "";
-  const manifestRootKeys = rootKeysRaw.split(",").map((k) => k.trim()).filter((k) => k.length > 0);
-  const manifestThreshold = Number.parseInt(process.env.CELLO_CONSORTIUM_THRESHOLD ?? "", 10);
-  if (manifestRootKeys.length === 0 || Number.isNaN(manifestThreshold)) {
+  const keyList = (raw: string | undefined): string[] =>
+    (raw ?? "").split(",").map((k) => k.trim()).filter((k) => k.length > 0);
+  const rootKeys = keyList(process.env.CELLO_CONSORTIUM_ROOT_KEYS);
+  const threshold = Number.parseInt(process.env.CELLO_CONSORTIUM_THRESHOLD ?? "", 10);
+  if (rootKeys.length === 0 || Number.isNaN(threshold)) {
     throw new Error(
       "CELLO_CONSORTIUM_MANIFEST is set but CELLO_CONSORTIUM_ROOT_KEYS / CELLO_CONSORTIUM_THRESHOLD are missing or invalid",
     );
   }
+  // M9D 004 decision 8: the PQ pair is BOTH-OR-NEITHER, and "neither" is refused too — a manifest is
+  // verified under both officer sets or not at all, so an override without the ML-DSA roots could
+  // never verify anything. One without the other names which half is missing.
+  const rawPqKeys = process.env.CELLO_CONSORTIUM_ROOT_KEYS_PQ;
+  const rawPqThreshold = process.env.CELLO_CONSORTIUM_PQ_THRESHOLD;
+  const rootKeysPq = keyList(rawPqKeys);
+  const pqThreshold = Number.parseInt(rawPqThreshold ?? "", 10);
+  if (rootKeysPq.length === 0 || Number.isNaN(pqThreshold)) {
+    const which = rawPqKeys === undefined && rawPqThreshold === undefined
+      ? "both are unset"
+      : rootKeysPq.length === 0 ? "CELLO_CONSORTIUM_ROOT_KEYS_PQ is missing or empty" : "CELLO_CONSORTIUM_PQ_THRESHOLD is missing or not an integer";
+    throw new Error(
+      `CELLO_CONSORTIUM_MANIFEST is set but CELLO_CONSORTIUM_ROOT_KEYS_PQ / CELLO_CONSORTIUM_PQ_THRESHOLD are invalid (${which}) — ` +
+        "a manifest is verified under the Ed25519 AND the ML-DSA officer set, so both pairs are required",
+    );
+  }
+  const manifestRoots: ConsortiumRoots = { rootKeys, threshold, rootKeysPq, pqThreshold };
 
   const manifestProvider = new FileManifestProvider({ path: manifestPath });
   const challengeVerifier = new ManifestDirectoryChallengeVerifier(
@@ -181,10 +211,12 @@ export function buildManifestDeps(logger: Logger): ManifestDeps {
   const manifestPollScheduler = new RandomizedPollScheduler(pollOpts);
   logger.info("daemon.manifest.configured", {
     manifestPath,
-    rootKeyCount: manifestRootKeys.length,
-    threshold: manifestThreshold,
+    rootKeyCount: rootKeys.length,
+    threshold,
+    pqRootKeyCount: rootKeysPq.length,
+    pqThreshold,
     pollMinMs: pollOpts?.minMs ?? null,
     pollMaxMs: pollOpts?.maxMs ?? null,
   });
-  return { manifestProvider, manifestRootKeys, manifestThreshold, challengeVerifier, manifestPollScheduler };
+  return { manifestProvider, manifestRoots, challengeVerifier, manifestPollScheduler };
 }

@@ -163,7 +163,7 @@ async function startDaemonHoldingLock(
    * Reading the compiled-in constant instead would print the genuine CELLO fingerprint on a daemon
    * pointed at someone else's consortium, or at none.
    */
-  const enforcedConsortium = { rootKeys: config.manifestRootKeys, threshold: config.manifestThreshold };
+  const enforcedConsortium = config.manifestRoots;
 
   // 040-DAEMONROOT unit 7 (phase 1): transport, gateway, session manager, the manifest gate, the
   // roster sweep and the type registry → boot-core.ts. Three inputs, everything below comes out.

@@ -20,6 +20,26 @@
  */
 
 import type { ConsortiumManifest } from "@cello-protocol/protocol-types";
+import type { ManifestVerifyOptions } from "@cello-protocol/crypto";
+
+/**
+ * The roots a manifest is verified against — M9D 004: the Ed25519 officer keys and threshold AND
+ * the ML-DSA officer keys and threshold, carried as ONE value so no caller can pass one set without
+ * the other.
+ */
+export type ConsortiumRoots = ManifestVerifyOptions;
+
+/**
+ * True when both root sets are non-empty and both thresholds are at least 1 — the ONE definition of
+ * "anchored". A zero threshold on either set would let an unsigned set pass, so every gate that
+ * decides whether to verify, adopt or report "anchored" asks this, never its own copy.
+ */
+// Deliberately NOT a type predicate: `false` does not mean "undefined", and a predicate would
+// narrow the refusal branch to `never`, where a caller logs the very counts that made it unusable.
+export function consortiumRootsUsable(roots: ConsortiumRoots | undefined): boolean {
+  return !!roots && roots.rootKeys.length > 0 && roots.threshold >= 1 &&
+    roots.rootKeysPq.length > 0 && roots.pqThreshold >= 1;
+}
 
 // ─── Client-side interfaces ───────────────────────────────────────────────────
 
@@ -47,11 +67,11 @@ export interface IManifestVersionStore {
  */
 export interface IManifestProvider {
   /**
-   * Load the manifest from its source, verify the threshold signatures against
-   * the supplied root keys, and cache it for getCurrentManifest().
+   * Load the manifest from its source, verify BOTH officer signature sets against
+   * the supplied roots, and cache it for getCurrentManifest().
    * Throws on signature failure, expiry, or missing nodes.
    */
-  loadAndVerify(rootKeys: readonly string[], threshold: number): Promise<ConsortiumManifest>;
+  loadAndVerify(roots: ConsortiumRoots): Promise<ConsortiumManifest>;
   /**
    * Returns the cached manifest from the last successful loadAndVerify() call.
    * Returns null if loadAndVerify() has not been called or failed.

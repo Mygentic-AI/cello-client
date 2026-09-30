@@ -64,38 +64,9 @@ describe("DOD-END-SUBMIT-1 — refusal paths (§5a ABSENT IS NOT FINE)", () => {
     expect(res.guidance).toMatch(/manifest/i);
   });
 
-  it("REFUSES when the manifest carries no intake key — and NEVER falls back to unsealed", async () => {
-    // The whole claim of the sealed queue is that the directory cannot read what it holds. A daemon
-    // that sent plaintext when it could not find a key would satisfy every other test in this file
-    // and destroy the property outright.
-    const res = await compose({ manifest: manifest({ intake_key: undefined }) });
-    expect(res.ok).toBe(false);
-    if (res.ok) throw new Error("unreachable");
-    expect(res.reason).toBe("intake_key_absent");
-    expect(res.guidance).toMatch(/intake key/i);
-  });
-
-  it("REFUSES a MALFORMED intake key rather than sealing to garbage", async () => {
-    // Malformed gets the same answer as absent, for the same reason. Sealing to a non-key produces
-    // a blob nobody can open — which arrives at the portal as unattributable POISON with no reply
-    // possible (M10B-D22b), so the operator would see their submission vanish silently.
-    for (const pubkey of ["", "not-hex", "aabb", intakePubHex.toUpperCase(), intakePubHex + "00"]) {
-      const res = await compose({ manifest: manifest({ intake_key: { key_id: "k", pubkey } }) });
-      expect(res.ok, `pubkey ${JSON.stringify(pubkey)} must be refused`).toBe(false);
-      if (res.ok) throw new Error("unreachable");
-      expect(res.reason).toBe("intake_key_malformed");
-    }
-  });
-
-  it("REFUSES an intake key with an empty key_id — the id is what makes rotation retention work", async () => {
-    // Every queue row records the key_id it was sealed to; the portal retains a rotated-out private
-    // key until no undrained row references it (M10B-D11). An empty id breaks that bookkeeping
-    // silently, stranding submissions at the next rotation.
-    const res = await compose({ manifest: manifest({ intake_key: { key_id: "", pubkey: intakePubHex } }) });
-    expect(res.ok).toBe(false);
-    if (res.ok) throw new Error("unreachable");
-    expect(res.reason).toBe("intake_key_malformed");
-  });
+  // The absent / malformed / empty-key_id intake-key cases moved to the crypto verifier's test
+  // (`manifest_intake_key_invalid`, M9D 004): a manifest carrying one never verifies, so it never
+  // reaches `composeSubmission`.
 });
 
 describe("DOD-END-SUBMIT-1 — the sealed submission", () => {

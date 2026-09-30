@@ -28,7 +28,7 @@ import { verifyStartupManifest, createConsortiumRouting } from "./consortium-boo
 import { startManifestValidityWatch, type ManifestOrigin } from "./manifest-validity.js";
 import { resolveDirectoryUrl } from "./directory-bootstrap.js";
 import type { RosterFreshness } from "./roster-freshness.js";
-import type { IManifestVersionStore } from "@cello-protocol/transport";
+import { consortiumRootsUsable, type IManifestVersionStore } from "@cello-protocol/transport";
 import type { DaemonConfig, Logger } from "./types.js";
 import { extractErrorMessage } from "./error-message.js";
 
@@ -45,7 +45,7 @@ export async function startBootCore(deps: BootCoreDeps) {
   // this phase reads config, and a nine-argument dependency list would be the root with an extra hop.
   const {
     celloDir, socketPath, lockFilePath,
-    manifestProvider, manifestRootKeys, manifestThreshold,
+    manifestProvider, manifestRoots,
     manifestVersionStore: injectedManifestVersionStore, manifestPollScheduler,
     challengeVerifier, sessionNodeFactory, directoryEndpointResolver, version,
   } = config;
@@ -66,11 +66,11 @@ export async function startBootCore(deps: BootCoreDeps) {
 
   // ADV-006 + ADV-008 (hoisted — code-review MED): pure config validation runs BEFORE any disk side
   // effect (lock, the irreversible one-time migration, DB open). A misconfigured daemon must fail
-  // before mutating state. If manifestProvider is set, manifestRootKeys + a positive threshold are
-  // required.
-  if (manifestProvider && (!manifestRootKeys || !manifestThreshold || manifestThreshold <= 0)) {
+  // before mutating state. If manifestProvider is set, usable roots — both sets non-empty, both
+  // thresholds >= 1 — are required.
+  if (manifestProvider && !consortiumRootsUsable(manifestRoots)) {
     throw new Error(
-      "DaemonConfig: manifestProvider requires manifestRootKeys (non-empty) and manifestThreshold (positive integer >= 1)",
+      "DaemonConfig: manifestProvider requires manifestRoots with non-empty Ed25519 and ML-DSA root keys and both thresholds >= 1",
     );
   }
 
@@ -174,8 +174,7 @@ export async function startBootCore(deps: BootCoreDeps) {
   // because only we hold the DB handle and the singleton lock a refusal has to release.
   const { manifestVerified, verifiedManifestVersion, verifiedManifest, unresolvedNodes: startupUnresolvedNodes, unresolvedSweptAt: startupSweptAt } = await verifyStartupManifest({
     manifestProvider,
-    manifestRootKeys,
-    manifestThreshold,
+    manifestRoots,
     manifestVersionStore,
     logger,
     // DOD-M15-STALEROSTER-1: the same injected fetch the sweep uses, so the startup probe and the
@@ -195,7 +194,8 @@ export async function startBootCore(deps: BootCoreDeps) {
     // through it, so no failure path can leak the lock by forgetting.
     throw new Error(
       "Manifest verification failed. The daemon cannot start with an unverified manifest when manifestProvider is configured. " +
-      "Check the logs for the specific failure reason (manifest_signature_invalid, manifest_expired, or manifest_version_rollback).",
+      "Check the logs for the specific failure reason (manifest_signature_invalid, manifest_pq_signatures_missing, " +
+      "manifest_pq_signatures_below_threshold, manifest_expired, manifest_version_rollback, …).",
     );
   }
 
@@ -203,8 +203,7 @@ export async function startBootCore(deps: BootCoreDeps) {
   const { resolveConsortiumRoster, failoverEndpointResolver, getFailoverEndpoint, getUnresolvedNodes, getUnresolvedSweptAt, getDeclaredNodeCount, stopHttpManifestPoll } =
     createConsortiumRouting({
       manifestProvider,
-      manifestRootKeys,
-      manifestThreshold,
+      manifestRoots,
       manifestVersionStore,
       manifestPollScheduler,
       directoryHttpUrl,

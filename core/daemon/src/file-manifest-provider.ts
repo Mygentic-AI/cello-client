@@ -24,7 +24,7 @@
 import { readFileSync } from "node:fs";
 import type { ConsortiumManifest } from "@cello-protocol/protocol-types";
 import { verifyManifest, type ConsortiumManifestInput } from "@cello-protocol/crypto";
-import type { IManifestProvider } from "@cello-protocol/transport";
+import type { ConsortiumRoots, IManifestProvider } from "@cello-protocol/transport";
 import { extractErrorMessage } from "./error-message.js";
 
 export class ManifestLoadError extends Error {
@@ -49,7 +49,7 @@ export class FileManifestProvider implements IManifestProvider {
     this.#path = opts.path;
   }
 
-  async loadAndVerify(rootKeys: readonly string[], threshold: number): Promise<ConsortiumManifest> {
+  async loadAndVerify(roots: ConsortiumRoots): Promise<ConsortiumManifest> {
     let raw: string;
     try {
       raw = readFileSync(this.#path, "utf8");
@@ -64,12 +64,13 @@ export class FileManifestProvider implements IManifestProvider {
       throw new ManifestLoadError("manifest_malformed", extractErrorMessage(err));
     }
 
-    // Threshold officer-signature verification (RFC 8032). verifyManifest also
-    // rejects an empty node set. This is the TUF root-of-trust gate. Expiry / version
-    // monotonicity are enforced by the daemon (named events), not here.
-    const result = verifyManifest(parsed as unknown as ConsortiumManifestInput, rootKeys, threshold);
+    // Both officer-signature sets (RFC 8032, FIPS 204). verifyManifest also rejects an empty node
+    // set. This is the TUF root-of-trust gate. Expiry / version monotonicity are enforced by the
+    // daemon (named events), not here. The error carries the verifier's OWN reason, so a failed
+    // post-quantum set is never reported as an Ed25519 failure.
+    const result = await verifyManifest(parsed as unknown as ConsortiumManifestInput, roots);
     if (!result.ok) {
-      throw new ManifestLoadError("manifest_signature_invalid", result.detail);
+      throw new ManifestLoadError(result.reason, result.detail);
     }
 
     this.#manifest = parsed;
@@ -104,13 +105,13 @@ export class EmbeddedManifestProvider implements IManifestProvider {
     this.#input = input;
   }
 
-  loadAndVerify(rootKeys: readonly string[], threshold: number): Promise<ConsortiumManifest> {
-    const result = verifyManifest(this.#input, rootKeys, threshold);
+  async loadAndVerify(roots: ConsortiumRoots): Promise<ConsortiumManifest> {
+    const result = await verifyManifest(this.#input, roots);
     if (!result.ok) {
-      return Promise.reject(new ManifestLoadError("manifest_signature_invalid", result.detail));
+      throw new ManifestLoadError(result.reason, result.detail);
     }
     this.#manifest = this.#input as unknown as ConsortiumManifest;
-    return Promise.resolve(this.#manifest);
+    return this.#manifest;
   }
 
   getCurrentManifest(): ConsortiumManifest | null {
