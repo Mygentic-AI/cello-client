@@ -624,14 +624,21 @@ export function gatewayConfigSet(
 export type ConfirmAnswer = "yes" | "no" | "no_tty";
 
 /**
- * Ask a yes/no question on the terminal. Returns `no_tty` — distinct from `no` — when stdin is not
- * a TTY: a pipe, a CI job or an agent spawning the CLI is not a human, and treating one as a human
- * who declined is the side door INV-10 exists to close, told as a misleading story.
+ * What a POLICY-approval prompt resolves to. Unlike `ConfirmAnswer`, a bare Enter / Ctrl-D / stray
+ * key is `skip` — leave the draft pending — NOT `no`, because for a policy `no` DISCARDS the draft
+ * and the safe-looking key must not be the destructive one (085-POLICYSKIP). `config set` keeps the
+ * two-way `ConfirmAnswer`, where "anything but y means no" is exactly right.
  */
-async function confirmAtTty(question: string): Promise<ConfirmAnswer> {
-  if (!process.stdin.isTTY) return "no_tty";
-  process.stderr.write(`${question} [y/N] `);
-  const answer = await new Promise<string>((resolve) => {
+export type PolicyConfirmAnswer = "yes" | "no" | "skip" | "no_tty";
+
+/**
+ * Read one trimmed, lowercased line from an interactive stdin. Resolves to "" for an empty line, for
+ * end-of-input (the operator hit Ctrl-D, which closes stdin without ever emitting data) and for a
+ * stdin error — INV-6 says a deadline always produces an answer rather than hanging. Shared by both
+ * prompt helpers below so the read path is written once; each helper decides what "" means.
+ */
+async function readTtyLine(): Promise<string> {
+  return new Promise<string>((resolve) => {
     process.stdin.resume();
     process.stdin.setEncoding("utf8");
     const done = (value: string): void => {
@@ -641,16 +648,39 @@ async function confirmAtTty(question: string): Promise<ConfirmAnswer> {
       process.stdin.off("error", onEnd);
       resolve(value);
     };
-    // `end`/`error` as well as `data`: a terminal where the operator hits Ctrl-D closes stdin
-    // without ever emitting data, and a promise that never settles is a hang — INV-6 says a
-    // deadline always produces an answer, and "no" is the safe one.
     const onData = (chunk: string): void => done(chunk.trim().toLowerCase());
     const onEnd = (): void => done("");
     process.stdin.once("data", onData);
     process.stdin.once("end", onEnd);
     process.stdin.once("error", onEnd);
   });
+}
+
+/**
+ * Ask a yes/no question on the terminal. Returns `no_tty` — distinct from `no` — when stdin is not
+ * a TTY: a pipe, a CI job or an agent spawning the CLI is not a human, and treating one as a human
+ * who declined is the side door INV-10 exists to close, told as a misleading story.
+ */
+async function confirmAtTty(question: string): Promise<ConfirmAnswer> {
+  if (!process.stdin.isTTY) return "no_tty";
+  process.stderr.write(`${question} [y/N] `);
+  const answer = await readTtyLine();
   return answer === "y" || answer === "yes" ? "yes" : "no";
+}
+
+/**
+ * Ask a policy-approval question with THREE answers. `y`/`yes` approve; a typed `n`/`no` discards;
+ * everything else typed — `s`, `skip`, an empty line, Ctrl-D, a stray key — leaves the draft pending
+ * (`skip`), never approves and never discards. `no_tty` when stdin is not a terminal, exactly as
+ * `confirmAtTty`.
+ */
+async function policyConfirmAtTty(question: string): Promise<PolicyConfirmAnswer> {
+  if (!process.stdin.isTTY) return "no_tty";
+  process.stderr.write(`${question} [y/n/s] `);
+  const answer = await readTtyLine();
+  if (answer === "y" || answer === "yes") return "yes";
+  if (answer === "n" || answer === "no") return "no";
+  return "skip";
 }
 
 /**
@@ -755,17 +785,39 @@ const policyValueText = (mode: string | null | undefined, text: string | null | 
   mode === "none" ? "NONE (no policy is sent at this level)" : (text ?? "");
 
 /**
+ * A proposal expires 24 hours after it was drafted. The daemon owns this — `PROPOSAL_TTL_MS` in
+ * `core/daemon/src/policy-proposals.ts`, which is not exported from any package the CLI imports — so
+ * the value is duplicated here and pinned to the daemon's by a test that reads the daemon source, so
+ * the two cannot drift.
+ */
+export const PROPOSAL_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * How long is left before a draft expires, phrased for the operator. Remaining time is the ttl minus
+ * the proposal's age; it is clamped at zero so it never prints a negative number — a draft already
+ * past its ttl reads `expires now`.
+ */
+export function policyExpiryPhrase(ageMs: number): string {
+  const remaining = PROPOSAL_TTL_MS - ageMs;
+  if (remaining <= 0) return "expires now";
+  const h = Math.floor(remaining / (60 * 60 * 1000));
+  const m = Math.floor((remaining % (60 * 60 * 1000)) / (60 * 1000));
+  return `expires in ${h}h ${m}m`;
+}
+
+/**
  * `cello policy approve [p<n>]` — THE human step that puts a policy in force (008 amendment).
  *
  * The same mechanism as `gatewayConfigSet`: a prompt at an interactive terminal, `not_a_tty` —
  * never `declined` — when stdin is not one, and no `--yes` flag. No argument walks every pending
- * proposal in turn. `y` approves; `n` discards the proposal.
+ * proposal in turn. `y` approves; a typed `n` discards the proposal; a bare Enter, Ctrl-D or a stray
+ * key leaves it pending (`skip`), so the safe-looking key is not the destructive one.
  */
 export function policyApprove(
   celloDir: string,
   proposalId: string | undefined,
   opts: ParityOptions,
-  prompt: (question: string) => Promise<ConfirmAnswer> = confirmAtTty,
+  prompt: (question: string) => Promise<PolicyConfirmAnswer> = policyConfirmAtTty,
 ): Promise<CliOutput> {
   return withDaemon(celloDir, opts, false, async (client) => {
     const agent = opts.agent ?? (await readCurrentAgent(celloDir));
@@ -777,7 +829,7 @@ export function policyApprove(
     if (proposalId !== undefined && todo.length === 0) {
       return { ok: false, reason: "proposal_not_found", guidance: `No pending proposal '${proposalId}' (it may have expired after 24 hours). See: cello policy pending` };
     }
-    const results: Array<{ proposal_id: string; outcome: "approved" | "declined" }> = [];
+    const results: Array<{ proposal_id: string; outcome: "approved" | "declined" | "skipped" }> = [];
     for (const p of todo) {
       const level = p.target === "" ? p.scope.replace("_", "-") : `${p.scope} ${p.target}`;
       const cadence = p.type === "conduct" && p.action === "set" ? `every ${p.every_n ?? 10} messages` : "once per session notice";
@@ -803,11 +855,27 @@ export function policyApprove(
             `Nothing was changed. Run it yourself in a terminal: cello policy approve ${p.proposal_id}`,
         };
       }
+      if (answer === "skip") {
+        // Send NOTHING to the daemon — no approve, no decline — so the draft stays pending. Tell the
+        // operator when it expires and how to come back to it, then walk on to the next draft.
+        process.stderr.write(
+          `Left pending. ${p.proposal_id} ${policyExpiryPhrase(p.age_ms)}. ` +
+            `Decide later with: cello policy approve ${p.proposal_id}${agent !== undefined ? ` --agent ${agent}` : ""}\n`,
+        );
+        results.push({ proposal_id: p.proposal_id, outcome: "skipped" });
+        continue;
+      }
       const r = (await client.send(answer === "yes" ? "cello_policy_approve" : "cello_policy_decline", { ...who, proposal_id: p.proposal_id })) as Record<string, unknown>;
       if (r.ok !== true) return { ...r, ...(results.length > 0 ? { results } : {}) };
       results.push({ proposal_id: p.proposal_id, outcome: answer === "yes" ? "approved" : "declined" });
     }
-    return { ok: true, results, ...(todo.length === 0 ? { guidance: "Nothing is pending." } : {}) };
+    const skipped = results.filter((r) => r.outcome === "skipped").length;
+    const guidance = todo.length === 0
+      ? "Nothing is pending."
+      : skipped > 0 && skipped === results.length
+        ? `Nothing was changed. ${skipped} draft${skipped === 1 ? "" : "s"} left pending — decide later with: cello policy approve.`
+        : undefined;
+    return { ok: true, results, ...(guidance !== undefined ? { guidance } : {}) };
   });
 }
 

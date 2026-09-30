@@ -535,7 +535,8 @@ const POLICY_DOCS: ReadonlyArray<{ verb: string; usage: string; paragraph: strin
     usage: "cello policy pending [--agent <name>]",
     paragraph:
       "Proposed changes waiting for your approval, with their ids, level, who proposed them and their age. " +
-      "None of them is in force. A proposal expires after 24 hours.",
+      "None of them is in force. A proposal expires after 24 hours. It prints the full text of each waiting " +
+      "draft and asks nothing, so a draft can be read, or shown to someone else, before deciding.",
     examples: ["cello policy pending"],
   },
   {
@@ -543,7 +544,8 @@ const POLICY_DOCS: ReadonlyArray<{ verb: string; usage: string; paragraph: strin
     usage: "cello policy approve [p<n>] [--agent <name>]",
     paragraph:
       "Show a pending change — level, type, cadence, the text in force (was:) and the proposed text (now:) — " +
-      "and ask Apply it? [y/N]. y puts it in force; n discards it. With no id it walks every pending change " +
+      "and ask Apply it? [y/n/s]. y puts it in force; n discards it; s, Enter or Ctrl-D leave it pending until it " +
+      "expires 24 hours after it was drafted. With no id it walks every pending change " +
       "in turn. It needs an interactive terminal and has no --yes flag: the agent's MCP tools are refused, and a " +
       "command an agent runs through its shell tool normally has no terminal to answer. It raises the bar; it " +
       "does not stop an agent that already controls your machine.",
