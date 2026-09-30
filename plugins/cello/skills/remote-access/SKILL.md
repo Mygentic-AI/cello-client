@@ -37,6 +37,9 @@ Run `npx -y @cello-protocol/mcp-http --help` for every flag.
 - **`--agents`** — the only agents this endpoint may act as, by name or pubkey, comma-separated. Each must
   exist on the daemon or it will not start. A caller asking for any other agent is refused
   `agent_not_permitted`. Always set it: leaving it out allows every agent on the daemon.
+  **Give it an agent no other AI is driving.** If Hermes, a Claude Code session or another endpoint
+  already answers for that agent, both get woken by each message and both reply in its name. Create a
+  separate agent for the remote client instead.
 - **`--tools-file`** — one `cello_*` tool name per line; `*` means every tool; `-name` removes one; `#`
   lines are comments. A good start:
   ```
