@@ -14,7 +14,14 @@
 
 import { describe, it, expect, afterEach } from "vitest";
 import { createServer, type Server } from "node:http";
-import { makeTestManifest, TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD } from "@cello-protocol/crypto";
+import { makeTestManifest, testConsortiumRoots } from "@cello-protocol/crypto";
+import {
+  BUNDLED_CONSORTIUM_MANIFEST, BUNDLED_CONSORTIUM_ROOT_KEYS, BUNDLED_CONSORTIUM_THRESHOLD,
+  BUNDLED_CONSORTIUM_ROOT_KEYS_PQ, BUNDLED_CONSORTIUM_PQ_THRESHOLD,
+} from "../bundled-consortium-manifest.js";
+
+/** M9D 004: both test officer sets, one value. */
+const ROOTS = await testConsortiumRoots();
 import { InMemoryManifestVersionStore, TestManifestProvider } from "@cello-protocol/transport";
 import { pollManifestOverHttp } from "../http-manifest-poll.js";
 
@@ -57,8 +64,7 @@ function makeDeps(opts?: { seedVersion?: number; seedManifest?: unknown }) {
     deps: {
       manifestProvider: provider,
       manifestVersionStore: versionStore,
-      rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
-      threshold: TEST_CONSORTIUM_THRESHOLD,
+      roots: ROOTS,
       logger: noopLogger,
     },
   };
@@ -66,8 +72,8 @@ function makeDeps(opts?: { seedVersion?: number; seedManifest?: unknown }) {
 
 describe("CONN-001 HTTP manifest poll", () => {
   it("AC-003: adopts a newer, validly-signed manifest fetched over HTTP", async () => {
-    const v1 = makeTestManifest(NODES, { version: 1 });
-    const v2 = makeTestManifest(NODES, { version: 2 });
+    const v1 = await makeTestManifest(NODES, { version: 1 });
+    const v2 = await makeTestManifest(NODES, { version: 2 });
     const { versionStore, provider, deps } = makeDeps({ seedManifest: v1 });
     await versionStore.persistVersion(1);
     const url = await serve(() => v2);
@@ -82,7 +88,7 @@ describe("CONN-001 HTTP manifest poll", () => {
   it("AC-004: runs with ZERO agents — the poll needs no agent identity or signaling connection", async () => {
     // The module touches no agent state by construction; a successful adopt with only a
     // version store + provider (no agents anywhere) is the property the keystone lacked.
-    const v5 = makeTestManifest(NODES, { version: 5 });
+    const v5 = await makeTestManifest(NODES, { version: 5 });
     const { provider, deps } = makeDeps();
     const url = await serve(() => v5);
 
@@ -93,7 +99,7 @@ describe("CONN-001 HTTP manifest poll", () => {
   });
 
   it("AC-005: rejects a forged manifest (bad officer signatures) — TUF preserved over HTTP", async () => {
-    const forged = makeTestManifest(NODES, { version: 9 });
+    const forged = await makeTestManifest(NODES, { version: 9 });
     forged.signatures = forged.signatures.map((s) => ({ ...s, signature: "f".repeat(128) }));
     const { provider, deps } = makeDeps();
     const url = await serve(() => forged);
@@ -104,8 +110,43 @@ describe("CONN-001 HTTP manifest poll", () => {
     expect(provider.getCurrentManifest()).toBeNull();
   });
 
+  it("★ M9D 004: a manifest whose POST-QUANTUM set is forged is refused by its own name, and not adopted", async () => {
+    // Valid Ed25519 signatures, corrupted ML-DSA ones: only the PQ check can refuse this, and the
+    // reason must say so rather than read as an Ed25519 failure.
+    const forged = await makeTestManifest(NODES, { version: 9 });
+    forged["pq_signatures"] = (forged["pq_signatures"] as Array<{ officerIndex: number; signature: string }>)
+      .map((e) => ({ ...e, signature: "0".repeat(e.signature.length) }));
+    const { provider, deps } = makeDeps();
+    const url = await serve(() => forged);
+
+    const out = await pollManifestOverHttp({ directoryUrl: url, ...deps });
+
+    expect(out).toEqual({ ok: false, reason: "manifest_pq_signatures_below_threshold" });
+    expect(provider.getCurrentManifest()).toBeNull();
+  });
+
+  it("★ M9D 004 test 9a: the real version-4 manifest (~17 KB) crosses the poll path intact and is adopted", async () => {
+    // Nothing on this path caps the body size (fetch → resp.json()); this proves the grown manifest
+    // is not truncated or refused anywhere between the wire and the verifier.
+    expect(JSON.stringify(BUNDLED_CONSORTIUM_MANIFEST).length).toBeGreaterThan(15_000);
+    const { provider, deps } = makeDeps();
+    const url = await serve(() => BUNDLED_CONSORTIUM_MANIFEST);
+
+    const out = await pollManifestOverHttp({
+      directoryUrl: url, ...deps,
+      roots: {
+        rootKeys: BUNDLED_CONSORTIUM_ROOT_KEYS, threshold: BUNDLED_CONSORTIUM_THRESHOLD,
+        rootKeysPq: BUNDLED_CONSORTIUM_ROOT_KEYS_PQ, pqThreshold: BUNDLED_CONSORTIUM_PQ_THRESHOLD,
+      },
+      now: new Date("2027-01-01T00:00:00Z"),
+    });
+
+    expect(out).toMatchObject({ ok: true, adopted: true, newVersion: 4 });
+    expect(provider.getCurrentManifest()?.version).toBe(4);
+  });
+
   it("AC-005: rejects a rolled-back manifest (version < trusted)", async () => {
-    const v3 = makeTestManifest(NODES, { version: 3 });
+    const v3 = await makeTestManifest(NODES, { version: 3 });
     const { versionStore, deps } = makeDeps();
     await versionStore.persistVersion(5);
     const url = await serve(() => v3);
@@ -117,7 +158,7 @@ describe("CONN-001 HTTP manifest poll", () => {
   });
 
   it("AC-005: rejects an expired manifest (refuse, hold trusted)", async () => {
-    const expired = makeTestManifest(NODES, { version: 2, notBefore: "2020-01-01T00:00:00Z", expires: "2020-02-01T00:00:00Z" });
+    const expired = await makeTestManifest(NODES, { version: 2, notBefore: "2020-01-01T00:00:00Z", expires: "2020-02-01T00:00:00Z" });
     const { provider, deps } = makeDeps();
     const url = await serve(() => expired);
 
@@ -128,7 +169,7 @@ describe("CONN-001 HTTP manifest poll", () => {
   });
 
   it("does not adopt a manifest that is not yet valid (not_before in the future)", async () => {
-    const future = makeTestManifest(NODES, { version: 2, notBefore: "2099-01-01T00:00:00Z", expires: "2099-02-01T00:00:00Z" });
+    const future = await makeTestManifest(NODES, { version: 2, notBefore: "2099-01-01T00:00:00Z", expires: "2099-02-01T00:00:00Z" });
     const { provider, deps } = makeDeps();
     const url = await serve(() => future);
 
@@ -139,7 +180,7 @@ describe("CONN-001 HTTP manifest poll", () => {
   });
 
   it("is a no-op when the served version equals the trusted version (already current)", async () => {
-    const v2 = makeTestManifest(NODES, { version: 2 });
+    const v2 = await makeTestManifest(NODES, { version: 2 });
     const { versionStore, deps } = makeDeps();
     await versionStore.persistVersion(2);
     const url = await serve(() => v2);
@@ -150,7 +191,7 @@ describe("CONN-001 HTTP manifest poll", () => {
   });
 
   it("DB-001: on an unreachable endpoint, returns manifest_http_unreachable and keeps the cached manifest", async () => {
-    const v1 = makeTestManifest(NODES, { version: 1 });
+    const v1 = await makeTestManifest(NODES, { version: 1 });
     const { provider, deps } = makeDeps({ seedManifest: v1 });
     // A port that nothing is listening on.
     const out = await pollManifestOverHttp({ directoryUrl: "http://127.0.0.1:1", ...deps });
@@ -162,7 +203,7 @@ describe("CONN-001 HTTP manifest poll", () => {
 
   // Boundary precision (test-attacker LOW): pin the exact rollback / expiry / not_before ticks.
   it("AC-005: rejects a manifest exactly one version below the trusted floor (adjacent rollback)", async () => {
-    const v4 = makeTestManifest(NODES, { version: 4 });
+    const v4 = await makeTestManifest(NODES, { version: 4 });
     const { versionStore, deps } = makeDeps();
     await versionStore.persistVersion(5);
     const url = await serve(() => v4);
@@ -174,7 +215,7 @@ describe("CONN-001 HTTP manifest poll", () => {
 
   it("treats expires === now as expired (boundary is <=, deterministic via the now param)", async () => {
     const T = new Date("2026-06-01T00:00:00Z");
-    const m = makeTestManifest(NODES, { version: 2, notBefore: "2020-01-01T00:00:00Z", expires: "2026-06-01T00:00:00Z" });
+    const m = await makeTestManifest(NODES, { version: 2, notBefore: "2020-01-01T00:00:00Z", expires: "2026-06-01T00:00:00Z" });
     const { provider, deps } = makeDeps();
     const url = await serve(() => m);
 
@@ -186,7 +227,7 @@ describe("CONN-001 HTTP manifest poll", () => {
 
   it("treats now === not_before as valid (not_before is inclusive)", async () => {
     const T = new Date("2026-06-01T00:00:00Z");
-    const m = makeTestManifest(NODES, { version: 2, notBefore: "2026-06-01T00:00:00Z", expires: "2030-01-01T00:00:00Z" });
+    const m = await makeTestManifest(NODES, { version: 2, notBefore: "2026-06-01T00:00:00Z", expires: "2030-01-01T00:00:00Z" });
     const { provider, deps } = makeDeps();
     const url = await serve(() => m);
 
@@ -197,7 +238,7 @@ describe("CONN-001 HTTP manifest poll", () => {
   });
 
   it("MED: a throwing version store yields manifest_store_error (the throw is NOT swallowed)", async () => {
-    const v2 = makeTestManifest(NODES, { version: 2 });
+    const v2 = await makeTestManifest(NODES, { version: 2 });
     const provider = new TestManifestProvider();
     const throwingStore = {
       getLastSeenVersion: async () => { throw new Error("db boom"); },
@@ -209,8 +250,7 @@ describe("CONN-001 HTTP manifest poll", () => {
       directoryUrl: url,
       manifestProvider: provider,
       manifestVersionStore: throwingStore as never,
-      rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
-      threshold: TEST_CONSORTIUM_THRESHOLD,
+      roots: ROOTS,
       logger: noopLogger,
     });
 

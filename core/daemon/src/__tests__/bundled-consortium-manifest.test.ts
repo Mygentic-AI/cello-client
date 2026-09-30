@@ -16,22 +16,35 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { verifyManifest } from "@cello-protocol/crypto";
+import { verifyManifest, mlDsaProviderFromSeed } from "@cello-protocol/crypto";
 import {
   makeTestManifest,
+  testConsortiumRoots,
   TEST_CONSORTIUM_ROOT_KEYS,
   TEST_CONSORTIUM_THRESHOLD,
+  TEST_CONSORTIUM_PQ_THRESHOLD,
+  testConsortiumRootKeysPq,
 } from "@cello-protocol/crypto";
 import {
   BUNDLED_CONSORTIUM_MANIFEST,
   BUNDLED_CONSORTIUM_ROOT_KEYS,
   BUNDLED_CONSORTIUM_THRESHOLD,
+  BUNDLED_CONSORTIUM_ROOT_KEYS_PQ,
+  BUNDLED_CONSORTIUM_PQ_THRESHOLD,
 } from "../bundled-consortium-manifest.js";
 import { PRODUCTION_DIRECTORY_URL } from "../directory-bootstrap.js";
 import { validatorNodes } from "@cello-protocol/protocol-types";
 import { EmbeddedManifestProvider } from "../file-manifest-provider.js";
 import { buildManifestDeps } from "../manifest-deps.js";
 import type { Logger } from "../types.js";
+
+/** The compiled-in roots, as the one value every verifier takes. */
+const BUNDLED_ROOTS = {
+  rootKeys: BUNDLED_CONSORTIUM_ROOT_KEYS,
+  threshold: BUNDLED_CONSORTIUM_THRESHOLD,
+  rootKeysPq: BUNDLED_CONSORTIUM_ROOT_KEYS_PQ,
+  pqThreshold: BUNDLED_CONSORTIUM_PQ_THRESHOLD,
+};
 
 function nullLogger(): Logger {
   return { debug() {}, info() {}, warn() {}, error() {} };
@@ -41,6 +54,8 @@ const MANIFEST_ENV_KEYS = [
   "CELLO_CONSORTIUM_MANIFEST",
   "CELLO_CONSORTIUM_ROOT_KEYS",
   "CELLO_CONSORTIUM_THRESHOLD",
+  "CELLO_CONSORTIUM_ROOT_KEYS_PQ",
+  "CELLO_CONSORTIUM_PQ_THRESHOLD",
   "CELLO_MANIFEST_POLL_MIN_MS",
   "CELLO_MANIFEST_POLL_MAX_MS",
   // CELLO_DIRECTORY_URL gates the bundled default: unset → production default (a bundled node) →
@@ -49,13 +64,23 @@ const MANIFEST_ENV_KEYS = [
 ] as const;
 
 describe("FINDING-4: bundled consortium manifest constant", () => {
-  it("verifies against its pinned root keys at the pinned threshold", () => {
-    const res = verifyManifest(
-      BUNDLED_CONSORTIUM_MANIFEST,
-      BUNDLED_CONSORTIUM_ROOT_KEYS,
-      BUNDLED_CONSORTIUM_THRESHOLD,
-    );
-    expect(res.ok).toBe(true);
+  it("★ 004 test 7: verifies under BOTH pinned root sets — and is refused with another genuine ML-DSA root", async () => {
+    const res = await verifyManifest(BUNDLED_CONSORTIUM_MANIFEST, BUNDLED_ROOTS);
+    expect(res, JSON.stringify(res)).toMatchObject({ ok: true, signerCount: 1, pqSignerCount: 1 });
+    expect(BUNDLED_CONSORTIUM_MANIFEST.version, "the real, officer-signed version 4 (D22)").toBe(4);
+
+    // A REAL ML-DSA key that is not the officer: the Ed25519 set still verifies, so only the PQ
+    // set can refuse this — which is the property D22 is about.
+    const other = Buffer.from(await (await mlDsaProviderFromSeed(new Uint8Array(32).fill(0x42))).getPublicKey()).toString("hex");
+    const swapped = await verifyManifest(BUNDLED_CONSORTIUM_MANIFEST, { ...BUNDLED_ROOTS, rootKeysPq: [other] });
+    expect(swapped.ok === false && swapped.reason).toBe("manifest_pq_signatures_below_threshold");
+  });
+
+  it("the compiled ML-DSA root is a real key, never a placeholder (D22)", () => {
+    expect(BUNDLED_CONSORTIUM_ROOT_KEYS_PQ).toHaveLength(1);
+    expect(BUNDLED_CONSORTIUM_ROOT_KEYS_PQ[0]).toMatch(/^[0-9a-f]{2624}$/);
+    expect(new Set(BUNDLED_CONSORTIUM_ROOT_KEYS_PQ[0]).size, "an all-one-character key is a placeholder").toBeGreaterThan(8);
+    expect(BUNDLED_CONSORTIUM_PQ_THRESHOLD).toBe(1);
   });
 
   it("lists the three sovereign directories with well-formed nodes", () => {
@@ -138,7 +163,7 @@ describe("FINDING-4: EmbeddedManifestProvider", () => {
   it("loadAndVerify caches the manifest when signatures verify", async () => {
     const p = new EmbeddedManifestProvider(BUNDLED_CONSORTIUM_MANIFEST);
     expect(p.getCurrentManifest()).toBeNull();
-    const m = await p.loadAndVerify(BUNDLED_CONSORTIUM_ROOT_KEYS, BUNDLED_CONSORTIUM_THRESHOLD);
+    const m = await p.loadAndVerify(BUNDLED_ROOTS);
     expect(m.nodes).toHaveLength(3);
     expect(p.getCurrentManifest()).not.toBeNull();
   });
@@ -146,7 +171,7 @@ describe("FINDING-4: EmbeddedManifestProvider", () => {
   it("fails CLOSED (throws) when verified against a wrong root key", async () => {
     const p = new EmbeddedManifestProvider(BUNDLED_CONSORTIUM_MANIFEST);
     const wrongKey = "00".repeat(32);
-    await expect(p.loadAndVerify([wrongKey], 1)).rejects.toThrow(/manifest_signature_invalid/);
+    await expect(p.loadAndVerify({ ...BUNDLED_ROOTS, rootKeys: [wrongKey] })).rejects.toThrow(/manifest_signature_invalid/);
     expect(p.getCurrentManifest()).toBeNull();
   });
 });
@@ -173,11 +198,10 @@ describe("FINDING-4: buildManifestDeps default (bundled) vs override (env) path"
     const deps = buildManifestDeps(nullLogger());
     expect(deps.manifestProvider).toBeDefined();
     expect(deps.challengeVerifier).toBeDefined();
-    expect(deps.manifestRootKeys).toEqual(BUNDLED_CONSORTIUM_ROOT_KEYS);
-    expect(deps.manifestThreshold).toBe(BUNDLED_CONSORTIUM_THRESHOLD);
+    expect(deps.manifestRoots).toEqual(BUNDLED_ROOTS);
     expect(deps.manifestPollScheduler).toBeUndefined();
     // the provider actually verifies + exposes the 3-node roster
-    const m = await deps.manifestProvider!.loadAndVerify(deps.manifestRootKeys!, deps.manifestThreshold!);
+    const m = await deps.manifestProvider!.loadAndVerify(deps.manifestRoots!);
     expect(m.nodes).toHaveLength(3);
   });
 
@@ -211,7 +235,7 @@ describe("FINDING-4: buildManifestDeps default (bundled) vs override (env) path"
     const deps = buildManifestDeps(nullLogger());
     expect(deps.manifestProvider).toBeUndefined();
     expect(deps.challengeVerifier).toBeUndefined();
-    expect(deps.manifestRootKeys).toBeUndefined();
+    expect(deps.manifestRoots).toBeUndefined();
   });
 
   it("with no env but CELLO_DIRECTORY_URL pointed at a bundled node: loads the bundle", () => {
@@ -229,21 +253,40 @@ describe("FINDING-4: buildManifestDeps default (bundled) vs override (env) path"
     expect(() => buildManifestDeps(nullLogger())).toThrow(/ROOT_KEYS|THRESHOLD/);
   });
 
+  it("★ 004 test 8: the PQ override pair is both-or-neither — keys without a threshold fail at startup", async () => {
+    process.env.CELLO_CONSORTIUM_MANIFEST = "/tmp/does-not-matter.json";
+    process.env.CELLO_CONSORTIUM_ROOT_KEYS = TEST_CONSORTIUM_ROOT_KEYS.join(",");
+    process.env.CELLO_CONSORTIUM_THRESHOLD = String(TEST_CONSORTIUM_THRESHOLD);
+    process.env.CELLO_CONSORTIUM_ROOT_KEYS_PQ = (await testConsortiumRootKeysPq()).join(",");
+    expect(() => buildManifestDeps(nullLogger())).toThrow(/CELLO_CONSORTIUM_PQ_THRESHOLD is missing/);
+
+    delete process.env.CELLO_CONSORTIUM_ROOT_KEYS_PQ;
+    process.env.CELLO_CONSORTIUM_PQ_THRESHOLD = String(TEST_CONSORTIUM_PQ_THRESHOLD);
+    expect(() => buildManifestDeps(nullLogger())).toThrow(/CELLO_CONSORTIUM_ROOT_KEYS_PQ is missing/);
+
+    // Neither is refused too: every manifest is verified under both sets.
+    delete process.env.CELLO_CONSORTIUM_PQ_THRESHOLD;
+    expect(() => buildManifestDeps(nullLogger())).toThrow(/both are unset/);
+  });
+
   it("with a valid override manifest file: returns a file-backed provider + step-6", async () => {
     const dir = await mkdtemp(join(tmpdir(), "cello-manifest-"));
     try {
       const path = join(dir, "manifest.json");
-      const manifest = makeTestManifest([
+      const manifest = await makeTestManifest([
         { nodeId: "us-east-1", pubkey: "aa".repeat(32), region: "us-east-1", provider: "aws", endpoint: "http://d.example" },
       ]);
       await writeFile(path, JSON.stringify(manifest), "utf8");
       process.env.CELLO_CONSORTIUM_MANIFEST = path;
       process.env.CELLO_CONSORTIUM_ROOT_KEYS = TEST_CONSORTIUM_ROOT_KEYS.join(",");
       process.env.CELLO_CONSORTIUM_THRESHOLD = String(TEST_CONSORTIUM_THRESHOLD);
+      process.env.CELLO_CONSORTIUM_ROOT_KEYS_PQ = (await testConsortiumRootKeysPq()).join(",");
+      process.env.CELLO_CONSORTIUM_PQ_THRESHOLD = String(TEST_CONSORTIUM_PQ_THRESHOLD);
       const deps = buildManifestDeps(nullLogger());
       expect(deps.manifestProvider).toBeDefined();
       expect(deps.challengeVerifier).toBeDefined();
-      const m = await deps.manifestProvider!.loadAndVerify(deps.manifestRootKeys!, deps.manifestThreshold!);
+      expect(deps.manifestRoots).toEqual(await testConsortiumRoots());
+      const m = await deps.manifestProvider!.loadAndVerify(deps.manifestRoots!);
       expect(m.nodes).toHaveLength(1);
     } finally {
       await rm(dir, { recursive: true, force: true });

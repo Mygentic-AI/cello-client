@@ -162,6 +162,7 @@ export {
   TEST_CONSORTIUM_ROOT_KEYS,
   TEST_CONSORTIUM_THRESHOLD,
   testConsortiumRootKeysPq,
+  testConsortiumRoots,
   TEST_CONSORTIUM_PQ_THRESHOLD,
   testNodeMlDsaPubkeyHex,
   testMlKemIntakeKeyHex,

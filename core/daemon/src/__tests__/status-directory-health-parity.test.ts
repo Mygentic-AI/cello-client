@@ -81,8 +81,7 @@ describe("launch triage item 6 — a daemon that cannot reach a directory must n
       version: "0.0.1-test",
       logger,
       manifestProvider: makeProvider(makeManifest()),
-      manifestRootKeys: ["a".repeat(64)],
-      manifestThreshold: 1,
+      manifestRoots: { rootKeys: ["a".repeat(64)], threshold: 1, rootKeysPq: ["b".repeat(2624)], pqThreshold: 1 },
     };
     handle = await startDaemon(config);
     return config;

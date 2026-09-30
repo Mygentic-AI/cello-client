@@ -421,8 +421,7 @@ describe("DOD-M15-STALEROSTER-1: the daemon actually STARTS the sweep", () => {
         getCurrentManifest: vi.fn(() => manifest()),
         updateManifest: vi.fn(),
       },
-      manifestRootKeys: ["a".repeat(64)],
-      manifestThreshold: 1,
+      manifestRoots: { rootKeys: ["a".repeat(64)], threshold: 1, rootKeysPq: ["b".repeat(2624)], pqThreshold: 1 },
       rosterSweepScheduler: sched,
     } as unknown as DaemonConfig);
 
@@ -718,8 +717,7 @@ describe("DOD-M15-STALEROSTER-1: the background sweep uses the PATIENT probe", (
         getCurrentManifest: () => manifest,
         updateManifest: () => {},
       },
-      manifestRootKeys: ["a".repeat(64)],
-      manifestThreshold: 1,
+      manifestRoots: { rootKeys: ["a".repeat(64)], threshold: 1, rootKeysPq: ["b".repeat(2624)], pqThreshold: 1 },
       rosterSweepScheduler: sched,
       fetchFn: (async () => { attempts++; throw new Error("ECONNREFUSED"); }) as unknown as typeof fetch,
     } as unknown as DaemonConfig);

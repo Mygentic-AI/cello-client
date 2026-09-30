@@ -19,10 +19,13 @@ import { fileURLToPath } from "node:url";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
+import { createHash } from "node:crypto";
 import {
   BUNDLED_CONSORTIUM_MANIFEST,
   BUNDLED_CONSORTIUM_ROOT_KEYS,
   BUNDLED_CONSORTIUM_THRESHOLD,
+  BUNDLED_CONSORTIUM_ROOT_KEYS_PQ,
+  BUNDLED_CONSORTIUM_PQ_THRESHOLD,
 } from "../bundled-consortium-manifest.js";
 import {
   consortiumFingerprintFull,
@@ -32,24 +35,23 @@ import {
   describeConsortiumFingerprint,
 } from "../consortium-fingerprint.js";
 import { EmbeddedManifestProvider } from "../file-manifest-provider.js";
-import {
-  makeTestManifest,
-  TEST_CONSORTIUM_ROOT_KEYS,
-  TEST_CONSORTIUM_THRESHOLD,
-} from "@cello-protocol/crypto";
-import type { ConsortiumManifestInput } from "@cello-protocol/crypto";
+import { makeTestManifest, testConsortiumRoots } from "@cello-protocol/crypto";
+import type { ConsortiumManifestInput, ManifestVerifyOptions } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig } from "../types.js";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..");
 
-const EXPECTED_SHORT = consortiumFingerprintShort(
-  BUNDLED_CONSORTIUM_ROOT_KEYS,
-  BUNDLED_CONSORTIUM_THRESHOLD,
-);
-const EXPECTED_FULL = consortiumFingerprintFull(
-  BUNDLED_CONSORTIUM_ROOT_KEYS,
-  BUNDLED_CONSORTIUM_THRESHOLD,
-);
+/** M9D 004: the compiled-in roots — both officer sets — as the one value the fingerprint covers. */
+const BUNDLED_ROOTS: ManifestVerifyOptions = {
+  rootKeys: BUNDLED_CONSORTIUM_ROOT_KEYS,
+  threshold: BUNDLED_CONSORTIUM_THRESHOLD,
+  rootKeysPq: BUNDLED_CONSORTIUM_ROOT_KEYS_PQ,
+  pqThreshold: BUNDLED_CONSORTIUM_PQ_THRESHOLD,
+};
+const TEST_ROOTS = await testConsortiumRoots();
+
+const EXPECTED_SHORT = consortiumFingerprintShort(BUNDLED_ROOTS);
+const EXPECTED_FULL = consortiumFingerprintFull(BUNDLED_ROOTS);
 
 describe("DOD-M15-CONSORTIUM-FINGERPRINT-1: the printed value tracks the ENFORCED key set", () => {
   /**
@@ -62,11 +64,11 @@ describe("DOD-M15-CONSORTIUM-FINGERPRINT-1: the printed value tracks the ENFORCE
    * here.
    */
   it("a different enforced key set produces a different printed fingerprint", () => {
-    const forkKeys = ["f".repeat(64)];
+    const fork = { ...BUNDLED_ROOTS, rootKeys: ["f".repeat(64)] };
 
-    const block = describeConsortiumFingerprint({ rootKeys: forkKeys, threshold: 1 });
+    const block = describeConsortiumFingerprint(fork);
 
-    expect(block["consortium_root_fingerprint"]).toBe(consortiumFingerprintShort(forkKeys, 1));
+    expect(block["consortium_root_fingerprint"]).toBe(consortiumFingerprintShort(fork));
     expect(block["consortium_root_fingerprint"]).not.toBe(EXPECTED_SHORT);
     expect(block["consortium_root_fingerprint_state"]).toBe("overridden");
     // And the genuine value is shown BESIDE it, so the reader can see what they are not on.
@@ -75,10 +77,7 @@ describe("DOD-M15-CONSORTIUM-FINGERPRINT-1: the printed value tracks the ENFORCE
 
   /** The bundled posture is the one an ordinary operator is in, and it says so without hedging. */
   it("the compiled-in key set reports the bundled posture and the published value", () => {
-    const block = describeConsortiumFingerprint({
-      rootKeys: BUNDLED_CONSORTIUM_ROOT_KEYS,
-      threshold: BUNDLED_CONSORTIUM_THRESHOLD,
-    });
+    const block = describeConsortiumFingerprint(BUNDLED_ROOTS);
 
     expect(block["consortium_root_fingerprint"]).toBe(EXPECTED_SHORT);
     expect(block["consortium_root_fingerprint_state"]).toBe("bundled");
@@ -94,10 +93,12 @@ describe("DOD-M15-CONSORTIUM-FINGERPRINT-1: the printed value tracks the ENFORCE
    */
   it("with no enforced key set it reports NO fingerprint, and says why", () => {
     for (const enforced of [
-      { rootKeys: undefined, threshold: undefined },
-      { rootKeys: [], threshold: 1 },
-      { rootKeys: BUNDLED_CONSORTIUM_ROOT_KEYS, threshold: undefined },
-      { rootKeys: BUNDLED_CONSORTIUM_ROOT_KEYS, threshold: 0 },
+      undefined,
+      { ...BUNDLED_ROOTS, rootKeys: [] },
+      { ...BUNDLED_ROOTS, threshold: 0 },
+      // M9D 004: the ML-DSA half unset or at 0 is not anchored either — both sets are enforced.
+      { ...BUNDLED_ROOTS, rootKeysPq: [] },
+      { ...BUNDLED_ROOTS, pqThreshold: 0 },
     ]) {
       const block = describeConsortiumFingerprint(enforced);
       expect(block["consortium_root_fingerprint"]).toBeNull();
@@ -111,25 +112,48 @@ describe("DOD-M15-CONSORTIUM-FINGERPRINT-1: the printed value tracks the ENFORCE
   it("a reordered, differently-cased copy of our own key set is still `bundled`", () => {
     expect(
       consortiumPosture({
+        ...BUNDLED_ROOTS,
         rootKeys: [...BUNDLED_CONSORTIUM_ROOT_KEYS].map((k) => k.toUpperCase()).reverse(),
-        threshold: BUNDLED_CONSORTIUM_THRESHOLD,
+        rootKeysPq: [...BUNDLED_CONSORTIUM_ROOT_KEYS_PQ].map((k) => k.toUpperCase()).reverse(),
       }),
     ).toBe("bundled");
   });
 
   /** The threshold is enforced alongside the keys, so it is inside the preimage. */
   it("the same keys at a different threshold fingerprint differently, and read as an override", () => {
-    expect(consortiumFingerprintFull(BUNDLED_CONSORTIUM_ROOT_KEYS, 1)).not.toBe(
-      consortiumFingerprintFull(BUNDLED_CONSORTIUM_ROOT_KEYS, 2),
+    expect(consortiumFingerprintFull({ ...BUNDLED_ROOTS, threshold: 1 })).not.toBe(
+      consortiumFingerprintFull({ ...BUNDLED_ROOTS, threshold: 2 }),
     );
-    expect(consortiumPosture({ rootKeys: BUNDLED_CONSORTIUM_ROOT_KEYS, threshold: 2 })).toBe("overridden");
+    expect(consortiumPosture({ ...BUNDLED_ROOTS, threshold: 2 })).toBe("overridden");
+    // The PQ threshold is enforced too, so it is inside the preimage as well.
+    expect(consortiumPosture({ ...BUNDLED_ROOTS, pqThreshold: 2 })).toBe("overridden");
+  });
+
+  /**
+   * ★ 004 test 9 (v2). A fork that kept our Ed25519 officer and swapped only the ML-DSA one must
+   * not fingerprint as ours — the PQ set is half of what clients enforce.
+   */
+  it("the same Ed25519 set with a DIFFERENT ML-DSA set fingerprints differently (v2)", () => {
+    const pqFork = { ...BUNDLED_ROOTS, rootKeysPq: ["c".repeat(2624)] };
+    expect(consortiumFingerprintFull(pqFork)).not.toBe(EXPECTED_FULL);
+    expect(consortiumPosture(pqFork)).toBe("overridden");
+  });
+
+  /** ★ 004 test 9: recomputed from the DOCUMENTED string, not from the function under test. */
+  it("the runtime value equals sha256 of the documented v2 preimage", () => {
+    const sorted = (ks: readonly string[]) => [...ks].map((k) => k.toLowerCase()).sort();
+    const documented =
+      "cello-consortium-root-v2\n" +
+      sorted(BUNDLED_CONSORTIUM_ROOT_KEYS).join("\n") + "\n" + String(BUNDLED_CONSORTIUM_THRESHOLD) + "\n" +
+      sorted(BUNDLED_CONSORTIUM_ROOT_KEYS_PQ).join("\n") + "\n" + String(BUNDLED_CONSORTIUM_PQ_THRESHOLD) + "\n";
+    expect(createHash("sha256").update(documented, "utf8").digest("hex")).toBe(EXPECTED_FULL);
   });
 
   /** Order is not identity: a cosmetic reordering must not read as a different consortium. */
   it("key ORDER and case do not change the fingerprint", () => {
-    const keys = ["b".repeat(64), "a".repeat(64)];
-    expect(consortiumFingerprintFull(keys, 1)).toBe(
-      consortiumFingerprintFull(["A".repeat(64), "B".repeat(64)], 1),
+    const keys = { ...BUNDLED_ROOTS, rootKeys: ["b".repeat(64), "a".repeat(64)] };
+    expect(consortiumFingerprintFull(keys)).toBe(
+      consortiumFingerprintFull({ ...BUNDLED_ROOTS, rootKeys: ["A".repeat(64), "B".repeat(64)] }),
     );
   });
 
@@ -172,7 +196,7 @@ describe("DOD-M15-CONSORTIUM-FINGERPRINT-1: both status surfaces answer the ques
    * fingerprint would be a lie. Every surface test now boots a daemon that is actually verifying
    * something, and says which key set it is verifying against.
    */
-  async function boot(enforced?: { manifest: ConsortiumManifestInput; rootKeys: readonly string[]; threshold: number }): Promise<DaemonConfig> {
+  async function boot(enforced?: { manifest: ConsortiumManifestInput; roots: ManifestVerifyOptions }): Promise<DaemonConfig> {
     const config: DaemonConfig = {
       securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
@@ -184,8 +208,7 @@ describe("DOD-M15-CONSORTIUM-FINGERPRINT-1: both status surfaces answer the ques
       ...(enforced
         ? {
             manifestProvider: new EmbeddedManifestProvider(enforced.manifest),
-            manifestRootKeys: enforced.rootKeys,
-            manifestThreshold: enforced.threshold,
+            manifestRoots: enforced.roots,
           }
         : {}),
     };
@@ -196,11 +219,7 @@ describe("DOD-M15-CONSORTIUM-FINGERPRINT-1: both status surfaces answer the ques
     return config;
   }
 
-  const bundled = () => ({
-    manifest: BUNDLED_CONSORTIUM_MANIFEST,
-    rootKeys: BUNDLED_CONSORTIUM_ROOT_KEYS,
-    threshold: BUNDLED_CONSORTIUM_THRESHOLD,
-  });
+  const bundled = () => ({ manifest: BUNDLED_CONSORTIUM_MANIFEST, roots: BUNDLED_ROOTS });
 
   /**
    * The CLI surface. An operator asking "is this the real CELLO?" runs `cello status`, and this is
@@ -237,7 +256,7 @@ describe("DOD-M15-CONSORTIUM-FINGERPRINT-1: both status surfaces answer the ques
   for (const surface of ["status", "cello_status"] as const) {
     it(`${surface} prints the OVERRIDING key set, not the compiled-in one`, async () => {
       await boot({
-        manifest: makeTestManifest([
+        manifest: await makeTestManifest([
           {
             nodeId: "test-1",
             pubkey: "a".repeat(64),
@@ -246,12 +265,11 @@ describe("DOD-M15-CONSORTIUM-FINGERPRINT-1: both status surfaces answer the ques
             endpoint: "http://127.0.0.1:1",
           },
         ]),
-        rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
-        threshold: TEST_CONSORTIUM_THRESHOLD,
+        roots: TEST_ROOTS,
       });
       const status = (await clients[0]!.send(surface)) as Record<string, unknown>;
 
-      const expected = consortiumFingerprintShort(TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD);
+      const expected = consortiumFingerprintShort(TEST_ROOTS);
       expect(status["consortium_root_fingerprint"]).toBe(expected);
       expect(status["consortium_root_fingerprint"]).not.toBe(EXPECTED_SHORT);
       expect(status["consortium_root_fingerprint_state"]).toBe("overridden");
@@ -334,9 +352,7 @@ describe("DOD-M15-CONSORTIUM-FINGERPRINT-1: the published copies cannot drift", 
       if (rel.endsWith(".md")) {
         const recompute = /printf '([^']*)' \| shasum -a 256/.exec(text);
         expect(recompute, `${rel} carries no runnable recompute command`).not.toBeNull();
-        expect(recompute![1]!.replace(/\\n/g, "\n")).toBe(
-          consortiumFingerprintPreimage(BUNDLED_CONSORTIUM_ROOT_KEYS, BUNDLED_CONSORTIUM_THRESHOLD),
-        );
+        expect(recompute![1]!.replace(/\\n/g, "\n")).toBe(consortiumFingerprintPreimage(BUNDLED_ROOTS));
       }
     });
   }
@@ -350,9 +366,11 @@ describe("DOD-M15-CONSORTIUM-FINGERPRINT-1: the published copies cannot drift", 
     expect(doc["fingerprint_full"]).toBe(EXPECTED_FULL);
     expect(doc["root_keys"]).toEqual([...BUNDLED_CONSORTIUM_ROOT_KEYS]);
     expect(doc["threshold"]).toBe(BUNDLED_CONSORTIUM_THRESHOLD);
+    expect(doc["root_keys_pq"]).toEqual([...BUNDLED_CONSORTIUM_ROOT_KEYS_PQ]);
+    expect(doc["pq_threshold"]).toBe(BUNDLED_CONSORTIUM_PQ_THRESHOLD);
     // Recomputable by a stranger with sha256 and nothing else — that is what makes it checkable
     // before install rather than a value they have to take on faith.
-    expect(String(doc["recompute"])).toContain("cello-consortium-root-v1");
+    expect(String(doc["recompute"])).toContain("cello-consortium-root-v2");
 
     /**
      * The recipe has to RECOMPUTE the value, not merely mention the domain string. A published
@@ -365,9 +383,7 @@ describe("DOD-M15-CONSORTIUM-FINGERPRINT-1: the published copies cannot drift", 
      */
     const payload = /printf '([^']*)'/.exec(String(doc["recompute"]));
     expect(payload, "the recompute recipe is not a printf of the preimage").not.toBeNull();
-    expect(payload![1]!.replace(/\\n/g, "\n")).toBe(
-      consortiumFingerprintPreimage(BUNDLED_CONSORTIUM_ROOT_KEYS, BUNDLED_CONSORTIUM_THRESHOLD),
-    );
+    expect(payload![1]!.replace(/\\n/g, "\n")).toBe(consortiumFingerprintPreimage(BUNDLED_ROOTS));
   });
 });
 
@@ -380,7 +396,7 @@ describe("DOD-M15-CONSORTIUM-FINGERPRINT-1: the refusal is untouched and names i
     const provider = new EmbeddedManifestProvider(BUNDLED_CONSORTIUM_MANIFEST);
 
     await expect(
-      provider.loadAndVerify(["9".repeat(64)], BUNDLED_CONSORTIUM_THRESHOLD),
+      provider.loadAndVerify({ ...BUNDLED_ROOTS, rootKeys: ["9".repeat(64)] }),
     ).rejects.toThrow(/manifest_signature_invalid/);
     // And nothing was adopted — a refusal that leaves the manifest loaded is not a refusal.
     expect(provider.getCurrentManifest()).toBeNull();
@@ -389,7 +405,7 @@ describe("DOD-M15-CONSORTIUM-FINGERPRINT-1: the refusal is untouched and names i
   it("the genuine root keys still load it", async () => {
     const provider = new EmbeddedManifestProvider(BUNDLED_CONSORTIUM_MANIFEST);
     await expect(
-      provider.loadAndVerify(BUNDLED_CONSORTIUM_ROOT_KEYS, BUNDLED_CONSORTIUM_THRESHOLD),
+      provider.loadAndVerify(BUNDLED_ROOTS),
     ).resolves.toBeDefined();
   });
 });
@@ -397,7 +413,7 @@ describe("DOD-M15-CONSORTIUM-FINGERPRINT-1: the refusal is untouched and names i
 describe("DOD-M15-CONSORTIUM-FINGERPRINT-1: the value is not configurable", () => {
   /** A fingerprint an operator can override is one an attacker can talk them into overriding. */
   it("no environment variable changes the printed fingerprint", () => {
-    const enforced = { rootKeys: BUNDLED_CONSORTIUM_ROOT_KEYS, threshold: BUNDLED_CONSORTIUM_THRESHOLD };
+    const enforced = BUNDLED_ROOTS;
     const before = describeConsortiumFingerprint(enforced);
     const saved = { ...process.env };
     try {

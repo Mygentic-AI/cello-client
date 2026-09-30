@@ -19,8 +19,7 @@ import { tmpdir } from "node:os";
 import { createServer, type Server } from "node:http";
 import {
   makeTestManifest,
-  TEST_CONSORTIUM_ROOT_KEYS,
-  TEST_CONSORTIUM_THRESHOLD,
+  testConsortiumRoots,
   TEST_DIRECTORY_NODE_KEYPAIR,
 } from "@cello-protocol/crypto";
 import {
@@ -59,15 +58,18 @@ function makeTestNode(nodeId: string, pubkeyHex: string) {
   };
 }
 
-function makeValidManifest(version = 1): ConsortiumManifest {
-  return makeTestManifest(
+/** M9D 004: both test officer sets, one value. */
+const ROOTS = await testConsortiumRoots();
+
+async function makeValidManifest(version = 1): Promise<ConsortiumManifest> {
+  return await makeTestManifest(
     [makeTestNode("test-node-us-east-1", TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex)],
     { version, expires: "2030-01-01T00:00:00Z" },
   ) as ConsortiumManifest;
 }
 
-function makeExpiredManifest(): ConsortiumManifest {
-  return makeTestManifest(
+async function makeExpiredManifest(): Promise<ConsortiumManifest> {
+  return await makeTestManifest(
     [makeTestNode("test-node-us-east-1", TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex)],
     { expires: "2020-01-01T00:00:00Z" },
   ) as ConsortiumManifest;
@@ -115,14 +117,13 @@ describe("AC-004: startDaemon manifest loading at startup", () => {
 
   it("emits directory.auth.manifest.verified when manifest loads successfully", async () => {
     const logger = makeLogger();
-    const manifest = makeValidManifest();
+    const manifest = await makeValidManifest();
     const manifestProvider = new TestManifestProvider(manifest);
     const versionStore = new InMemoryManifestVersionStore();
 
     handle = await startDaemon(makeBaseConfig(logger, {
       manifestProvider,
-      manifestRootKeys: TEST_CONSORTIUM_ROOT_KEYS,
-      manifestThreshold: TEST_CONSORTIUM_THRESHOLD,
+      manifestRoots: ROOTS,
       manifestVersionStore: versionStore,
     }));
 
@@ -133,13 +134,12 @@ describe("AC-004: startDaemon manifest loading at startup", () => {
 
   it("AC-007 / SI-002 / ADV-002: expired manifest causes fatal startup error when manifestProvider configured", async () => {
     const logger = makeLogger();
-    const expiredManifest = makeExpiredManifest();
+    const expiredManifest = await makeExpiredManifest();
     const manifestProvider = new TestManifestProvider(expiredManifest);
 
     await expect(startDaemon(makeBaseConfig(logger, {
       manifestProvider,
-      manifestRootKeys: TEST_CONSORTIUM_ROOT_KEYS,
-      manifestThreshold: TEST_CONSORTIUM_THRESHOLD,
+      manifestRoots: ROOTS,
     }))).rejects.toThrow(/Manifest verification failed/);
 
     const expiredEvent = logger.events.find((e) => e.event === "directory.auth.manifest.expired");
@@ -149,15 +149,14 @@ describe("AC-004: startDaemon manifest loading at startup", () => {
 
   it("AC-008 / ADV-002: version rollback causes fatal startup error when manifestProvider configured", async () => {
     const logger = makeLogger();
-    const manifest = makeValidManifest(5);
+    const manifest = await makeValidManifest(5);
     const manifestProvider = new TestManifestProvider(manifest);
     const versionStore = new InMemoryManifestVersionStore();
     await versionStore.persistVersion(10);
 
     await expect(startDaemon(makeBaseConfig(logger, {
       manifestProvider,
-      manifestRootKeys: TEST_CONSORTIUM_ROOT_KEYS,
-      manifestThreshold: TEST_CONSORTIUM_THRESHOLD,
+      manifestRoots: ROOTS,
       manifestVersionStore: versionStore,
     }))).rejects.toThrow(/Manifest verification failed/);
 
@@ -174,7 +173,7 @@ describe("AC-004: startDaemon manifest loading at startup", () => {
     // proven by the transport poll-on-connect unit test + the J-AUTH live binary test — a
     // daemon unit harness has no real directory stream to dispatch onto.)
     const logger = makeLogger();
-    const manifest = makeValidManifest();
+    const manifest = await makeValidManifest();
     const manifestProvider = new TestManifestProvider(manifest);
 
     const scheduler: IManifestPollScheduler = {
@@ -184,8 +183,7 @@ describe("AC-004: startDaemon manifest loading at startup", () => {
 
     handle = await startDaemon(makeBaseConfig(logger, {
       manifestProvider,
-      manifestRootKeys: TEST_CONSORTIUM_ROOT_KEYS,
-      manifestThreshold: TEST_CONSORTIUM_THRESHOLD,
+      manifestRoots: ROOTS,
       manifestPollScheduler: scheduler,
     }));
 
@@ -199,8 +197,8 @@ describe("AC-004: startDaemon manifest loading at startup", () => {
     // the keystone could not poll under (it borrowed the primary agent's identity). The poll
     // moved to daemon-level HTTP (DOD-CONN-3): it must fire and adopt with zero agents.
     const logger = makeLogger();
-    const v1 = makeValidManifest(1);
-    const v2 = makeValidManifest(2);
+    const v1 = await makeValidManifest(1);
+    const v2 = await makeValidManifest(2);
     const manifestProvider = new TestManifestProvider(v1);
     const versionStore = new InMemoryManifestVersionStore();
 
@@ -221,8 +219,7 @@ describe("AC-004: startDaemon manifest loading at startup", () => {
     try {
       handle = await startDaemon(makeBaseConfig(logger, {
         manifestProvider,
-        manifestRootKeys: TEST_CONSORTIUM_ROOT_KEYS,
-        manifestThreshold: TEST_CONSORTIUM_THRESHOLD,
+        manifestRoots: ROOTS,
         manifestVersionStore: versionStore,
         manifestPollScheduler: new ImmediatePollScheduler(),
         directoryHttpUrl: `http://127.0.0.1:${port}`,
@@ -246,15 +243,14 @@ describe("AC-004: startDaemon manifest loading at startup", () => {
 
   it("equal version passes (same version as last-seen is not a rollback)", async () => {
     const logger = makeLogger();
-    const manifest = makeValidManifest(42);
+    const manifest = await makeValidManifest(42);
     const manifestProvider = new TestManifestProvider(manifest);
     const versionStore = new InMemoryManifestVersionStore();
     await versionStore.persistVersion(42);
 
     handle = await startDaemon(makeBaseConfig(logger, {
       manifestProvider,
-      manifestRootKeys: TEST_CONSORTIUM_ROOT_KEYS,
-      manifestThreshold: TEST_CONSORTIUM_THRESHOLD,
+      manifestRoots: ROOTS,
       manifestVersionStore: versionStore,
     }));
 
@@ -270,14 +266,13 @@ describe("AC-004: startDaemon manifest loading at startup", () => {
 
   it("manifestVerified field appears in daemon.started event", async () => {
     const logger = makeLogger();
-    const manifest = makeValidManifest();
+    const manifest = await makeValidManifest();
     const manifestProvider = new TestManifestProvider(manifest);
     const versionStore = new InMemoryManifestVersionStore();
 
     handle = await startDaemon(makeBaseConfig(logger, {
       manifestProvider,
-      manifestRootKeys: TEST_CONSORTIUM_ROOT_KEYS,
-      manifestThreshold: TEST_CONSORTIUM_THRESHOLD,
+      manifestRoots: ROOTS,
       manifestVersionStore: versionStore,
     }));
 
@@ -288,40 +283,46 @@ describe("AC-004: startDaemon manifest loading at startup", () => {
 
   it("ADV-002: manifestVerified=false with manifestProvider configured throws (fatal)", async () => {
     const logger = makeLogger();
-    const expiredManifest = makeExpiredManifest();
+    const expiredManifest = await makeExpiredManifest();
     const manifestProvider = new TestManifestProvider(expiredManifest);
 
     await expect(startDaemon(makeBaseConfig(logger, {
       manifestProvider,
-      manifestRootKeys: TEST_CONSORTIUM_ROOT_KEYS,
-      manifestThreshold: TEST_CONSORTIUM_THRESHOLD,
+      manifestRoots: ROOTS,
     }))).rejects.toThrow(/Manifest verification failed/);
 
     // daemon.started is never emitted when startup throws
     expect(logger.events.find((e) => e.event === "daemon.started")).toBeUndefined();
   });
 
-  it("ADV-006: manifestProvider without manifestRootKeys throws config error", async () => {
+  it("ADV-006: manifestProvider without manifestRoots throws config error", async () => {
     const logger = makeLogger();
-    const manifest = makeValidManifest();
+    const manifest = await makeValidManifest();
     const manifestProvider = new TestManifestProvider(manifest);
 
     await expect(startDaemon(makeBaseConfig(logger, {
       manifestProvider,
-      // manifestRootKeys intentionally omitted
-      manifestThreshold: TEST_CONSORTIUM_THRESHOLD,
-    }))).rejects.toThrow(/manifestProvider requires manifestRootKeys/);
+      // manifestRoots intentionally omitted
+    }))).rejects.toThrow(/manifestProvider requires manifestRoots/);
   });
 
-  it("ADV-008: manifestThreshold=0 throws config error", async () => {
+  it("ADV-008: a 0 threshold on EITHER set throws config error", async () => {
     const logger = makeLogger();
-    const manifest = makeValidManifest();
+    const manifest = await makeValidManifest();
     const manifestProvider = new TestManifestProvider(manifest);
 
     await expect(startDaemon(makeBaseConfig(logger, {
       manifestProvider,
-      manifestRootKeys: TEST_CONSORTIUM_ROOT_KEYS,
-      manifestThreshold: 0,
-    }))).rejects.toThrow(/manifestProvider requires manifestRootKeys.*manifestThreshold/);
+      manifestRoots: { ...ROOTS, threshold: 0 },
+    }))).rejects.toThrow(/manifestProvider requires manifestRoots/);
+    // M9D 004: the ML-DSA half is required the same way — an empty PQ root set or a 0 PQ threshold.
+    await expect(startDaemon(makeBaseConfig(makeLogger(), {
+      manifestProvider,
+      manifestRoots: { ...ROOTS, pqThreshold: 0 },
+    }))).rejects.toThrow(/manifestProvider requires manifestRoots/);
+    await expect(startDaemon(makeBaseConfig(makeLogger(), {
+      manifestProvider,
+      manifestRoots: { ...ROOTS, rootKeysPq: [] },
+    }))).rejects.toThrow(/manifestProvider requires manifestRoots/);
   });
 });

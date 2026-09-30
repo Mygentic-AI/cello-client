@@ -287,8 +287,7 @@ describe("DOD-M15-MANIFEST-EXPIRY-LIVE-1: the DAEMON surfaces it, not just the m
         getCurrentManifest: () => (booted ? held : atBoot),
         updateManifest: () => {},
       },
-      manifestRootKeys: ["a".repeat(64)],
-      manifestThreshold: 1,
+      manifestRoots: { rootKeys: ["a".repeat(64)], threshold: 1, rootKeysPq: ["b".repeat(2624)], pqThreshold: 1 },
       fetchFn: (async () => { throw new Error("ECONNREFUSED"); }) as unknown as typeof fetch,
     } as unknown as DaemonConfig);
 
@@ -391,8 +390,7 @@ describe("DOD-M15-MANIFEST-EXPIRY-LIVE-1: the gaps the review found in these tes
         getCurrentManifest: () => (booted ? held : atBoot),
         updateManifest: () => {},
       },
-      manifestRootKeys: ["a".repeat(64)],
-      manifestThreshold: 1,
+      manifestRoots: { rootKeys: ["a".repeat(64)], threshold: 1, rootKeysPq: ["b".repeat(2624)], pqThreshold: 1 },
       rosterSweepScheduler: sched,
       fetchFn: (async () => { throw new Error("ECONNREFUSED"); }) as unknown as typeof fetch,
     } as unknown as DaemonConfig);

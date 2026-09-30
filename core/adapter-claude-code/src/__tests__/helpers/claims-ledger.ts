@@ -1366,9 +1366,9 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
     enforcedBy: "structural",
     evidence:
       "`file-manifest-provider.ts` — EmbeddedManifestProvider.loadAndVerify rejects with " +
-      "ManifestLoadError(\"manifest_signature_invalid\") when verifyManifest fails, and leaves " +
+      "ManifestLoadError(<the verifier's reason>) when verifyManifest fails, and leaves " +
       "#manifest null. `consortium-fingerprint.ts` — describeConsortiumFingerprint(enforced) is " +
-      "handed config.manifestRootKeys / manifestThreshold, the same pair startBootCore gives " +
+      "handed config.manifestRoots (both officer sets, M9D 004), the same value startBootCore gives " +
       "verifyStartupManifest. dod-m15-consortium-fingerprint-1.test.ts boots a daemon against a " +
       "DIFFERENT signed consortium and asserts both surfaces print that consortium's fingerprint " +
       "with state `overridden`, and boots one with no provider and asserts a null fingerprint with " +

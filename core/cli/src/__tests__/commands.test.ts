@@ -25,6 +25,8 @@ import {
   BUNDLED_CONSORTIUM_MANIFEST,
   BUNDLED_CONSORTIUM_ROOT_KEYS,
   BUNDLED_CONSORTIUM_THRESHOLD,
+  BUNDLED_CONSORTIUM_ROOT_KEYS_PQ,
+  BUNDLED_CONSORTIUM_PQ_THRESHOLD,
   EmbeddedManifestProvider,
 } from "@cello-protocol/daemon";
 
@@ -278,21 +280,21 @@ describe("cli commands", () => {
      * existing. This asserts the text the terminal emits.
      */
     it("prints the consortium root fingerprint the daemon verifies against", async () => {
+      const bundledRoots = {
+        rootKeys: BUNDLED_CONSORTIUM_ROOT_KEYS, threshold: BUNDLED_CONSORTIUM_THRESHOLD,
+        rootKeysPq: BUNDLED_CONSORTIUM_ROOT_KEYS_PQ, pqThreshold: BUNDLED_CONSORTIUM_PQ_THRESHOLD,
+      };
       // The manifest deps are REAL: a daemon wired with none verifies nothing, and a fingerprint
       // printed in that posture would describe a check that is not running.
       handle = await startDaemon({
         ...makeConfig(),
         manifestProvider: new EmbeddedManifestProvider(BUNDLED_CONSORTIUM_MANIFEST),
-        manifestRootKeys: BUNDLED_CONSORTIUM_ROOT_KEYS,
-        manifestThreshold: BUNDLED_CONSORTIUM_THRESHOLD,
+        manifestRoots: bundledRoots,
       });
 
       const result = await status(tempDir);
 
-      const expected = consortiumFingerprintShort(
-        BUNDLED_CONSORTIUM_ROOT_KEYS,
-        BUNDLED_CONSORTIUM_THRESHOLD,
-      );
+      const expected = consortiumFingerprintShort(bundledRoots);
       expect(result.output).toContain(expected);
       const parsed = JSON.parse(result.output);
       expect(parsed.consortium_root_fingerprint).toBe(expected);

@@ -19,7 +19,10 @@
 import type { OperationResult, OperationFailure } from "../signaling-manager.js";
 import { describe, it, expect } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519.js";
-import { makeTestManifest, TEST_DIRECTORY_NODE_KEYPAIR, TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD } from "@cello-protocol/crypto";
+import { makeTestManifest, TEST_DIRECTORY_NODE_KEYPAIR, testConsortiumRoots } from "@cello-protocol/crypto";
+
+/** M9D 004: both test officer sets, one value. */
+const ROOTS = await testConsortiumRoots();
 import {
   SignalingManager,
   InMemorySignalingOutboundQueue,
@@ -49,7 +52,7 @@ function expectFailure(r: OperationResult): OperationFailure {
 }
 
 
-// ─── Why every makeTestManifest() call below is double-cast ──────────────────────────────────────
+// ─── Why every await makeTestManifest() call below is double-cast ──────────────────────────────────────
 //
 // `makeTestManifest` DECLARES `ConsortiumManifestInput` — the loose signing shape, whose `nodes` are
 // `Record<string, unknown>` — while everything under test takes the structured `ConsortiumManifest`.
@@ -87,7 +90,7 @@ function makeTestNode(nodeId: string, pubkeyHex: string) {
   };
 }
 
-function makeManagerConfig(overrides?: Partial<SignalingManagerConfig>): {
+async function makeManagerConfig(overrides?: Partial<SignalingManagerConfig>): Promise<{
   manager: SignalingManager;
   logger: ReturnType<typeof makeLogger>;
   versionStore: InMemoryManifestVersionStore;
@@ -95,11 +98,11 @@ function makeManagerConfig(overrides?: Partial<SignalingManagerConfig>): {
   scheduler: ImmediatePollScheduler;
   manifestProvider: TestManifestProvider;
   manifest: ConsortiumManifest;
-} {
+}> {
   const publicKeyHex = TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex;
   const nodeId = "test-node-us-east-1";
 
-  const manifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as unknown as ConsortiumManifest;
+  const manifest = await makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as unknown as ConsortiumManifest;
   const manifestProvider = new TestManifestProvider(manifest);
   const versionStore = new InMemoryManifestVersionStore();
   const verifier = new TestDirectoryChallengeVerifier();
@@ -113,8 +116,7 @@ function makeManagerConfig(overrides?: Partial<SignalingManagerConfig>): {
     manifestProvider,
     logger,
     correlationId: "test-corr-001",
-    rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
-    threshold: TEST_CONSORTIUM_THRESHOLD,
+    roots: ROOTS,
     ...overrides,
   });
 
@@ -183,16 +185,16 @@ describe("AC-003: IDirectoryChallengeVerifier — Ed25519 challenge verification
   const publicKeyHex = TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex;
   const nodeId = "test-node-us-east-1";
 
-  function makeVerifier() {
-    const manifest: ConsortiumManifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as unknown as ConsortiumManifest;
+  async function makeVerifier() {
+    const manifest: ConsortiumManifest = await makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as unknown as ConsortiumManifest;
     const provider = new TestManifestProvider(manifest);
-    void provider.loadAndVerify([], 0); // sets #loaded so getCurrentManifest() returns it
+    void provider.loadAndVerify(ROOTS); // sets #loaded so getCurrentManifest() returns it
     const verifier = new ManifestDirectoryChallengeVerifier(provider);
     return { verifier, manifest };
   }
 
   it("returns { valid: true } for a valid Ed25519 signature over TBS bytes (RFC 8032)", async () => {
-    const { verifier } = makeVerifier();
+    const { verifier } = await makeVerifier();
     const keyProvider = new TestDirectoryKeyProvider({ nodeId, privateKeyHex });
 
     const tbsBytes = buildStep5Tbs({
@@ -221,12 +223,12 @@ describe("AC-003: IDirectoryChallengeVerifier — Ed25519 challenge verification
    * every challenge*, and neither is visible in any gate.
    */
   describe("DOD-M15-EXPIRY-CONSUMER-POLICY-1: authenticating against a LAPSED manifest is reported", () => {
-    function lapsedVerifier() {
-      const manifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)], {
+    async function lapsedVerifier() {
+      const manifest = await makeTestManifest([makeTestNode(nodeId, publicKeyHex)], {
         expires: "2020-01-01T00:00:00Z",
       }) as unknown as ConsortiumManifest;
       const provider = new TestManifestProvider(manifest);
-      void provider.loadAndVerify([], 0);
+      void provider.loadAndVerify(ROOTS);
       const seen: Array<{ nodeId: string; version: number; expires: string }> = [];
       const verifier = new ManifestDirectoryChallengeVerifier(provider, (info) => seen.push(info));
       return { verifier, provider, seen };
@@ -242,7 +244,7 @@ describe("AC-003: IDirectoryChallengeVerifier — Ed25519 challenge verification
     }
 
     it("★ reports ONCE for a node, not once per challenge", async () => {
-      const { verifier, seen } = lapsedVerifier();
+      const { verifier, seen } = await lapsedVerifier();
       const { tbsBytes, signatureHex } = await goodChallenge();
 
       expect(verifier.verifyChallenge(nodeId, tbsBytes, signatureHex)).toEqual({ valid: true });
@@ -254,9 +256,9 @@ describe("AC-003: IDirectoryChallengeVerifier — Ed25519 challenge verification
     });
 
     it("★ an IN-WINDOW manifest reports NOTHING — a signal that fires on the normal case is not a signal", async () => {
-      const manifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as unknown as ConsortiumManifest;
+      const manifest = await makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as unknown as ConsortiumManifest;
       const provider = new TestManifestProvider(manifest);
-      void provider.loadAndVerify([], 0);
+      void provider.loadAndVerify(ROOTS);
       const seen: unknown[] = [];
       const verifier = new ManifestDirectoryChallengeVerifier(provider, (i) => seen.push(i));
       const { tbsBytes, signatureHex } = await goodChallenge();
@@ -273,7 +275,7 @@ describe("AC-003: IDirectoryChallengeVerifier — Ed25519 challenge verification
        * the lapsed anchor silent. **A security signal an attacker can switch off is worse than none,
        * because its absence reads as safety.**
        */
-      const { verifier, seen } = lapsedVerifier();
+      const { verifier, seen } = await lapsedVerifier();
       const { tbsBytes } = await goodChallenge();
 
       expect(verifier.verifyChallenge(nodeId, tbsBytes, "00".repeat(64)))
@@ -295,11 +297,11 @@ describe("AC-003: IDirectoryChallengeVerifier — Ed25519 challenge verification
        * logger write failure would have accused a healthy directory node of forging its identity
        * proof, once, unreproducibly. A reporting failure must never fail an authentication.
        */
-      const manifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)], {
+      const manifest = await makeTestManifest([makeTestNode(nodeId, publicKeyHex)], {
         expires: "2020-01-01T00:00:00Z",
       }) as unknown as ConsortiumManifest;
       const provider = new TestManifestProvider(manifest);
-      void provider.loadAndVerify([], 0);
+      void provider.loadAndVerify(ROOTS);
       const verifier = new ManifestDirectoryChallengeVerifier(provider, () => {
         throw new Error("the log sink is down");
       });
@@ -318,11 +320,11 @@ describe("AC-003: IDirectoryChallengeVerifier — Ed25519 challenge verification
        * silent. That is the same "absence reads as safety" argument accepted for the adversary,
        * with a flaky logger as the actor instead of an attacker.
        */
-      const manifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)], {
+      const manifest = await makeTestManifest([makeTestNode(nodeId, publicKeyHex)], {
         expires: "2020-01-01T00:00:00Z",
       }) as unknown as ConsortiumManifest;
       const provider = new TestManifestProvider(manifest);
-      void provider.loadAndVerify([], 0);
+      void provider.loadAndVerify(ROOTS);
 
       let failNext = true;
       const seen: Array<{ nodeId: string }> = [];
@@ -344,7 +346,7 @@ describe("AC-003: IDirectoryChallengeVerifier — Ed25519 challenge verification
   });
 
   it("returns { valid: false, reason: 'signature_invalid' } for wrong signature", async () => {
-    const { verifier } = makeVerifier();
+    const { verifier } = await makeVerifier();
     const tbsBytes = buildStep5Tbs({
       nodeId,
       agentPubkeyHex: "a".repeat(64),
@@ -356,7 +358,7 @@ describe("AC-003: IDirectoryChallengeVerifier — Ed25519 challenge verification
   });
 
   it("AC-007: returns { valid: false, reason: 'key_not_in_manifest' } for unknown nodeId", async () => {
-    const { verifier } = makeVerifier();
+    const { verifier } = await makeVerifier();
     const tbsBytes = buildStep5Tbs({
       nodeId: "unknown-node",
       agentPubkeyHex: "a".repeat(64),
@@ -369,8 +371,8 @@ describe("AC-003: IDirectoryChallengeVerifier — Ed25519 challenge verification
     });
   });
 
-  it("returns { valid: false, reason: 'key_not_in_manifest' } if manifest not loaded yet", () => {
-    const manifest: ConsortiumManifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as unknown as ConsortiumManifest;
+  it("returns { valid: false, reason: 'key_not_in_manifest' } if manifest not loaded yet", async () => {
+    const manifest: ConsortiumManifest = await makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as unknown as ConsortiumManifest;
     const provider = new TestManifestProvider(manifest);
     // Do NOT call loadAndVerify — getCurrentManifest() returns null
     const verifier = new ManifestDirectoryChallengeVerifier(provider);
@@ -396,12 +398,12 @@ describe("AC-003: IDirectoryChallengeVerifier — Ed25519 challenge verification
     const privBBytes = new Uint8Array(32).fill(0x20);
     const pubB = Buffer.from(ed25519.getPublicKey(privBBytes)).toString("hex");
 
-    const manifest: ConsortiumManifest = makeTestManifest([
+    const manifest: ConsortiumManifest = await makeTestManifest([
       makeTestNode(nodeIdA, pubA),
       makeTestNode(nodeIdB, pubB),
     ]) as unknown as ConsortiumManifest;
     const provider = new TestManifestProvider(manifest);
-    void provider.loadAndVerify([], 0);
+    void provider.loadAndVerify(ROOTS);
     const verifier = new ManifestDirectoryChallengeVerifier(provider);
 
     const tbsA = buildStep5Tbs({
@@ -430,9 +432,9 @@ describe("AC-004: SignalingManager.processStep5Frame — step-6 verification flo
     const publicKeyHex = TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex;
     const nodeId = "test-node-us-east-1";
 
-    const manifest: ConsortiumManifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as unknown as ConsortiumManifest;
+    const manifest: ConsortiumManifest = await makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as unknown as ConsortiumManifest;
     const manifestProvider = new TestManifestProvider(manifest);
-    await manifestProvider.loadAndVerify([], 0);
+    await manifestProvider.loadAndVerify(ROOTS);
     const realVerifier = new ManifestDirectoryChallengeVerifier(manifestProvider);
 
     const logger = makeLogger();
@@ -443,8 +445,7 @@ describe("AC-004: SignalingManager.processStep5Frame — step-6 verification flo
       manifestProvider,
       logger,
       correlationId: "test-corr",
-      rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
-      threshold: TEST_CONSORTIUM_THRESHOLD,
+      roots: ROOTS,
     });
 
     const nonceHex = "cc".repeat(32);
@@ -473,9 +474,9 @@ describe("AC-004: SignalingManager.processStep5Frame — step-6 verification flo
     const publicKeyHex = TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex;
     const nodeId = "test-node-us-east-1";
 
-    const manifest: ConsortiumManifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as unknown as ConsortiumManifest;
+    const manifest: ConsortiumManifest = await makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as unknown as ConsortiumManifest;
     const manifestProvider = new TestManifestProvider(manifest);
-    await manifestProvider.loadAndVerify([], 0);
+    await manifestProvider.loadAndVerify(ROOTS);
     const realVerifier = new ManifestDirectoryChallengeVerifier(manifestProvider);
 
     const logger = makeLogger();
@@ -486,8 +487,7 @@ describe("AC-004: SignalingManager.processStep5Frame — step-6 verification flo
       manifestProvider,
       logger,
       correlationId: "fail-test",
-      rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
-      threshold: TEST_CONSORTIUM_THRESHOLD,
+      roots: ROOTS,
     });
 
     manager.setHandshakeContext("cc".repeat(32), "aa".repeat(32));
@@ -511,9 +511,9 @@ describe("AC-004: SignalingManager.processStep5Frame — step-6 verification flo
     const knownNodeId = "test-node-us-east-1";
     const rogueNodeId = "rogue-node-not-in-manifest";
 
-    const manifest: ConsortiumManifest = makeTestManifest([makeTestNode(knownNodeId, publicKeyHex)]) as unknown as ConsortiumManifest;
+    const manifest: ConsortiumManifest = await makeTestManifest([makeTestNode(knownNodeId, publicKeyHex)]) as unknown as ConsortiumManifest;
     const manifestProvider = new TestManifestProvider(manifest);
-    await manifestProvider.loadAndVerify([], 0);
+    await manifestProvider.loadAndVerify(ROOTS);
     const realVerifier = new ManifestDirectoryChallengeVerifier(manifestProvider);
 
     const logger = makeLogger();
@@ -524,8 +524,7 @@ describe("AC-004: SignalingManager.processStep5Frame — step-6 verification flo
       manifestProvider,
       logger,
       correlationId: "ac-007-test",
-      rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
-      threshold: TEST_CONSORTIUM_THRESHOLD,
+      roots: ROOTS,
     });
 
     manager.setHandshakeContext("cc".repeat(32), "aa".repeat(32));
@@ -545,8 +544,8 @@ describe("AC-004: SignalingManager.processStep5Frame — step-6 verification flo
     expect(failEvent?.context.nodeId).toBe(rogueNodeId);
   });
 
-  it("emits directory.auth.challenge.skipped when frame has no identity proof", () => {
-    const { manager, logger } = makeManagerConfig();
+  it("emits directory.auth.challenge.skipped when frame has no identity proof", async () => {
+    const { manager, logger } = await makeManagerConfig();
 
     manager.setHandshakeContext("cc".repeat(32), "aa".repeat(32));
 
@@ -559,8 +558,8 @@ describe("AC-004: SignalingManager.processStep5Frame — step-6 verification flo
     expect(skipEvent?.level).toBe("warn");
   });
 
-  it("returns handshake_context_missing when setHandshakeContext was not called", () => {
-    const { manager, logger } = makeManagerConfig();
+  it("returns handshake_context_missing when setHandshakeContext was not called", async () => {
+    const { manager, logger } = await makeManagerConfig();
     // Do NOT call setHandshakeContext
 
     const result = manager.processStep5Frame({
@@ -581,9 +580,9 @@ describe("AC-004: SignalingManager.processStep5Frame — step-6 verification flo
     const publicKeyHex = TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex;
     const nodeId = "test-node-us-east-1";
 
-    const manifest: ConsortiumManifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as unknown as ConsortiumManifest;
+    const manifest: ConsortiumManifest = await makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as unknown as ConsortiumManifest;
     const manifestProvider = new TestManifestProvider(manifest);
-    await manifestProvider.loadAndVerify([], 0);
+    await manifestProvider.loadAndVerify(ROOTS);
     const realVerifier = new ManifestDirectoryChallengeVerifier(manifestProvider);
 
     const logger = makeLogger();
@@ -594,8 +593,7 @@ describe("AC-004: SignalingManager.processStep5Frame — step-6 verification flo
       manifestProvider,
       logger,
       correlationId: "replay-test",
-      rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
-      threshold: TEST_CONSORTIUM_THRESHOLD,
+      roots: ROOTS,
     });
 
     // Original challenge
@@ -652,16 +650,16 @@ describe("AC-001: InMemoryManifestVersionStore — monotonicity", () => {
 
 describe("AC-002: TestManifestProvider — manifest loading and caching", () => {
   it("loadAndVerify returns the supplied manifest", async () => {
-    const manifest: ConsortiumManifest = makeTestManifest([
+    const manifest: ConsortiumManifest = await makeTestManifest([
       makeTestNode("node-1", "00".repeat(32)),
     ]) as unknown as ConsortiumManifest;
     const provider = new TestManifestProvider(manifest);
-    const result = await provider.loadAndVerify([], 0);
+    const result = await provider.loadAndVerify(ROOTS);
     expect(result.nodes[0].nodeId).toBe("node-1");
   });
 
-  it("getCurrentManifest returns null before loadAndVerify", () => {
-    const manifest: ConsortiumManifest = makeTestManifest([
+  it("getCurrentManifest returns null before loadAndVerify", async () => {
+    const manifest: ConsortiumManifest = await makeTestManifest([
       makeTestNode("node-1", "00".repeat(32)),
     ]) as unknown as ConsortiumManifest;
     const provider = new TestManifestProvider(manifest);
@@ -669,11 +667,11 @@ describe("AC-002: TestManifestProvider — manifest loading and caching", () => 
   });
 
   it("getCurrentManifest returns the manifest after loadAndVerify", async () => {
-    const manifest: ConsortiumManifest = makeTestManifest([
+    const manifest: ConsortiumManifest = await makeTestManifest([
       makeTestNode("node-1", "00".repeat(32)),
     ]) as unknown as ConsortiumManifest;
     const provider = new TestManifestProvider(manifest);
-    await provider.loadAndVerify([], 0);
+    await provider.loadAndVerify(ROOTS);
     expect(provider.getCurrentManifest()).toBe(manifest);
   });
 });
@@ -686,15 +684,15 @@ describe("AC-010: Manifest poll round-trip", () => {
     // connection up, dispatch must be a harmless no-op — it must not throw and must NOT log
     // poll.dispatched (that event only emits on a real ok send), so nothing is mistaken for
     // a delivered poll. (makeManagerConfig has no connect → the manager never connects.)
-    const { manager, logger } = makeManagerConfig();
+    const { manager, logger } = await makeManagerConfig();
     expect(() => manager.dispatchManifestPoll()).not.toThrow();
     await new Promise((r) => setTimeout(r, 10)); // let the sendRaw promise settle
     expect(logger.events.find((e) => e.event === "directory.auth.manifest.poll.dispatched")).toBeUndefined();
   });
 
   it("handleManifestPollResponse persists version and logs manifest.poll.success", async () => {
-    const { manager, logger, versionStore } = makeManagerConfig();
-    const newManifest: ConsortiumManifest = makeTestManifest([
+    const { manager, logger, versionStore } = await makeManagerConfig();
+    const newManifest: ConsortiumManifest = await makeTestManifest([
       makeTestNode("test-node-us-east-1", TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex),
     ], { version: 2 }) as unknown as ConsortiumManifest;
 
@@ -705,12 +703,12 @@ describe("AC-010: Manifest poll round-trip", () => {
   });
 
   it("handleManifestPollResponse rejects version rollback", async () => {
-    const { manager, logger, versionStore } = makeManagerConfig();
+    const { manager, logger, versionStore } = await makeManagerConfig();
 
     // First set a higher version
     await versionStore.persistVersion(5);
 
-    const oldManifest: ConsortiumManifest = makeTestManifest([
+    const oldManifest: ConsortiumManifest = await makeTestManifest([
       makeTestNode("test-node-us-east-1", TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex),
     ], { version: 3 }) as unknown as ConsortiumManifest;
 
@@ -731,8 +729,8 @@ describe("AC-010: Manifest poll round-trip", () => {
   // passed every test. These pin the security path; teeth proven by neutering → red.)
 
   it("rejects a FORGED-signature manifest over the poll path (does not adopt)", async () => {
-    const { manager, logger, versionStore } = makeManagerConfig();
-    const forged: ConsortiumManifest = makeTestManifest([
+    const { manager, logger, versionStore } = await makeManagerConfig();
+    const forged: ConsortiumManifest = await makeTestManifest([
       makeTestNode("test-node-us-east-1", TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex),
     ], { version: 2 }) as unknown as ConsortiumManifest;
     // A compromised/rogue directory serves a structurally-valid manifest signed by ATTACKER
@@ -748,8 +746,8 @@ describe("AC-010: Manifest poll round-trip", () => {
   });
 
   it("rejects an EXPIRED manifest over the poll path (does not adopt)", async () => {
-    const { manager, logger, versionStore } = makeManagerConfig();
-    const expired: ConsortiumManifest = makeTestManifest([
+    const { manager, logger, versionStore } = await makeManagerConfig();
+    const expired: ConsortiumManifest = await makeTestManifest([
       makeTestNode("test-node-us-east-1", TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex),
     ], { version: 2, expires: "2020-01-01T00:00:00Z" }) as unknown as ConsortiumManifest;
 
@@ -761,8 +759,8 @@ describe("AC-010: Manifest poll round-trip", () => {
   });
 
   it("rejects a NOT-YET-VALID manifest over the poll path (does not adopt)", async () => {
-    const { manager, logger, versionStore } = makeManagerConfig();
-    const future: ConsortiumManifest = makeTestManifest([
+    const { manager, logger, versionStore } = await makeManagerConfig();
+    const future: ConsortiumManifest = await makeTestManifest([
       makeTestNode("test-node-us-east-1", TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex),
     ], { version: 2, notBefore: "2099-01-01T00:00:00Z" }) as unknown as ConsortiumManifest;
 
@@ -782,11 +780,10 @@ describe("AC-010: Manifest poll round-trip", () => {
       challengeVerifier: new TestDirectoryChallengeVerifier(),
       pollScheduler: new ImmediatePollScheduler(0),
       manifestVersionStore: store, // same store instance
-      manifestProvider: new TestManifestProvider(makeTestManifest([]) as unknown as ConsortiumManifest),
+      manifestProvider: new TestManifestProvider(await makeTestManifest([]) as unknown as ConsortiumManifest),
       logger: makeLogger(),
       correlationId: "restart-test",
-      rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
-      threshold: TEST_CONSORTIUM_THRESHOLD,
+      roots: ROOTS,
     };
     const manager2 = new SignalingManager(manager2Config);
 
@@ -795,7 +792,7 @@ describe("AC-010: Manifest poll round-trip", () => {
     expect(lastSeen).toBe(10);
 
     // Reject any manifest version <= 10
-    const oldManifest: ConsortiumManifest = makeTestManifest([
+    const oldManifest: ConsortiumManifest = await makeTestManifest([
       makeTestNode("node", "00".repeat(32)),
     ], { version: 9 }) as unknown as ConsortiumManifest;
     await manager2.handleManifestPollResponse(oldManifest);
@@ -882,8 +879,8 @@ describe("TestDirectoryKeyProvider", () => {
 // ─── TestDirectoryManifestStore ───────────────────────────────────────────────
 
 describe("TestDirectoryManifestStore", () => {
-  it("getCurrentManifest returns the fixed manifest", () => {
-    const manifest: ConsortiumManifest = makeTestManifest([
+  it("getCurrentManifest returns the fixed manifest", async () => {
+    const manifest: ConsortiumManifest = await makeTestManifest([
       makeTestNode("node-1", "00".repeat(32)),
     ]) as unknown as ConsortiumManifest;
     const store = new TestDirectoryManifestStore(manifest);
@@ -1341,11 +1338,10 @@ describe("SignalingManager — lifecycle (SIGNAL-001)", () => {
         logger,
         pollScheduler: new ImmediatePollScheduler(0),
         manifestProvider: new TestManifestProvider(
-          makeTestManifest([makeTestNode("local", "00".repeat(32))]) as unknown as ConsortiumManifest,
+          await makeTestManifest([makeTestNode("local", "00".repeat(32))]) as unknown as ConsortiumManifest,
         ),
         manifestVersionStore: new InMemoryManifestVersionStore(),
-        rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
-        threshold: TEST_CONSORTIUM_THRESHOLD,
+        roots: ROOTS,
       });
       await delay(80); // connect + the immediate poll fire
       expect(manager.status).toBe("connected");
@@ -1378,11 +1374,10 @@ describe("SignalingManager — lifecycle (SIGNAL-001)", () => {
         logger,
         pollScheduler: new ImmediatePollScheduler(20), // fires ~every 20ms via re-arm
         manifestProvider: new TestManifestProvider(
-          makeTestManifest([makeTestNode("local", "00".repeat(32))]) as unknown as ConsortiumManifest,
+          await makeTestManifest([makeTestNode("local", "00".repeat(32))]) as unknown as ConsortiumManifest,
         ),
         manifestVersionStore: new InMemoryManifestVersionStore(),
-        rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
-        threshold: TEST_CONSORTIUM_THRESHOLD,
+        roots: ROOTS,
       });
       await delay(120);
       const pollFrames = sentFrames.filter(

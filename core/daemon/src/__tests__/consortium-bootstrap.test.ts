@@ -26,8 +26,8 @@ function logged(logger: TestLogger, level: "info" | "warn" | "error", event: str
   return logger[level].mock.calls.some((c: unknown[]) => c[0] === event);
 }
 
-const ROOT_KEYS = ["a".repeat(64)];
-const THRESHOLD = 1;
+// M9D 004: both officer sets, one value. The keys are placeholders — the provider fakes verification.
+const ROOTS = { rootKeys: ["a".repeat(64)], threshold: 1, rootKeysPq: ["b".repeat(2624)], pqThreshold: 1 };
 
 function node(nodeId: string, endpoint = `https://${nodeId}.example.com`) {
   return {
@@ -102,8 +102,7 @@ describe("verifyStartupManifest — the gate reports, it does not decide", () =>
     const store = makeVersionStore(null);
     const result = await verifyStartupManifest({
       manifestProvider: makeProvider(makeManifest()),
-      manifestRootKeys: ROOT_KEYS,
-      manifestThreshold: THRESHOLD,
+      manifestRoots: ROOTS,
       manifestVersionStore: store,
       logger,
       fetchFn: bootstrapFetch(["n1", "n2"]),
@@ -122,8 +121,7 @@ describe("verifyStartupManifest — the gate reports, it does not decide", () =>
     const store = makeVersionStore();
     const result = await verifyStartupManifest({
       manifestProvider: makeProvider(makeManifest({ not_before: new Date(Date.now() + 3_600_000).toISOString() })),
-      manifestRootKeys: ROOT_KEYS,
-      manifestThreshold: THRESHOLD,
+      manifestRoots: ROOTS,
       manifestVersionStore: store,
       logger,
     });
@@ -160,8 +158,7 @@ describe("verifyStartupManifest — the gate reports, it does not decide", () =>
     const store = makeVersionStore();
     const result = await verifyStartupManifest({
       manifestProvider: makeProvider(makeManifest({ expires: "not-a-date" })),
-      manifestRootKeys: ROOT_KEYS,
-      manifestThreshold: THRESHOLD,
+      manifestRoots: ROOTS,
       manifestVersionStore: store,
       logger,
     });
@@ -183,8 +180,7 @@ describe("verifyStartupManifest — the gate reports, it does not decide", () =>
     const store = makeVersionStore();
     const result = await verifyStartupManifest({
       manifestProvider: makeProvider(makeManifest({ expires: new Date(Date.now() - 1_000).toISOString() })),
-      manifestRootKeys: ROOT_KEYS,
-      manifestThreshold: THRESHOLD,
+      manifestRoots: ROOTS,
       manifestVersionStore: store,
       logger,
     });
@@ -199,8 +195,7 @@ describe("verifyStartupManifest — the gate reports, it does not decide", () =>
     const store = makeVersionStore(9); // we have already seen v9
     const result = await verifyStartupManifest({
       manifestProvider: makeProvider(makeManifest({ version: 7 })),
-      manifestRootKeys: ROOT_KEYS,
-      manifestThreshold: THRESHOLD,
+      manifestRoots: ROOTS,
       manifestVersionStore: store,
       logger,
     });
@@ -215,8 +210,7 @@ describe("verifyStartupManifest — the gate reports, it does not decide", () =>
     const store = makeVersionStore(7);
     const result = await verifyStartupManifest({
       manifestProvider: makeProvider(makeManifest({ version: 7 })),
-      manifestRootKeys: ROOT_KEYS,
-      manifestThreshold: THRESHOLD,
+      manifestRoots: ROOTS,
       manifestVersionStore: store,
       logger,
       fetchFn: bootstrapFetch(["n1", "n2"]),
@@ -232,8 +226,7 @@ describe("verifyStartupManifest — the gate reports, it does not decide", () =>
     const logger = makeLogger();
     const result = await verifyStartupManifest({
       manifestProvider: makeProvider(new Error("manifest_signature_invalid")),
-      manifestRootKeys: ROOT_KEYS,
-      manifestThreshold: THRESHOLD,
+      manifestRoots: ROOTS,
       manifestVersionStore: makeVersionStore(),
       logger,
     });
@@ -246,8 +239,7 @@ describe("verifyStartupManifest — the gate reports, it does not decide", () =>
     const logger = makeLogger();
     const result = await verifyStartupManifest({
       manifestProvider: makeProvider(makeManifest()),
-      manifestRootKeys: ROOT_KEYS,
-      manifestThreshold: THRESHOLD,
+      manifestRoots: ROOTS,
       manifestVersionStore: makeVersionStore(),
       logger,
       fetchFn: bootstrapFetch(["n1"]), // n2 is down
@@ -264,8 +256,7 @@ describe("verifyStartupManifest — the gate reports, it does not decide", () =>
     const logger = makeLogger();
     const result = await verifyStartupManifest({
       manifestProvider: makeProvider(makeManifest()),
-      manifestRootKeys: ROOT_KEYS,
-      manifestThreshold: THRESHOLD,
+      manifestRoots: ROOTS,
       manifestVersionStore: makeVersionStore(),
       logger,
       fetchFn: bootstrapFetch([]), // every node down
@@ -282,8 +273,7 @@ describe("createConsortiumRouting", () => {
     const routing = createConsortiumRouting({
       manifestProvider: makeProvider(makeManifest()),
       manifestVersionStore: makeVersionStore(),
-      manifestRootKeys: ROOT_KEYS,
-      manifestThreshold: THRESHOLD,
+      manifestRoots: ROOTS,
       logger,
     });
 
@@ -297,8 +287,7 @@ describe("createConsortiumRouting", () => {
     const routing = createConsortiumRouting({
       manifestProvider: makeProvider(makeManifest({ nodes: [{ ...node("n1"), peerId: "12D3KooWPrimary" }, node("n2")] })),
       manifestVersionStore: makeVersionStore(),
-      manifestRootKeys: ROOT_KEYS,
-      manifestThreshold: THRESHOLD,
+      manifestRoots: ROOTS,
       directoryEndpointResolver: async () => primary as never,
       logger,
     });
@@ -325,8 +314,7 @@ describe("createConsortiumRouting", () => {
     const routing = createConsortiumRouting({
       manifestProvider: makeProvider(lapsed),
       manifestVersionStore: makeVersionStore(),
-      manifestRootKeys: ROOT_KEYS,
-      manifestThreshold: THRESHOLD,
+      manifestRoots: ROOTS,
       directoryEndpointResolver: async () => primary as never,
       logger,
     });
@@ -359,8 +347,7 @@ describe("createConsortiumRouting", () => {
     const routing = createConsortiumRouting({
       manifestProvider: makeProvider(makeManifest()),
       manifestVersionStore: makeVersionStore(),
-      manifestRootKeys: ROOT_KEYS,
-      manifestThreshold: THRESHOLD,
+      manifestRoots: ROOTS,
       logger,
       fetchFn: bootstrapFetch(["n1", "n2"]),
     });
@@ -373,8 +360,7 @@ describe("createConsortiumRouting", () => {
     const routing = createConsortiumRouting({
       manifestProvider: makeProvider(makeManifest()),
       manifestVersionStore: makeVersionStore(),
-      manifestRootKeys: ROOT_KEYS,
-      manifestThreshold: THRESHOLD,
+      manifestRoots: ROOTS,
       logger,
       fetchFn: bootstrapFetch([]), // the whole consortium is down
     });
@@ -399,8 +385,7 @@ describe("createConsortiumRouting", () => {
     const result = await verifyStartupManifest({
       manifestProvider: makeProvider(makeManifest()),
       manifestVersionStore: makeVersionStore(),
-      manifestRootKeys: ROOT_KEYS,
-      manifestThreshold: THRESHOLD,
+      manifestRoots: ROOTS,
       logger,
       fetchFn: bootstrapFetch(["n1"]), // n2 is unreachable
     });
@@ -418,8 +403,7 @@ describe("createConsortiumRouting", () => {
     const result = await verifyStartupManifest({
       manifestProvider: makeProvider(makeManifest()),
       manifestVersionStore: makeVersionStore(),
-      manifestRootKeys: ROOT_KEYS,
-      manifestThreshold: THRESHOLD,
+      manifestRoots: ROOTS,
       logger,
       fetchFn: bootstrapFetch(["n1", "n2"]),
     });
@@ -433,8 +417,7 @@ describe("createConsortiumRouting", () => {
     const routing = createConsortiumRouting({
       manifestProvider: makeProvider(makeManifest()),
       manifestVersionStore: makeVersionStore(),
-      manifestRootKeys: ROOT_KEYS,
-      manifestThreshold: THRESHOLD,
+      manifestRoots: ROOTS,
       initialUnresolvedNodes: startupFailures,
       logger,
     });
@@ -449,8 +432,7 @@ describe("createConsortiumRouting", () => {
     const routing = createConsortiumRouting({
       manifestProvider: makeProvider(makeManifest()),
       manifestVersionStore: makeVersionStore(),
-      manifestRootKeys: ROOT_KEYS,
-      manifestThreshold: THRESHOLD,
+      manifestRoots: ROOTS,
       initialUnresolvedNodes: [{ nodeId: "n2", endpoint: "https://n2.example.com", reason: "dns_error" }],
       fetchFn: bootstrapFetch(["n1", "n2"]),
       logger,
@@ -467,8 +449,7 @@ describe("createConsortiumRouting", () => {
     const routing = createConsortiumRouting({
       manifestProvider: makeProvider(makeManifest()),
       manifestVersionStore: makeVersionStore(),
-      manifestRootKeys: ROOT_KEYS,
-      manifestThreshold: THRESHOLD,
+      manifestRoots: ROOTS,
       logger,
     });
 
@@ -481,8 +462,7 @@ describe("createConsortiumRouting", () => {
     const routing = createConsortiumRouting({
       manifestProvider: makeProvider(makeManifest()),
       manifestVersionStore: makeVersionStore(),
-      manifestRootKeys: ROOT_KEYS,
-      manifestThreshold: THRESHOLD,
+      manifestRoots: ROOTS,
       manifestPollScheduler: scheduler as never,
       directoryHttpUrl: "https://directory.example.com",
       logger,
@@ -515,8 +495,7 @@ describe("createConsortiumRouting", () => {
         createConsortiumRouting({
           manifestProvider: makeProvider(makeManifest()),
           manifestVersionStore: makeVersionStore(),
-          manifestRootKeys: [],
-          manifestThreshold: THRESHOLD,
+          manifestRoots: { ...ROOTS, rootKeys: [] },
           manifestPollScheduler: scheduler as never,
           directoryHttpUrl: "https://directory.example.com",
           logger,
@@ -525,6 +504,23 @@ describe("createConsortiumRouting", () => {
     ).toThrow(/directory_manifest_poll_misconfigured/);
 
     expect(scheduler.scheduleNext, "and it must not have started the poll on the way out").not.toHaveBeenCalled();
+  });
+
+  it("★ M9D 004: a wired poll with the ML-DSA roots EMPTY (or PQ threshold 0) refuses the same way", () => {
+    // The Ed25519 half being present is not enough: every manifest is verified under both sets, so
+    // a poll with no ML-DSA roots could never adopt anything — rotation silently dead again.
+    for (const roots of [{ ...ROOTS, rootKeysPq: [] }, { ...ROOTS, pqThreshold: 0 }]) {
+      const scheduler = { scheduleNext: vi.fn(), cancel: vi.fn() };
+      expect(() => createConsortiumRouting({
+        manifestProvider: makeProvider(makeManifest()),
+        manifestVersionStore: makeVersionStore(),
+        manifestRoots: roots,
+        manifestPollScheduler: scheduler as never,
+        directoryHttpUrl: "https://directory.example.com",
+        logger: makeLogger(),
+      })).toThrow(/directory_manifest_poll_misconfigured: .*rootKeysPq=/);
+      expect(scheduler.scheduleNext).not.toHaveBeenCalled();
+    }
   });
 
   it("★★ but NO SCHEDULER is still legitimate and silent — the back-compat path must not break", () => {
@@ -541,8 +537,7 @@ describe("createConsortiumRouting", () => {
     const routing = createConsortiumRouting({
       manifestProvider: makeProvider(makeManifest()),
       manifestVersionStore: makeVersionStore(),
-      manifestRootKeys: [],
-      manifestThreshold: THRESHOLD,
+      manifestRoots: { ...ROOTS, rootKeys: [] },
       directoryHttpUrl: "https://directory.example.com",
       logger,
     });

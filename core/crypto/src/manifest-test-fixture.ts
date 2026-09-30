@@ -18,7 +18,7 @@ import { canonicalManifestBody } from "./manifest.js";
 import { mlDsaProviderFromSeed } from "./ml-dsa.js";
 import { mlKemKeypairFromSeed } from "./ml-kem.js";
 import { signMlDsa } from "./pq-frame.js";
-import type { ConsortiumManifestInput } from "./manifest.js";
+import type { ConsortiumManifestInput, ManifestVerifyOptions } from "./manifest.js";
 
 /**
  * Deterministic test officer seeds (private keys). Used to derive
@@ -114,6 +114,16 @@ export async function testConsortiumRootKeysPq(): Promise<string[]> {
     Buffer.from(await (await mlDsaProviderFromSeed(s)).getPublicKey()).toString("hex")));
 }
 export const TEST_CONSORTIUM_PQ_THRESHOLD = 3;
+
+/** Both test root sets and thresholds, as the ONE value every verifier takes (M9D 004). */
+export async function testConsortiumRoots(): Promise<ManifestVerifyOptions> {
+  return {
+    rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
+    threshold: TEST_CONSORTIUM_THRESHOLD,
+    rootKeysPq: await testConsortiumRootKeysPq(),
+    pqThreshold: TEST_CONSORTIUM_PQ_THRESHOLD,
+  };
+}
 
 /** A test node's ML-DSA public key, deterministic from its nodeId. */
 export async function testNodeMlDsaPubkeyHex(nodeId: string): Promise<string> {

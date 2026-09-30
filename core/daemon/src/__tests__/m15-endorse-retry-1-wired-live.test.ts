@@ -150,8 +150,7 @@ describe("DOD-M15-ENDORSE-RETRY-1 — over a live daemon", () => {
         getCurrentManifest: () => manifest,
         updateManifest: () => {},
       },
-      manifestRootKeys: ["a".repeat(64)],
-      manifestThreshold: 1,
+      manifestRoots: { rootKeys: ["a".repeat(64)], threshold: 1, rootKeysPq: ["b".repeat(2624)], pqThreshold: 1 },
       // Deterministic timings. Without them this test's green depends on the real SignalingManager
       // reconnect ladder (1s → 2s → 4s → 8s → 16s, cap 30s) landing before the queue's own first
       // attempt — and when it lands after, the next attempt is a full minute away and a CORRECT
