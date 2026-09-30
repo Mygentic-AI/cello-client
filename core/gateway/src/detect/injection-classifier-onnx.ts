@@ -35,12 +35,7 @@ import { join } from "node:path";
 import { isModelInstalled } from "./model-installer.js";
 import { resolveScreenerRuntime } from "./screener-state.js";
 import { SCREENER_MODEL } from "./screener-model-manifest.js";
-import { buildWindows, aggregateWindowScores } from "./injection-windows.js";
-
-interface TokenizerLike {
-  encode(text: string): number[];
-  decode(ids: number[], opts?: { skip_special_tokens?: boolean }): string;
-}
+import { textWindows, aggregateWindowScores, type WindowTokenizer } from "./injection-windows.js";
 
 /**
  * P(injection) from one window's label scores.
@@ -156,28 +151,6 @@ export async function loadInjectionClassifier(
     };
   }
 
-  /**
-   * The message as windows of TEXT, cut on token boundaries.
-   *
-   * The pipeline carries the model's own tokenizer, so the split is in the units the window is
-   * measured in. Without a tokenizer the honest thing is one window: guessing a character count
-   * would cut mid-token and change what the model reads.
-   */
-  async function textWindows(text: string, pipeline: Pipe): Promise<string[]> {
-    const tok = (pipeline as unknown as { tokenizer?: TokenizerLike }).tokenizer;
-    if (!tok || typeof tok.encode !== "function" || typeof tok.decode !== "function") return [text];
-    let ids: number[];
-    try {
-      ids = tok.encode(text);
-    } catch {
-      return [text];
-    }
-    if (ids.length <= SCREENER_MODEL.windowTokens) return [text];
-    return buildWindows(ids, SCREENER_MODEL.windowTokens, SCREENER_MODEL.windowOverlapTokens).map((w) =>
-      tok.decode(w, { skip_special_tokens: true }),
-    );
-  }
-
   return {
     classifier: {
       async classify(text: string): Promise<{ injectionProbability: number; label?: string }> {
@@ -188,7 +161,8 @@ export async function loadInjectionClassifier(
         // that only holds if the score handed to it is the injection score.
         // WINDOWED, so nothing past the model's window goes unscreened. A single call truncates,
         // and a truncated scan is a gap that looks exactly like coverage.
-        const windows = await textWindows(text, pipe);
+        const tok = (pipe as unknown as { tokenizer?: WindowTokenizer }).tokenizer;
+        const windows = textWindows(text, tok, SCREENER_MODEL.windowTokens, SCREENER_MODEL.windowOverlapTokens);
         const scores: number[] = [];
         let lastLabel: string | undefined;
         for (const window of windows) {

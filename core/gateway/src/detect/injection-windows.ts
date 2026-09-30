@@ -49,3 +49,25 @@ export function aggregateWindowScores(scores: readonly number[]): number {
   }
   return Math.max(...scores);
 }
+
+/** The tokenizer surface windowing needs — both backends carry the model's own tokenizer. */
+export interface WindowTokenizer {
+  encode(text: string): number[];
+  decode(ids: number[], opts?: { skip_special_tokens?: boolean }): string;
+}
+
+/**
+ * The message as windows of TEXT, cut on token boundaries in the model's own units. Without a
+ * usable tokenizer it is one window: guessing a character count would cut mid-token.
+ */
+export function textWindows(text: string, tok: WindowTokenizer | undefined, size: number, overlap: number): string[] {
+  if (!tok || typeof tok.encode !== "function" || typeof tok.decode !== "function") return [text];
+  let ids: number[];
+  try {
+    ids = tok.encode(text);
+  } catch {
+    return [text];
+  }
+  if (ids.length <= size) return [text];
+  return buildWindows(ids, size, overlap).map((w) => tok.decode(w, { skip_special_tokens: true }));
+}

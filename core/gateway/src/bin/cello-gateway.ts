@@ -11,7 +11,7 @@
  * server itself stays logger-injected (no console.* in library code, INV-7).
  */
 import { createGatewayServer } from "../server.js";
-import { GATEWAY_READY_TOKEN } from "../spawn.js";
+import { GATEWAY_READY_TOKEN, GATEWAY_SELFCHECK_TOKEN } from "../spawn.js";
 import { OutboundScreener } from "../screen/outbound.js";
 import { InboundScreener } from "../screen/inbound.js";
 import { initLinearRegex } from "../detect/linear-regex.js";
@@ -24,6 +24,8 @@ import { GatewayRecordStore, type RecordDisposition } from "../records/record-st
 import { createHash } from "node:crypto";
 import { InjectionScanner } from "../detect/injection-scanner.js";
 import { loadInjectionClassifier } from "../detect/injection-classifier-onnx.js";
+import { loadWasmInjectionClassifier } from "../detect/injection-classifier-wasm.js";
+import { selectClassifierBackend } from "../detect/classifier-selfcheck.js";
 import { screenerModelDir, screenerState, runtimeAvailable, classifierLoadable } from "../detect/screener-state.js";
 import type { ScreenVerdict } from "../types.js";
 
@@ -134,14 +136,20 @@ async function main(): Promise<void> {
   // existence, which cannot tell a swapped model from the verified one.
   const screener = await screenerState({ dir: modelDir, runtimePresent: await runtimeAvailable() });
   const loadable = classifierLoadable(screener);
-  const load = loadable.load
-    ? await loadInjectionClassifier(modelDir)
-    : { classifier: null, reason: loadable.reason };
+  // 080-SCREENERCPU: verified bytes are not verified SCORES. Each backend proves it tells a benign
+  // sentence from a hostile one before it is used; native first, WASM only if native fails.
+  const selection = loadable.load
+    ? await selectClassifierBackend({
+      native: () => loadInjectionClassifier(modelDir),
+      wasm: () => loadWasmInjectionClassifier(modelDir),
+      log: (event, fields) => process.stderr.write(`${JSON.stringify({ level: "info", event, ...fields })}\n`),
+    })
+    : { classifier: null, layer2: `off:${loadable.reason ?? "unknown"}`, checks: [] };
   // ON STDOUT, and specifically on the line the PARENT reads. Written to stderr this was drained
   // into an in-memory tail that the spawner only ever surfaces when the spawn FAILS — so on a
   // successful boot the answer to "is semantic screening on?" was captured and thrown away. That is
   // the exact shape of the defect this whole unit exists to fix: a state nothing can report.
-  const layer2 = load.classifier ? "active" : `off:${load.reason ?? "unknown"}`;
+  const layer2 = selection.layer2;
   // The same four states the CLI prints, on the daemon's own startup line: "is the classifier
   // usable?" must be answerable from the log, not only by running a command.
   // DOD-M9C-SCREENBASE-1 — `language_allow` was validated, gated, versioned and hash-chained, and
@@ -158,7 +166,7 @@ async function main(): Promise<void> {
   // for being in a language is off unless the operator turns it on.
   const languageEnforce = cfg<boolean>("language_enforce", false);
   const inbound = new InboundScreener({
-    ...(load.classifier ? { injectionScanner: new InjectionScanner(load.classifier) } : {}),
+    ...(selection.classifier ? { injectionScanner: new InjectionScanner(selection.classifier) } : {}),
     language: { allow: languageAllow },
     languageEnforce,
   });
@@ -264,7 +272,11 @@ async function main(): Promise<void> {
     // was false — the id reached `applied` and stopped there.
     process.stderr.write(`${JSON.stringify({ level: "info", event: "gateway.boot", correlationId: bootCorrelationId, socketPath })}\n`);
   }
+  // The self-checks travel on stdout, before READY, because stderr is only surfaced on a failed
+  // spawn — the parent logs these into daemon.log. One write, so they arrive with the READY line.
+  const selfCheckLines = selection.checks.map((c) => `${GATEWAY_SELFCHECK_TOKEN} ${JSON.stringify(c)}\n`).join("");
   process.stdout.write(
+    selfCheckLines +
     `${GATEWAY_READY_TOKEN} ${socketPath} regex-engine=${engine} layer2=${layer2.replace(/\s+/g, " ")} ` +
       `screener=${screener.state} screener-model-dir=${modelDir}\n`,
   );

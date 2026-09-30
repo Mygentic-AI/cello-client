@@ -10,6 +10,8 @@ import { once } from "node:events";
 
 /** Printed by the gateway bin on stdout once it is listening. */
 export const GATEWAY_READY_TOKEN = "GATEWAY_READY";
+/** Prefixes one stdout line per classifier self-check, before the READY line (080-SCREENERCPU). */
+export const GATEWAY_SELFCHECK_TOKEN = "GATEWAY_SELFCHECK";
 
 export interface SpawnGatewayOptions {
   socketPath: string;
@@ -26,7 +28,8 @@ export interface SpawnGatewayOptions {
 
 export interface SpawnedGateway {
   /**
-   * What the child reported about Layer 2 on its ready line — `active`, or `off:<reason>`.
+   * What the child reported about Layer 2 on its ready line — `active:native`, `active:wasm`, or
+   * `off:<reason>` (the whole reason, spaces included).
    *
    * Carried out of the child DELIBERATELY. It used to be written to the gateway's stderr, which is
    * drained into a tail this module only surfaces when the spawn FAILS — so on a successful boot
@@ -34,6 +37,8 @@ export interface SpawnedGateway {
    * The parent logs this; that log line is the whole point.
    */
   readonly layer2: string;
+  /** Each classifier self-check the child ran, as it reported them — logged by the parent. */
+  readonly selfChecks: ReadonlyArray<Record<string, unknown>>;
   readonly socketPath: string;
   readonly pid: number | undefined;
   readonly process: ChildProcess;
@@ -42,8 +47,9 @@ export interface SpawnedGateway {
 
 // Loading the classifier model takes 5 to 8.4 s on a 2-vCPU e2-medium, so 10 s failed 2 of 11 starts on
 // the support VM (2026-09-28). A missed start is not retried, and every message fails closed until the
-// daemon restarts.
-const DEFAULT_READY_TIMEOUT_MS = 30_000;
+// daemon restarts. 080-SCREENERCPU adds the self-check, and on a CPU that falls back it adds a second
+// model load (WASM) too — so the window doubles rather than cutting that path close.
+const DEFAULT_READY_TIMEOUT_MS = 60_000;
 
 function defaultEntryPath(): string {
   // dist/spawn.js → dist/bin/cello-gateway.js
@@ -69,6 +75,8 @@ export async function spawnGatewaySidecar(opts: SpawnGatewayOptions): Promise<Sp
 
   const readyTimeoutMs = opts.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
   let layer2 = "unreported";
+  const selfChecks: Array<Record<string, unknown>> = [];
+  let stdoutBuf = "";
 
   // DRAIN the child's stderr and keep the tail. Two reasons, and the first one is the whole point:
   // every refusal the gateway can produce — a missing key file, a locked store, a leftover
@@ -100,7 +108,8 @@ export async function spawnGatewaySidecar(opts: SpawnGatewayOptions): Promise<Sp
     }, readyTimeoutMs);
 
     const onStdout = (chunk: Buffer) => {
-      const text = chunk.toString("utf8");
+      stdoutBuf += chunk.toString("utf8");
+      const text = stdoutBuf;
       if (text.includes(GATEWAY_READY_TOKEN)) {
         if (settled) return;
         settled = true;
@@ -109,8 +118,17 @@ export async function spawnGatewaySidecar(opts: SpawnGatewayOptions): Promise<Sp
         // ABSENT IS NOT FINE, and it is not "off" either: an older child that does not report at
         // all is a different fact from one reporting Layer 2 disabled, and calling it `off` would
         // invent a state nobody observed.
-        const m = /layer2=(\S+)/.exec(text);
+        // The reason after `off:` has spaces, so read up to the next field, not the next space.
+        const m = /layer2=(.*?) screener=/.exec(text) ?? /layer2=(\S+)/.exec(text);
         layer2 = m?.[1] ?? "unreported";
+        for (const line of text.split("\n")) {
+          if (!line.startsWith(`${GATEWAY_SELFCHECK_TOKEN} `)) continue;
+          try {
+            selfChecks.push(JSON.parse(line.slice(GATEWAY_SELFCHECK_TOKEN.length + 1)) as Record<string, unknown>);
+          } catch {
+            selfChecks.push({ unparsed: line });
+          }
+        }
         resolve();
       }
     };
@@ -129,6 +147,7 @@ export async function spawnGatewaySidecar(opts: SpawnGatewayOptions): Promise<Sp
 
   return {
     layer2,
+    selfChecks,
     socketPath: opts.socketPath,
     pid: child.pid,
     process: child,

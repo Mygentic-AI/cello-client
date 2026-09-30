@@ -175,12 +175,28 @@ export function classifierLoadable(s: ScreenerStatus): { load: boolean; reason?:
   return { load: false, reason: `classifier not installed (${s.state}) — install it with 'cello screener install'` };
 }
 
-/** One sentence per state, and every sentence that is not `ready` names the command that fixes it. */
-export function describeScreenerState(s: ScreenerStatus): string {
+/**
+ * One sentence per state, and every sentence that is not `ready` names the command that fixes it.
+ *
+ * `layer2` is what the running gateway reported (080-SCREENERCPU). Verified files prove the bytes,
+ * not the scores, so "2 of 2 layers active" appears ONLY when a backend passed its self-check:
+ * `active:native` or `active:wasm`. With no report (the CLI, or a gateway that has not said) the
+ * sentence says the files are verified and nothing more.
+ */
+export function describeScreenerState(s: ScreenerStatus, layer2?: string): string {
   const fix = "Run: cello screener install";
+  const rev = s.revision.slice(0, 8);
   switch (s.state) {
     case "ready":
-      return `Screening: 2 of 2 layers active (classifier ${s.revision.slice(0, 8)} verified).`;
+      if (layer2 === "active:native") return `Screening: 2 of 2 layers active (classifier ${rev} verified).`;
+      if (layer2 === "active:wasm") {
+        return `Screening: 2 of 2 layers active (classifier ${rev} verified, running on WASM — this CPU's native path gives wrong scores; long messages screen more slowly).`;
+      }
+      if (layer2?.startsWith("off:")) {
+        // No install command here: reinstalling the same verified files cannot change what this CPU computes.
+        return `Screening: 1 of 2 layers active — the classifier is BROKEN: ${layer2.slice(4)}. Reinstalling will not fix this; the pattern layer still screens.`;
+      }
+      return `Screening: classifier ${rev} installed and verified; the security gateway has not reported whether it scores correctly on this machine — check 'cello status' while the daemon runs.`;
     case "not_installed":
       return `Screening: 1 of 2 layers active (classifier not installed). ${fix}`;
     case "half_installed":
