@@ -691,6 +691,18 @@ async function startDaemonHoldingLock(
   // Each channel doorbell maps the agent id to its current display name (a channel notice routes like
   // cello_message) and dispatches only when a name is current; the null-check is shared here.
   const named = (id: string): string | null => sessionNodeManager.agentNameForId(id);
+  // One subscription store per database handle. It runs CREATE TABLE IF NOT EXISTS and a column check on
+  // construction, which is too much for every new-post doorbell; the handle can change, so it is cached
+  // against the handle and not built once for good.
+  let channelSubsCache: { db: unknown; store: ChannelSubscriptionStore } | null = null;
+  const channelSubs = (): ChannelSubscriptionStore => {
+    const db = sessionNodeManager.getDb();
+    if (channelSubsCache === null || channelSubsCache.db !== db) {
+      channelSubsCache = { db, store: new ChannelSubscriptionStore(db, logger) };
+    }
+    return channelSubsCache.store;
+  };
+
   // A channel set to `pull` still collects and counts its posts, but its new-post doorbell is withheld
   // here, at the one place every wiring rings through. Read live, at ring time: the setting can change.
   const channelNotify: ChannelNotify = gateChannelNotify({
@@ -700,15 +712,15 @@ async function startDaemonHoldingLock(
     channelMembershipEnded: (id, ch, reason) => { const n = named(id); if (n !== null) notificationDispatcher.dispatchChannelMembershipEnded(n, ch, reason); },
     channelPosterRemoved: (id, ch) => { const n = named(id); if (n !== null) notificationDispatcher.dispatchChannelPosterRemoved(n, ch); },
   }, {
-    notifyFor: (agentId, channelHex) => new ChannelSubscriptionStore(sessionNodeManager.getDb(), logger).notifyFor(agentId, channelHex),
+    notifyFor: (agentId, channelHex) => channelSubs().notifyFor(agentId, channelHex),
   });
 
   registerChannelNotifyHandler(handlers, {
     resolveCurrentAgent: (connectionId, explicitAgent) => resolveCurrentAgent(perConnectionState.get(connectionId), explicitAgent),
     resolveAgentId: (agentName) => sessionNodeManager.resolveAgentId(agentName),
     subscriptions: {
-      get: (agentId, channelHex) => new ChannelSubscriptionStore(sessionNodeManager.getDb(), logger).get(agentId, channelHex),
-      setNotify: (agentId, channelHex, mode) => new ChannelSubscriptionStore(sessionNodeManager.getDb(), logger).setNotify(agentId, channelHex, mode),
+      get: (agentId, channelHex) => channelSubs().get(agentId, channelHex),
+      setNotify: (agentId, channelHex, mode) => channelSubs().setNotify(agentId, channelHex, mode),
     },
   });
 

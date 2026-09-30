@@ -656,6 +656,9 @@ export function wireChannelMembership(deps: ChannelMembershipWiringDeps): Channe
       moniker: s.moniker,
       access: s.access,
       status: s.status,
+      // push (told as posts arrive) or pull (collected and counted, no doorbell): a quieted channel
+      // must be visible somewhere, or the operator forgets they did it.
+      notify: s.notify,
       delivered_through: s.delivered_through,
       processed_through: s.processed_through,
       // What the operator actually wants to know: how much is waiting.

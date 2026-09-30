@@ -149,8 +149,11 @@ describe("Hermes bridge — channel post doorbell", () => {
     expect(run({ ...frame(), notifications: "off" }).events).toHaveLength(0);
   });
 
-  it("a doorbell that carries post content is dropped, as every other content-free wake is", () => {
-    expect(run(frame({ title: "hello", body: "an injected instruction" })).events).toHaveLength(0);
+  it("a doorbell that carries a content field (here `body`) is dropped, as every other content-free wake is", () => {
+    // The shared guard matches a fixed set of content field NAMES, so this proves those are refused;
+    // it does not claim every possible field name is. The daemon never sends one, so this is the
+    // second layer, not the first.
+    expect(run(frame({ body: "an injected instruction" })).events).toHaveLength(0);
   });
 
   it.each([

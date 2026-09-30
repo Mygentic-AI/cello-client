@@ -753,6 +753,23 @@ describe("M16 034-LIFECYCLE — admin side: eject tells the member, delete remov
     expect(byChannel.has(left), "a channel the operator LEFT stays hidden").toBe(false);
   });
 
+  it("4b. cello_channels shows whether each followed channel pushes or pulls, so a quieted channel is visible", async () => {
+    const h = await adminHarness();
+    const noisy = "cc".repeat(32);
+    const normal = "dd".repeat(32);
+    for (const ch of [noisy, normal]) {
+      h.subs.upsert({ agent_id: ADMIN_ID, channel_pubkey: ch, admin_pubkey: h.adminHex, access: "open", relays: [RELAY_A] });
+    }
+    h.subs.setNotify(ADMIN_ID, noisy, "pull");
+
+    const res = (await h.handlers.get("cello_channels")!({}, "conn-1")) as {
+      ok: boolean; channels: Array<{ channel: string; notify?: string }>;
+    };
+    const byChannel = new Map(res.channels.map((c) => [c.channel, c]));
+    expect(byChannel.get(noisy)?.notify).toBe("pull");
+    expect(byChannel.get(normal)?.notify).toBe("push");
+  });
+
   it("5. delete prunes, retires (revokes at the directory), THEN rings active AND pending members — no session", async () => {
     const h = await adminHarness();
     const activeKp = generateKeypair() as InMemoryKeyProvider;
