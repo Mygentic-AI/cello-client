@@ -16,6 +16,7 @@ import type {
 } from "@cello-protocol/transport";
 import type { TransportDialer, SessionNegotiator } from "./transport-selector.js";
 import type { SecurityGatewayClient } from "@cello-protocol/gateway";
+import type { SingletonLock } from "./singleton-lock.js";
 
 // Re-export the TYPE for daemon consumers (the composition root supplies the impl). The always-allow
 // implementation is NOT re-exported here — it lives at `@cello-protocol/daemon/testing`, so a
@@ -381,6 +382,14 @@ export interface DaemonConfig {
   maxConnections: number;
   version: string;
   logger: Logger;
+  /**
+   * 084-GATEWAYSOCK Part B: a singleton lock the caller already holds. When present, startDaemon
+   * adopts it instead of acquiring one — the daemon binary takes the lock BEFORE it spawns the
+   * security gateway, so a daemon that loses the race exits before any gateway exists. The daemon's
+   * own stop()/failure paths still release it. When absent (tests, embedders), startDaemon acquires
+   * its own lock as before.
+   */
+  singletonLock?: SingletonLock;
   /**
    * Manifest loading and verification.
    * When provided, startDaemon() calls manifestProvider.loadAndVerify() at startup.

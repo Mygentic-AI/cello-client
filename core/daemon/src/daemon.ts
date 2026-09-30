@@ -137,7 +137,7 @@ import { extractErrorMessage } from "./error-message.js";
  */
 export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   await mkdir(config.celloDir, { recursive: true });
-  const singletonLock = acquireSingletonLock(config.celloDir, config.logger);
+  const singletonLock = config.singletonLock ?? acquireSingletonLock(config.celloDir, config.logger);
   try {
     return await startDaemonHoldingLock(config, singletonLock);
   } catch (err: unknown) {

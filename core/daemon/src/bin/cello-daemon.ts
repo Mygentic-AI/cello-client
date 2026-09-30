@@ -22,7 +22,7 @@ import { RandomizedPollScheduler } from "../manifest-poll-scheduler.js";
 // EXIT_ALREADY_RUNNING is distinct from 1 (generic startup failure) so a caller can tell "lost the
 // race" from "broken" — connectOrStart relies on exactly that distinction, so the constant is shared
 // rather than written down twice.
-import { DaemonAlreadyRunningError, EXIT_ALREADY_RUNNING } from "../singleton-lock.js";
+import { DaemonAlreadyRunningError, EXIT_ALREADY_RUNNING, acquireSingletonLock, type SingletonLock } from "../singleton-lock.js";
 import type { Logger } from "../types.js";
 import { createCollapsingLogger } from "../log-collapse.js";
 import { extractErrorMessage } from "../error-message.js";
@@ -205,6 +205,22 @@ async function main(): Promise<void> {
   // node pubkeys in it. Both dialers (keystone + per-agent) receive the verifier via startDaemon.
   const manifest = buildManifestDeps(logger);
 
+  // 084-GATEWAYSOCK Part B: TAKE THE SINGLETON LOCK BEFORE SPAWNING THE GATEWAY.
+  //
+  // The gateway used to be spawned first, in startSecurityLayer, and the lock was taken later inside
+  // startDaemon. So a daemon that would LOSE the race started its own gateway before it knew — and
+  // that gateway deleted the winner's socket on the way in and again on the way out, leaving the
+  // winner alive with nothing at its path (every send fails gateway_unavailable until a restart).
+  //
+  // Acquiring here means a losing daemon throws DaemonAlreadyRunningError (handled in main().catch,
+  // which exits EXIT_ALREADY_RUNNING) BEFORE any gateway exists, leaving every file the winner owns
+  // untouched. The DB key file — the reason the sidecar is spawned early (see startSecurityLayer) —
+  // is still created inside startSecurityLayer, unchanged; only the lock moved earlier. The held
+  // lock is handed to startDaemon, which adopts it rather than taking it a second time, and the
+  // daemon's own stop()/failure paths release it.
+  mkdirSync(celloDir, { recursive: true, mode: 0o700 });
+  const singletonLock: SingletonLock = acquireSingletonLock(celloDir, logger);
+
   // D-2: the security and governance layer runs ENFORCING in the shipped daemon. This is the line
   // whose absence made every guard M9 built inert.
   const security: { client: LocalSidecarGatewayClient; sidecar: SpawnedGateway | undefined } =
@@ -314,6 +330,9 @@ async function main(): Promise<void> {
     maxConnections: MAX_CONNECTIONS,
     version,
     logger,
+    // 084-GATEWAYSOCK Part B: startDaemon adopts the lock we already hold (taken above, before the
+    // gateway spawned) instead of acquiring a second one.
+    singletonLock,
     directoryEndpointResolver,
     ...manifest,
     securityGateway: security.client,

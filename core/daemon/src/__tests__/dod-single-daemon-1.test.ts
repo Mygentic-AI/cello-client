@@ -21,11 +21,13 @@ import { join } from "node:path";
 import { connectOrStart } from "../connect-or-start.js";
 import { connectToDaemon } from "../ipc-client.js";
 import { SINGLETON_LOCK_FILENAME, acquireSingletonLock } from "../singleton-lock.js";
+import { LocalSidecarGatewayClient } from "@cello-protocol/gateway";
 import type { Logger } from "../types.js";
 import {
   spawnRealDaemon,
   makeCelloDir,
   cleanupCelloDir,
+  logEvents,
   type SpawnedDaemon,
 } from "./helpers/spawn-real-daemon.js";
 
@@ -277,5 +279,62 @@ describe("DOD-SINGLE-DAEMON-1 — a second daemon cannot start", () => {
     await daemon.waitForEvent("daemon.started");
     const lock = JSON.parse(await readFile(lockPath, "utf-8")) as { pid: number };
     expect(lock.pid).toBe(daemon.pid);
+  }, 90_000);
+
+  it("084-GATEWAYSOCK Part B: a daemon that loses the race never spawns a gateway; the winner's socket answers", async () => {
+    // The reported break: three near-simultaneous `cello login`s. A loser started its own security
+    // gateway BEFORE its daemon discovered it had lost the singleton lock; that gateway deleted the
+    // WINNER's socket and left the winner alive with nothing at its path. Every send then failed
+    // gateway_unavailable until a manual restart.
+    //
+    // Part B moves the lock acquisition AHEAD of the gateway spawn, so a losing daemon exits with
+    // EXIT_ALREADY_RUNNING before any gateway exists. The proof is behavioural: across ALL three
+    // outputs exactly ONE gateway is ever spawned, and the winner's gateway.sock still answers.
+    celloDir = await makeCelloDir();
+    const gwSockPath = join(celloDir, "gateway.sock");
+
+    const racers = [spawnTracked(celloDir), spawnTracked(celloDir), spawnTracked(celloDir)];
+
+    // Let the field settle: two lose, one serves.
+    const deadline = Date.now() + 45_000;
+    let survivors: SpawnedDaemon[] = [];
+    let losers: SpawnedDaemon[] = [];
+    while (Date.now() < deadline) {
+      survivors = racers.filter((d) => d.child.exitCode === null);
+      losers = racers.filter((d) => d.child.exitCode !== null);
+      if (losers.length === 2 && survivors.length === 1) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(survivors).toHaveLength(1);
+    expect(losers).toHaveLength(2);
+
+    const winner = survivors[0];
+    await winner.waitForEvent("daemon.started");
+
+    // The losers refused for the right reason and BEFORE any gateway existed.
+    for (const loser of losers) {
+      expect(loser.child.exitCode).toBe(3);
+      expect(logEvents(loser.output(), "security.gateway.spawned")).toHaveLength(0);
+    }
+
+    // Exactly one gateway was ever spawned across the whole race — the winner's.
+    const spawnedTotal = racers.reduce((n, d) => n + logEvents(d.output(), "security.gateway.spawned").length, 0);
+    expect(spawnedTotal).toBe(1);
+
+    // The winner's gateway is intact and ANSWERS — not deleted out from under it.
+    expect(await exists(gwSockPath)).toBe(true);
+    const gwClient = new LocalSidecarGatewayClient({ socketPath: gwSockPath, deadlineMs: 5_000 });
+    try {
+      const verdict = await gwClient.screenOutbound(new TextEncoder().encode("ping"), {
+        direction: "outbound",
+        agentName: "singleton-test-agent",
+        sessionId: "ab".repeat(16),
+        correlationId: "gatewaysock-084",
+      });
+      expect(verdict.disposition).toBeDefined();
+      expect(verdict.reason).not.toBe("gateway_unavailable");
+    } finally {
+      await gwClient.close();
+    }
   }, 90_000);
 });
