@@ -348,7 +348,7 @@ export async function verifyManifest(
 
 const MLDSA_PUBKEY_HEX = new RegExp("^[0-9a-f]{" + ML_DSA_PUBLIC_KEY_BYTES * 2 + "}$");
 const ED25519_PUBKEY_HEX = /^[0-9a-f]{64}$/;
-const MLKEM_INTAKE_KEY_HEX =new RegExp("^[0-9a-f]{" + ML_KEM_PUBLIC_KEY_BYTES * 2 + "}$");
+const MLKEM_INTAKE_KEY_HEX = new RegExp("^[0-9a-f]{" + ML_KEM_PUBLIC_KEY_BYTES * 2 + "}$");
 
 // ─── Internal helpers ────────────────────────────────────────────────────────
 
