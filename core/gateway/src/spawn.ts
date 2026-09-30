@@ -119,7 +119,7 @@ export async function spawnGatewaySidecar(opts: SpawnGatewayOptions): Promise<Sp
         // all is a different fact from one reporting Layer 2 disabled, and calling it `off` would
         // invent a state nobody observed.
         // The reason after `off:` has spaces, so read up to the next field, not the next space.
-        const m = /layer2=(.*?) screener=/.exec(text) ?? /layer2=(\S+)/.exec(text);
+        const m = /layer2=(.*?) screener=/.exec(text);
         layer2 = m?.[1] ?? "unreported";
         for (const line of text.split("\n")) {
           if (!line.startsWith(`${GATEWAY_SELFCHECK_TOKEN} `)) continue;
