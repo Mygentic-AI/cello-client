@@ -192,9 +192,9 @@ each flagged item. Nothing reaches the peer until you do.
 
 **What runs, and what does not.** The deterministic sanitizer and the pattern matcher are live and
 enforcing. The layer that judges *meaning* — the one that would catch a prompt injection phrased in
-a way no pattern anticipates — loads only if a classifier model is present at
-`~/.cello/gateway-model`, and CELLO does not install one. The gateway says which it got on its
-startup line: `layer2=active`, or `layer2=off:<reason>`. **Read that line before relying on
+a way no pattern anticipates — loads only if the classifier model is installed
+(`cello screener install`, opt-in, about 241 MB). The gateway says which it got on its
+startup line: `layer2=active:native` or `layer2=active:wasm` (the classifier passed its startup self-check on that backend), or `layer2=off:<reason>`. **Read that line before relying on
 screening to stop a determined attacker.**
 
 (This paragraph has now been wrong in both directions. It first said screening was "planned, not yet

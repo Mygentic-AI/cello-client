@@ -67,7 +67,8 @@ server.tool("cello_agents", "List all agents with state from this connection's p
 //   Layer 2, the one that judges MEANING — OFF on any ordinary install. It loads only if an ONNX
 //   classifier is present at ~/.cello/gateway-model (`cello-gateway.ts`, `loadInjectionClassifier`),
 //   and nothing ships one. The gateway announces which it got on its ready line as
-//   `layer2=active` or `layer2=off:<reason>`; on a normal install it is the second.
+//   `layer2=active:native`, `layer2=active:wasm` (native failed its startup self-check), or
+//   `layer2=off:<reason>`; on a normal install it is the last.
 //
 // So "message content is screened" is TRUE, and "prompt-injection defense is fully active" is NOT.
 // Anything an operator reads — a tool description on this file, skill prose, status output — must

@@ -26,6 +26,7 @@ import { DaemonAlreadyRunningError, EXIT_ALREADY_RUNNING } from "../singleton-lo
 import type { Logger } from "../types.js";
 import { createCollapsingLogger } from "../log-collapse.js";
 import { extractErrorMessage } from "../error-message.js";
+import { recordGatewayLayer2 } from "../screening-status.js";
 
 const MAX_CONNECTIONS = 16;
 
@@ -122,6 +123,18 @@ async function startSecurityLayer(correlationId?: string): Promise<{ client: Loc
       state: sidecar.layer2,
       ...(correlationId !== undefined ? { correlationId } : {}),
     });
+    // 080-SCREENERCPU: which backend proved it scores correctly on this CPU, in daemon.log — the
+    // gateway's own stderr is only surfaced when its spawn fails.
+    for (const check of sidecar.selfChecks) {
+      logger.info("security.gateway.layer2.selfcheck", { ...check, ...(correlationId !== undefined ? { correlationId } : {}) });
+    }
+    const backend = sidecar.layer2.startsWith("active:") ? sidecar.layer2.slice(7) : "off";
+    logger.info("security.gateway.layer2.backend", {
+      backend,
+      reason: backend === "off" ? sidecar.layer2.replace(/^off:/, "") : `${backend} passed its self-check`,
+      ...(correlationId !== undefined ? { correlationId } : {}),
+    });
+    recordGatewayLayer2(sidecar.layer2);
     sidecar.process.once("exit", (code, signal) => {
       // No auto-restart (M9B-D14). Every subsequent screen fails closed with a real cause; this
       // line is how the operator learns the screening process died rather than inferring it from

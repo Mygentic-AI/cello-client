@@ -91,8 +91,10 @@ describe("SCREENINSTALL: screener state", () => {
       const text = describeScreenerState({ state, revision: SCREENER_MODEL.revision, model: { filesPresent: 0, filesExpected: 5, verified: false }, runtimePresent: false, missing: ["model"], problem: "x" });
       expect(text, state).toContain(needle);
     }
-    const ready = describeScreenerState({ state: "ready", revision: SCREENER_MODEL.revision, model: { filesPresent: 5, filesExpected: 5, verified: true }, runtimePresent: true, missing: [], problem: undefined });
-    expect(ready).toMatch(/2 of 2|both layers/i);
+    const readyStatus = { state: "ready", revision: SCREENER_MODEL.revision, model: { filesPresent: 5, filesExpected: 5, verified: true }, runtimePresent: true, missing: [], problem: undefined } as const;
+    // 080-SCREENERCPU: "2 of 2" only once the gateway's self-check passed; verified files alone are not enough.
+    expect(describeScreenerState({ ...readyStatus, missing: [] }, "active:native")).toMatch(/2 of 2/);
+    expect(describeScreenerState({ ...readyStatus, missing: [] })).not.toMatch(/2 of 2/);
   });
 });
 

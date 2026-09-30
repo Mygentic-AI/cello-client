@@ -6,7 +6,7 @@
  * gateway's startup line carries. Three surfaces computing this three ways is how "installed" came
  * to mean three different things.
  */
-import { screenerState, screenerModelDir, runtimeAvailable, describeScreenerState } from "@cello-protocol/gateway";
+import { screenerState, screenerModelDir, runtimeAvailable, describeScreenerState, type ScreenerStatus } from "@cello-protocol/gateway";
 import type { ScreeningStatusInfo } from "./types.js";
 import { extractErrorMessage } from "./error-message.js";
 
@@ -23,6 +23,27 @@ const CACHE_MS = 60_000;
 let cached: { at: number; value: ScreeningStatusInfo | undefined } | undefined;
 
 /**
+ * What the running gateway reported about Layer 2 on its READY line (080-SCREENERCPU):
+ * `active:native`, `active:wasm` or `off:<reason>`. Files on disk prove the bytes; only the
+ * gateway's self-check proves the scores, so the summary is built from this.
+ */
+let gatewayLayer2: string | undefined;
+
+/** Called by the daemon each time a gateway sidecar reports ready. */
+export function recordGatewayLayer2(layer2: string): void {
+  gatewayLayer2 = layer2;
+  cached = undefined;
+}
+
+/** The status block from the file state AND the gateway's report. Pure, so T5 needs no sidecar. */
+export function screeningInfoFrom(s: ScreenerStatus, layer2: string | undefined): ScreeningStatusInfo {
+  if (s.state === "ready" && layer2?.startsWith("off:")) {
+    return { classifier: "broken", summary: describeScreenerState(s, layer2), problem: layer2.slice(4) };
+  }
+  return { classifier: s.state, summary: describeScreenerState(s, layer2), ...(s.problem ? { problem: s.problem } : {}) };
+}
+
+/**
  * Never throws: a screener check that could break `cello status` would be a worse defect than the
  * gap it reports. A failure is REPORTED as `unknown` with its cause, never omitted.
  *
@@ -32,7 +53,7 @@ export async function screeningStatus(): Promise<ScreeningStatusInfo> {
   if (cached && now - cached.at < CACHE_MS && cached.value) return cached.value;
   try {
     const s = await screenerState({ dir: screenerModelDir(), runtimePresent: await runtimeAvailable() });
-    const value = { classifier: s.state, summary: describeScreenerState(s), ...(s.problem ? { problem: s.problem } : {}) };
+    const value = screeningInfoFrom(s, gatewayLayer2);
     cached = { at: now, value };
     return value;
   } catch (err) {
@@ -58,6 +79,10 @@ export async function screeningSessionNoticeFrom(
 ): Promise<string | undefined> {
   const s = await read();
   if (!s || s.classifier === "ready") return undefined;
+  if (s.classifier === "broken" && s.problem?.includes("self-check")) {
+    // No --repair: reinstalling the same verified files cannot change what this CPU computes.
+    return `Screening: the classifier gives wrong scores on this machine and did NOT judge this content: ${s.problem}. The pattern layer still ran.`;
+  }
   if (s.classifier === "broken") {
     return `Screening: the classifier is BROKEN and did NOT judge this content: ${s.problem ?? "unknown fault"}. Fix it with: cello screener install --repair`;
   }

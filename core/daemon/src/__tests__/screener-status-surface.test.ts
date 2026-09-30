@@ -10,13 +10,13 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, writeFile, mkdir, truncate } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import { SCREENER_MODEL, localPathOf, screenerState, describeScreenerState } from "@cello-protocol/gateway";
+import { SCREENER_MODEL, localPathOf, screenerState } from "@cello-protocol/gateway";
 import type { ScreeningStatusInfo } from "../types.js";
-import { screeningSessionNoticeFrom, screeningStatus } from "../screening-status.js";
+import { screeningSessionNoticeFrom, screeningStatus, screeningInfoFrom } from "../screening-status.js";
 
-/** Exactly what `daemon-status-report.ts` builds, kept in one place so the shape is asserted once. */
+/** The shipped mapping, with the gateway having reported a passing native self-check. */
 function toScreeningInfo(s: Awaited<ReturnType<typeof screenerState>>): ScreeningStatusInfo {
-  return { classifier: s.state, summary: describeScreenerState(s), ...(s.problem ? { problem: s.problem } : {}) };
+  return screeningInfoFrom(s, "active:native");
 }
 
 describe("SCREENINSTALL: cello_status screening block", () => {

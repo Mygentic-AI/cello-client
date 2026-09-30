@@ -79,7 +79,9 @@ describe("SCREENINSTALL: cello screener", () => {
       });
       expect(runtimeInstalled).toBe(true);
       expect(r.exitCode).toBe(0);
-      expect(r.stdout).toContain("2 of 2 layers");
+      // 080-SCREENERCPU: an install proves the bytes, not the scores — "2 of 2" is the gateway's to claim.
+      expect(r.stdout).toContain("installed and verified");
+      expect(r.stdout).not.toContain("2 of 2");
     });
 
     it("is a no-op when everything is already installed and verified", async () => {
