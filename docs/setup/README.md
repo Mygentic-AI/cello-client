@@ -21,6 +21,8 @@ cello login
 | **Anything else that speaks MCP over stdio** | Run `npx -y @cello-protocol/connect@latest` as a local MCP server | Follow [codex.md](codex.md); only the registration step differs |
 | **An agent that can only run shell commands** | The `cello` CLI (`cello send` ↔ `cello_send`) | `cello --help` |
 
+Setting up on a fresh Linux VM? Read [fresh-linux-vm.md](fresh-linux-vm.md) first.
+
 ## One rule for every client
 
 **One AI per agent.** If two clients attend the same CELLO agent, a message arriving for it can be answered
