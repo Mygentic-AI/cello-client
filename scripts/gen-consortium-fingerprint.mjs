@@ -5,7 +5,7 @@
  * The fingerprint an operator compares against has to live somewhere a stranger can read without
  * installing anything, which means copies outside the compiled constant. Copies are exactly the
  * hazard this order is about, so they are GENERATED here from `BUNDLED_CONSORTIUM_ROOT_KEYS` and
- * never hand-edited, and `dod-m15-consortium-fingerprint-1.test.ts` fails the moment one of them
+ * `BUNDLED_CONSORTIUM_ROOT_KEYS_PQ` (M9D 004: v2 covers both officer sets) and never hand-edited, and `dod-m15-consortium-fingerprint-1.test.ts` fails the moment one of them
  * stops matching the constant the verifier enforces.
  *
  * Run it after any officer-key rotation, in the same commit as the constant:
@@ -33,28 +33,42 @@ const END = "<!-- END CONSORTIUM FINGERPRINT -->";
  */
 function readConstants() {
   const src = readFileSync(SOURCE, "utf8");
-  const keysBlock = /BUNDLED_CONSORTIUM_ROOT_KEYS:\s*readonly string\[\]\s*=\s*\[([^\]]*)\]/.exec(src);
+  const block = (name) => new RegExp(`${name}:\\s*readonly string\\[\\]\\s*=\\s*\\[([^\\]]*)\\]`).exec(src);
+  const keysBlock = block("BUNDLED_CONSORTIUM_ROOT_KEYS");
+  const pqBlock = block("BUNDLED_CONSORTIUM_ROOT_KEYS_PQ");
   const thresholdMatch = /BUNDLED_CONSORTIUM_THRESHOLD\s*=\s*(\d+)/.exec(src);
-  if (!keysBlock || !thresholdMatch) {
-    throw new Error(`could not read the root keys / threshold out of ${SOURCE} — did the constants move?`);
+  const pqThresholdMatch = /BUNDLED_CONSORTIUM_PQ_THRESHOLD\s*=\s*(\d+)/.exec(src);
+  if (!keysBlock || !pqBlock || !thresholdMatch || !pqThresholdMatch) {
+    throw new Error(`could not read the root keys / thresholds out of ${SOURCE} — did the constants move?`);
   }
-  const rootKeys = [...keysBlock[1].matchAll(/"([0-9a-fA-F]{64})"/g)].map((m) => m[1]);
-  if (rootKeys.length === 0) throw new Error("no root keys parsed — refusing to publish an empty fingerprint");
-  return { rootKeys, threshold: Number.parseInt(thresholdMatch[1], 10) };
+  // Each key is one or more string literals joined by `+` (the 2,624-hex ML-DSA keys are wrapped).
+  const keysOf = (body) => body.split(",").map((k) => k.replace(/["+\s]/g, "")).filter((k) => k.length > 0);
+  const rootKeys = keysOf(keysBlock[1]);
+  const rootKeysPq = keysOf(pqBlock[1]);
+  if (rootKeys.length === 0 || rootKeysPq.length === 0) {
+    throw new Error("no root keys parsed for one of the sets — refusing to publish a fingerprint");
+  }
+  for (const k of rootKeys) if (!/^[0-9a-f]{64}$/i.test(k)) throw new Error(`bad Ed25519 root ${k}`);
+  for (const k of rootKeysPq) if (!/^[0-9a-f]{2624}$/i.test(k)) throw new Error(`bad ML-DSA root ${k.slice(0, 16)}…`);
+  return {
+    rootKeys, threshold: Number.parseInt(thresholdMatch[1], 10),
+    rootKeysPq, pqThreshold: Number.parseInt(pqThresholdMatch[1], 10),
+  };
 }
 
 /** Must stay byte-identical to `consortiumFingerprintPreimage` in core/daemon/src. */
-function preimage(rootKeys, threshold) {
-  const keys = [...rootKeys].map((k) => k.trim().toLowerCase()).sort();
-  return ["cello-consortium-root-v1", ...keys, String(threshold)].join("\n") + "\n";
+const norm = (ks) => [...ks].map((k) => k.trim().toLowerCase()).sort();
+function preimage({ rootKeys, threshold, rootKeysPq, pqThreshold }) {
+  return ["cello-consortium-root-v2", ...norm(rootKeys), String(threshold), ...norm(rootKeysPq), String(pqThreshold)].join("\n") + "\n";
 }
 
-const { rootKeys, threshold } = readConstants();
-const full = createHash("sha256").update(preimage(rootKeys, threshold), "utf8").digest("hex");
+const roots = readConstants();
+const { rootKeys, threshold, rootKeysPq, pqThreshold } = roots;
+const full = createHash("sha256").update(preimage(roots), "utf8").digest("hex");
 const short = full.slice(0, 16).match(/.{4}/g).join("-");
 
 const recompute =
-  `printf 'cello-consortium-root-v1\\n${[...rootKeys].map((k) => k.toLowerCase()).sort().join("\\n")}\\n${threshold}\\n' | shasum -a 256`;
+  `printf 'cello-consortium-root-v2\\n${norm(rootKeys).join("\\n")}\\n${threshold}\\n${norm(rootKeysPq).join("\\n")}\\n${pqThreshold}\\n' | shasum -a 256`;
 
 writeFileSync(
   join(REPO_ROOT, "consortium-fingerprint.json"),
@@ -64,7 +78,9 @@ writeFileSync(
       fingerprint_full: full,
       root_keys: rootKeys,
       threshold,
-      algorithm: "sha256 over the canonical preimage: the domain string, the root keys lowercased and sorted, then the threshold, each on its own line and each newline-terminated",
+      root_keys_pq: rootKeysPq,
+      pq_threshold: pqThreshold,
+      algorithm: "sha256 over the canonical preimage: the domain string, the Ed25519 root keys lowercased and sorted, their threshold, the ML-DSA root keys lowercased and sorted, their threshold — each on its own line and each newline-terminated",
       recompute,
       generated_by: "scripts/gen-consortium-fingerprint.mjs",
     },
