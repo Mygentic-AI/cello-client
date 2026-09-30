@@ -1,7 +1,7 @@
 /**
  * The CELLO MCP tool registry — ONE list of tools, registered by every entrypoint.
  *
- * `bin/cello-mcp.ts` (stdio) and `bin/cello-mcp-http.ts` (Streamable HTTP) both call
+ * `bin/cello-mcp.ts` (stdio) and `@cello-protocol/mcp-http` (Streamable HTTP, via `lib.ts`) both call
  * `registerCelloTools`, so a tool's name, description and parameter schema exist exactly once and
  * the two surfaces cannot drift. Every handler proxies to the daemon over `proxy.call`; nothing here
  * holds key material or state.

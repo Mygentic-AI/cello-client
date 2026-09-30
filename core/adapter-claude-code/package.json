@@ -10,8 +10,14 @@
     "access": "public"
   },
   "bin": {
-    "cello-mcp": "./dist/bin/cello-mcp.js",
-    "cello-mcp-http": "./dist/bin/cello-mcp-http.js"
+    "cello-mcp": "./dist/bin/cello-mcp.js"
+  },
+  "exports": {
+    "./lib": {
+      "types": "./dist/lib.d.ts",
+      "import": "./dist/lib.js"
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "dist/",
