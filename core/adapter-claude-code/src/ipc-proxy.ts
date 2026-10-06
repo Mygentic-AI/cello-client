@@ -19,6 +19,8 @@
  */
 
 import { createConnection, type Socket } from "node:net";
+import { dirname } from "node:path";
+import { getDaemonIpcEndpoint } from "./ipc-endpoint.js";
 
 export interface IpcProxyResult {
   [key: string]: unknown;
@@ -92,7 +94,9 @@ export class IpcProxy {
   #currentAgent: string | null = null;
 
   constructor(socketPath: string, opts: IpcProxyOptions = {}) {
-    this.#socketPath = socketPath;
+    this.#socketPath = process.platform === "win32" && !socketPath.startsWith("\\\\.\\pipe\\")
+      ? getDaemonIpcEndpoint(dirname(socketPath))
+      : socketPath;
     this.#clientType = opts.clientType;
   }
 

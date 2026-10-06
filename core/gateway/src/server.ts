@@ -110,11 +110,17 @@ async function probeExistingSocket(socketPath: string, timeoutMs: number): Promi
   });
 }
 
+import { dirname } from "node:path";
+import { getGatewayIpcEndpoint } from "./ipc-endpoint.js";
+
 /** Start the gateway server on its socket. Resolves once it is listening. */
 export async function createGatewayServer(opts: GatewayServerOptions): Promise<GatewayServerHandle> {
   const screen = opts.screen ?? ALLOW_ALL;
   const logger = opts.logger ?? NOOP_LOGGER;
-  const { socketPath } = opts;
+  const rawPath = opts.socketPath;
+  const socketPath = process.platform === "win32" && !rawPath.startsWith("\\\\.\\pipe\\")
+    ? getGatewayIpcEndpoint(dirname(rawPath))
+    : rawPath;
 
   // 084-GATEWAYSOCK: never delete a socket another gateway is LIVE on. A stale file from a crashed
   // prior run makes listen() fail with EADDRINUSE and must be removed; a live peer's socket must be

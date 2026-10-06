@@ -30,7 +30,9 @@
 
 import { createServer, type Server, type Socket } from "node:net";
 import { chmod, stat, unlink } from "node:fs/promises";
+import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
+import { getDaemonIpcEndpoint } from "./ipc-endpoint.js";
 import type { Logger, IpcRequest, IpcResponse, IpcNotification } from "./types.js";
 import { extractErrorMessage } from "./error-message.js";
 import { DOCUMENTS_FLAG_ENV } from "./document-flag.js";
@@ -82,7 +84,13 @@ export function createIpcServer(
    */
   handlers: HandlerLookup,
 ): IpcServer {
-  const { socketPath, maxConnections, logger } = config;
+  const { maxConnections, logger } = config;
+  const rawPath = config.socketPath;
+  console.log("createIpcServer config.socketPath:", rawPath, "process.platform:", process.platform);
+  const socketPath = process.platform === "win32" && !rawPath.startsWith("\\\\.\\pipe\\")
+    ? getDaemonIpcEndpoint(dirname(rawPath))
+    : rawPath;
+  console.log("createIpcServer resolved socketPath:", socketPath);
   let server: Server | null = null;
   const connections = new Map<string, ActiveConnection>();
   let stopping = false;

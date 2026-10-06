@@ -23,6 +23,9 @@ import { withProvenance } from "./screen/affordance.js";
 import { failClosedVerdict, GOVERNANCE_TIMEOUT, type GatewayMode, type ScreenContext, type ScreenVerdict, type SecurityGatewayClient } from "./types.js";
 import type { GatewayLogger } from "./server.js";
 
+import { dirname } from "node:path";
+import { getGatewayIpcEndpoint } from "./ipc-endpoint.js";
+
 const NOOP_LOGGER: GatewayLogger = { info() {}, warn() {}, error() {} };
 const DEFAULT_DEADLINE_MS = 5_000;
 
@@ -73,7 +76,9 @@ export class LocalSidecarGatewayClient implements SecurityGatewayClient {
   #unavailable: { reason: string; guidance: string } | undefined;
 
   constructor(opts: LocalSidecarGatewayClientOptions) {
-    this.#socketPath = opts.socketPath;
+    this.#socketPath = process.platform === "win32" && !opts.socketPath.startsWith("\\\\.\\pipe\\")
+      ? getGatewayIpcEndpoint(dirname(opts.socketPath))
+      : opts.socketPath;
     this.#deadlineMs = opts.deadlineMs ?? DEFAULT_DEADLINE_MS;
     this.#logger = opts.logger ?? NOOP_LOGGER;
   }

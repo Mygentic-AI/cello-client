@@ -15,7 +15,9 @@
  */
 
 import { createConnection, type Socket } from "node:net";
+import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
+import { getDaemonIpcEndpoint } from "./ipc-endpoint.js";
 import type { IpcRequest, IpcResponse, IpcResponseError, IpcNotification } from "./types.js";
 import { extractErrorMessage } from "./error-message.js";
 
@@ -42,8 +44,11 @@ export interface IpcClientOptions {
 }
 
 export function connectToDaemon(socketPath: string, opts?: IpcClientOptions): Promise<IpcClient> {
+  const effectivePath = process.platform === "win32" && !socketPath.startsWith("\\\\.\\pipe\\")
+    ? getDaemonIpcEndpoint(dirname(socketPath))
+    : socketPath;
   return new Promise<IpcClient>((resolve, reject) => {
-    const socket: Socket = createConnection(socketPath);
+    const socket: Socket = createConnection(effectivePath);
     const pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
     let buffer = "";
     let notificationHandler: ((notification: IpcNotification) => void) | null = null;
