@@ -10,6 +10,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createWriteStream, mkdirSync } from "node:fs";
+import { getDaemonIpcEndpoint } from "../ipc-endpoint.js";
 import { IpcProxy } from "../ipc-proxy.js";
 import { forwardDaemonNotifications } from "../channel-forward.js";
 import { summarizeInboundFrame } from "../frame-trace.js";
@@ -73,7 +74,7 @@ process.stderr.write = (
 // Connect to daemon IPC socket under the same CELLO_DIR resolved above — otherwise an
 // operator (or test) running the daemon under a non-default home would have cello-mcp
 // look in ~/.cello and fail to find the socket.
-const socketPath = join(celloDir, "daemon.sock");
+const socketPath = getDaemonIpcEndpoint(celloDir);
 // RECONNECT-001: clientType is handed to the proxy so it can replay `ipc.connect` after a daemon
 // restart. Without it the reconnected socket has no registered client and no current agent.
 const proxy = new IpcProxy(socketPath, { clientType: "mcp" });

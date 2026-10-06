@@ -65,10 +65,12 @@ const stdoutLogger: Logger = {
  * one sentence, and eleven hours in which the loop producing it was invisible inside its own
  * output.
  */
+import { getDaemonIpcEndpoint, getGatewayIpcEndpoint } from "../ipc-endpoint.js";
+
 const logger: Logger = createCollapsingLogger(stdoutLogger);
 
 const celloDir = process.env.CELLO_DIR || join(homedir(), ".cello");
-const socketPath = join(celloDir, "daemon.sock");
+const socketPath = getDaemonIpcEndpoint(celloDir);
 const lockFilePath = join(celloDir, "daemon.lock");
 const version = process.env.CELLO_VERSION || "0.0.1";
 
@@ -87,7 +89,7 @@ const version = process.env.CELLO_VERSION || "0.0.1";
  * silent downgrade to passthrough is the original bug wearing a hat.
  */
 async function startSecurityLayer(correlationId?: string): Promise<{ client: LocalSidecarGatewayClient; sidecar: SpawnedGateway | undefined }> {
-  const socketPath = join(celloDir, "gateway.sock");
+  const socketPath = getGatewayIpcEndpoint(celloDir);
   const client = new LocalSidecarGatewayClient({ socketPath, logger });
 
   // The sidecar opens the encrypted store at startup, but the key file is only created when the

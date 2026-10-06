@@ -13,8 +13,9 @@ import { mkdtemp, rm, rename, writeFile } from "node:fs/promises";
 import { existsSync, statSync } from "node:fs";
 import { createServer, type Server } from "node:net";
 import { spawn, type ChildProcess } from "node:child_process";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
+import { getGatewayIpcEndpoint } from "../ipc-endpoint.js";
 import { createGatewayServer, GatewaySocketInUseError, type GatewayServerHandle, type GatewayLogger } from "../server.js";
 import { LocalSidecarGatewayClient } from "../client.js";
 import type { ScreenContext } from "../types.js";
@@ -134,7 +135,8 @@ describe("gateway sidecar: server + LocalSidecarGatewayClient over a real Unix s
     // A raw server that accepts the connection and reads, but never writes a response frame.
     const blackhole = createServer((sock) => { sock.on("data", () => { /* swallow, never reply */ }); });
     rawServers.push(blackhole);
-    await new Promise<void>((res) => blackhole.listen(sockPath, () => res()));
+    const listenPath = process.platform === "win32" ? getGatewayIpcEndpoint(dirname(sockPath)) : sockPath;
+    await new Promise<void>((res) => blackhole.listen(listenPath, () => res()));
 
     const client = makeClient(200);
     const start = process.hrtime.bigint();
@@ -167,7 +169,7 @@ describe("gateway sidecar: server + LocalSidecarGatewayClient over a real Unix s
  * minutes. Two guards close it here: refuse to bind over a LIVE socket, and at stop delete only the
  * socket THIS instance created.
  */
-describe("084-GATEWAYSOCK: a gateway never deletes a socket it does not own", () => {
+describe.skipIf(process.platform === "win32")("084-GATEWAYSOCK: a gateway never deletes a socket it does not own", () => {
   let tempDir: string;
   let sockPath: string;
   const servers: GatewayServerHandle[] = [];

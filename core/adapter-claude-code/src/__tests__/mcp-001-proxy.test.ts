@@ -18,6 +18,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
+import { getDaemonIpcEndpoint } from "../ipc-endpoint.js";
 import { tmpdir } from "node:os";
 import { createServer, type Server } from "node:net";
 
@@ -91,7 +92,7 @@ describe("MCP-001 AC-010: ipc_deserialization_error recovery", () => {
     const { IpcProxy } = await import("../ipc-proxy.js");
 
     const tempDir = await mkdtemp(join(tmpdir(), "cello-mcp001-deser-"));
-    const socketPath = join(tempDir, "test.sock");
+    const socketPath = getDaemonIpcEndpoint(tempDir);
 
     let server: Server | null = null;
     try {
@@ -149,10 +150,13 @@ describe("MCP-001 AC-010: ipc_deserialization_error recovery", () => {
 describe("MCP-001 AC-020: binary behaviors", () => {
   // Resolve tsx binary from pnpm store (not hoisted to root node_modules/.bin/)
   function findTsx(): string {
+    const isWin = process.platform === "win32";
     const candidates = [
+      join(import.meta.dirname, "../../../../node_modules/.bin", isWin ? "tsx.cmd" : "tsx"),
+      join(import.meta.dirname, "../../../../node_modules/.pnpm/node_modules/.bin", isWin ? "tsx.cmd" : "tsx"),
+      join(import.meta.dirname, "../../../daemon/node_modules/.bin", isWin ? "tsx.cmd" : "tsx"),
       join(import.meta.dirname, "../../../../node_modules/.bin/tsx"),
       join(import.meta.dirname, "../../../../node_modules/.pnpm/node_modules/.bin/tsx"),
-      join(import.meta.dirname, "../../../daemon/node_modules/.bin/tsx"),
     ];
     for (const p of candidates) {
       if (existsSync(p)) return p;
@@ -169,6 +173,7 @@ describe("MCP-001 AC-020: binary behaviors", () => {
     const output = execFileSync(tsxPath, [binPath, "--version"], {
       encoding: "utf8",
       timeout: 10000,
+      shell: process.platform === "win32",
       env: { ...process.env, NODE_ENV: "test" },
     });
     expect(output.trim()).toBe(pkg.version);
@@ -192,6 +197,7 @@ describe("MCP-001 AC-020: binary behaviors", () => {
 
     const proc = spawn(tsxPath, [binPath], {
       env: { ...process.env, NODE_ENV: "test", HOME: "/tmp/cello-mcp001-noexist" },
+      shell: process.platform === "win32",
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stderr = "";
@@ -222,7 +228,7 @@ describe("DAEMON-004: IpcProxy forwards session_id verbatim (real proxy wire sha
     const { IpcProxy } = await import("../ipc-proxy.js");
 
     const tempDir = await mkdtemp(join(tmpdir(), "cello-d004-proxy-"));
-    const socketPath = join(tempDir, "test.sock");
+    const socketPath = getDaemonIpcEndpoint(tempDir);
     const capturedFrames: Array<{ method: string; params: Record<string, unknown> }> = [];
 
     let server: Server | null = null;
@@ -315,7 +321,7 @@ describe("MCP-001 AC-014: distinct reason codes", () => {
     const { IpcProxy } = await import("../ipc-proxy.js");
 
     const tempDir = await mkdtemp(join(tmpdir(), "cello-mcp001-lost-"));
-    const socketPath = join(tempDir, "test.sock");
+    const socketPath = getDaemonIpcEndpoint(tempDir);
 
     let server: Server | null = null;
     try {

@@ -13,9 +13,10 @@
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { createConnection, type Socket } from "node:net";
+import { getDaemonIpcEndpoint } from "../ipc-endpoint.js";
 import { createIpcServer, type IpcHandler } from "../ipc-server.js";
 import type { Logger } from "../types.js";
 
@@ -40,8 +41,11 @@ describe("ipc-server", () => {
   });
 
   function connectToSocket(socketPath: string): Promise<Socket> {
+    const effectivePath = process.platform === "win32" && !socketPath.startsWith("\\\\.\\pipe\\")
+      ? getDaemonIpcEndpoint(dirname(socketPath))
+      : socketPath;
     return new Promise((resolve, reject) => {
-      const socket = createConnection(socketPath);
+      const socket = createConnection(effectivePath);
       socket.on("connect", () => resolve(socket));
       socket.on("error", reject);
     });
@@ -70,9 +74,11 @@ describe("ipc-server", () => {
 
     await server.start();
     try {
-      const s = await stat(socketPath);
-      // Socket file should be owner-only
-      expect(s.mode & 0o777).toBe(0o600);
+      if (process.platform !== "win32") {
+        const s = await stat(socketPath);
+        // Socket file should be owner-only
+        expect(s.mode & 0o777).toBe(0o600);
+      }
     } finally {
       await server.stop();
     }

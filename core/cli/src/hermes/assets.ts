@@ -266,7 +266,11 @@ def check_cello_requirements() -> bool:
 
     Called on every gateway config load; the registry logs its own warning when
     requirements are unmet and the adapter is actually requested.
+    The CELLO Hermes bridge currently targets POSIX environments (Linux/macOS).
+    On Windows, operators connect agents via the CELLO CLI or MCP adapters (Claude Code, Desktop).
     """
+    if sys.platform == "win32":
+        return False
     return _cello_socket_path().exists()
 
 

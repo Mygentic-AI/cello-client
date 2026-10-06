@@ -9,6 +9,7 @@ import { DOWNLOAD_MB } from "./screener-commands.js";
 import {
   connectOrStart,
   connectToDaemon,
+  getDaemonIpcEndpoint,
   readLock,
   removeLock,
   // isProcessAlive may NEVER answer "does a daemon exist?" — a pid can be dead, or reused by an
@@ -308,7 +309,7 @@ export async function logout(
 
   // The socket path is DETERMINISTIC. `daemon.lock`'s copy of it is metadata, and metadata is not
   // to be trusted here.
-  const socketPath = join(celloDir, "daemon.sock");
+  const socketPath = getDaemonIpcEndpoint(celloDir);
   const lock = await readLock(lockFilePath);
 
   // DOD-SINGLE-DAEMON-1 (AC4) — the lock file does not get to decide whether a daemon exists.
@@ -751,7 +752,7 @@ export async function status(celloDir: string): Promise<CommandResult> {
   //
   // So ask the daemon itself first, at the DETERMINISTIC socket path — daemon.lock's copy is
   // metadata, and here there may be no lock file to read it from anyway.
-  const socketPath = lock?.socketPath ?? join(celloDir, "daemon.sock");
+  const socketPath = lock?.socketPath ?? getDaemonIpcEndpoint(celloDir);
 
   try {
     // Bounded, for the same reason `daemonGone` bounds its probe: connectToDaemon has no connect

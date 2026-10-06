@@ -22,6 +22,7 @@ import { openLogHandle } from "./log-rotate.js";
 import { join } from "node:path";
 import { readLock, removeLock } from "./lock-file.js";
 import { probeSingletonLock, SINGLETON_LOCK_FILENAME, EXIT_ALREADY_RUNNING } from "./singleton-lock.js";
+import { getDaemonIpcEndpoint } from "./ipc-endpoint.js";
 import { connectToDaemon, type IpcClient } from "./ipc-client.js";
 import type { Logger } from "./types.js";
 import { extractErrorMessage } from "./error-message.js";
@@ -45,7 +46,7 @@ export async function connectOrStart(
   const lockFilePath = join(celloDir, "daemon.lock");
   const lock = await readLock(lockFilePath);
   // The socket path is deterministic; the lock's copy is metadata, and it may be stale.
-  const socketPath = lock?.socketPath ?? join(celloDir, "daemon.sock");
+  const socketPath = lock?.socketPath ?? getDaemonIpcEndpoint(celloDir);
 
   // 1. If a daemon is answering, we are done. This is the overwhelmingly common path.
   try {
@@ -135,7 +136,7 @@ async function spawnDaemon(
   lockFilePath: string,
   logger: Logger,
 ): Promise<IpcClient> {
-  const socketPath = join(celloDir, "daemon.sock");
+  const socketPath = getDaemonIpcEndpoint(celloDir);
   const logPath = join(celloDir, "daemon.log");
 
   // The daemon's stdout/stderr go to a LOG FILE, never a pipe to this process.
