@@ -12,7 +12,7 @@
  * callers. This matches the owner-only access invariant enforced by POSIX `chmod 0o600`.
  */
 import { createHash } from "node:crypto";
-import { join, resolve, win32 } from "node:path";
+import { join, win32 } from "node:path";
 
 export function getDaemonIpcEndpoint(celloDir: string, platform: NodeJS.Platform = process.platform): string {
   if (platform === "win32") {

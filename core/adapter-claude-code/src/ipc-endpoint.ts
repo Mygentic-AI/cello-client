@@ -5,7 +5,7 @@
  * Windows systems use Windows Named Pipes (`\\\\.\\pipe\\cello-<hash>-daemon`).
  */
 import { createHash } from "node:crypto";
-import { join, resolve, win32 } from "node:path";
+import { join, win32 } from "node:path";
 
 export function getDaemonIpcEndpoint(celloDir: string, platform: NodeJS.Platform = process.platform): string {
   if (platform === "win32") {
