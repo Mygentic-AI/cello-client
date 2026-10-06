@@ -10,3 +10,4 @@ export { installDaemonGate } from "./daemon-gate.js";
 export { forwardDaemonNotifications } from "./channel-forward.js";
 export { logEvent, jsonText, type LogFn } from "./shim-log.js";
 export { IpcProxy, type IpcProxyOptions, type IpcProxyResult } from "./ipc-proxy.js";
+export { getDaemonIpcEndpoint } from "./ipc-endpoint.js";
