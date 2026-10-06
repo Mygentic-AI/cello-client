@@ -16,7 +16,7 @@ Then run the Hermes installer again.
 ## Ask `cello status`, not `systemctl`, whether the daemon is up
 
 `cello-daemon.service` is a oneshot unit. After you run `cello login` by hand, `systemctl is-active
-cello-daemon` reads `inactive` even while the daemon is running, so it cannot tell you whether the daemon
+cello-daemon` reads `inactive` even while the daemon is running, so it does not report whether the daemon
 is up. Use this instead:
 
 ```bash

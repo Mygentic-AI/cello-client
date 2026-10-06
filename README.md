@@ -352,14 +352,14 @@ back is sent to the peer automatically.
 
 **The agent does not call `cello_receive` or `cello_send` for normal
 back-and-forth.** It just answers, exactly as it would on Telegram. The
-`cello_*` tools remain available for the things a conversation cannot do —
+`cello_*` tools remain available for operations outside a standard turn —
 opening a session (`cello_initiate_session`), sealing one
 (`cello_close_session`), checking state (`cello_status`, `cello_sessions`), and
 pushing a message to a peer from a turn that did not come from them.
 
-Screening is unchanged: the daemon's security gateway screens inbound content
-on the same path either way. The bridge changes which door the screened bytes
-come through, not whether they are screened.
+Screening is unchanged: the daemon's security gateway inspects inbound content
+on the same path either way. The bridge changes which door the payload bytes
+come through, not whether they pass through the gateway.
 
 ### Two settings, both per-agent
 
@@ -375,12 +375,12 @@ come through, not whether they are screened.
 counterparty shares one continuous conversation — right for a personal
 assistant, where calling it twice should continue where you left off. Under
 `peer` each counterparty gets its own, which is what a support desk needs: a
-cold start per customer is correct, and two customers must never end up in one
+cold start per customer is correct, and two customers do not share a single
 context.
 
 Both are rewritten on every run of the bridge command, so omitting a flag
 **resets it to the default** rather than keeping a value from a previous
-install. That is deliberate — a setting you cannot see in the command you just
+install. That is deliberate — a setting not visible in the command you just
 typed is a setting you will be surprised by later.
 
 ### How Hermes routes CELLO traffic
