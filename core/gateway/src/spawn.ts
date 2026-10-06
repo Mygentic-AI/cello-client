@@ -7,6 +7,7 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
+import { fileURLToPath } from "node:url";
 
 /** Printed by the gateway bin on stdout once it is listening. */
 export const GATEWAY_READY_TOKEN = "GATEWAY_READY";
@@ -53,7 +54,7 @@ const DEFAULT_READY_TIMEOUT_MS = 60_000;
 
 function defaultEntryPath(): string {
   // dist/spawn.js → dist/bin/cello-gateway.js
-  return new URL("./bin/cello-gateway.js", import.meta.url).pathname;
+  return fileURLToPath(new URL("./bin/cello-gateway.js", import.meta.url));
 }
 
 export async function spawnGatewaySidecar(opts: SpawnGatewayOptions): Promise<SpawnedGateway> {

@@ -130,7 +130,9 @@ export async function createGatewayServer(opts: GatewayServerOptions): Promise<G
     logger.info("security.gateway.socket.in_use", { socketPath });
     throw new GatewaySocketInUseError(socketPath);
   }
-  await rm(socketPath, { force: true });
+  if (process.platform !== "win32") {
+    await rm(socketPath, { force: true });
+  }
 
   // Track live connections so stop() can close them. net.Server.close() stops accepting but
   // waits for EXISTING sockets to end; the daemon client holds its socket open for the daemon's
@@ -238,8 +240,12 @@ export async function createGatewayServer(opts: GatewayServerOptions): Promise<G
       for (const s of sockets) s.destroy();
       sockets.clear();
 
-      // Decide ownership BEFORE closing. server.close() unlinks the bound path UNCONDITIONALLY at
-      // the libuv level, so it may run ONLY while the file at our path is still the inode we created.
+      if (process.platform === "win32") {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        return;
+      }
+
+      // Decide ownership BEFORE closing.
       if (await socketStillOurs()) {
         await new Promise<void>((resolve) => server.close(() => resolve()));
         await rm(socketPath, { force: true });

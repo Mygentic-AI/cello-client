@@ -342,12 +342,14 @@ export function createIpcServer(
 
   return {
     async start(): Promise<void> {
-      // Remove stale socket file if it exists
-      try {
-        await unlink(socketPath);
-      } catch (err: unknown) {
-        if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-          throw err;
+      // Remove stale socket file if it exists (POSIX only — Named Pipes on Windows do not exist on disk)
+      if (process.platform !== "win32") {
+        try {
+          await unlink(socketPath);
+        } catch (err: unknown) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+            throw err;
+          }
         }
       }
 
@@ -362,21 +364,14 @@ export function createIpcServer(
         });
       });
 
-      // SI-001: Set socket permissions to owner-only
-      await chmod(socketPath, 0o600);
+      // SI-001: Set socket permissions to owner-only (POSIX only)
+      if (process.platform !== "win32") {
+        await chmod(socketPath, 0o600);
 
-      // DOD-DAEMON-CLEANUP-1 (AC2): remember WHICH socket we created, by identity — not merely that
-      // a file exists at this path. If another daemon later rebinds the path, its listen() replaces
-      // the file with a different inode, and stop() must be able to tell the two apart so it does not
-      // unlink a socket it does not own.
-      //
-      // No fallback here, deliberately. Swallowing this stat and leaving the identity unknown would
-      // make stop() treat our OWN socket as foreign: it would then never close the server, so the
-      // daemon would go on accepting IPC connections into a torn-down handler stack after stop()
-      // returned, and would leave its socket behind. A daemon that cannot identify the socket it just
-      // bound has no business coming up — and startup failure is already handled cleanly.
-      const created = await stat(socketPath);
-      createdSocket = { dev: created.dev, ino: created.ino };
+        // DOD-DAEMON-CLEANUP-1 (AC2): remember WHICH socket we created, by identity
+        const created = await stat(socketPath);
+        createdSocket = { dev: created.dev, ino: created.ino };
+      }
     },
 
     async stop(): Promise<void> {
@@ -421,35 +416,31 @@ export function createIpcServer(
       // is actually there now. If another daemon has since rebound this path, closing our server
       // deletes THEIR socket, and they are left alive, serving, and unreachable. Guarding our own
       // explicit unlink is not enough; the close would already have done the damage.
-      const ownership = await socketOwnership();
-
-      if (ownership === "foreign") {
-        // We must not close: that would unlink the healthy daemon's socket out from under it. Drop
-        // the handle from the event loop instead and let process exit reclaim the fd. The listening
-        // socket is already inert — its path was taken from it, so nothing can reach it. Leaking an
-        // unreachable fd for the last moments of a dying process is a trade we make happily against
-        // disarming a live peer.
-        logger.info("daemon.ipc.socket.not_ours", { socketPath, ourIno: createdSocket?.ino ?? null });
-        server.unref();
-      } else {
+      if (process.platform === "win32") {
         await new Promise<void>((resolve) => {
           server!.close(() => resolve());
         });
+      } else {
+        const ownership = await socketOwnership();
 
-        // close() normally unlinks the path for us. Re-check rather than assume: only remove the file
-        // if it is STILL the socket we created. Between the close and here, the singleton lock is
-        // still held (the daemon releases it after this returns), so no successor can have bound the
-        // path — but the cost of re-checking is one stat, and the cost of being wrong is the bug this
-        // whole unit exists to kill.
-        if (await socketOwnership() === "ours") {
-          try {
-            await unlink(socketPath);
-          } catch (err: unknown) {
-            if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-              logger.warn("daemon.ipc.socket.unlink.failed", {
-                socketPath,
-                error: extractErrorMessage(err),
-              });
+        if (ownership === "foreign") {
+          logger.info("daemon.ipc.socket.not_ours", { socketPath, ourIno: createdSocket?.ino ?? null });
+          server.unref();
+        } else {
+          await new Promise<void>((resolve) => {
+            server!.close(() => resolve());
+          });
+
+          if (await socketOwnership() === "ours") {
+            try {
+              await unlink(socketPath);
+            } catch (err: unknown) {
+              if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+                logger.warn("daemon.ipc.socket.unlink.failed", {
+                  socketPath,
+                  error: extractErrorMessage(err),
+                });
+              }
             }
           }
         }
