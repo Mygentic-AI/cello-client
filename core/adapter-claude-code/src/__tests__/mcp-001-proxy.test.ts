@@ -18,6 +18,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
+import { getDaemonIpcEndpoint } from "../ipc-endpoint.js";
 import { tmpdir } from "node:os";
 import { createServer, type Server } from "node:net";
 
@@ -91,7 +92,7 @@ describe("MCP-001 AC-010: ipc_deserialization_error recovery", () => {
     const { IpcProxy } = await import("../ipc-proxy.js");
 
     const tempDir = await mkdtemp(join(tmpdir(), "cello-mcp001-deser-"));
-    const socketPath = join(tempDir, "test.sock");
+    const socketPath = getDaemonIpcEndpoint(tempDir);
 
     let server: Server | null = null;
     try {
@@ -227,7 +228,7 @@ describe("DAEMON-004: IpcProxy forwards session_id verbatim (real proxy wire sha
     const { IpcProxy } = await import("../ipc-proxy.js");
 
     const tempDir = await mkdtemp(join(tmpdir(), "cello-d004-proxy-"));
-    const socketPath = join(tempDir, "test.sock");
+    const socketPath = getDaemonIpcEndpoint(tempDir);
     const capturedFrames: Array<{ method: string; params: Record<string, unknown> }> = [];
 
     let server: Server | null = null;
@@ -320,7 +321,7 @@ describe("MCP-001 AC-014: distinct reason codes", () => {
     const { IpcProxy } = await import("../ipc-proxy.js");
 
     const tempDir = await mkdtemp(join(tmpdir(), "cello-mcp001-lost-"));
-    const socketPath = join(tempDir, "test.sock");
+    const socketPath = getDaemonIpcEndpoint(tempDir);
 
     let server: Server | null = null;
     try {
