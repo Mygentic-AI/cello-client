@@ -5,11 +5,11 @@
  * Windows systems use Windows Named Pipes (`\\\\.\\pipe\\cello-<hash>-daemon`).
  */
 import { createHash } from "node:crypto";
-import { join, resolve } from "node:path";
+import { join, resolve, win32 } from "node:path";
 
 export function getDaemonIpcEndpoint(celloDir: string, platform: NodeJS.Platform = process.platform): string {
   if (platform === "win32") {
-    const canonical = resolve(celloDir).toLowerCase().replace(/\//g, "\\");
+    const canonical = win32.resolve(celloDir).toLowerCase().replace(/\//g, "\\");
     const hash = createHash("sha256").update(canonical).digest("hex").slice(0, 12);
     return `\\\\.\\pipe\\cello-${hash}-daemon`;
   }
