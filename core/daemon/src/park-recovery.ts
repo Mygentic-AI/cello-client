@@ -86,7 +86,6 @@ export interface ParkContext {
 function isPermanentIngestFailure(reason: string): boolean {
   switch (reason) {
     case "content_hash_mismatch":
-    case "content_hash_alg_unknown":
     case "session_committed":
     case "session_size_limit_exceeded":
     case "inbound_screen_blocked":
