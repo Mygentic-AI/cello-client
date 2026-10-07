@@ -259,7 +259,7 @@ describe("DOD-M15-AWAYSCOPE-1: an unattended agent says nothing into a session i
     snm.addContact("bob", caller, undefined, null, TIER.KNOWN);
 
     injectRef.inject!(await assignmentFrame(caller, bobPubkey));
-    await wait(5400); // AWAYSALT-1: a request-triggered ack waits out the salt agreement first
+    await wait(15400); // AWAYSALT-1: a request-triggered ack waits out the salt agreement first
 
     const { messages } = snm.readTranscript("bob", SID_HEX);
     const sent = messages.filter((m) => m.direction === "sent");

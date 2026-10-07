@@ -95,7 +95,7 @@ export const MAX_REFUSALS_PER_READ = 25;
  * the product for. This is only ever paid by a session that HAS an agreement outstanding: a
  * park-only session never starts one and never waits (constraint 5).
  */
-export const SALT_AGREEMENT_WAIT_MS = 5_000;
+export const SALT_AGREEMENT_WAIT_MS = 15_000;
 
 
 /**

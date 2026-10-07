@@ -11,6 +11,8 @@ import SkipVisibilityReporter from "./vitest-skip-reporter.js";
 export default defineConfig({
   test: {
     reporters: ["default", new SkipVisibilityReporter()],
+    testTimeout: 60_000,
+    hookTimeout: 60_000,
     /**
      * 074-DOCSFLAG — THE TEST SUITE RUNS WITH THE DOCUMENT LAYER ON. THE SHIPPED DEFAULT IS OFF.
      *

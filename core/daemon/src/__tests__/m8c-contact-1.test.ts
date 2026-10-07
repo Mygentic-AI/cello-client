@@ -321,7 +321,7 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     // behaviour, but this fixture has no relay for it to park to, so nothing is recorded.
     h.getSessionNodeManager().setSessionContentKeyForTest("bob", SID_HEX, new Uint8Array(32).fill(0x7e));
     injectRef.inject!(await assignmentFrame(strangerPubkey, bobPubkey));
-    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
+    await wait(15400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     const sentEvent = events.find((e) => e.event === "session.away.response.sent");
     expect(sentEvent?.context).toMatchObject({ kind: "request", isKnown: false });
@@ -365,12 +365,12 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     const strangerPubkey = fixtureIdentity().pubkeyHex;
     snm.setSessionContentKeyForTest("bob", SID_HEX, new Uint8Array(32).fill(0x7e));
     injectRef.inject!(await assignmentFrame(strangerPubkey, bobPubkey));
-    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
+    await wait(15400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     // The stranger, still unknown, now says something on the session they just opened.
     const m1 = new TextEncoder().encode("from the stranger");
     await snm.ingestReceivedContent("bob", SID_HEX, m1, msgLeafHash(m1), "c1");
-    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
+    await wait(15400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     /**
      * THE ASSERTION THAT FAILS ON A REVERT of EITHER line. Restoring the message-kind away reply
@@ -392,7 +392,7 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     // asked for. A `suppressed_duplicate` here would mean a second ack was computed and caught late
     // rather than never attempted.
     expect(events.find((e) => e.event === "session.away.response.suppressed_duplicate")).toBeUndefined();
-  });
+  }, 60_000);
 
   it("DOD-M15-AWAYSALT-1: a LATE salt agreement still reaches the away ack, so adoption is never closed", async () => {
     /**
@@ -421,7 +421,7 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     // The counterparty's half, arriving AFTER the request that triggers the ack — the live ordering.
     await wait(400);
     await snm.handleSaltFrameForTest("bob", SID_HEX, { contribution: new Uint8Array(32).fill(0x5a) });
-    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
+    await wait(15400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     /**
      * THE REVERT ASSERTION. Pre-fix the ack has already hashed unsalted, so this frame arrives at a
@@ -434,7 +434,7 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     expect(events.find((e) => e.event === "session.salt.agreed")).toBeDefined();
     // And the ack itself still exists — a wait that swallowed it would be worse than the bug fixed.
     expect(snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent").length).toBe(1);
-  });
+  }, 60_000);
 
   it("DOD-M15-AWAYSALT-1: a park-only session says NOBODY WAS CONNECTED, not that the peer ignored us", async () => {
     /**
@@ -454,13 +454,13 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     await snm.ensureStandingReceiverForAgent("bob");
     snm.setSessionContentKeyForTest("bob", SID_HEX, new Uint8Array(32).fill(0x7e));
     injectRef.inject!(await assignmentFrame(fixtureIdentity().pubkeyHex, bobPubkey));
-    await wait(6000); // no counterparty will ever announce: the speculative arm must time out
+    await wait(16000); // no counterparty will ever announce: the speculative arm must time out
 
     const unsalted = events.find((e) => e.event === "session.content.unsalted" && e.context["sessionId"] === SID_HEX);
     expect(unsalted?.context["reason"], "nobody was connected — do not blame the counterparty").toBe("no_agreement_started");
     // The WARN that tells the operator to chase a version mismatch must NOT fire on the benign path.
     expect(events.find((e) => e.event === "session.salt.agreement.timeout")).toBeUndefined();
-  }, 15_000);
+  }, 60_000);
 
   it("DOD-M15-AWAYLEAF-1: a KNOWN contact with a CONFIGURED away message also gets ONE ack, not two", async () => {
     /**
@@ -484,10 +484,10 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     snm.setContactAwayMessage("bob", callerPubkey, "Back in an hour.");
     snm.setSessionContentKeyForTest("bob", SID_HEX, new Uint8Array(32).fill(0x7e));
     injectRef.inject!(await assignmentFrame(callerPubkey, bobPubkey));
-    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
+    await wait(15400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
     const m1 = new TextEncoder().encode("from a known contact");
     await snm.ingestReceivedContent("bob", SID_HEX, m1, msgLeafHash(m1), "c1");
-    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
+    await wait(15400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     const sent = snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent");
     // DOD-INBOX-ONESHOT-1: the configured greeting once, then the fixed closing line. The point of
@@ -496,7 +496,7 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
       markAsAutoReply("Back in an hour."),
       markAsAutoReply("This inbox only accepts one message per visit. Closing. [[WRAP]]"),
     ]);
-  });
+  }, 60_000);
 
   it("DOD-M15-AWAYSCOPE-1: a KNOWN contact on the DEFAULT text gets the GREETING and nothing for the message", async () => {
     /**
@@ -521,10 +521,10 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     snm.addContact("bob", callerPubkey, undefined, null, TIER.KNOWN); // no configured message → per-kind defaults
     snm.setSessionContentKeyForTest("bob", SID_HEX, new Uint8Array(32).fill(0x7e));
     injectRef.inject!(await assignmentFrame(callerPubkey, bobPubkey));
-    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
+    await wait(15400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
     const m1 = new TextEncoder().encode("from a known contact");
     await snm.ingestReceivedContent("bob", SID_HEX, m1, msgLeafHash(m1), "c1");
-    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
+    await wait(15400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     const sent = snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent");
     // The knock is answered with the GREETING; the message is answered only by the close, never by a
@@ -535,7 +535,7 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     // Named, so a future widening back into the session is caught by the artifact the seal is taken
     // over rather than only by a transcript count.
     expect(snm.getSessionTree("bob", SID_HEX).size(), "greeting + the caller's message + the close").toBe(3);
-  });
+  }, 60_000);
 
   it("DOD-INBOX-ONESHOT-1: a caller talking to an empty room gets one close, and the session ends", async () => {
     /**
@@ -567,14 +567,14 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
 
     snm.setSessionContentKeyForTest("bob", SID_HEX, new Uint8Array(32).fill(0x7e));
     injectRef.inject!(await assignmentFrame(fixtureIdentity().pubkeyHex, bobPubkey));
-    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
+    await wait(15400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     const m1 = new TextEncoder().encode("first");
     await snm.ingestReceivedContent("bob", SID_HEX, m1, msgLeafHash(m1), "c1");
-    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
+    await wait(15400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
     const m2 = new TextEncoder().encode("second, ignoring the one-shot rule");
     await snm.ingestReceivedContent("bob", SID_HEX, m2, msgLeafHash(m2), "c2");
-    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
+    await wait(15400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     // The visit ends on their FIRST message, so the second one arrives at a session already closing
     // and draws nothing further — the close fires once, not once per message.
@@ -585,7 +585,7 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
       markAsAutoReply("Dispatched."),
       markAsAutoReply("This inbox only accepts one message per visit. Closing. [[WRAP]]"),
     ]);
-  });
+  }, 90_000);
 
   it("K3 (CC-1): the operator replying INTO an inbound session (cello_send) promotes the sender to a known contact", async () => {
     await makeAgentDir("alice");
@@ -634,7 +634,7 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     // behaviour, but this fixture has no relay for it to park to, so nothing is recorded.
     h.getSessionNodeManager().setSessionContentKeyForTest("bob", SID_HEX, new Uint8Array(32).fill(0x7e));
     injectRef.inject!(await assignmentFrame(knownPubkey, bobPubkey));
-    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
+    await wait(15400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     const sentEvent = events.find((e) => e.event === "session.away.response.sent");
     expect(sentEvent?.context).toMatchObject({ kind: "request", isKnown: true });

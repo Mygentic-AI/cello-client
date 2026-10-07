@@ -207,7 +207,7 @@ describe("M8C-AWAY-1: away response", () => {
     // behaviour, but this fixture has no relay for it to park to, so nothing is recorded.
     h.getSessionNodeManager().setSessionContentKeyForTest("bob", SID_HEX, new Uint8Array(32).fill(0x7e));
     injectRef.inject!(await assignmentFrame(initiatorPubkey, bobPubkey)); // bob never attended — no client connected yet
-    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
+    await wait(15400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     /**
      * DOD-M15-AWAYSCOPE-1: `kind` is a CONSTANT in the code now, and this is the only assertion on
@@ -261,7 +261,7 @@ describe("M8C-AWAY-1: away response", () => {
 
     injectRef.inject!(await assignmentFrame(caller, bobPubkey));
     injectRef.inject!(await assignmentFrame(caller, bobPubkey, SID_2_BYTES));
-    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
+    await wait(15400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     // BOTH sessions, named — a count of two would also pass if one session were greeted twice.
     const greeted = events
@@ -271,7 +271,7 @@ describe("M8C-AWAY-1: away response", () => {
     expect(greeted, "each caller is answered on their own session").toEqual([SID_HEX, SID_2_HEX].sort());
     expect(snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent")).toHaveLength(1);
     expect(snm.readTranscript("bob", SID_2_HEX).messages.filter((m) => m.direction === "sent")).toHaveLength(1);
-  }, 15_000);
+  }, 60_000);
 
   // A gateway whose OUTBOUND verdict is configurable per test (inbound always allows).
   class StubGateway implements SecurityGatewayClient {
@@ -293,7 +293,7 @@ describe("M8C-AWAY-1: away response", () => {
     snm.setContactAwayMessage("bob", initiatorPubkey, "Hey - reach me on Signal");
 
     injectRef.inject!(await assignmentFrame(initiatorPubkey, bobPubkey)); // unattended
-    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
+    await wait(15400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     // The RESOLVED custom text is what landed in the transcript — not the system default (bypass:
     // reverting the caller to the constant would send "session request has been received…" here).
@@ -320,7 +320,7 @@ describe("M8C-AWAY-1: away response", () => {
     snm.addContact("bob", initiatorPubkey, undefined, null, TIER.KNOWN);
 
     injectRef.inject!(await assignmentFrame(initiatorPubkey, bobPubkey));
-    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
+    await wait(15400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     expect(events.find((e) => e.event === "session.away.response.screened_out" && e.context.disposition === "block")).toBeDefined();
     expect(events.find((e) => e.event === "session.away.response.sent")).toBeUndefined();
@@ -342,7 +342,7 @@ describe("M8C-AWAY-1: away response", () => {
     snm.setContactAwayMessage("bob", initiatorPubkey, "my home address is 123 Main St"); // would-be leak
 
     injectRef.inject!(await assignmentFrame(initiatorPubkey, bobPubkey));
-    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
+    await wait(15400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     const sent = snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent")[0];
     // The ALTERED bytes — the draft never went on the wire. DOD-M12B-AWAY-MARK-1 moved the
@@ -397,12 +397,12 @@ describe("M8C-AWAY-1: away response", () => {
 
     // Step 1: inbound session request → daemon sends away greeting (seq 0, sent).
     injectRef.inject!(await assignmentFrame(caller, bobPubkey));
-    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
+    await wait(15400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     // Step 2: the caller leaves its message. The daemon answers nothing into the accepted session.
     const wrapContent = new TextEncoder().encode("leaving my message [[WRAP]]");
     await snm.ingestReceivedContent("bob", SID_HEX, wrapContent, msgLeafHash(wrapContent), "wrap-corr");
-    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
+    await wait(15400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     const { messages } = snm.readTranscript("bob", SID_HEX);
     expect(messages).toHaveLength(2);
@@ -412,7 +412,7 @@ describe("M8C-AWAY-1: away response", () => {
     expect(messages[1].text).toContain("[[WRAP]]");
     // No seq 2: the answering machine does not talk into a session it has already answered.
     expect(snm.getSessionTree("bob", SID_HEX).size(), "the receipt covers one greeting and one message").toBe(2);
-  });
+  }, 60_000);
 
   // DOD-AWAY-WRAP-1 AC1: the request-kind greeting names the agent and gives leave-a-message instructions.
   it("DOD-AWAY-WRAP-1 AC1: request-kind away greeting names the agent and instructs to use [[WRAP]]", async () => {
@@ -426,7 +426,7 @@ describe("M8C-AWAY-1: away response", () => {
     h.getSessionNodeManager().addContact("bob", caller, undefined, null, TIER.KNOWN);
 
     injectRef.inject!(await assignmentFrame(caller, bobPubkey));
-    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
+    await wait(15400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     const { messages } = h.getSessionNodeManager().readTranscript("bob", SID_HEX);
     const sent = messages.filter((m) => m.direction === "sent")[0];
@@ -471,7 +471,7 @@ describe("M8C-AWAY-1: away response", () => {
     });
 
     injectRef.inject!(await assignmentFrame(caller, bobPubkey));
-    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
+    await wait(15400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
     return { snm, events };
   }
 
@@ -484,7 +484,7 @@ describe("M8C-AWAY-1: away response", () => {
     // Deferred is not failed, and it must be visible as its own event — a queued reply that reads
     // as `failed` sends the next investigation looking for a message that is not actually lost.
     expect(events.find((e) => e.event === "session.away.response.deferred")).toBeDefined();
-  }, 15_000);
+  }, 60_000);
 
   it("M12-P13: a LOST away greeting appends nothing and says so at ERROR — silence is what made this cost two sessions", async () => {
     // The mirror of the durable case. A leaf here would commit a sequence the counterparty will
@@ -498,7 +498,7 @@ describe("M8C-AWAY-1: away response", () => {
     expect(failed).toBeDefined();
     expect(failed!.level, "a lost message is an error, not a warning").toBe("error");
     expect(String(failed!.context.impact)).toContain("lost");
-  }, 15_000);
+  }, 60_000);
 
   // ─── M12-P18: a refused session tells a TRUSTED sender why, and stays silent to a stranger ─────
   async function driveOverCapRefusal(tier: number, preseed: number) {
