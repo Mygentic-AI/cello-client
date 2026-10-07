@@ -82,6 +82,20 @@ export interface ParkContext {
   persistedRelayEndpoint(agentName: string, sessionId: string): { relayPeerId: string; relayAddrs: string[] } | null;
 }
 
+/** Ingest failures that represent permanent / terminal refusals rather than transient errors. */
+function isPermanentIngestFailure(reason: string): boolean {
+  switch (reason) {
+    case "content_hash_mismatch":
+    case "content_hash_alg_unknown":
+    case "session_committed":
+    case "session_size_limit_exceeded":
+    case "inbound_screen_blocked":
+      return true;
+    default:
+      return false;
+  }
+}
+
 export class ParkRecovery {
   readonly #ctx: ParkContext;
 
@@ -117,7 +131,7 @@ export class ParkRecovery {
    * `${agent}:${session}:${contentHash}` → the refusal reason. Bounded (see
    * #rememberRefusedParkedEntry) because its keys come from a REMOTE mailbox.
    */
-  readonly #refusedParkedEntries = new Map<string, ParkAuthFailure>();
+  readonly #refusedParkedEntries = new Map<string, string>();
   #parkedDrainLastBackstopAt = 0;
   /** DOD-PARK-DRAIN-1: how often the backstop drain rides the watchdog grid — see #parkedDrainBackstopTick. */
   #parkedDrainBackstopMs: number;
@@ -796,8 +810,8 @@ export class ParkRecovery {
     if (result.ok && result.held !== true && recoveredSeq !== null) {
       this.#ctx.noteAcknowledgeable(agentName, sessionId, recoveredSeq, contentHash);
     }
-    if (!result.ok) {
-      this.rememberRefusedParkedEntry(refusalKey, result.reason as ParkAuthFailure);
+    if (!result.ok && isPermanentIngestFailure(result.reason)) {
+      this.rememberRefusedParkedEntry(refusalKey, result.reason);
     }
     return result;
   }
@@ -808,7 +822,7 @@ export class ParkRecovery {
    * an unbounded map would be a memory leak fed by a remote party (the exact class the DOD-MSG-4
    * review already caught once in the offered-moniker map).
    */
-  rememberRefusedParkedEntry(key: string, reason: ParkAuthFailure): void {
+  rememberRefusedParkedEntry(key: string, reason: string): void {
     if (this.#refusedParkedEntries.size >= MAX_REFUSED_PARKED_ENTRIES) {
       const oldest = this.#refusedParkedEntries.keys().next();
       if (!oldest.done) this.#refusedParkedEntries.delete(oldest.value);
