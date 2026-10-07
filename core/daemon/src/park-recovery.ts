@@ -21,7 +21,7 @@ import { decodeStructure1 } from "@cello-protocol/protocol-types";
 import { decodeParkEnvelope, authenticateParkedEntry, decodeParkedDeliveryAck, type ParkedDeliveryAck } from "./park-envelope.js";
 import type { InboundRefusals } from "./inbound-refusals.js";
 import { type ParkedDrainReason, type ParkAttempt, type ActiveSessionEntry, MAX_REFUSED_PARKED_ENTRIES } from "./session-node-types.js";
-import { ParkEnvelopeError, type ParkAuthFailure } from "./park-envelope.js";
+import { ParkEnvelopeError } from "./park-envelope.js";
 import { extractErrorMessage } from "./error-message.js";
 
 /** What park recovery needs from the manager, stated explicitly rather than handed `this`. */
