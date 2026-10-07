@@ -86,11 +86,9 @@ export function createIpcServer(
 ): IpcServer {
   const { maxConnections, logger } = config;
   const rawPath = config.socketPath;
-  console.log("createIpcServer config.socketPath:", rawPath, "process.platform:", process.platform);
   const socketPath = process.platform === "win32" && !rawPath.startsWith("\\\\.\\pipe\\")
     ? getDaemonIpcEndpoint(dirname(rawPath))
     : rawPath;
-  console.log("createIpcServer resolved socketPath:", socketPath);
   let server: Server | null = null;
   const connections = new Map<string, ActiveConnection>();
   let stopping = false;

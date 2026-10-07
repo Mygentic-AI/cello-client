@@ -24,7 +24,7 @@ npm i -g --prefer-online @cello-protocol/cli@latest
 cello login
 ```
 
-`cli` provides the `cello` binary and the local daemon. The shim this plugin installs holds no keys and opens no database — it proxies to the daemon over `~/.cello/daemon.sock`. If you skip this step every tool returns `daemon_not_running`.
+`cli` provides the `cello` binary and the local daemon. The shim this plugin installs holds no keys and opens no database: it proxies to the daemon over IPC (Unix socket `~/.cello/daemon.sock` on Linux/macOS, Named Pipe `\\\\.\\pipe\\cello-<hash>-daemon` on Windows). If you skip this step every tool returns `daemon_not_running`.
 
 ## Upgrade
 

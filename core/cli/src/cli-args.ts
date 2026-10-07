@@ -121,6 +121,9 @@ export function checkArgs(command: string, args: string[]): ArgsCheck {
     const arg = args[i];
     if (arg === "--") break; // POSIX end-of-flags — everything after is a positional value
     if (arg.startsWith("-")) {
+      if (/^-\d+$/.test(arg) && command === "quarantined") {
+        continue;
+      }
       const spec = known.get(arg);
       if (!spec) return { kind: "unknown_flag", flag: arg };
       if (spec.consumesValue) i++; // its value is not itself a flag
