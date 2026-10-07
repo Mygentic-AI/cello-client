@@ -33,8 +33,10 @@ describe("F1: usage string lists every command", () => {
     expect(checkArgs("settings", ["set", "away.default", "-5"])).toEqual({ kind: "unknown_flag", flag: "-5" });
   });
 
-  it("allows negative sequence numbers as positional arguments specifically for quarantined command", () => {
+  it("allows negative integer sequence numbers as positional arguments specifically for quarantined command", () => {
     expect(checkArgs("quarantined", ["some-session-id", "-1"])).toEqual({ kind: "ok" });
+    expect(checkArgs("quarantined", ["some-session-id", "-1.5"])).toEqual({ kind: "unknown_flag", flag: "-1.5" });
+    expect(checkArgs("quarantined", ["some-session-id", "-Infinity"])).toEqual({ kind: "unknown_flag", flag: "-Infinity" });
     expect(checkArgs("transcript", ["some-session-id", "-5"])).toEqual({ kind: "unknown_flag", flag: "-5" });
     expect(checkArgs("settings", ["set", "away.default", "-5"])).toEqual({ kind: "unknown_flag", flag: "-5" });
   });

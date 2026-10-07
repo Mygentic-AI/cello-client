@@ -497,4 +497,20 @@ describe("SEC-1: relay-park content authentication (fail-closed)", () => {
     if (res.ok) throw new Error("unreachable");
     expect(res.reason).toBe("counterparty_unknown");
   });
+
+  it("memoizes permanent content_hash_mismatch refusals but leaves transient failures retryable", async () => {
+    const mgr = await makeSession("permanent-vs-transient");
+    const content = new TextEncoder().encode("content that fails hash check");
+    const tamperedHash = msgLeafHash(new TextEncoder().encode("different content"));
+    const sig = await signPark(counterparty, { contentHash: tamperedHash });
+    const plaintext = encodeParkEnvelope({ content, senderPubkey: counterpartyPub, parkSig: sig });
+
+    const first = await mgr.recoverParkedEntry(AGENT, sid, victimPub, plaintext, tamperedHash);
+    expect(first.ok).toBe(false);
+
+    // Second look hits the memo
+    const second = await mgr.recoverParkedEntry(AGENT, sid, victimPub, plaintext, tamperedHash);
+    expect(second.ok).toBe(false);
+    expect(events.some((e) => e.event === "content.recover.unauthenticated" && e.context["repeat"] === true)).toBe(true);
+  });
 });

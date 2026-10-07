@@ -90,6 +90,7 @@ function isPermanentIngestFailure(reason: string): boolean {
     case "session_committed":
     case "session_size_limit_exceeded":
     case "inbound_screen_blocked":
+    case "transcript_write_failed":
       return true;
     default:
       return false;

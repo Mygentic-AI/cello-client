@@ -121,7 +121,7 @@ export function checkArgs(command: string, args: string[]): ArgsCheck {
     const arg = args[i];
     if (arg === "--") break; // POSIX end-of-flags — everything after is a positional value
     if (arg.startsWith("-")) {
-      if (!Number.isNaN(Number(arg)) && command === "quarantined") {
+      if (/^-\d+$/.test(arg) && command === "quarantined") {
         continue;
       }
       const spec = known.get(arg);
