@@ -796,6 +796,9 @@ export class ParkRecovery {
     if (result.ok && result.held !== true && recoveredSeq !== null) {
       this.#ctx.noteAcknowledgeable(agentName, sessionId, recoveredSeq, contentHash);
     }
+    if (!result.ok) {
+      this.rememberRefusedParkedEntry(refusalKey, result.reason as ParkAuthFailure);
+    }
     return result;
   }
   /**

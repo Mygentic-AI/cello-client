@@ -955,6 +955,8 @@ export function createContentPark(deps: ContentParkDeps) {
   const draining = new Set<string>();
   /** agentName → the trigger of the coalesced re-run owed to it (absent = none owed). */
   const drainRerunRequested = new Map<string, string>();
+  const relayRefusalCooldowns = new Map<string, number>();
+  const RELAY_REFUSAL_COOLDOWN_MS = 60_000;
 
   async function autoRecoverForAgent(agentName: string, trigger = "unspecified"): Promise<void> {
     if (draining.has(agentName)) {
@@ -985,15 +987,25 @@ export function createContentPark(deps: ContentParkDeps) {
     let refusedTotal = 0;
     const refusedReasons: Record<string, number> = {};
     let failed = 0;
+    const now = Date.now();
     for (const r of relays) {
+      const cooldownKey = `${agentName}:${r.relayPeerId}`;
+      const cooldownUntil = relayRefusalCooldowns.get(cooldownKey) ?? 0;
+      if (now < cooldownUntil) {
+        continue;
+      }
       try {
         const res = await recoverParkedFromRelay(agent, r.relayPeerId, r.relayAddrs);
         if (res.ok) {
+          relayRefusalCooldowns.delete(cooldownKey);
           total += res.recovered;
           // F3: tally by reason so the unattended drain reports refusals it would otherwise swallow.
           refusedTotal += res.refused;
           for (const r2 of res.refusals) refusedReasons[r2.reason] = (refusedReasons[r2.reason] ?? 0) + 1;
         } else {
+          if (res.reason === "relay_refused_pull:not_a_participant") {
+            relayRefusalCooldowns.set(cooldownKey, now + RELAY_REFUSAL_COOLDOWN_MS);
+          }
           // Review #2: a non-ok result (signing_key_unavailable / cannot_unseal / the precise
           // no-receiver cause) was previously silent — log the reason so a run where every relay
           // failed is distinguishable from "nothing was parked".
