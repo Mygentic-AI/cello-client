@@ -15,8 +15,8 @@ cannot create one. Registration in particular needs a token you paste at your ow
 
 ## Step 1 — Install the daemon
 
-The plugin ships the MCP shim only. The shim holds no keys and opens no database — it proxies to a
-local daemon over `~/.cello/daemon.sock`. Without the daemon every tool returns `daemon_not_running`.
+The plugin ships the MCP shim only. The shim holds no keys and opens no database: it proxies to a
+local daemon over IPC (Unix socket `~/.cello/daemon.sock` on Linux/macOS, Named Pipe `\\\\.\\pipe\\cello-<hash>-daemon` on Windows). Without the daemon every tool returns `daemon_not_running`.
 
 ```bash
 npm i -g --prefer-online @cello-protocol/cli@latest

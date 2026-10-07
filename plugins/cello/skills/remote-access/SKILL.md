@@ -17,7 +17,7 @@ works for Claude Code on the same machine. It does not work for a client that ca
 
 For those, run `@cello-protocol/mcp-http` on the daemon's machine. It serves the same `cello_*` tools,
 with the same parameters, over MCP Streamable HTTP at one URL ending in `/mcp`. It forwards every call to
-the daemon over `~/.cello/daemon.sock`. It holds no keys and keeps no conversation state.
+the daemon over IPC (Unix socket `~/.cello/daemon.sock` on Linux/macOS, Named Pipe `\\\\.\\pipe\\cello-<hash>-daemon` on Windows). It holds no keys and keeps no conversation state.
 
 If the client and the daemon are on the same machine and the client can start a local process, you do not
 need this. Use the `cello` plugin.
