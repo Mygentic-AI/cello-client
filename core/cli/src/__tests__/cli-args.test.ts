@@ -33,6 +33,12 @@ describe("F1: usage string lists every command", () => {
     expect(checkArgs("settings", ["set", "away.default", "-5"])).toEqual({ kind: "unknown_flag", flag: "-5" });
   });
 
+  it("allows negative sequence numbers as positional arguments specifically for quarantined and transcript commands", () => {
+    expect(checkArgs("quarantined", ["some-session-id", "-1"])).toEqual({ kind: "ok" });
+    expect(checkArgs("transcript", ["some-session-id", "-5"])).toEqual({ kind: "ok" });
+    expect(checkArgs("settings", ["set", "away.default", "-5"])).toEqual({ kind: "unknown_flag", flag: "-5" });
+  });
+
   // This hand-written list is deliberately INDEPENDENT of the registry — it is the outside anchor
   // that the registry's own derive-lock tests cannot be (they would agree with any table, including
   // a wrong one). Adding OR RENAMING a command means updating this list on purpose. It is what
