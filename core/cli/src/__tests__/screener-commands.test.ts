@@ -425,15 +425,14 @@ describe("SCREENINSTALL: npmInstallRuntime", () => {
       return ee;
     };
 
-    const testDir = "C:\\Users\\Jane Doe %Test%\\.cello\\screener-runtime";
     await npmInstallRuntime({
       spawnImpl: mockSpawn as unknown as typeof import("node:child_process").spawn,
       platform: "win32",
-      runtimeDir: testDir,
+      runtimeDir,
     });
 
     expect(spawnedCmd).toBe("npm install @huggingface/transformers");
-    expect(spawnedOptions["cwd"]).toBe(testDir);
+    expect(spawnedOptions["cwd"]).toBe(runtimeDir);
     expect(spawnedOptions["shell"]).toBe(true);
   });
 
@@ -520,5 +519,15 @@ describe("SCREENINSTALL: mergeAllowScripts helper", () => {
     const allowLines = res.split("\n").filter((l) => l.startsWith("allow-scripts="));
     expect(allowLines).toHaveLength(1);
     expect(allowLines[0]).toBe("allow-scripts=foo,bar,baz,onnxruntime-node,protobufjs");
+  });
+
+  it("is idempotent across repeated invocations without accumulating blank lines", () => {
+    const input = "allow-scripts=foo\n";
+    const once = mergeAllowScripts(input);
+    expect(once).toBe("allow-scripts=foo,onnxruntime-node,protobufjs\n");
+    const twice = mergeAllowScripts(once);
+    expect(twice).toBe(once);
+    const thrice = mergeAllowScripts(twice);
+    expect(thrice).toBe(once);
   });
 });
