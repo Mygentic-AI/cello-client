@@ -176,36 +176,96 @@ async function askOnTerminal(question: string): Promise<string> {
   }
 }
 
-export async function npmInstallRuntime(spawnImpl: typeof spawn = spawn): Promise<void> {
-  const runtimeDir = screenerRuntimeDir();
-  await mkdir(runtimeDir, { recursive: true });
-  // npm 11+ skips lifecycle scripts by default unless allowed. onnxruntime-node
-  // relies on its postinstall script to download native binary artifacts (e.g. onnxruntime.dll on Windows).
-  const npmrcPath = join(runtimeDir, ".npmrc");
-  try {
-    const existing = await readFile(npmrcPath, "utf8");
-    if (!existing.includes("allow-scripts")) {
-      await writeFile(npmrcPath, `${existing.trimEnd()}\nallow-scripts=onnxruntime-node,protobufjs\n`, "utf8");
-    } else if (!existing.includes("onnxruntime-node")) {
-      await writeFile(npmrcPath, `${existing.trimEnd()},onnxruntime-node,protobufjs\n`, "utf8");
+/**
+ * Safely parse and merge `allow-scripts` packages into .npmrc text.
+ * Preserves all other settings, comments, and empty lines.
+ */
+export function mergeAllowScripts(existing: string, requiredPackages = ["onnxruntime-node", "protobufjs"]): string {
+  const lines = existing.split(/\r?\n/);
+  let found = false;
+  const allowScriptsPattern = /^\s*allow-scripts\s*=\s*(.*)$/;
+
+  const updatedLines = lines.map((line) => {
+    const match = line.match(allowScriptsPattern);
+    if (!match) return line;
+    found = true;
+    const existingPkgs = match[1]
+      .split(",")
+      .map((p) => p.trim())
+      .filter(Boolean);
+    const set = new Set(existingPkgs);
+    for (const pkg of requiredPackages) {
+      set.add(pkg);
     }
-  } catch {
-    await writeFile(npmrcPath, "allow-scripts=onnxruntime-node,protobufjs\n", "utf8");
+    return `allow-scripts=${Array.from(set).join(",")}`;
+  });
+
+  if (!found) {
+    if (updatedLines.length > 0 && updatedLines[updatedLines.length - 1] === "") {
+      updatedLines.pop();
+    }
+    updatedLines.push(`allow-scripts=${requiredPackages.join(",")}`);
   }
 
-  const isWindows = process.platform === "win32";
+  return updatedLines.join("\n") + "\n";
+}
+
+/**
+ * Format the Windows npm install command string for cmd.exe shell execution,
+ * safely escaping quotes and percent signs while rejecting control characters.
+ */
+export function formatWindowsNpmInstallCommand(runtimeDir: string, moduleName: string): string {
+  if (/[\r\n&|<>^]/.test(runtimeDir)) {
+    throw new Error(`Invalid characters in screener runtime directory path: ${runtimeDir}`);
+  }
+  // Escape quotes and percent signs for cmd.exe
+  const safeDir = runtimeDir.replace(/"/g, '""').replace(/%/g, "%%");
+  return `npm install --prefix "${safeDir}" ${moduleName}`;
+}
+
+export interface NpmInstallRuntimeOptions {
+  spawnImpl?: typeof spawn;
+  platform?: NodeJS.Platform;
+  runtimeDir?: string;
+}
+
+export async function npmInstallRuntime(opts: NpmInstallRuntimeOptions | typeof spawn = {}): Promise<void> {
+  const normalizedOpts: NpmInstallRuntimeOptions = typeof opts === "function" ? { spawnImpl: opts } : opts;
+  const spawnImpl = normalizedOpts.spawnImpl ?? spawn;
+  const platform = normalizedOpts.platform ?? process.platform;
+  const runtimeDir = normalizedOpts.runtimeDir ?? screenerRuntimeDir();
+
+  await mkdir(runtimeDir, { recursive: true });
+
+  const npmrcPath = join(runtimeDir, ".npmrc");
+  let existingContent = "";
+  try {
+    existingContent = await readFile(npmrcPath, "utf8");
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code !== "ENOENT") {
+      throw err;
+    }
+  }
+  const merged = mergeAllowScripts(existingContent);
+  await writeFile(npmrcPath, merged, "utf8");
+
+  const isWindows = platform === "win32";
   await new Promise<void>((resolve, reject) => {
-    // On Windows, spawn with shell: true requires a single command string so cmd.exe
-    // properly handles arguments containing spaces (e.g. user home directories like C:\Users\Jane Doe).
-    const child = isWindows
-      ? (spawnImpl as (command: string, options?: unknown) => import("node:child_process").ChildProcess)(
-          `npm install --prefix "${runtimeDir}" ${SCREENER_RUNTIME_MODULE}`,
-          { stdio: "inherit", shell: true }
-        )
-      : spawnImpl("npm", ["install", "--prefix", runtimeDir, SCREENER_RUNTIME_MODULE], {
-          stdio: "inherit",
-          shell: false,
-        });
+    let child: import("node:child_process").ChildProcess;
+    try {
+      child = isWindows
+        ? (spawnImpl as (command: string, options?: unknown) => import("node:child_process").ChildProcess)(
+            formatWindowsNpmInstallCommand(runtimeDir, SCREENER_RUNTIME_MODULE),
+            { stdio: "inherit", shell: true }
+          )
+        : spawnImpl("npm", ["install", "--prefix", runtimeDir, SCREENER_RUNTIME_MODULE], {
+            stdio: "inherit",
+            shell: false,
+          });
+    } catch (spawnErr) {
+      return reject(spawnErr);
+    }
     child.on("error", reject);
     child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`npm exited ${code}`))));
   });

@@ -11,7 +11,14 @@ import { mkdtemp, rm, writeFile, mkdir, truncate } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { SCREENER_MODEL, localPathOf } from "@cello-protocol/gateway";
-import { screenerStatusCommand, screenerInstallCommand, screenerManualInstructions, npmInstallRuntime } from "../screener-commands.js";
+import {
+  screenerStatusCommand,
+  screenerInstallCommand,
+  screenerManualInstructions,
+  npmInstallRuntime,
+  mergeAllowScripts,
+  formatWindowsNpmInstallCommand,
+} from "../screener-commands.js";
 import { screenerLoginLine } from "../commands.js";
 
 async function writeVerifiedModel(dir: string): Promise<void> {
@@ -370,7 +377,7 @@ describe("SCREENINSTALL: npmInstallRuntime", () => {
     await rm(runtimeDir, { recursive: true, force: true });
   });
 
-  it("writes .npmrc with allow-scripts and passes shell option appropriately", async () => {
+  it("writes .npmrc with allow-scripts and passes shell option appropriately for default platform", async () => {
     let spawnedCmd = "";
     let spawnedArgs: string[] | undefined = undefined;
     let spawnedOptions: Record<string, unknown> = {};
@@ -391,7 +398,7 @@ describe("SCREENINSTALL: npmInstallRuntime", () => {
     };
 
     const { readFile } = await import("node:fs/promises");
-    await npmInstallRuntime(mockSpawn as unknown as typeof import("node:child_process").spawn);
+    await npmInstallRuntime({ spawnImpl: mockSpawn as unknown as typeof import("node:child_process").spawn });
 
     const npmrcContent = await readFile(join(runtimeDir, ".npmrc"), "utf8");
     expect(npmrcContent).toContain("allow-scripts=onnxruntime-node,protobufjs");
@@ -405,6 +412,55 @@ describe("SCREENINSTALL: npmInstallRuntime", () => {
     }
   });
 
+  it("exercises Windows-specific spawning when platform is win32", async () => {
+    let spawnedCmd = "";
+    let spawnedOptions: Record<string, unknown> = {};
+
+    const mockSpawn = (cmd: string, options?: unknown) => {
+      spawnedCmd = cmd;
+      spawnedOptions = (options as Record<string, unknown>) || {};
+      const { EventEmitter } = require("node:events");
+      const ee = new EventEmitter();
+      process.nextTick(() => ee.emit("exit", 0));
+      return ee;
+    };
+
+    await npmInstallRuntime({
+      spawnImpl: mockSpawn as unknown as typeof import("node:child_process").spawn,
+      platform: "win32",
+      runtimeDir: "C:\\Users\\Jane Doe\\.cello\\screener-runtime",
+    });
+
+    expect(spawnedCmd).toBe('npm install --prefix "C:\\Users\\Jane Doe\\.cello\\screener-runtime" @huggingface/transformers');
+    expect(spawnedOptions["shell"]).toBe(true);
+  });
+
+  it("exercises POSIX-specific spawning when platform is linux or darwin", async () => {
+    let spawnedCmd = "";
+    let spawnedArgs: string[] = [];
+    let spawnedOptions: Record<string, unknown> = {};
+
+    const mockSpawn = (cmd: string, args: string[], options: Record<string, unknown>) => {
+      spawnedCmd = cmd;
+      spawnedArgs = args;
+      spawnedOptions = options;
+      const { EventEmitter } = require("node:events");
+      const ee = new EventEmitter();
+      process.nextTick(() => ee.emit("exit", 0));
+      return ee;
+    };
+
+    await npmInstallRuntime({
+      spawnImpl: mockSpawn as unknown as typeof import("node:child_process").spawn,
+      platform: "linux",
+      runtimeDir,
+    });
+
+    expect(spawnedCmd).toBe("npm");
+    expect(spawnedArgs).toEqual(["install", "--prefix", runtimeDir, "@huggingface/transformers"]);
+    expect(spawnedOptions["shell"]).toBe(false);
+  });
+
   it("safely preserves and updates existing .npmrc file", async () => {
     const { writeFile, readFile } = await import("node:fs/promises");
     await writeFile(join(runtimeDir, ".npmrc"), "legacy-peer-deps=true\n", "utf8");
@@ -416,10 +472,48 @@ describe("SCREENINSTALL: npmInstallRuntime", () => {
       return ee;
     };
 
-    await npmInstallRuntime(mockSpawn as unknown as typeof import("node:child_process").spawn);
+    await npmInstallRuntime({ spawnImpl: mockSpawn as unknown as typeof import("node:child_process").spawn });
 
     const npmrcContent = await readFile(join(runtimeDir, ".npmrc"), "utf8");
     expect(npmrcContent).toContain("legacy-peer-deps=true");
     expect(npmrcContent).toContain("allow-scripts=onnxruntime-node,protobufjs");
+  });
+});
+
+describe("SCREENINSTALL: mergeAllowScripts helper", () => {
+  it("creates allow-scripts when file is empty", () => {
+    const res = mergeAllowScripts("");
+    expect(res).toBe("allow-scripts=onnxruntime-node,protobufjs\n");
+  });
+
+  it("preserves other settings and appends allow-scripts", () => {
+    const input = "legacy-peer-deps=true\nregistry=https://registry.npmjs.org/\n";
+    const res = mergeAllowScripts(input);
+    expect(res).toContain("legacy-peer-deps=true");
+    expect(res).toContain("registry=https://registry.npmjs.org/");
+    expect(res).toContain("allow-scripts=onnxruntime-node,protobufjs");
+  });
+
+  it("merges with existing allow-scripts without duplicating", () => {
+    const input = "allow-scripts=foo,onnxruntime-node\nother-key=1";
+    const res = mergeAllowScripts(input);
+    expect(res).toContain("allow-scripts=foo,onnxruntime-node,protobufjs");
+    expect(res).toContain("other-key=1");
+  });
+});
+
+describe("SCREENINSTALL: formatWindowsNpmInstallCommand helper", () => {
+  it("formats path with spaces correctly inside quotes", () => {
+    const cmd = formatWindowsNpmInstallCommand("C:\\Users\\Jane Doe\\.cello", "@huggingface/transformers");
+    expect(cmd).toBe('npm install --prefix "C:\\Users\\Jane Doe\\.cello" @huggingface/transformers');
+  });
+
+  it("escapes percent signs for cmd.exe", () => {
+    const cmd = formatWindowsNpmInstallCommand("C:\\Users\\Jane%20Doe\\.cello", "@huggingface/transformers");
+    expect(cmd).toBe('npm install --prefix "C:\\Users\\Jane%%20Doe\\.cello" @huggingface/transformers');
+  });
+
+  it("rejects paths with command injection characters", () => {
+    expect(() => formatWindowsNpmInstallCommand("C:\\Users\\Jane & calc.exe", "@huggingface/transformers")).toThrow(/Invalid characters/);
   });
 });
