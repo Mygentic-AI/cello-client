@@ -11,7 +11,7 @@ import { mkdtemp, rm, writeFile, mkdir, truncate } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { SCREENER_MODEL, localPathOf } from "@cello-protocol/gateway";
-import { screenerStatusCommand, screenerInstallCommand, screenerManualInstructions } from "../screener-commands.js";
+import { screenerStatusCommand, screenerInstallCommand, screenerManualInstructions, npmInstallRuntime } from "../screener-commands.js";
 import { screenerLoginLine } from "../commands.js";
 
 async function writeVerifiedModel(dir: string): Promise<void> {
@@ -349,5 +349,77 @@ describe("SCREENINSTALL: the prompt accepts an answer", () => {
     });
     expect(asked).toBe(false);
     expect(r.stdout).toContain("--yes");
+  });
+});
+
+describe("SCREENINSTALL: npmInstallRuntime", () => {
+  let runtimeDir: string;
+  const originalEnv = process.env["CELLO_SCREENER_RUNTIME_DIR"];
+
+  beforeEach(async () => {
+    runtimeDir = await mkdtemp(join(tmpdir(), "cello-runtime-"));
+    process.env["CELLO_SCREENER_RUNTIME_DIR"] = runtimeDir;
+  });
+
+  afterEach(async () => {
+    if (originalEnv !== undefined) {
+      process.env["CELLO_SCREENER_RUNTIME_DIR"] = originalEnv;
+    } else {
+      delete process.env["CELLO_SCREENER_RUNTIME_DIR"];
+    }
+    await rm(runtimeDir, { recursive: true, force: true });
+  });
+
+  it("writes .npmrc with allow-scripts and passes shell option appropriately", async () => {
+    let spawnedCmd = "";
+    let spawnedArgs: string[] | undefined = undefined;
+    let spawnedOptions: Record<string, unknown> = {};
+
+    const mockSpawn = (cmd: string, argsOrOptions?: unknown, options?: unknown) => {
+      spawnedCmd = cmd;
+      if (Array.isArray(argsOrOptions)) {
+        spawnedArgs = argsOrOptions;
+        spawnedOptions = (options as Record<string, unknown>) || {};
+      } else {
+        spawnedArgs = undefined;
+        spawnedOptions = (argsOrOptions as Record<string, unknown>) || {};
+      }
+      const { EventEmitter } = require("node:events");
+      const ee = new EventEmitter();
+      process.nextTick(() => ee.emit("exit", 0));
+      return ee;
+    };
+
+    const { readFile } = await import("node:fs/promises");
+    await npmInstallRuntime(mockSpawn as unknown as typeof import("node:child_process").spawn);
+
+    const npmrcContent = await readFile(join(runtimeDir, ".npmrc"), "utf8");
+    expect(npmrcContent).toContain("allow-scripts=onnxruntime-node,protobufjs");
+    if (process.platform === "win32") {
+      expect(spawnedCmd).toBe(`npm install --prefix "${runtimeDir}" @huggingface/transformers`);
+      expect(spawnedOptions["shell"]).toBe(true);
+    } else {
+      expect(spawnedCmd).toBe("npm");
+      expect(spawnedArgs).toEqual(["install", "--prefix", runtimeDir, "@huggingface/transformers"]);
+      expect(spawnedOptions["shell"]).toBe(false);
+    }
+  });
+
+  it("safely preserves and updates existing .npmrc file", async () => {
+    const { writeFile, readFile } = await import("node:fs/promises");
+    await writeFile(join(runtimeDir, ".npmrc"), "legacy-peer-deps=true\n", "utf8");
+
+    const mockSpawn = () => {
+      const { EventEmitter } = require("node:events");
+      const ee = new EventEmitter();
+      process.nextTick(() => ee.emit("exit", 0));
+      return ee;
+    };
+
+    await npmInstallRuntime(mockSpawn as unknown as typeof import("node:child_process").spawn);
+
+    const npmrcContent = await readFile(join(runtimeDir, ".npmrc"), "utf8");
+    expect(npmrcContent).toContain("legacy-peer-deps=true");
+    expect(npmrcContent).toContain("allow-scripts=onnxruntime-node,protobufjs");
   });
 });

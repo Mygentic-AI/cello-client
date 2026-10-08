@@ -14,7 +14,7 @@
  * silently drops the download size fails.
  */
 import { spawn } from "node:child_process";
-import { rm } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   SCREENER_MODEL,
@@ -176,9 +176,36 @@ async function askOnTerminal(question: string): Promise<string> {
   }
 }
 
-async function npmInstallRuntime(): Promise<void> {
+export async function npmInstallRuntime(spawnImpl: typeof spawn = spawn): Promise<void> {
+  const runtimeDir = screenerRuntimeDir();
+  await mkdir(runtimeDir, { recursive: true });
+  // npm 11+ skips lifecycle scripts by default unless allowed. onnxruntime-node
+  // relies on its postinstall script to download native binary artifacts (e.g. onnxruntime.dll on Windows).
+  const npmrcPath = join(runtimeDir, ".npmrc");
+  try {
+    const existing = await readFile(npmrcPath, "utf8");
+    if (!existing.includes("allow-scripts")) {
+      await writeFile(npmrcPath, `${existing.trimEnd()}\nallow-scripts=onnxruntime-node,protobufjs\n`, "utf8");
+    } else if (!existing.includes("onnxruntime-node")) {
+      await writeFile(npmrcPath, `${existing.trimEnd()},onnxruntime-node,protobufjs\n`, "utf8");
+    }
+  } catch {
+    await writeFile(npmrcPath, "allow-scripts=onnxruntime-node,protobufjs\n", "utf8");
+  }
+
+  const isWindows = process.platform === "win32";
   await new Promise<void>((resolve, reject) => {
-    const child = spawn("npm", ["install", "--prefix", screenerRuntimeDir(), SCREENER_RUNTIME_MODULE], { stdio: "inherit" });
+    // On Windows, spawn with shell: true requires a single command string so cmd.exe
+    // properly handles arguments containing spaces (e.g. user home directories like C:\Users\Jane Doe).
+    const child = isWindows
+      ? (spawnImpl as (command: string, options?: unknown) => import("node:child_process").ChildProcess)(
+          `npm install --prefix "${runtimeDir}" ${SCREENER_RUNTIME_MODULE}`,
+          { stdio: "inherit", shell: true }
+        )
+      : spawnImpl("npm", ["install", "--prefix", runtimeDir, SCREENER_RUNTIME_MODULE], {
+          stdio: "inherit",
+          shell: false,
+        });
     child.on("error", reject);
     child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`npm exited ${code}`))));
   });
