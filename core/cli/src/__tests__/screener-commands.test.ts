@@ -17,7 +17,6 @@ import {
   screenerManualInstructions,
   npmInstallRuntime,
   mergeAllowScripts,
-  formatWindowsNpmInstallCommand,
 } from "../screener-commands.js";
 import { screenerLoginLine } from "../commands.js";
 
@@ -402,17 +401,18 @@ describe("SCREENINSTALL: npmInstallRuntime", () => {
 
     const npmrcContent = await readFile(join(runtimeDir, ".npmrc"), "utf8");
     expect(npmrcContent).toContain("allow-scripts=onnxruntime-node,protobufjs");
+    expect(spawnedOptions["cwd"]).toBe(runtimeDir);
     if (process.platform === "win32") {
-      expect(spawnedCmd).toBe(`npm install --prefix "${runtimeDir}" @huggingface/transformers`);
+      expect(spawnedCmd).toBe("npm install @huggingface/transformers");
       expect(spawnedOptions["shell"]).toBe(true);
     } else {
       expect(spawnedCmd).toBe("npm");
-      expect(spawnedArgs).toEqual(["install", "--prefix", runtimeDir, "@huggingface/transformers"]);
+      expect(spawnedArgs).toEqual(["install", "@huggingface/transformers"]);
       expect(spawnedOptions["shell"]).toBe(false);
     }
   });
 
-  it("exercises Windows-specific spawning when platform is win32", async () => {
+  it("exercises Windows-specific spawning directly inside target cwd without path arguments", async () => {
     let spawnedCmd = "";
     let spawnedOptions: Record<string, unknown> = {};
 
@@ -425,13 +425,15 @@ describe("SCREENINSTALL: npmInstallRuntime", () => {
       return ee;
     };
 
+    const testDir = "C:\\Users\\Jane Doe %Test%\\.cello\\screener-runtime";
     await npmInstallRuntime({
       spawnImpl: mockSpawn as unknown as typeof import("node:child_process").spawn,
       platform: "win32",
-      runtimeDir: "C:\\Users\\Jane Doe\\.cello\\screener-runtime",
+      runtimeDir: testDir,
     });
 
-    expect(spawnedCmd).toBe('npm install --prefix "C:\\Users\\Jane Doe\\.cello\\screener-runtime" @huggingface/transformers');
+    expect(spawnedCmd).toBe("npm install @huggingface/transformers");
+    expect(spawnedOptions["cwd"]).toBe(testDir);
     expect(spawnedOptions["shell"]).toBe(true);
   });
 
@@ -457,7 +459,8 @@ describe("SCREENINSTALL: npmInstallRuntime", () => {
     });
 
     expect(spawnedCmd).toBe("npm");
-    expect(spawnedArgs).toEqual(["install", "--prefix", runtimeDir, "@huggingface/transformers"]);
+    expect(spawnedArgs).toEqual(["install", "@huggingface/transformers"]);
+    expect(spawnedOptions["cwd"]).toBe(runtimeDir);
     expect(spawnedOptions["shell"]).toBe(false);
   });
 
@@ -500,20 +503,22 @@ describe("SCREENINSTALL: mergeAllowScripts helper", () => {
     expect(res).toContain("allow-scripts=foo,onnxruntime-node,protobufjs");
     expect(res).toContain("other-key=1");
   });
-});
 
-describe("SCREENINSTALL: formatWindowsNpmInstallCommand helper", () => {
-  it("formats path with spaces correctly inside quotes", () => {
-    const cmd = formatWindowsNpmInstallCommand("C:\\Users\\Jane Doe\\.cello", "@huggingface/transformers");
-    expect(cmd).toBe('npm install --prefix "C:\\Users\\Jane Doe\\.cello" @huggingface/transformers');
-  });
-
-  it("escapes percent signs for cmd.exe", () => {
-    const cmd = formatWindowsNpmInstallCommand("C:\\Users\\Jane%20Doe\\.cello", "@huggingface/transformers");
-    expect(cmd).toBe('npm install --prefix "C:\\Users\\Jane%%20Doe\\.cello" @huggingface/transformers');
-  });
-
-  it("rejects paths with command injection characters", () => {
-    expect(() => formatWindowsNpmInstallCommand("C:\\Users\\Jane & calc.exe", "@huggingface/transformers")).toThrow(/Invalid characters/);
+  it("consolidates multiple allow-scripts lines into a single line", () => {
+    const input = [
+      "legacy-peer-deps=true",
+      "allow-scripts=foo,bar",
+      "registry=https://registry.npmjs.org/",
+      "allow-scripts=baz,onnxruntime-node",
+      "other-setting=yes",
+    ].join("\n");
+    const res = mergeAllowScripts(input);
+    expect(res).toContain("legacy-peer-deps=true");
+    expect(res).toContain("registry=https://registry.npmjs.org/");
+    expect(res).toContain("other-setting=yes");
+    // Exactly one allow-scripts line
+    const allowLines = res.split("\n").filter((l) => l.startsWith("allow-scripts="));
+    expect(allowLines).toHaveLength(1);
+    expect(allowLines[0]).toBe("allow-scripts=foo,bar,baz,onnxruntime-node,protobufjs");
   });
 });
