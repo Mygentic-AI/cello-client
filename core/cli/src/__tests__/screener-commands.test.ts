@@ -372,13 +372,18 @@ describe("SCREENINSTALL: npmInstallRuntime", () => {
 
   it("writes .npmrc with allow-scripts and passes shell option appropriately", async () => {
     let spawnedCmd = "";
-    let spawnedArgs: string[] = [];
+    let spawnedArgs: string[] | undefined = undefined;
     let spawnedOptions: Record<string, unknown> = {};
 
-    const mockSpawn = (cmd: string, args: string[], options: Record<string, unknown>) => {
+    const mockSpawn = (cmd: string, argsOrOptions?: unknown, options?: unknown) => {
       spawnedCmd = cmd;
-      spawnedArgs = args;
-      spawnedOptions = options;
+      if (Array.isArray(argsOrOptions)) {
+        spawnedArgs = argsOrOptions;
+        spawnedOptions = (options as Record<string, unknown>) || {};
+      } else {
+        spawnedArgs = undefined;
+        spawnedOptions = (argsOrOptions as Record<string, unknown>) || {};
+      }
       const { EventEmitter } = require("node:events");
       const ee = new EventEmitter();
       process.nextTick(() => ee.emit("exit", 0));
@@ -390,8 +395,31 @@ describe("SCREENINSTALL: npmInstallRuntime", () => {
 
     const npmrcContent = await readFile(join(runtimeDir, ".npmrc"), "utf8");
     expect(npmrcContent).toContain("allow-scripts=onnxruntime-node,protobufjs");
-    expect(spawnedCmd).toBe("npm");
-    expect(spawnedArgs).toEqual(["install", "--prefix", runtimeDir, "@huggingface/transformers"]);
-    expect(spawnedOptions["shell"]).toBe(process.platform === "win32");
+    if (process.platform === "win32") {
+      expect(spawnedCmd).toBe(`npm install --prefix "${runtimeDir}" @huggingface/transformers`);
+      expect(spawnedOptions["shell"]).toBe(true);
+    } else {
+      expect(spawnedCmd).toBe("npm");
+      expect(spawnedArgs).toEqual(["install", "--prefix", runtimeDir, "@huggingface/transformers"]);
+      expect(spawnedOptions["shell"]).toBe(false);
+    }
+  });
+
+  it("safely preserves and updates existing .npmrc file", async () => {
+    const { writeFile, readFile } = await import("node:fs/promises");
+    await writeFile(join(runtimeDir, ".npmrc"), "legacy-peer-deps=true\n", "utf8");
+
+    const mockSpawn = () => {
+      const { EventEmitter } = require("node:events");
+      const ee = new EventEmitter();
+      process.nextTick(() => ee.emit("exit", 0));
+      return ee;
+    };
+
+    await npmInstallRuntime(mockSpawn as unknown as typeof import("node:child_process").spawn);
+
+    const npmrcContent = await readFile(join(runtimeDir, ".npmrc"), "utf8");
+    expect(npmrcContent).toContain("legacy-peer-deps=true");
+    expect(npmrcContent).toContain("allow-scripts=onnxruntime-node,protobufjs");
   });
 });
