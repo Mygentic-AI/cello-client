@@ -11,7 +11,7 @@ import { mkdtemp, rm, writeFile, mkdir, truncate } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { SCREENER_MODEL, localPathOf } from "@cello-protocol/gateway";
-import { screenerStatusCommand, screenerInstallCommand, screenerManualInstructions } from "../screener-commands.js";
+import { screenerStatusCommand, screenerInstallCommand, screenerManualInstructions, npmInstallRuntime } from "../screener-commands.js";
 import { screenerLoginLine } from "../commands.js";
 
 async function writeVerifiedModel(dir: string): Promise<void> {
@@ -349,5 +349,49 @@ describe("SCREENINSTALL: the prompt accepts an answer", () => {
     });
     expect(asked).toBe(false);
     expect(r.stdout).toContain("--yes");
+  });
+});
+
+describe("SCREENINSTALL: npmInstallRuntime", () => {
+  let runtimeDir: string;
+  const originalEnv = process.env["CELLO_SCREENER_RUNTIME_DIR"];
+
+  beforeEach(async () => {
+    runtimeDir = await mkdtemp(join(tmpdir(), "cello-runtime-"));
+    process.env["CELLO_SCREENER_RUNTIME_DIR"] = runtimeDir;
+  });
+
+  afterEach(async () => {
+    if (originalEnv !== undefined) {
+      process.env["CELLO_SCREENER_RUNTIME_DIR"] = originalEnv;
+    } else {
+      delete process.env["CELLO_SCREENER_RUNTIME_DIR"];
+    }
+    await rm(runtimeDir, { recursive: true, force: true });
+  });
+
+  it("writes .npmrc with allow-scripts and passes shell option appropriately", async () => {
+    let spawnedCmd = "";
+    let spawnedArgs: string[] = [];
+    let spawnedOptions: Record<string, unknown> = {};
+
+    const mockSpawn = (cmd: string, args: string[], options: Record<string, unknown>) => {
+      spawnedCmd = cmd;
+      spawnedArgs = args;
+      spawnedOptions = options;
+      const { EventEmitter } = require("node:events");
+      const ee = new EventEmitter();
+      process.nextTick(() => ee.emit("exit", 0));
+      return ee;
+    };
+
+    const { readFile } = await import("node:fs/promises");
+    await npmInstallRuntime(mockSpawn as unknown as typeof import("node:child_process").spawn);
+
+    const npmrcContent = await readFile(join(runtimeDir, ".npmrc"), "utf8");
+    expect(npmrcContent).toContain("allow-scripts=onnxruntime-node,protobufjs");
+    expect(spawnedCmd).toBe("npm");
+    expect(spawnedArgs).toEqual(["install", "--prefix", runtimeDir, "@huggingface/transformers"]);
+    expect(spawnedOptions["shell"]).toBe(process.platform === "win32");
   });
 });

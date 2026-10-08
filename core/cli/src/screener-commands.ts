@@ -14,7 +14,7 @@
  * silently drops the download size fails.
  */
 import { spawn } from "node:child_process";
-import { rm } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   SCREENER_MODEL,
@@ -176,9 +176,18 @@ async function askOnTerminal(question: string): Promise<string> {
   }
 }
 
-async function npmInstallRuntime(): Promise<void> {
+export async function npmInstallRuntime(spawnImpl: typeof spawn = spawn): Promise<void> {
+  const runtimeDir = screenerRuntimeDir();
+  await mkdir(runtimeDir, { recursive: true });
+  // npm 11+ skips lifecycle scripts by default unless allowed. onnxruntime-node
+  // relies on its postinstall script to download native binary artifacts (e.g. onnxruntime.dll on Windows).
+  await writeFile(join(runtimeDir, ".npmrc"), "allow-scripts=onnxruntime-node,protobufjs\n", "utf8");
+
   await new Promise<void>((resolve, reject) => {
-    const child = spawn("npm", ["install", "--prefix", screenerRuntimeDir(), SCREENER_RUNTIME_MODULE], { stdio: "inherit" });
+    const child = spawnImpl("npm", ["install", "--prefix", runtimeDir, SCREENER_RUNTIME_MODULE], {
+      stdio: "inherit",
+      shell: process.platform === "win32",
+    });
     child.on("error", reject);
     child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`npm exited ${code}`))));
   });
