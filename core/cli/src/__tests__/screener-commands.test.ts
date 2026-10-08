@@ -7,6 +7,7 @@
  * the download size still fails.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { EventEmitter } from "node:events";
 import { mkdtemp, rm, writeFile, mkdir, truncate } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
@@ -390,7 +391,6 @@ describe("SCREENINSTALL: npmInstallRuntime", () => {
         spawnedArgs = undefined;
         spawnedOptions = (argsOrOptions as Record<string, unknown>) || {};
       }
-      const { EventEmitter } = require("node:events");
       const ee = new EventEmitter();
       process.nextTick(() => ee.emit("exit", 0));
       return ee;
@@ -419,7 +419,6 @@ describe("SCREENINSTALL: npmInstallRuntime", () => {
     const mockSpawn = (cmd: string, options?: unknown) => {
       spawnedCmd = cmd;
       spawnedOptions = (options as Record<string, unknown>) || {};
-      const { EventEmitter } = require("node:events");
       const ee = new EventEmitter();
       process.nextTick(() => ee.emit("exit", 0));
       return ee;
@@ -445,7 +444,6 @@ describe("SCREENINSTALL: npmInstallRuntime", () => {
       spawnedCmd = cmd;
       spawnedArgs = args;
       spawnedOptions = options;
-      const { EventEmitter } = require("node:events");
       const ee = new EventEmitter();
       process.nextTick(() => ee.emit("exit", 0));
       return ee;
@@ -468,7 +466,6 @@ describe("SCREENINSTALL: npmInstallRuntime", () => {
     await writeFile(join(runtimeDir, ".npmrc"), "legacy-peer-deps=true\n", "utf8");
 
     const mockSpawn = () => {
-      const { EventEmitter } = require("node:events");
       const ee = new EventEmitter();
       process.nextTick(() => ee.emit("exit", 0));
       return ee;
