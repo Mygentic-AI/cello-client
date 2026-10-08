@@ -177,50 +177,49 @@ async function askOnTerminal(question: string): Promise<string> {
 }
 
 /**
- * Safely parse and merge `allow-scripts` packages into .npmrc text.
- * Preserves all other settings, comments, and empty lines.
+ * Safely parse, merge, and consolidate `allow-scripts` packages into .npmrc text.
+ * Preserves all other settings, comments, and empty lines, and consolidates any
+ * multiple `allow-scripts` lines into a single directive.
  */
 export function mergeAllowScripts(existing: string, requiredPackages = ["onnxruntime-node", "protobufjs"]): string {
   const lines = existing.split(/\r?\n/);
-  let found = false;
   const allowScriptsPattern = /^\s*allow-scripts\s*=\s*(.*)$/;
+  const collectedPkgs = new Set<string>();
+  let firstAllowScriptsIndex = -1;
 
-  const updatedLines = lines.map((line) => {
+  const nonAllowScriptLines: string[] = [];
+
+  for (const line of lines) {
     const match = line.match(allowScriptsPattern);
-    if (!match) return line;
-    found = true;
-    const existingPkgs = match[1]
-      .split(",")
-      .map((p) => p.trim())
-      .filter(Boolean);
-    const set = new Set(existingPkgs);
-    for (const pkg of requiredPackages) {
-      set.add(pkg);
+    if (match) {
+      if (firstAllowScriptsIndex === -1) {
+        firstAllowScriptsIndex = nonAllowScriptLines.length;
+      }
+      for (const p of match[1].split(",").map((s) => s.trim()).filter(Boolean)) {
+        collectedPkgs.add(p);
+      }
+    } else {
+      nonAllowScriptLines.push(line);
     }
-    return `allow-scripts=${Array.from(set).join(",")}`;
-  });
-
-  if (!found) {
-    if (updatedLines.length > 0 && updatedLines[updatedLines.length - 1] === "") {
-      updatedLines.pop();
-    }
-    updatedLines.push(`allow-scripts=${requiredPackages.join(",")}`);
   }
 
-  return updatedLines.join("\n") + "\n";
-}
-
-/**
- * Format the Windows npm install command string for cmd.exe shell execution,
- * safely escaping quotes and percent signs while rejecting control characters.
- */
-export function formatWindowsNpmInstallCommand(runtimeDir: string, moduleName: string): string {
-  if (/[\r\n&|<>^]/.test(runtimeDir)) {
-    throw new Error(`Invalid characters in screener runtime directory path: ${runtimeDir}`);
+  for (const pkg of requiredPackages) {
+    collectedPkgs.add(pkg);
   }
-  // Escape quotes and percent signs for cmd.exe
-  const safeDir = runtimeDir.replace(/"/g, '""').replace(/%/g, "%%");
-  return `npm install --prefix "${safeDir}" ${moduleName}`;
+
+  const consolidatedLine = `allow-scripts=${Array.from(collectedPkgs).join(",")}`;
+  const resultLines = [...nonAllowScriptLines];
+
+  if (firstAllowScriptsIndex !== -1) {
+    resultLines.splice(firstAllowScriptsIndex, 0, consolidatedLine);
+  } else {
+    while (resultLines.length > 0 && resultLines[resultLines.length - 1] === "") {
+      resultLines.pop();
+    }
+    resultLines.push(consolidatedLine);
+  }
+
+  return resultLines.join("\n") + "\n";
 }
 
 export interface NpmInstallRuntimeOptions {
@@ -254,12 +253,16 @@ export async function npmInstallRuntime(opts: NpmInstallRuntimeOptions | typeof 
   await new Promise<void>((resolve, reject) => {
     let child: import("node:child_process").ChildProcess;
     try {
+      // Running npm install directly inside cwd: runtimeDir avoids passing directory paths
+      // through shell command strings, completely eliminating shell expansion, quoting,
+      // and command injection risks from user directory paths on Windows.
       child = isWindows
         ? (spawnImpl as (command: string, options?: unknown) => import("node:child_process").ChildProcess)(
-            formatWindowsNpmInstallCommand(runtimeDir, SCREENER_RUNTIME_MODULE),
-            { stdio: "inherit", shell: true }
+            `npm install ${SCREENER_RUNTIME_MODULE}`,
+            { cwd: runtimeDir, stdio: "inherit", shell: true }
           )
-        : spawnImpl("npm", ["install", "--prefix", runtimeDir, SCREENER_RUNTIME_MODULE], {
+        : spawnImpl("npm", ["install", SCREENER_RUNTIME_MODULE], {
+            cwd: runtimeDir,
             stdio: "inherit",
             shell: false,
           });
