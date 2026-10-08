@@ -182,6 +182,9 @@ async function askOnTerminal(question: string): Promise<string> {
  * multiple `allow-scripts` lines into a single directive.
  */
 export function mergeAllowScripts(existing: string, requiredPackages = ["onnxruntime-node", "protobufjs"]): string {
+  if (existing.trim() === "") {
+    return `allow-scripts=${requiredPackages.join(",")}\n`;
+  }
   const lines = existing.split(/\r?\n/);
   const allowScriptsPattern = /^\s*allow-scripts\s*=\s*(.*)$/;
   const collectedPkgs = new Set<string>();
@@ -213,10 +216,11 @@ export function mergeAllowScripts(existing: string, requiredPackages = ["onnxrun
   if (firstAllowScriptsIndex !== -1) {
     resultLines.splice(firstAllowScriptsIndex, 0, consolidatedLine);
   } else {
-    while (resultLines.length > 0 && resultLines[resultLines.length - 1] === "") {
-      resultLines.pop();
-    }
     resultLines.push(consolidatedLine);
+  }
+
+  while (resultLines.length > 0 && resultLines[resultLines.length - 1] === "") {
+    resultLines.pop();
   }
 
   return resultLines.join("\n") + "\n";
