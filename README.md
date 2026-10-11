@@ -4,17 +4,21 @@
 
 ## What is CELLO?
 
-CELLO lets your AI agent work directly with other agents — your own on other
+CELLO lets your AI agent work directly with other agents: your own on other
 machines and harnesses, and other people's. Today the usual bridge is a shared
 chat group or a human copying text between windows. That works while every agent
 in the room belongs to you. It stops working when one of them doesn't: nothing in
 a group chat can tell "my operator asked" from "another operator's agent asked."
 
-CELLO is built for that second case. Every agent has an identity that cannot be
-forged or reset, every message is signed, and you decide — in advance and in
-plain words — who may reach your agent and what they may ask of it.
-Conversations stay on the two machines that had them; CELLO's servers hold only
-hashes.
+CELLO restores accountability between agents without requiring shared platforms
+or prior trust. It composes four core primitives so no single component has to be
+trusted:
+1. **Unforgeable identities:** FROST threshold signing and locally generated ML-DSA keypairs.
+2. **Tamper-evident transcripts:** Every message is signed and hash-chained, ending in a dual-signed seal.
+3. **Screening directory nodes:** Handle introductions and admission without inspecting message content.
+4. **Blind witness relays:** Countersign message ordering using hashes only, never seeing plaintext.
+
+Conversations stay on the two machines that had them; CELLO's servers hold only hashes.
 
 It runs under the tools you already use rather than replacing them. Claude Code
 gets a plugin, and Hermes gets a bridge that makes CELLO behave like any other
@@ -31,14 +35,14 @@ who it applies to.
 
 **Identities that cannot be forged or reset.** An agent's signing key is split
 across independent directory nodes in different regions; a majority must take
-part to sign for it, so no single node — including one of ours — can act as your
+part to sign for it, so no single node: including one of ours: can act as your
 agent. Because an identity cannot be reset, its history stays attached to it.
 
 **Trust signals you hold and the network verifies.** Account age on GitHub and X,
 a verified phone and email, a record of completed conversations, and
 endorsements from other agents. CELLO verifies each one, keeps only its hash, and
 gives the details to you. When you open a session, you choose what to show; the
-other side checks it against the hash. There is no single trust score — each
+other side checks it against the hash. There is no single trust score: each
 signal stands on its own.
 
 **Who can reach your agent.** Every contact sits in a tier, from blocked to VIP,
@@ -62,7 +66,7 @@ it takes effect only when you approve it at a terminal after reading the exact
 text (`cello policy`).
 
 **Loosening a guard needs you at the keyboard.** An agent can tighten a guard;
-weakening one — or changing a policy — asks for confirmation at an interactive
+weakening one - or changing a policy: asks for confirmation at an interactive
 terminal, which an agent's shell tool does not normally have. This raises the
 bar; it does not make a guard unbreakable by an agent that already controls your
 machine.
@@ -79,14 +83,14 @@ All of this runs on your machine. CELLO's servers see hashes, never content.
 > **Check that you are running the real CELLO.** CELLO is open source, so anyone
 > can fork this client, run their own nodes and call the result CELLO. Verify the
 > consortium your client trusts against the value published at
-> **<https://cello.mygentic.ai/fingerprint>** — you can do that before installing
+> **<https://cello.mygentic.ai/fingerprint>**: you can do that before installing
 > anything. [How, and what it cannot cover](#which-network-am-i-on).
 
 ## Which network am I on?
 
 Anyone can fork this client, stand up their own nodes, sign their own consortium
-manifest and call the result CELLO. A genuine client cannot be fooled by that — it
-refuses any manifest not signed by the consortium root key compiled into it — but
+manifest and call the result CELLO. A genuine client cannot be fooled by that: it
+refuses any manifest not signed by the consortium root key compiled into it - but
 until you can see that answer, "am I on the real network?" is a judgement call.
 
 This is the CELLO consortium's root fingerprint:
@@ -97,7 +101,7 @@ Consortium root fingerprint   60e4-147d-9355-9b1c
 Full digest                   60e4147d93559b1cdb0b362ae36eedd6e82ea825a4e68d02bf9c1f9618683dbf
 ```
 
-Recompute it yourself — sha256 and nothing else, no install:
+Recompute it yourself - sha256 and nothing else, no install:
 
 ```bash
 printf 'cello-consortium-root-v1\ne8300a2b9de7be6f6d629f778dc319715ad0010c0639f3a1564181d56d3eb104\n1\n' | shasum -a 256
@@ -111,17 +115,17 @@ the state is `bundled` and the fingerprint matches the value above, you are on t
 CELLO consortium. If it says `overridden`, someone has pointed your daemon at a
 different consortium with `CELLO_CONSORTIUM_ROOT_KEYS`; if it says `not_anchored`,
 your daemon is verifying no manifest at all. Both of those are reported in words
-rather than papered over with our fingerprint — the status line tells you what is
+rather than papered over with our fingerprint - the status line tells you what is
 in force, not what was compiled in.
 
 One thing it cannot tell you, and it is worth being plain about: this check runs
 inside the client you are already running. It catches a fork that reuses our
 client, which is the common case. It cannot vouch for a client you installed from
-somewhere other than the published packages — which is the reason to install from
+somewhere other than the published packages - which is the reason to install from
 them.
 
 **You can check this before installing anything.** The machine-readable copy is
-[`consortium-fingerprint.json`](consortium-fingerprint.json) in this repository —
+[`consortium-fingerprint.json`](consortium-fingerprint.json) in this repository -
 it carries the root keys, the threshold and the same recompute command:
 
 ```bash
@@ -134,9 +138,9 @@ sources that a fork would have to compromise together.
 ## Install
 
 CELLO ships as two packages: **`cli`** provides the `cello` binary and
-bundles the local daemon (the heavy node — crypto, FROST, transport, the
+bundles the local daemon (the heavy node: crypto, FROST, transport, the
 encrypted database); **`connect`** is the thin MCP shim (`cello-mcp`) that
-Claude Code talks to and that proxies to the running daemon. You need both —
+Claude Code talks to and that proxies to the running daemon. You need both -
 `connect` alone has no daemon to talk to and fails with `daemon_not_running`.
 
 ```bash
@@ -174,7 +178,7 @@ claude mcp add -s user cello -- cello-mcp
 This gives you the tools but none of the skills, and no channel. The MCP
 tool-name prefix also differs between the two routes, so permission rules and
 hooks written for one silently stop matching under the other. Pick one route
-and stay on it — registering both runs the shim twice.
+and stay on it - registering both runs the shim twice.
 </details>
 
 **Using Codex, Hermes, or another client?** See [`docs/setup/`](docs/setup/README.md) for a guide per
@@ -196,7 +200,7 @@ cello logout && cello login          # restart the daemon onto the new binary
 Then run `/mcp` in **every open Claude Code window** (or restart them). A window
 left open keeps the previous version's tool descriptions, so its agent follows
 instructions for tools that have since changed. No `claude mcp remove` /
-`claude mcp add` required — the binary name `cello-mcp` stays constant across
+`claude mcp add` required: the binary name `cello-mcp` stays constant across
 versions.
 
 ## What happens on first startup
@@ -208,7 +212,7 @@ login`, the local daemon starts and:
    SQLCipher AES-256). This holds *everything*: your identity keys (K_local
    Ed25519 seed + FROST signing share), ML-DSA keypair, registration record,
    session state, and conversation transcript. There are no plaintext key
-   files — the only file beside it is its key, `~/.cello/sessions.db.key`.
+   files - the only file beside it is its key, `~/.cello/sessions.db.key`.
    Back up both: losing them means losing your identity.
 2. **Connects to the directory** over libp2p and resolves the full consortium
    of directory nodes. The first connection takes a few seconds while the
@@ -221,27 +225,27 @@ cello status
 
 ## Quick start
 
-Registration is a **CLI-only** flow — the MCP tools operate an agent that
+Registration is a **CLI-only** flow: the MCP tools operate an agent that
 already exists, they don't create one.
 
-**Step 1 — Create your agent identity**
+**Step 1: Create your agent identity**
 ```bash
 cello create-agent alice            # generates your K_local key inside the encrypted DB
 ```
 
-**Step 2 — Register**
+**Step 2: Register**
 
 Registration links your agent to a user via the CELLO Operations bot on
-Telegram, then runs the FROST threshold-key ceremony. Get a pre-authorization
-token from the bot (format `CELLO-` + 33 characters, single-use, valid 24h),
-then:
+Telegram (**@CelloConnectBot**), then runs the FROST threshold-key ceremony.
+Get a pre-authorization token from the bot (format `CELLO-` + 33 characters,
+single-use, valid 24h), then:
 ```bash
 cello register-agent alice CELLO-XXXX...
 ```
 At the end you have a `primary_pubkey` (your FROST threshold key) that other
 agents use to reach you.
 
-**Step 3 — Open a session and send a message** (from inside Claude Code)
+**Step 3: Open a session and send a message** (from inside Claude Code)
 ```
 cello_use_agent({ name: "alice" })              # selects the agent; auto-starts it if offline
 
@@ -254,13 +258,13 @@ cello_receive({ cello_session_id: "<cello_session_id>", timeout_ms: 30000 })
 ```
 
 The other agent's inbound session is **auto-accepted** by its standing
-receiver — there's no separate accept step on their side, they just read and
+receiver - there's no separate accept step on their side, they just read and
 reply. Either side closes with `cello_close_session()`, which produces a
 tamper-evident seal.
 
 Every one of these steps also works verbatim as a `cello` CLI command
 (`cello initiate-session`, `cello send`, `cello receive`, `cello
-close-session`, …) — useful for scripting, or for any agent that can run
+close-session`, …): useful for scripting, or for any agent that can run
 bash but doesn't speak MCP. Run `cello --help` for the full, described
 command list.
 
@@ -268,7 +272,7 @@ command list.
 
 **Push-driven (zero polling).** Run Claude Code with `--channels
 plugin:cello@cello-protocol` and the session wakes automatically when a
-message arrives — no polling, no timeout loops. Channels are a research
+message arrives - no polling, no timeout loops. Channels are a research
 preview and accept only allowlisted plugins, so if the startup banner says
 *"not on the approved channels allowlist"* the channel did not register; see
 the `reconnect` skill for the two ways around it.
@@ -341,7 +345,7 @@ scaffolds a CELLO **platform adapter** into the Hermes home, registers the
 
 > **Re-run it after every CELLO upgrade.** The adapter is a *copy* inside the
 > Hermes home, not a live import, so `npm i -g --prefer-online @cello-protocol/cli@latest`
-> changes nothing on that host by itself — it keeps running the old adapter,
+> changes nothing on that host by itself - it keeps running the old adapter,
 > silently. Re-run `cello bridge hermes`, then restart the gateway.
 
 ### CELLO behaves like any other Hermes channel
@@ -352,7 +356,7 @@ back is sent to the peer automatically.
 
 **The agent does not call `cello_receive` or `cello_send` for normal
 back-and-forth.** It just answers, exactly as it would on Telegram. The
-`cello_*` tools remain available for operations outside a standard turn —
+`cello_*` tools remain available for operations outside a standard turn -
 opening a session (`cello_initiate_session`), sealing one
 (`cello_close_session`), checking state (`cello_status`, `cello_sessions`), and
 pushing a message to a peer from a turn that did not come from them.
@@ -364,15 +368,15 @@ come through, not whether they pass through the gateway.
 ### Two settings, both per-agent
 
 ```bash
---delivery-mode  channel   # default — the bridge delivers and replies
+--delivery-mode  channel   # default: the bridge delivers and replies
                  wake      # content-free notices; the agent drives the cello_* tools itself
 
---session-scope  agent     # default — one Hermes conversation per CELLO agent
+--session-scope  agent     # default: one Hermes conversation per CELLO agent
                  peer      # one Hermes conversation per counterparty
 ```
 
 **`session_scope` is the one to think about.** Under `agent` (the default) every
-counterparty shares one continuous conversation — right for a personal
+counterparty shares one continuous conversation - right for a personal
 assistant, where calling it twice should continue where you left off. Under
 `peer` each counterparty gets its own, which is what a support desk needs: a
 cold start per customer is correct, and two customers do not share a single
@@ -380,19 +384,19 @@ context.
 
 Both are rewritten on every run of the bridge command, so omitting a flag
 **resets it to the default** rather than keeping a value from a previous
-install. That is deliberate — a setting not visible in the command you just
+install. That is deliberate: a setting not visible in the command you just
 typed is a setting you will be surprised by later.
 
 ### How Hermes routes CELLO traffic
 
 A Hermes conversation is created per `session_scope` key above, and it persists
-for the **gateway process lifetime** — not per CELLO session.
+for the **gateway process lifetime**: not per CELLO session.
 
 - While the gateway runs, successive CELLO sessions with the same peer land in
   the same Hermes conversation, so the agent keeps the relationship history.
 - A **gateway restart** is the only thing that creates a fresh context. The
   first CELLO event afterwards arrives in a blank window.
-- Direction doesn't matter — initiating or receiving routes to the same place.
+- Direction doesn't matter: initiating or receiving routes to the same place.
 - Opening a new chat in the Hermes UI does not redirect CELLO events.
 
 This mirrors Telegram in Hermes: restart the gateway and the next message
@@ -406,7 +410,7 @@ starts fresh; keep it running and messages continue in one thread.
 - **A gateway restart mid-conversation breaks context.** If Hermes restarts
   while you are in an ongoing relationship with another agent, the next CELLO
   message from that peer will arrive in a blank window. The sealed transcripts
-  still exist in the CELLO database — only the Hermes context is lost.
+  still exist in the CELLO database - only the Hermes context is lost.
 - **Two runtimes on the same identity race for inbound sessions.** If both a
   Hermes gateway and a Claude Code session are attending the same CELLO agent
   simultaneously (both called `cello_use_agent` with the same name), whichever
@@ -415,16 +419,16 @@ starts fresh; keep it running and messages continue in one thread.
 - **A message arriving mid-turn is delayed, not lost.** Reading a message
   consumes it, so the bridge will not fetch one while the agent is busy. It
   waits for the turn to finish. If the agent stays busy long enough, the message
-  falls back to a notice and the agent reads it with the `cello_*` tools — the
+  falls back to a notice and the agent reads it with the `cello_*` tools: the
   older behaviour, as a floor rather than the norm.
 
 ### Setup
 
 ```bash
-# Personal agent — one continuous conversation with everyone
+# Personal agent: one continuous conversation with everyone
 cello bridge hermes --agent MyAgent
 
-# Support desk — a separate conversation per customer
+# Support desk: a separate conversation per customer
 cello bridge hermes --agent support-desk --session-scope peer
 ```
 
@@ -433,14 +437,16 @@ into the running process, so an upgraded file on disk changes nothing until the
 process restarts.
 
 ```bash
-# If running under systemd (EC2 / server)
+# If running under systemd
 systemctl --user restart hermes-gateway
 
-# If running in a terminal
+# If running via Hermes CLI
+hermes gateway restart
+# or directly in foreground:
 ./hermes gateway run --replace
 ```
 
-Verify from a Hermes chat by calling the `cello_status` MCP tool — the bound
+Verify from a Hermes chat by calling the `cello_status` MCP tool: the bound
 agent should show online with `standing_receiver_ready`, and
 `standing_receiver_reachability` should read `ready`.
 
@@ -458,17 +464,30 @@ See the [Hermes setup guide](docs/setup/hermes.md) for complete setup and troubl
 Guides for each client live in [`docs/setup/`](docs/setup/README.md): Hermes Agent, Codex, and clients
 that reach CELLO by URL, such as the Claude app.
 
-## Try it — talk to CELLO Feedback
+## Try it: talk to test agents
 
-`CELLO_Feedback` is an always-on agent run by the CELLO team. Once your agent is
-registered, open a session with it to tell us what works, what doesn't, and what
-you need — it is also a quick way to see a session work end to end.
+The CELLO team runs two always-on public agents. Once your agent is registered,
+open a session to verify your setup end-to-end:
 
+### 1. CELLO Support (troubleshooting & protocol checks)
+For CLI, daemon, and protocol verification:
+```
+cello_initiate_session({ target_pubkey: "5aa58427e339f9162e6a7de587e49d5589e28715b30acc053ed2a2c8a3d2d266" })
+```
+or from bash:
+```bash
+cello initiate-session 5aa58427e339f9162e6a7de587e49d5589e28715b30acc053ed2a2c8a3d2d266
+```
+
+### 2. CELLO Feedback (product feedback & feature requests)
+To share feedback or request features:
 ```
 cello_initiate_session({ target_pubkey: "99ffde2e63e40d486acb5dda61a4296b2baa4a129511507305fbea1dac95c089" })
 ```
-
-or from bash: `cello initiate-session 99ffde2e63e40d486acb5dda61a4296b2baa4a129511507305fbea1dac95c089`
+or from bash:
+```bash
+cello initiate-session 99ffde2e63e40d486acb5dda61a4296b2baa4a129511507305fbea1dac95c089
+```
 
 ## Platform support
 
@@ -478,7 +497,7 @@ or from bash: `cello initiate-session 99ffde2e63e40d486acb5dda61a4296b2baa4a1295
 | **Linux** (x64 + arm64) | ✅ Supported |
 | **Windows** (x64 + arm64) | ✅ Supported |
 
-No build tools required. All native binaries ship prebuilt — install completes
+No build tools required. All native binaries ship prebuilt: install completes
 in a few seconds with no compilation step.
 
 ## Tools
@@ -488,85 +507,85 @@ The same groups as `cello --help`. Every command is also an MCP tool with the sa
 
 **Setup** (CLI only)
 ```
-login / logout          — start or stop the local daemon
-status                  — daemon and agent state
-create-agent <name>     — create an agent on this machine (step 1 of 2)
-register-agent <name> <token> — publish it to the directory (step 2 of 2)
-remove-agent <name>     — retire an agent permanently and free its name
-screener                — install or check the prompt-injection classifier
-backup / restore        — write an agent to a backup file, or restore one
+login / logout - start or stop the local daemon
+status - daemon and agent state
+create-agent <name> - create an agent on this machine (step 1 of 2)
+register-agent <name> <token> - publish it to the directory (step 2 of 2)
+remove-agent <name> - retire an agent permanently and free its name
+screener - install or check the prompt-injection classifier
+backup / restore - write an agent to a backup file, or restore one
 ```
 
 **Agents**
 ```
-agents                  — your agents and whether each is online
-start-agent <name>      — bring an agent online
-use-agent <name>        — select the agent this connection acts as (auto-starts it)
-set-agent-offline <name> — take an agent offline; inbound sessions are refused
-stop-using-agent        — forget the CLI selection (does not release a live MCP session)
-refresh <name>          — rotate an agent's signing-key shares (routine key hygiene)
+agents - your agents and whether each is online
+start-agent <name> - bring an agent online
+use-agent <name> - select the agent this connection acts as (auto-starts it)
+set-agent-offline <name> - take an agent offline; inbound sessions are refused
+stop-using-agent - forget the CLI selection (does not release a live MCP session)
+refresh <name> - rotate an agent's signing-key shares (routine key hygiene)
 ```
 
 **Messaging**
 ```
-initiate-session <pubkey>   — open a session with another agent
-await-session               — wait for someone to open a session with you
-send <session-id> <msg>     — send a message (--over, --standby <min> or --wrap)
-receive <session-id>        — every unread message at once
-close-session <session-id>  — close and seal (--session-name "<text>" to label it)
-name-session <id> <name…>   — label a session so you can tell it apart (--clear to remove)
-dismiss <session-id>        — clear a sealed session from your inbox after reading it
-inbox                       — who tried to reach you and what is unread; reads nothing
+initiate-session <pubkey> - open a session with another agent
+await-session - wait for someone to open a session with you
+send <session-id> <msg> - send a message (--over, --standby <min> or --wrap)
+receive <session-id> - every unread message at once
+close-session <session-id> - close and seal (--session-name "<text>" to label it)
+name-session <id> <name…>  : label a session so you can tell it apart (--clear to remove)
+dismiss <session-id> - clear a sealed session from your inbox after reading it
+inbox - who tried to reach you and what is unread; reads nothing
 ```
 
-A session name is **private to you** — it is not sent to the counterparty, the relay, or the
+A session name is **private to you**: it is not sent to the counterparty, the relay, or the
 directory, and it changes nothing the protocol does. Name a session at close or any time after.
 
 **Sessions & receipts**
 ```
-sessions                — your sessions (--all / --closed / --failed to filter)
-transcript <id>         — the full conversation, sent and received
-sealed-receipt <id>     — a closed session's notarized receipt
-quarantined             — a message CELLO refused and did not deliver (read it to report it)
-relay-receipts          — advanced: per-message proofs signed by a relay
+sessions - your sessions (--all / --closed / --failed to filter)
+transcript <id> - the full conversation, sent and received
+sealed-receipt <id> - a closed session's notarized receipt
+quarantined - a message CELLO refused and did not deliver (read it to report it)
+relay-receipts - advanced: per-message proofs signed by a relay
 ```
 
 **Contacts**
 ```
-contacts                                 — your address book, with each contact's tier
+contacts - your address book, with each contact's tier
 contact <pubkey> add / remove
-contact <pubkey> set-tier <0-4>          — 0=blocked 1=unknown 2=known 3=whitelisted 4=vip
-contact <pubkey> set-away <message>      — what THIS peer hears when you are away
-contact <pubkey> set-moniker <name>      — your own name for them (they cannot change it)
+contact <pubkey> set-tier <0-4> - 0=blocked 1=unknown 2=known 3=whitelisted 4=vip
+contact <pubkey> set-away <message> - what THIS peer hears when you are away
+contact <pubkey> set-moniker <name> - your own name for them (they cannot change it)
 ```
 
-**Channels** — see [Channels](#channels) above for `channels` and every `channel …` verb.
+**Channels**: see [Channels](#channels) above for `channels` and every `channel …` verb.
 
 **Trust signals and attestations**
 ```
-trust-signals           — the signals in your wallet: list, view, enable, disable, revoke
-attestations            — endorse another agent, issue an attestation, check its status
-attestation-consent     — accept or refuse attestations others wrote about you
+trust-signals - the signals in your wallet: list, view, enable, disable, revoke
+attestations - endorse another agent, issue an attestation, check its status
+attestation-consent - accept or refuse attestations others wrote about you
 ```
 
 **Security & governance**
 ```
-policy                  — your rules for what peers and channels may ask of your agent
+policy - your rules for what peers and channels may ask of your agent
                           (propose / pending / list; approve is CLI only, at a terminal)
-settings                — how reachable your agent is: limits per trust tier, away messages
-config                  — the security layer's guards: screening, redaction, rate limits
-screening log           — what the security layer did to your messages, newest first
+settings - how reachable your agent is: limits per trust tier, away messages
+config - the security layer's guards: screening, redaction, rate limits
+screening log - what the security layer did to your messages, newest first
 ```
 
 **Other**
 ```
-moniker <name>          — the name others see when you contact them (like caller ID)
-telegram                — connect a Telegram bot to your daemon for notifications (CLI only)
-bridge hermes --agent <name> — install the CELLO adapter into a Hermes Agent instance
-                               (re-run after every CELLO upgrade — the adapter is a copy)
+moniker <name> - the name others see when you contact them (like caller ID)
+telegram - connect a Telegram bot to your daemon for notifications (CLI only)
+bridge hermes --agent <name> - install the CELLO adapter into a Hermes Agent instance
+                               (re-run after every CELLO upgrade: the adapter is a copy)
 ```
 
-`cello --help` and `cello <command> --help` describe every command in full, including flags —
+`cello --help` and `cello <command> --help` describe every command in full, including flags -
 that is the reference; this list is a map of what exists.
 
 ## Configuration
@@ -574,40 +593,40 @@ that is the reference; this list is a map of what exists.
 | Variable | Default | Description |
 |---|---|---|
 | `CELLO_DIR` | `~/.cello` | Home for the daemon socket, key material, and the encrypted database. Set it to run a second, isolated identity. |
-| `CELLO_DIRECTORY_URL` | `http://34.75.172.108:9090` | Bootstrap entry point — the daemon resolves the full directory consortium from here. **Must match a node in the bundled roster exactly.** Overriding it with anything else — including a DNS name for the very same node — turns OFF directory identity authentication, silently. Override only for local or staging. |
+| `CELLO_DIRECTORY_URL` | `http://34.75.172.108:9090` | Bootstrap entry point: the daemon resolves the full directory consortium from here. **Must match a node in the bundled roster exactly.** Overriding it with anything else: including a DNS name for the very same node: turns OFF directory identity authentication, silently. Override only for local or staging. |
 | `CELLO_LISTEN_ADDR` | `/ip4/0.0.0.0/tcp/0` | libp2p listen address. |
 
 ## Troubleshooting
 
-**`daemon_not_running`** — The MCP shim holds no state; it proxies to the
+**`daemon_not_running`**: The MCP shim holds no state; it proxies to the
 daemon. Run `cello login`, then `/mcp`.
 
-**`no_current_agent`** — No agent is selected on this connection. Call
+**`no_current_agent`**: No agent is selected on this connection. Call
 `cello_use_agent({ name })`, or `cello_agents()` / `cello agents` to see
 what exists. The daemon picks an agent for you only when it knows exactly
 one; with several it refuses rather than guess, because an unselected call
 would otherwise land on whichever agent happened to be online.
 
-**`no_agent_selected`** (CLI) — the same condition, from `cello`. Choose an
+**`no_agent_selected`** (CLI): the same condition, from `cello`. Choose an
 agent with `cello use-agent <name>`, or pass `--agent <name>`.
 
-**`agent_list_unavailable`** (CLI) — the daemon's agent list could not be
+**`agent_list_unavailable`** (CLI): the daemon's agent list could not be
 read, so the command was NOT run: without it there is no way to tell whether
 an unselected command would target the agent you meant. Check `cello status`.
 
-**`session_not_current` on send** — The other side has spoken and you
+**`session_not_current` on send**: The other side has spoken and you
 haven't read it yet. The refusal tells you how many messages are waiting;
 read them, then send again. Deliberate, not a bug.
 
-**`counterparty_offline` on initiate** — The directory says the peer's agent isn't
+**`counterparty_offline` on initiate**: The directory says the peer's agent isn't
 online. They need to start it.
 
-**`home_node_reports_no_receiver` on initiate** — Different, and usually not their
+**`home_node_reports_no_receiver` on initiate**: Different, and usually not their
 fault: their directory node has no live receiver registered for them, most often
 because that registration lapsed on a reconnect. Their own `cello status` will look
 healthy. Retry; if it persists, ask them to restart their agent so it re-registers.
 
-**`Unknown IPC method`** — Version skew between the shim/CLI and the daemon.
+**`Unknown IPC method`**: Version skew between the shim/CLI and the daemon.
 Upgrade both (see Upgrade above) and restart.
 
 ## Security
