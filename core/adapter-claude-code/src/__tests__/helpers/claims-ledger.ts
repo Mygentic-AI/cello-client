@@ -682,7 +682,6 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
     surface: "README.md",
     claim: "Intro and Security & governance: an agent identity cannot be forged or reset",
     excerpts: [
-      "Every agent has an identity that cannot be",
       "**Identities that cannot be forged or reset.**",
       "Because an identity cannot be reset",
     ],
@@ -719,7 +718,10 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "README.md",
     claim: "Security & governance: 'CELLO's servers see hashes, never content.'",
-    excerpts: ["CELLO's servers see hashes, never content."],
+    excerpts: [
+      "never seeing plaintext.",
+      "CELLO's servers see hashes, never content.",
+    ],
     enforcedBy: "structural",
     verdict: "true",
     evidence:
@@ -1427,9 +1429,9 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
     surface: "README.md",
     claim: "A genuine client cannot be fooled by a fork's consortium; the status line reports the key set actually in force, and says what it cannot vouch for",
     excerpts: [
-      "A genuine client cannot be fooled by that — it",
-      "refuses any manifest not signed by the consortium root key compiled into it — but",
-      "rather than papered over with our fingerprint — the status line tells you what is",
+      "A genuine client cannot be fooled by that: it",
+      "refuses any manifest not signed by the consortium root key compiled into it, but",
+      "rather than papered over with our fingerprint - the status line tells you what is",
       "`consortium_root_fingerprint`, alongside `consortium_root_fingerprint_state`. If",
       "your daemon is verifying no manifest at all. Both of those are reported in words",
       "One thing it cannot tell you, and it is worth being plain about: this check runs",
@@ -1563,15 +1565,17 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   },
   {
     surface: "README.md",
-    claim: "Open and invite-only channel posts are encrypted, readable by members only (public posts are not)",
+    claim: "Channels are a verified feed, and open/invite-only channel posts are encrypted, readable by members only (public posts are not)",
     excerpts: [
+      "A channel is a verified feed and sovereign syndication bus that many agents follow.",
       "Posts are encrypted, so only members can read them, not the relays and not CELLO.",
       "Posts are encrypted, as with open channels.",
     ],
     verdict: "true",
     enforcedBy: "daemon-local",
     evidence:
-      "`ChannelPublisher.publish` (core/daemon/src/channel-publisher.ts) encrypts every non-public " +
+      "`ChannelCollector` verifies each post's Ed25519 signature against the channel or leased poster " +
+      "pubkey before storing. `ChannelPublisher.publish` (core/daemon/src/channel-publisher.ts) encrypts every non-public " +
       "post with the channel group key before deposit, and a poster's post takes the same rule in " +
       "`ChannelPosterPublisher` (refuses channel_group_key_unavailable, never plaintext). The group " +
       "key reaches a member only through the join acceptance or a re-key, wrapped to that member's " +
