@@ -5,6 +5,12 @@
  */
 
 export { createNode, isValidMultiaddr, buildConfiguredHosts } from "./node.js";
+export {
+  installSafeNetworkInterfacesGuard,
+  uninstallSafeNetworkInterfacesGuardForTest,
+  type NetworkInterfacesFallbackEvent,
+  type SafeNetworkInterfacesGuardOptions,
+} from "./network-interfaces-guard.js";
 // DOD-RELAY-KEEPALIVE-1: the connection-monitor policy. WAN_PING_TIMEOUT_FLOOR_MS doubles as the
 // capability marker a consumer can test for — the relay refuses to start on a transport that
 // predates the policy, because there the connectionMonitor option is silently ignored.

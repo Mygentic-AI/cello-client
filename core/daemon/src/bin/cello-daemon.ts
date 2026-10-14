@@ -13,6 +13,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
+import { installSafeNetworkInterfacesGuard } from "@cello-protocol/transport";
 import { LocalSidecarGatewayClient, spawnGatewaySidecar, type SpawnedGateway } from "@cello-protocol/gateway";
 import { startDaemon } from "../daemon.js";
 import { resolveDbKey, dbKeyPathFor } from "../sqlcipher-db.js";
@@ -68,6 +69,20 @@ const stdoutLogger: Logger = {
 import { getDaemonIpcEndpoint, getGatewayIpcEndpoint } from "../ipc-endpoint.js";
 
 const logger: Logger = createCollapsingLogger(stdoutLogger);
+
+installSafeNetworkInterfacesGuard({
+  onFallback: (event) => {
+    logger.warn("transport.os.network_interfaces.fallback", {
+      code: event.code,
+      errno: event.errno ?? null,
+      syscall: event.syscall ?? null,
+      error: event.message,
+      impact:
+        "os.networkInterfaces() threw an OS error (common under Android SELinux / PRoot). " +
+        "Synthesized loopback interfaces are used for wildcard listen expansion; inbound sessions route over relay transport.",
+    });
+  },
+});
 
 const celloDir = process.env.CELLO_DIR || join(homedir(), ".cello");
 const socketPath = getDaemonIpcEndpoint(celloDir);

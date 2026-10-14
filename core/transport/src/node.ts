@@ -38,6 +38,7 @@ import {
   type Unsubscribe,
   DEFAULT_DIALABILITY,
 } from "./autonat.js";
+import { installSafeNetworkInterfacesGuard } from "./network-interfaces-guard.js";
 
 // ─── Dialability helpers ──────────────────────────────────────────────────────
 
@@ -1229,6 +1230,10 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
   const connectionMonitorPolicy = resolveConnectionMonitorConfig(opts);
   // Same discipline, same reason: resolved ONCE and handed to both libp2p and the node.
   const connectionLimits = resolveConnectionLimits(opts);
+
+  // Ensure os.networkInterfaces() is guarded before libp2p's TCP listener expands wildcard
+  // addresses (0.0.0.0 / ::), which throws ERR_SYSTEM_ERROR (EACCES) in Android / PRoot userlands.
+  installSafeNetworkInterfacesGuard();
 
   const libp2p = await createLibp2p({
     start: false,
