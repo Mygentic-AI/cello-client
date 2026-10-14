@@ -7,7 +7,6 @@
 export { createNode, isValidMultiaddr, buildConfiguredHosts } from "./node.js";
 export {
   installSafeNetworkInterfacesGuard,
-  uninstallSafeNetworkInterfacesGuardForTest,
   type NetworkInterfacesFallbackEvent,
   type SafeNetworkInterfacesGuardOptions,
 } from "./network-interfaces-guard.js";

@@ -100,12 +100,26 @@ export function installSafeNetworkInterfacesGuard(
   }
   if (opts?.onFallback !== undefined) {
     currentOnFallback = opts.onFallback;
+    reportedCodes.clear();
   }
   if (!installed) {
     os.networkInterfaces = guardedNetworkInterfaces;
     syncBuiltinESMExports();
     installed = true;
   }
+}
+
+/**
+ * Configure the underlying implementation and fallback listener WITHOUT installing the wrapper on
+ * `os.networkInterfaces` (for unit tests verifying that `createNode` itself installs the guard).
+ */
+export function setNetworkInterfacesImplForTest(
+  impl: () => NodeJS.Dict<os.NetworkInterfaceInfo[]>,
+  onFallback?: (event: NetworkInterfacesFallbackEvent) => void,
+): void {
+  currentImpl = impl;
+  currentOnFallback = onFallback;
+  reportedCodes.clear();
 }
 
 /** Restore the original `os.networkInterfaces` binding (for unit tests only). */

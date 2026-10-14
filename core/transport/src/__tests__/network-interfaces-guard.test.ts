@@ -27,9 +27,12 @@ import { generateKeypair, type KeyProvider } from "@cello-protocol/crypto";
 import {
   createNode,
   installSafeNetworkInterfacesGuard,
-  uninstallSafeNetworkInterfacesGuardForTest,
   type NetworkInterfacesFallbackEvent,
 } from "../index.js";
+import {
+  setNetworkInterfacesImplForTest,
+  uninstallSafeNetworkInterfacesGuardForTest,
+} from "../network-interfaces-guard.js";
 
 function makeKeyProvider(): KeyProvider {
   const inner = generateKeypair();
@@ -80,12 +83,13 @@ describe("installSafeNetworkInterfacesGuard", () => {
     expect(events).toEqual([]);
   });
 
-  it("2. catches ERR_SYSTEM_ERROR, reports upstream cause via onFallback once per code, and returns loopback interfaces", () => {
+  it("2. catches ERR_SYSTEM_ERROR, reports upstream cause via onFallback once per distinct code, and returns loopback interfaces", () => {
     const events: NetworkInterfacesFallbackEvent[] = [];
+    let currentError: NodeJS.ErrnoException = makeProotSystemError();
 
     installSafeNetworkInterfacesGuard({
       impl: () => {
-        throw makeProotSystemError();
+        throw currentError;
       },
       onFallback: (e) => events.push(e),
     });
@@ -99,9 +103,18 @@ describe("installSafeNetworkInterfacesGuard", () => {
       { address: "::1", family: "IPv6", internal: true },
     ]);
     expect(second["lo"]?.[0]?.address).toBe("127.0.0.1");
+    expect(events).toHaveLength(1);
 
-    // Reported once per distinct error code so repeated getAddrs() calls do not flood daemon.log,
-    // while carrying the full upstream cause (code, errno, syscall, message).
+    // A second distinct error code MUST be reported (proving per-code dedup rather than a boolean).
+    const eperm = new Error("uv_interface_addresses returned EPERM") as NodeJS.ErrnoException;
+    eperm.code = "EPERM";
+    eperm.errno = -1;
+    eperm.syscall = "uv_interface_addresses";
+    currentError = eperm;
+
+    os.networkInterfaces();
+    os.networkInterfaces();
+
     expect(events).toEqual([
       {
         code: "ERR_SYSTEM_ERROR",
@@ -109,10 +122,16 @@ describe("installSafeNetworkInterfacesGuard", () => {
         syscall: "uv_interface_addresses",
         message: "A system error occurred: uv_interface_addresses returned EACCES (permission denied)",
       },
+      {
+        code: "EPERM",
+        errno: -1,
+        syscall: "uv_interface_addresses",
+        message: "uv_interface_addresses returned EPERM",
+      },
     ]);
   });
 
-  it("3. syncBuiltinESMExports propagates the guarded function to the node:os ESM namespace", () => {
+  it("3. syncBuiltinESMExports propagates the guarded function to the node:os ESM namespace, and replacing onFallback clears prior code dedup", () => {
     installSafeNetworkInterfacesGuard({
       impl: () => {
         throw makeProotSystemError();
@@ -122,17 +141,30 @@ describe("installSafeNetworkInterfacesGuard", () => {
     expect(osNamespace.networkInterfaces).toBe(os.networkInterfaces);
     const viaNamespace = osNamespace.networkInterfaces();
     expect(viaNamespace["lo"]?.[0]?.address).toBe("127.0.0.1");
+
+    // Registering onFallback after an earlier un-listened fallback still delivers the event.
+    const lateEvents: NetworkInterfacesFallbackEvent[] = [];
+    installSafeNetworkInterfacesGuard({
+      onFallback: (e) => lateEvents.push(e),
+    });
+    os.networkInterfaces();
+    expect(lateEvents).toHaveLength(1);
+    expect(lateEvents[0]?.code).toBe("ERR_SYSTEM_ERROR");
   });
 
-  it("4. a real CelloNode listening on /ip4/0.0.0.0/tcp/0 starts and expands its wildcard address under PRoot failure", async () => {
+  it("4. createNode itself installs the guard so a CelloNode listening on /ip4/0.0.0.0/tcp/0 starts under PRoot failure", async () => {
     const events: NetworkInterfacesFallbackEvent[] = [];
+    const unguardedBinding = os.networkInterfaces;
 
-    installSafeNetworkInterfacesGuard({
-      impl: () => {
+    // Stage the throwing impl WITHOUT pre-installing the wrapper on os.networkInterfaces, so
+    // deleting installSafeNetworkInterfacesGuard() in createNode (node.ts) makes this test fail.
+    setNetworkInterfacesImplForTest(
+      () => {
         throw makeProotSystemError();
       },
-      onFallback: (e) => events.push(e),
-    });
+      (e) => events.push(e),
+    );
+    expect(os.networkInterfaces).toBe(unguardedBinding);
 
     const kp = makeKeyProvider();
     const node = await createNode({
@@ -141,6 +173,7 @@ describe("installSafeNetworkInterfacesGuard", () => {
       nodeType: "standing_receiver",
       autonatResponder: { enabled: false },
     });
+    expect(os.networkInterfaces).not.toBe(unguardedBinding);
 
     await node.start();
     try {
