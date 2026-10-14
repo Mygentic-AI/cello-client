@@ -24,21 +24,8 @@ export interface CheckNodeRuntimeOptions {
 }
 
 export type CheckNodeRuntimeResult =
-  | {
-      readonly ok: true;
-      readonly major: number;
-      readonly version: string;
-      readonly execPath: string;
-      readonly pathPrepended: boolean;
-    }
-  | {
-      readonly ok: false;
-      readonly major: number;
-      readonly version: string;
-      readonly execPath: string;
-      readonly minMajor: number;
-      readonly message: string;
-    };
+  | { readonly ok: true }
+  | { readonly ok: false; readonly message: string };
 
 export function checkNodeRuntime(opts?: CheckNodeRuntimeOptions): CheckNodeRuntimeResult {
   const rawVersion = (opts?.version ?? process.versions.node).replace(/^v/i, "");
@@ -54,32 +41,17 @@ export function checkNodeRuntime(opts?: CheckNodeRuntimeOptions): CheckNodeRunti
       `Unsupported Node.js runtime v${rawVersion} at ${execPath} (CELLO requires Node.js >=${minMajor}).\n` +
       `If you have a newer Node.js installed on this machine, place its bin directory first on PATH:\n` +
       `  export PATH="<path-to-node-${minMajor}+-bin>:$PATH"`;
-    return {
-      ok: false,
-      major: Number.isFinite(major) ? major : 0,
-      version: rawVersion,
-      execPath,
-      minMajor,
-      message,
-    };
+    return { ok: false, message };
   }
 
   const execDir = dirname(execPath);
   const currentPath = env["PATH"] ?? "";
   const segments = currentPath.length > 0 ? currentPath.split(delimiter) : [];
-  let pathPrepended = false;
   if (segments[0] !== execDir) {
     env["PATH"] = currentPath.length > 0 ? `${execDir}${delimiter}${currentPath}` : execDir;
-    pathPrepended = true;
   }
 
-  return {
-    ok: true,
-    major,
-    version: rawVersion,
-    execPath,
-    pathPrepended,
-  };
+  return { ok: true };
 }
 
 export interface EnforceNodeRuntimeOptions extends CheckNodeRuntimeOptions {

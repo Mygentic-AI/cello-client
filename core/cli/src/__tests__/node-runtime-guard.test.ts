@@ -17,11 +17,25 @@
 
 import { describe, it, expect } from "vitest";
 import { delimiter, join } from "node:path";
+import { existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { checkNodeRuntime, enforceNodeRuntime } from "../node-runtime-guard.js";
 
+function findTsx(): string {
+  const isWin = process.platform === "win32";
+  const candidates = [
+    join(import.meta.dirname, "../../../../node_modules/.bin", isWin ? "tsx.cmd" : "tsx"),
+    join(import.meta.dirname, "../../../../node_modules/.pnpm/node_modules/.bin", isWin ? "tsx.cmd" : "tsx"),
+    join(import.meta.dirname, "../../../daemon/node_modules/.bin", isWin ? "tsx.cmd" : "tsx"),
+  ];
+  for (const p of candidates) {
+    if (existsSync(p)) return p;
+  }
+  throw new Error(`tsx not found in candidate paths: ${candidates.join(", ")}`);
+}
+
 describe("node-runtime-guard (CLI)", () => {
-  it("1. passes on Node >= 22 and prepends dirname(execPath) to PATH when not already first", () => {
+  it("1. passes on Node >= 22 and prepends dirname(execPath) to PATH (including when PATH is empty)", () => {
     const env: NodeJS.ProcessEnv = {
       PATH: `/usr/local/bin${delimiter}/usr/bin`,
     };
@@ -31,12 +45,17 @@ describe("node-runtime-guard (CLI)", () => {
       env,
     });
 
-    expect(res.ok).toBe(true);
-    if (res.ok) {
-      expect(res.major).toBe(24);
-      expect(res.pathPrepended).toBe(true);
-    }
+    expect(res).toEqual({ ok: true });
     expect(env.PATH).toBe(`/opt/private-node-v24/bin${delimiter}/usr/local/bin${delimiter}/usr/bin`);
+
+    const emptyEnv: NodeJS.ProcessEnv = {};
+    const emptyRes = checkNodeRuntime({
+      version: "22.0.0",
+      execPath: "/opt/node22/bin/node",
+      env: emptyEnv,
+    });
+    expect(emptyRes).toEqual({ ok: true });
+    expect(emptyEnv.PATH).toBe("/opt/node22/bin");
   });
 
   it("2. does not duplicate dirname(execPath) when it is already first on PATH", () => {
@@ -48,15 +67,11 @@ describe("node-runtime-guard (CLI)", () => {
       env,
     });
 
-    expect(res.ok).toBe(true);
-    if (res.ok) {
-      expect(res.major).toBe(22);
-      expect(res.pathPrepended).toBe(false);
-    }
+    expect(res).toEqual({ ok: true });
     expect(env.PATH).toBe(initialPath);
   });
 
-  it("3. refuses Node < 22 and names both version and execPath with remediation guidance", () => {
+  it("3. refuses Node < 22 and unparseable versions, naming both version and execPath with guidance", () => {
     const env: NodeJS.ProcessEnv = { PATH: "/usr/bin" };
     const res = checkNodeRuntime({
       version: "20.11.1",
@@ -66,13 +81,21 @@ describe("node-runtime-guard (CLI)", () => {
 
     expect(res.ok).toBe(false);
     if (!res.ok) {
-      expect(res.major).toBe(20);
-      expect(res.version).toBe("20.11.1");
-      expect(res.execPath).toBe("/usr/bin/node");
       expect(res.message).toContain("20.11.1");
       expect(res.message).toContain("/usr/bin/node");
       expect(res.message).toContain(">=22");
       expect(res.message).toContain("PATH");
+    }
+
+    const badVer = checkNodeRuntime({
+      version: "invalid",
+      execPath: "/usr/local/bin/node",
+      env,
+    });
+    expect(badVer.ok).toBe(false);
+    if (!badVer.ok) {
+      expect(badVer.message).toContain("invalid");
+      expect(badVer.message).toContain("/usr/local/bin/node");
     }
   });
 
@@ -107,10 +130,12 @@ describe("node-runtime-guard (CLI)", () => {
     expect(okLines).toEqual([]);
   });
 
-  it("5. dist/bin/cello.js invokes enforceNodeRuntime at startup before dispatching", () => {
-    const binPath = join(import.meta.dirname, "../../dist/bin/cello.js");
-    const run = spawnSync(process.execPath, [binPath, "--version"], {
+  it("5. src/bin/cello.ts invokes enforceNodeRuntime via first import before dispatching", () => {
+    const tsxPath = findTsx();
+    const binPath = join(import.meta.dirname, "../bin/cello.ts");
+    const run = spawnSync(tsxPath, [binPath, "--version"], {
       env: { ...process.env, CELLO_MIN_NODE_MAJOR: "999" },
+      shell: process.platform === "win32",
       encoding: "utf8",
     });
 

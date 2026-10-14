@@ -7,10 +7,10 @@
  * creates no libp2p node. Per-connection agent state is managed by the daemon.
  */
 
+import "../node-runtime-guard-init.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createWriteStream, mkdirSync } from "node:fs";
-import { enforceNodeRuntime } from "../node-runtime-guard.js";
 import { getDaemonIpcEndpoint } from "../ipc-endpoint.js";
 import { IpcProxy } from "../ipc-proxy.js";
 import { forwardDaemonNotifications } from "../channel-forward.js";
@@ -18,8 +18,6 @@ import { summarizeInboundFrame } from "../frame-trace.js";
 import { registerCelloTools } from "../cello-tools.js";
 import { installDaemonGate } from "../daemon-gate.js";
 import { logEvent } from "../shim-log.js";
-
-enforceNodeRuntime();
 
 // --version flag — exit cleanly with the package version.
 // Must precede TTY detection so `cello-mcp --version` works in any context.
