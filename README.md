@@ -586,7 +586,7 @@ that is the authoritative reference; this list is a map of what exists.
 | Variable | Default | Description |
 |---|---|---|
 | `CELLO_DIR` | `~/.cello` | Home for the daemon socket, key material, and the encrypted database. Set it to run a second, isolated identity. |
-| `CELLO_DIRECTORY_URL` | `http://34.75.172.108:9090` | Bootstrap entry point: the daemon resolves the full directory consortium from here. **Must match a node in the bundled roster exactly.** Overriding it with anything else (including a DNS name for the very same node) turns OFF directory identity authentication, silently. Override only for local or staging. |
+| `CELLO_DIRECTORY_URL` | *(bundled HTTPS roster)* | Bootstrap entry point: when unset, the daemon picks from the bundled HTTPS consortium roster (`https://directory-{use1,usc1,euw1}.cello.mygentic.ai`). **Must match a node in the bundled roster exactly.** Overriding it with anything else (including a DNS name for the very same node) turns OFF directory identity authentication, silently. Leave unset in production; override only for local or staging. |
 | `CELLO_LISTEN_ADDR` | `/ip4/0.0.0.0/tcp/0` | libp2p listen address. |
 
 ## Troubleshooting
