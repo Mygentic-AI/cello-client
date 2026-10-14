@@ -15,9 +15,12 @@
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { createRequire } from "node:module";
+import { enforceNodeRuntime } from "../node-runtime-guard.js";
 import { KNOWN_COMMANDS, USAGE, checkArgs, helpForCommand, topLevelFlag } from "../cli-args.js";
 import { findCommand, type CommandContext } from "../registry.js";
 import type { Logger } from "@cello-protocol/daemon";
+
+enforceNodeRuntime();
 
 // Debug is OFF unless asked for. It used to write to stderr unconditionally, which made "demote a
 // noisy line to debug" a no-op for anyone standing at a terminal — the line still printed, just with
