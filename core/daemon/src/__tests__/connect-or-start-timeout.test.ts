@@ -66,7 +66,7 @@ describe("connectOrStart startup timeout and early boot log", () => {
     expect(CONTENDED_LOCK_RETRY_TIMEOUT_MS).toBe(10_000);
   });
 
-  it("2. times out after configured startTimeoutMs when spawned process stays alive without opening socket, including daemon.log tail", async () => {
+  it("2. times out after configured startTimeoutMs or CELLO_DAEMON_START_TIMEOUT_MS (with ms and whole-second formatting) and includes daemon.log tail", async () => {
     const dir = await mkdtemp(join(tmpdir(), "cello-start-timeout-"));
     tempDirs.push(dir);
     const fakeBin = join(dir, "fake-hung-daemon.mjs");
@@ -88,10 +88,27 @@ describe("connectOrStart startup timeout and early boot log", () => {
 
     const { readFile } = await import("node:fs/promises");
     const pidText = await readFile(join(dir, "pid.txt"), "utf8").catch(() => "");
-    if (pidText.trim()) childPids.push(Number(pidText.trim()));
+    if (pidText.trim()) {
+      try { process.kill(Number(pidText.trim()), "SIGKILL"); } catch { /* exited */ }
+    }
+
+    // Exercise CELLO_DAEMON_START_TIMEOUT_MS env override (whole-second formatting) with opts omitted.
+    const savedEnv = process.env["CELLO_DAEMON_START_TIMEOUT_MS"];
+    process.env["CELLO_DAEMON_START_TIMEOUT_MS"] = "1000";
+    try {
+      await expect(
+        connectOrStart(dir, silentLogger, fakeBin),
+      ).rejects.toThrow(/Daemon failed to start within 1 second\.[\s\S]*daemon\.boot\.starting/);
+    } finally {
+      if (savedEnv === undefined) delete process.env["CELLO_DAEMON_START_TIMEOUT_MS"];
+      else process.env["CELLO_DAEMON_START_TIMEOUT_MS"] = savedEnv;
+    }
+
+    const pidText2 = await readFile(join(dir, "pid.txt"), "utf8").catch(() => "");
+    if (pidText2.trim()) childPids.push(Number(pidText2.trim()));
   });
 
-  it("3. fails fast when spawned child exits non-zero without waiting for full startTimeoutMs", async () => {
+  it("3. rejects malformed startTimeoutMs / CELLO_DAEMON_START_TIMEOUT_MS loudly instead of silently falling back, and fails fast on early child exit", async () => {
     const dir = await mkdtemp(join(tmpdir(), "cello-start-fastfail-"));
     tempDirs.push(dir);
     const fakeBin = join(dir, "fake-crash-daemon.mjs");
@@ -103,6 +120,21 @@ describe("connectOrStart startup timeout and early boot log", () => {
       ].join("\n"),
       "utf8",
     );
+
+    await expect(
+      connectOrStart(dir, silentLogger, fakeBin, { startTimeoutMs: 0 }),
+    ).rejects.toThrow(/Invalid startTimeoutMs \(0\): must be a positive integer/);
+
+    const savedEnv = process.env["CELLO_DAEMON_START_TIMEOUT_MS"];
+    process.env["CELLO_DAEMON_START_TIMEOUT_MS"] = "30s";
+    try {
+      await expect(
+        connectOrStart(dir, silentLogger, fakeBin),
+      ).rejects.toThrow(/Invalid CELLO_DAEMON_START_TIMEOUT_MS \("30s"\): must be a positive integer/);
+    } finally {
+      if (savedEnv === undefined) delete process.env["CELLO_DAEMON_START_TIMEOUT_MS"];
+      else process.env["CELLO_DAEMON_START_TIMEOUT_MS"] = savedEnv;
+    }
 
     const startedAt = Date.now();
     await expect(

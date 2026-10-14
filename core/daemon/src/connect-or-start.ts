@@ -55,19 +55,38 @@ export const DEFAULT_DAEMON_START_TIMEOUT_MS = 30_000;
  */
 export const CONTENDED_LOCK_RETRY_TIMEOUT_MS = 10_000;
 
-function resolveStartTimeoutMs(opts?: ConnectOrStartOptions): number {
-  if (opts?.startTimeoutMs !== undefined && Number.isFinite(opts.startTimeoutMs) && opts.startTimeoutMs > 0) {
+export function resolveStartTimeoutMs(
+  opts?: ConnectOrStartOptions,
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  if (opts?.startTimeoutMs !== undefined) {
+    if (!Number.isInteger(opts.startTimeoutMs) || opts.startTimeoutMs <= 0) {
+      throw new Error(
+        `Invalid startTimeoutMs (${String(opts.startTimeoutMs)}): must be a positive integer millisecond budget.`,
+      );
+    }
     return opts.startTimeoutMs;
   }
-  const envVal = Number(process.env["CELLO_DAEMON_START_TIMEOUT_MS"]);
-  if (Number.isInteger(envVal) && envVal > 0) {
+  const rawEnv = env["CELLO_DAEMON_START_TIMEOUT_MS"];
+  if (rawEnv !== undefined && rawEnv.trim() !== "") {
+    const trimmed = rawEnv.trim();
+    const envVal = Number(trimmed);
+    if (!/^\d+$/.test(trimmed) || !Number.isSafeInteger(envVal) || envVal <= 0) {
+      throw new Error(
+        `Invalid CELLO_DAEMON_START_TIMEOUT_MS ("${rawEnv}"): must be a positive integer millisecond budget.`,
+      );
+    }
     return envVal;
   }
   return DEFAULT_DAEMON_START_TIMEOUT_MS;
 }
 
 function formatTimeoutWindow(timeoutMs: number): string {
-  return timeoutMs % 1_000 === 0 ? `${timeoutMs / 1_000} seconds` : `${timeoutMs}ms`;
+  if (timeoutMs % 1_000 === 0) {
+    const secs = timeoutMs / 1_000;
+    return secs === 1 ? "1 second" : `${secs} seconds`;
+  }
+  return `${timeoutMs}ms`;
 }
 
 export async function connectOrStart(
