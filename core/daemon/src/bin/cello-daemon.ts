@@ -200,6 +200,10 @@ async function stopSecurityLayer(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  // Log process boot entry immediately so daemon.log records true wall-clock startup duration
+  // before acquireSingletonLock and spawnGatewaySidecar run.
+  logger.info("daemon.boot.starting", { pid: process.pid, celloDir, version });
+
   // M7 Keystone (Part 1): give the daemon its door to the directory. The resolver
   // discovers the directory endpoint via GET ${CELLO_DIRECTORY_URL}/bootstrap (the
   // proven M6 path); startDaemon builds the real signalingConnect from it + the

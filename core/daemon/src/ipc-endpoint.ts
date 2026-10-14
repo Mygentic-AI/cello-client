@@ -15,13 +15,10 @@ import { createHash } from "node:crypto";
 import { win32, posix } from "node:path";
 
 export function getDaemonIpcEndpoint(celloDir: string, platform: NodeJS.Platform = process.platform): string {
-  console.log("getDaemonIpcEndpoint called with celloDir:", celloDir, "platform:", platform, "process.platform:", process.platform);
   if (platform === "win32") {
     const canonical = win32.resolve(celloDir).toLowerCase().replace(/\//g, "\\");
     const hash = createHash("sha256").update(canonical).digest("hex").slice(0, 12);
-    const result = `\\\\.\\pipe\\cello-${hash}-daemon`;
-    console.log("getDaemonIpcEndpoint win32 resolved to:", result);
-    return result;
+    return `\\\\.\\pipe\\cello-${hash}-daemon`;
   }
   return posix.join(celloDir, "daemon.sock");
 }

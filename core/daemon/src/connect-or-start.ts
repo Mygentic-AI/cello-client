@@ -32,10 +32,49 @@ export interface ConnectResult {
   alreadyRunning: boolean;
 }
 
+export interface ConnectOrStartOptions {
+  /** Override how long `spawnDaemon` waits for the newly spawned daemon's IPC socket to open. */
+  startTimeoutMs?: number;
+}
+
+/**
+ * How long `spawnDaemon` waits for a newly spawned daemon process to open its IPC socket.
+ *
+ * Before `ipcServer.start()` opens `daemon.sock`, `cello-daemon` sequentially spawns the security
+ * gateway sidecar (`spawnGatewaySidecar`, which runs classifier self-checks with a 60s ceiling),
+ * verifies the consortium manifest, and probes directory `/bootstrap` endpoints. On Android/PRoot,
+ * ARM, or cold boots, gateway sidecar startup plus manifest verification takes 8–12s total while
+ * `daemon.log` only shows ~2.5s between `security.gateway.spawned` and `daemon.started`. 30s gives
+ * slow cold boots headroom while fast boots still return on the first 150ms poll tick.
+ */
+export const DEFAULT_DAEMON_START_TIMEOUT_MS = 30_000;
+
+/**
+ * How long `connectWithRetry` waits when the singleton kernel lock is ALREADY held by a live
+ * process whose IPC socket is not answering. Kept at 10s so wedged-holder detection stays fast.
+ */
+export const CONTENDED_LOCK_RETRY_TIMEOUT_MS = 10_000;
+
+function resolveStartTimeoutMs(opts?: ConnectOrStartOptions): number {
+  if (opts?.startTimeoutMs !== undefined && Number.isFinite(opts.startTimeoutMs) && opts.startTimeoutMs > 0) {
+    return opts.startTimeoutMs;
+  }
+  const envVal = Number(process.env["CELLO_DAEMON_START_TIMEOUT_MS"]);
+  if (Number.isInteger(envVal) && envVal > 0) {
+    return envVal;
+  }
+  return DEFAULT_DAEMON_START_TIMEOUT_MS;
+}
+
+function formatTimeoutWindow(timeoutMs: number): string {
+  return timeoutMs % 1_000 === 0 ? `${timeoutMs / 1_000} seconds` : `${timeoutMs}ms`;
+}
+
 export async function connectOrStart(
   celloDir: string,
   logger: Logger,
   daemonBin: string,
+  opts?: ConnectOrStartOptions,
 ): Promise<ConnectResult> {
   // A CELLO_DIR that does not exist yet (first ever run) would make the singleton probe below fail to
   // open its lock file, and "I could not ask the kernel" would be reported as "I don't know whether a
@@ -87,7 +126,8 @@ export async function connectOrStart(
     logger.info("daemon.lock.stale", { pid: lock.pid, reason: "no_singleton_holder" });
     await removeLock(lockFilePath, logger);
   }
-  const client = await spawnDaemon(celloDir, daemonBin, lockFilePath, logger);
+  const startTimeoutMs = resolveStartTimeoutMs(opts);
+  const client = await spawnDaemon(celloDir, daemonBin, lockFilePath, logger, startTimeoutMs);
   return { client, alreadyRunning: false };
 }
 
@@ -105,7 +145,7 @@ async function connectWithRetry(
   logger: Logger,
   holderPid: number | null,
 ): Promise<IpcClient> {
-  const deadline = Date.now() + 10_000;
+  const deadline = Date.now() + CONTENDED_LOCK_RETRY_TIMEOUT_MS;
   let lastError: unknown;
   while (Date.now() < deadline) {
     try {
@@ -135,6 +175,7 @@ async function spawnDaemon(
   daemonBin: string,
   lockFilePath: string,
   logger: Logger,
+  startTimeoutMs: number,
 ): Promise<IpcClient> {
   const socketPath = getDaemonIpcEndpoint(celloDir);
   const logPath = join(celloDir, "daemon.log");
@@ -170,7 +211,7 @@ async function spawnDaemon(
   child.on("error", (err: Error) => { spawnError = err; });
   child.on("exit", (code: number | null) => { exitCode = code; });
 
-  const deadline = Date.now() + 10_000;
+  const deadline = Date.now() + startTimeoutMs;
   while (Date.now() < deadline) {
     if (spawnError) throw spawnError;
     try {
@@ -195,7 +236,9 @@ async function spawnDaemon(
       await new Promise((r) => setTimeout(r, 150));
     }
   }
-  throw new Error(`Daemon failed to start within 10 seconds.\n${await daemonLogTail(logPath)}`);
+  throw new Error(
+    `Daemon failed to start within ${formatTimeoutWindow(startTimeoutMs)}.\n${await daemonLogTail(logPath)}`,
+  );
 }
 
 async function daemonLogTail(logPath: string): Promise<string> {
