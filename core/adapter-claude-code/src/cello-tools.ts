@@ -148,14 +148,25 @@ server.tool("cello_attestations_issued", "What happened to attestations YOU wrot
   const [issued, fetched] = await Promise.all([
     proxy.call("wallet_list_issued", {}) as Promise<{
       ok: boolean;
+      reason?: string;
+      guidance?: string;
       issued?: Array<{ submission_id: string }>;
       in_flight?: Array<{ submission_id: string; delivery: string }>;
     }>,
-    proxy.call("wallet_fetch_results", {}) as Promise<{ ok: boolean; results?: Array<{ submission_id: string }>; unreachable_nodes?: string[] }>,
+    proxy.call("wallet_fetch_results", {}) as Promise<{
+      ok: boolean;
+      reason?: string;
+      guidance?: string;
+      results?: Array<{ submission_id: string }>;
+      unreachable_nodes?: string[];
+    }>,
   ]);
+  const primaryError = !issued.ok ? issued : !fetched.ok ? fetched : undefined;
   const byId = new Map((fetched.results ?? []).map((r) => [r.submission_id, r]));
   return jsonText({
     ok: issued.ok && fetched.ok,
+    ...(primaryError?.reason !== undefined ? { reason: primaryError.reason } : {}),
+    ...(primaryError?.guidance !== undefined ? { guidance: primaryError.guidance } : {}),
     ...(issued.ok ? {} : { issued_error: issued }),
     ...(fetched.ok ? {} : { results_error: fetched }),
     submissions: (issued.issued ?? []).map((s) => ({
