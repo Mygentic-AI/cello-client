@@ -3,8 +3,8 @@
  *
  * Every CELLO MCP tool returns `{ ok: false, reason, guidance }` at the top level when a daemon
  * IPC call fails. `cello_attestations_issued` fans out to two IPC verbs (`wallet_list_issued` and
- * `wallet_fetch_results`) and previously buried failures inside `issued_error` / `results_error`
- * while omitting top-level `reason` and `guidance`.
+ * `wallet_fetch_results`) and surfaces the primary failure `reason` and `guidance` at the top level
+ * alongside per-call `issued_error` / `results_error`.
  *
  * Clauses verified here:
  *   1. When both `wallet_list_issued` and `wallet_fetch_results` succeed (`ok: true`), the tool
@@ -87,7 +87,7 @@ describe("cello_attestations_issued error semantics", () => {
     expect("guidance" in payload).toBe(false);
   });
 
-  it("2. surfaces top-level reason and guidance when wallet_list_issued fails (and retains both error objects on dual failure)", async () => {
+  it("2. surfaces top-level reason and guidance when wallet_list_issued fails (both alone and on dual failure with distinct reasons)", async () => {
     const issuedErr = {
       ok: false,
       reason: "no_current_agent",
@@ -95,11 +95,30 @@ describe("cello_attestations_issued error semantics", () => {
     };
     const fetchedErr = {
       ok: false,
-      reason: "no_current_agent",
-      guidance: "Select an agent with cello_use_agent.",
+      reason: "directory_unreachable",
+      guidance: "Check cello_status and retry when a directory node is reachable.",
     };
 
-    const proxy: ToolProxy = {
+    // Case A: only wallet_list_issued fails (results_error must be omitted).
+    const singleFailProxy: ToolProxy = {
+      async call(method: string) {
+        if (method === "wallet_list_issued") return issuedErr;
+        if (method === "wallet_fetch_results") return { ok: true, results: [], unreachable_nodes: [] };
+        throw new Error(`Unexpected method: ${method}`);
+      },
+    };
+    const singleHandler = captureToolHandler("cello_attestations_issued", singleFailProxy);
+    const singleRes = await singleHandler({});
+    expect(singleRes.isError).toBeUndefined();
+    const singlePayload = JSON.parse(singleRes.content[0]!.text) as Record<string, unknown>;
+    expect(singlePayload["ok"]).toBe(false);
+    expect(singlePayload["reason"]).toBe("no_current_agent");
+    expect(singlePayload["guidance"]).toBe("No agent is selected on this connection. Call cello_use_agent first.");
+    expect(singlePayload["issued_error"]).toEqual(issuedErr);
+    expect(singlePayload["results_error"]).toBeUndefined();
+
+    // Case B: both fail with distinct reasons -> issued takes precedence at top level, both error objects retained.
+    const dualFailProxy: ToolProxy = {
       async call(method: string) {
         if (method === "wallet_list_issued") return issuedErr;
         if (method === "wallet_fetch_results") return fetchedErr;
@@ -107,7 +126,7 @@ describe("cello_attestations_issued error semantics", () => {
       },
     };
 
-    const handler = captureToolHandler("cello_attestations_issued", proxy);
+    const handler = captureToolHandler("cello_attestations_issued", dualFailProxy);
     const res = await handler({});
     expect(res.isError).toBeUndefined();
     const payload = JSON.parse(res.content[0]!.text) as Record<string, unknown>;
