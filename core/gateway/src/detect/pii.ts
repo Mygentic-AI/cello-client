@@ -84,8 +84,10 @@ const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?)?/;
  */
 function isPlausiblePhone(value: string): boolean {
   const trimmed = value.trim();
-  const remainder = trimmed.replace(ISO_DATE_RE, "");
-  // Nothing but a date -> not a phone. Anything left -> judge the remainder on its own merits.
+  const remainder = trimmed
+    .replace(ISO_DATE_RE, "")
+    .replace(IP_RE, (m) => (isNonIdentifyingIpv4(m) ? "" : m));
+  // Nothing but a date or non-identifying local IP -> not a phone. Anything left -> judge the remainder on its own merits.
   const digits = remainder.replace(/\D/g, "");
   return digits.length >= 7;
 }
@@ -107,9 +109,35 @@ function luhnValid(digits: string): boolean {
   return digits.length > 0 && sum % 10 === 0;
 }
 
-function validIp(value: string): boolean {
+function parseIpv4Octets(value: string): [number, number, number, number] | null {
   const parts = value.split(".");
-  return parts.length === 4 && parts.every((p) => { const n = Number(p); return p.length > 0 && n >= 0 && n <= 255; });
+  if (parts.length !== 4) return null;
+  const octets: number[] = [];
+  for (const p of parts) {
+    const n = Number(p);
+    if (p.length === 0 || n < 0 || n > 255) return null;
+    octets.push(n);
+  }
+  return octets as [number, number, number, number];
+}
+
+/**
+ * Non-identifying RFC 1122 / RFC 919 local-only IPv4 addresses cannot identify a host or person:
+ *   - 127.0.0.0/8 (loopback, e.g. 127.0.0.1)
+ *   - 0.0.0.0 (unspecified bind address)
+ *   - 255.255.255.255 (limited broadcast)
+ */
+function isNonIdentifyingIpv4(value: string): boolean {
+  const octets = parseIpv4Octets(value);
+  if (!octets) return false;
+  if (octets[0] === 127) return true;
+  if (octets[0] === 0 && octets[1] === 0 && octets[2] === 0 && octets[3] === 0) return true;
+  if (octets[0] === 255 && octets[1] === 255 && octets[2] === 255 && octets[3] === 255) return true;
+  return false;
+}
+
+function validIp(value: string): boolean {
+  return parseIpv4Octets(value) !== null && !isNonIdentifyingIpv4(value);
 }
 
 function normalizeEmail(v: string): string { return v.toLowerCase(); }

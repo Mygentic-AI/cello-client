@@ -89,4 +89,25 @@ describe("M9-OUT-002 OutboundPIIScreener", () => {
     expect(r.disposition).toBe("allow");
     expect(r.events).toHaveLength(0);
   });
+
+  it("loopback (127.0.0.0/8), unspecified (0.0.0.0), and broadcast (255.255.255.255) addresses pass without pii:ip or pii:phone warn, while routable IPs and adjacent phone numbers still warn", () => {
+    const s = new OutboundPIIScreener({ whitelist: [] });
+    const localMsg = "Synthesized loopback 127.0.0.1 127.0.1.1 and 127.255.255.254 bind 0.0.0.0 broadcast 255.255.255.255";
+    const clean = s.screen(enc(localMsg), "s-local");
+    expect(clean.disposition).toBe("allow");
+    expect(clean.events).toHaveLength(0);
+
+    for (const ip of ["126.0.0.1", "128.0.0.1", "192.168.1.42", "10.0.0.1", "34.75.172.108"]) {
+      const flagged = s.screen(enc(`host ${ip} here`), `s-${ip}`);
+      expect(flagged.disposition).toBe("warn");
+      expect(flagged.events).toHaveLength(1);
+      expect(flagged.events[0].category).toBe("pii:ip");
+      expect(flagged.events[0].value).toBe(ip);
+    }
+
+    // F3 guard: a loopback IP immediately followed by a real phone number still warns on the phone number.
+    const withPhone = s.screen(enc("loopback 127.0.0.1 415-555-2671 call me"), "s-phone");
+    expect(withPhone.disposition).toBe("warn");
+    expect(withPhone.events.some((e) => e.category === "pii:phone")).toBe(true);
+  });
 });
