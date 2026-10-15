@@ -69,14 +69,28 @@ describe("M9-OUT-003 screenOutboundExfil", () => {
     expect(r.events).toHaveLength(0);
   });
 
-  it("camelCase, PascalCase, snake_case, and kebab-case code identifiers are NOT redacted as exfil:encoded", () => {
-    const input =
-      "Added installSafeNetworkInterfacesGuard and uninstallSafeNetworkInterfacesGuardForTest " +
-      "plus syncBuiltinESMExports and OutboundPIIScreenerConfiguration " +
-      "and DEFAULT_DAEMON_START_TIMEOUT_MS and network_interfaces_fallback_guard and network-interfaces-guard-helper in transport";
+  it("camelCase, PascalCase, snake_case, and kebab-case code identifiers with >= 4.0 bits entropy are NOT redacted as exfil:encoded, while pure-letter base64 is", () => {
+    const highEntropyIdentifiers = [
+      "installSafeNetworkInterfacesGuard",
+      "uninstallSafeNetworkInterfacesGuardForTest",
+      "standingReceiverWatchdogIntervalMs",
+      "InMemorySignalingOutboundQueue",
+      "synchronizeBuiltinESMExports",
+      "BuiltinESMExportsSynchronizer",
+      "network_interfaces_fallback_guard",
+      "DIRECTORY_MANIFEST_POLL_MISCONFIGURED",
+      "network-interfaces-fallback-guard",
+    ];
+    const input = `Added ${highEntropyIdentifiers.join(" ")} in transport`;
     const r = screenOutboundExfil(enc(input));
     expect(r.disposition).toBe("allow");
     expect(r.text).toBe(input);
     expect(r.events).toHaveLength(0);
+
+    const pureLetterB64 = "dGhpc2lzYXNlY3JldHBheWxvYWRoaWRkZW5pbmJhc2Vmb3JleGZpbA";
+    const redacted = screenOutboundExfil(enc(`payload ${pureLetterB64} end`));
+    expect(redacted.disposition).toBe("redact");
+    expect(redacted.text).not.toContain(pureLetterB64);
+    expect(redacted.events.some((e) => e.category === "exfil:encoded")).toBe(true);
   });
 });

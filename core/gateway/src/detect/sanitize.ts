@@ -276,28 +276,33 @@ const SNAKE_OR_KEBAB_IDENTIFIER =
  * SCREAMING_SNAKE_CASE, or kebab-case code identifier rather than an encoded (base64/hex) blob:
  *   - No digits (`0-9`) and no base64 operators (`+`, `/`, `=`).
  *   - Either 2+ pure-alphabetic segments separated by `_` or `-` (snake_case / kebab-case), OR
- *   - Pure ASCII letters with at least one case transition, where every lowercase run is >= 2 chars
- *     (rejecting single-letter lowercase transitions like `dGh` or `NlY` in base64), at least two
- *     lowercase runs are >= 3 chars, and every uppercase run is 1..6 chars (word boundary or short
- *     acronym like `ESM`, `PII`, `HTTP`).
+ *   - Pure ASCII letters with at least one case transition, where lowercase runs are >= 2 chars
+ *     (allowing at most one 1-char lowercase run immediately after a 1-char uppercase run for
+ *     2-letter TitleCase words like `In`, `To`, `Of`, `By`, `Id`, `Ms`), at least two lowercase
+ *     runs are >= 3 chars, and every uppercase run is 1..6 chars (word boundary or short acronym
+ *     like `ESM`, `PII`, `HTTP`).
  */
-export function isCodeIdentifier(token: string): boolean {
+function isCodeIdentifier(token: string): boolean {
   if (/[0-9+/=]/.test(token)) return false;
   if (SNAKE_OR_KEBAB_IDENTIFIER.test(token)) return true;
   if (!/^[A-Za-z]+$/.test(token)) return false;
   const runs = token.match(/[A-Z]+|[a-z]+/g);
   if (!runs || runs.length < 3) return false;
   let lowerWordsGe3 = 0;
-  for (const run of runs) {
+  let singleLowerRuns = 0;
+  for (let i = 0; i < runs.length; i++) {
+    const run = runs[i]!;
     const isUpper = run.charCodeAt(0) <= 90;
     if (isUpper) {
       if (run.length > 6) return false;
-    } else {
-      if (run.length < 2) return false;
-      if (run.length >= 3) lowerWordsGe3 += 1;
+    } else if (run.length === 1) {
+      if (i === 0 || runs[i - 1]!.length !== 1) return false;
+      singleLowerRuns += 1;
+    } else if (run.length >= 3) {
+      lowerWordsGe3 += 1;
     }
   }
-  return lowerWordsGe3 >= 2;
+  return lowerWordsGe3 >= 2 && singleLowerRuns <= 1;
 }
 
 /** The space-free, encoded-alphabet, high-entropy tokens (encoded-blob candidates) in `text`. */

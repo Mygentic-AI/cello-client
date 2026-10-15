@@ -174,12 +174,19 @@ describe("M9-IN-001 sanitizeInbound — deterministic Layer-1 steps", () => {
     expect(r.notes).toHaveLength(0);
   });
 
-  it("camelCase, PascalCase, snake_case, and kebab-case code identifiers >= 20 chars do not trip high-entropy detection, while all-letter base64 still does", () => {
-    const codeMsg = [
-      "Updated installSafeNetworkInterfacesGuard and uninstallSafeNetworkInterfacesGuardForTest",
-      "plus syncBuiltinESMExports, OutboundPIIScreenerConfiguration, network_interfaces_fallback_guard,",
-      "DEFAULT_DAEMON_START_TIMEOUT_MS, and network-interfaces-guard-helper.",
-    ].join(" ");
+  it("camelCase, PascalCase, snake_case, and kebab-case code identifiers >= 20 chars with >= 4.0 bits entropy do not trip high-entropy detection, while all-letter base64 still does", () => {
+    const highEntropyIdentifiers = [
+      "installSafeNetworkInterfacesGuard",
+      "uninstallSafeNetworkInterfacesGuardForTest",
+      "standingReceiverWatchdogIntervalMs",
+      "InMemorySignalingOutboundQueue",
+      "synchronizeBuiltinESMExports",
+      "BuiltinESMExportsSynchronizer",
+      "network_interfaces_fallback_guard",
+      "DIRECTORY_MANIFEST_POLL_MISCONFIGURED",
+      "network-interfaces-fallback-guard",
+    ];
+    const codeMsg = `Updated ${highEntropyIdentifiers.join(" ")} in gateway`;
     const clean = sanitizeInbound(enc(codeMsg));
     expect(clean.entropySuspicion).toBe(0);
     expect(clean.notes.find((n) => n.step === "entropy")).toBeUndefined();
