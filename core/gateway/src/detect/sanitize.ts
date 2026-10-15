@@ -268,12 +268,45 @@ function shannonBits(s: string): number {
 // which excludes URLs, file paths, and prose (they carry `:` `/` `.` or whitespace). This keeps
 // the entropy signal on actual encoded payloads, not legitimate long tokens like a URL.
 const ENCODED_CHARSET = /^[A-Za-z0-9+/=_-]+$/;
+const SNAKE_OR_KEBAB_IDENTIFIER =
+  /^(?:[a-z]{2,}(?:_[a-z]{2,})+$|[A-Z]{2,}(?:_[A-Z]{2,})+$|[a-z]{2,}(?:-[a-z]{2,})+$)/;
+
+/**
+ * True when `token` has the structural shape of a camelCase, PascalCase, snake_case,
+ * SCREAMING_SNAKE_CASE, or kebab-case code identifier rather than an encoded (base64/hex) blob:
+ *   - No digits (`0-9`) and no base64 operators (`+`, `/`, `=`).
+ *   - Either 2+ pure-alphabetic segments separated by `_` or `-` (snake_case / kebab-case), OR
+ *   - Pure ASCII letters with at least one case transition, where every lowercase run is >= 2 chars
+ *     (rejecting single-letter lowercase transitions like `dGh` or `NlY` in base64), at least two
+ *     lowercase runs are >= 3 chars, and every uppercase run is 1..6 chars (word boundary or short
+ *     acronym like `ESM`, `PII`, `HTTP`).
+ */
+export function isCodeIdentifier(token: string): boolean {
+  if (/[0-9+/=]/.test(token)) return false;
+  if (SNAKE_OR_KEBAB_IDENTIFIER.test(token)) return true;
+  if (!/^[A-Za-z]+$/.test(token)) return false;
+  const runs = token.match(/[A-Z]+|[a-z]+/g);
+  if (!runs || runs.length < 3) return false;
+  let lowerWordsGe3 = 0;
+  for (const run of runs) {
+    const isUpper = run.charCodeAt(0) <= 90;
+    if (isUpper) {
+      if (run.length > 6) return false;
+    } else {
+      if (run.length < 2) return false;
+      if (run.length >= 3) lowerWordsGe3 += 1;
+    }
+  }
+  return lowerWordsGe3 >= 2;
+}
+
 /** The space-free, encoded-alphabet, high-entropy tokens (encoded-blob candidates) in `text`. */
 export function highEntropyTokens(text: string): string[] {
   const found: string[] = [];
   for (const token of text.split(/\s+/)) {
     if (token.length < ENTROPY_MIN_TOKEN_LEN) continue;
     if (!ENCODED_CHARSET.test(token)) continue;
+    if (isCodeIdentifier(token)) continue;
     if (shannonBits(token) >= ENTROPY_BITS_THRESHOLD) found.push(token);
   }
   return found;

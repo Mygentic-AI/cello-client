@@ -173,4 +173,21 @@ describe("M9-IN-001 sanitizeInbound — deterministic Layer-1 steps", () => {
     expect(r.entropySuspicion).toBe(0);
     expect(r.notes).toHaveLength(0);
   });
+
+  it("camelCase, PascalCase, snake_case, and kebab-case code identifiers >= 20 chars do not trip high-entropy detection, while all-letter base64 still does", () => {
+    const codeMsg = [
+      "Updated installSafeNetworkInterfacesGuard and uninstallSafeNetworkInterfacesGuardForTest",
+      "plus syncBuiltinESMExports, OutboundPIIScreenerConfiguration, network_interfaces_fallback_guard,",
+      "DEFAULT_DAEMON_START_TIMEOUT_MS, and network-interfaces-guard-helper.",
+    ].join(" ");
+    const clean = sanitizeInbound(enc(codeMsg));
+    expect(clean.entropySuspicion).toBe(0);
+    expect(clean.notes.find((n) => n.step === "entropy")).toBeUndefined();
+
+    // Pure-letter base64 (no digits, no +/=) for "thisisasecretpayloadhiddeninbasefor" still trips entropy.
+    const pureLetterB64 = "dGhpc2lzYXNlY3JldHBheWxvYWRoaWRkZW5pbmJhc2Vmb3JleGZpbA";
+    const flagged = sanitizeInbound(enc(`note: ${pureLetterB64} end`));
+    expect(flagged.entropySuspicion).toBeGreaterThan(0);
+    expect(flagged.notes.find((n) => n.step === "entropy")).toBeDefined();
+  });
 });

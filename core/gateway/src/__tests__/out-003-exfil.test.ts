@@ -68,4 +68,15 @@ describe("M9-OUT-003 screenOutboundExfil", () => {
     expect(r.text).toBe(input);
     expect(r.events).toHaveLength(0);
   });
+
+  it("camelCase, PascalCase, snake_case, and kebab-case code identifiers are NOT redacted as exfil:encoded", () => {
+    const input =
+      "Added installSafeNetworkInterfacesGuard and uninstallSafeNetworkInterfacesGuardForTest " +
+      "plus syncBuiltinESMExports and OutboundPIIScreenerConfiguration " +
+      "and DEFAULT_DAEMON_START_TIMEOUT_MS and network_interfaces_fallback_guard and network-interfaces-guard-helper in transport";
+    const r = screenOutboundExfil(enc(input));
+    expect(r.disposition).toBe("allow");
+    expect(r.text).toBe(input);
+    expect(r.events).toHaveLength(0);
+  });
 });
