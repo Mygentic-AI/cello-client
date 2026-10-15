@@ -84,10 +84,8 @@ const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?)?/;
  */
 function isPlausiblePhone(value: string): boolean {
   const trimmed = value.trim();
-  const remainder = trimmed
-    .replace(ISO_DATE_RE, "")
-    .replace(IP_RE, (m) => (isNonIdentifyingIpv4(m) ? "" : m));
-  // Nothing but a date or non-identifying local IP -> not a phone. Anything left -> judge the remainder on its own merits.
+  const remainder = trimmed.replace(ISO_DATE_RE, "");
+  // Nothing but a date -> not a phone. Anything left -> judge the remainder on its own merits.
   const digits = remainder.replace(/\D/g, "");
   return digits.length >= 7;
 }
@@ -169,18 +167,30 @@ export class OutboundPIIScreener {
     const text = new TextDecoder("utf-8", { fatal: false }).decode(content);
 
     const candidates: Candidate[] = [];
-    const collect = (re: RegExp, category: PIICategory, priority: number, accept: (v: string) => boolean) => {
-      for (const m of text.matchAll(re)) {
+    const collect = (
+      sourceText: string,
+      re: RegExp,
+      category: PIICategory,
+      priority: number,
+      accept: (v: string) => boolean,
+    ) => {
+      for (const m of sourceText.matchAll(re)) {
         const value = m[0];
         if (!accept(value)) continue;
         candidates.push({ start: m.index ?? 0, end: (m.index ?? 0) + value.length, category, value, priority });
       }
     };
-    collect(EMAIL_RE, "pii:email", 0, () => true);
-    collect(IP_RE, "pii:ip", 1, validIp);
-    collect(SSN_RE, "pii:ssn", 2, () => true);
-    collect(CC_RE, "pii:credit_card", 3, (v) => luhnValid(v.replace(/[^0-9]/g, "")));
-    collect(PHONE_RE, "pii:phone", 4, isPlausiblePhone);
+    collect(text, EMAIL_RE, "pii:email", 0, () => true);
+    collect(text, IP_RE, "pii:ip", 1, validIp);
+    collect(text, SSN_RE, "pii:ssn", 2, () => true);
+    collect(text, CC_RE, "pii:credit_card", 3, (v) => luhnValid(v.replace(/[^0-9]/g, "")));
+    // Mask valid IPv4 tokens (both routable and non-identifying local IPs) with equal-length "_" runs
+    // before running PHONE_RE so a 7+-digit reserved IP (e.g. 127.255.255.254, 255.255.255.255) never
+    // falls through as pii:phone, and PHONE_RE never greedily bridges across an IP into an adjacent
+    // phone number (which would either collide with pii:ip and drop the phone warn, or pollute the
+    // phone candidate's value/span with the preceding IP).
+    const phoneText = text.replace(IP_RE, (m) => (parseIpv4Octets(m) !== null ? "_".repeat(m.length) : m));
+    collect(phoneText, PHONE_RE, "pii:phone", 4, isPlausiblePhone);
 
     // Resolve overlaps: a higher-priority (more specific) match wins its character span.
     candidates.sort((a, b) => a.priority - b.priority || a.start - b.start);

@@ -97,7 +97,17 @@ describe("M9-OUT-002 OutboundPIIScreener", () => {
     expect(clean.disposition).toBe("allow");
     expect(clean.events).toHaveLength(0);
 
-    for (const ip of ["126.0.0.1", "128.0.0.1", "192.168.1.42", "10.0.0.1", "34.75.172.108"]) {
+    for (const ip of [
+      "0.0.0.1",
+      "0.1.2.3",
+      "126.0.0.1",
+      "128.0.0.1",
+      "192.168.1.42",
+      "10.0.0.1",
+      "34.75.172.108",
+      "255.255.255.0",
+      "255.0.0.1",
+    ]) {
       const flagged = s.screen(enc(`host ${ip} here`), `s-${ip}`);
       expect(flagged.disposition).toBe("warn");
       expect(flagged.events).toHaveLength(1);
@@ -105,9 +115,24 @@ describe("M9-OUT-002 OutboundPIIScreener", () => {
       expect(flagged.events[0].value).toBe(ip);
     }
 
-    // F3 guard: a loopback IP immediately followed by a real phone number still warns on the phone number.
+    // F3 guard: a loopback IP immediately followed by a real phone number still warns on the exact phone number,
+    // and a routable IP followed by a phone number warns on BOTH without span collision.
     const withPhone = s.screen(enc("loopback 127.0.0.1 415-555-2671 call me"), "s-phone");
     expect(withPhone.disposition).toBe("warn");
-    expect(withPhone.events.some((e) => e.category === "pii:phone")).toBe(true);
+    expect(withPhone.events).toHaveLength(1);
+    expect(withPhone.events[0].category).toBe("pii:phone");
+    expect(withPhone.events[0].value).toBe("415-555-2671");
+
+    const routableWithPhone = s.screen(enc("host 10.0.0.1 415-555-2671 call me"), "s-routable-phone");
+    expect(routableWithPhone.disposition).toBe("warn");
+    expect(routableWithPhone.events.map((e) => ({ category: e.category, value: e.value }))).toEqual([
+      { category: "pii:ip", value: "10.0.0.1" },
+      { category: "pii:phone", value: "415-555-2671" },
+    ]);
+
+    const sWhitelisted = new OutboundPIIScreener({ whitelist: ["+1 415 555 2671"] });
+    const whitelistedAfterLoopback = sWhitelisted.screen(enc("loopback 127.0.0.1 14155552671 ok"), "s-wl");
+    expect(whitelistedAfterLoopback.disposition).toBe("allow");
+    expect(whitelistedAfterLoopback.events).toHaveLength(0);
   });
 });
