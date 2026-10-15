@@ -19,7 +19,11 @@ import { describe, it, expect } from "vitest";
 import { delimiter, join } from "node:path";
 import { existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { checkNodeRuntime, enforceNodeRuntime } from "../node-runtime-guard.js";
+import {
+  checkNodeRuntime,
+  enforceNodeRuntime,
+  suppressUnconfiguredLocalStorageWarning,
+} from "../node-runtime-guard.js";
 
 function findTsx(): string {
   const isWin = process.platform === "win32";
@@ -143,5 +147,57 @@ describe("node-runtime-guard (CLI)", () => {
     expect(run.stderr).toContain(process.versions.node);
     expect(run.stderr).toContain(process.execPath);
     expect(run.stderr).toContain(">=999");
+  });
+
+  it("6. suppressUnconfiguredLocalStorageWarning neutralizes an unconfigured localStorage getter without invoking it, preserves configured --localstorage-file, and keeps cello --version stderr clean", () => {
+    let getterInvoked = 0;
+    const fakeGlobal: Record<string, unknown> = {};
+    Object.defineProperty(fakeGlobal, "localStorage", {
+      get() {
+        getterInvoked += 1;
+        return undefined;
+      },
+      configurable: true,
+      enumerable: true,
+    });
+
+    // When --localstorage-file is present in execArgv or NODE_OPTIONS, getter is preserved.
+    suppressUnconfiguredLocalStorageWarning({
+      target: fakeGlobal,
+      execArgv: ["--localstorage-file=/tmp/store"],
+      env: {},
+    });
+    expect(Object.getOwnPropertyDescriptor(fakeGlobal, "localStorage")?.get).toBeTypeOf("function");
+
+    suppressUnconfiguredLocalStorageWarning({
+      target: fakeGlobal,
+      execArgv: [],
+      env: { NODE_OPTIONS: "--localstorage-file /tmp/store" },
+    });
+    expect(Object.getOwnPropertyDescriptor(fakeGlobal, "localStorage")?.get).toBeTypeOf("function");
+    expect(getterInvoked).toBe(0);
+
+    // When --localstorage-file is absent, getter is replaced with undefined without invoking it.
+    suppressUnconfiguredLocalStorageWarning({
+      target: fakeGlobal,
+      execArgv: [],
+      env: {},
+    });
+    expect(getterInvoked).toBe(0);
+    expect(Object.getOwnPropertyDescriptor(fakeGlobal, "localStorage")?.get).toBeUndefined();
+    expect(fakeGlobal["localStorage"]).toBeUndefined();
+    expect(getterInvoked).toBe(0);
+
+    // End-to-end subprocess check: running cello.ts --version emits zero ExperimentalWarning on stderr.
+    const tsxPath = findTsx();
+    const binPath = join(import.meta.dirname, "../bin/cello.ts");
+    const okRun = spawnSync(tsxPath, [binPath, "--version"], {
+      env: { ...process.env },
+      shell: process.platform === "win32",
+      encoding: "utf8",
+    });
+    expect(okRun.status).toBe(0);
+    expect(okRun.stderr).not.toContain("ExperimentalWarning");
+    expect(okRun.stderr).not.toContain("localStorage");
   });
 });

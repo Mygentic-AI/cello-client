@@ -54,12 +54,52 @@ export function checkNodeRuntime(opts?: CheckNodeRuntimeOptions): CheckNodeRunti
   return { ok: true };
 }
 
+export interface SuppressLocalStorageWarningOptions {
+  target?: object;
+  execArgv?: readonly string[];
+  env?: NodeJS.ProcessEnv;
+}
+
+/**
+ * Node 25+ defines a lazy getter on `globalThis.localStorage` (`node:internal/webstorage`) that
+ * emits `ExperimentalWarning: localStorage is not available because --localstorage-file was not
+ * provided.` the first time any dependency (such as `lib0/storage.js` via `yjs`) evaluates
+ * `typeof localStorage !== "undefined"`.
+ *
+ * When `--localstorage-file` is not configured in `execArgv` or `NODE_OPTIONS`, replace the
+ * lazy getter on `globalThis` with `value: undefined` without invoking the getter.
+ */
+export function suppressUnconfiguredLocalStorageWarning(
+  opts?: SuppressLocalStorageWarningOptions,
+): void {
+  const target = opts?.target ?? globalThis;
+  const execArgv = opts?.execArgv ?? process.execArgv;
+  const env = opts?.env ?? process.env;
+  const nodeOptions = env["NODE_OPTIONS"] ?? "";
+
+  const hasFlag =
+    execArgv.some((arg) => arg === "--localstorage-file" || arg.startsWith("--localstorage-file=")) ||
+    /(?:^|\s)--localstorage-file(?:=|\s|$)/.test(nodeOptions);
+  if (hasFlag) return;
+
+  const desc = Object.getOwnPropertyDescriptor(target, "localStorage");
+  if (desc && typeof desc.get === "function" && desc.configurable) {
+    Object.defineProperty(target, "localStorage", {
+      value: undefined,
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    });
+  }
+}
+
 export interface EnforceNodeRuntimeOptions extends CheckNodeRuntimeOptions {
   writeStderr?: (text: string) => void;
   exit?: (code: number) => void;
 }
 
 export function enforceNodeRuntime(opts?: EnforceNodeRuntimeOptions): void {
+  suppressUnconfiguredLocalStorageWarning({ env: opts?.env });
   const res = checkNodeRuntime(opts);
   if (!res.ok) {
     const write = opts?.writeStderr ?? ((s: string) => process.stderr.write(s));

@@ -6,7 +6,11 @@ import { describe, it, expect } from "vitest";
 import { delimiter, join } from "node:path";
 import { existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { checkNodeRuntime, enforceNodeRuntime } from "../node-runtime-guard.js";
+import {
+  checkNodeRuntime,
+  enforceNodeRuntime,
+  suppressUnconfiguredLocalStorageWarning,
+} from "../node-runtime-guard.js";
 
 function findTsx(): string {
   const isWin = process.platform === "win32";
@@ -99,5 +103,35 @@ describe("node-runtime-guard (MCP adapter)", () => {
     expect(run.stderr).toContain(process.versions.node);
     expect(run.stderr).toContain(process.execPath);
     expect(run.stderr).toContain(">=999");
+  });
+
+  it("5. suppressUnconfiguredLocalStorageWarning neutralizes an unconfigured localStorage getter without invoking it and preserves --localstorage-file", () => {
+    let getterInvoked = 0;
+    const fakeGlobal: Record<string, unknown> = {};
+    Object.defineProperty(fakeGlobal, "localStorage", {
+      get() {
+        getterInvoked += 1;
+        return undefined;
+      },
+      configurable: true,
+      enumerable: true,
+    });
+
+    suppressUnconfiguredLocalStorageWarning({
+      target: fakeGlobal,
+      execArgv: ["--localstorage-file=/tmp/store"],
+      env: {},
+    });
+    expect(Object.getOwnPropertyDescriptor(fakeGlobal, "localStorage")?.get).toBeTypeOf("function");
+
+    suppressUnconfiguredLocalStorageWarning({
+      target: fakeGlobal,
+      execArgv: [],
+      env: {},
+    });
+    expect(getterInvoked).toBe(0);
+    expect(Object.getOwnPropertyDescriptor(fakeGlobal, "localStorage")?.get).toBeUndefined();
+    expect(fakeGlobal["localStorage"]).toBeUndefined();
+    expect(getterInvoked).toBe(0);
   });
 });

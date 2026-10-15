@@ -1,3 +1,4 @@
+import "./localstorage-guard.js";
 export type {
   Logger,
   LockFileContent,

@@ -10,6 +10,7 @@
  *   CELLO_VERSION   Version string for lock file (default: from package.json)
  */
 
+import "../localstorage-guard.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
