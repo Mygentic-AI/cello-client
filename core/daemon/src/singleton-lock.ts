@@ -148,33 +148,56 @@ function openLockDb(lockDbPath: string): SignalDatabase {
   }
 }
 
+const SLEEP_ARRAY = new Int32Array(new SharedArrayBuffer(4));
+const MIN_RETRY_JITTER_MS = 5;
+const MAX_RETRY_JITTER_SPAN_MS = 20;
+
 export function acquireSingletonLock(
   celloDir: string,
   logger: Logger,
   busyTimeoutMs: number = DAEMON_ACQUIRE_BUSY_TIMEOUT_MS,
 ): SingletonLock {
   const lockDbPath = join(celloDir, SINGLETON_LOCK_FILENAME);
-  const db = openLockDb(lockDbPath);
+  const deadline = Date.now() + Math.max(0, busyTimeoutMs);
+  let db: SignalDatabase;
 
-  try {
-    db.pragma(`busy_timeout = ${busyTimeoutMs}`);
-    db.pragma("locking_mode = exclusive");
-    // SQLite defers the actual lock acquisition until it has a reason to write. `user_version` is a
-    // write to the database header — it takes the exclusive lock and stores nothing.
-    db.pragma("user_version = 1");
-  } catch (err: unknown) {
-    try { db.close(); } catch { /* we are already failing; closing is best-effort */ }
-    if (isBusy(err)) {
-      const holderPid = readHolderPid(celloDir);
-      logger.info("daemon.singleton.contended", { holderPid, lockPath: lockDbPath });
-      throw new DaemonAlreadyRunningError(holderPid);
+  // Never pass busyTimeoutMs into SQLite's in-connection `PRAGMA busy_timeout`. During
+  // `PRAGMA user_version = 1` with `locking_mode = exclusive`, SQLite first acquires a SHARED
+  // lock and then upgrades SHARED -> RESERVED -> PENDING -> EXCLUSIVE. When 2+ processes enter
+  // simultaneously, one holds PENDING waiting for EXCLUSIVE while another holds SHARED inside the
+  // in-connection busy loop — mutually deadlocking until busy_timeout expires so ALL contenders
+  // fail with SQLITE_BUSY (0 survivors). Instead, probe with `busy_timeout = 0`, immediately
+  // `db.close()` on SQLITE_BUSY so zero partial locks are held while waiting, and retry with
+  // short randomized jitter up to `busyTimeoutMs`.
+  while (true) {
+    db = openLockDb(lockDbPath);
+    try {
+      db.pragma("busy_timeout = 0");
+      db.pragma("locking_mode = exclusive");
+      // SQLite defers the actual lock acquisition until it has a reason to write. `user_version` is a
+      // write to the database header — it takes the exclusive lock and stores nothing.
+      db.pragma("user_version = 1");
+      break;
+    } catch (err: unknown) {
+      try { db.close(); } catch { /* we are already failing; closing is best-effort */ }
+      if (isBusy(err)) {
+        const remaining = deadline - Date.now();
+        if (remaining > 0) {
+          const jitter = MIN_RETRY_JITTER_MS + Math.floor(Math.random() * MAX_RETRY_JITTER_SPAN_MS);
+          Atomics.wait(SLEEP_ARRAY, 0, 0, Math.min(remaining, jitter));
+          continue;
+        }
+        const holderPid = readHolderPid(celloDir);
+        logger.info("daemon.singleton.contended", { holderPid, lockPath: lockDbPath });
+        throw new DaemonAlreadyRunningError(holderPid);
+      }
+      // Some other SQLite failure. Keep the frame — a bare SQLITE_* error here reads as a database
+      // problem, when what actually failed was taking the singleton lock.
+      throw new Error(
+        `Could not take the daemon singleton lock at ${lockDbPath}: ${extractErrorMessage(err)}`,
+        { cause: err },
+      );
     }
-    // Some other SQLite failure. Keep the frame — a bare SQLITE_* error here reads as a database
-    // problem, when what actually failed was taking the singleton lock.
-    throw new Error(
-      `Could not take the daemon singleton lock at ${lockDbPath}: ${extractErrorMessage(err)}`,
-      { cause: err },
-    );
   }
 
   logger.info("daemon.singleton.acquired", { pid: process.pid, lockPath: lockDbPath });

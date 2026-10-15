@@ -337,4 +337,64 @@ describe("DOD-SINGLE-DAEMON-1 — a second daemon cannot start", () => {
       await gwClient.close();
     }
   }, 90_000);
+
+  it("AC1: synchronized 3-way lock contention never deadlocks into zero winners (SHARED -> EXCLUSIVE upgrade race)", async () => {
+    // Reproduces the exact 084-GATEWAYSOCK Part B flake: when 3 processes preload SQLCipher and enter
+    // acquireSingletonLock at the exact same millisecond, SQLite's SHARED -> RESERVED -> PENDING -> EXCLUSIVE
+    // upgrade with in-connection busy_timeout can mutually block all 3 contenders until busyTimeoutMs expires,
+    // leaving 0 survivors (all 3 exit 3). Across 12 barrier-synchronized 3-way races, every single race must
+    // produce 1 winner (exit 0) and 2 losers (exit 3).
+    const daemonPkgRoot = join(import.meta.dirname, "../..");
+    for (let iter = 0; iter < 12; iter++) {
+      celloDir = await makeCelloDir(`cello-sync-race-${iter}-`);
+      const goAt = Date.now() + 350;
+      const script = [
+        `import { acquireSingletonLock } from "./dist/singleton-lock.js";`,
+        `import { loadSignalModule } from "./dist/sqlcipher-db.js";`,
+        `loadSignalModule();`,
+        `const logger = { debug(){}, info(){}, warn(){}, error(){} };`,
+        `while (Date.now() < ${goAt}) {}`,
+        `try {`,
+        `  acquireSingletonLock(process.env.RACE_DIR, logger, 250);`,
+        `  process.stdout.write("WON\\n");`,
+        `  setInterval(() => {}, 10000);`,
+        `} catch {`,
+        `  process.exit(3);`,
+        `}`,
+      ].join("\n");
+
+      const procs = [0, 1, 2].map(() => {
+        const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
+          cwd: daemonPkgRoot,
+          env: { ...process.env, RACE_DIR: celloDir },
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let won = false;
+        child.stdout.on("data", (c: Buffer) => {
+          if (c.toString("utf8").includes("WON")) won = true;
+        });
+        return { child, isWon: () => won };
+      });
+
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline) {
+        const alive = procs.filter((p) => p.child.exitCode === null);
+        const exited = procs.filter((p) => p.child.exitCode !== null);
+        if ((exited.length === 2 && alive.length === 1 && alive[0]!.isWon()) || exited.length === 3) {
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 20));
+      }
+
+      const survivors = procs.filter((p) => p.child.exitCode === null);
+      const losers = procs.filter((p) => p.child.exitCode !== null);
+      for (const p of procs) p.child.kill("SIGKILL");
+      await cleanupCelloDir(celloDir);
+      celloDir = undefined;
+
+      expect(survivors).toHaveLength(1);
+      expect(losers).toHaveLength(2);
+      for (const l of losers) expect(l.child.exitCode).toBe(3);
+    }
+  }, 60_000);
 });
