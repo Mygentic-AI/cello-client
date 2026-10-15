@@ -275,8 +275,24 @@ def _get_cello_env(name: str, default: str = "") -> str:
     return str(val if val is not None else default).strip()
 
 
-def _cello_socket_path() -> Path:
-    cello_dir = _get_cello_env("CELLO_DIR") or str(Path.home() / ".cello")
+def _default_bindings_path() -> Path:
+    """Resolve the per-profile session-bindings path via hermes_constants.get_hermes_home().
+
+    Under gateway.multiplex_profiles, each profile has its own HERMES_HOME (bound per profile via
+    _profile_runtime_scope). Using a single hardcoded ~/.hermes/cello/session-bindings.json caused
+    secondary profiles to overwrite and prune the default profile's open session bindings on connect.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+        base = Path(get_hermes_home())
+    except ImportError:
+        base = Path.home() / ".hermes"
+    return base / "cello" / "session-bindings.json"
+
+
+def _cello_socket_path(explicit_dir: Optional[Any] = None) -> Path:
+    raw = str(explicit_dir).strip() if explicit_dir is not None else ""
+    cello_dir = raw or _get_cello_env("CELLO_DIR") or str(Path.home() / ".cello")
     return Path(cello_dir) / "daemon.sock"
 
 
@@ -380,6 +396,9 @@ class CelloAdapter(BasePlatformAdapter):
             or _get_cello_env("CELLO_CHANNEL_NOTIFICATIONS")
             or DEFAULT_CHANNEL_NOTIFICATIONS
         ).strip().lower()
+        # Pin the socket path while _profile_runtime_scope is active so background reconnects
+        # (_reconnect_forever) never re-query an unscoped ContextVar after connect() returns.
+        self._socket_path: Path = _cello_socket_path(extra.get("cello_dir"))
         self._writer: Optional[asyncio.StreamWriter] = None
         self._read_task: Optional[asyncio.Task] = None
         self._reconnect_task: Optional[asyncio.Task] = None
@@ -395,7 +414,7 @@ class CelloAdapter(BasePlatformAdapter):
         self._closing = False
         # 049-BRIDGEREPLY Part B: CELLO-session -> Hermes-chat bindings, recovered from disk so an
         # escalation opened before a restart still has its answer routed home.
-        self._bindings_path: Path = BINDINGS_PATH
+        self._bindings_path: Path = _default_bindings_path()
         self._bindings: Dict[str, str] = self._load_bindings()
         # Part C: chat_id -> {session_id: who} for replies the agent has not sent yet. The loop is
         # captured in connect(), because the reminder is scheduled from a hook that may run off it.
@@ -604,7 +623,7 @@ class CelloAdapter(BasePlatformAdapter):
             logger.error(
                 "[cello] Could not connect to the CELLO daemon at %s: %s. "
                 "Is the daemon running? Start it with 'cello login'.",
-                _cello_socket_path(),
+                getattr(self, "_socket_path", None) or _cello_socket_path(),
                 exc,
             )
             # Suppress the read loop's auto-reconnect: a failed INITIAL connect must
@@ -642,8 +661,9 @@ class CelloAdapter(BasePlatformAdapter):
 
     async def _establish(self) -> None:
         """Open the socket, start the frame reader, and run the IPC handshake."""
+        sock_path = getattr(self, "_socket_path", None) or _cello_socket_path()
         reader, writer = await asyncio.open_unix_connection(
-            str(_cello_socket_path()), limit=MAX_LINE_BYTES
+            str(sock_path), limit=MAX_LINE_BYTES
         )
         self._writer = writer
         self._start_wake_worker()
@@ -1694,6 +1714,7 @@ def _env_enablement() -> Optional[dict]:
         ("delivery_mode", "CELLO_DELIVERY_MODE"),
         ("session_scope", "CELLO_SESSION_SCOPE"),
         ("channel_notifications", "CELLO_CHANNEL_NOTIFICATIONS"),
+        ("cello_dir", "CELLO_DIR"),
     ):
         val = _get_cello_env(env_name)
         if val:
