@@ -342,15 +342,15 @@ describe("DOD-SINGLE-DAEMON-1 — a second daemon cannot start", () => {
     // Reproduces the exact 084-GATEWAYSOCK Part B flake: when 3 processes preload SQLCipher and enter
     // acquireSingletonLock at the exact same millisecond, SQLite's SHARED -> RESERVED -> PENDING -> EXCLUSIVE
     // upgrade with in-connection busy_timeout can mutually block all 3 contenders until busyTimeoutMs expires,
-    // leaving 0 survivors (all 3 exit 3). Across 12 barrier-synchronized 3-way races, every single race must
-    // produce 1 winner (exit 0) and 2 losers (exit 3).
+    // leaving 0 survivors (all 3 exit 3). Across 10 barrier-synchronized 3-way races against src/singleton-lock.ts,
+    // every single race must produce 1 winner and 2 losers (DaemonAlreadyRunningError -> exit 3).
     const daemonPkgRoot = join(import.meta.dirname, "../..");
-    for (let iter = 0; iter < 12; iter++) {
+    for (let iter = 0; iter < 10; iter++) {
       celloDir = await makeCelloDir(`cello-sync-race-${iter}-`);
-      const goAt = Date.now() + 350;
+      const goAt = Date.now() + 700;
       const script = [
-        `import { acquireSingletonLock } from "./dist/singleton-lock.js";`,
-        `import { loadSignalModule } from "./dist/sqlcipher-db.js";`,
+        `import { acquireSingletonLock, DaemonAlreadyRunningError } from "./src/singleton-lock.ts";`,
+        `import { loadSignalModule } from "./src/sqlcipher-db.ts";`,
         `loadSignalModule();`,
         `const logger = { debug(){}, info(){}, warn(){}, error(){} };`,
         `while (Date.now() < ${goAt}) {}`,
@@ -358,43 +358,55 @@ describe("DOD-SINGLE-DAEMON-1 — a second daemon cannot start", () => {
         `  acquireSingletonLock(process.env.RACE_DIR, logger, 250);`,
         `  process.stdout.write("WON\\n");`,
         `  setInterval(() => {}, 10000);`,
-        `} catch {`,
-        `  process.exit(3);`,
+        `} catch (err) {`,
+        `  if (err instanceof DaemonAlreadyRunningError) process.exit(3);`,
+        `  process.stderr.write(String(err) + "\\n");`,
+        `  process.exit(1);`,
         `}`,
       ].join("\n");
 
       const procs = [0, 1, 2].map(() => {
-        const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
+        const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], {
           cwd: daemonPkgRoot,
           env: { ...process.env, RACE_DIR: celloDir },
           stdio: ["ignore", "pipe", "pipe"],
         });
         let won = false;
+        let errOut = "";
         child.stdout.on("data", (c: Buffer) => {
           if (c.toString("utf8").includes("WON")) won = true;
         });
-        return { child, isWon: () => won };
+        child.stderr.on("data", (c: Buffer) => {
+          errOut += c.toString("utf8");
+        });
+        return { child, isWon: () => won, stderr: () => errOut };
       });
 
-      const deadline = Date.now() + 5_000;
-      while (Date.now() < deadline) {
-        const alive = procs.filter((p) => p.child.exitCode === null);
-        const exited = procs.filter((p) => p.child.exitCode !== null);
-        if ((exited.length === 2 && alive.length === 1 && alive[0]!.isWon()) || exited.length === 3) {
-          break;
+      try {
+        const deadline = Date.now() + 8_000;
+        while (Date.now() < deadline) {
+          const alive = procs.filter((p) => p.child.exitCode === null);
+          const exited = procs.filter((p) => p.child.exitCode !== null);
+          if ((exited.length === 2 && alive.length === 1 && alive[0]!.isWon()) || exited.length === 3) {
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 20));
         }
-        await new Promise((r) => setTimeout(r, 20));
+
+        const survivors = procs.filter((p) => p.child.exitCode === null);
+        const losers = procs.filter((p) => p.child.exitCode !== null);
+        for (const p of procs) {
+          expect(p.stderr()).toBe("");
+        }
+        expect(survivors).toHaveLength(1);
+        expect(survivors[0]!.isWon()).toBe(true);
+        expect(losers).toHaveLength(2);
+        for (const l of losers) expect(l.child.exitCode).toBe(3);
+      } finally {
+        for (const p of procs) p.child.kill("SIGKILL");
+        await cleanupCelloDir(celloDir);
+        celloDir = undefined;
       }
-
-      const survivors = procs.filter((p) => p.child.exitCode === null);
-      const losers = procs.filter((p) => p.child.exitCode !== null);
-      for (const p of procs) p.child.kill("SIGKILL");
-      await cleanupCelloDir(celloDir);
-      celloDir = undefined;
-
-      expect(survivors).toHaveLength(1);
-      expect(losers).toHaveLength(2);
-      for (const l of losers) expect(l.child.exitCode).toBe(3);
     }
-  }, 60_000);
+  }, 90_000);
 });

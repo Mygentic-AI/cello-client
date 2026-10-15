@@ -161,14 +161,14 @@ export function acquireSingletonLock(
   const deadline = Date.now() + Math.max(0, busyTimeoutMs);
   let db: SignalDatabase;
 
-  // Never pass busyTimeoutMs into SQLite's in-connection `PRAGMA busy_timeout`. During
-  // `PRAGMA user_version = 1` with `locking_mode = exclusive`, SQLite first acquires a SHARED
-  // lock and then upgrades SHARED -> RESERVED -> PENDING -> EXCLUSIVE. When 2+ processes enter
-  // simultaneously, one holds PENDING waiting for EXCLUSIVE while another holds SHARED inside the
-  // in-connection busy loop — mutually deadlocking until busy_timeout expires so ALL contenders
-  // fail with SQLITE_BUSY (0 survivors). Instead, probe with `busy_timeout = 0`, immediately
-  // `db.close()` on SQLITE_BUSY so zero partial locks are held while waiting, and retry with
-  // short randomized jitter up to `busyTimeoutMs`.
+  // Probe each attempt with `busy_timeout = 0`. During `PRAGMA user_version = 1` with
+  // `locking_mode = exclusive`, SQLite first acquires a SHARED lock and then upgrades
+  // SHARED -> RESERVED -> PENDING -> EXCLUSIVE. If an in-connection `busy_timeout` is used when
+  // 2+ processes enter simultaneously, one holds PENDING waiting for EXCLUSIVE while another
+  // holds SHARED inside the in-connection busy loop — mutually deadlocking until busy_timeout
+  // expires so all contenders fail with SQLITE_BUSY (0 survivors). Using `busy_timeout = 0` and
+  // immediately calling `db.close()` on SQLITE_BUSY ensures zero partial locks are held while
+  // waiting between short randomized jitter retries up to `busyTimeoutMs`.
   while (true) {
     db = openLockDb(lockDbPath);
     try {
