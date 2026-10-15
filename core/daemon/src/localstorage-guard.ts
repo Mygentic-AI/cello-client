@@ -8,16 +8,28 @@
  * to `stderr` whenever `--localstorage-file` is not set.
  */
 
-const execArgv = process.execArgv;
-const nodeOptions = process.env["NODE_OPTIONS"] ?? "";
-const hasLocalStorageFlag =
-  execArgv.some((arg) => arg === "--localstorage-file" || arg.startsWith("--localstorage-file=")) ||
-  /(?:^|\s)--localstorage-file(?:=|\s|$)/.test(nodeOptions);
+export interface SuppressLocalStorageWarningOptions {
+  target?: object;
+  execArgv?: readonly string[];
+  env?: NodeJS.ProcessEnv;
+}
 
-if (!hasLocalStorageFlag) {
-  const desc = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+export function suppressUnconfiguredLocalStorageWarning(
+  opts?: SuppressLocalStorageWarningOptions,
+): void {
+  const target = opts?.target ?? globalThis;
+  const execArgv = opts?.execArgv ?? process.execArgv;
+  const env = opts?.env ?? process.env;
+  const nodeOptions = env["NODE_OPTIONS"] ?? "";
+
+  const hasLocalStorageFlag =
+    execArgv.some((arg) => arg === "--localstorage-file" || arg.startsWith("--localstorage-file=")) ||
+    /(?:^|\s)--localstorage-file(?:=|\s|$)/.test(nodeOptions);
+  if (hasLocalStorageFlag) return;
+
+  const desc = Object.getOwnPropertyDescriptor(target, "localStorage");
   if (desc && typeof desc.get === "function" && desc.configurable) {
-    Object.defineProperty(globalThis, "localStorage", {
+    Object.defineProperty(target, "localStorage", {
       value: undefined,
       writable: true,
       enumerable: false,
@@ -25,3 +37,5 @@ if (!hasLocalStorageFlag) {
     });
   }
 }
+
+suppressUnconfiguredLocalStorageWarning();

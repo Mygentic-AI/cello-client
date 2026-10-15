@@ -29,6 +29,7 @@
  * DOD-DOC-ENVELOPE-1's job and the cross-daemon proof is DOD-DOC-E2E-REJECT-1's.
  */
 
+import "./localstorage-guard.js";
 import * as Y from "yjs";
 import {
   buildDocumentRejectionTbs,

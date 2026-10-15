@@ -86,13 +86,19 @@ export function suppressUnconfiguredLocalStorageWarning(
   }
 }
 
-export interface EnforceNodeRuntimeOptions extends CheckNodeRuntimeOptions {
+export interface EnforceNodeRuntimeOptions
+  extends CheckNodeRuntimeOptions,
+    SuppressLocalStorageWarningOptions {
   writeStderr?: (text: string) => void;
   exit?: (code: number) => void;
 }
 
 export function enforceNodeRuntime(opts?: EnforceNodeRuntimeOptions): void {
-  suppressUnconfiguredLocalStorageWarning({ env: opts?.env });
+  suppressUnconfiguredLocalStorageWarning({
+    target: opts?.target,
+    execArgv: opts?.execArgv,
+    env: opts?.env,
+  });
   const res = checkNodeRuntime(opts);
   if (!res.ok) {
     const write = opts?.writeStderr ?? ((s: string) => process.stderr.write(s));

@@ -127,11 +127,36 @@ describe("node-runtime-guard (MCP adapter)", () => {
     suppressUnconfiguredLocalStorageWarning({
       target: fakeGlobal,
       execArgv: [],
+      env: { NODE_OPTIONS: "--localstorage-file /tmp/store" },
+    });
+    expect(Object.getOwnPropertyDescriptor(fakeGlobal, "localStorage")?.get).toBeTypeOf("function");
+    expect(getterInvoked).toBe(0);
+
+    enforceNodeRuntime({
+      version: "24.21.0",
+      execPath: "/opt/node24/bin/node",
+      target: fakeGlobal,
+      execArgv: [],
       env: {},
     });
     expect(getterInvoked).toBe(0);
     expect(Object.getOwnPropertyDescriptor(fakeGlobal, "localStorage")?.get).toBeUndefined();
     expect(fakeGlobal["localStorage"]).toBeUndefined();
     expect(getterInvoked).toBe(0);
+
+    const tsxPath = findTsx();
+    const initUrl = new URL("../node-runtime-guard-init.ts", import.meta.url).href;
+    const initRun = spawnSync(
+      tsxPath,
+      ["-e", `import(${JSON.stringify(initUrl)}).then(() => { void globalThis.localStorage; });`],
+      {
+        env: { ...process.env },
+        shell: process.platform === "win32",
+        encoding: "utf8",
+      },
+    );
+    expect(initRun.status).toBe(0);
+    expect(initRun.stderr).not.toContain("ExperimentalWarning");
+    expect(initRun.stderr).not.toContain("localStorage");
   });
 });

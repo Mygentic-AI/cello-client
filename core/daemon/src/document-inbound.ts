@@ -29,6 +29,7 @@
  *                          peer has decided, so the sender must stop retrying and supersede.
  */
 
+import "./localstorage-guard.js";
 import * as Y from "yjs";
 import {
   decodeDocumentUpdateEnvelope,

@@ -27,6 +27,7 @@
  * reason an operator or a screening log sees.
  */
 
+import "./localstorage-guard.js";
 import * as Y from "yjs";
 import type { DocumentEnvelopeRow } from "./document-store.js";
 import type { Logger } from "./types.js";

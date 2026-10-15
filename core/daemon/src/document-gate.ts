@@ -41,6 +41,7 @@
  * two copies permanently and invisibly (§3.2).
  */
 
+import "./localstorage-guard.js";
 import * as Y from "yjs";
 import type { DocumentEngine } from "./document-engine.js";
 import type { Logger } from "./types.js";

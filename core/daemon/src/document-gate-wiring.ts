@@ -24,6 +24,7 @@
  * anyway: this is the one place in the composition root that decides whether a whole subsystem
  * exists, and the alternative was eighty lines of branch in the middle of the wiring.
  */
+import "./localstorage-guard.js";
 import { createDocumentWiring } from "./document-wiring.js";
 import { createDocumentSurface } from "./document-surface.js";
 import { isDocumentFrame } from "./document-frame-router.js";

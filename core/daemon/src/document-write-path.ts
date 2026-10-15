@@ -22,6 +22,7 @@
  * intent. Measured, so the projection is written to disk beside the document and read back.
  */
 
+import "./localstorage-guard.js";
 import { mkdir, readFile, writeFile, rename, access, rm } from "node:fs/promises";
 import { join } from "node:path";
 import * as Y from "yjs";

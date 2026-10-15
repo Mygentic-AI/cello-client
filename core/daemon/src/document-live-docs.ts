@@ -24,6 +24,7 @@
  *   eviction existed without log-backed restore it would be exactly the silent loss it looks like.
  */
 
+import "./localstorage-guard.js";
 import * as Y from "yjs";
 import type { DocumentStore } from "./document-store.js";
 import type { DocumentEngine } from "./document-engine.js";

@@ -24,6 +24,7 @@
  * against the state the operator actually saw.
  */
 
+import "./localstorage-guard.js";
 import { randomBytes, randomUUID } from "node:crypto";
 import * as Y from "yjs";
 import {

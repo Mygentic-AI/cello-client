@@ -177,8 +177,10 @@ describe("node-runtime-guard (CLI)", () => {
     expect(Object.getOwnPropertyDescriptor(fakeGlobal, "localStorage")?.get).toBeTypeOf("function");
     expect(getterInvoked).toBe(0);
 
-    // When --localstorage-file is absent, getter is replaced with undefined without invoking it.
-    suppressUnconfiguredLocalStorageWarning({
+    // When --localstorage-file is absent, enforceNodeRuntime replaces the getter with undefined without invoking it.
+    enforceNodeRuntime({
+      version: "24.21.0",
+      execPath: "/opt/node24/bin/node",
       target: fakeGlobal,
       execArgv: [],
       env: {},
@@ -188,8 +190,24 @@ describe("node-runtime-guard (CLI)", () => {
     expect(fakeGlobal["localStorage"]).toBeUndefined();
     expect(getterInvoked).toBe(0);
 
-    // End-to-end subprocess check: running cello.ts --version emits zero ExperimentalWarning on stderr.
+    // Direct init module check (independent of @cello-protocol/daemon): importing node-runtime-guard-init.ts
+    // and reading globalThis.localStorage emits zero ExperimentalWarning on stderr.
     const tsxPath = findTsx();
+    const initUrl = new URL("../node-runtime-guard-init.ts", import.meta.url).href;
+    const initRun = spawnSync(
+      tsxPath,
+      ["-e", `import(${JSON.stringify(initUrl)}).then(() => { void globalThis.localStorage; });`],
+      {
+        env: { ...process.env },
+        shell: process.platform === "win32",
+        encoding: "utf8",
+      },
+    );
+    expect(initRun.status).toBe(0);
+    expect(initRun.stderr).not.toContain("ExperimentalWarning");
+    expect(initRun.stderr).not.toContain("localStorage");
+
+    // End-to-end subprocess check: running cello.ts --version emits zero ExperimentalWarning on stderr.
     const binPath = join(import.meta.dirname, "../bin/cello.ts");
     const okRun = spawnSync(tsxPath, [binPath, "--version"], {
       env: { ...process.env },
