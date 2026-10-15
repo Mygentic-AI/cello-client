@@ -12,12 +12,14 @@
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { installHermes, type ExecFn } from "../hermes/install-hermes.js";
 import { HERMES_POLICY_STEP_MD } from "../hermes/assets.js";
 import { KNOWN_COMMANDS, USAGE, helpForCommand, checkArgs } from "../cli-args.js";
+import { installHermesDriver } from "./helpers/hermes-python-driver.js";
 
 let hermesHome: string;
 let execCalls: Array<{ cmd: string; args: string[] }>;
@@ -297,5 +299,115 @@ describe("hermes assets — template integrity", () => {
     // so a single backtick there ends the template mid-file.
     const { HERMES_PLUGIN_INIT_PY } = await import("../hermes/assets.js");
     expect(HERMES_PLUGIN_INIT_PY.includes("`")).toBe(false);
+  });
+
+  it("multiplexed profile isolation: _env_enablement, CelloAdapter, and _delivery_hint read gateway.platforms._shared.get_scoped_secret instead of leaking os.environ", async () => {
+    await installHermesDriver(hermesHome);
+    writeFileSync(
+      join(hermesHome, "gateway", "platforms", "_shared.py"),
+      [
+        "import json, os",
+        "def get_scoped_secret(name, default=None, *, external_fallback=False):",
+        "    raw = os.environ.get('TEST_SCOPED_SECRETS')",
+        "    if raw is not None:",
+        "        scope = json.loads(raw)",
+        "        val = scope.get(name)",
+        "        return val if val is not None else default",
+        "    val = os.environ.get(name)",
+        "    return val if val is not None else default",
+        "",
+      ].join("\n"),
+    );
+
+    const pyProbe = [
+      "import json, os",
+      "from gateway.config import PlatformConfig",
+      "import cello_plugin as m",
+      "enabled = m._env_enablement()",
+      "adapter_from_seeded = m.CelloAdapter(PlatformConfig(extra=enabled or {}))",
+      "adapter_from_empty = m.CelloAdapter(PlatformConfig(extra={}))",
+      "hint = m._delivery_hint()",
+      "sock = str(m._cello_socket_path())",
+      "print(json.dumps({",
+      "    'enabled': enabled,",
+      "    'seeded_agent': adapter_from_seeded._agent_name,",
+      "    'seeded_mode': adapter_from_seeded._delivery_mode,",
+      "    'seeded_scope': adapter_from_seeded._session_scope,",
+      "    'seeded_notify': adapter_from_seeded._channel_notifications,",
+      "    'empty_agent': adapter_from_empty._agent_name,",
+      "    'empty_mode': adapter_from_empty._delivery_mode,",
+      "    'empty_scope': adapter_from_empty._session_scope,",
+      "    'empty_notify': adapter_from_empty._channel_notifications,",
+      "    'hint': hint,",
+      "    'sock': sock,",
+      "}))",
+    ].join("\n");
+
+    const runProbe = (extraEnv: Record<string, string>) => {
+      const out = execFileSync("python3", ["-c", pyProbe], {
+        cwd: hermesHome,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PYTHONPATH: hermesHome,
+          PYTHONDONTWRITEBYTECODE: "1",
+          // Simulate default profile in os.environ (Miss_Chelly / channel / agent / on)
+          CELLO_AGENT_NAME: "Miss_Chelly",
+          CELLO_DELIVERY_MODE: "channel",
+          CELLO_SESSION_SCOPE: "agent",
+          CELLO_CHANNEL_NOTIFICATIONS: "on",
+          CELLO_DIR: "/tmp/default-cello",
+          ...extraEnv,
+        },
+      });
+      return JSON.parse(out) as Record<string, unknown>;
+    };
+
+    // Case 1: Secondary profile has its own scoped .env (CELLO_LinkedIn) -> must NOT read Miss_Chelly from os.environ.
+    const secondaryConfigured = runProbe({
+      TEST_SCOPED_SECRETS: JSON.stringify({
+        CELLO_AGENT_NAME: "CELLO_LinkedIn",
+        CELLO_DELIVERY_MODE: "explicit",
+        CELLO_SESSION_SCOPE: "peer",
+        CELLO_CHANNEL_NOTIFICATIONS: "off",
+        CELLO_DIR: "/tmp/scoped-cello",
+      }),
+    });
+    expect(secondaryConfigured.enabled).toEqual({
+      enabled: true,
+      agent_name: "CELLO_LinkedIn",
+      delivery_mode: "explicit",
+      session_scope: "peer",
+      channel_notifications: "off",
+    });
+    expect(secondaryConfigured.seeded_agent).toBe("CELLO_LinkedIn");
+    expect(secondaryConfigured.seeded_mode).toBe("explicit");
+    expect(secondaryConfigured.seeded_scope).toBe("peer");
+    expect(secondaryConfigured.seeded_notify).toBe("off");
+    expect(secondaryConfigured.empty_agent).toBe("CELLO_LinkedIn");
+    expect(secondaryConfigured.empty_mode).toBe("explicit");
+    expect(secondaryConfigured.empty_scope).toBe("peer");
+    expect(secondaryConfigured.empty_notify).toBe("off");
+    expect(String(secondaryConfigured.hint)).toContain("call cello_send on the session named in the message");
+    expect(secondaryConfigured.sock).toBe("/tmp/scoped-cello/daemon.sock");
+
+    // Case 2: Secondary profile has NO CELLO_AGENT_NAME in its scoped .env -> fails closed (None / ""), never borrows Miss_Chelly.
+    const secondaryUnconfigured = runProbe({
+      TEST_SCOPED_SECRETS: JSON.stringify({}),
+    });
+    expect(secondaryUnconfigured.enabled).toBeNull();
+    expect(secondaryUnconfigured.empty_agent).toBe("");
+
+    // Case 3: Unscoped / standalone fallback (when gateway.platforms._shared is absent) -> reads os.environ.
+    rmSync(join(hermesHome, "gateway", "platforms", "_shared.py"));
+    const standalone = runProbe({});
+    expect(standalone.enabled).toEqual({
+      enabled: true,
+      agent_name: "Miss_Chelly",
+      delivery_mode: "channel",
+      session_scope: "agent",
+      channel_notifications: "on",
+    });
+    expect(standalone.seeded_agent).toBe("Miss_Chelly");
   });
 });

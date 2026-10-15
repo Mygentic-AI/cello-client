@@ -257,8 +257,26 @@ _SAFE_SCALAR_RE = re.compile(r"^[A-Za-z0-9+/=_.:@-]{1,120}$")
 _MONIKER_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
+def _get_cello_env(name: str, default: str = "") -> str:
+    """Scope-aware env reader for multiplexed Hermes profiles (#72348 / #86905).
+
+    Under gateway.multiplex_profiles, os.environ holds only the DEFAULT profile's .env values;
+    secondary profiles' .env values live in agent.secret_scope and are read via
+    gateway.platforms._shared.get_scoped_secret. Reading os.environ directly leaks the default
+    profile's CELLO_AGENT_NAME into every secondary profile. Falls back to os.environ.get only
+    when gateway.platforms._shared is unavailable (e.g. standalone test harnesses).
+    """
+    try:
+        from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret
+    except ImportError:
+        val = os.environ.get(name, default)
+    else:
+        val = _get_scoped_secret(name, default)
+    return str(val if val is not None else default).strip()
+
+
 def _cello_socket_path() -> Path:
-    cello_dir = os.environ.get("CELLO_DIR") or str(Path.home() / ".cello")
+    cello_dir = _get_cello_env("CELLO_DIR") or str(Path.home() / ".cello")
     return Path(cello_dir) / "daemon.sock"
 
 
@@ -339,7 +357,7 @@ class CelloAdapter(BasePlatformAdapter):
         super().__init__(config, Platform("cello"))
         extra = config.extra or {}
         self._agent_name: str = str(
-            extra.get("agent_name") or os.environ.get("CELLO_AGENT_NAME", "")
+            extra.get("agent_name") or _get_cello_env("CELLO_AGENT_NAME")
         ).strip()
         self._runtime_session: str = str(
             extra.get("runtime_session", DEFAULT_RUNTIME_SESSION)
@@ -349,17 +367,17 @@ class CelloAdapter(BasePlatformAdapter):
         # takes down more than this platform. connect() is the loud gate - see _invalid_settings.
         self._delivery_mode: str = str(
             extra.get("delivery_mode")
-            or os.environ.get("CELLO_DELIVERY_MODE")
+            or _get_cello_env("CELLO_DELIVERY_MODE")
             or DEFAULT_DELIVERY_MODE
         ).strip().lower()
         self._session_scope: str = str(
             extra.get("session_scope")
-            or os.environ.get("CELLO_SESSION_SCOPE")
+            or _get_cello_env("CELLO_SESSION_SCOPE")
             or DEFAULT_SESSION_SCOPE
         ).strip().lower()
         self._channel_notifications: str = str(
             extra.get("channel_notifications")
-            or os.environ.get("CELLO_CHANNEL_NOTIFICATIONS")
+            or _get_cello_env("CELLO_CHANNEL_NOTIFICATIONS")
             or DEFAULT_CHANNEL_NOTIFICATIONS
         ).strip().lower()
         self._writer: Optional[asyncio.StreamWriter] = None
@@ -542,7 +560,7 @@ class CelloAdapter(BasePlatformAdapter):
         # cello_send" while send() is a no-op means replies stop dead, with no error anywhere.
         # Cannot be fixed from here (the hint is already registered), so say so loudly. A genuine
         # per-entry hint arrives with multi-agent binding (DOD-HERMES-5).
-        hint_mode = (os.environ.get("CELLO_DELIVERY_MODE") or DEFAULT_DELIVERY_MODE).strip().lower()
+        hint_mode = (_get_cello_env("CELLO_DELIVERY_MODE") or DEFAULT_DELIVERY_MODE).strip().lower()
         if hint_mode != self._delivery_mode:
             # REFUSE rather than warn. Both directions are broken and one is silent: adapter
             # 'wake' with a 'channel' hint tells the agent not to call cello_send while send() is
@@ -1668,9 +1686,19 @@ def _is_connected(config: PlatformConfig) -> bool:
 
 def _env_enablement() -> Optional[dict]:
     """Auto-enable the platform when CELLO_AGENT_NAME is set (Raft's RAFT_PROFILE pattern)."""
-    if not os.getenv("CELLO_AGENT_NAME"):
+    agent_name = _get_cello_env("CELLO_AGENT_NAME")
+    if not agent_name:
         return None
-    return {"enabled": True}
+    seeded: Dict[str, Any] = {"enabled": True, "agent_name": agent_name}
+    for extra_key, env_name in (
+        ("delivery_mode", "CELLO_DELIVERY_MODE"),
+        ("session_scope", "CELLO_SESSION_SCOPE"),
+        ("channel_notifications", "CELLO_CHANNEL_NOTIFICATIONS"),
+    ):
+        val = _get_cello_env(env_name)
+        if val:
+            seeded[extra_key] = val
+    return seeded
 
 
 def _delivery_hint() -> str:
@@ -1681,7 +1709,7 @@ def _delivery_hint() -> str:
     send, producing duplicate sends and a read that consumes nothing. The two are mutually
     exclusive, so they are never concatenated.
     """
-    mode = (os.environ.get("CELLO_DELIVERY_MODE") or DEFAULT_DELIVERY_MODE).strip().lower()
+    mode = (_get_cello_env("CELLO_DELIVERY_MODE") or DEFAULT_DELIVERY_MODE).strip().lower()
     if mode == "wake":
         return (
             "HOW MESSAGES REACH YOU: as content-free wake notices naming a session and a "
@@ -1941,7 +1969,7 @@ def register(ctx) -> None:
             "fix the cause, and retry the tool.\n"
             "\n"
             "Before any other cello_* call, select your agent with cello_use_agent "
-            "(name='" + os.environ.get("CELLO_AGENT_NAME", "your-agent") + "'). The cello MCP "
+            "(name='" + (_get_cello_env("CELLO_AGENT_NAME") or "your-agent") + "'). The cello MCP "
             "server holds its own daemon connection with no agent selected, so other calls "
             "fail with no_current_agent until you do.\n"
             "\n"
