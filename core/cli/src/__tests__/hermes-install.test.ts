@@ -118,6 +118,84 @@ describe("installHermes — argument and environment validation", () => {
     expect(env).toContain("OTHER=1");
     expect(env).toContain("CELLO_AGENT_NAME=alice");
   });
+
+  it("writes the chosen landing session to .env and landing-session.json", async () => {
+    const res = await installHermes({
+      agentName: "alice", hermesHome, landingSession: "20261016_062747_c3f05f", exec: okExec,
+    });
+    expect(res.exitCode).toBe(0);
+    const env = readFileSync(join(hermesHome, ".env"), "utf-8");
+    expect(env).toContain("CELLO_LANDING_SESSION=20261016_062747_c3f05f");
+    expect(res.output).toContain("CELLO_LANDING_SESSION=20261016_062747_c3f05f");
+
+    const landingJson = join(hermesHome, "cello", "landing-session.json");
+    expect(existsSync(landingJson)).toBe(true);
+    expect(JSON.parse(readFileSync(landingJson, "utf-8"))).toEqual({
+      session_id: "20261016_062747_c3f05f",
+    });
+  });
+
+  it("resolves --landing-session current from HERMES_SESSION_ID", async () => {
+    process.env.HERMES_SESSION_ID = "20261016_062747_c3f05f";
+    try {
+      const res = await installHermes({
+        agentName: "alice", hermesHome, landingSession: "current", exec: okExec,
+      });
+      expect(res.exitCode).toBe(0);
+      const env = readFileSync(join(hermesHome, ".env"), "utf-8");
+      expect(env).toContain("CELLO_LANDING_SESSION=20261016_062747_c3f05f");
+    } finally {
+      delete process.env.HERMES_SESSION_ID;
+    }
+  });
+
+  it("fails loud when --landing-session current is requested but HERMES_SESSION_ID is unset", async () => {
+    delete process.env.HERMES_SESSION_ID;
+    const res = await installHermes({
+      agentName: "alice", hermesHome, landingSession: "current", exec: okExec,
+    });
+    expect(res.exitCode).toBe(1);
+    expect(res.output).toContain("HERMES_SESSION_ID");
+  });
+
+  it("rejects an invalid --landing-session before touching the filesystem", async () => {
+    const res = await installHermes({
+      agentName: "alice", hermesHome, landingSession: "bad/session!id", exec: okExec,
+    });
+    expect(res.exitCode).toBe(1);
+    expect(res.output).toContain("--landing-session");
+    expect(existsSync(join(hermesHome, ".env"))).toBe(false);
+  });
+
+  it("re-running WITHOUT --landing-session resets it and removes landing-session.json", async () => {
+    await installHermes({
+      agentName: "alice", hermesHome, landingSession: "20261016_062747_c3f05f", exec: okExec,
+    });
+    const landingJson = join(hermesHome, "cello", "landing-session.json");
+    expect(existsSync(landingJson)).toBe(true);
+
+    const res = await installHermes({ agentName: "alice", hermesHome, exec: okExec });
+    const env = readFileSync(join(hermesHome, ".env"), "utf-8");
+    expect(env).not.toContain("CELLO_LANDING_SESSION=");
+    expect(existsSync(landingJson)).toBe(false);
+    expect(res.output).toContain("Landing:      default");
+  });
+
+  it("passing --landing-session default explicitly clears it and removes landing-session.json", async () => {
+    await installHermes({
+      agentName: "alice", hermesHome, landingSession: "20261016_062747_c3f05f", exec: okExec,
+    });
+    const landingJson = join(hermesHome, "cello", "landing-session.json");
+    expect(existsSync(landingJson)).toBe(true);
+
+    const res = await installHermes({
+      agentName: "alice", hermesHome, landingSession: "default", exec: okExec,
+    });
+    const env = readFileSync(join(hermesHome, ".env"), "utf-8");
+    expect(env).not.toContain("CELLO_LANDING_SESSION=");
+    expect(existsSync(landingJson)).toBe(false);
+    expect(res.output).toContain("Landing:      default");
+  });
 });
 
 describe("installHermes — successful scaffold", () => {
@@ -255,6 +333,7 @@ describe("cli-args — install command surface", () => {
   it("checkArgs accepts install's flags and rejects unknown ones", () => {
     expect(checkArgs("bridge", ["hermes", "--agent", "alice"])).toEqual({ kind: "ok" });
     expect(checkArgs("bridge", ["hermes", "--hermes-home", "/tmp/x"])).toEqual({ kind: "ok" });
+    expect(checkArgs("bridge", ["hermes", "--agent", "alice", "--landing-session", "20261016_062747_c3f05f"])).toEqual({ kind: "ok" });
     expect(checkArgs("bridge", ["hermes", "--bogus"])).toEqual({ kind: "unknown_flag", flag: "--bogus" });
   });
 });

@@ -39,12 +39,44 @@ class BasePlatformAdapter:
     def __init__(self, config, platform):
         self.config = config; self._message_handler = None
         self._active_sessions = set(); self._pending_messages = {}
+        self.gateway_runner = None
+        self._test_profile = "main"
     def build_source(self, **kw):
         class S: pass
         s = S(); s.__dict__.update(kw); return s
+    def _source_session_key(self, source):
+        prof = getattr(self, "_test_profile", None) or "main"
+        return build_session_key(source, profile=prof)
     async def handle_message(self, event): self.delivered.append(event)
     def _mark_connected(self): pass
     def _mark_disconnected(self): pass
+class FakeSessionEntry:
+    def __init__(self, session_key, session_id):
+        self.session_key = session_key
+        self.session_id = session_id
+class FakeSessionStore:
+    def __init__(self, profile="main"):
+        self.profile = profile
+        self.entries = {}
+        self.switched = []
+    def get_or_create_session(self, source, **kw):
+        key = build_session_key(source, profile=self.profile)
+        if key not in self.entries:
+            self.entries[key] = FakeSessionEntry(key, "initial-default-session")
+        return self.entries[key]
+    def switch_session(self, session_key, target_sid, preserve_prompt_pin=True):
+        # Real gateway/session.py:1265 returns None when session_key is not in _entries.
+        if session_key not in self.entries:
+            return None
+        self.switched.append((session_key, target_sid))
+        self.entries[session_key] = FakeSessionEntry(session_key, target_sid)
+        return self.entries[session_key]
+class FakeRunner:
+    def __init__(self, profile="main"):
+        self.session_store = FakeSessionStore(profile=profile)
+        self.evicted = []
+    def _evict_cached_agent(self, key):
+        self.evicted.append(key)
 def merge_pending_message_event(pending, key, event, *, merge_text=False):
     # Mirrors gateway/platforms/base.py:2438 for the TEXT/TEXT case: WITHOUT merge_text the
     # pending slot is REPLACED (the earlier event is discarded outright); with it, the texts are
@@ -56,11 +88,13 @@ def merge_pending_message_event(pending, key, event, *, merge_text=False):
         return
     pending[key] = event
 def build_session_key(source, **kw):
-    # The REAL shape from gateway/session.py:1058 — namespaced, NOT the bare chat_id. A stub that
-    # returned chat_id made a busy-check comparing against chat_id look correct while it could
-    # never match anything in production. The stub must not assert the identity the code under
-    # test is being checked for.
-    return "agent:main:cello:dm:" + str(getattr(source, "chat_id", "?"))
+    # The REAL shape from gateway/session.py:1058 — namespaced, NOT the bare chat_id. Without an
+    # explicit profile kwarg (what BasePlatformAdapter._source_session_key supplies), build_session_key
+    # defaults to "agent:main:...".
+    prof = kw.get("profile") or getattr(source, "profile", None) or "main"
+    if prof == "default":
+        prof = "main"
+    return "agent:" + str(prof) + ":cello:dm:" + str(getattr(source, "chat_id", "?"))
 def get_session_env(name, default=""):
     # Real signature from gateway/session_context.py:363. The real one reads a ContextVar carried
     # into the tool worker thread; here the driver sets HERMES_SESSION_CHAT_ID / _PLATFORM in the
@@ -79,6 +113,7 @@ def get_session_env(name, default=""):
 export const DRIVER = `
 import asyncio, json, sys, logging
 import cello_plugin as m
+import gateway.platforms.base as _gpb
 
 # Capture the plugin's log records so a test can assert the loud error on an unparseable result.
 _log_records = []
@@ -103,6 +138,10 @@ adapter._active_sessions = set()
 adapter._pending_messages = {}
 adapter.delivered = []
 adapter.config = m.PlatformConfig(extra={})
+adapter._test_profile = spec.get("profile", "main")
+adapter.gateway_runner = None if spec.get("no_gateway_runner") else getattr(_gpb, "FakeRunner", lambda **k: None)(profile=adapter._test_profile)
+adapter._landing_session = spec.get("landing_session")
+adapter._landing_session_path = spec.get("landing_session_path") or "/tmp/cello-test-landing-session.json"
 # __new__ skips __init__, so this driver stands in for it. These two must match __init__'s
 # starting state or _start_wake_worker cannot tell "no worker yet" from "worker running".
 adapter._wake_queue = None
@@ -228,10 +267,16 @@ async def main():
         # it a tick to run the scheduled callback before reading the result.
         import os as _os
         adapter._loop = asyncio.get_running_loop()
+        if "bindings_path" in spec:
+            m._TEST_BINDINGS_PATH = spec["bindings_path"]
         if "chat_env" in spec:
             _os.environ["HERMES_SESSION_CHAT_ID"] = spec["chat_env"]
         else:
             _os.environ.pop("HERMES_SESSION_CHAT_ID", None)
+        if "session_id_env" in spec:
+            _os.environ["HERMES_SESSION_ID"] = spec["session_id_env"]
+        else:
+            _os.environ.pop("HERMES_SESSION_ID", None)
         _os.environ["HERMES_SESSION_PLATFORM"] = spec.get("platform_env", "cello")
         m._on_post_tool_call(
             tool_name=spec["tool_name"], args=spec.get("args") or {}, result=spec.get("hook_result")
@@ -300,6 +345,9 @@ async def main():
             {"text": e.text, "chat_id": getattr(e.source, "chat_id", None), "message_id": e.message_id}
             for e in adapter.delivered
         ]
+    runner = getattr(adapter, "gateway_runner", None)
+    out["switched_sessions"] = runner.session_store.switched if runner else []
+    out["evicted_agents"] = runner.evicted if runner else []
     out["calls"] = calls
     sys.stdout.write(json.dumps(out))
 
@@ -324,6 +372,8 @@ export interface Verdict {
   bindings?: Record<string, string>;
   awaiting?: Record<string, string[]>;
   logs?: Array<{ level: string; msg: string }>;
+  switched_sessions?: Array<[string, string]>;
+  evicted_agents?: string[];
   calls: Array<{ method: string; params: Record<string, unknown> }>;
 }
 

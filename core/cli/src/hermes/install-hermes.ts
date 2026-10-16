@@ -16,7 +16,7 @@
  * scaffolded files in place and keeps exactly one CELLO_AGENT_NAME line.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -49,6 +49,8 @@ export interface InstallHermesOptions {
   sessionScope?: string;
   /** `on` (default): a new post on a followed channel wakes the agent. `off`: channel doorbells are ignored. */
   channelNotifications?: string;
+  /** Direct incoming messages to this Hermes session instead of the default landing session. */
+  landingSession?: string;
   /** Injectable for tests; defaults to a spawn-based runner. */
   exec?: ExecFn;
 }
@@ -103,6 +105,16 @@ function upsertEnvLine(envPath: string, key: string, value: string): void {
   writeFileSync(envPath, lines.join("\n") + (lines[lines.length - 1] === "" ? "" : "\n"));
 }
 
+/** Drop KEY=value lines from an env file if present. */
+function removeEnvLine(envPath: string, key: string): void {
+  if (!existsSync(envPath)) return;
+  const lines = readFileSync(envPath, "utf-8").split("\n").filter((l) => !l.startsWith(`${key}=`));
+  while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  writeFileSync(envPath, lines.join("\n") + (lines.length > 0 ? "\n" : ""));
+}
+
+const SAFE_SESSION_ID_RE = /^[A-Za-z0-9+/=_.:@-]{1,120}$/;
+
 export async function installHermes(
   opts: InstallHermesOptions,
 ): Promise<{ exitCode: number; output: string }> {
@@ -122,6 +134,29 @@ export async function installHermes(
   const deliveryMode = (opts.deliveryMode ?? DEFAULT_DELIVERY_MODE).trim().toLowerCase();
   const sessionScope = (opts.sessionScope ?? DEFAULT_SESSION_SCOPE).trim().toLowerCase();
   const channelNotifications = (opts.channelNotifications ?? DEFAULT_CHANNEL_NOTIFICATIONS).trim().toLowerCase();
+
+  let landingSession = (opts.landingSession ?? "").trim();
+  if (landingSession.toLowerCase() === "default") {
+    landingSession = "";
+  } else if (landingSession.toLowerCase() === "current") {
+    const currentId = (process.env.HERMES_SESSION_ID ?? "").trim();
+    if (!currentId) {
+      return {
+        exitCode: 1,
+        output:
+          "Unable to resolve --landing-session current: HERMES_SESSION_ID is not set in the environment.\n" +
+          "Run from inside a Hermes session, or pass the explicit session ID: --landing-session <session-id>.",
+      };
+    }
+    landingSession = currentId;
+  }
+  if (landingSession && !SAFE_SESSION_ID_RE.test(landingSession)) {
+    return {
+      exitCode: 1,
+      output: `Invalid --landing-session '${landingSession}'. Session ID must match [A-Za-z0-9+/=_.:@-]{1,120}.`,
+    };
+  }
+
   for (const [flag, value, allowed] of [
     ["--delivery-mode", deliveryMode, DELIVERY_MODES],
     ["--session-scope", sessionScope, SESSION_SCOPES],
@@ -177,7 +212,7 @@ export async function installHermes(
   writeFileSync(join(policySkillDir, "SKILL.md"), HERMES_POLICY_SKILL_MD);
   out.push(`Wrote skill:  ${policySkillDir}/SKILL.md`);
 
-  // 3. Agent binding + behaviour settings. All three are written on every run, so re-running the
+  // 3. Agent binding + behaviour settings. All settings are written on every run, so re-running the
   //    installer without a flag RESETS that flag to its default rather than silently inheriting
   //    a value the operator can no longer see in the command they typed.
   const envPath = join(hermesHome, ".env");
@@ -189,6 +224,20 @@ export async function installHermes(
   out.push(`Delivery:     CELLO_DELIVERY_MODE=${deliveryMode}`);
   out.push(`Scope:        CELLO_SESSION_SCOPE=${sessionScope}`);
   out.push(`Channels:     CELLO_CHANNEL_NOTIFICATIONS=${channelNotifications}`);
+
+  const landingJsonPath = join(hermesHome, "cello", "landing-session.json");
+  if (landingSession) {
+    upsertEnvLine(envPath, "CELLO_LANDING_SESSION", landingSession);
+    mkdirSync(join(hermesHome, "cello"), { recursive: true });
+    writeFileSync(landingJsonPath, JSON.stringify({ session_id: landingSession }, null, 2) + "\n");
+    out.push(`Landing:      CELLO_LANDING_SESSION=${landingSession}`);
+  } else {
+    removeEnvLine(envPath, "CELLO_LANDING_SESSION");
+    if (existsSync(landingJsonPath)) {
+      rmSync(landingJsonPath, { force: true });
+    }
+    out.push("Landing:      default (CELLO_LANDING_SESSION unset)");
+  }
 
   // 4. Register through Hermes' own CLI. A failure here is loud: the files are in
   // place, so we print exactly what remains to be run by hand.
