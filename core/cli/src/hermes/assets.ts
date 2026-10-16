@@ -282,12 +282,64 @@ def _default_bindings_path() -> Path:
     _profile_runtime_scope). Using a single hardcoded ~/.hermes/cello/session-bindings.json caused
     secondary profiles to overwrite and prune the default profile's open session bindings on connect.
     """
+def _default_bindings_path() -> Path:
+    test_path = getattr(sys.modules.get(__name__), "_TEST_BINDINGS_PATH", None)
+    if test_path:
+        return Path(test_path)
     try:
         from hermes_constants import get_hermes_home
         base = Path(get_hermes_home())
     except ImportError:
         base = Path.home() / ".hermes"
     return base / "cello" / "session-bindings.json"
+
+
+def _default_landing_session_path() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+        base = Path(get_hermes_home())
+    except ImportError:
+        base = Path.home() / ".hermes"
+    return base / "cello" / "landing-session.json"
+
+
+def _record_disk_binding(session_id: str, chat_id: str, path: Optional[Path] = None) -> None:
+    target = path or _default_bindings_path()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        existing = {}
+        if target.exists():
+            try:
+                existing = json.loads(target.read_text(encoding="utf-8"))
+            except Exception:
+                existing = {}
+        if not isinstance(existing, dict):
+            existing = {}
+        existing[str(session_id)] = str(chat_id)
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        tmp.write_text(json.dumps(existing), encoding="utf-8")
+        os.replace(str(tmp), str(target))
+    except Exception as exc:
+        logger.error("[cello] Could not persist disk binding %s -> %s: %s", session_id, chat_id, exc)
+
+
+def _remove_disk_binding(session_id: str, path: Optional[Path] = None) -> None:
+    target = path or _default_bindings_path()
+    try:
+        if not target.exists():
+            return
+        existing = {}
+        try:
+            existing = json.loads(target.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if isinstance(existing, dict) and session_id in existing:
+            del existing[session_id]
+            tmp = target.with_suffix(target.suffix + ".tmp")
+            tmp.write_text(json.dumps(existing), encoding="utf-8")
+            os.replace(str(tmp), str(target))
+    except Exception as exc:
+        logger.error("[cello] Could not remove disk binding %s: %s", session_id, exc)
 
 
 def _cello_socket_path(explicit_dir: Optional[Any] = None) -> Path:
@@ -416,6 +468,10 @@ class CelloAdapter(BasePlatformAdapter):
         # escalation opened before a restart still has its answer routed home.
         self._bindings_path: Path = _default_bindings_path()
         self._bindings: Dict[str, str] = self._load_bindings()
+        self._landing_session_path: Path = _default_landing_session_path()
+        self._landing_session: Optional[str] = (
+            str(extra.get("landing_session") or _get_cello_env("CELLO_LANDING_SESSION") or "").strip() or None
+        )
         # Part C: chat_id -> {session_id: who} for replies the agent has not sent yet. The loop is
         # captured in connect(), because the reminder is scheduled from a hook that may run off it.
         self._awaiting: Dict[str, Dict[str, str]] = {}
@@ -515,6 +571,36 @@ class CelloAdapter(BasePlatformAdapter):
             del self._bindings[session_id]
             self._persist_bindings()
             logger.info("[cello] Unbound session %s (closed)", session_id)
+
+    def _get_landing_session_id(self) -> Optional[str]:
+        try:
+            path = Path(self._landing_session_path)
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    sid = data.get("session_id")
+                    if isinstance(sid, str) and _SAFE_SCALAR_RE.fullmatch(sid):
+                        return sid
+        except Exception as exc:
+            logger.debug("[cello] Could not read landing session file: %s", exc)
+        return self._landing_session
+
+    def _sync_gateway_landing_session(self, source: Any, session_key: str, landing_sid: str) -> None:
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None:
+            return
+        store = getattr(runner, "session_store", None)
+        if store is None:
+            return
+        try:
+            entry = store.get_or_create_session(source)
+            if entry and entry.session_id != landing_sid:
+                store.switch_session(session_key, landing_sid, preserve_prompt_pin=False)
+                if hasattr(runner, "_evict_cached_agent"):
+                    runner._evict_cached_agent(session_key)
+                logger.info("[cello] Switched landing session for %s from %s to %s", session_key, entry.session_id, landing_sid)
+        except Exception as exc:
+            logger.warning("[cello] Failed to switch gateway landing session to %s: %s", landing_sid, exc)
 
     async def _prune_bindings(self) -> None:
         """Drop links whose session the daemon no longer lists as open (active or interrupted).
@@ -1095,6 +1181,8 @@ class CelloAdapter(BasePlatformAdapter):
         counterparty = self._counterparty_of(kind, data)
         # Part B step 3: a session THIS agent opened comes home to the chat that opened it, ahead of
         # the sender-based routing. The source's user_id stays the real counterparty below.
+        if session_id not in self._bindings:
+            self._bindings = self._load_bindings()
         bound_chat = self._bindings.get(session_id)
         chat_id = bound_chat if bound_chat is not None else self._chat_id_for(counterparty)
         if chat_id is None:
@@ -1142,6 +1230,10 @@ class CelloAdapter(BasePlatformAdapter):
         # member and the guard silently protected nothing - a check that reports safety it does
         # not provide is worse than no check. Computed once here and reused below.
         session_key = self._session_key_for(source)
+        if bound_chat is None and self._session_scope == "agent":
+            landing_sid = self._get_landing_session_id()
+            if landing_sid:
+                self._sync_gateway_landing_session(source, session_key, landing_sid)
         text = None
         if self._delivers_content() and kind == "cello_message":
             if session_key in self._active_sessions:
@@ -1873,9 +1965,7 @@ def _on_post_tool_call(**kwargs: Any) -> None:
         logger.info("[cello] post_tool_call sees a CELLO tool as %r", tool_name)
 
     adapter = _ADAPTER_INSTANCE
-    if adapter is None:
-        logger.error("[cello] post_tool_call fired for %r but no CelloAdapter is bound", tool_name)
-        return
+    bpath = getattr(adapter, "_bindings_path", None) or getattr(sys.modules.get(__name__), "_TEST_BINDINGS_PATH", None)
 
     result = _parse_tool_result(kwargs.get("result"))
     if not (isinstance(result, dict) and "ok" in result):
@@ -1896,14 +1986,14 @@ def _on_post_tool_call(**kwargs: Any) -> None:
         sid = _tool_session_arg(kwargs.get("args"))
         # Part C step 2: any successful send counts as a reply, including a 'standby' signal.
         if succeeded:
-            if sid:
+            if sid and adapter is not None:
                 adapter._run_on_loop(adapter._clear_awaiting, sid)
             return
         # 050-BRIDGEQUIET Part B: a send REFUSED because the session is over clears the owed reply -
         # the agent can never answer a conversation that has ended, so a reminder would tell it to
         # reply to nothing (the live defect). Any other ok:false keeps the reminder armed.
         reason = result.get("reason")
-        if isinstance(reason, str) and reason in SESSION_ENDED_SEND_REASONS and sid:
+        if isinstance(reason, str) and reason in SESSION_ENDED_SEND_REASONS and sid and adapter is not None:
             adapter._run_on_loop(adapter._clear_awaiting, sid)
         return
 
@@ -1914,30 +2004,34 @@ def _on_post_tool_call(**kwargs: Any) -> None:
             return
         sid = _tool_session_arg(kwargs.get("args"))
         if sid:
-            adapter._run_on_loop(adapter._unbind_session, sid)
-            # 050-BRIDGEQUIET Part B: a closed session is over - drop any reply still owed on it, in
-            # addition to the unbind, so no reminder follows a conversation the agent itself ended.
-            adapter._run_on_loop(adapter._clear_awaiting, sid)
+            _remove_disk_binding(sid, Path(bpath) if bpath else None)
+            if adapter is not None:
+                adapter._run_on_loop(adapter._unbind_session, sid)
+                # 050-BRIDGEQUIET Part B: a closed session is over - drop any reply still owed on it, in
+                # addition to the unbind, so no reminder follows a conversation the agent itself ended.
+                adapter._run_on_loop(adapter._clear_awaiting, sid)
         return
 
-    # Part B step 2: record only a SUCCESSFUL initiate from a turn whose platform is cello.
-    if get_session_env("HERMES_SESSION_PLATFORM", "") != "cello":
-        # A turn started elsewhere (e.g. the desktop app) needs the manual bind, not in this order.
-        return
+    # Part B step 2: record a SUCCESSFUL initiate from any turn.
     if not succeeded:
         return
     sid = result.get("sessionId")
     if not (isinstance(sid, str) and sid):
         logger.error("[cello] cello_initiate_session succeeded but carried no sessionId (%r)", result)
         return
-    chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+    chat_id = (
+        get_session_env("HERMES_SESSION_CHAT_ID", "")
+        or get_session_env("HERMES_SESSION_ID", "")
+        or str(kwargs.get("session_id") or "")
+    )
     if not chat_id:
         logger.error(
-            "[cello] cello_initiate_session succeeded but HERMES_SESSION_CHAT_ID is empty - refusing "
-            "to guess a chat, so this session is not bound (session %s)", sid,
+            "[cello] cello_initiate_session succeeded but HERMES_SESSION_CHAT_ID and HERMES_SESSION_ID are empty - not bound (session %s)", sid,
         )
         return
-    adapter._run_on_loop(adapter._bind_session, sid, chat_id)
+    _record_disk_binding(sid, chat_id, Path(bpath) if bpath else None)
+    if adapter is not None:
+        adapter._run_on_loop(adapter._bind_session, sid, chat_id)
 
 
 def _on_post_llm_call(**kwargs: Any) -> None:

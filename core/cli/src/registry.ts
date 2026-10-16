@@ -2101,6 +2101,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       { name: "--delivery-mode" },
       { name: "--session-scope" },
       { name: "--channel-notifications" },
+      { name: "--landing-session" },
     ],
     async run(_ctx, args) {
       // A flag present with no value is NOT the same as an absent flag. Mapping it to undefined
@@ -2121,7 +2122,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       // Every flag consumes a value, so a positional is one that is neither a flag nor any
       // flag's value — that is what lets `cello bridge --agent alice hermes` still find `hermes`.
       const valueIndexes = new Set(
-        ["--agent", "--hermes-home", "--delivery-mode", "--session-scope", "--channel-notifications"]
+        ["--agent", "--hermes-home", "--delivery-mode", "--session-scope", "--channel-notifications", "--landing-session"]
           .map((f) => args.indexOf(f))
           .filter((i) => i !== -1)
           .map((i) => i + 1),
@@ -2136,6 +2137,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
         deliveryMode: valueOf("--delivery-mode"),
         sessionScope: valueOf("--session-scope"),
         channelNotifications: valueOf("--channel-notifications"),
+        landingSession: valueOf("--landing-session"),
       };
       if (missingValue.length > 0) {
         return {

@@ -16,6 +16,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -187,19 +188,21 @@ describe("049-BRIDGEREPLY Part B — a session the agent opens belongs to the ch
     expect(v.bindings![SID]).toBe("caller-chat-42"); // link kept
   });
 
-  it("B6: a failed initiate, or one from a non-cello turn, stores nothing", () => {
+  it("B6: a failed initiate stores nothing", () => {
     const failed = runDriver(dir, {
       op: "record", bindings_path: bpath(), chat_env: "caller-chat-42",
       tool_name: "mcp__cello__cello_initiate_session",
       hook_result: envelope({ ok: false, reason: "no_relay" }),
     });
     expect(Object.keys(failed.bindings ?? {})).toHaveLength(0);
+  });
 
+  it("B6: a successful initiate from a desktop turn binds to the chat or session", () => {
     const desktop = runDriver(dir, {
       op: "record", bindings_path: bpath(), chat_env: "caller-chat-42", platform_env: "desktop",
       tool_name: "mcp__cello__cello_initiate_session", hook_result: INITIATE_RESULT,
     });
-    expect(Object.keys(desktop.bindings ?? {})).toHaveLength(0);
+    expect(desktop.bindings?.[SID]).toBe("caller-chat-42");
   });
 
   it("B6: an empty HERMES_SESSION_CHAT_ID stores nothing — the bridge never guesses a chat", () => {
@@ -220,6 +223,37 @@ describe("049-BRIDGEREPLY Part B — a session the agent opens belongs to the ch
       receive_queue: [],
     });
     expect(v.delivered ?? []).toHaveLength(0);
+  });
+
+  it("B8: landing_session switches the gateway landing route to the configured session ID", () => {
+    const landingJson = join(dir, "landing-session.json");
+    writeFileSync(landingJson, JSON.stringify({ session_id: "20261016_062747_c3f05f" }));
+
+    const v = runDriver(dir, {
+      op: "notify", delivery_mode: "explicit", session_scope: "agent",
+      landing_session_path: landingJson,
+      kind: "cello_message", data: { session_id: SID, from: PUB },
+    });
+    expect(v.switched_sessions).toEqual([
+      ["agent:main:cello:dm:" + AGENT, "20261016_062747_c3f05f"],
+    ]);
+    expect(v.evicted_agents).toContain("agent:main:cello:dm:" + AGENT);
+  });
+
+  it("B9: cross-process: post_tool_call binds session using HERMES_SESSION_ID when no CelloAdapter instance is bound", () => {
+    const bpath = join(dir, "cross-proc-bindings.json");
+    runDriver(dir, {
+      op: "record",
+      no_adapter: true,
+      bindings_path: bpath,
+      tool_name: "mcp__cello__cello_initiate_session",
+      hook_result: JSON.stringify({ result: JSON.stringify({ ok: true, sessionId: "sess-cross-proc-123" }) }),
+      session_id_env: "desktop-session-999",
+      platform_env: "desktop",
+    });
+    expect(existsSync(bpath)).toBe(true);
+    const saved = JSON.parse(readFileSync(bpath, "utf-8"));
+    expect(saved["sess-cross-proc-123"]).toBe("desktop-session-999");
   });
 });
 
