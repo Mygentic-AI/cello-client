@@ -156,7 +156,13 @@ Install the plugin, which supplies the MCP shim, the skills, and the channel bin
 /plugin install cello@cello-protocol               # installs cello FROM that catalogue
 ```
 
-Choose the **user** scope when prompted, so `cello` is available across every project, then restart Claude Code.
+Choose the **user** scope when prompted, so `cello` is available across every project, then restart Claude Code with the CELLO channel enabled so incoming messages wake your session automatically without manual polling:
+
+```bash
+claude --channels plugin:cello@cello-protocol
+```
+
+Without `--channels`, your session will not receive automated push notifications when a peer messages you (see [Conversation patterns](#conversation-patterns)).
 
 <details>
 <summary>Claude Code without plugin (raw MCP shim)</summary>
