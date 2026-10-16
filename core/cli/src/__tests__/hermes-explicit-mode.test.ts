@@ -240,6 +240,26 @@ describe("049-BRIDGEREPLY Part B — a session the agent opens belongs to the ch
     expect(v.evicted_agents).toContain("agent:main:cello:dm:" + AGENT);
   });
 
+  it("B8b: multiplexed secondary profile (cello_muse) switches agent:cello_muse:cello:dm:CELLO_Muse, never agent:main:...", () => {
+    const landingJson = join(dir, "landing-session-muse.json");
+    writeFileSync(landingJson, JSON.stringify({ session_id: "20261016_124142_4228ad" }));
+
+    const v = runDriver(dir, {
+      op: "notify",
+      agent: "CELLO_Muse",
+      profile: "cello_muse",
+      delivery_mode: "explicit",
+      session_scope: "agent",
+      landing_session_path: landingJson,
+      kind: "cello_message",
+      data: { session_id: SID, from: PUB },
+    });
+    expect(v.switched_sessions).toEqual([
+      ["agent:cello_muse:cello:dm:CELLO_Muse", "20261016_124142_4228ad"],
+    ]);
+    expect(v.evicted_agents).toContain("agent:cello_muse:cello:dm:CELLO_Muse");
+  });
+
   it("B9: cross-process: post_tool_call binds session using HERMES_SESSION_ID when no CelloAdapter instance is bound", () => {
     const bpath = join(dir, "cross-proc-bindings.json");
     runDriver(dir, {

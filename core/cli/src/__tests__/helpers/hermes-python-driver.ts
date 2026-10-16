@@ -40,30 +40,40 @@ class BasePlatformAdapter:
         self.config = config; self._message_handler = None
         self._active_sessions = set(); self._pending_messages = {}
         self.gateway_runner = None
+        self._test_profile = "main"
     def build_source(self, **kw):
         class S: pass
         s = S(); s.__dict__.update(kw); return s
+    def _source_session_key(self, source):
+        prof = getattr(self, "_test_profile", None) or "main"
+        return build_session_key(source, profile=prof)
     async def handle_message(self, event): self.delivered.append(event)
     def _mark_connected(self): pass
     def _mark_disconnected(self): pass
 class FakeSessionEntry:
-    def __init__(self, session_id): self.session_id = session_id
+    def __init__(self, session_key, session_id):
+        self.session_key = session_key
+        self.session_id = session_id
 class FakeSessionStore:
-    def __init__(self):
+    def __init__(self, profile="main"):
+        self.profile = profile
         self.entries = {}
         self.switched = []
     def get_or_create_session(self, source, **kw):
-        key = build_session_key(source)
+        key = build_session_key(source, profile=self.profile)
         if key not in self.entries:
-            self.entries[key] = FakeSessionEntry("initial-default-session")
+            self.entries[key] = FakeSessionEntry(key, "initial-default-session")
         return self.entries[key]
     def switch_session(self, session_key, target_sid, preserve_prompt_pin=True):
+        # Real gateway/session.py:1265 returns None when session_key is not in _entries.
+        if session_key not in self.entries:
+            return None
         self.switched.append((session_key, target_sid))
-        self.entries[session_key] = FakeSessionEntry(target_sid)
+        self.entries[session_key] = FakeSessionEntry(session_key, target_sid)
         return self.entries[session_key]
 class FakeRunner:
-    def __init__(self):
-        self.session_store = FakeSessionStore()
+    def __init__(self, profile="main"):
+        self.session_store = FakeSessionStore(profile=profile)
         self.evicted = []
     def _evict_cached_agent(self, key):
         self.evicted.append(key)
@@ -78,11 +88,13 @@ def merge_pending_message_event(pending, key, event, *, merge_text=False):
         return
     pending[key] = event
 def build_session_key(source, **kw):
-    # The REAL shape from gateway/session.py:1058 — namespaced, NOT the bare chat_id. A stub that
-    # returned chat_id made a busy-check comparing against chat_id look correct while it could
-    # never match anything in production. The stub must not assert the identity the code under
-    # test is being checked for.
-    return "agent:main:cello:dm:" + str(getattr(source, "chat_id", "?"))
+    # The REAL shape from gateway/session.py:1058 — namespaced, NOT the bare chat_id. Without an
+    # explicit profile kwarg (what BasePlatformAdapter._source_session_key supplies), build_session_key
+    # defaults to "agent:main:...".
+    prof = kw.get("profile") or getattr(source, "profile", None) or "main"
+    if prof == "default":
+        prof = "main"
+    return "agent:" + str(prof) + ":cello:dm:" + str(getattr(source, "chat_id", "?"))
 def get_session_env(name, default=""):
     # Real signature from gateway/session_context.py:363. The real one reads a ContextVar carried
     # into the tool worker thread; here the driver sets HERMES_SESSION_CHAT_ID / _PLATFORM in the
@@ -126,7 +138,8 @@ adapter._active_sessions = set()
 adapter._pending_messages = {}
 adapter.delivered = []
 adapter.config = m.PlatformConfig(extra={})
-adapter.gateway_runner = None if spec.get("no_gateway_runner") else getattr(_gpb, "FakeRunner", lambda: None)()
+adapter._test_profile = spec.get("profile", "main")
+adapter.gateway_runner = None if spec.get("no_gateway_runner") else getattr(_gpb, "FakeRunner", lambda **k: None)(profile=adapter._test_profile)
 adapter._landing_session = spec.get("landing_session")
 adapter._landing_session_path = spec.get("landing_session_path") or "/tmp/cello-test-landing-session.json"
 # __new__ skips __init__, so this driver stands in for it. These two must match __init__'s

@@ -600,11 +600,18 @@ class CelloAdapter(BasePlatformAdapter):
             return
         try:
             entry = store.get_or_create_session(source)
+            route_key = getattr(entry, "session_key", None) or session_key
             if entry and entry.session_id != landing_sid:
-                store.switch_session(session_key, landing_sid, preserve_prompt_pin=False)
+                switched = store.switch_session(route_key, landing_sid, preserve_prompt_pin=False)
+                if switched is None:
+                    logger.warning(
+                        "[cello] Gateway session_store.switch_session refused %s -> %s",
+                        route_key, landing_sid,
+                    )
+                    return
                 if hasattr(runner, "_evict_cached_agent"):
-                    runner._evict_cached_agent(session_key)
-                logger.info("[cello] Switched landing session for %s from %s to %s", session_key, entry.session_id, landing_sid)
+                    runner._evict_cached_agent(route_key)
+                logger.info("[cello] Switched landing session for %s from %s to %s", route_key, entry.session_id, landing_sid)
         except Exception as exc:
             logger.warning("[cello] Failed to switch gateway landing session to %s: %s", landing_sid, exc)
 
@@ -1402,10 +1409,13 @@ class CelloAdapter(BasePlatformAdapter):
     def _session_key_for(self, source: Any) -> str:
         """The gateway's session key for a source, built exactly as handle_message builds it.
 
-        One helper so the busy check in _on_notification and the queueing decision in
-        handle_message can never drift apart - they must agree or the fetch guard protects a
-        different session than the one that is actually busy.
+        Delegates to BasePlatformAdapter._source_session_key when present so multiplexed secondary
+        profiles canonicalize the source and include the profile namespace (agent:<profile>:cello:...)
+        instead of falling back to agent:main:cello:...
         """
+        source_key_fn = getattr(super(), "_source_session_key", None)
+        if callable(source_key_fn):
+            return str(source_key_fn(source))
         return build_session_key(
             source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
