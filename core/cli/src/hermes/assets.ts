@@ -282,7 +282,6 @@ def _default_bindings_path() -> Path:
     _profile_runtime_scope). Using a single hardcoded ~/.hermes/cello/session-bindings.json caused
     secondary profiles to overwrite and prune the default profile's open session bindings on connect.
     """
-def _default_bindings_path() -> Path:
     test_path = getattr(sys.modules.get(__name__), "_TEST_BINDINGS_PATH", None)
     if test_path:
         return Path(test_path)
@@ -303,18 +302,24 @@ def _default_landing_session_path() -> Path:
     return base / "cello" / "landing-session.json"
 
 
+def _read_disk_bindings(path: Path) -> Dict[str, str]:
+    if not path.exists():
+        return {}
+    try:
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items() if isinstance(v, str)}
+    except Exception as exc:
+        logger.warning("[cello] Could not read disk bindings at %s: %s", path, exc)
+    return {}
+
+
 def _record_disk_binding(session_id: str, chat_id: str, path: Optional[Path] = None) -> None:
     target = path or _default_bindings_path()
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        existing = {}
-        if target.exists():
-            try:
-                existing = json.loads(target.read_text(encoding="utf-8"))
-            except Exception:
-                existing = {}
-        if not isinstance(existing, dict):
-            existing = {}
+        existing = _read_disk_bindings(target)
         existing[str(session_id)] = str(chat_id)
         tmp = target.with_suffix(target.suffix + ".tmp")
         tmp.write_text(json.dumps(existing), encoding="utf-8")
@@ -328,12 +333,8 @@ def _remove_disk_binding(session_id: str, path: Optional[Path] = None) -> None:
     try:
         if not target.exists():
             return
-        existing = {}
-        try:
-            existing = json.loads(target.read_text(encoding="utf-8"))
-        except Exception:
-            return
-        if isinstance(existing, dict) and session_id in existing:
+        existing = _read_disk_bindings(target)
+        if session_id in existing:
             del existing[session_id]
             tmp = target.with_suffix(target.suffix + ".tmp")
             tmp.write_text(json.dumps(existing), encoding="utf-8")
@@ -535,6 +536,9 @@ class CelloAdapter(BasePlatformAdapter):
         path = Path(self._bindings_path)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
+            disk_copy = _read_disk_bindings(path)
+            disk_copy.update(self._bindings)
+            self._bindings = disk_copy
             tmp = path.with_suffix(path.suffix + ".tmp")
             tmp.write_text(json.dumps(self._bindings), encoding="utf-8")
             os.replace(str(tmp), str(path))
@@ -583,7 +587,9 @@ class CelloAdapter(BasePlatformAdapter):
                         return sid
         except Exception as exc:
             logger.debug("[cello] Could not read landing session file: %s", exc)
-        return self._landing_session
+        if isinstance(self._landing_session, str) and _SAFE_SCALAR_RE.fullmatch(self._landing_session):
+            return self._landing_session
+        return None
 
     def _sync_gateway_landing_session(self, source: Any, session_key: str, landing_sid: str) -> None:
         runner = getattr(self, "gateway_runner", None)

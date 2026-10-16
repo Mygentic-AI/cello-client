@@ -255,6 +255,22 @@ describe("049-BRIDGEREPLY Part B — a session the agent opens belongs to the ch
     const saved = JSON.parse(readFileSync(bpath, "utf-8"));
     expect(saved["sess-cross-proc-123"]).toBe("desktop-session-999");
   });
+
+  it("B10: cross-process: post_tool_call unbinds session on cello_close_session when no CelloAdapter instance is bound", () => {
+    const bpath = join(dir, "cross-proc-bindings-close.json");
+    writeFileSync(bpath, JSON.stringify({ "sess-to-close-456": "desktop-session-123" }));
+    runDriver(dir, {
+      op: "record",
+      no_adapter: true,
+      bindings_path: bpath,
+      tool_name: "mcp__cello__cello_close_session",
+      args: { session_id: "sess-to-close-456" },
+      hook_result: JSON.stringify({ result: JSON.stringify({ ok: true }) }),
+      platform_env: "desktop",
+    });
+    const saved = JSON.parse(readFileSync(bpath, "utf-8"));
+    expect(saved["sess-to-close-456"]).toBeUndefined();
+  });
 });
 
 describe("049-BRIDGEREPLY Part C — a turn that ends without a reply gets one reminder", () => {

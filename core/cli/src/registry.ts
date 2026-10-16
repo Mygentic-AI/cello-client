@@ -2089,6 +2089,9 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "                   off               channel doorbells are ignored; the agent reads channels only\n" +
       "                                     when it looks, or from a scheduled job. To quiet ONE channel\n" +
       "                                     and keep the rest, run: cello channel notify <channel> pull\n" +
+      "  --landing-session  <id|current|default>  route inbound messages to this Hermes session\n" +
+      "                                           instead of the default landing session. 'current' uses\n" +
+      "                                           HERMES_SESSION_ID; 'default' restores the default session.\n" +
       "\n" +
       "  These settings are per-agent and are REWRITTEN on every run: omitting a flag resets it to\n" +
       "  its default rather than keeping a value from a previous install.\n" +

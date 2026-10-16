@@ -174,10 +174,27 @@ describe("installHermes — argument and environment validation", () => {
     const landingJson = join(hermesHome, "cello", "landing-session.json");
     expect(existsSync(landingJson)).toBe(true);
 
-    await installHermes({ agentName: "alice", hermesHome, exec: okExec });
+    const res = await installHermes({ agentName: "alice", hermesHome, exec: okExec });
     const env = readFileSync(join(hermesHome, ".env"), "utf-8");
     expect(env).not.toContain("CELLO_LANDING_SESSION=");
     expect(existsSync(landingJson)).toBe(false);
+    expect(res.output).toContain("Landing:      default");
+  });
+
+  it("passing --landing-session default explicitly clears it and removes landing-session.json", async () => {
+    await installHermes({
+      agentName: "alice", hermesHome, landingSession: "20261016_062747_c3f05f", exec: okExec,
+    });
+    const landingJson = join(hermesHome, "cello", "landing-session.json");
+    expect(existsSync(landingJson)).toBe(true);
+
+    const res = await installHermes({
+      agentName: "alice", hermesHome, landingSession: "default", exec: okExec,
+    });
+    const env = readFileSync(join(hermesHome, ".env"), "utf-8");
+    expect(env).not.toContain("CELLO_LANDING_SESSION=");
+    expect(existsSync(landingJson)).toBe(false);
+    expect(res.output).toContain("Landing:      default");
   });
 });
 

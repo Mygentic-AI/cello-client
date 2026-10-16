@@ -236,6 +236,7 @@ export async function installHermes(
     if (existsSync(landingJsonPath)) {
       rmSync(landingJsonPath, { force: true });
     }
+    out.push("Landing:      default (CELLO_LANDING_SESSION unset)");
   }
 
   // 4. Register through Hermes' own CLI. A failure here is loud: the files are in
