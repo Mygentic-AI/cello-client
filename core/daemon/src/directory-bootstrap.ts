@@ -36,14 +36,14 @@ import { extractErrorMessage } from "./error-message.js";
  * A NAME as of 2026-09-10, and the condition the previous comment set is exactly what changed: it
  * said this "cannot be this constant until the manifest carries names", and the manifest now carries
  * names. Every node sits behind its own regional load balancer terminating TLS, and the bundled
- * roster moved to `https://directory-<region>.cello.mygentic.ai` in the same change. The two are
+ * roster moved to `https://directory-<region>.celloprotocol.com` in the same change. The two are
  * only ever correct together.
  *
  * No port: 443, and the balancer's URL map routes /bootstrap, /manifest, /health, /agent-lookup and
  * /registry to the node's HTTP listener while everything else — the libp2p WebSocket upgrade — goes
  * to the protocol listener. One port now serves what needed two.
  */
-export const PRODUCTION_DIRECTORY_URL = "https://directory-use1.cello.mygentic.ai";
+export const PRODUCTION_DIRECTORY_URL = "https://directory-use1.celloprotocol.com";
 
 /**
  * The bundled manifest's endpoint list, used by resolveDirectoryUrl to distribute cold-boot

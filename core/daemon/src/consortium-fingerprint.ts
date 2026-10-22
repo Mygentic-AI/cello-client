@@ -63,7 +63,7 @@ import type { Logger } from "./types.js";
 export const CONSORTIUM_FINGERPRINT_DOMAIN = "cello-consortium-root-v1";
 
 /** Where the genuine value is published, for an operator comparing what they just read. */
-export const CONSORTIUM_FINGERPRINT_PUBLISHED_AT = "https://cello.mygentic.ai/fingerprint";
+export const CONSORTIUM_FINGERPRINT_PUBLISHED_AT = "https://celloprotocol.com/fingerprint";
 
 /**
  * The canonical preimage: domain, then the root keys lowercased and SORTED, then the threshold.

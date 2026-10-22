@@ -1405,7 +1405,7 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
     // switched to verbatim excerpts to make visible.
     excerpts: [
       "> **Waitlist token** — what the bot asks *you* for, once, the first time you talk to it. It comes",
-      "> from being admitted to a launch cohort at **https://cello.mygentic.ai/waitlist**, and it is",
+      "> from being admitted to a launch cohort at **https://celloprotocol.com/waitlist**, and it is",
       "> burned on use: after that the bot knows your Telegram account and never asks again.",
     ],
     verdict: "true",

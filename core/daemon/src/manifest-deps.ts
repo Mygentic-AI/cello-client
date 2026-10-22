@@ -104,7 +104,7 @@ export function buildManifestDeps(logger: Logger): ManifestDeps {
     // manifest updates via the /manifest poll is a separate opt-in reachable through the env path.
     //
     // GATE (do NOT enable step-6 against a directory the bundle can't authenticate): the bundled
-    // manifest is the trust anchor for the PRODUCTION consortium ONLY (the mygentic.ai directories
+    // manifest is the trust anchor for the PRODUCTION consortium ONLY (the celloprotocol.com directories
     // it lists). When the operator has pointed CELLO_DIRECTORY_URL at a directory that is NOT in the
     // bundle — local dev (`CELLO_ENV=local`) and the e2e spine harness both run their own local
     // directory on 127.0.0.1 — the bundled node pubkeys don't describe it, so enforcing step-6 would

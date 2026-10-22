@@ -214,7 +214,7 @@ describe("DOD-M15-CONSORTIUM-FINGERPRINT-1: both status surfaces answer the ques
     expect(status["consortium_root_fingerprint_full"]).toBe(EXPECTED_FULL);
     expect(status["consortium_root_fingerprint_state"]).toBe("bundled");
     expect(String(status["consortium_root_fingerprint_guidance"])).toContain(
-      "https://cello.mygentic.ai/fingerprint",
+      "https://celloprotocol.com/fingerprint",
     );
   });
 

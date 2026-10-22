@@ -68,13 +68,13 @@ describe("FINDING-4: bundled consortium manifest constant", () => {
       // The scheme is asserted, not just the host: an `http://` endpoint that still reaches the
       // node would work and would silently give up the metadata privacy the cutover bought.
       expect(String(node["endpoint"])).toMatch(
-        /^https:\/\/directory-[a-z0-9]+\.cello\.mygentic\.ai$/,
+        /^https:\/\/directory-[a-z0-9]+\.celloprotocol\.com$/,
       );
       // The dial address is STATED, not derived from `endpoint`: they are consumed by different
       // code, and inferring one from the other is how anti-entropy broke. Both are port 443 on the
       // same name now, which makes the temptation to derive it stronger, not weaker.
       expect(String(node["multiaddr"])).toMatch(
-        /^\/dns4\/directory-[a-z0-9]+\.cello\.mygentic\.ai\/tcp\/443\/tls\/ws$/,
+        /^\/dns4\/directory-[a-z0-9]+\.celloprotocol\.com\/tcp\/443\/tls\/ws$/,
       );
       // The name in the multiaddr must be the SAME name as the endpoint. A mismatch would leave
       // /bootstrap resolving to one node and the dial to another, which reads as a peer-id mismatch
@@ -196,7 +196,7 @@ describe("FINDING-4: buildManifestDeps default (bundled) vs override (env) path"
     expect(lines.at(-1)?.level, "loopback is designed — must not cry wolf").toBe("info");
 
     lines.length = 0;
-    process.env.CELLO_DIRECTORY_URL = "http://directory-use1.cello.mygentic.ai:9090";
+    process.env.CELLO_DIRECTORY_URL = "http://directory-use1.celloprotocol.com:9090";
     buildManifestDeps(logger as never);
     const last = lines.at(-1);
     expect(last?.level, "a public directory outside the roster is a downgrade").toBe("warn");
@@ -218,7 +218,7 @@ describe("FINDING-4: buildManifestDeps default (bundled) vs override (env) path"
     // gcp-euw1, byte for byte as it appears in the bundle. That exactness is the whole point of the
     // test: the raw address this used to be still REACHES the same node, and after the 2026-09-10
     // TLS cutover it no longer matches, so step 6 would be skipped while everything still worked.
-    process.env.CELLO_DIRECTORY_URL = "https://directory-euw1.cello.mygentic.ai";
+    process.env.CELLO_DIRECTORY_URL = "https://directory-euw1.celloprotocol.com";
     const deps = buildManifestDeps(nullLogger());
     expect(deps.manifestProvider).toBeDefined();
     expect(deps.challengeVerifier).toBeDefined();

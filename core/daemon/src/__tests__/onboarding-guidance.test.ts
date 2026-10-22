@@ -64,7 +64,7 @@ describe("NO_AGENTS_GUIDANCE", () => {
 
   it("points at the waitlist so someone who never signed up knows where to start", () => {
     expect(NO_AGENTS_GUIDANCE).toContain(WAITLIST_URL);
-    expect(WAITLIST_URL).toBe("https://cello.mygentic.ai/waitlist");
+    expect(WAITLIST_URL).toBe("https://celloprotocol.com/waitlist");
   });
 
   it("names both commands, so the next keystroke is never a guess", () => {

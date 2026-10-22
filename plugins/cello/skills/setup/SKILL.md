@@ -47,7 +47,7 @@ reusable after an agent is retired, so never treat a name as proof of who you ar
 > 24-hour expiry. The bot issues it.
 >
 > **Waitlist token** — what the bot asks *you* for, once, the first time you talk to it. It comes
-> from being admitted to a launch cohort at **https://cello.mygentic.ai/waitlist**, and it is
+> from being admitted to a launch cohort at **https://celloprotocol.com/waitlist**, and it is
 > burned on use: after that the bot knows your Telegram account and never asks again.
 >
 > So if the bot will not issue you an agent token, the cohort is why — not a fault.
@@ -348,7 +348,7 @@ manifest at all.
 This check runs inside the client you are running, so it catches a fork that
 reuses our client — not a client you got from somewhere other than the published
 packages. Install from those. The same fingerprint is published at
-<https://cello.mygentic.ai/fingerprint> and in
+<https://celloprotocol.com/fingerprint> and in
 [`consortium-fingerprint.json`](https://github.com/Mygentic-AI/cello-client/blob/main/consortium-fingerprint.json),
 which you can read before installing anything.
 

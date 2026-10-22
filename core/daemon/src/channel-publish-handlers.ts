@@ -93,7 +93,7 @@ function needChannel(params: Record<string, unknown> | undefined):
  * ⚠️ **THE `/p2p/<peer id>` TAIL IS REQUIRED, NOT DECORATION.** The peer id is how the relay is
  * AUTHENTICATED on connect — a directory-picked relay and the libp2p relays the enforcer runs all
  * carry one (`/ip4/…/tcp/…/p2p/12D3KooW…`). An address without it is not a usable relay: setup used
- * to accept a bare hostname like `relay-usc1.cello.mygentic.ai`, and every later publish then failed
+ * to accept a bare hostname like `relay-usc1.celloprotocol.com`, and every later publish then failed
  * on a dial that never had a peer to reach.
  *
  * Shape: `/dns4|dns6|ip4|ip6/<host>/tcp/<port>` then any transport segments (`/tls/ws`, …) and

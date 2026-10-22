@@ -60,7 +60,7 @@ export async function cleanupCelloDir(dir: string | undefined): Promise<void> {
  * ⚠️ **THE DIRECTORY PIN IS A DEFAULT, NOT A PER-TEST CHORE (037-TESTTRUTH, decision 4).**
  *
  * A daemon booted with no `CELLO_DIRECTORY_URL` picks a directory from the bundled manifest, which
- * names the LIVE GCP consortium (`*.cello.mygentic.ai`). Every unpinned `spawnRealDaemon` in the
+ * names the LIVE GCP consortium (`*.celloprotocol.com`). Every unpinned `spawnRealDaemon` in the
  * suite therefore dialled production on every full-suite run — and the 024 create test even
  * registered throwaway channels there, crashing a directory (fixed in fe8c5341). Pinning was left to
  * each caller, so a new test forgets it and reopens the hole. The pin now lives HERE: a closed local

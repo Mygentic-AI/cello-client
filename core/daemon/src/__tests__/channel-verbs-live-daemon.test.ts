@@ -126,16 +126,16 @@ describe("M16 018-PUBCOLLECT: the channel verbs on a live daemon", () => {
   });
 
   it("035 item 5 — setup refuses a relay that is not a /p2p-terminated multiaddr", async () => {
-    // Live evidence: `setup` accepted a bare hostname `relay-usc1.cello.mygentic.ai`, which cannot be
+    // Live evidence: `setup` accepted a bare hostname `relay-usc1.celloprotocol.com`, which cannot be
     // dialed — every later publish then failed on a relay with no peer to reach.
     const bare = await call("cello_channel_config", {
       agent: "alice", channel: channelHex, access: "public",
-      relays: ["relay-usc1.cello.mygentic.ai", RELAY_B],
+      relays: ["relay-usc1.celloprotocol.com", RELAY_B],
     });
     expect(bare["ok"]).toBe(false);
     expect(bare["reason"]).toBe("bad_relay");
     // The refusal names the offending value AND the expected shape.
-    expect(String(bare["guidance"])).toContain("relay-usc1.cello.mygentic.ai");
+    expect(String(bare["guidance"])).toContain("relay-usc1.celloprotocol.com");
     expect(String(bare["guidance"])).toContain("/p2p/");
 
     // A multiaddr WITHOUT the /p2p peer id is also refused — it is not a usable relay.

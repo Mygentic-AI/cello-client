@@ -63,7 +63,7 @@
  */
 
 /** Where someone who has not signed up starts. Live as of 2026-09-07. */
-export const WAITLIST_URL = "https://cello.mygentic.ai/waitlist";
+export const WAITLIST_URL = "https://celloprotocol.com/waitlist";
 
 /** The operations agent on Telegram, by environment. */
 export const BOT_HANDLE_PRODUCTION = "@CelloConnectBot";

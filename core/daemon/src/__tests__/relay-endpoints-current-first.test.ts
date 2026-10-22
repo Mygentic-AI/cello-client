@@ -24,7 +24,7 @@ import { seedAgents } from "./helpers/seed-agents.js";
 
 const RELAY = "12D3KooWJXHpnWQhGk3jXBJYdXMmeLxEhRqzwZCYd1bxSUh4pg83";
 const DEAD = `/ip4/34.139.119.165/tcp/4001/ws/p2p/${RELAY}`;
-const CURRENT = `/dns4/relay-use1.cello.mygentic.ai/tcp/443/tls/ws/p2p/${RELAY}`;
+const CURRENT = `/dns4/relay-use1.celloprotocol.com/tcp/443/tls/ws/p2p/${RELAY}`;
 const quiet: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 
 describe("relay endpoints the mailbox pull dials", () => {

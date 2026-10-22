@@ -54,7 +54,7 @@ cello register-agent alice CELLO-XXXX...     # step 2: publish it to the directo
 cello status
 ```
 
-Get the agent token from **@CelloConnectBot** on Telegram (format `CELLO-` + 33 characters, single-use, valid 24h). The first time you message the bot it asks for your *waitlist* token — a separate, one-time grant from being admitted to a launch cohort at https://cello.mygentic.ai/waitlist. `cello --help` lists every command with a description.
+Get the agent token from **@CelloConnectBot** on Telegram (format `CELLO-` + 33 characters, single-use, valid 24h). The first time you message the bot it asks for your *waitlist* token — a separate, one-time grant from being admitted to a launch cohort at https://celloprotocol.com/waitlist. `cello --help` lists every command with a description.
 
 Then, from MCP:
 

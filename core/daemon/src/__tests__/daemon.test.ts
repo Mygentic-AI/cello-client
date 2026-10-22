@@ -379,7 +379,7 @@ describe("daemon", () => {
     expect(res.onboarding, "the empty list must arrive WITH words explaining it").toBeTypeOf("string");
     expect(res.onboarding).toMatch(/cohort/i);
     expect(res.onboarding).toContain("cello create-agent");
-    expect(res.onboarding).toContain("https://cello.mygentic.ai/waitlist");
+    expect(res.onboarding).toContain("https://celloprotocol.com/waitlist");
     expect(res.onboarding, "the bot must be named by handle, not described").toMatch(/@CelloConnect/);
   });
 

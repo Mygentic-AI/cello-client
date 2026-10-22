@@ -34,7 +34,7 @@ We do not run a paid bounty programme. We would rather say that plainly than imp
 - **The protocol itself.** Findings about the design — the session handshake, the hash chain, the
   seal, threshold signing, the trust signal format — are in scope even where no code is at fault.
   A design flaw is worth more to us than an implementation bug.
-- **The running network** — the directory and relay nodes, `cello.mygentic.ai` and its subdomains.
+- **The running network** — the directory and relay nodes, `celloprotocol.com` and its subdomains.
 
 The directory and relay node software is not published. You do not need it to report a finding
 against the running nodes, and a report that is only reproducible against source we have not

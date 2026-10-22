@@ -29,7 +29,7 @@ const silentLogger: Logger = {
 };
 
 const PEER = "12D3KooWS46wUj6NYvoAsocxZnxth5EgYD2ZXCm7coMkXUWgS1j3";
-const MULTIADDR = `/dns4/directory-us1.cello.mygentic.ai/tcp/80/ws/p2p/${PEER}`;
+const MULTIADDR = `/dns4/directory-us1.celloprotocol.com/tcp/80/ws/p2p/${PEER}`;
 
 function jsonResponse(body: unknown, ok = true): Response {
   return {
@@ -521,8 +521,8 @@ describe("mapEndpointToBootstrapBase", () => {
   });
 
   it("passes an https:// endpoint through", () => {
-    expect(mapEndpointToBootstrapBase("https://directory-us1.cello.mygentic.ai")).toBe(
-      "https://directory-us1.cello.mygentic.ai",
+    expect(mapEndpointToBootstrapBase("https://directory-us1.celloprotocol.com")).toBe(
+      "https://directory-us1.celloprotocol.com",
     );
   });
 
@@ -533,7 +533,7 @@ describe("mapEndpointToBootstrapBase", () => {
   it("returns null for a wss:// dial address — NOT port-guessed to plaintext:443", () => {
     // The wss address is what /bootstrap RETURNS, not the bootstrap base. Mapping it to
     // http://host:443 would speak plaintext to the TLS port and silently fail — refuse it.
-    expect(mapEndpointToBootstrapBase("wss://directory-us1.cello.mygentic.ai:443")).toBeNull();
+    expect(mapEndpointToBootstrapBase("wss://directory-us1.celloprotocol.com:443")).toBeNull();
   });
 
   it("returns null for a bare multiaddr (a config error in signed data, not a base)", () => {

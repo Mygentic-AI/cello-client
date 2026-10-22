@@ -1,4 +1,4 @@
-[https://cello.mygentic.ai/](https://cello.mygentic.ai/l/2axsGFs)
+[https://celloprotocol.com/](https://celloprotocol.com/l/2axsGFs)
 
 # cello-client
 
@@ -83,7 +83,7 @@ All of this runs on your machine. CELLO's servers see hashes, never content.
 > **Check that you are running the real CELLO.** CELLO is open source, so anyone
 > can fork this client, run their own nodes and call the result CELLO. Verify the
 > consortium your client trusts against the value published at
-> **<https://cello.mygentic.ai/fingerprint>**: you can do that before installing
+> **<https://celloprotocol.com/fingerprint>**: you can do that before installing
 > anything. [How, and what it cannot cover](#which-network-am-i-on).
 
 ## Which network am I on?
@@ -132,7 +132,7 @@ it carries the root keys, the threshold and the same recompute command:
 curl -fsSL https://raw.githubusercontent.com/Mygentic-AI/cello-client/main/consortium-fingerprint.json
 ```
 
-The same value is published at <https://cello.mygentic.ai/fingerprint>. Two
+The same value is published at <https://celloprotocol.com/fingerprint>. Two
 sources that a fork would have to compromise together.
 
 ## Install
@@ -592,7 +592,7 @@ that is the authoritative reference; this list is a map of what exists.
 | Variable | Default | Description |
 |---|---|---|
 | `CELLO_DIR` | `~/.cello` | Home for the daemon socket, key material, and the encrypted database. Set it to run a second, isolated identity. |
-| `CELLO_DIRECTORY_URL` | *(bundled HTTPS roster)* | Bootstrap entry point: when unset, the daemon picks from the bundled HTTPS consortium roster (`https://directory-{use1,usc1,euw1}.cello.mygentic.ai`). **Must match a node in the bundled roster exactly.** Overriding it with anything else (including a DNS name for the very same node) turns OFF directory identity authentication, silently. Leave unset in production; override only for local or staging. |
+| `CELLO_DIRECTORY_URL` | *(bundled HTTPS roster)* | Bootstrap entry point: when unset, the daemon picks from the bundled HTTPS consortium roster (`https://directory-{use1,usc1,euw1}.celloprotocol.com`). **Must match a node in the bundled roster exactly.** Overriding it with anything else (including a DNS name for the very same node) turns OFF directory identity authentication, silently. Leave unset in production; override only for local or staging. |
 | `CELLO_LISTEN_ADDR` | `/ip4/0.0.0.0/tcp/0` | libp2p listen address. |
 
 ## Troubleshooting

@@ -7,8 +7,8 @@
  * `spawnRealDaemon` now pins a closed local port by default (see its header); this test proves a
  * daemon started through that helper — with NOTHING pinned by the caller — never names a live node.
  *
- * ⚠️ **TEETH.** The bundled manifest genuinely names `*.cello.mygentic.ai`, asserted below, so the
- * regex is not vacuous: the same `/mygentic\.ai/` matcher was RED against an unpinned 024 daemon's
+ * ⚠️ **TEETH.** The bundled manifest genuinely names `*.celloprotocol.com`, asserted below, so the
+ * regex is not vacuous: the same `/celloprotocol\.com|mygentic\.ai/` matcher was RED against an unpinned 024 daemon's
  * log before fe8c5341. Reproducing that red here would require booting a daemon that dials
  * production, which the order forbids, so the pin is verified in the safe direction and its teeth
  * rest on that recorded evidence plus the manifest assertion.
@@ -48,7 +48,7 @@ describe("M16 037-TESTTRUTH: a helper-started daemon never reaches the live cons
     // The live directories the pin exists to keep out — if the manifest ever stopped naming them this
     // guard would pass for the wrong reason, so the presence is asserted first.
     expect(JSON.stringify(BUNDLED_CONSORTIUM_MANIFEST), "the bundled manifest must name the live nodes the pin overrides")
-      .toMatch(/mygentic\.ai/);
+      .toMatch(/celloprotocol\.com/);
 
     celloDir = await makeCelloDir("cello-m16-037-");
     // No CELLO_DIRECTORY_URL and no CELLO_E2E_LIVE: the helper's default pin is the only thing between
@@ -59,7 +59,7 @@ describe("M16 037-TESTTRUTH: a helper-started daemon never reaches the live cons
     // be named in directory.bootstrap.* by now.
     await new Promise((r) => setTimeout(r, 2000));
 
-    expect(daemon.output(), "a helper-started daemon reached a live CELLO directory").not.toMatch(/mygentic\.ai/);
+    expect(daemon.output(), "a helper-started daemon reached a live CELLO directory").not.toMatch(/celloprotocol\.com|mygentic\.ai/);
   }, 40_000);
 
   /**
