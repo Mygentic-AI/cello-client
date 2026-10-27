@@ -86,6 +86,16 @@ describe("daemon credential", () => {
     }
   });
 
+  it("5a. the issuer's signature over the credential's JSON WITHOUT the domain label does not verify", async () => {
+    // This is what the capability scheme signs. Only the domain label can reject it: the JSON is
+    // byte-for-byte the credential's own, so without the label it would verify.
+    const { issuer, issuerPub, cred, body } = await fixture();
+    const sorted: Record<string, unknown> = {};
+    for (const k of Object.keys(body).sort()) sorted[k] = (body as unknown as Record<string, unknown>)[k];
+    const unlabelled = hex(await issuer.sign(new TextEncoder().encode(JSON.stringify(sorted))));
+    expect(verifyDaemonCredential({ ...cred, sig: unlabelled }, issuerPub)).toEqual({ ok: false, reason: "credential_signature_invalid" });
+  });
+
   it("5. a capability signature and a credential signature never cross-verify", async () => {
     const { issuer, issuerPub, cred } = await fixture();
     // A capability signed by the same issuer: its signature, transplanted onto the credential,
