@@ -136,9 +136,9 @@ const SENDRAW_SELECTORS = [
  * would otherwise re-break. Compressing past that deletes the finding, the trade every note above
  * records as the wrong one; a split is `DOD-M15-GODFILE-1`, not this unit. Shrink only.
  *
- * THREE MOVED ON 2026-10-28 FOR M10E `007-NOTICES`. `daemon.ts` 1483 -> 1537 (the customer's
- * background noticer: the offer/no-right wiring, the two session-path hooks and the receive/inbox
- * surface, all composition-root wiring that belongs in daemon.ts), `session-node-manager.ts`
+ * M10E `007-NOTICES`, 2026-10-28. `daemon.ts` 1483 -> 1479: the noticer's wiring moved to
+ * `attestation-wiring.ts` and runs of stray blank lines collapsed, so the root carries a few lines
+ * and the cap SHRANK (review: a +54 raise was the wrong fix). Two others moved: `session-node-manager.ts`
  * 3447 -> 3450 (the `onSessionSealed` setter + ctx getter mirroring `onSessionStateChanged`), and
  * `session-seal.ts` 1209 -> 1220 (fire the seal hook in `markSealed`). Feature work in exactly the
  * files these ratchets pin.
@@ -425,7 +425,7 @@ export default [
     // holds. Each function only maps agent id → name and routes; INV-CONTENTFREE lives downstream.
     // 1,482 → 1,483 (+1, M16 043-POSTERS): the membership wiring re-deposits the info record through
     // the publishing wiring (late-bound, like pruneAllPosts) — a seam only the root can pass.
-    rules: { "max-lines": ["error", { max: 1537, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 1479, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/daemon-handle.ts"],
