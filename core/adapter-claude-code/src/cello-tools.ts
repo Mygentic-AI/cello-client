@@ -135,6 +135,33 @@ server.tool("cello_attestations_issue", "ATTEST to something about another agent
   return jsonText(result);
 });
 
+// M10E 003-NSCLIENT — attestation namespaces: open one, close one, read any owner's index.
+server.tool("cello_attestations_namespace_create", "Open an attestation (review) namespace owned by the selected agent. It fixes, once and for good, whether reviews are public or private, whether they carry a 1-5 rating, how long a reviewer has to write one, and the plain-words condition under which the right to review is granted. It is immutable — to change any of that you open a new namespace, and the directory keeps the old one in your public index.", {
+  namespace: z.string().describe("1-3 dotted segments, each [a-z0-9_] up to 32 chars, e.g. reviews.prop_8821"),
+  mode: z.enum(["public", "private"]).describe("public: anyone may read the reviews. private: only readers you choose."),
+  scored: z.boolean().optional().describe("true for a 1-5 rating plus text; omit or false for text-only"),
+  ttl_days: z.number().optional().describe("How many days a reviewer has to write, 7-180 (default 30)"),
+  condition: z.string().describe("The plain-words rule under which a session earns the right to review, 1-280 characters"),
+}, async ({ namespace, mode, scored, ttl_days, condition }) => {
+  const result = await proxy.call("cello_attestations_namespace_create", { namespace, mode, scored, ttl_days, condition });
+  return jsonText(result);
+});
+
+server.tool("cello_attestations_namespace_close", "Close one of the selected agent's attestation namespaces. A closed namespace grants no new rights to review, and it stays listed in the owner's public index so it is not hidden.", {
+  namespace: z.string().describe("The namespace to close, e.g. reviews.prop_8821"),
+}, async ({ namespace }) => {
+  const result = await proxy.call("cello_attestations_namespace_close", { namespace });
+  return jsonText(result);
+});
+
+server.tool("cello_attestations_index", "List every attestation namespace an owner has ever opened, closed ones included, which is how a reader finds them all. Defaults to the selected agent's own key. The client checks each entry's owner signature itself; an entry whose signature does not check out comes back with verified:false rather than being dropped. `next` is a cursor — pass it as `after` for the following page.", {
+  owner_pubkey: z.string().optional().describe("The owner's public key, 64 hex characters. Omit to list your own."),
+  after: z.string().optional().describe("A page cursor from a previous call's `next`"),
+}, async ({ owner_pubkey, after }) => {
+  const result = await proxy.call("cello_attestations_index", { owner_pubkey, after });
+  return jsonText(result);
+});
+
 server.tool("cello_trust_signals_list", "List the trust signals held in this wallet — verifiable claims about you (GitHub account age, phone, email, endorsements from others) that are presented to contacts during sessions. Each row carries TWO independent answers: `status` is the directory's (is the notarization live) and `consent_state` is yours (may it be shown at all). Only an 'accepted' signal is presentable, whatever `default_present` says.", {}, async () => {
   const result = await proxy.call("wallet_list_signals", {});
   return jsonText(result);

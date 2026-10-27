@@ -32,6 +32,7 @@ import {
   type AttestationNamespace,
 } from "@cello-protocol/protocol-types";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 export interface NamespaceCreateInput {
   namespace: string;
@@ -230,7 +231,7 @@ export async function createNamespace(deps: NamespaceDeps, input: NamespaceCreat
     record = encodeAttestationNamespace(rec);
   } catch (err: unknown) {
     const reason = err instanceof Error && "code" in err ? String((err as { code: unknown }).code) : "bad_record";
-    return { ok: false, reason, guidance: `The namespace could not be built: ${err instanceof Error ? err.message : String(err)}. Fix the input and try again.` };
+    return { ok: false, reason, guidance: `The namespace could not be built: ${extractErrorMessage(err)}. Fix the input and try again.` };
   }
   const signature = await deps.keyProvider.sign(hashAttestationNamespace(rec));
   return serialize(() => doWrite(deps, "create", input.namespace, { type: "attestation_namespace_put", record, signature }));
@@ -243,7 +244,7 @@ export async function closeNamespace(deps: NamespaceDeps, namespace: string): Pr
     record = encodeAttestationNamespaceClose(rec);
   } catch (err: unknown) {
     const reason = err instanceof Error && "code" in err ? String((err as { code: unknown }).code) : "bad_record";
-    return { ok: false, reason, guidance: `The close could not be built: ${err instanceof Error ? err.message : String(err)}. Check the namespace name.` };
+    return { ok: false, reason, guidance: `The close could not be built: ${extractErrorMessage(err)}. Check the namespace name.` };
   }
   const signature = await deps.keyProvider.sign(hashAttestationNamespaceClose(rec));
   return serialize(() => doWrite(deps, "close", namespace, { type: "attestation_namespace_close", record, signature }));

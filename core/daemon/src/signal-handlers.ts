@@ -29,6 +29,7 @@ import type { SignalingManager } from "@cello-protocol/transport";
 import { CONSENT_ACCEPTED } from "./consent-migration.js";
 import { revocabilityOf } from "./signal-revocability.js";
 import { composeSealedSubmission, fetchSubmissionResults, sendSealedSubmission } from "./signal-submission.js";
+import { registerAttestationNamespaceHandlers } from "./attestation-namespace-handlers.js";
 import { DEFAULT_RETRY_WINDOW_MS, isRetryableSendFailure } from "./submission-retry.js";
 import type { SubmissionRetryQueue } from "./submission-retry.js";
 import { TrustSignalStore } from "./trust-signal-store.js";
@@ -288,7 +289,6 @@ export function registerSignalHandlers(deps: SignalHandlerDeps): void {
     }
     return { ok: true, name, pubkey: rec.pubkey };
   };
-
 
   /**
    * Compose → seal → send ONE submission on behalf of the selected agent, applying every guard that
@@ -616,7 +616,6 @@ export function registerSignalHandlers(deps: SignalHandlerDeps): void {
     };
   });
 
-
   handlers.set("wallet_list_issued", async (_params, connectionId) => {
     const sel = resolveSelectedAgent(connectionId);
     if (!sel.ok) return sel;
@@ -723,6 +722,8 @@ export function registerSignalHandlers(deps: SignalHandlerDeps): void {
         : `Submitted for '${sel.name}'. The portal will scan and mint it, and it stays invisible to everyone unless the subject ACCEPTS it — they are free to refuse, and a signal they have not accepted is inert. Nothing here is final until they decide.`,
     };
   });
+
+  registerAttestationNamespaceHandlers({ handlers, resolveSelectedAgent, onlineAgents, keyProviders, getAgentSignaling, logger }); // M10E 003-NSCLIENT namespace verbs (helper module: this file is at its cap)
 
   /**
    * M10B / DOD-END-SURFACE-1 — per-counterparty presentation choice.

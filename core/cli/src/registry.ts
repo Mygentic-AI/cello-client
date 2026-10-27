@@ -1467,6 +1467,18 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "  cello attestations issue <pubkey> <text\u2026>\n" +
       "                                        \u2014 endorse them for something you have seen them do\n" +
       "  cello attestations issued             \u2014 the status of every attestation you have issued\n" +
+      "  cello attestations namespace create <ns> --mode <public|private> [--scored] [--ttl <days>] --condition \"<words>\"\n" +
+      "                                        \u2014 open a review namespace others can review you in\n" +
+      "  cello attestations namespace close <ns>\n" +
+      "                                        \u2014 stop a namespace granting new rights; it stays listed\n" +
+      "  cello attestations index [<pubkey>] [--after <ns>]\n" +
+      "                                        \u2014 list every namespace an owner has ever opened\n" +
+      "\n" +
+      "A namespace fixes, for good, whether its reviews are public or private, their shape, how long a\n" +
+      "reviewer has, and the rule under which the right to review is granted. It is immutable: a new\n" +
+      "rule means a new namespace, and the index is public so an old one stays on show. Reading an\n" +
+      "index, the client checks each entry's owner signature itself; an entry that fails that check is\n" +
+      "shown flagged, not dropped.\n" +
       "\n" +
       "An attestation is YOUR words about ANOTHER agent \u2014 the person-to-person half of trust. The\n" +
       "network's own claims about you (GitHub account age, phone, email) are 'cello trust-signals'.\n" +

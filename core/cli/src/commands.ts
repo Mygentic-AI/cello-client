@@ -1020,12 +1020,99 @@ export async function attestations(
     }
   }
 
+  // M10E 003-NSCLIENT — attestation namespaces.
+  if (sub === "namespace") {
+    const [action, ns, ...flags] = args;
+    if (action === "create") {
+      let mode: string | undefined;
+      let condition: string | undefined;
+      let scored = false;
+      let ttl: number | undefined;
+      for (let i = 0; i < flags.length; i++) {
+        if (flags[i] === "--mode") mode = flags[++i];
+        else if (flags[i] === "--scored") scored = true;
+        else if (flags[i] === "--ttl") ttl = Number(flags[++i]);
+        else if (flags[i] === "--condition") condition = flags[++i];
+      }
+      if (!ns || !mode || !condition) {
+        return {
+          exitCode: 1,
+          output:
+            'Usage: cello attestations namespace create <ns> --mode <public|private> [--scored] [--ttl <days>] --condition "<words>"\n' +
+            "\n" +
+            "  <ns>          1–3 dotted segments, e.g. reviews.prop_8821\n" +
+            "  --mode        public (anyone reads the reviews) or private (chosen readers)\n" +
+            "  --scored      a 1–5 rating plus text; omit for text-only\n" +
+            "  --ttl         how many days a reviewer has, 7–180 (default 30)\n" +
+            "  --condition   the plain-words rule under which the right to review is granted",
+        };
+      }
+      try {
+        const params: Record<string, unknown> = { namespace: ns, mode, scored, condition };
+        if (ttl !== undefined) params.ttl_days = ttl;
+        const result = (await withIpc(lock.socketPath, (client) =>
+          client.send("cello_attestations_namespace_create", params))) as { ok: boolean; reason?: string; guidance?: string };
+        if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+        return { exitCode: 0, output: result.guidance ?? "Created." };
+      } catch (err: unknown) {
+        return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+      }
+    }
+    if (action === "close") {
+      if (!ns) return { exitCode: 1, output: "Usage: cello attestations namespace close <ns>" };
+      try {
+        const result = (await withIpc(lock.socketPath, (client) =>
+          client.send("cello_attestations_namespace_close", { namespace: ns }))) as { ok: boolean; reason?: string; guidance?: string };
+        if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+        return { exitCode: 0, output: result.guidance ?? "Closed." };
+      } catch (err: unknown) {
+        return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+      }
+    }
+    return { exitCode: 1, output: "Usage:\n  cello attestations namespace create <ns> --mode <public|private> [--scored] [--ttl <days>] --condition \"<words>\"\n  cello attestations namespace close <ns>" };
+  }
+
+  if (sub === "index") {
+    let owner: string | undefined;
+    let after: string | undefined;
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === "--after") after = args[++i];
+      else if (!args[i]!.startsWith("--")) owner = args[i];
+    }
+    try {
+      const params: Record<string, unknown> = {};
+      if (owner) params.owner_pubkey = owner;
+      if (after) params.after = after;
+      const result = (await withIpc(lock.socketPath, (client) =>
+        client.send("cello_attestations_index", params))) as {
+        ok: boolean; reason?: string; guidance?: string; next?: string | null;
+        entries?: Array<{ namespace: string; mode: string | null; template: string | null; right_ttl_days: number | null; closed_at: number | null; verified: boolean }>;
+      };
+      if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+      const entries = result.entries ?? [];
+      if (entries.length === 0) return { exitCode: 0, output: "No namespaces." };
+      const lines = entries.map((e) => {
+        const ttl = e.right_ttl_days === null ? "—" : `${e.right_ttl_days}d`;
+        const state = e.closed_at === null ? "open" : "closed";
+        const flag = e.verified ? "" : "  UNVERIFIED";
+        return `  ${e.namespace.padEnd(28)}  ${(e.mode ?? "—").padEnd(8)}  ${(e.template ?? "—").padEnd(7)}  ${ttl.padEnd(5)}  ${state}${flag}`;
+      });
+      const more = result.next ? `\n\n  More — cello attestations index ${owner ?? ""} --after ${result.next}` : "";
+      return { exitCode: 0, output: lines.join("\n") + more };
+    } catch (err: unknown) {
+      return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
   return {
     exitCode: 1,
     output:
       "Usage:\n" +
       "  cello attestations issue <pubkey> <text…>  — attest to something you have seen them do\n" +
       "  cello attestations issued                  — what happened to the ones you wrote\n" +
+      "  cello attestations namespace create <ns> …  — open a review namespace\n" +
+      "  cello attestations namespace close <ns>    — stop a namespace granting new rights\n" +
+      "  cello attestations index [<pubkey>]        — list an owner's namespaces\n" +
       "\n" +
       "What others wrote about YOU is 'cello attestation-consent'.",
   };

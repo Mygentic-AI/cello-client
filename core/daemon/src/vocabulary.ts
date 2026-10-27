@@ -82,6 +82,10 @@ const ALWAYS_ON_VERBS: readonly DualSurfaceVerb[] = [
   { mcp: "cello_trust_signals_list", cli: "cello trust-signals list" },
   { mcp: "cello_attestations_issue", cli: "cello attestations issue" },
   { mcp: "cello_attestations_issued", cli: "cello attestations issued" },
+  // M10E 003-NSCLIENT — attestation namespaces
+  { mcp: "cello_attestations_namespace_create", cli: "cello attestations namespace create" },
+  { mcp: "cello_attestations_namespace_close", cli: "cello attestations namespace close" },
+  { mcp: "cello_attestations_index", cli: "cello attestations index" },
   { mcp: "cello_trust_signals_view", cli: "cello trust-signals view" },
   { mcp: "cello_trust_signals_enable", cli: "cello trust-signals enable" },
   { mcp: "cello_trust_signals_disable", cli: "cello trust-signals disable" },
