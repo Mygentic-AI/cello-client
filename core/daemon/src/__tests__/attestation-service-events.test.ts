@@ -111,8 +111,7 @@ function svcDeps(over: Partial<ServiceEventDeps> = {}): ServiceEventDeps {
 
 // The `expired` flag the client surfaces comes from the directory's reply, not from the record, so
 // both rights carry a valid in-range TTL (604800..15552000s); only the reply's flag differs.
-function rightRecord(ttlSeconds: number): AttestationRight {
-  const createdAt = 1_800_000_000;
+function rightRecord(ttlSeconds: number, createdAt = 1_800_000_000): AttestationRight {
   return {
     service_event_hash: new Uint8Array(32).fill(1), holder_pubkey: mePub, subject_pubkey: themPub,
     namespace: "reviews.alpha", template_hash: attestationTemplateHash("scored"),
@@ -258,7 +257,7 @@ describe("005-SVCCLIENT — marking a service event", () => {
 describe("005-SVCCLIENT — listing rights", () => {
   it("K8. a rights reply with one live and one expired right → both listed, expired false then true", async () => {
     const live = rightRecord(2_592_000);
-    const dead = rightRecord(604_800);
+    const dead = rightRecord(604_800, 1_800_000_000 - 8 * 86_400);
     const p = listRights(svcDeps());
     await waitForSent(sig, 1);
     expect(sig.sent[0]!["type"]).toBe("attestation_rights_list");
@@ -289,5 +288,34 @@ describe("005-SVCCLIENT — listing rights", () => {
     expect(res.rights).toHaveLength(1);
     expect(res.rights[0]!.right_id).toBe(hex(hashAttestationRight(r)));
     expect(logger.events.find((e) => e.event === "attestation.rights.id_mismatch")?.level).toBe("warn");
+  });
+
+  it("K8b. expiry is judged by our clock, never the directory's flag", async () => {
+    // A dishonest node flags the live right expired, and the expired one live. Neither sticks.
+    const live = rightRecord(2_592_000);
+    const dead = rightRecord(604_800, 1_800_000_000 - 8 * 86_400);
+    const p = listRights(svcDeps());
+    await waitForSent(sig, 1);
+    sig.push({
+      type: "attestation_rights",
+      entries: [
+        { right: encodeAttestationRight(live), right_id: hex(hashAttestationRight(live)), expired: true },
+        { right: encodeAttestationRight(dead), right_id: hex(hashAttestationRight(dead)), expired: false },
+      ],
+      next: null,
+    });
+    const res = await p;
+    if (!res.ok) throw new Error(JSON.stringify(res));
+    expect(res.rights.map((r) => r.expired)).toEqual([false, true]);
+  });
+
+  it("an undecodable entry is logged, never dropped silently", async () => {
+    const p = listRights(svcDeps());
+    await waitForSent(sig, 1);
+    sig.push({ type: "attestation_rights", entries: [{ right: new Uint8Array([1, 2, 3]), right_id: "ab", expired: false }], next: null });
+    const res = await p;
+    if (!res.ok) throw new Error(JSON.stringify(res));
+    expect(res.rights).toHaveLength(0);
+    expect(logger.events.find((e) => e.event === "attestation.rights.undecodable")?.level).toBe("warn");
   });
 });

@@ -14,6 +14,7 @@
  *
  * Crypto: Ed25519 → RFC 8032, CBOR → RFC 8949, SHA-256 → FIPS 180-4.
  */
+import { extractErrorMessage } from "./error-message.js";
 import { randomUUID } from "node:crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import {
@@ -188,9 +189,16 @@ export async function listRights(
     const rights: RightView[] = [];
     for (const e of rawEntries) {
       const rightBytes = toU8(e["right"]);
-      if (!rightBytes) continue;
+      if (!rightBytes) {
+        // Nothing to show, but never silently: the log is the record that the directory sent it.
+        deps.logger.warn("attestation.rights.undecodable", { right_id: typeof e["right_id"] === "string" ? e["right_id"] : "", reason: "not_bytes" });
+        continue;
+      }
       let decoded;
-      try { decoded = decodeAttestationRight(rightBytes); } catch { continue; }
+      try { decoded = decodeAttestationRight(rightBytes); } catch (err: unknown) {
+        deps.logger.warn("attestation.rights.undecodable", { right_id: typeof e["right_id"] === "string" ? e["right_id"] : "", reason: extractErrorMessage(err) });
+        continue;
+      }
       // Recompute the id and TRUST OUR OWN hash, never the directory's. A mismatch is kept — a
       // dropped right is the hide route — with the recomputed id and a warning.
       const recomputed = Buffer.from(hashAttestationRight(decoded)).toString("hex");
@@ -205,7 +213,9 @@ export async function listRights(
         session_id: Buffer.from(decoded.session_id).toString("hex"),
         created_at: decoded.created_at,
         expires_at: decoded.expires_at,
-        expired: e["expired"] === true,
+        // OUR clock against the signed expiry, never the directory's flag: a dishonest node that
+        // marked a live right "expired" would talk the customer out of a review they are owed.
+        expired: Math.floor(deps.now() / 1000) >= decoded.expires_at,
         template: templateIdForHash(decoded.template_hash),
       });
     }
