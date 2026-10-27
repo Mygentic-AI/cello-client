@@ -1,6 +1,5 @@
 import { describe, it, expect } from "vitest";
 import { Buffer } from "node:buffer";
-import { hash as sha256 } from "@cello-protocol/crypto";
 import { encodeCbor } from "../cbor.js";
 import {
   AttestationRecordError,
