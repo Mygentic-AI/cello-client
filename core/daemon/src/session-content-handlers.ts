@@ -14,6 +14,7 @@
 // (`DOD-M15-SEALWIRE-1` part B2b). A direct call would be a hash computed without deciding — or
 // recording — how it was made, which is the state that made a version skew look like a tamper.
 import { randomUUID } from "node:crypto";
+import { AttestationNotices, attestationNoticesField, type AttestationNoticeView } from "./attestation-notices.js";
 import { LEAF_KIND_MSG } from "./session-relay-client.js";
 import { MAX_CONTENT_BYTES } from "@cello-protocol/protocol-types";
 import { TIER } from "./contacts-tier-migration.js";
@@ -318,6 +319,12 @@ export interface SessionContentDeps {
    * every other 64-hex token is screened as today. Optional: omitted, no key is protected.
    */
   knownPublicKeys?: (agentName: string, sessionId: string, content: Uint8Array) => string[];
+  /**
+   * M10E 007-NOTICES: the customer's attestation notices (offer at open, no-right at close), surfaced
+   * into every `cello_receive` reply the way refusals are — a destructive, agent-wide read, so each
+   * notice appears once in the next receive and not after. Optional: omitted, the field never appears.
+   */
+  attestationNotices?: AttestationNotices;
 }
 
 export function registerSessionContentHandlers(deps: SessionContentDeps): void {
@@ -325,8 +332,13 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     handlers, logger, sessionNodeManager, securityGateway, retryQueue,
     getConnState, resolveCurrentAgent, NO_CURRENT_AGENT_RESPONSE,
     getConnectionCursor, advanceConnectionCursor, clearTelegramRung,
-    attendanceCount, sendClaims, knownPublicKeys,
+    attendanceCount, sendClaims, knownPublicKeys, attestationNotices,
   } = deps;
+
+  // M10E 007-NOTICES: the undelivered notices for this agent, spread into a receive reply beside the
+  // refusals. Destructive and agent-wide — one drain per receive, whichever return point runs.
+  const attNoticesFor = (agentName: string): { attestationNotices?: AttestationNoticeView[] } =>
+    attestationNotices ? attestationNoticesField(attestationNotices, sessionNodeManager.resolveAgentId(agentName)) : {};
 
   /**
    * DOD-COATTEND-SENDWINDOW-1 (review F1) — sessions with a send ON THE WIRE right now.
@@ -1327,6 +1339,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         })),
         ...(autoReplyCount > 0 ? { auto_reply_guidance: AUTO_REPLY_GUIDANCE } : {}),
         ...refusalsField(sessionNodeManager, agentName, sessionId, connectionId),
+        ...attNoticesFor(agentName),
         attendance: attendingNow(agentName),
         ...(signalGuidance !== undefined ? { guidance: signalGuidance } : {}),
         // 008-POLICY: the operator's conduct rule, beside the messages and never inside them.
@@ -1401,6 +1414,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
           // sequence is exactly the bad one: skew, silence, the operator gives up and seals, and the
           // explanation becomes unreachable through every door they are pointed at.
           ...refusalsField(sessionNodeManager, agentName, sessionId, connectionId),
+          ...attNoticesFor(agentName),
           guidance: terminal.unreadCount > 0
             ? `The session has been sealed by both parties. ${terminal.unreadCount} message(s) arrived that were not read live — call cello_transcript to retrieve the full sealed history. No further actions are required on this session.`
             : "The session has been sealed by both parties. The full history is available via cello_transcript. No further actions are required on this session.",
@@ -1434,6 +1448,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
             // A local write failure and a refused message look identical from the operator's chair —
             // nothing arrived. Carrying the refusal here keeps the two distinguishable.
             ...refusalsField(sessionNodeManager, agentName, sessionId, connectionId),
+            ...attNoticesFor(agentName),
             undeliverable_sequences: [...undeliverable],
             guidance: `${undeliverable.length} message(s) arrived but could not be written to the local transcript, so they cannot be delivered — this is a fault on THIS machine (check disk space and ~/.cello permissions; see transcript.message.record.failed in the daemon log), not a quiet counterparty. Do not wait: waiting cannot recover them. Ask the counterparty to resend once the local fault is fixed.`,
           };
@@ -1458,6 +1473,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
             // lands HERE, pre-empting the quiet exit. A wrong explanation plus an action is worse
             // than saying nothing at all.
             ...refusalsField(sessionNodeManager, agentName, sessionId, connectionId),
+            ...attNoticesFor(agentName),
             reason: "counterparty_gone",
             liveness: "gone",
             /**
@@ -1524,6 +1540,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
             // notice and its advice travel together (see `refusalsField`), and they do — so this
             // exit cannot carry the reason without also carrying what to do about it.
             ...refusalsField(sessionNodeManager, agentName, sessionId, connectionId),
+            ...attNoticesFor(agentName),
             ...(impairment ? { impairment } : {}),
             guidance: `Nothing arrived. ${what}${whatNext} Their connection is still up, so content may still arrive and this can clear on its own — call cello_status for this session rather than assuming the counterparty is ignoring you.`,
           };
@@ -1553,6 +1570,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
           messages: [],
           attendance: attendingNow(agentName),
           ...quietRefusals,
+          ...attNoticesFor(agentName),
           // ONE source for the refusal advice (see `refusalsField`). It used to be written out
           // again here, which is how the batch exit came to carry the notice without it.
           // ONE source for the refusal advice (see `refusalsField`), and it is now the header for

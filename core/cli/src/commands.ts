@@ -1154,6 +1154,40 @@ export async function attestations(
     }
   }
 
+  // M10E 007-NOTICES — file a service-received claim for a session that earned no right.
+  if (sub === "claim-service") {
+    const [sessionId, ns] = args;
+    if (!sessionId || !ns) {
+      return { exitCode: 1, output: "Usage: cello attestations claim-service <session-id> <namespace>" };
+    }
+    try {
+      const result = (await withIpc(lock.socketPath, (client) =>
+        client.send("cello_attestations_claim_service", { session_id: sessionId, namespace: ns }))) as { ok: boolean; reason?: string; guidance?: string };
+      if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+      return { exitCode: 0, output: result.guidance ?? "Claim filed." };
+    } catch (err: unknown) {
+      return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
+  // M10E 007-NOTICES — the public activity counts for an owner's namespace.
+  if (sub === "activity") {
+    const [owner, ns] = args;
+    if (!owner || !ns) {
+      return { exitCode: 1, output: "Usage: cello attestations activity <pubkey> <namespace>" };
+    }
+    try {
+      const result = (await withIpc(lock.socketPath, (client) =>
+        client.send("cello_attestations_activity", { owner_pubkey: owner, namespace: ns }))) as {
+        ok: boolean; reason?: string; guidance?: string; service_events?: number; unmarked_claims?: number;
+      };
+      if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+      return { exitCode: 0, output: `  ${ns}\n  service events: ${result.service_events ?? 0}\n  unmarked claims: ${result.unmarked_claims ?? 0}` };
+    } catch (err: unknown) {
+      return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
   return {
     exitCode: 1,
     output:
@@ -1165,6 +1199,8 @@ export async function attestations(
       "  cello attestations index [<pubkey>]        — list an owner's namespaces\n" +
       "  cello attestations mark <session-id> <ns>  — mark a service event during a session\n" +
       "  cello attestations rights                  — the rights to review that you hold\n" +
+      "  cello attestations claim-service <sid> <ns> — claim a dodged service event (no right)\n" +
+      "  cello attestations activity <pubkey> <ns>  — service-event and unmarked-claim counts\n" +
       "\n" +
       "What others wrote about YOU is 'cello attestation-consent'.",
   };

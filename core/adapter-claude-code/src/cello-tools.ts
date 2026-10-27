@@ -180,6 +180,23 @@ server.tool("cello_attestations_rights", "List the rights to review that the sel
   return jsonText(result);
 });
 
+server.tool("cello_attestations_claim_service", "File a service-received claim for a sealed session that earned you NO review right — the provider never marked a service event. It grants you no right. It records that you say you received the service and counts against the provider's namespace as an unmarked claim, which anyone can see with the activity counts, until the provider marks a service event for that session. One claim per session+namespace. Use the namespace the counterparty named in the offer notice at session open.", {
+  cello_session_id: z.string().describe("The sealed session's id, as cello_sessions reports it"),
+  namespace: z.string().describe("The counterparty's namespace the right was owed in, e.g. reviews.prop_8821"),
+}, async ({ cello_session_id, namespace }) => {
+  // Renamed on destructure so the daemon receives `session_id` (the Cowork bridge strips a bare one).
+  const result = await proxy.call("cello_attestations_claim_service", { session_id: cello_session_id, namespace });
+  return jsonText(result);
+});
+
+server.tool("cello_attestations_activity", "The public activity counts for an owner's namespace: how many service events were marked, and how many unmarked claims customers filed. A high unmarked-claim count against a low service-event count is a provider dodging the marks that would earn reviews — this is what makes that visible.", {
+  owner_pubkey: z.string().describe("The namespace owner's pubkey, 64 hex"),
+  namespace: z.string().describe("The namespace, e.g. reviews.prop_8821"),
+}, async ({ owner_pubkey, namespace }) => {
+  const result = await proxy.call("cello_attestations_activity", { owner_pubkey, namespace });
+  return jsonText(result);
+});
+
 server.tool("cello_trust_signals_list", "List the trust signals held in this wallet — verifiable claims about you (GitHub account age, phone, email, endorsements from others) that are presented to contacts during sessions. Each row carries TWO independent answers: `status` is the directory's (is the notarization live) and `consent_state` is yours (may it be shown at all). Only an 'accepted' signal is presentable, whatever `default_present` says.", {}, async () => {
   const result = await proxy.call("wallet_list_signals", {});
   return jsonText(result);

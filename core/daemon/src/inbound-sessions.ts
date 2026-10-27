@@ -173,6 +173,12 @@ export interface InboundSessionDeps {
    * is a channel only because it subscribed to it.
    */
   isSubscribedChannel: (agentName: string, counterpartyPubkeyHex: string) => boolean;
+  /**
+   * M10E 007-NOTICES: fired after the responder keeps the session proof, so the customer's daemon can
+   * look up the counterparty's open public namespaces and leave offer notices. Fire-and-forget by
+   * contract — it must never delay or fail the session.
+   */
+  onSessionOpened?: (agentName: string, sessionIdHex: string, counterpartyPubkeyHex: string) => void;
 }
 
 /**
@@ -1583,6 +1589,11 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       } catch (err: unknown) {
         logger.error("attestation.session_proof.store_failed", { session_id: parsed.sessionIdHex, reason: extractErrorMessage(err) });
       }
+      // M10E 007-NOTICES: the customer (responder) leaves itself offer notices for the counterparty's
+      // open public namespaces. The counterparty is participant A (the initiator). Fire-and-forget: a
+      // throw here must never reach the session path.
+      try { deps.onSessionOpened?.(localAgent.name, parsed.sessionIdHex, parsed.participantAPubkeyHex.toLowerCase()); }
+      catch (err: unknown) { logger.debug("attestation.notice.lookup_skipped", { session_id: parsed.sessionIdHex, reason: extractErrorMessage(err) }); }
     }
     /**
      * ONE event, and `internal` is loud.

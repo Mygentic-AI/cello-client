@@ -96,6 +96,9 @@ import { createSealFlows } from "./seal-flows.js";
 import { registerCloseSessionHandler } from "./close-session-handler.js";
 import { createInboundSessions } from "./inbound-sessions.js";
 import { createOutboundSessions } from "./outbound-sessions.js";
+import { AttestationNotices, makeAttestationNoticer } from "./attestation-notices.js";
+import type { NamespaceDeps } from "./attestation-namespaces.js";
+import type { ServiceEventDeps } from "./attestation-service-events.js";
 import { registerSessionReadHandlers } from "./session-read-handlers.js";
 import { registerInclusionProofHandlers } from "./inclusion-proof-handlers.js";
 import { pullSealCertificate } from "./seal-certificate-pull.js";
@@ -439,11 +442,51 @@ async function startDaemonHoldingLock(
     sessionNodeManager.getStandingReceiverAutoNat() ??
     new LocalAutoNatStub();
 
+  // M10E 007-NOTICES — the customer's background noticer. At session open it looks up the
+  // counterparty's open public namespaces and leaves offer notices; at seal it leaves a no-right
+  // notice when a promised review right never arrived. All of it is fire-and-forget and never touches
+  // the session path. The deps builders return null when the agent is not online/loaded, so a notice
+  // lookup for an agent this daemon cannot serve is a debug skip, not a crash.
+  const attestationNoticeStore = new AttestationNotices({ db: () => sessionNodeManager.getDb(), logger, now: Date.now });
+  const attestationNamespaceDepsFor = (agentName: string): NamespaceDeps | null => {
+    if (!onlineAgents.has(agentName)) return null;
+    const kp = keyProviders.get(agentName);
+    if (!kp) return null;
+    const pub = loadedAgents.find((a) => a.name === agentName)?.pubkey?.toLowerCase();
+    if (!pub) return null;
+    return { signaling: getAgentSignaling(agentName, kp, pub).signaling, keyProvider: kp, ownerPubkeyHex: pub, now: Date.now, logger };
+  };
+  const attestationServiceEventDepsFor = (agentName: string): ServiceEventDeps | null => {
+    const base = attestationNamespaceDepsFor(agentName);
+    if (!base) return null;
+    const agentId = sessionNodeManager.resolveAgentId(agentName);
+    return {
+      ...base,
+      loadSessionProof: (sid) => {
+        const row = sessionNodeManager.getDb()?.prepare("SELECT proof FROM session_proofs WHERE agent_id = ? AND session_id = ?").get(agentId, sid) as { proof: Buffer } | undefined;
+        return row ? new Uint8Array(row.proof) : null;
+      },
+      chainHeadHash: (sid) => {
+        const row = sessionNodeManager.getDb()?.prepare("SELECT leaf_hash_hex FROM session_tree_leaves WHERE agent_id = ? AND session_id = ? ORDER BY leaf_index DESC LIMIT 1").get(agentId, sid) as { leaf_hash_hex: string } | undefined;
+        return row ? new Uint8Array(Buffer.from(row.leaf_hash_hex, "hex")) : new Uint8Array(32);
+      },
+    };
+  };
+  const attestationNoticer = makeAttestationNoticer({
+    store: attestationNoticeStore,
+    namespaceDepsFor: attestationNamespaceDepsFor,
+    serviceEventDepsFor: attestationServiceEventDepsFor,
+    screen: async (text, agentName, sessionId) => securityGateway.screenInbound(new TextEncoder().encode(text), { direction: "inbound", agentName, sessionId }),
+    resolveAgentId: (a) => sessionNodeManager.resolveAgentId(a),
+    logger,
+  });
+
   // The OUTBOUND session path (outbound-sessions.ts): discovery, the session request, and cross-node
   // setup via a transient VISITING connection to the counterparty's home node.
   const { openVisitingConnection, crossNodeBrokerBySession, resolvedSessionNegotiator, runDiscoveryLookup, sweepTrustSignalsAndTick, trustSignalSweepTicker } = createOutboundSessions({
     logger,
     sessionNodeManager,
+    onSessionOpened: (a, s, c) => attestationNoticer.onSessionOpened(a, s, c),
     getKeyProvider: (agentName: string) => keyProviders.get(agentName),
     getPersistence,
     getAgentSignaling: (agentName: string, kp, pubkeyHex: string) => getAgentSignaling(agentName, kp, pubkeyHex),
@@ -522,6 +565,7 @@ async function startDaemonHoldingLock(
   } = createInboundSessions({
     logger,
     sessionNodeManager,
+    onSessionOpened: (a, s, c) => attestationNoticer.onSessionOpened(a, s, c),
     agents,
     isExplicitlyOffline: (agentName: string) => explicitlyOfflineAgents.has(agentName),
     // M12-P18: lets the responder send a refusal reason back to a TRUSTED sender.
@@ -1031,6 +1075,8 @@ async function startDaemonHoldingLock(
     attendanceCount,
     // M16 031: the known public keys in an outbound message the gateway must pass untouched.
     knownPublicKeys: createKnownPublicKeysIn(knownPublicKeysDepsFromDaemon(sessionNodeManager, logger)),
+    // M10E 007-NOTICES: the customer's offer/no-right notices, spread into every receive reply.
+    attestationNotices: attestationNoticeStore,
   });
 
   // cello_check_notifications (notification-handlers.ts): the push-loss reconciler. Notifications are
@@ -1059,6 +1105,8 @@ async function startDaemonHoldingLock(
       : {}),
     ownerKeyFor: (agentName) =>
       loadedAgents.find((a) => a.name === agentName)?.pubkey?.toLowerCase() ?? null,
+    // M10E 007-NOTICES: the inbox door for the customer's offer/no-right notices.
+    attestationNotices: attestationNoticeStore,
   });
 
   // The address book — contacts, tiers, monikers, settings, the telegram token. Ten handlers, now
@@ -1106,6 +1154,12 @@ async function startDaemonHoldingLock(
   // (it depends on the IPC server), so constructor injection would be circular.
   sessionNodeManager.setOnSessionStateChanged((agentName, sessionId, state, counterpartyPubkey) => {
     dispatchSessionStateChangedWithTelegram(agentName, sessionId, state, counterpartyPubkey);
+  });
+
+  // M10E 007-NOTICES: when a session reaches sealed for this agent, the customer's daemon checks
+  // whether a promised review right arrived and, if not, leaves a no-right notice. Fire-and-forget.
+  sessionNodeManager.setOnSessionSealed((agentName, sessionId) => {
+    attestationNoticer.onSessionSealed(agentName, sessionId);
   });
 
   // M8C-MSGWAKE-1 (channel stage 2): per-message wake — a verified inbound message fires a

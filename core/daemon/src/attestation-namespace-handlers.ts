@@ -10,7 +10,7 @@
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { SignalingManager } from "@cello-protocol/transport";
 import { createNamespace, closeNamespace, readIndex, type NamespaceDeps } from "./attestation-namespaces.js";
-import { markServiceEvent, listRights, type ServiceEventDeps } from "./attestation-service-events.js";
+import { markServiceEvent, listRights, sendServiceClaim, getActivity, type ServiceEventDeps } from "./attestation-service-events.js";
 import type { IpcHandler } from "./ipc-server.js";
 import type { Logger } from "./types.js";
 
@@ -118,6 +118,43 @@ export function registerAttestationNamespaceHandlers(args: {
       guidance: res.next
         ? `Showing ${res.rights.length}. More exist — call again with after='${res.next}'. An expired right is listed and flagged, never hidden.`
         : `An expired right is listed and flagged, never hidden.`,
+    };
+  });
+
+  // M10E 007-NOTICES — a customer files a service-received claim for a session that earned no right.
+  handlers.set("cello_attestations_claim_service", async (params, connectionId) => {
+    const r = resolveServiceEventDeps(connectionId);
+    if (!r.ok) return r;
+    const session_id = typeof params?.session_id === "string" ? params.session_id : "";
+    const namespace = typeof params?.namespace === "string" ? params.namespace : "";
+    if (session_id.length === 0 || namespace.length === 0) {
+      return { ok: false, reason: "invalid_input", guidance: "Pass the session id and the namespace, e.g. cello attestations claim-service <session-id> reviews.prop_8821." };
+    }
+    const res = await sendServiceClaim(r.deps, { session_id, namespace });
+    if (!res.ok) return res;
+    return {
+      ok: true, status: res.status, session_id, namespace,
+      guidance: res.status === "stored"
+        ? `Claim filed in '${namespace}'. It grants you NO right to review — it records that you say you received the service, and counts against the provider's namespace until they mark a service event for this session.`
+        : `You had already filed this exact claim in '${namespace}'; nothing changed.`,
+    };
+  });
+
+  // M10E 007-NOTICES — the public activity counts for a namespace (service events + unmarked claims).
+  handlers.set("cello_attestations_activity", async (params, connectionId) => {
+    const r = resolveServiceEventDeps(connectionId);
+    if (!r.ok) return r;
+    const owner_pubkey = typeof params?.owner_pubkey === "string" ? params.owner_pubkey : "";
+    const namespace = typeof params?.namespace === "string" ? params.namespace : "";
+    if (!/^[0-9a-f]{64}$/.test(owner_pubkey.toLowerCase()) || namespace.length === 0) {
+      return { ok: false, reason: "invalid_input", guidance: "Pass the owner's 64-hex pubkey and the namespace, e.g. cello attestations activity <pubkey> reviews.prop_8821." };
+    }
+    const res = await getActivity(r.deps, { owner_pubkey, namespace });
+    if (!res.ok) return res;
+    return {
+      ok: true, owner_pubkey: owner_pubkey.toLowerCase(), namespace,
+      service_events: res.service_events, unmarked_claims: res.unmarked_claims,
+      guidance: `'${namespace}': ${res.service_events} service event(s) marked, ${res.unmarked_claims} unmarked claim(s). An unmarked claim is a customer who says they got the service in a session the provider never marked.`,
     };
   });
 
