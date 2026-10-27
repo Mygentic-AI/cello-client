@@ -193,7 +193,11 @@ export async function markServiceEvent(
       deps.logger.warn("attestation.service_event.replied", { session_id: sessionIdHex, namespace: input.namespace, outcome: reason, correlationId });
       return { ok: false, reason, guidance: MARK_GUIDANCE[reason] ?? `The directory refused the mark: ${reason}.` };
     }
-    const status = reply["status"] === "identical" ? "identical" : "stored";
+    const status = reply["status"];
+    if (status !== "stored" && status !== "identical") {
+      // An unconfirmed write is not reported as done.
+      return { ok: false, reason: "status_unconfirmed", guidance: "The directory answered without saying whether it stored this. Run the command again; a repeat is safe." };
+    }
     deps.logger.info("attestation.service_event.replied", { session_id: sessionIdHex, namespace: input.namespace, outcome: status, correlationId });
     return { ok: true, status };
   });
@@ -323,7 +327,11 @@ export async function sendServiceClaim(
       deps.logger.warn("attestation.service_claim.replied", { session_id: sessionIdHex, namespace: input.namespace, outcome: reason, correlationId });
       return { ok: false, reason, guidance: CLAIM_GUIDANCE[reason] ?? `The directory refused the claim: ${reason}.` };
     }
-    const status = reply["status"] === "identical" ? "identical" : "stored";
+    const status = reply["status"];
+    if (status !== "stored" && status !== "identical") {
+      // An unconfirmed write is not reported as done.
+      return { ok: false, reason: "status_unconfirmed", guidance: "The directory answered without saying whether it stored this. Run the command again; a repeat is safe." };
+    }
     deps.logger.info("attestation.service_claim.replied", { session_id: sessionIdHex, namespace: input.namespace, outcome: status, correlationId });
     return { ok: true, status };
   });
@@ -348,8 +356,13 @@ export async function getActivity(
       const reason = typeof reply["reason"] === "string" ? reply["reason"] : "unspecified";
       return { ok: false, reason, guidance: ACTIVITY_GUIDANCE[reason] ?? `The directory could not serve the activity: ${reason}.` };
     }
-    const service_events = typeof reply["service_events"] === "number" ? reply["service_events"] : 0;
-    const unmarked_claims = typeof reply["unmarked_claims"] === "number" ? reply["unmarked_claims"] : 0;
+    // A missing count is NOT zero: "0 unmarked claims" is the all-clear this read exists to give, so
+    // a reply without the numbers is refused by name rather than reported as clean.
+    const service_events = reply["service_events"];
+    const unmarked_claims = reply["unmarked_claims"];
+    if (typeof service_events !== "number" || typeof unmarked_claims !== "number") {
+      return { ok: false, reason: "activity_counts_missing", guidance: "The directory's answer carried no counts, so nothing can be concluded. Try again shortly." };
+    }
     return { ok: true, service_events, unmarked_claims };
   });
 }

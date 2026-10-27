@@ -24,7 +24,7 @@ import {
 import { openEncryptedDatabase, type DaemonDatabase } from "../sqlcipher-db.js";
 import { ensureSessionSchema } from "../session-schema.js";
 import { type NamespaceDeps } from "../attestation-namespaces.js";
-import { sendServiceClaim, type ServiceEventDeps } from "../attestation-service-events.js";
+import { sendServiceClaim, getActivity, type ServiceEventDeps } from "../attestation-service-events.js";
 import {
   encodeSessionProof, type SessionProof,
 } from "../attestation-session-proof.js";
@@ -340,6 +340,20 @@ describe("007-NOTICES — claim-service", () => {
     const res = await p;
     expect(res).toMatchObject({ ok: false, reason: "already_marked" });
     expect((res as { guidance: string }).guidance).toContain("cello attestations rights");
+  });
+
+  it("a claim reply with no known status is not reported as filed", async () => {
+    const p = sendServiceClaim(svcDeps(), { session_id: SID, namespace: "reviews.alpha" });
+    await waitForSent(sig, 1);
+    sig.push({ type: "attestation_service_claim_result", session_id: SID, namespace: "reviews.alpha" });
+    expect(await p).toMatchObject({ ok: false, reason: "status_unconfirmed" });
+  });
+
+  it("an activity reply without counts is refused, never shown as zero", async () => {
+    const p = getActivity(svcDeps(), { owner_pubkey: themPub, namespace: "reviews.alpha" });
+    await waitForSent(sig, 1);
+    sig.push({ type: "attestation_activity", owner_pubkey: themPub, namespace: "reviews.alpha" });
+    expect(await p).toMatchObject({ ok: false, reason: "activity_counts_missing" });
   });
 
   it("a session with no stored proof → no_session_proof, nothing sent", async () => {
