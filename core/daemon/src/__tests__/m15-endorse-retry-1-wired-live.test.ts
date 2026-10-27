@@ -181,7 +181,7 @@ describe("DOD-M15-ENDORSE-RETRY-1 — over a live daemon", () => {
     const c = await attach("alice");
 
     // ── The node is down. This is the whole defect: before this unit the command simply failed.
-    const issued = (await c.send("cello_attestations_issue", {
+    const issued = (await c.send("cello_endorsements_issue", {
       subject_pubkey: "ab".repeat(32),
       body: "worked with them on the migration",
     })) as Record<string, unknown>;
@@ -193,7 +193,7 @@ describe("DOD-M15-ENDORSE-RETRY-1 — over a live daemon", () => {
     expect(issued["submission_id"]).toMatch(/^[0-9a-f]{64}$/);
     // Clause 5's actual requirement: the surface says it is retrying, and says what to do.
     expect(String(issued["guidance"])).toMatch(/do NOT need to run this again/i);
-    expect(String(issued["guidance"])).toMatch(/cello_attestations_issued/);
+    expect(String(issued["guidance"])).toMatch(/cello_endorsements_issued/);
     // Nothing reached the node, so nothing may claim it did.
     expect(dirNode.state.writes).toHaveLength(0);
 
@@ -259,7 +259,7 @@ describe("DOD-M15-ENDORSE-RETRY-1 — over a live daemon", () => {
     await boot(dirNode.connect, logger, 30 * 60_000);
     const c = await attach("alice");
 
-    const issued = (await c.send("cello_attestations_issue", {
+    const issued = (await c.send("cello_endorsements_issue", {
       subject_pubkey: "ef".repeat(32),
       body: "vouching just before the key rotates",
     })) as Record<string, unknown>;
@@ -299,7 +299,7 @@ describe("DOD-M15-ENDORSE-RETRY-1 — over a live daemon", () => {
     await boot(connect, logger);
     const c = await attach("alice");
 
-    const issued = (await c.send("cello_attestations_issue", {
+    const issued = (await c.send("cello_endorsements_issue", {
       subject_pubkey: "cd".repeat(32),
       body: "a claim the node will not take",
     })) as Record<string, unknown>;

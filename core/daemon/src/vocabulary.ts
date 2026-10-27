@@ -80,8 +80,11 @@ const ALWAYS_ON_VERBS: readonly DualSurfaceVerb[] = [
   { mcp: "cello_contact_set_signal", cli: "cello contact <pubkey> set-signal" },
   // The wallet's own trust signals (M10B / DOD-END-SURFACE-1 — CLI-only until now)
   { mcp: "cello_trust_signals_list", cli: "cello trust-signals list" },
-  { mcp: "cello_attestations_issue", cli: "cello attestations issue" },
-  { mcp: "cello_attestations_issued", cli: "cello attestations issued" },
+  // 008-ENDRENAME — the person-to-person ENDORSEMENT (vouch + accept/refuse) gets its own name, so
+  // `cello attestations` means only the M10E review system. The pre-rename MCP tool names survive
+  // one release as deprecated aliases — see DEPRECATED_ALIAS_TOOLS below.
+  { mcp: "cello_endorsements_issue", cli: "cello endorsements issue" },
+  { mcp: "cello_endorsements_issued", cli: "cello endorsements issued" },
   // M10E 003-NSCLIENT — attestation namespaces
   { mcp: "cello_attestations_namespace_create", cli: "cello attestations namespace create" },
   { mcp: "cello_attestations_namespace_close", cli: "cello attestations namespace close" },
@@ -96,10 +99,11 @@ const ALWAYS_ON_VERBS: readonly DualSurfaceVerb[] = [
   { mcp: "cello_trust_signals_enable", cli: "cello trust-signals enable" },
   { mcp: "cello_trust_signals_disable", cli: "cello trust-signals disable" },
   { mcp: "cello_trust_signals_revoke", cli: "cello trust-signals revoke" },
-  // Consent (M10B / DOD-END-SURFACE-1) — deciding on signals others issued ABOUT this agent
-  { mcp: "cello_attestation_consent_list", cli: "cello attestation-consent list" },
-  { mcp: "cello_attestation_consent_accept", cli: "cello attestation-consent accept" },
-  { mcp: "cello_attestation_consent_refuse", cli: "cello attestation-consent refuse" },
+  // Consent (M10B / DOD-END-SURFACE-1, renamed 008-ENDRENAME) — deciding on ENDORSEMENTS others
+  // issued ABOUT this agent. Old names kept as deprecated aliases for one release.
+  { mcp: "cello_endorsement_consent_list", cli: "cello endorsement-consent list" },
+  { mcp: "cello_endorsement_consent_accept", cli: "cello endorsement-consent accept" },
+  { mcp: "cello_endorsement_consent_refuse", cli: "cello endorsement-consent refuse" },
   /**
    * Channels (M16 / 023-MCPCHAN). Subscriber verbs first, matching the `Channels:` section of
    * `cello -h` — following a channel is the common case and publishing is the rare one.
@@ -251,11 +255,27 @@ export const MCP_ONLY_TOOLS: readonly string[] = [
  */
 export const NON_TOOL_IDENTIFIERS: readonly string[] = ["cello_message"];
 
+/**
+ * 008-ENDRENAME — the pre-rename endorsement tool names, kept registered as deprecated MCP aliases
+ * for ONE release so permission allowlists and hooks keyed on them keep matching. They are NOT in
+ * DUAL_SURFACE_VERBS (their CLI twin is a refuse-stub, not a real command) and NOT in MCP_ONLY_TOOLS
+ * (that list is the custody stubs, exactly). They resolve here only so the shim may register them
+ * and the daemon's own guidance never needs to name one. Delete this list in the next release.
+ */
+export const DEPRECATED_ALIAS_TOOLS: readonly string[] = [
+  "cello_attestations_issue",
+  "cello_attestations_issued",
+  "cello_attestation_consent_list",
+  "cello_attestation_consent_accept",
+  "cello_attestation_consent_refuse",
+];
+
 /** Every `cello_*` token the daemon is ALLOWED to name in guidance. Anything else is a bug. */
 export function knownToolNames(): ReadonlySet<string> {
   return new Set([
     ...DUAL_SURFACE_VERBS.map((v) => v.mcp),
     ...MCP_ONLY_TOOLS,
+    ...DEPRECATED_ALIAS_TOOLS,
     ...NON_TOOL_IDENTIFIERS,
   ]);
 }

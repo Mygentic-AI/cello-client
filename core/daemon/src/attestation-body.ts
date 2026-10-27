@@ -57,7 +57,7 @@ export function checkAttestationBody(body: string): BodyRefusal | null {
       guidance:
         `Not sent — nothing left this machine. The body is ${body.length} characters and the limit ` +
         `is ${ATTESTATION_LENGTH_CAP}. An endorsement is a testimonial, not a document: say the one ` +
-        `thing you would want a stranger to know, and run cello_attestations_issue again.`,
+        `thing you would want a stranger to know, and run cello_endorsements_issue again.`,
     };
   }
   const index = body.search(ATTESTATION_DISALLOWED_CHARSET);
@@ -75,7 +75,7 @@ export function checkAttestationBody(body: string): BodyRefusal | null {
         `Not sent — nothing left this machine. The body contains ${named} at position ${index}. ` +
         `Line breaks are fine; other control characters and angle brackets are not, because they ` +
         `hide content from a reader while a parser still sees it. Remove it and run ` +
-        `cello_attestations_issue again.`,
+        `cello_endorsements_issue again.`,
     };
   }
   return null;
