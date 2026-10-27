@@ -868,156 +868,28 @@ export async function sessions(
  *  daemon-wide bot credentials (narrow, dedicated surface; NOT folded into the parked `cello
  *  config`, since a bot token has no sensible default and can't wait for M9-CFG-001). */
 /**
- * `cello attestations` — YOUR words about ANOTHER agent, and what became of them.
+ * `cello attestations` — the M10E REVIEW system (008-ENDRENAME).
  *
- * SEPARATE FROM `trust-signals` ON PURPOSE. On the wire an attestation IS a trust signal, so folding
- * the two together is the obvious move — and it is the wrong one. A trust signal is the NETWORK
- * verifying an attribute of yours; an attestation is a PERSON vouching for a PERSON. That second
- * thing is the primitive collaboration rests on, and filing it as a subcommand of a wallet listing
- * makes the most important capability the hardest one to find.
- *
- * Subcommands:
- *   issue <pubkey> <text…>  — attest to something you have seen them do
- *   issued                  — what happened to the ones you wrote
- *
- * The receiving direction — what others wrote about YOU — is `cello attestation-consent`.
+ * Namespaces, service-event marks, rights, the owner index, claim-service and activity counts — a
+ * review earned at a service event, which nothing can refuse or withdraw. The person-to-person
+ * ENDORSEMENT (vouch + accept/refuse) that used to live under `issue`/`issued` here is now
+ * `cello endorsements`; those two sub-verbs refuse with a rename line.
  */
 export async function attestations(
   celloDir: string,
   sub: string,
   args: string[],
 ): Promise<CommandResult> {
+  // 008-ENDRENAME — `issue`/`issued` are the person-to-person ENDORSEMENT, now `cello endorsements`.
+  // A CLI is typed by a person, so point them at the new name and act on nothing, rather than
+  // silently aliasing. The MCP tools keep deprecated aliases; a typed command does not need one.
+  if (sub === "issue" || sub === "issued") {
+    return { exitCode: 1, output: `renamed: use \`cello endorsements ${sub}\`` };
+  }
   const lockFilePath = join(celloDir, "daemon.lock");
   const lock = await readLock(lockFilePath);
   if (!lock) {
     return { exitCode: 1, output: "No daemon running. Run 'cello login' first." };
-  }
-
-  // M10B / `M10B-D25r2` — "what happened to what I submitted?". A NETWORK call, so it is its own verb
-  // rather than folded into `list`: listing what you hold must keep working when the directory is
-  // unreachable, and a remote failure must not break a local read.
-  if (sub === "issued") {
-    try {
-      // TWO CALLS. `wallet_list_issued` is the local record of what was submitted; `wallet_fetch_results`
-      // is the network sweep for outcomes. Showing only the second made a submission still awaiting the
-      // subject INVISIBLE — three in flight printed as "no outcomes waiting", which reads as "nothing
-      // was ever sent" rather than "nobody has answered yet".
-      const [issued, res] = (await withIpc(lock.socketPath, (client) =>
-        Promise.all([client.send("wallet_list_issued"), client.send("wallet_fetch_results")]),
-      )) as [
-        {
-          ok: boolean; reason?: string; guidance?: string;
-          issued?: Array<{ submission_id: string; subject_pubkey: string; op: string; submitted_at: number }>;
-          // DOD-M15-ENDORSE-RETRY-1: submissions that reached no directory node — the daemon is
-          // re-sending them, or gave up.
-          in_flight?: Array<{ submission_id: string; op: string; delivery: string; last_reason: string; gave_up_because?: string; guidance: string }>;
-        },
-        {
-          ok: boolean;
-          reason?: string;
-          guidance?: string;
-          results?: Array<{ submission_id: string; outcome: string; reason: string | null; signal_hash: string | null; message: string | null; created_at: string }>;
-          unreachable_nodes?: string[];
-        },
-      ];
-      if (!issued.ok) {
-        return { exitCode: 1, output: `${issued.reason ?? "failed"}\n${issued.guidance ?? ""}`.trim() };
-      }
-      if (!res.ok) {
-        return { exitCode: 1, output: `${res.reason ?? "failed"}\n${res.guidance ?? ""}`.trim() };
-      }
-      const byId = new Map((res.results ?? []).map((r) => [r.submission_id, r]));
-      const rows: Array<{ submission_id: string; outcome: string; reason: string | null; message: string | null }> =
-        (issued.issued ?? []).map((s) => ({
-          ...(byId.get(s.submission_id) ?? { outcome: "pending", reason: null, message: null }),
-          submission_id: s.submission_id,
-        }));
-      // Anything that came back for a submission this wallet has no local record of still gets shown —
-      // dropping it would hide a real outcome behind a local bookkeeping gap.
-      for (const r of res.results ?? []) if (!rows.some((x) => x.submission_id === r.submission_id)) rows.push(r);
-      // A node that did not answer is stated, never folded into the list — an incomplete sweep must not
-      // be readable as "nothing came back".
-      const partial = (res.unreachable_nodes ?? []).length > 0
-        ? `\n\n  ⚠ ${res.unreachable_nodes!.length} node(s) did not answer (${res.unreachable_nodes!.join(", ")}).\n    This list may be incomplete — an outcome recorded there is not shown yet.`
-        : "";
-      /**
-       * DOD-M15-ENDORSE-RETRY-1 — THE ONES THAT NEVER REACHED A NODE, printed in their own block.
-       *
-       * Not merged into the table above: those rows carry an OUTCOME from a directory, and these
-       * have none because no directory has ever seen them. Printing them as `pending` would say the
-       * subject has not answered yet, about a submission nobody was ever asked about.
-       *
-       * Printed BEFORE the empty check too, or an operator whose node was down for the whole
-       * session reads "You have submitted no endorsements" while the daemon is holding three.
-       */
-      const flight = issued.in_flight ?? [];
-      const flightBlock = flight.length === 0 ? "" :
-        "\n\n  Not yet at any directory node (held in memory — a daemon restart loses these):\n" +
-        flight.map((f) => {
-          const state = f.delivery === "gave_up" ? `gave up (${f.gave_up_because ?? "unknown"})` : "retrying";
-          return `  ${state.padEnd(30)}  ${f.submission_id.slice(0, 12)}…  ${f.op}  last: ${f.last_reason}\n      ${f.guidance}`;
-        }).join("\n");
-      if (rows.length === 0) {
-        return {
-          exitCode: 0,
-          output: (flight.length === 0
-            ? "You have submitted no endorsements. Results are held until you collect them, so nothing has been missed."
-            : "No submission has reached a directory node yet.") + flightBlock + partial,
-        };
-      }
-      const lines = rows.map((r) => {
-        const head = `  ${r.outcome.padEnd(10)}  ${r.submission_id.slice(0, 12)}…  ${r.reason ?? "—"}`;
-        // THE MESSAGE ON ITS OWN LINE, quoted and attributed. It is the SUBJECT'S words about the
-        // operator's claim, and running it into the status columns would read as CELLO's verdict.
-        return r.message ? `${head}\n      they said: "${r.message}"` : head;
-      });
-      const header = `  ${"outcome".padEnd(10)}  submission    reason`;
-      return {
-        exitCode: 0,
-        output: [header, "  " + "─".repeat(60), ...lines].join("\n") +
-          flightBlock +
-          "\n\n  A refusal is the subject declining to stand behind your claim — not a fault in it.\n" +
-          "  Re-submitting a corrected version is the intended next step.\n" +
-          "  'pending' means the subject has not answered yet — the submission is not lost." + partial,
-      };
-    } catch (err) {
-      return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
-    }
-  }
-
-  if (sub === "issue") {
-    const [subject, ...rest] = args;
-    // `--` ENDS FLAG PARSING. Free prose is the whole point of this verb, and prose contains things
-    // that look like flags: "cut p99 -30ms" is rejected as an unknown flag, and "-h" anywhere prints
-    // help instead of issuing. The operator needs a way to say "the rest is text", and `--` is the
-    // convention every shell user already knows.
-    const body = (rest[0] === "--" ? rest.slice(1) : rest).join(" ");
-    if (!subject || body.length === 0) {
-      return {
-        exitCode: 1,
-        output:
-          "Usage: cello attestations issue <subject-pubkey> <what you are endorsing them for…>\n" +
-          "\n" +
-          "The text: MAXIMUM 500 CHARACTERS — a testimonial, not a document. Line breaks are fine;\n" +
-          "no other control characters, and no < or >.\n" +
-          "\n" +
-          "If your text contains something that looks like a flag (a leading '-', or '-h'), put `--`\n" +
-          "before it so it is read as text:\n" +
-          "  cello attestations issue <pubkey> -- cut p99 by -30ms on the auth path",
-      };
-    }
-    try {
-      const result = (await withIpc(lock.socketPath, (client) =>
-        client.send("cello_attestations_issue", { subject_pubkey: subject, body }))) as {
-        ok: boolean; reason?: string; guidance?: string; submission_id?: string;
-      };
-      if (!result.ok) {
-        return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
-      }
-      return { exitCode: 0, output: result.guidance ?? "Submitted." };
-    } catch (err: unknown) {
-      return { exitCode: 1, output: `Failed to issue signal: ${err instanceof Error ? err.message : String(err)}` };
-    }
   }
 
   // M10E 003-NSCLIENT — attestation namespaces.
@@ -1192,8 +1064,6 @@ export async function attestations(
     exitCode: 1,
     output:
       "Usage:\n" +
-      "  cello attestations issue <pubkey> <text…>  — attest to something you have seen them do\n" +
-      "  cello attestations issued                  — what happened to the ones you wrote\n" +
       "  cello attestations namespace create <ns> …  — open a review namespace\n" +
       "  cello attestations namespace close <ns>    — stop a namespace granting new rights\n" +
       "  cello attestations index [<pubkey>]        — list an owner's namespaces\n" +
@@ -1202,7 +1072,167 @@ export async function attestations(
       "  cello attestations claim-service <sid> <ns> — claim a dodged service event (no right)\n" +
       "  cello attestations activity <pubkey> <ns>  — service-event and unmarked-claim counts\n" +
       "\n" +
-      "What others wrote about YOU is 'cello attestation-consent'.",
+      "To vouch for another agent in your own words, that is 'cello endorsements' (008-ENDRENAME).",
+  };
+}
+
+/**
+ * `cello endorsements` — YOUR words about ANOTHER agent, and what became of them (008-ENDRENAME).
+ *
+ * Split from `cello attestations` so the two systems stop sharing a word. `cello attestations` is
+ * the M10E review system, where nothing can be refused; an ENDORSEMENT is a PERSON vouching for a
+ * PERSON, which the subject accepts or refuses. The receiving direction is `cello endorsement-consent`.
+ *
+ * Subcommands:
+ *   issue <pubkey> <text…>  — vouch for something you have seen them do
+ *   issued                  — what happened to the ones you wrote
+ */
+export async function endorsements(
+  celloDir: string,
+  sub: string,
+  args: string[],
+): Promise<CommandResult> {
+  const lockFilePath = join(celloDir, "daemon.lock");
+  const lock = await readLock(lockFilePath);
+  if (!lock) {
+    return { exitCode: 1, output: "No daemon running. Run 'cello login' first." };
+  }
+
+  // M10B / `M10B-D25r2` — "what happened to what I submitted?". A NETWORK call, so it is its own verb
+  // rather than folded into `list`: listing what you hold must keep working when the directory is
+  // unreachable, and a remote failure must not break a local read.
+  if (sub === "issued") {
+    try {
+      // TWO CALLS. `wallet_list_issued` is the local record of what was submitted; `wallet_fetch_results`
+      // is the network sweep for outcomes. Showing only the second made a submission still awaiting the
+      // subject INVISIBLE — three in flight printed as "no outcomes waiting", which reads as "nothing
+      // was ever sent" rather than "nobody has answered yet".
+      const [issued, res] = (await withIpc(lock.socketPath, (client) =>
+        Promise.all([client.send("wallet_list_issued"), client.send("wallet_fetch_results")]),
+      )) as [
+        {
+          ok: boolean; reason?: string; guidance?: string;
+          issued?: Array<{ submission_id: string; subject_pubkey: string; op: string; submitted_at: number }>;
+          // DOD-M15-ENDORSE-RETRY-1: submissions that reached no directory node — the daemon is
+          // re-sending them, or gave up.
+          in_flight?: Array<{ submission_id: string; op: string; delivery: string; last_reason: string; gave_up_because?: string; guidance: string }>;
+        },
+        {
+          ok: boolean;
+          reason?: string;
+          guidance?: string;
+          results?: Array<{ submission_id: string; outcome: string; reason: string | null; signal_hash: string | null; message: string | null; created_at: string }>;
+          unreachable_nodes?: string[];
+        },
+      ];
+      if (!issued.ok) {
+        return { exitCode: 1, output: `${issued.reason ?? "failed"}\n${issued.guidance ?? ""}`.trim() };
+      }
+      if (!res.ok) {
+        return { exitCode: 1, output: `${res.reason ?? "failed"}\n${res.guidance ?? ""}`.trim() };
+      }
+      const byId = new Map((res.results ?? []).map((r) => [r.submission_id, r]));
+      const rows: Array<{ submission_id: string; outcome: string; reason: string | null; message: string | null }> =
+        (issued.issued ?? []).map((s) => ({
+          ...(byId.get(s.submission_id) ?? { outcome: "pending", reason: null, message: null }),
+          submission_id: s.submission_id,
+        }));
+      // Anything that came back for a submission this wallet has no local record of still gets shown —
+      // dropping it would hide a real outcome behind a local bookkeeping gap.
+      for (const r of res.results ?? []) if (!rows.some((x) => x.submission_id === r.submission_id)) rows.push(r);
+      // A node that did not answer is stated, never folded into the list — an incomplete sweep must not
+      // be readable as "nothing came back".
+      const partial = (res.unreachable_nodes ?? []).length > 0
+        ? `\n\n  ⚠ ${res.unreachable_nodes!.length} node(s) did not answer (${res.unreachable_nodes!.join(", ")}).\n    This list may be incomplete — an outcome recorded there is not shown yet.`
+        : "";
+      /**
+       * DOD-M15-ENDORSE-RETRY-1 — THE ONES THAT NEVER REACHED A NODE, printed in their own block.
+       *
+       * Not merged into the table above: those rows carry an OUTCOME from a directory, and these
+       * have none because no directory has ever seen them. Printing them as `pending` would say the
+       * subject has not answered yet, about a submission nobody was ever asked about.
+       *
+       * Printed BEFORE the empty check too, or an operator whose node was down for the whole
+       * session reads "You have submitted no endorsements" while the daemon is holding three.
+       */
+      const flight = issued.in_flight ?? [];
+      const flightBlock = flight.length === 0 ? "" :
+        "\n\n  Not yet at any directory node (held in memory — a daemon restart loses these):\n" +
+        flight.map((f) => {
+          const state = f.delivery === "gave_up" ? `gave up (${f.gave_up_because ?? "unknown"})` : "retrying";
+          return `  ${state.padEnd(30)}  ${f.submission_id.slice(0, 12)}…  ${f.op}  last: ${f.last_reason}\n      ${f.guidance}`;
+        }).join("\n");
+      if (rows.length === 0) {
+        return {
+          exitCode: 0,
+          output: (flight.length === 0
+            ? "You have submitted no endorsements. Results are held until you collect them, so nothing has been missed."
+            : "No submission has reached a directory node yet.") + flightBlock + partial,
+        };
+      }
+      const lines = rows.map((r) => {
+        const head = `  ${r.outcome.padEnd(10)}  ${r.submission_id.slice(0, 12)}…  ${r.reason ?? "—"}`;
+        // THE MESSAGE ON ITS OWN LINE, quoted and attributed. It is the SUBJECT'S words about the
+        // operator's claim, and running it into the status columns would read as CELLO's verdict.
+        return r.message ? `${head}\n      they said: "${r.message}"` : head;
+      });
+      const header = `  ${"outcome".padEnd(10)}  submission    reason`;
+      return {
+        exitCode: 0,
+        output: [header, "  " + "─".repeat(60), ...lines].join("\n") +
+          flightBlock +
+          "\n\n  A refusal is the subject declining to stand behind your claim — not a fault in it.\n" +
+          "  Re-submitting a corrected version is the intended next step.\n" +
+          "  'pending' means the subject has not answered yet — the submission is not lost." + partial,
+      };
+    } catch (err) {
+      return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
+  if (sub === "issue") {
+    const [subject, ...rest] = args;
+    // `--` ENDS FLAG PARSING. Free prose is the whole point of this verb, and prose contains things
+    // that look like flags: "cut p99 -30ms" is rejected as an unknown flag, and "-h" anywhere prints
+    // help instead of issuing. The operator needs a way to say "the rest is text", and `--` is the
+    // convention every shell user already knows.
+    const body = (rest[0] === "--" ? rest.slice(1) : rest).join(" ");
+    if (!subject || body.length === 0) {
+      return {
+        exitCode: 1,
+        output:
+          "Usage: cello endorsements issue <subject-pubkey> <what you are endorsing them for…>\n" +
+          "\n" +
+          "The text: MAXIMUM 500 CHARACTERS — a testimonial, not a document. Line breaks are fine;\n" +
+          "no other control characters, and no < or >.\n" +
+          "\n" +
+          "If your text contains something that looks like a flag (a leading '-', or '-h'), put `--`\n" +
+          "before it so it is read as text:\n" +
+          "  cello endorsements issue <pubkey> -- cut p99 by -30ms on the auth path",
+      };
+    }
+    try {
+      const result = (await withIpc(lock.socketPath, (client) =>
+        client.send("cello_endorsements_issue", { subject_pubkey: subject, body }))) as {
+        ok: boolean; reason?: string; guidance?: string; submission_id?: string;
+      };
+      if (!result.ok) {
+        return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+      }
+      return { exitCode: 0, output: result.guidance ?? "Submitted." };
+    } catch (err: unknown) {
+      return { exitCode: 1, output: `Failed to issue signal: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
+  return {
+    exitCode: 1,
+    output:
+      "Usage:\n" +
+      "  cello endorsements issue <pubkey> <text…>  — vouch for something you have seen them do\n" +
+      "  cello endorsements issued                  — what happened to the ones you wrote\n" +
+      "\n" +
+      "What others wrote about YOU is 'cello endorsement-consent'.",
   };
 }
 
