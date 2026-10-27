@@ -14,6 +14,7 @@
  */
 import { Encoder } from "cbor-x";
 import type { SessionAssignmentFrost } from "@cello-protocol/protocol-types";
+import { extractErrorMessage } from "./error-message.js";
 import type { Logger } from "./types.js";
 
 export const SESSION_PROOF_DOMAIN = "CELLO-ASPROOF-v1";
@@ -141,7 +142,7 @@ export function persistSessionProof(
     logger.debug("attestation.session_proof.stored", { session_id: sessionIdHex, correlationId });
   } catch (err: unknown) {
     logger.error("attestation.session_proof.store_failed", {
-      session_id: sessionIdHex, reason: err instanceof Error ? err.message : String(err),
+      session_id: sessionIdHex, reason: extractErrorMessage(err),
     });
   }
 }
