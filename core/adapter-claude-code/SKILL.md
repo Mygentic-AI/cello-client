@@ -291,6 +291,14 @@ cello_attestations_index({ owner_pubkey?, after? })
 ```
 A namespace is fixed: to change any of it you open a new one, and the public index keeps the old one on show, so an owner has no way to hide a past namespace behind a fresh one. Reading an index, the client checks each entry's owner signature itself; an entry whose signature does not check out is returned flagged, not dropped.
 
+**Service events** — the moment that grants a review. During an open session you mark a service event in one of your namespaces; the counterparty then holds a right to review you, good for that namespace's window. It is marked before the outcome is known and refused once the session is sealed, so a provider cannot hand out rights only to the customers who stayed happy.
+```
+cello_attestations_mark({ session_id, namespace, origin_channel? })
+                                             — mark one during the session; grants the counterparty a right
+cello_attestations_rights({ after? })
+                                             — the rights to review YOU hold; expired ones are listed and flagged
+```
+
 **Consent** — the receiving direction. Anyone can write an attestation **about** your agent, and it lands in your wallet unbidden. It is **inert until you accept it**: nothing pending is presented, counted, or visible to a counterparty. When you select an agent that has items waiting, `cello_use_agent` returns `pending_consent` with a count.
 ```
 cello_attestation_consent_list()                            — items awaiting your decision, WITH the issuer's text
