@@ -343,7 +343,9 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // `checked` — daemon.ts calls it to build the customer's offer/no-right noticer. Unwired it is
     // silent in this corpus's own way: no session would ever leave an offer or a no-right notice, so a
     // customer would never learn a review right was due — every suite green.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(130);
+    // 130 → 131 for M10E 007's review fix: `wireAttestationNoticer` (attestation-wiring.ts), which
+    // moved the noticer's composition out of daemon.ts. It is called from daemon.ts, so it is wired.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(131);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",
