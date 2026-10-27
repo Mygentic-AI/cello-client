@@ -1104,6 +1104,56 @@ export async function attestations(
     }
   }
 
+  // M10E 005-SVCCLIENT — mark a service event while a session is open.
+  if (sub === "mark") {
+    const [sessionId, ns, ...flags] = args;
+    let originChannel: string | undefined;
+    for (let i = 0; i < flags.length; i++) {
+      if (flags[i] === "--origin-channel") originChannel = flags[++i];
+    }
+    if (!sessionId || !ns) {
+      return { exitCode: 1, output: "Usage: cello attestations mark <session-id> <namespace> [--origin-channel <pubkey>]" };
+    }
+    try {
+      const params: Record<string, unknown> = { session_id: sessionId, namespace: ns };
+      if (originChannel) params.origin_channel = originChannel;
+      const result = (await withIpc(lock.socketPath, (client) =>
+        client.send("cello_attestations_mark", params))) as { ok: boolean; reason?: string; guidance?: string };
+      if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+      return { exitCode: 0, output: result.guidance ?? "Marked." };
+    } catch (err: unknown) {
+      return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
+  // M10E 005-SVCCLIENT — the rights this agent holds (expired ones shown, flagged).
+  if (sub === "rights") {
+    let after: string | undefined;
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === "--after") after = args[++i];
+    }
+    try {
+      const params: Record<string, unknown> = {};
+      if (after) params.after = after;
+      const result = (await withIpc(lock.socketPath, (client) =>
+        client.send("cello_attestations_rights", params))) as {
+        ok: boolean; reason?: string; guidance?: string; next?: string | null;
+        rights?: Array<{ right_id: string; subject_pubkey: string; namespace: string; expires_at: number; expired: boolean; template: string | null }>;
+      };
+      if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+      const rights = result.rights ?? [];
+      if (rights.length === 0) return { exitCode: 0, output: "No rights." };
+      const lines = rights.map((r) => {
+        const flag = r.expired ? "  EXPIRED" : "";
+        return `  ${r.namespace.padEnd(28)}  ${(r.template ?? "—").padEnd(7)}  ${r.subject_pubkey.slice(0, 16)}…  ${r.right_id.slice(0, 16)}…${flag}`;
+      });
+      const more = result.next ? `\n\n  More — cello attestations rights --after ${result.next}` : "";
+      return { exitCode: 0, output: lines.join("\n") + more };
+    } catch (err: unknown) {
+      return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
   return {
     exitCode: 1,
     output:
@@ -1113,6 +1163,8 @@ export async function attestations(
       "  cello attestations namespace create <ns> …  — open a review namespace\n" +
       "  cello attestations namespace close <ns>    — stop a namespace granting new rights\n" +
       "  cello attestations index [<pubkey>]        — list an owner's namespaces\n" +
+      "  cello attestations mark <session-id> <ns>  — mark a service event during a session\n" +
+      "  cello attestations rights                  — the rights to review that you hold\n" +
       "\n" +
       "What others wrote about YOU is 'cello attestation-consent'.",
   };

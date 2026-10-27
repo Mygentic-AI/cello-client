@@ -723,7 +723,11 @@ export function registerSignalHandlers(deps: SignalHandlerDeps): void {
     };
   });
 
-  registerAttestationNamespaceHandlers({ handlers, resolveSelectedAgent, onlineAgents, keyProviders, getAgentSignaling, logger }); // M10E 003-NSCLIENT namespace verbs (helper module: this file is at its cap)
+  registerAttestationNamespaceHandlers({
+    handlers, resolveSelectedAgent, onlineAgents, keyProviders, getAgentSignaling, logger,
+    getDb: () => sessionNodeManager.getDb(),
+    resolveAgentId: (agentName) => sessionNodeManager.resolveAgentId(agentName),
+  }); // M10E 003-NSCLIENT namespace verbs + 005-SVCCLIENT mark/rights (helper module: this file is at its cap)
 
   /**
    * M10B / DOD-END-SURFACE-1 — per-counterparty presentation choice.

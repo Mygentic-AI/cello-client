@@ -1473,6 +1473,10 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "                                        \u2014 stop a namespace granting new rights; it stays listed\n" +
       "  cello attestations index [<pubkey>] [--after <ns>]\n" +
       "                                        \u2014 list every namespace an owner has ever opened\n" +
+      "  cello attestations mark <session-id> <namespace> [--origin-channel <pubkey>]\n" +
+      "                                        \u2014 mark a service event during an open session; it grants the counterparty a right to review you\n" +
+      "  cello attestations rights [--after <cursor>]\n" +
+      "                                        \u2014 the rights to review you hold; expired ones are shown and flagged\n" +
       "\n" +
       "A namespace fixes, for good, whether its reviews are public or private, their shape, how long a\n" +
       "reviewer has, and the rule under which the right to review is granted. It is immutable: a new\n" +

@@ -162,6 +162,22 @@ server.tool("cello_attestations_index", "List every attestation namespace an own
   return jsonText(result);
 });
 
+server.tool("cello_attestations_mark", "Mark a service event during an open session with your counterparty, in one of the selected agent's own namespaces. It is the moment that grants the counterparty a right to review you — marked before the outcome is known, during the session, and refused once the session is sealed.", {
+  session_id: z.string().describe("The open session's id, as cello_sessions reports it"),
+  namespace: z.string().describe("One of YOUR namespaces, e.g. reviews.prop_8821"),
+  origin_channel: z.string().optional().describe("The channel pubkey this deal began in, 64 hex, when crediting a channel"),
+}, async ({ session_id, namespace, origin_channel }) => {
+  const result = await proxy.call("cello_attestations_mark", { session_id, namespace, origin_channel });
+  return jsonText(result);
+});
+
+server.tool("cello_attestations_rights", "List the rights to review that the selected agent holds — each earned from a service event a provider marked during a session. Expired rights are listed and flagged, never hidden. `next` is a cursor — pass it as `after` for the following page.", {
+  after: z.string().optional().describe("A page cursor from a previous call's `next`"),
+}, async ({ after }) => {
+  const result = await proxy.call("cello_attestations_rights", { after });
+  return jsonText(result);
+});
+
 server.tool("cello_trust_signals_list", "List the trust signals held in this wallet — verifiable claims about you (GitHub account age, phone, email, endorsements from others) that are presented to contacts during sessions. Each row carries TWO independent answers: `status` is the directory's (is the notarization live) and `consent_state` is yours (may it be shown at all). Only an 'accepted' signal is presentable, whatever `default_present` says.", {}, async () => {
   const result = await proxy.call("wallet_list_signals", {});
   return jsonText(result);
