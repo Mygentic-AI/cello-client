@@ -135,6 +135,12 @@ export { canonicalManifestBody, verifyManifest } from "./manifest.js";
 // M8B-PREAUTH-CAP: signed pre-authorization capability (replaces the opaque single-use token).
 export type { PreAuthCapability, PreAuthCapabilityBody, CapabilityVerifyResult, CapabilityVerifyReason } from "./preauth-capability.js";
 export { canonicalCapabilityBody, signCapability, verifyCapability, encodeCapability, decodeCapability } from "./preauth-capability.js";
+export type { DaemonCredential, DaemonCredentialBody, CredentialVerifyResult, CredentialVerifyReason, RegistrationGrant } from "./daemon-credential.js";
+export {
+  canonicalCredentialBody, signDaemonCredential, verifyDaemonCredential,
+  registrationProofBytes, pairingPollBytes, signWithDaemonKey, verifyDaemonSignature,
+  encodeRegistrationGrant, decodeRegistrationGrant, REGISTRATION_GRANT_PREFIX,
+} from "./daemon-credential.js";
 export {
   CONSORTIUM_ROOT_KEYS,
   CONSORTIUM_THRESHOLD,
