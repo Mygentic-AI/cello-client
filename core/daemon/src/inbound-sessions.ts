@@ -33,6 +33,7 @@ import { TIER } from "./contacts-tier-migration.js";
 import type { RelayConnectParams } from "./session-node-manager.js";
 import type { RelayAssignmentCarry } from "./session-relay-client.js";
 import { extractErrorMessage } from "./error-message.js";
+import { persistSessionProof } from "./attestation-session-proof.js";
 
 /**
  * DOD-CAP-SELF-HEAL-1 — how often the operator's own cap may raise an alarm about one counterparty.
@@ -1568,6 +1569,20 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         correlationId,
       });
       return;
+    }
+    // M10E 005-SVCCLIENT — the RESPONDER keeps the proof too. A customer usually opens the session
+    // with the provider, so without this the provider could not mark a service event in the most
+    // common case. Same rules as the initiator: success path only, and a failure to keep it never
+    // fails the session.
+    if (rawAssignment !== null && rawAssignment.signature_type === "frost") {
+      try {
+        persistSessionProof(
+          sessionNodeManager.getDb(), sessionNodeManager.resolveAgentId(localAgent.name), parsed.sessionIdHex,
+          rawAssignment, { ok: true }, Date.now, logger, correlationId,
+        );
+      } catch (err: unknown) {
+        logger.error("attestation.session_proof.store_failed", { session_id: parsed.sessionIdHex, reason: extractErrorMessage(err) });
+      }
     }
     /**
      * ONE event, and `internal` is loud.
