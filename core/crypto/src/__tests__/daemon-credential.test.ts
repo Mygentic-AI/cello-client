@@ -79,6 +79,8 @@ describe("daemon credential", () => {
       { ...cred, nonce: "00112233445566778899aabbccddee" },
       { ...cred, account_id: "not-a-uuid" },
       { ...cred, sig: cred.sig.slice(0, 127) },
+      { ...cred, sig: cred.sig.toUpperCase() },
+      { ...cred, account_role: "admin" },
       null,
       "a string",
     ];
@@ -130,6 +132,17 @@ describe("daemon-key proofs", () => {
     expect(verifyDaemonSignature(pairingPollBytes("KQ7M-4TXP", 1_800_000_000), reg, daemonPub)).toBe(false);
     expect(verifyDaemonSignature(registrationProofBytes("c".repeat(64), "0".repeat(32)), poll, daemonPub)).toBe(false);
     expect(verifyDaemonSignature(pairingPollBytes("KQ7M-4TXP", 1_800_000_000), poll, daemonPub)).toBe(true);
+  });
+
+  it("7a. each proof's domain label is load-bearing: the same content signed without it does not verify", async () => {
+    const { daemon, daemonPub } = await fixture();
+    const agent = "c".repeat(64);
+    const nonce = "0".repeat(32);
+    const bare = (s: string) => new TextEncoder().encode(s);
+    const regNoLabel = await signWithDaemonKey(bare(`${agent}\n${nonce}`), daemon);
+    const pollNoLabel = await signWithDaemonKey(bare(`KQ7M-4TXP\n1800000000`), daemon);
+    expect(verifyDaemonSignature(registrationProofBytes(agent, nonce), regNoLabel, daemonPub)).toBe(false);
+    expect(verifyDaemonSignature(pairingPollBytes("KQ7M-4TXP", 1_800_000_000), pollNoLabel, daemonPub)).toBe(false);
   });
 
   it("verifyDaemonSignature never throws on garbage", () => {

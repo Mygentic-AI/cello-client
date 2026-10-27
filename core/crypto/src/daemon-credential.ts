@@ -49,6 +49,7 @@ const CREDENTIAL_DOMAIN = "cello-daemon-credential-v1\n";
 const REGISTER_DOMAIN = "cello-daemon-register-v1\n";
 const PAIRING_POLL_DOMAIN = "cello-pairing-poll-v1\n";
 
+const SIGNED_FIELDS = new Set(["v", "daemon_pubkey", "account_id", "nonce", "issued_at"]);
 const HEX64 = /^[0-9a-f]{64}$/;
 const HEX32 = /^[0-9a-f]{32}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -81,6 +82,11 @@ export async function signDaemonCredential(
  */
 export function verifyDaemonCredential(c: DaemonCredential, issuerPubkeyHex: string): CredentialVerifyResult {
   if (c === null || typeof c !== "object") return { ok: false, reason: "credential_malformed" };
+  // Only signed fields and the signature: an extra field would ride along unsigned.
+  if (Object.keys(c).some((k) => !SIGNED_FIELDS.has(k) && k !== "sig")) {
+    return { ok: false, reason: "credential_malformed" };
+  }
+  if (typeof c.sig !== "string" || !/^[0-9a-f]{128}$/.test(c.sig)) return { ok: false, reason: "credential_malformed" };
   if (
     c.v !== 1 ||
     typeof c.daemon_pubkey !== "string" || !HEX64.test(c.daemon_pubkey) ||
