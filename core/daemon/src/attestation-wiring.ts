@@ -28,7 +28,7 @@ export function wireAttestationNoticer(ctx: AttestationWiringCtx): {
   store: AttestationNotices;
   noticer: ReturnType<typeof makeAttestationNoticer>;
 } {
-  const store = new AttestationNotices({ db: ctx.db, logger: ctx.logger, now: Date.now });
+  const store = new AttestationNotices({ db: () => ctx.db() ?? null, logger: ctx.logger, now: Date.now });
   const namespaceDepsFor = (agentName: string): NamespaceDeps | null => {
     if (!ctx.isOnline(agentName)) return null;
     const kp = ctx.keyProvider(agentName);
