@@ -20,10 +20,13 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import {
   decodeAttestationRight,
   encodeServiceEvent,
+  encodeServiceReceivedClaim,
   hashAttestationRight,
   hashServiceEvent,
+  hashServiceReceivedClaim,
   templateIdForHash,
   type ServiceEvent,
+  type ServiceReceivedClaim,
 } from "@cello-protocol/protocol-types";
 import { serialize, sendAndAwait, toU8, type NamespaceSignaling } from "./attestation-namespaces.js";
 import { decodeSessionProof } from "./attestation-session-proof.js";
@@ -83,7 +86,32 @@ const RIGHTS_GUIDANCE: Record<string, string> = {
   lookup_failed: "The directory could not read your rights. It is a directory-side fault — try again shortly.",
 };
 
-function timeoutRefusal(kind: "mark" | "rights", sawNotAuthenticated: boolean): Refusal {
+/** M10E 007-NOTICES — a service-received claim earns NO right; it makes a dodged mark visible (006). */
+const CLAIM_GUIDANCE: Record<string, string> = {
+  already_marked: "The provider did mark this session; you have a right. Run `cello attestations rights`.",
+  already_claimed: "You have already filed a claim for this session and namespace. One claim per session.",
+  not_owner: "A claim is filed by the customer who took part. This claim does not name you as the claimant.",
+  unknown_namespace: "There is no such namespace to claim against. Check the name with `cello attestations index <their-pubkey>`.",
+  proof_mismatch: "The stored proof does not match this session or the two parties. This is a client bug — upgrade @cello-protocol/connect.",
+  proof_bad_signature: "The directory could not verify the session proof. This is a client bug — upgrade @cello-protocol/connect.",
+  proof_signer_not_a_participant: "The session proof was signed by a key that is not a participant's. Retry; if it repeats, upgrade @cello-protocol/connect.",
+  proof_unknown_participant: "The directory does not yet know one of the two parties. Try again shortly; registrations replicate between nodes.",
+  bad_record: "The directory could not read the claim. This is a client/version mismatch — upgrade @cello-protocol/connect.",
+  bad_proof: "The directory could not read the session proof. This is a client/version mismatch — upgrade @cello-protocol/connect.",
+  bad_signature: "The directory could not verify your signature on the claim. This is a client bug — upgrade @cello-protocol/connect.",
+  unregistered: "This agent is not registered with the directory yet. Run `cello status`.",
+  stale_record: "The claim's timestamp is too far from the directory's clock. Check this machine's clock and run it again.",
+  rate_limited: "Too many claims too fast. A claim is rare by nature — wait and run it again.",
+  lookup_failed: "The directory could not check the parties. It is a directory-side fault — try again shortly.",
+  store_failed: "The directory could not store the claim. Try again; re-running is safe.",
+};
+
+const ACTIVITY_GUIDANCE: Record<string, string> = {
+  rate_limited: "Too many activity reads too fast. Wait a few seconds and run it again.",
+  lookup_failed: "The directory could not read the activity. It is a directory-side fault — try again shortly.",
+};
+
+function timeoutRefusal(kind: "mark" | "rights" | "claim" | "activity", sawNotAuthenticated: boolean): Refusal {
   if (sawNotAuthenticated) {
     return {
       ok: false,
@@ -93,10 +121,12 @@ function timeoutRefusal(kind: "mark" | "rights", sawNotAuthenticated: boolean): 
   }
   return {
     ok: false,
-    reason: `attestation_${kind === "mark" ? "service_event" : "rights"}_timeout`,
+    reason: `attestation_${kind === "mark" ? "service_event" : kind}_timeout`,
     guidance: kind === "mark"
       ? "The directory node did not answer within the timeout. Whether the mark stored is unknown; re-running is safe (the same session+namespace is marked once)."
-      : "The directory node did not answer within the timeout. Run it again.",
+      : kind === "claim"
+        ? "The directory node did not answer within the timeout. Whether the claim stored is unknown; re-running is safe (one claim per session+namespace)."
+        : "The directory node did not answer within the timeout. Run it again.",
   };
 }
 
@@ -221,5 +251,105 @@ export async function listRights(
     }
     const next = typeof reply["next"] === "string" ? reply["next"] : null;
     return { ok: true, rights, next };
+  });
+}
+
+/**
+ * M10E 007-NOTICES — file a service-received claim for a session that earned no right.
+ *
+ * The claim issues NO right. It names US as the claimant and the counterparty (the party who should
+ * have marked) as the subject, taken from the stored session proof, and carries the same quorum-signed
+ * proof a mark does, so each claim costs a real session with that provider and cannot be forged. The
+ * directory counts it against the namespace while the session has no service event; a later mark
+ * retires it.
+ */
+export async function sendServiceClaim(
+  deps: ServiceEventDeps,
+  input: { session_id: string; namespace: string },
+): Promise<{ ok: true; status: "stored" | "identical" } | Refusal> {
+  const sessionIdHex = input.session_id.toLowerCase();
+  const proofBytes = deps.loadSessionProof(sessionIdHex);
+  if (!proofBytes) {
+    return {
+      ok: false,
+      reason: "no_session_proof",
+      guidance: "This agent kept no proof for that session, so it cannot claim against it. A claim is filed for a session THIS agent took part in; sessions opened before this client version stored no proof.",
+    };
+  }
+  let proof;
+  try { proof = decodeSessionProof(proofBytes); } catch {
+    return { ok: false, reason: "no_session_proof", guidance: "The stored session proof could not be read. There is nothing to claim against." };
+  }
+  // The subject is the participant who is NOT us — the provider who should have marked.
+  const pubAHex = Buffer.from(proof.pub_a).toString("hex");
+  const pubBHex = Buffer.from(proof.pub_b).toString("hex");
+  const me = deps.ownerPubkeyHex.toLowerCase();
+  const subject = pubAHex === me ? pubBHex : pubBHex === me ? pubAHex : null;
+  if (!subject) {
+    return {
+      ok: false,
+      reason: "no_session_proof",
+      guidance: "The stored proof for that session does not name this agent as a participant. Select the agent that took part (cello_use_agent) and claim with them.",
+    };
+  }
+
+  const claim: ServiceReceivedClaim = {
+    session_id: new Uint8Array(Buffer.from(sessionIdHex, "hex")),
+    claimant_pubkey: me,
+    subject_pubkey: subject,
+    namespace: input.namespace,
+    claimed_at: Math.floor(deps.now() / 1000),
+  };
+  const signature = await deps.keyProvider.sign(hashServiceReceivedClaim(claim));
+  const frame = { type: "attestation_service_claim", claim: encodeServiceReceivedClaim(claim), signature, session_proof: proofBytes };
+
+  return serialize(async (): Promise<{ ok: true; status: "stored" | "identical" } | Refusal> => {
+    const correlationId = randomUUID();
+    deps.logger.info("attestation.service_claim.sent", { session_id: sessionIdHex, namespace: input.namespace, correlationId });
+    const out = await sendAndAwait(deps, frame, (reply) =>
+      reply["type"] === "attestation_service_claim_result" && reply["session_id"] === sessionIdHex && reply["namespace"] === input.namespace);
+    if (out.kind === "send_failed") {
+      deps.logger.warn("attestation.service_claim.replied", { session_id: sessionIdHex, namespace: input.namespace, outcome: out.reason, correlationId });
+      return { ok: false, reason: out.reason, guidance: out.guidance ?? `The claim was not handed to a directory node (${out.reason}). Re-running is safe.` };
+    }
+    if (out.kind === "timeout") {
+      const r = timeoutRefusal("claim", out.sawNotAuthenticated);
+      deps.logger.warn("attestation.service_claim.replied", { session_id: sessionIdHex, namespace: input.namespace, outcome: r.reason, correlationId });
+      return r;
+    }
+    const reply = out.reply;
+    if (reply["type"] === "attestation_namespace_error") {
+      const reason = typeof reply["reason"] === "string" ? reply["reason"] : "unspecified";
+      deps.logger.warn("attestation.service_claim.replied", { session_id: sessionIdHex, namespace: input.namespace, outcome: reason, correlationId });
+      return { ok: false, reason, guidance: CLAIM_GUIDANCE[reason] ?? `The directory refused the claim: ${reason}.` };
+    }
+    const status = reply["status"] === "identical" ? "identical" : "stored";
+    deps.logger.info("attestation.service_claim.replied", { session_id: sessionIdHex, namespace: input.namespace, outcome: status, correlationId });
+    return { ok: true, status };
+  });
+}
+
+/** M10E 007-NOTICES — the public activity counts that make a provider who dodges marking visible. */
+export async function getActivity(
+  deps: ServiceEventDeps,
+  input: { owner_pubkey: string; namespace: string },
+): Promise<{ ok: true; service_events: number; unmarked_claims: number } | Refusal> {
+  const owner = input.owner_pubkey.toLowerCase();
+  const frame = { type: "attestation_activity_get", owner_pubkey: owner, namespace: input.namespace };
+  return serialize(async (): Promise<{ ok: true; service_events: number; unmarked_claims: number } | Refusal> => {
+    const out = await sendAndAwait(deps, frame, (reply) =>
+      reply["type"] === "attestation_activity" && reply["owner_pubkey"] === owner && reply["namespace"] === input.namespace);
+    if (out.kind === "send_failed") {
+      return { ok: false, reason: out.reason, guidance: out.guidance ?? `The activity request was not handed to a directory node (${out.reason}). Try again shortly.` };
+    }
+    if (out.kind === "timeout") return timeoutRefusal("activity", out.sawNotAuthenticated);
+    const reply = out.reply;
+    if (reply["type"] === "attestation_namespace_error") {
+      const reason = typeof reply["reason"] === "string" ? reply["reason"] : "unspecified";
+      return { ok: false, reason, guidance: ACTIVITY_GUIDANCE[reason] ?? `The directory could not serve the activity: ${reason}.` };
+    }
+    const service_events = typeof reply["service_events"] === "number" ? reply["service_events"] : 0;
+    const unmarked_claims = typeof reply["unmarked_claims"] === "number" ? reply["unmarked_claims"] : 0;
+    return { ok: true, service_events, unmarked_claims };
   });
 }

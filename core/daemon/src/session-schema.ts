@@ -984,4 +984,24 @@ export function ensureSessionSchema(
       PRIMARY KEY (agent_id, session_id)
     )
   `);
+
+  // M10E 007-NOTICES: the one-time notices a CUSTOMER's daemon leaves itself about a counterparty's
+  // review namespaces — an `offer` at session open (naming the condition under which a right is
+  // granted) and a `no_right` at close when no right was issued. Additive and keyed on agent_id,
+  // never agent_name (the repo guide's stable-key rule). `delivered` is a single flag: a notice is
+  // surfaced once in the next receive and not after (`takeUndelivered`). Appended after every
+  // existing statement; an existing database gains it empty at the next start and its prior rows are
+  // untouched (N8).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS attestation_notices (
+      agent_id   TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      namespace  TEXT NOT NULL,
+      kind       TEXT NOT NULL CHECK (kind IN ('offer','no_right')),
+      payload    BLOB NOT NULL,
+      created_at INTEGER NOT NULL,
+      delivered  INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (agent_id, session_id, namespace, kind)
+    )
+  `);
 }
