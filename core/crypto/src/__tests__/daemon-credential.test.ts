@@ -70,7 +70,8 @@ describe("daemon credential", () => {
 
   it("4. every malformed case is refused without throwing", async () => {
     const { cred, issuerPub } = await fixture();
-    const { nonce: _dropped, ...noNonce } = cred;
+    const noNonce: Record<string, unknown> = { ...cred };
+    delete noNonce["nonce"];
     const cases: unknown[] = [
       noNonce,
       { ...cred, v: 2 },
