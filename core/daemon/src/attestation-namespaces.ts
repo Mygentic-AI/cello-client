@@ -92,7 +92,8 @@ const TTL_MAX_DAYS = 180;
  * unambiguously this one's. Reads ride the same chain for the same reason.
  */
 let opChain: Promise<unknown> = Promise.resolve();
-function serialize<T>(fn: () => Promise<T>): Promise<T> {
+/** Exported so 005's marks ride the SAME chain — a namespace write and a mark never overlap (K7). */
+export function serialize<T>(fn: () => Promise<T>): Promise<T> {
   const run = opChain.then(fn, fn);
   opChain = run.then(() => undefined, () => undefined);
   return run;
@@ -117,7 +118,7 @@ const READ_GUIDANCE: Record<string, string> = {
   lookup_failed: "The directory could not read the index. It is a directory-side fault — try again shortly.",
 };
 
-function toU8(v: unknown): Uint8Array | null {
+export function toU8(v: unknown): Uint8Array | null {
   if (v instanceof Uint8Array) return v;
   if (v && typeof v === "object" && typeof (v as { length?: unknown }).length === "number") {
     try { return Uint8Array.from(v as ArrayLike<number>); } catch { return null; }
@@ -131,8 +132,8 @@ function toU8(v: unknown): Uint8Array | null {
  * is advisory ONLY — an older directory answers it for any undecodable frame, and it is also what a
  * node sends before auth completes, so it sharpens the TIMEOUT rather than resolving the call.
  */
-async function sendAndAwait(
-  deps: NamespaceDeps,
+export async function sendAndAwait(
+  deps: { signaling: NamespaceSignaling; timeoutMs?: number },
   frame: Record<string, unknown>,
   match: (reply: Record<string, unknown>) => boolean,
 ): Promise<{ kind: "reply"; reply: Record<string, unknown> } | { kind: "send_failed"; reason: string; guidance?: string } | { kind: "timeout"; sawNotAuthenticated: boolean }> {

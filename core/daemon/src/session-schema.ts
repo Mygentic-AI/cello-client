@@ -970,4 +970,18 @@ export function ensureSessionSchema(
   // would not fail here, it would fail on the first insert, which is a far worse place to find out.
   ensureTrustSignalSchema(db, logger);
 
+  // M10E 005-SVCCLIENT: the proof of every session whose assignment this daemon verified, kept so a
+  // provider can mark a service event while the session is open. Additive and keyed on agent_id,
+  // never agent_name — a mark may only be made from a proof THIS agent stored (the repo guide's
+  // stable-key rule). Appended after every existing statement; an existing database gains it empty
+  // at the next start and its prior rows are untouched.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS session_proofs (
+      agent_id   TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      proof      BLOB NOT NULL,
+      stored_at  INTEGER NOT NULL,
+      PRIMARY KEY (agent_id, session_id)
+    )
+  `);
 }

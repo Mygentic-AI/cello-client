@@ -26,6 +26,7 @@ import { classifyOnlineResult, type DiscoveryOutcome } from "./cross-node-negoti
 import { parseDiscoveryLookupResult, discoveryLookupErrorReason, parseSessionAssignment, sessionRequestErrorReason, sessionRequestErrorGuidance, resolveOutboundMoniker } from "./session-assignment-parser.js";
 import { DbIdentityStore } from "./db-identity-store.js";
 import { verifyAssignmentSignature } from "./assignment-verify.js";
+import { persistSessionProof } from "./attestation-session-proof.js";
 import { createSignalingConnect } from "./signaling-connect.js";
 import type { IDirectoryChallengeVerifier } from "@cello-protocol/transport";
 import { wireSessionCeremonyHandler, wireSealCeremonyHandler } from "./session-ceremony.js";
@@ -530,6 +531,21 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
        * first.
        */
       const verified = await verifyAssignmentSignature(assignment, getPersistence(agentName), logger, agentName, correlationId);
+      // M10E 005-SVCCLIENT — keep the proof of every session we verified, so this agent can mark a
+      // service event while the session is open. Gated on ok inside persistSessionProof (a failed
+      // verification stores nothing); a write failure is logged and never fails the session.
+      if (assignment.signature_type === "frost") {
+        persistSessionProof(
+          sessionNodeManager.getDb(),
+          sessionNodeManager.resolveAgentId(agentName),
+          Buffer.from(assignment.session_id).toString("hex"),
+          assignment,
+          verified,
+          Date.now,
+          logger,
+          correlationId,
+        );
+      }
       if (!verified.ok) {
         return { ok: false, reason: verified.reason, guidance: verified.guidance };
       }
