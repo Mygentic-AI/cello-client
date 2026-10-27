@@ -163,11 +163,13 @@ server.tool("cello_attestations_index", "List every attestation namespace an own
 });
 
 server.tool("cello_attestations_mark", "Mark a service event during an open session with your counterparty, in one of the selected agent's own namespaces. It is the moment that grants the counterparty a right to review you — marked before the outcome is known, during the session, and refused once the session is sealed.", {
-  session_id: z.string().describe("The open session's id, as cello_sessions reports it"),
+  cello_session_id: z.string().describe("The open session's id, as cello_sessions reports it"),
   namespace: z.string().describe("One of YOUR namespaces, e.g. reviews.prop_8821"),
   origin_channel: z.string().optional().describe("The channel pubkey this deal began in, 64 hex, when crediting a channel"),
-}, async ({ session_id, namespace, origin_channel }) => {
-  const result = await proxy.call("cello_attestations_mark", { session_id, namespace, origin_channel });
+}, async ({ cello_session_id, namespace, origin_channel }) => {
+  // Renamed on destructure so the daemon still receives `session_id` — the Cowork bridge strips a
+  // bare `session_id` schema key (claude-code#77248), so the surface declares `cello_session_id`.
+  const result = await proxy.call("cello_attestations_mark", { session_id: cello_session_id, namespace, origin_channel });
   return jsonText(result);
 });
 

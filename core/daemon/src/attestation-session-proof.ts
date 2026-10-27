@@ -12,13 +12,15 @@
  *
  * Crypto: CBOR → RFC 8949 (canonical via cbor-x with records off).
  */
-import { Encoder } from "cbor-x";
-import type { SessionAssignmentFrost } from "@cello-protocol/protocol-types";
+import { decode as cborDecode } from "cbor-x";
+import { encodeCbor, type SessionAssignmentFrost } from "@cello-protocol/protocol-types";
 import { extractErrorMessage } from "./error-message.js";
 import type { Logger } from "./types.js";
 
+// The directory's `session-proof.ts` encodes with cbor-x options tagUint8Array:false + useRecords:false.
+// `encodeCbor` is the one canonical encoder (same options), so these bytes match the golden hex (K1)
+// while this file constructs no second encoder (§1.1 one-CBOR-encoder guard). `decode` is read-only.
 export const SESSION_PROOF_DOMAIN = "CELLO-ASPROOF-v1";
-const ENC = new Encoder({ tagUint8Array: false, useRecords: false });
 
 export interface SessionProof {
   session_id: Uint8Array;
@@ -38,7 +40,7 @@ export interface SessionProof {
 }
 
 export function encodeSessionProof(p: SessionProof): Uint8Array {
-  return new Uint8Array(ENC.encode([
+  return new Uint8Array(encodeCbor([
     SESSION_PROOF_DOMAIN, p.session_id, p.pub_a, p.pub_b, p.session_timestamp,
     p.initiator_session_peer_id, p.initiator_session_addrs, p.counterparty_session_peer_id,
     p.counterparty_session_addrs, p.transport_mode, p.high_stakes, p.prior_relay_id, p.relay_id,
@@ -48,7 +50,7 @@ export function encodeSessionProof(p: SessionProof): Uint8Array {
 
 /** Throws on any shape fault: wrong length, wrong domain, wrong type. Mirrors the directory. */
 export function decodeSessionProof(raw: Uint8Array): SessionProof {
-  const a = ENC.decode(raw) as unknown;
+  const a = cborDecode(raw) as unknown;
   if (!Array.isArray(a) || a.length !== 15) throw new Error("session proof: must be a 15-element array");
   if (a[0] !== SESSION_PROOF_DOMAIN) throw new Error("session proof: wrong domain");
   const ts = typeof a[4] === "bigint" ? Number(a[4]) : a[4];
