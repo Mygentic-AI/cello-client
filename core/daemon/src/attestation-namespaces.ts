@@ -40,7 +40,7 @@ export interface NamespaceCreateInput {
   scored: boolean;
   /** 7..180, default 30. Checked HERE before anything is built or sent. */
   right_ttl_days: number;
-  /** NFC-normalized HERE (never inside the 001 codec), then 1..280 code points. */
+  /** NFC-normalized HERE (never inside the 001 codec). The codec then refuses anything outside 1..280 code points as `bad_condition`. */
   condition: string;
 }
 
@@ -147,7 +147,7 @@ async function sendAndAwait(
   });
   try {
     const sent = await deps.signaling.sendRaw(frame);
-    if (!sent.ok) return { kind: "send_failed", reason: sent.reason ?? "directory_unreachable", guidance: sent.guidance };
+    if (!sent.ok) return { kind: "send_failed", reason: sent.reason ?? "send_failed", guidance: sent.guidance };
     let timer!: ReturnType<typeof setTimeout>;
     const timeout = new Promise<Record<string, unknown>>((r) => { timer = setTimeout(() => r({ type: "__timeout__" }), timeoutMs); });
     const reply = await Promise.race([pending, timeout]);
