@@ -335,7 +335,11 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // and `cello channel notify` answers method_not_found — a channel set to pull would keep ringing
     // the agent while the operator believes it is quiet, every suite green. Both land in `checked`,
     // not EXEMPT.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(127);
+    // 127 → 129 for M10E 003-NSCLIENT: `createNamespace` (attestation-namespaces.ts) and
+    // `registerAttestationNamespaceHandlers` (attestation-namespace-handlers.ts). Both land in
+    // `checked` — createNamespace is called from the handlers module, the handlers module is
+    // registered from signal-handlers.ts.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(129);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",

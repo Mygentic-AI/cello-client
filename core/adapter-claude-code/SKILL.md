@@ -280,6 +280,17 @@ cello_attestations_issued()                  — what happened to the ones you w
 ```
 Nothing you write is final on your say-so. It is sealed to the CELLO portal (the directory cannot read it), screened, minted — and it stays invisible to everyone unless the SUBJECT accepts it. They are free to refuse, and a refusal is them declining to stand behind your wording, not a fault in the claim; re-submitting a corrected version is the intended next step. You cannot attest about yourself.
 
+**Review namespaces** — before anyone reviews you, you open a namespace that fixes, once, whether its reviews are public or private, whether they carry a 1–5 rating, how long a reviewer has, and the plain-words condition under which a session earns the right to review.
+```
+cello_attestations_namespace_create({ namespace, mode, scored?, ttl_days?, condition })
+                                             — open one; it is fixed once stored
+cello_attestations_namespace_close({ namespace })
+                                             — stop it granting new rights; it stays listed
+cello_attestations_index({ owner_pubkey?, after? })
+                                             — list every namespace an owner has opened
+```
+A namespace is fixed: to change any of it you open a new one, and the public index keeps the old one on show, so an owner has no way to hide a past namespace behind a fresh one. Reading an index, the client checks each entry's owner signature itself; an entry whose signature does not check out is returned flagged, not dropped.
+
 **Consent** — the receiving direction. Anyone can write an attestation **about** your agent, and it lands in your wallet unbidden. It is **inert until you accept it**: nothing pending is presented, counted, or visible to a counterparty. When you select an agent that has items waiting, `cello_use_agent` returns `pending_consent` with a count.
 ```
 cello_attestation_consent_list()                            — items awaiting your decision, WITH the issuer's text
