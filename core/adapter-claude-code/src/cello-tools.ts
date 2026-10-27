@@ -19,6 +19,52 @@ export interface ToolProxy {
   call(method: string, params?: Record<string, unknown>): Promise<unknown>;
 }
 
+/**
+ * 008-ENDRENAME — the composed body behind `cello_endorsements_issued` (formerly
+ * `cello_attestations_issued`). Extracted so the deprecated `cello_attestations_issued` ALIAS reuses
+ * it verbatim rather than duplicating the two-call merge. Two calls, not one: `wallet_list_issued` is
+ * a local read of what was submitted, `wallet_fetch_results` a network sweep for outcomes — joined so
+ * a submission still in flight is VISIBLE as pending rather than read as "nothing waiting".
+ */
+async function endorsementsIssued(proxy: ToolProxy): Promise<Record<string, unknown>> {
+  const [issued, fetched] = await Promise.all([
+    proxy.call("wallet_list_issued", {}) as Promise<{
+      ok: boolean;
+      reason?: string;
+      guidance?: string;
+      issued?: Array<{ submission_id: string }>;
+      in_flight?: Array<{ submission_id: string; delivery: string }>;
+    }>,
+    proxy.call("wallet_fetch_results", {}) as Promise<{
+      ok: boolean;
+      reason?: string;
+      guidance?: string;
+      results?: Array<{ submission_id: string }>;
+      unreachable_nodes?: string[];
+    }>,
+  ]);
+  const primaryError = !issued.ok ? issued : !fetched.ok ? fetched : undefined;
+  const byId = new Map((fetched.results ?? []).map((r) => [r.submission_id, r]));
+  return {
+    ok: issued.ok && fetched.ok,
+    ...(primaryError?.reason !== undefined ? { reason: primaryError.reason } : {}),
+    ...(primaryError?.guidance !== undefined ? { guidance: primaryError.guidance } : {}),
+    ...(issued.ok ? {} : { issued_error: issued }),
+    ...(fetched.ok ? {} : { results_error: fetched }),
+    submissions: (issued.issued ?? []).map((s) => ({
+      ...s,
+      // NO OUTCOME IS "pending", NOT "none". The submission was accepted by a node and is waiting on
+      // the subject; saying nothing came back would read as a dead end rather than an open question.
+      ...(byId.get(s.submission_id) ?? { outcome: "pending" }),
+    })),
+    // DOD-M15-ENDORSE-RETRY-1 — SEPARATE FROM `submissions`, not merged into it. These reached no
+    // node, so there is no outcome to fetch and no id for a result to arrive under; folding them in
+    // would print them as `outcome: "pending"`, which claims a node is holding them.
+    in_flight: issued.in_flight ?? [],
+    unreachable_nodes: fetched.unreachable_nodes ?? [],
+  };
+}
+
 export function registerCelloTools(server: ToolSink, proxy: ToolProxy): void {
 // ─── Agent management tools ─────────────────────────────────────────────────
 
@@ -127,11 +173,11 @@ server.tool("cello_contact_set_tier", "Set a contact's reachability tier: 0=bloc
 // These existed on the CLI only, which is the DOD-SETTINGS-SURFACE-1 mistake: an agent driving CELLO
 // through MCP could hold signals it could neither read nor control.
 
-server.tool("cello_attestations_issue", "ATTEST to something about another agent — your own words vouching for something you have seen them do. This is the person-to-person primitive: trust signals are what the NETWORK verifies about you (GitHub age, phone, email), an attestation is what a PERSON says about a person. It is submitted to the CELLO portal (sealed; the directory cannot read it), scanned, and minted; the SUBJECT must then accept it before anyone else can see it, so nothing here is final until they decide. You cannot issue one about yourself.", {
+server.tool("cello_endorsements_issue", "ENDORSE another agent — your own words vouching for something you have seen them do. This is the person-to-person primitive: trust signals are what the NETWORK verifies about you (GitHub age, phone, email), an endorsement is what a PERSON says about a person. It is submitted to the CELLO portal (sealed; the directory cannot read it), scanned, and minted; the SUBJECT must then accept it before anyone else can see it, so nothing here is final until they decide. You cannot endorse yourself. (NOT the M10E review system — that is cello_attestations_*.)", {
   subject_pubkey: z.string().describe("The counterparty's public key, 64 hex characters — see cello_contacts"),
   body: z.string().describe("What you are vouching for, in your own words. MAXIMUM 500 CHARACTERS — an endorsement is a testimonial, not a document. Line breaks are fine; no other control characters and no < or >. Scanned at intake; it reaches readers quoted and attributed to you, never restated in CELLO's voice."),
 }, async ({ subject_pubkey, body }) => {
-  const result = await proxy.call("cello_attestations_issue", { subject_pubkey, body });
+  const result = await proxy.call("cello_endorsements_issue", { subject_pubkey, body });
   return jsonText(result);
 });
 
@@ -206,43 +252,8 @@ server.tool("cello_trust_signals_list", "List the trust signals held in this wal
 // Two calls, not one: `wallet_list_issued` is a local read of what was submitted, `wallet_fetch_results`
 // is a network sweep for outcomes. Joined here so a submission still in flight is VISIBLE as pending —
 // reporting only outcomes would print "nothing waiting" while three submissions sat unanswered.
-server.tool("cello_attestations_issued", "What happened to attestations YOU wrote about other agents — the outgoing direction. NOT the wallet of signals held about you (that is cello_trust_signals_list). Each submission is minted, refused by the subject, rejected by the screening scan, or still pending. A refusal is the subject declining to stand behind your wording — not a fault in the claim — and it may carry a message from them explaining why; re-submitting a corrected version is the intended next step. `in_flight` holds submissions that have not reached any directory node yet: `delivery: \"retrying\"` means the daemon is re-sending it for you and you should NOT send it again, `delivery: \"gave_up\"` means it never got there and each entry carries the reason and what to do. These are held IN MEMORY only — a daemon restart loses anything still retrying, and it has to be written again. `unreachable_nodes` means some directory node did not answer, so the list may be incomplete — it never means 'no result'.", {}, async () => {
-  const [issued, fetched] = await Promise.all([
-    proxy.call("wallet_list_issued", {}) as Promise<{
-      ok: boolean;
-      reason?: string;
-      guidance?: string;
-      issued?: Array<{ submission_id: string }>;
-      in_flight?: Array<{ submission_id: string; delivery: string }>;
-    }>,
-    proxy.call("wallet_fetch_results", {}) as Promise<{
-      ok: boolean;
-      reason?: string;
-      guidance?: string;
-      results?: Array<{ submission_id: string }>;
-      unreachable_nodes?: string[];
-    }>,
-  ]);
-  const primaryError = !issued.ok ? issued : !fetched.ok ? fetched : undefined;
-  const byId = new Map((fetched.results ?? []).map((r) => [r.submission_id, r]));
-  return jsonText({
-    ok: issued.ok && fetched.ok,
-    ...(primaryError?.reason !== undefined ? { reason: primaryError.reason } : {}),
-    ...(primaryError?.guidance !== undefined ? { guidance: primaryError.guidance } : {}),
-    ...(issued.ok ? {} : { issued_error: issued }),
-    ...(fetched.ok ? {} : { results_error: fetched }),
-    submissions: (issued.issued ?? []).map((s) => ({
-      ...s,
-      // NO OUTCOME IS "pending", NOT "none". The submission was accepted by a node and is waiting on
-      // the subject; saying nothing came back would read as a dead end rather than an open question.
-      ...(byId.get(s.submission_id) ?? { outcome: "pending" }),
-    })),
-    // DOD-M15-ENDORSE-RETRY-1 — SEPARATE FROM `submissions`, not merged into it. These reached no
-    // node, so there is no outcome to fetch and no id for a result to arrive under; folding them in
-    // would print them as `outcome: "pending"`, which claims a node is holding them.
-    in_flight: issued.in_flight ?? [],
-    unreachable_nodes: fetched.unreachable_nodes ?? [],
-  });
+server.tool("cello_endorsements_issued", "What happened to endorsements YOU wrote about other agents — the outgoing direction. NOT the wallet of signals held about you (that is cello_trust_signals_list). Each submission is minted, refused by the subject, rejected by the screening scan, or still pending. A refusal is the subject declining to stand behind your wording — not a fault in the claim — and it may carry a message from them explaining why; re-submitting a corrected version is the intended next step. `in_flight` holds submissions that have not reached any directory node yet: `delivery: \"retrying\"` means the daemon is re-sending it for you and you should NOT send it again, `delivery: \"gave_up\"` means it never got there and each entry carries the reason and what to do. These are held IN MEMORY only — a daemon restart loses anything still retrying, and it has to be written again. `unreachable_nodes` means some directory node did not answer, so the list may be incomplete — it never means 'no result'.", {}, async () => {
+  return jsonText(await endorsementsIssued(proxy));
 });
 
 server.tool("cello_trust_signals_view", "Decode and display one trust signal's full payload — the actual claim, its issuer, and its framing. For a signal someone else issued ABOUT you, this is the text you are being asked to stand behind; read it before accepting.", {
@@ -279,25 +290,60 @@ server.tool("cello_trust_signals_revoke", "Retract a trust signal about you — 
 // there is no `agent` parameter, deliberately: consent is a statement about oneself, and letting a
 // caller name a different agent would be letting one agent accept on another's behalf.
 
-server.tool("cello_attestation_consent_list", "List trust signals (e.g. endorsements) that other parties have issued ABOUT the currently selected agent and that are waiting on its decision. Nothing here is visible to counterparties yet — a pending signal is inert until accepted. Listing marks them as seen, which silences the 'items waiting' nudge on agent selection; it does NOT decide them, and they stay listed until accepted or refused.", {}, async () => {
-  const result = await proxy.call("cello_attestation_consent_list", {});
+server.tool("cello_endorsement_consent_list", "List endorsements that other parties have issued ABOUT the currently selected agent and that are waiting on its decision. Nothing here is visible to counterparties yet — a pending endorsement is inert until accepted. Listing marks them as seen, which silences the 'items waiting' nudge on agent selection; it does NOT decide them, and they stay listed until accepted or refused.", {}, async () => {
+  const result = await proxy.call("cello_endorsement_consent_list", {});
   return jsonText(result);
 });
 
-server.tool("cello_attestation_consent_accept", "Accept a trust signal issued about the currently selected agent, making it presentable to counterparties. Read the plaintext (via cello_attestation_consent_list) before accepting: accepting is what puts YOUR name behind someone else's claim about you.", {
-  hash_prefix: z.string().describe("Signal hash of the pending item, or a prefix of it (min 8 hex chars), as shown by cello_attestation_consent_list"),
+server.tool("cello_endorsement_consent_accept", "Accept an endorsement issued about the currently selected agent, making it presentable to counterparties. Read the plaintext (via cello_endorsement_consent_list) before accepting: accepting is what puts YOUR name behind someone else's claim about you.", {
+  hash_prefix: z.string().describe("Signal hash of the pending item, or a prefix of it (min 8 hex chars), as shown by cello_endorsement_consent_list"),
 }, async ({ hash_prefix }) => {
-  const result = await proxy.call("cello_attestation_consent_accept", { hash_prefix });
+  const result = await proxy.call("cello_endorsement_consent_accept", { hash_prefix });
   return jsonText(result);
 });
 
-server.tool("cello_attestation_consent_refuse", "Refuse an attestation issued about the currently selected agent — INCLUDING one you already accepted, which is how you take back an endorsement you no longer want shown. It stays refused and is never presented. Refusing is not a deletion — the record remains so the decision is auditable — but a refused signal is inert everywhere it is checked. This is for attestations another party wrote about you; signals the portal issued (your track record, verified email and phone, GitHub links, security factors) are not refused here. OPTIONALLY send the issuer a message saying why: there is no edit, so refuse-and-reissue is how a wrong endorsement gets corrected. Without a message the issuer is told nothing at all. The refusal itself takes effect whether or not the message reaches them.", {
-  hash_prefix: z.string().describe("Signal hash of the pending item, or a prefix of it (min 8 hex chars), as shown by cello_attestation_consent_list"),
+server.tool("cello_endorsement_consent_refuse", "Refuse an endorsement issued about the currently selected agent — INCLUDING one you already accepted, which is how you take back an endorsement you no longer want shown. It stays refused and is never presented. Refusing is not a deletion — the record remains so the decision is auditable — but a refused endorsement is inert everywhere it is checked. This is for endorsements another party wrote about you; signals the portal issued (your track record, verified email and phone, GitHub links, security factors) are not refused here. OPTIONALLY send the issuer a message saying why: there is no edit, so refuse-and-reissue is how a wrong endorsement gets corrected. Without a message the issuer is told nothing at all. The refusal itself takes effect whether or not the message reaches them.", {
+  hash_prefix: z.string().describe("Signal hash of the pending item, or a prefix of it (min 8 hex chars), as shown by cello_endorsement_consent_list"),
   message: z.string().optional().describe("Optional note back to the issuer, e.g. what to change so you would accept a reissued one. Omit to refuse silently — the issuer then learns nothing."),
 }, async ({ hash_prefix, message }) => {
-  const result = await proxy.call("cello_attestation_consent_refuse", message ? { hash_prefix, message } : { hash_prefix });
+  const result = await proxy.call("cello_endorsement_consent_refuse", message ? { hash_prefix, message } : { hash_prefix });
   return jsonText(result);
 });
+
+// ─── 008-ENDRENAME — deprecated endorsement tool ALIASES ────────────────────────────────────────
+// The pre-rename tool names, kept for ONE release so permission allowlists and hooks keyed on them
+// keep matching silently. Each proxies the NEW IPC method (the real tools above) and flags itself
+// `deprecated` in its result. Defined in ONE table so the next release removes them in one deletion.
+// Do NOT add an alias for any M10E review tool (cello_attestations_namespace_*, _mark, _rights,
+// _index, _claim_service, _activity) — the rename exists to keep the two systems apart.
+const ENDORSEMENT_ALIASES: ReadonlyArray<{
+  old: string;
+  now: string;
+  schema: z.ZodRawShape;
+  run: (args: Record<string, unknown>) => Promise<Record<string, unknown>>;
+}> = [
+  { old: "cello_attestations_issue", now: "cello_endorsements_issue",
+    schema: { subject_pubkey: z.string(), body: z.string() },
+    run: (a) => proxy.call("cello_endorsements_issue", a) as Promise<Record<string, unknown>> },
+  { old: "cello_attestations_issued", now: "cello_endorsements_issued",
+    schema: {},
+    run: () => endorsementsIssued(proxy) },
+  { old: "cello_attestation_consent_list", now: "cello_endorsement_consent_list",
+    schema: {},
+    run: () => proxy.call("cello_endorsement_consent_list", {}) as Promise<Record<string, unknown>> },
+  { old: "cello_attestation_consent_accept", now: "cello_endorsement_consent_accept",
+    schema: { hash_prefix: z.string() },
+    run: (a) => proxy.call("cello_endorsement_consent_accept", a) as Promise<Record<string, unknown>> },
+  { old: "cello_attestation_consent_refuse", now: "cello_endorsement_consent_refuse",
+    schema: { hash_prefix: z.string(), message: z.string().optional() },
+    run: (a) => proxy.call("cello_endorsement_consent_refuse", a) as Promise<Record<string, unknown>> },
+];
+for (const { old, now, schema, run } of ENDORSEMENT_ALIASES) {
+  server.tool(old, `DEPRECATED — renamed to ${now}. This old name still works for one release; switch to ${now}. The result carries a 'deprecated' field.`, schema, async (args: Record<string, unknown>) => {
+    const result = await run(args);
+    return jsonText({ ...result, deprecated: `renamed to ${now}; this name is removed in the next release` });
+  });
+}
 
 server.tool("cello_contact_set_signal", "Choose whether ONE trust signal is presented to ONE counterparty — finer than the signal's global default, because an endorsement that is right for a prospective client is not necessarily right for a competitor. Pass present:null to CLEAR the choice (fall back to the signal's default), which is different from false (never show it to this person). This can only NARROW what is presented: it cannot show a signal you have not accepted.", {
   pubkey: z.string().describe("The counterparty's public key, 64 hex characters"),

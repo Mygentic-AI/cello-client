@@ -69,7 +69,7 @@ describe("cello_attestations_issued error semantics", () => {
       },
     };
 
-    const handler = captureToolHandler("cello_attestations_issued", proxy);
+    const handler = captureToolHandler("cello_endorsements_issued", proxy);
     const res = await handler({});
     expect(res.isError).toBeUndefined();
     const payload = JSON.parse(res.content[0]!.text) as Record<string, unknown>;
@@ -107,7 +107,7 @@ describe("cello_attestations_issued error semantics", () => {
         throw new Error(`Unexpected method: ${method}`);
       },
     };
-    const singleHandler = captureToolHandler("cello_attestations_issued", singleFailProxy);
+    const singleHandler = captureToolHandler("cello_endorsements_issued", singleFailProxy);
     const singleRes = await singleHandler({});
     expect(singleRes.isError).toBeUndefined();
     const singlePayload = JSON.parse(singleRes.content[0]!.text) as Record<string, unknown>;
@@ -126,7 +126,7 @@ describe("cello_attestations_issued error semantics", () => {
       },
     };
 
-    const handler = captureToolHandler("cello_attestations_issued", dualFailProxy);
+    const handler = captureToolHandler("cello_endorsements_issued", dualFailProxy);
     const res = await handler({});
     expect(res.isError).toBeUndefined();
     const payload = JSON.parse(res.content[0]!.text) as Record<string, unknown>;
@@ -159,7 +159,7 @@ describe("cello_attestations_issued error semantics", () => {
       },
     };
 
-    const handler = captureToolHandler("cello_attestations_issued", proxy);
+    const handler = captureToolHandler("cello_endorsements_issued", proxy);
     const res = await handler({});
     expect(res.isError).toBeUndefined();
     const payload = JSON.parse(res.content[0]!.text) as Record<string, unknown>;
@@ -173,5 +173,81 @@ describe("cello_attestations_issued error semantics", () => {
       { submission_id: "sub-local", subject_pubkey: "dd".repeat(32), outcome: "pending" },
     ]);
     expect(payload["in_flight"]).toEqual([{ submission_id: "sub-retry", delivery: "retrying" }]);
+  });
+});
+
+/**
+ * 008-ENDRENAME — the person-to-person endorsement verbs get their own names, and the pre-rename MCP
+ * tool names survive one release as deprecated aliases so permission allowlists / hooks keyed on them
+ * keep matching.
+ */
+describe("008-ENDRENAME — endorsement tool rename + deprecated aliases", () => {
+  /** Register every tool against a method-recording proxy; return {handlers, calls}. */
+  function registerAll() {
+    const calls: string[] = [];
+    const proxy: ToolProxy = {
+      async call(method: string) {
+        calls.push(method);
+        // Enough shape for the composed `issued` fan-out to not throw.
+        if (method === "wallet_list_issued") return { ok: true, issued: [], in_flight: [] };
+        if (method === "wallet_fetch_results") return { ok: true, results: [], unreachable_nodes: [] };
+        return { ok: true };
+      },
+    };
+    const handlers = new Map<string, ToolHandler>();
+    const sink: ToolSink = {
+      tool: ((name: string, _d: string, _s: unknown, h: ToolHandler) => {
+        handlers.set(name, h);
+      }) as unknown as ToolSink["tool"],
+    };
+    registerCelloTools(sink, proxy);
+    return { handlers, calls };
+  }
+
+  it("E1: cello_endorsements_issue reaches the daemon method that issues an endorsement", async () => {
+    const { handlers, calls } = registerAll();
+    const issue = handlers.get("cello_endorsements_issue");
+    expect(issue, "cello_endorsements_issue must be registered").toBeDefined();
+    await issue!({ subject_pubkey: "aa".repeat(32), body: "ship it" });
+    expect(calls).toContain("cello_endorsements_issue");
+    expect(calls).not.toContain("cello_attestations_issue");
+  });
+
+  it("E2: the old cello_attestations_issue still works, proxies the NEW method, and carries `deprecated`", async () => {
+    const { handlers, calls } = registerAll();
+    const alias = handlers.get("cello_attestations_issue");
+    expect(alias, "the deprecated alias must still be registered").toBeDefined();
+    const res = await alias!({ subject_pubkey: "bb".repeat(32), body: "ok" });
+    // The alias proxies the NEW IPC method, never the old one.
+    expect(calls).toContain("cello_endorsements_issue");
+    expect(calls).not.toContain("cello_attestations_issue");
+    const payload = JSON.parse(res.content[0]!.text) as Record<string, unknown>;
+    expect(payload["deprecated"]).toBe("renamed to cello_endorsements_issue; this name is removed in the next release");
+  });
+
+  it("E3: every old MCP name in the alias table resolves, and no alias exists for an M10E review tool", () => {
+    const { handlers } = registerAll();
+    const aliases = [
+      "cello_attestations_issue",
+      "cello_attestations_issued",
+      "cello_attestation_consent_list",
+      "cello_attestation_consent_accept",
+      "cello_attestation_consent_refuse",
+    ];
+    for (const old of aliases) expect(handlers.has(old), `${old} alias must resolve`).toBe(true);
+    // The review system keeps its name — no deprecated alias may exist for any M10E review tool.
+    for (const review of [
+      "cello_endorsements_namespace_create",
+      "cello_endorsements_mark",
+      "cello_endorsements_rights",
+      "cello_endorsements_index",
+      "cello_endorsements_claim_service",
+      "cello_endorsements_activity",
+    ]) {
+      expect(handlers.has(review), `${review} must NOT exist — the review system is not renamed`).toBe(false);
+    }
+    // And the review tools keep their attestations_* names.
+    expect(handlers.has("cello_attestations_namespace_create")).toBe(true);
+    expect(handlers.has("cello_attestations_mark")).toBe(true);
   });
 });
