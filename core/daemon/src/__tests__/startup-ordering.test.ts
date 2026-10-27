@@ -339,7 +339,11 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // `registerAttestationNamespaceHandlers` (attestation-namespace-handlers.ts). Both land in
     // `checked` — createNamespace is called from the handlers module, the handlers module is
     // registered from signal-handlers.ts.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(129);
+    // 129 → 130 for M10E 007-NOTICES's `makeAttestationNoticer` (attestation-notices.ts). It lands in
+    // `checked` — daemon.ts calls it to build the customer's offer/no-right noticer. Unwired it is
+    // silent in this corpus's own way: no session would ever leave an offer or a no-right notice, so a
+    // customer would never learn a review right was due — every suite green.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(130);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",

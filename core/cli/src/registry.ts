@@ -1478,7 +1478,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "  cello attestations rights [--after <cursor>]\n" +
       "                                        \u2014 the rights to review you hold; expired ones are shown and flagged\n" +
       "  cello attestations claim-service <session-id> <namespace>\n" +
-      "                                        \u2014 claim a session the provider never marked; grants no right, counts as an unmarked claim\n" +
+      "                                        \u2014 claim a session the provider left unmarked; grants no right, counts as an unmarked claim\n" +
       "  cello attestations activity <pubkey> <namespace>\n" +
       "                                        \u2014 the service-event and unmarked-claim counts for a namespace\n" +
       "\n" +

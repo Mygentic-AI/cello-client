@@ -193,10 +193,12 @@ describe("074-DOCSFLAG clauses 2/5/6/9 — the daemon's three document surfaces,
   // so the 14-verb document gap is unchanged.
   // 89/103 → 91/105 for M10E 005-SVCCLIENT's `cello_attestations_mark` and
   // `cello_attestations_rights`. Registered unconditionally, so the 14-verb document gap is unchanged.
-  it("OFF: the operator's socket answers 91 verbs, exactly 14 fewer than ON, and no doc verb", async () => {
+  // 91/105 → 93/107 for M10E 007-NOTICES's `cello_attestations_claim_service` and
+  // `cello_attestations_activity`. Registered unconditionally, so the 14-verb document gap is unchanged.
+  it("OFF: the operator's socket answers 93 verbs, exactly 14 fewer than ON, and no doc verb", async () => {
     const off = await start("off");
     const offKeys = productionVerbs(off);
-    expect(offKeys).toHaveLength(91);
+    expect(offKeys).toHaveLength(93);
     expect(offKeys.filter((k) => k.startsWith("cello_doc_"))).toEqual([]);
     for (const verb of DOC_VERBS) expect(offKeys).not.toContain(verb);
 
@@ -205,7 +207,7 @@ describe("074-DOCSFLAG clauses 2/5/6/9 — the daemon's three document surfaces,
 
     const on = await start("on");
     const onKeys = productionVerbs(on);
-    expect(onKeys).toHaveLength(105);
+    expect(onKeys).toHaveLength(107);
     // The three assertions that survive any unrelated verb being added or removed.
     expect(onKeys.length - offKeys.length).toBe(14);
     expect(onKeys.filter((k) => k.startsWith("cello_doc_")).sort()).toEqual([...DOC_VERBS].sort());

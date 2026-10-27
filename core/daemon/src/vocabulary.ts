@@ -89,6 +89,9 @@ const ALWAYS_ON_VERBS: readonly DualSurfaceVerb[] = [
   // M10E 005-SVCCLIENT — service events: mark one, list the rights you hold
   { mcp: "cello_attestations_mark", cli: "cello attestations mark" },
   { mcp: "cello_attestations_rights", cli: "cello attestations rights" },
+  // M10E 007-NOTICES — claim a dodged service event, and read a namespace's activity counts
+  { mcp: "cello_attestations_claim_service", cli: "cello attestations claim-service" },
+  { mcp: "cello_attestations_activity", cli: "cello attestations activity" },
   { mcp: "cello_trust_signals_view", cli: "cello trust-signals view" },
   { mcp: "cello_trust_signals_enable", cli: "cello trust-signals enable" },
   { mcp: "cello_trust_signals_disable", cli: "cello trust-signals disable" },
