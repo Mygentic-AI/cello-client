@@ -442,6 +442,41 @@ export {
 } from "./channel-relay-record.js";
 export type { ChannelRelayRecord, ChannelRelayRecordDecodeReason } from "./channel-relay-record.js";
 
+// M10E / M10E-RECORDS-1 — the attestation records. ONE implementation; every party hashes these bytes.
+export {
+  AttestationRecordError,
+  ATTESTATION_TEMPLATE_DOMAIN,
+  ATTESTATION_SIGNAL_TYPE,
+  attestationTemplateHash,
+  templateIdForHash,
+  ATTESTATION_NAMESPACE_DOMAIN,
+  ATTESTATION_NAMESPACE_CLOSE_DOMAIN,
+  SERVICE_EVENT_DOMAIN,
+  ATTESTATION_RIGHT_DOMAIN,
+  ATTESTATION_PAYLOAD_DOMAIN,
+  SERVICE_RECEIVED_CLAIM_DOMAIN,
+  ATTESTATION_HEAD_DOMAIN,
+  encodeAttestationNamespace, decodeAttestationNamespace, hashAttestationNamespace,
+  encodeAttestationNamespaceClose, decodeAttestationNamespaceClose, hashAttestationNamespaceClose,
+  encodeServiceEvent, decodeServiceEvent, hashServiceEvent,
+  encodeAttestationRight, decodeAttestationRight, hashAttestationRight,
+  encodeAttestationPayload, decodeAttestationPayload, hashAttestationPayload,
+  encodeServiceReceivedClaim, decodeServiceReceivedClaim, hashServiceReceivedClaim,
+  encodeAttestationHead, decodeAttestationHead, hashAttestationHead,
+  rightId,
+} from "./attestation.js";
+export type {
+  AttestationRecordErrorCode,
+  AttestationTemplateId,
+  AttestationNamespace,
+  AttestationNamespaceClose,
+  ServiceEvent,
+  AttestationRight,
+  AttestationPayload,
+  ServiceReceivedClaim,
+  AttestationHead,
+} from "./attestation.js";
+
 // The channel frames that carry a signature of their own. ONE definition, imported by the client
 // that signs and the relay that verifies — see the header of channel-auth.ts.
 export {

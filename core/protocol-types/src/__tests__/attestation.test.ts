@@ -118,8 +118,8 @@ describe("M10E-RECORDS-1 attestation records", () => {
   });
 
   it("3 template hashes are pinned and distinct", () => {
-    expect(hex(TEXT)).toBe("GOLDEN_TEXT_TEMPLATE");
-    expect(hex(SCORED)).toBe("GOLDEN_SCORED_TEMPLATE");
+    expect(hex(TEXT)).toBe("c1079dcac23e90510f8918e52b94d46399fd7036d8d69b0a492c74f39a882db4");
+    expect(hex(SCORED)).toBe("b5c86642b3165f68419eded8bf78bdbf5e7571997168047287663ffcd8afa0f9");
     expect(hex(TEXT)).not.toBe(hex(SCORED));
     expect(templateIdForHash(TEXT)).toBe("text");
     expect(templateIdForHash(SCORED)).toBe("scored");
