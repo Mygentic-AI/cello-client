@@ -533,18 +533,26 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
       const verified = await verifyAssignmentSignature(assignment, getPersistence(agentName), logger, agentName, correlationId);
       // M10E 005-SVCCLIENT — keep the proof of every session we verified, so this agent can mark a
       // service event while the session is open. Gated on ok inside persistSessionProof (a failed
-      // verification stores nothing); a write failure is logged and never fails the session.
-      if (assignment.signature_type === "frost") {
-        persistSessionProof(
-          sessionNodeManager.getDb(),
-          sessionNodeManager.resolveAgentId(agentName),
-          Buffer.from(assignment.session_id).toString("hex"),
-          assignment,
-          verified,
-          Date.now,
-          logger,
-          correlationId,
-        );
+      // verification stores nothing). The WHOLE block is wrapped: resolving the db or the agent id
+      // must never throw into the session path — keeping the proof is best-effort, and a session that
+      // cannot store it still opens; only a later mark of it is refused `no_session_proof`.
+      if (assignment.signature_type === "frost" && verified.ok) {
+        try {
+          persistSessionProof(
+            sessionNodeManager.getDb(),
+            sessionNodeManager.resolveAgentId(agentName),
+            Buffer.from(assignment.session_id).toString("hex"),
+            assignment,
+            verified,
+            Date.now,
+            logger,
+            correlationId,
+          );
+        } catch (err: unknown) {
+          logger.error("attestation.session_proof.store_failed", {
+            session_id: Buffer.from(assignment.session_id).toString("hex"), reason: extractErrorMessage(err),
+          });
+        }
       }
       if (!verified.ok) {
         return { ok: false, reason: verified.reason, guidance: verified.guidance };
