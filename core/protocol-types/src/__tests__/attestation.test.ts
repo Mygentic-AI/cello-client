@@ -135,8 +135,11 @@ describe("M10E-RECORDS-1 attestation records", () => {
   });
 
   it("5 a record decoded under the wrong decoder is refused", () => {
-    const bytes = encodeServiceEvent(validServiceEvent());
-    expectCode(() => decodeAttestationRight(bytes), "bad_shape");
+    // Length mismatch (ServiceEvent is 8, AttestationRight is 10) lands on bad_shape.
+    expectCode(() => decodeAttestationRight(encodeServiceEvent(validServiceEvent())), "bad_shape");
+    // ServiceEvent and AttestationNamespace are BOTH 8-element arrays, so only the domain guard
+    // separates them — this exercises wrong_domain, which the length-mismatch case cannot.
+    expectCode(() => decodeAttestationNamespace(encodeServiceEvent(validServiceEvent())), "wrong_domain");
   });
 
   it("6 non-NFC text is refused, not normalized", () => {
@@ -237,5 +240,17 @@ describe("M10E-RECORDS-1 attestation records", () => {
   it("16 head counts", () => {
     expectCode(() => encodeAttestationHead({ ...validAttestationHead(), count: -1 }), "bad_count");
     expectCode(() => encodeAttestationHead({ ...validAttestationHead(), count: 1, sum_of_ratings: 6 }), "bad_count");
+  });
+
+  it("17 condition and field-level codes", () => {
+    const n = validAttestationNamespace();
+    expectCode(() => encodeAttestationNamespace({ ...n, condition: "x".repeat(281) }), "bad_condition");
+    expectCode(() => encodeAttestationNamespace({ ...n, condition: "" }), "bad_condition");
+    expectCode(() => encodeAttestationNamespace({ ...n, condition: "café service" }), "not_nfc");
+    expect(() => encodeAttestationNamespace({ ...n, condition: "😀".repeat(280) })).not.toThrow();
+    expectCode(() => encodeAttestationNamespace({ ...n, owner_pubkey: "A".repeat(64) }), "bad_pubkey");
+    expectCode(() => encodeAttestationNamespace({ ...n, mode: "secret" as never }), "bad_mode");
+    expectCode(() => encodeAttestationNamespace({ ...n, template_hash: new Uint8Array(32) }), "bad_template");
+    expectCode(() => encodeServiceEvent({ ...validServiceEvent(), session_id: new Uint8Array(15) }), "bad_bytes");
   });
 });
