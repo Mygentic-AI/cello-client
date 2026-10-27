@@ -297,6 +297,10 @@ cello_attestations_mark({ session_id, namespace, origin_channel? })
                                              — mark one during the session; grants the counterparty a right
 cello_attestations_rights({ after? })
                                              — the rights to review YOU hold; expired ones are listed and flagged
+cello_attestations_claim_service({ cello_session_id, namespace })
+                                             — a sealed session earned no right because the provider left it unmarked; this grants no right and counts as an unmarked claim against them
+cello_attestations_activity({ owner_pubkey, namespace })
+                                             — a namespace's public counts: service events marked, and unmarked claims filed
 ```
 
 **Consent** — the receiving direction. Anyone can write an attestation **about** your agent, and it lands in your wallet unbidden. It is **inert until you accept it**: nothing pending is presented, counted, or visible to a counterparty. When you select an agent that has items waiting, `cello_use_agent` returns `pending_consent` with a count.
