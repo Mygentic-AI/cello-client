@@ -41,7 +41,8 @@ async function serve(getBody: () => unknown | null): Promise<string> {
     res.writeHead(404); res.end();
   });
   servers.push(server);
-  await new Promise<void>((r) => server.listen(0, r));
+  // Bound on the address the URL names: a port free on `::` can be held on 127.0.0.1 by another process.
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   const addr = server.address();
   const port = typeof addr === "object" && addr ? addr.port : 0;
   return `http://127.0.0.1:${port}`;
