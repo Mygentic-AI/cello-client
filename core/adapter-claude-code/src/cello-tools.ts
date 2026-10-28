@@ -196,7 +196,7 @@ server.tool("cello_attestations_namespace_close", "Close one of the selected age
   return jsonText(result);
 });
 
-server.tool("cello_attestations_index", "List every attestation namespace an owner has ever opened, closed ones included, which is how a reader finds them all. Defaults to the selected agent's own key. The client checks each entry's owner signature itself; an entry whose signature does not check out comes back with verified:false rather than being dropped. `next` is a cursor — pass it as `after` for the following page.", {
+server.tool("cello_attestations_index", "List every review namespace an owner has ever opened, closed ones included, with each one's settings. It lists the namespaces only, not the reviews in them; read those with cello_attestations_reviews. Defaults to the selected agent's own key. The client checks each entry's owner signature itself; an entry whose signature does not check out comes back with verified:false rather than being dropped. Treat such an entry as untrusted: show it to the operator as unverified, not as the owner's. `next` is a cursor — pass it as `after` for the following page.", {
   owner_pubkey: z.string().optional().describe("The owner's public key, 64 hex characters. Omit to list your own."),
   after: z.string().optional().describe("A page cursor from a previous call's `next`"),
 }, async ({ owner_pubkey, after }) => {
