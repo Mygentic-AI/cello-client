@@ -72,7 +72,14 @@ export const SUBMISSION_DOMAIN = "CELLO-SUBMIT-v1";
  * is "queued" and the outcome arrives on the results channel — and that is the price of the rule
  * being real rather than advisory.
  */
-export type SubmissionOp = "submit" | "withdraw" | "refuse" | "revoke";
+/**
+ * M10E CLAIM — `attest`: a reviewer claims an attestation right. `subject` is the provider being
+ * reviewed (an agent pubkey), and `body` is the hex of `encodeAttestationPayload(...)`: the right id,
+ * namespace, template, session and the review itself. The portal decodes and validates it against
+ * the template, scans its text, mints it as a trust-signal envelope of type `attestation`, and
+ * publishes it. The subject has no accept or refuse step: an attestation cannot be refused.
+ */
+export type SubmissionOp = "submit" | "withdraw" | "refuse" | "revoke" | "attest";
 
 /** The number of elements in the TBS array, INCLUDING the domain tag. Bump only with the wire. */
 const TBS_ARITY = 8;
@@ -198,7 +205,7 @@ export function decodeSubmission(bytes: Uint8Array): SignedSubmission {
   // POISON — which is documented as unattributable and therefore reports nothing to anybody — acked,
   // and deleted. The operator was told "queued" and would have waited forever. Caught on the live
   // proof, after the type change had been shipped twice.
-  if (op !== "submit" && op !== "withdraw" && op !== "refuse" && op !== "revoke") {
+  if (op !== "submit" && op !== "withdraw" && op !== "refuse" && op !== "revoke" && op !== "attest") {
     throw new Error(`submission_malformed: unknown op '${op}'`);
   }
   const subjectKind = str(decoded[3], "subject_kind");

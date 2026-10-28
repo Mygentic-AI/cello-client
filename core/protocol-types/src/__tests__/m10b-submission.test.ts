@@ -224,7 +224,8 @@ describe("M10B-D4 — the `refuse` op", () => {
  * without adding it to the validator and this goes red.
  */
 describe("every SubmissionOp survives a round trip — the union is not the validator", () => {
-  const ALL_OPS: SubmissionOp[] = ["submit", "withdraw", "refuse", "revoke"];
+  // M10E CLAIM: `attest` carries an attestation claim (the payload as hex in `body`).
+  const ALL_OPS: SubmissionOp[] = ["submit", "withdraw", "refuse", "revoke", "attest"];
 
   it.each(ALL_OPS)("op '%s' encodes and decodes", (op) => {
     const body: SubmissionBody = {
