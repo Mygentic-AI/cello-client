@@ -1026,6 +1026,58 @@ export async function attestations(
     }
   }
 
+  // M10E 011-CLAIM — write a review for a right you hold. Text after `--`, so it can contain flags
+  // or dashes without being parsed. `cello attestations claim <right-id> [--rating N] [--origin-channel pk] -- <text…>`
+  if (sub === "claim") {
+    const [rightId, ...rest] = args;
+    let rating: number | undefined;
+    let originChannel: string | undefined;
+    const textParts: string[] = [];
+    for (let i = 0; i < rest.length; i++) {
+      if (rest[i] === "--rating") rating = Number(rest[++i]);
+      else if (rest[i] === "--origin-channel") originChannel = rest[++i];
+      else if (rest[i] === "--") { textParts.push(...rest.slice(i + 1)); break; }
+      else textParts.push(rest[i]!);
+    }
+    const text = textParts.join(" ").trim();
+    if (!rightId || text.length === 0) {
+      return { exitCode: 1, output: 'Usage: cello attestations claim <right-id> [--rating <1-5>] [--origin-channel <pubkey>] -- <review text>' };
+    }
+    try {
+      const params: Record<string, unknown> = { right_id: rightId, text };
+      if (rating !== undefined) params.rating = rating;
+      if (originChannel) params.origin_channel = originChannel;
+      const result = (await withIpc(lock.socketPath, (client) =>
+        client.send("cello_attestations_claim", params))) as { ok: boolean; reason?: string; guidance?: string };
+      if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+      return { exitCode: 0, output: result.guidance ?? "Review submitted." };
+    } catch (err: unknown) {
+      return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
+  // M10E 011-CLAIM — the reviews you have written, each with its submission outcome.
+  if (sub === "claimed") {
+    try {
+      const result = (await withIpc(lock.socketPath, (client) =>
+        client.send("cello_attestations_claimed", {}))) as {
+        ok: boolean; reason?: string; guidance?: string; results_unavailable?: string;
+        claimed?: Array<{ namespace: string; subject_pubkey: string; rating: number | null; outcome: string; submission_id: string }>;
+      };
+      if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+      const claimed = result.claimed ?? [];
+      if (claimed.length === 0) return { exitCode: 0, output: "No reviews written." };
+      const lines = claimed.map((c) => {
+        const score = c.rating === null ? "—" : `${c.rating}/5`;
+        return `  ${c.namespace.padEnd(28)}  ${c.subject_pubkey.slice(0, 16)}…  ${score.padEnd(4)}  ${c.outcome.padEnd(8)}  ${c.submission_id.slice(0, 16)}…`;
+      });
+      const note = result.results_unavailable ? `\n\n  Outcomes could not be read now (${result.results_unavailable}); they show 'pending'. Nothing is lost.` : "";
+      return { exitCode: 0, output: lines.join("\n") + note };
+    } catch (err: unknown) {
+      return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
   // M10E 007-NOTICES — file a service-received claim for a session that earned no right.
   if (sub === "claim-service") {
     const [sessionId, ns] = args;
@@ -1069,6 +1121,8 @@ export async function attestations(
       "  cello attestations index [<pubkey>]        — list an owner's namespaces\n" +
       "  cello attestations mark <session-id> <ns>  — mark a service event during a session\n" +
       "  cello attestations rights                  — the rights to review that you hold\n" +
+      "  cello attestations claim <right-id> -- <text> — write a review for a right you hold\n" +
+      "  cello attestations claimed                 — the reviews you have written, with outcomes\n" +
       "  cello attestations claim-service <sid> <ns> — claim a dodged service event (no right)\n" +
       "  cello attestations activity <pubkey> <ns>  — service-event and unmarked-claim counts\n" +
       "\n" +

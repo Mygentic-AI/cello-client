@@ -1004,4 +1004,22 @@ export function ensureSessionSchema(
       PRIMARY KEY (agent_id, session_id, namespace, kind)
     )
   `);
+
+  // M10E 011-CLAIM: the reviewer's own encrypted-at-rest copy of a review it wrote (spec 6.4). The
+  // whole database is SQLCipher, so storing the AttestationPayload bytes here IS the encrypted copy —
+  // and keeping it is deliberate, unlike an endorsement's body: this is the author's record of their
+  // OWN review, and `cello attestations claimed` reads it back to show where each submission got to.
+  // Keyed on agent_id + submission_id (the content-derived handle), never agent_name (the repo
+  // guide's stable-key rule). Additive; an existing database gains it empty at the next start (N8).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS claimed_attestations (
+      agent_id       TEXT NOT NULL,
+      submission_id  TEXT NOT NULL,
+      right_id       TEXT NOT NULL,
+      subject_pubkey TEXT NOT NULL,
+      payload        BLOB NOT NULL,
+      created_at     INTEGER NOT NULL,
+      PRIMARY KEY (agent_id, submission_id)
+    )
+  `);
 }

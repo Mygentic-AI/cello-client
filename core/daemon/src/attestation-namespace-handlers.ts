@@ -11,12 +11,26 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import type { SignalingManager } from "@cello-protocol/transport";
 import { createNamespace, closeNamespace, readIndex, type NamespaceDeps } from "./attestation-namespaces.js";
 import { markServiceEvent, listRights, sendServiceClaim, getActivity, type ServiceEventDeps } from "./attestation-service-events.js";
+import { claimRight, listClaimedAttestations, type ClaimSubmitResult, type ClaimedCopy } from "./attestation-claim.js";
+import { fetchSubmissionResults } from "./signal-submission.js";
+import type { SignalSubjectKind, SubmissionOp } from "@cello-protocol/protocol-types";
 import type { IpcHandler } from "./ipc-server.js";
 import type { Logger } from "./types.js";
 
 type SelResult =
   | { ok: true; name: string; pubkey: string }
   | { ok: false; reason: string; guidance: string };
+
+/** The shared submission path (signal-handlers.ts `submitForAgent`), passed in so the claim verb
+ *  signs and seals through the one audited composer rather than a second copy. */
+export type SubmitForAgent = (opts: {
+  connectionId: string;
+  op: SubmissionOp;
+  subjectKind: SignalSubjectKind;
+  subject: string;
+  body: string;
+  context: string;
+}) => Promise<ClaimSubmitResult>;
 
 /** The minimum of the SQLCipher handle the service-event deps need (reads + stored-proof reads). */
 interface HandlerDb {
@@ -32,8 +46,10 @@ export function registerAttestationNamespaceHandlers(args: {
   logger: Logger;
   getDb: () => HandlerDb;
   resolveAgentId: (agentName: string) => string;
+  /** The audited compose/sign/seal/send path — 011-CLAIM sends the `attest` op through it. */
+  submitForAgent: SubmitForAgent;
 }): void {
-  const { handlers, resolveSelectedAgent, onlineAgents, keyProviders, getAgentSignaling, logger, getDb, resolveAgentId } = args;
+  const { handlers, resolveSelectedAgent, onlineAgents, keyProviders, getAgentSignaling, logger, getDb, resolveAgentId, submitForAgent } = args;
 
   function resolveNamespaceDeps(connectionId: string): { ok: true; deps: NamespaceDeps; pubkey: string } | { ok: false; reason: string; guidance: string } {
     const sel = resolveSelectedAgent(connectionId);
@@ -58,7 +74,7 @@ export function registerAttestationNamespaceHandlers(args: {
 
   // M10E 005-SVCCLIENT — the mark/rights deps add the two DB reads a service event needs: the proof
   // this agent kept for the session, and the hash of its last leaf. Keyed on agent_id throughout.
-  function resolveServiceEventDeps(connectionId: string): { ok: true; deps: ServiceEventDeps } | { ok: false; reason: string; guidance: string } {
+  function resolveServiceEventDeps(connectionId: string): { ok: true; deps: ServiceEventDeps; sel: { name: string; pubkey: string }; agentId: string; keyProvider: KeyProvider } | { ok: false; reason: string; guidance: string } {
     const sel = resolveSelectedAgent(connectionId);
     if (!sel.ok) return sel;
     if (!onlineAgents.has(sel.name)) {
@@ -85,7 +101,7 @@ export function registerAttestationNamespaceHandlers(args: {
         return row ? new Uint8Array(Buffer.from(row.leaf_hash_hex, "hex")) : new Uint8Array(32);
       },
     };
-    return { ok: true, deps };
+    return { ok: true, deps, sel: { name: sel.name, pubkey: sel.pubkey }, agentId, keyProvider: kp };
   }
 
   handlers.set("cello_attestations_mark", async (params, connectionId) => {
@@ -118,6 +134,69 @@ export function registerAttestationNamespaceHandlers(args: {
       guidance: res.next
         ? `Showing ${res.rights.length}. More exist — call again with after='${res.next}'. An expired right is listed and flagged, never hidden.`
         : `An expired right is listed and flagged, never hidden.`,
+    };
+  });
+
+  // M10E 011-CLAIM — the holder of a right writes the review; the daemon seals it as an `attest`
+  // submission and keeps the author's own copy. The subject has no refuse step.
+  handlers.set("cello_attestations_claim", async (params, connectionId) => {
+    const r = resolveServiceEventDeps(connectionId);
+    if (!r.ok) return r;
+    const right_id = typeof params?.right_id === "string" ? params.right_id : "";
+    const text = typeof params?.text === "string" ? params.text : "";
+    if (!/^[0-9a-f]{64}$/i.test(right_id) || text.length === 0) {
+      return { ok: false, reason: "invalid_input", guidance: "Pass the 64-hex right id and the review text, e.g. cello attestations claim <right-id> -- Great to work with." };
+    }
+    const rating = typeof params?.rating === "number" ? params.rating : undefined;
+    const origin_channel = typeof params?.origin_channel === "string" ? params.origin_channel : null;
+    const agentId = r.agentId;
+    const res = await claimRight(
+      {
+        svc: r.deps,
+        submitAttest: (subject, bodyHex) =>
+          submitForAgent({ connectionId, op: "attest", subjectKind: "agent", subject, body: bodyHex, context: "The review was NOT submitted:" }),
+        storeLocalCopy: (c) => {
+          getDb().prepare(
+            "INSERT OR REPLACE INTO claimed_attestations (agent_id, submission_id, right_id, subject_pubkey, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+          ).run(agentId, c.submissionId, c.rightId, c.subject, Buffer.from(c.payload), c.createdAt);
+        },
+        now: Date.now,
+        logger,
+      },
+      { rightId: right_id, ...(rating !== undefined ? { rating } : {}), text, originChannel: origin_channel },
+    );
+    if (!res.ok) return res;
+    return { ok: true, submission_id: res.submissionId, namespace: res.namespace, subject: res.subject, retrying: res.retrying, stored: res.stored, guidance: res.guidance };
+  });
+
+  // M10E 011-CLAIM — the reviews this agent has written, each with its submission outcome.
+  handlers.set("cello_attestations_claimed", async (_params, connectionId) => {
+    const r = resolveServiceEventDeps(connectionId);
+    if (!r.ok) return r;
+    const agentId = r.agentId;
+    const opener = r.keyProvider as { openContentSeal?: (c: Uint8Array) => Promise<Uint8Array | null> };
+    const res = await listClaimedAttestations({
+      loadLocalCopies: () => {
+        const rows = getDb().prepare(
+          "SELECT submission_id, right_id, subject_pubkey, payload, created_at FROM claimed_attestations WHERE agent_id = ? ORDER BY created_at DESC",
+        ).all(agentId) as Array<{ submission_id: string; right_id: string; subject_pubkey: string; payload: Buffer; created_at: number }>;
+        return rows.map((row): ClaimedCopy => ({
+          submissionId: row.submission_id,
+          rightId: row.right_id,
+          subject: row.subject_pubkey,
+          payload: new Uint8Array(row.payload),
+          createdAt: row.created_at,
+        }));
+      },
+      fetchResults: () => fetchSubmissionResults({ signaling: r.deps.signaling, keyProvider: opener, logger }),
+      logger,
+    });
+    return {
+      ok: true, claimed: res.claimed,
+      ...(res.results_unavailable ? { results_unavailable: res.results_unavailable } : {}),
+      guidance: res.results_unavailable
+        ? `Showing ${res.claimed.length} review(s). The directory could not return outcomes right now (${res.results_unavailable}), so those show 'pending'; your reviews are held and nothing is lost.`
+        : `Showing ${res.claimed.length} review(s) you have written. A review the subject cannot refuse; 'pending' means no outcome has come back yet.`,
     };
   });
 
