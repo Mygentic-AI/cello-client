@@ -477,15 +477,15 @@ describe("cli commands", () => {
     // A retired CELLO- code is refused in the terminal with the pairing instruction, and the daemon
     // is never asked: the recorder starts undefined and must stay so.
     it("refuses a CELLO- code client-side with token_retired and never contacts the daemon", async () => {
-      const fake = await startFakeDaemon(tempDir, { cello_register: { ok: true } });
+      const fake = await startFakeDaemon(tempDir, { cello_register: { ok: true }, cello_list_agents: { agents: [] } });
       try {
         const result = await register(tempDir, "alice", "CELLO-" + "3xY7abcdefghijkmnopqrstuvwxyzABCD");
+        expect(fake.requests, "the daemon must not be asked").toBeUndefined();
         expect(result.exitCode).toBe(1);
         const parsed = JSON.parse(result.output) as { ok: boolean; reason: string; guidance: string };
         expect(parsed.ok).toBe(false);
         expect(parsed.reason).toBe("token_retired");
         expect(parsed.guidance).toContain("cello register-agent");
-        expect(fake.requests).toBeUndefined();
       } finally {
         await fake.close();
       }
@@ -498,14 +498,14 @@ describe("cli commands", () => {
         JSON.stringify({ nonce: "0".repeat(32), expires_at: "2030-07-29T00:00:00.000Z", sig: "b".repeat(128) }),
         "utf8",
       ).toString("base64url");
-      const fake = await startFakeDaemon(tempDir, { cello_register: { ok: true } });
+      const fake = await startFakeDaemon(tempDir, { cello_register: { ok: true }, cello_list_agents: { agents: [] } });
       try {
         const result = await register(tempDir, "alice", capability);
+        expect(fake.requests, "the daemon must not be asked").toBeUndefined();
         expect(result.exitCode).toBe(1);
         const parsed = JSON.parse(result.output) as { reason: string; guidance: string };
         expect(parsed.reason).toBe("token_retired");
         expect(parsed.guidance).toContain("cello register-agent");
-        expect(fake.requests).toBeUndefined();
       } finally {
         await fake.close();
       }
