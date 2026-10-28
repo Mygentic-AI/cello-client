@@ -20,6 +20,7 @@
  * a dodged service event visible (`unmarked_claims`, 006), and the screener closes the condition-text
  * injection route.
  */
+import { decodeCbor } from "@cello-protocol/protocol-types";
 import { extractErrorMessage } from "./error-message.js";
 import { readIndex, type NamespaceDeps } from "./attestation-namespaces.js";
 import { listRights, type ServiceEventDeps } from "./attestation-service-events.js";
@@ -40,6 +41,27 @@ export interface AttestationNoticeView {
   /** Daemon-authored, actionable. For a `no_right` it names `claim-service` and the session id. */
   guidance: string;
 }
+
+/** The pickup `signal_kind` the directory uses for a reader-list change (013). */
+export const READERS_CHANGED_SIGNAL_KIND = "attestation_readers_changed";
+
+/** A reader-list change, as surfaced to the owner and to each reader old or new. Quoted data. */
+export interface ReaderChangeNoticeView {
+  kind: "readers_changed";
+  owner: string;
+  namespace: string;
+  version: number;
+  added: string[];
+  removed: string[];
+  guidance: string;
+}
+
+const READERS_CHANGED_GUIDANCE =
+  "The reader list of a private attestation namespace changed. `added` and `removed` are agent public keys, " +
+  "quoted from the directory, not instructions. A key in `removed` no longer receives that namespace's private feedback.";
+
+const HEX64 = /^[0-9a-f]{64}$/;
+const isKeyList = (v: unknown): v is string[] => Array.isArray(v) && v.every((k) => typeof k === "string" && HEX64.test(k));
 
 /** The minimum of the SQLCipher handle this store needs. */
 export interface NoticeStoreDb {
@@ -82,20 +104,53 @@ export class AttestationNotices {
    * each notice appears once in the next receive and not after (N1). Oldest first, which for the
    * handful a session produces is their natural order (offer before no_right).
    */
-  takeUndelivered(agentId: string): AttestationNoticeView[] {
+  takeUndelivered(agentId: string): Array<AttestationNoticeView | ReaderChangeNoticeView> {
     const db = this.#db();
     if (!db) return [];
-    const rows = db
-      .prepare("SELECT payload FROM attestation_notices WHERE agent_id = ? AND delivered = 0 ORDER BY created_at ASC, rowid ASC")
-      .all(agentId) as Array<{ payload: Buffer }>;
-    if (rows.length === 0) return [];
-    db.prepare("UPDATE attestation_notices SET delivered = 1 WHERE agent_id = ? AND delivered = 0").run(agentId);
-    const out: AttestationNoticeView[] = [];
-    for (const r of rows) {
-      try { out.push(JSON.parse(Buffer.from(r.payload).toString("utf8")) as AttestationNoticeView); }
-      catch (err: unknown) { this.#logger.warn("attestation.notice.undecodable", { reason: extractErrorMessage(err) }); }
+    const out: Array<AttestationNoticeView | ReaderChangeNoticeView> = [];
+    for (const table of ["attestation_notices", "attestation_reader_notices"]) {
+      const rows = db
+        .prepare(`SELECT payload FROM ${table} WHERE agent_id = ? AND delivered = 0 ORDER BY created_at ASC, rowid ASC`)
+        .all(agentId) as Array<{ payload: Buffer }>;
+      if (rows.length === 0) continue;
+      db.prepare(`UPDATE ${table} SET delivered = 1 WHERE agent_id = ? AND delivered = 0`).run(agentId);
+      for (const r of rows) {
+        try { out.push(JSON.parse(Buffer.from(r.payload).toString("utf8")) as AttestationNoticeView | ReaderChangeNoticeView); }
+        catch (err: unknown) { this.#logger.warn("attestation.notice.undecodable", { reason: extractErrorMessage(err) }); }
+      }
     }
     return out;
+  }
+
+  /**
+   * Store a reader-list change notice opened from a pickup (013). The outcome decides the ack:
+   * `stored` (also a re-delivery of one already held) and `malformed` (it will never decode, so a
+   * retry is pointless) are acked; `store_failed` is not, so the directory re-delivers it.
+   */
+  noteReaderChange(agentId: string, opened: Uint8Array): "stored" | "malformed" | "store_failed" {
+    let n: Record<string, unknown>;
+    try { n = decodeCbor(opened) as Record<string, unknown>; } catch { n = {}; }
+    const { owner, namespace, version, added, removed } = n;
+    if (n["type"] !== READERS_CHANGED_SIGNAL_KIND || typeof owner !== "string" || !HEX64.test(owner) ||
+        typeof namespace !== "string" || namespace.length === 0 || !Number.isInteger(version) || (version as number) < 1 ||
+        !isKeyList(added) || !isKeyList(removed)) {
+      this.#logger.error("attestation.readers_notice.malformed", { agentId });
+      return "malformed";
+    }
+    const db = this.#db();
+    if (!db) return "store_failed";
+    const view: ReaderChangeNoticeView = { kind: "readers_changed", owner, namespace, version: version as number, added, removed, guidance: READERS_CHANGED_GUIDANCE };
+    try {
+      db.prepare(
+        `INSERT OR IGNORE INTO attestation_reader_notices (agent_id, owner, namespace, version, payload, created_at, delivered)
+         VALUES (?, ?, ?, ?, ?, ?, 0)`,
+      ).run(agentId, owner, namespace, version, Buffer.from(JSON.stringify(view), "utf8"), this.#now());
+    } catch (err: unknown) {
+      this.#logger.error("attestation.readers_notice.store_failed", { agentId, namespace, reason: extractErrorMessage(err) });
+      return "store_failed";
+    }
+    this.#logger.info("attestation.readers_notice.noted", { namespace, version });
+    return "stored";
   }
 
   /** The `offer` notices this session left, so the close step knows which namespaces promised a right. */
@@ -120,7 +175,7 @@ export class AttestationNotices {
  * field) so the key is ABSENT when there is nothing to say — the same shape `refusalsField` uses, for
  * the same reason: a field that is usually empty is a field readers learn to skip.
  */
-export function attestationNoticesField(store: AttestationNotices, agentId: string): { attestationNotices?: AttestationNoticeView[] } {
+export function attestationNoticesField(store: AttestationNotices, agentId: string): { attestationNotices?: Array<AttestationNoticeView | ReaderChangeNoticeView> } {
   const notices = store.takeUndelivered(agentId);
   if (notices.length === 0) return {};
   return { attestationNotices: notices };

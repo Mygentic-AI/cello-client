@@ -1022,4 +1022,21 @@ export function ensureSessionSchema(
       PRIMARY KEY (agent_id, submission_id)
     )
   `);
+
+  // M10E 013-PRIVATE: a reader-list change notice from the directory, kept until the next receive
+  // shows it. Its own table because `attestation_notices.kind` is CHECK-constrained and an existing
+  // database cannot widen that without a rebuild. One row per (owner, namespace, version), so a
+  // re-delivered pickup stores nothing new. Keyed on agent_id. Additive (N8).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS attestation_reader_notices (
+      agent_id   TEXT NOT NULL,
+      owner      TEXT NOT NULL,
+      namespace  TEXT NOT NULL,
+      version    INTEGER NOT NULL,
+      payload    BLOB NOT NULL,
+      created_at INTEGER NOT NULL,
+      delivered  INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (agent_id, owner, namespace, version)
+    )
+  `);
 }

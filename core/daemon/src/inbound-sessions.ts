@@ -24,6 +24,7 @@ import type { ConnState } from "./contact-handlers.js";
 import { frameValueToHex } from "./frame-values.js";
 import { computeGenesisPrevRoot, computeChainAnchor, decodeTrustSignalEnvelope, hashTrustSignalEnvelope, verifyTrustSignalHash, decodeCbor, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
 import { TrustSignalStore } from "./trust-signal-store.js";
+import { AttestationNotices, READERS_CHANGED_SIGNAL_KIND } from "./attestation-notices.js";
 import { verifyInboundAssignment } from "./assignment-verify.js";
 import { REFUSAL_REASONS, NOT_ACCEPTING_CALLER_GUIDANCE, type RefusalReason, type AnyRefusalReason } from "./refusal-reasons.js";
 import { WIRE_REASON_RE } from "./counterparty-refusal.js";
@@ -1780,6 +1781,14 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       logger.warn("daemon.trust_signal.open_failed", { origin, agentName, signalKind, correlationId });
       return;
     }
+    // M10E 013: a reader-list change is a plain CBOR notice, not an envelope. Decoding it as one threw
+    // and never acked, so nobody saw the change and the directory re-delivered it forever.
+    if (signalKind === READERS_CHANGED_SIGNAL_KIND) {
+      const notices = new AttestationNotices({ db: () => sessionNodeManager.getDb(), logger, now: Date.now });
+      if (notices.noteReaderChange(sessionNodeManager.resolveAgentId(agentName), recovered) === "store_failed") return;
+      await ackPickup(mgr, id, agentName, signalKind, origin);
+      return;
+    }
     // M10-D18 / M10-D22: the recovered bytes are a canonical CBOR trust-signal envelope (NOT the M8
     // canonical-JSON record). Decode with the SHARED decoder (INV-CANONICAL — same code the portal/directory
     // encode with), then hand it to the holder's own chokepoint: `deliverWalletSignal` RE-DERIVES the
@@ -1810,6 +1819,10 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       return;
     }
     logger.info("daemon.trust_signal.received", { origin, agentName, signalKind, verified: true, correlationId });
+    await ackPickup(mgr, id, agentName, signalKind, origin);
+  }
+
+  async function ackPickup(mgr: SignalingManager, id: string, agentName: string, signalKind: string, origin: string): Promise<void> {
     // DOD-SENDRAW-1: sendRaw never throws — a discarded result hid every failed ack, leaving the
     // sender to retransmit against a daemon that believed it had answered.
     const ackRes = await mgr.sendRaw({ type: "trust_signal_ack", id });
@@ -1817,7 +1830,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       logger.warn("daemon.trust_signal.ack_send_failed", { origin,
         agentName,
         signalKind,
-        correlationId,
+        correlationId: id,
         detail: ackRes.reason ?? "send_not_ok",
         ...(ackRes.guidance ? { guidance: ackRes.guidance } : {}),
       });
