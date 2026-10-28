@@ -143,8 +143,8 @@ export const GROUP_ORDER = [
   // find, join and read a channel did not exist and nobody noticed for five orders.
   "Channels",
   // TWO GROUPS, NOT ONE. On the wire an attestation is a trust signal, and they sat together for
-  // exactly that reason — which made the person-to-person primitive read as a wallet chore. What the
-  // NETWORK verifies about you and what a PERSON says about a person are different affordances, and
+  // exactly that reason — which made the agent-to-agent primitive read as a wallet chore. What the
+  // NETWORK verifies about you and what an AGENT says about an agent are different affordances, and
   // the help is where an operator learns which is which. Attestations come first: it is the one that
   // needs two people, and the one nothing else here can substitute for.
   "Attestations",
@@ -1454,8 +1454,8 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
     },
   },
 
-  // ═══ Attestations — the person-to-person primitive ══════════════════════════════════════════
-  // ITS OWN GROUP, deliberately. An attestation is a PERSON vouching for a PERSON; a trust signal is
+  // ═══ Attestations — the agent-to-agent primitive ══════════════════════════════════════════
+  // ITS OWN GROUP, deliberately. An attestation is an AGENT vouching for an AGENT; a trust signal is
   // the NETWORK verifying an attribute (GitHub age, phone, email). The wire format is the same, so it
   // is tempting to file them together — but they are different affordances, and burying attestation
   // under a wallet listing hides the one capability that makes collaboration possible.
@@ -1499,9 +1499,9 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
     },
   },
 
-  // \u2550\u2550\u2550 Endorsements \u2014 the person-to-person vouch (008-ENDRENAME) \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+  // \u2550\u2550\u2550 Endorsements \u2014 the agent-to-agent vouch (008-ENDRENAME) \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
   // Split out of `cello attestations` so the two systems stop sharing a word. An endorsement is a
-  // PERSON vouching for a PERSON, which the subject accepts or refuses; the M10E review system under
+  // AGENT vouching for an AGENT, which the subject accepts or refuses; the M10E review system under
   // `cello attestations` has no refusal. The old `cello attestations issue`/`issued` now refuse with
   // a rename line (see attestations() in commands.ts).
   {
@@ -1514,7 +1514,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "                                        \u2014 vouch for something you have seen them do\n" +
       "  cello endorsements issued             \u2014 the status of every endorsement you have issued\n" +
       "\n" +
-      "An endorsement is YOUR words about ANOTHER agent \u2014 the person-to-person half of trust. The\n" +
+      "An endorsement is YOUR words about ANOTHER agent \u2014 the agent-to-agent half of trust. The\n" +
       "network's own claims about you (GitHub account age, phone, email) are 'cello trust-signals'.\n" +
       "\n" +
       "Nothing you write is final on your say-so. It is sealed to the CELLO portal (the directory\n" +
@@ -1523,7 +1523,9 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "it is them declining to stand behind your wording, not a fault in the claim.\n" +
       "\n" +
       "The receiving direction \u2014 endorsements others wrote about YOU \u2014 is 'cello endorsement-consent'.\n" +
-      "You cannot endorse yourself.\n" +
+      "The portal refuses an endorsement an agent writes about itself. An agent can endorse\n" +
+      "another agent with the same owner; that endorsement is labelled as coming from an agent\n" +
+      "with the same owner and does not count toward endorsement minimums.\n" +
       "\n" +
       "Prose contains things that look like flags, so use -- to end flag parsing:\n" +
       "  cello endorsements issue b23c24dd\u2026 -- cut p99 by -30ms on the auth path",
