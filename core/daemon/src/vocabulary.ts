@@ -95,6 +95,12 @@ const ALWAYS_ON_VERBS: readonly DualSurfaceVerb[] = [
   // M10E 007-NOTICES — claim a dodged service event, and read a namespace's activity counts
   { mcp: "cello_attestations_claim_service", cli: "cello attestations claim-service" },
   { mcp: "cello_attestations_activity", cli: "cello attestations activity" },
+  // M10E 011-CLAIM — write a review you earned, and read the ones you have written
+  { mcp: "cello_attestations_claim", cli: "cello attestations claim" },
+  { mcp: "cello_attestations_claimed", cli: "cello attestations claimed" },
+  // M10E 013-PRIVATE — the readers of a private namespace (owner only)
+  { mcp: "cello_attestations_readers_list", cli: "cello attestations readers list" },
+  { mcp: "cello_attestations_readers_set", cli: "cello attestations readers add" },
   { mcp: "cello_trust_signals_view", cli: "cello trust-signals view" },
   { mcp: "cello_trust_signals_enable", cli: "cello trust-signals enable" },
   { mcp: "cello_trust_signals_disable", cli: "cello trust-signals disable" },
