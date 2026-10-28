@@ -158,7 +158,13 @@ export function createInboundSealRequestHandler(deps: InboundSealRequestDeps) {
        * `relay_bilateral`: a relay-witnessed half is completed by the relay's leaf log, not by an
        * ack here, so answering there would mint a leaf that can never be joined.
        */
-      if (pendingCeremony === "seal_interrupted" && counterpartyPubkey > initiatorPubkey) {
+      // Only for THIS session's counterparty: the initiator check below runs after this early
+      // branch, and a pending session must not sign its half for a stranger who names it.
+      if (
+        pendingCeremony === "seal_interrupted" &&
+        localRecord.counterparty_pubkey === initiatorPubkey &&
+        counterpartyPubkey > initiatorPubkey
+      ) {
         const kp = getKeyProvider(localAgent.name);
         if (kp) {
           const ownTree = sessionNodeManager.getSessionTree(localAgent.name, sessionId);
