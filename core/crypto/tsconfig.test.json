@@ -23,7 +23,6 @@
     "src/__tests__/index.test.ts",
     "src/__tests__/manifest.test.ts",
     "src/__tests__/merkle.test.ts",
-    "src/__tests__/ml-dsa.test.ts",
-    "src/__tests__/preauth-capability.test.ts"
+    "src/__tests__/ml-dsa.test.ts"
   ]
 }

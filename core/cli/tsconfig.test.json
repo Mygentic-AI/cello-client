@@ -19,6 +19,7 @@
     "src/__tests__/dod-doc-cli-subverbs.test.ts",
     "src/__tests__/dod-onboard-help-1-help.test.ts",
     "src/__tests__/dod-onboard-help-1-sweep.test.ts",
+    "src/__tests__/helpers/fake-daemon.ts",
     "src/__tests__/helpers/hermes-python-driver.ts",
     "src/__tests__/hermes-channel-mode.test.ts",
     "src/__tests__/hermes-explicit-mode.test.ts",
