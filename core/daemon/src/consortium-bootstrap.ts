@@ -127,8 +127,7 @@ export async function verifyStartupManifest(deps: ManifestGateDeps): Promise<Man
      * artefact nobody can date. `manifest-validity.ts` says exactly this about exactly this code —
      * *"the startup check's own shape waves a garbage timestamp through as though it were
      * in-window"* — and fixed it for the RUNTIME classifier while leaving the startup gate as it
-     * found it. `signal-submission.ts` and `preauth-capability.ts` both get it right; this was the
-     * odd one out.
+     * found it. `signal-submission.ts` gets it right; this was the odd one out.
      *
      * **It also falsified the argument the rest of this line rests on.** Everything else here reasons
      * that a lapsed manifest exists only inside a LONG-RUNNING daemon, so refusing would strand a

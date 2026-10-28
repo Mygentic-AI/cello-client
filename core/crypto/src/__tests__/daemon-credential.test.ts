@@ -9,7 +9,6 @@
  */
 import { describe, it, expect } from "vitest";
 import { generateKeypair } from "../ed25519.js";
-import { signCapability, verifyCapability, type PreAuthCapabilityBody } from "../preauth-capability.js";
 import {
   signDaemonCredential,
   verifyDaemonCredential,
@@ -97,19 +96,6 @@ describe("daemon credential", () => {
     for (const k of Object.keys(body).sort()) sorted[k] = (body as unknown as Record<string, unknown>)[k];
     const unlabelled = hex(await issuer.sign(new TextEncoder().encode(JSON.stringify(sorted))));
     expect(verifyDaemonCredential({ ...cred, sig: unlabelled }, issuerPub)).toEqual({ ok: false, reason: "credential_signature_invalid" });
-  });
-
-  it("5. a capability signature and a credential signature never cross-verify", async () => {
-    const { issuer, issuerPub, cred } = await fixture();
-    // A capability signed by the same issuer: its signature, transplanted onto the credential,
-    // must not verify — and the credential's signature must not verify as a capability.
-    const capBody: PreAuthCapabilityBody = {
-      nonce: cred.nonce, phone_stub_hash: "a".repeat(64), email_domain: "e",
-      issued_at: cred.issued_at, expires_at: "2099-01-01T00:00:00.000Z",
-    };
-    const cap = await signCapability(capBody, issuer);
-    expect(verifyDaemonCredential({ ...cred, sig: cap.sig }, issuerPub).ok).toBe(false);
-    expect(verifyCapability({ ...cap, sig: cred.sig }, issuerPub).ok).toBe(false);
   });
 });
 
