@@ -10,6 +10,7 @@
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { SignalingManager } from "@cello-protocol/transport";
 import { createNamespace, closeNamespace, readIndex, type NamespaceDeps } from "./attestation-namespaces.js";
+import { readersList, readersUpdate } from "./attestation-readers.js";
 import { markServiceEvent, listRights, sendServiceClaim, getActivity, type ServiceEventDeps } from "./attestation-service-events.js";
 import { claimRight, listClaimedAttestations, type ClaimSubmitResult, type ClaimedCopy } from "./attestation-claim.js";
 import { fetchSubmissionResults } from "./signal-submission.js";
@@ -291,6 +292,42 @@ export function registerAttestationNamespaceHandlers(args: {
       guidance: res.next
         ? `Showing ${res.entries.length}. More exist — call again with after='${res.next}'. An entry flagged unverified failed its owner-signature check; it is shown, not hidden.`
         : `An entry flagged unverified failed its owner-signature check; it is shown, not hidden.`,
+    };
+  });
+
+  // M10E 013-PRIVATE — the owner names the readers of a PRIVATE namespace. `list` reads the current
+  // set; `add`/`remove` build and sign the next version and announce the change to every reader.
+  handlers.set("cello_attestations_readers_list", async (params, connectionId) => {
+    const r = resolveNamespaceDeps(connectionId);
+    if (!r.ok) return r;
+    const namespace = typeof params?.namespace === "string" ? params.namespace : "";
+    if (namespace.length === 0) return { ok: false, reason: "invalid_namespace", guidance: "Pass the private namespace, e.g. support.qa." };
+    const res = await readersList(r.deps, namespace);
+    if (!res.ok) return res;
+    return {
+      ok: true, namespace, version: res.view.version, readers: res.view.readers,
+      guidance: res.view.readers.length === 0
+        ? `No readers set for '${namespace}' yet. Add one with \`cello attestations readers add ${namespace} <pubkey>\`.`
+        : `${res.view.readers.length} reader(s) at version ${res.view.version}. Every change is announced to all of them.`,
+    };
+  });
+
+  handlers.set("cello_attestations_readers_set", async (params, connectionId) => {
+    const r = resolveNamespaceDeps(connectionId);
+    if (!r.ok) return r;
+    const namespace = typeof params?.namespace === "string" ? params.namespace : "";
+    if (namespace.length === 0) return { ok: false, reason: "invalid_namespace", guidance: "Pass the private namespace, e.g. support.qa." };
+    const toHexArr = (v: unknown): string[] => Array.isArray(v) ? v.filter((x): x is string => typeof x === "string" && /^[0-9a-f]{64}$/i.test(x)).map((x) => x.toLowerCase()) : [];
+    const add = toHexArr(params?.add);
+    const remove = toHexArr(params?.remove);
+    if (add.length === 0 && remove.length === 0) {
+      return { ok: false, reason: "no_change", guidance: "Pass at least one reader pubkey to add or remove (64-hex)." };
+    }
+    const res = await readersUpdate(r.deps, namespace, { add, remove });
+    if (!res.ok) return res;
+    return {
+      ok: true, status: res.status, namespace, version: res.version, readers: res.readers,
+      guidance: `Reader list for '${namespace}' is now version ${res.version} with ${res.readers.length} reader(s). Every reader, old and new, is told what changed.`,
     };
   });
 }

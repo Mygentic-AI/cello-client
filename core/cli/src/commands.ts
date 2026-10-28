@@ -1026,6 +1026,43 @@ export async function attestations(
     }
   }
 
+  // M10E 013-PRIVATE — the readers of a PRIVATE namespace (owner only).
+  //   cello attestations readers list <ns>
+  //   cello attestations readers add|remove <ns> <pubkey>
+  if (sub === "readers") {
+    const [action, ns, pubkey] = args;
+    if (action === "list") {
+      if (!ns) return { exitCode: 1, output: "Usage: cello attestations readers list <ns>" };
+      try {
+        const result = (await withIpc(lock.socketPath, (client) =>
+          client.send("cello_attestations_readers_list", { namespace: ns }))) as {
+          ok: boolean; reason?: string; guidance?: string; version?: number | null; readers?: string[];
+        };
+        if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+        const readers = result.readers ?? [];
+        const body = readers.length === 0 ? "No readers." : readers.map((r) => `  ${r}`).join("\n");
+        return { exitCode: 0, output: `${body}\n\n  ${result.guidance ?? ""}`.trimEnd() };
+      } catch (err: unknown) {
+        return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+      }
+    }
+    if (action === "add" || action === "remove") {
+      if (!ns || !pubkey || !/^[0-9a-f]{64}$/i.test(pubkey)) {
+        return { exitCode: 1, output: `Usage: cello attestations readers ${action} <ns> <pubkey-64hex>` };
+      }
+      try {
+        const params = action === "add" ? { namespace: ns, add: [pubkey.toLowerCase()] } : { namespace: ns, remove: [pubkey.toLowerCase()] };
+        const result = (await withIpc(lock.socketPath, (client) =>
+          client.send("cello_attestations_readers_set", params))) as { ok: boolean; reason?: string; guidance?: string };
+        if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+        return { exitCode: 0, output: result.guidance ?? "Reader list updated." };
+      } catch (err: unknown) {
+        return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+      }
+    }
+    return { exitCode: 1, output: "Usage:\n  cello attestations readers list <ns>\n  cello attestations readers add <ns> <pubkey>\n  cello attestations readers remove <ns> <pubkey>" };
+  }
+
   // M10E 011-CLAIM — write a review for a right you hold. Text after `--`, so it can contain flags
   // or dashes without being parsed. `cello attestations claim <right-id> [--rating N] [--origin-channel pk] -- <text…>`
   if (sub === "claim") {

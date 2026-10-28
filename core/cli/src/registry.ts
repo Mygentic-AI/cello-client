@@ -1479,6 +1479,10 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "                                        \u2014 claim a session the provider left unmarked; grants no right, counts as an unmarked claim\n" +
       "  cello attestations activity <pubkey> <namespace>\n" +
       "                                        \u2014 the service-event and unmarked-claim counts for a namespace\n" +
+      "  cello attestations readers list <ns>\n" +
+      "                                        \u2014 the readers of a PRIVATE namespace (owner only)\n" +
+      "  cello attestations readers add|remove <ns> <pubkey>\n" +
+      "                                        \u2014 name who receives its private feedback; every change is announced to all readers\n" +
       "\n" +
       "A namespace fixes, for good, whether its reviews are public or private, their shape, how long a\n" +
       "reviewer has, and the rule under which the right to review is granted. It is immutable: a new\n" +
