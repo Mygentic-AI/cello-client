@@ -20,6 +20,7 @@ import { TIER } from "./contacts-tier-migration.js";
 import { screeningSessionNotice } from "./screening-status.js";
 import type { AgentInfo } from "./types.js";
 import { extractErrorMessage } from "./error-message.js";
+import { ACCOUNT_NOTICE_TEXT, type AccountNoticeBox } from "./account-notices.js";
 
 export interface NotificationHandlerDeps {
   handlers: Map<string, IpcHandler>;
@@ -47,6 +48,8 @@ export interface NotificationHandlerDeps {
   documentNotices?: (ownerAgentId: string) => Array<{ documentId: string; pending: number; noticedAtMs: number }>;
   /** Owner key for an agent NAME — document rows are keyed by the owner's pubkey, never the name. */
   ownerKeyFor?: (agentName: string) => string | null;
+  /** Account notices a directory pushed; each reaches the inbox once. */
+  accountNotices?: AccountNoticeBox;
 }
 
 export function registerNotificationHandlers(deps: NotificationHandlerDeps): void {
@@ -196,6 +199,12 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
    * operator is told once per reason per window, whichever door they came through, and a reason
    * whose count has grown by an order of magnitude re-announces with `repeat: true`.
    */
+  function accountNoticeSection(agentName: string): Record<string, unknown> {
+    const kinds = deps.accountNotices?.take(sessionNodeManager.resolveAgentId(agentName)) ?? [];
+    if (kinds.length === 0) return {};
+    return { account_notices: kinds.map((kind) => ({ kind, ...ACCOUNT_NOTICE_TEXT[kind] })) };
+  }
+
   function refusalSection(agentName: string, connectionId: string): Record<string, unknown> {
     /**
      * ⚠️ **A FAULT HERE MUST NOT TAKE DOWN THE INBOX — review N3.**
@@ -500,7 +509,7 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
           ...(knocks.length > 0 ? { knocks } : {}),
           unread,
           total_unread, rename_notices, ...documentSection(agent), ...witnessSection(agent),
-          ...refusalSection(agent, connectionId),
+          ...refusalSection(agent, connectionId), ...accountNoticeSection(agent),
           // DOD-SEALED-INBOX-2 + M12-P17 review F2 — BOTH properties, neither dropped in the merge.
           //
           // The rename half: `session_state` was HARDCODED to "sealed" for every row, on a list that
@@ -545,7 +554,7 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
       }
       return { agent, pending_session_requests: pending, expired_session_requests: expired,
         ...(screeningNotice && (pending.length > 0 || unread.length > 0) ? { screening_notice: screeningNotice } : {}),
-        ...pendingGuidance, ...expiredGuidance, ...(refused.length > 0 ? { refused_session_requests: refused } : {}), ...(knocks.length > 0 ? { knocks } : {}), unread, total_unread, rename_notices, ...documentSection(agent), ...witnessSection(agent), ...refusalSection(agent, connectionId) };
+        ...pendingGuidance, ...expiredGuidance, ...(refused.length > 0 ? { refused_session_requests: refused } : {}), ...(knocks.length > 0 ? { knocks } : {}), unread, total_unread, rename_notices, ...documentSection(agent), ...witnessSection(agent), ...refusalSection(agent, connectionId), ...accountNoticeSection(agent) };
     });
 
     const totalUnread = agents.reduce((sum, a) => sum + a.total_unread, 0);

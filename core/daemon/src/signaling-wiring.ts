@@ -73,7 +73,9 @@ export interface SignalingWiringDeps {
    * collector is built in the channel wiring, which is constructed after this one.
    */
   onChannelWake?: (agentName: string) => void;
-  onChannelJoinBell?: (agentName: string, frame: Record<string, unknown>) => void; // 046-JOINBELL: parsed by the membership half
+  onChannelJoinBell?: (agentName: string, frame: Record<string, unknown>) => void;
+  /** A directory pushed an account notice; `kind` is unvalidated wire data. */
+  onAccountNotice?: (agentName: string, kind: unknown) => void; // 046-JOINBELL: parsed by the membership half
   /** C2, late-bound; built in outbound-sessions. See trust-signal-sweep.ts. */
   getSweepTrustSignals: () => ((n: string, k: KeyProvider, p: string) => Promise<unknown>) | undefined;
   resolveConsortiumRoster: () => Promise<ConsortiumEndpoint[] | null>;
@@ -304,6 +306,8 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
      */
     mgr.registerInboundHandler((frame) => {
       if (frame["type"] === "channel_wake") deps.onChannelWake?.(agentName);
+      // Account notice: a kind code only; the daemon supplies every word the agent reads.
+      else if (frame["type"] === "account_notice") deps.onAccountNotice?.(agentName, frame["kind"]);
       else if (frame["type"] === "channel_join_bell") deps.onChannelJoinBell?.(agentName, frame); // 046: names only which slot to read
     });
 

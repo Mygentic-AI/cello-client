@@ -240,6 +240,11 @@ export class NotificationDispatcher {
     });
   }
 
+  /** A directory pushed an account notice for this agent. Content-free: the inbox carries the text. */
+  dispatchAccountNotice(agentName: string, kind: string): void {
+    this.#dispatchToCurrent(agentName, "account_notice", { agent: agentName, kind });
+  }
+
   /** This agent's own join request was answered: `admitted` | `pending` | `refused` (+ reason) | `expired`. */
   dispatchChannelJoinAnswer(
     agentName: string,
