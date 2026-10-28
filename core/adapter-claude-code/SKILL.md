@@ -303,7 +303,7 @@ cello_attestations_activity({ owner_pubkey, namespace })
                                              — a namespace's public counts: service events marked, and unmarked claims filed
 ```
 
-**Writing a review** — a right you hold lets you write exactly one review, which the subject cannot refuse or withdraw.
+**Writing a review** — a right you hold lets you write exactly one review, and the subject has no refuse or withdraw step.
 ```
 cello_attestations_claim({ right_id, text, rating?, origin_channel? })
                                              — write the one review this right earns; pass a 1–5 rating for a scored namespace
@@ -311,7 +311,7 @@ cello_attestations_claimed({})
                                              — the reviews you have written, each with the directory's outcome
 ```
 
-**Private readers** — a PRIVATE namespace's reviews are never stored by CELLO; as its owner you name who receives a sealed copy, and every change is announced to every reader so none is dropped silently. A reviewer never learns who the readers are.
+**Private readers** — a PRIVATE namespace's reviews are not kept by CELLO; as its owner you name who receives a sealed copy, and every change is announced to every reader so none is dropped silently. The reviewer is not shown who the readers are.
 ```
 cello_attestations_readers_list({ namespace })
                                              — the readers of your private namespace (owner only)
