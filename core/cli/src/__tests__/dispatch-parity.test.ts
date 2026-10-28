@@ -102,17 +102,15 @@ beforeEach(() => {
 });
 
 describe("T2: the registry forwards EXACTLY what the old switch forwarded", () => {
-  it("register-agent: positional agent + token + phone stub, in order", async () => {
-    await run("register-agent", ["alice", "CELLO-tok", "+15551234"]);
-    expect(commands.register).toHaveBeenCalledWith(CELLO_DIR, "alice", "CELLO-tok", "+15551234", undefined);
+  it("register-agent: positional agent + DEV- token, in order", async () => {
+    await run("register-agent", ["alice", "DEV-tok"]);
+    expect(commands.register).toHaveBeenCalledWith(CELLO_DIR, "alice", "DEV-tok", undefined);
   });
 
-  it("register-agent: falls back to CELLO_PREAUTH_TOKEN when the token argument is absent", async () => {
-    // The env-var form is documented in help and keeps the token out of shell history. The
-    // argv[3..5] → args[0..2] translation is precisely where this fallback could be lost.
-    process.env.CELLO_PREAUTH_TOKEN = "CELLO-from-env";
+  it("register-agent: no token argument forwards an empty token, whatever the environment holds", async () => {
+    process.env.CELLO_PREAUTH_TOKEN = "DEV-from-env";
     await run("register-agent", ["alice"]);
-    expect(commands.register).toHaveBeenCalledWith(CELLO_DIR, "alice", "CELLO-from-env", "", undefined);
+    expect(commands.register).toHaveBeenCalledWith(CELLO_DIR, "alice", "", undefined);
   });
 
   it("create-agent / remove-agent / refresh / receipts: the name positional", async () => {

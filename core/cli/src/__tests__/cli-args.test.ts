@@ -180,12 +180,13 @@ describe("F2: --help/-h on subcommands", () => {
     expect(help).toContain("no spaces");
   });
 
-  it("register help shows the two-step, a worked example, the token format, and the env-var form", () => {
+  it("register help shows the two-step, a worked example, and the approval link", () => {
     const help = helpForCommand("register-agent");
     expect(help).toContain("create-agent"); // the create → register two-step is explained
-    expect(help).toContain("CELLO-");        // token format
     expect(help.toLowerCase()).toContain("example");
-    expect(help).toContain("CELLO_PREAUTH_TOKEN"); // env-var form documented
+    expect(help).toContain("link to approve this device");
+    expect(help).not.toContain("CELLO-");
+    expect(help).not.toContain("CELLO_PREAUTH_TOKEN");
   });
 });
 

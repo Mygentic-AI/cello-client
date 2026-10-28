@@ -14,6 +14,10 @@
  * call as success (the DOD-SENDRAW-1 / DOD-LOGOUT-WAIT-1 lesson at the CLI surface).
  */
 import { describe, it, expect } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { startFakeDaemon } from "./helpers/fake-daemon.js";
 import { COMMANDS, findCommand, renderCommandsTable, commandNames } from "../registry.js";
 import { emitIpcResult } from "../json-out.js";
 import { USAGE, KNOWN_COMMANDS, helpForCommand, checkArgs } from "../cli-args.js";
@@ -352,5 +356,31 @@ describe("008-POLICY — every flag the policy and screening help documents is a
 
   it("screening log's documented --limit and --since pass checkArgs", () => {
     expect(checkArgs("screening", ["log", "--limit", "20", "--since", "0"])).toEqual({ kind: "ok" });
+  });
+});
+
+describe("register-agent ignores CELLO_PREAUTH_TOKEN", () => {
+  it("with only the env var set, it pairs and sends no preAuthToken", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "cello-registry-test-"));
+    const prior = process.env["CELLO_PREAUTH_TOKEN"];
+    process.env["CELLO_PREAUTH_TOKEN"] = "DEV-env";
+    const fake = await startFakeDaemon(dir, {
+      cello_pair_start: { ok: true, paired: true },
+      cello_register: { ok: true, agent_id: "id-1", primary_pubkey: "pk-1" },
+      cello_list_agents: { agents: [{ name: "alice", pubkey: "local-pk" }] },
+    });
+    try {
+      const silent = { debug() {}, info() {}, warn() {}, error() {} };
+      const out = await findCommand("register-agent")!.run({ celloDir: dir, daemonBin: "", logger: silent }, ["alice"]);
+      expect(out.exitCode).toBe(0);
+      expect(fake.requests?.map((r) => r.method)).toContain("cello_pair_start");
+      const reg = fake.requests?.find((r) => r.method === "cello_register");
+      expect(reg?.params).toEqual({ agent: "alice" });
+    } finally {
+      await fake.close();
+      if (prior === undefined) delete process.env["CELLO_PREAUTH_TOKEN"];
+      else process.env["CELLO_PREAUTH_TOKEN"] = prior;
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

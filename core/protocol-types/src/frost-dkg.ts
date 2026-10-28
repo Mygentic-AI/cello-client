@@ -60,9 +60,9 @@ export interface DkgRound2Share {
  * The directory node generates its own secret polynomial and returns
  * its public broadcast.
  *
- * OPS-AGENT-001: preAuthToken is required. The directory consumes it
- * atomically as the first operation before any crypto computation.
- * Use 'DEV-test-token' (or any 'DEV-' prefix) in CELLO_ENV=local.
+ * preAuthToken carries a paired device's `DCRED1.` grant, or a local test
+ * directory's `DEV-` token (CELLO_ENV=local). The directory checks it before
+ * any crypto computation.
  */
 export interface FrostDkgRound1Request {
   type: "frost_dkg_round1_request";

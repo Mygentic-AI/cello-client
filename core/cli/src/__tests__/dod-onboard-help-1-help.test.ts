@@ -86,8 +86,22 @@ describe("§2 — the renames are CLEAN (old names gone, no aliases)", () => {
   it("the onboarding line in USAGE points at register-agent — a half-rename is a broken rename", () => {
     // The exact trap the work order named: rename the command, leave the first-run string telling a
     // brand-new user to run a verb that no longer exists.
-    expect(USAGE).toContain("cello register-agent <name> <token>");
+    expect(USAGE).toContain("cello register-agent <name>  →");
     expect(USAGE).not.toMatch(/cello register </);
+  });
+
+  it("the first screen and register-agent --help send nobody for a token", () => {
+    const help = findCommand("register-agent")?.help ?? "";
+    // The onboarding lines above the command table; the table itself lists the operator's own
+    // Telegram doorbell, which is not onboarding.
+    const firstScreen = USAGE.slice(0, USAGE.indexOf("Usage: cello <command>"));
+    expect(firstScreen.length).toBeGreaterThan(0);
+    for (const [label, text] of [["USAGE first screen", firstScreen], ["register-agent --help", help]] as const) {
+      expect(text, label).toContain("cello register-agent");
+      expect(text, label).not.toMatch(/telegram/i);
+      expect(text, label).not.toMatch(/token/i);
+      expect(text, label).not.toContain("@Cello");
+    }
   });
 
   it("bridge does not hardcode Hermes in its summary — the runtime is a PARAMETER", () => {

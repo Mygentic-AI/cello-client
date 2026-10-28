@@ -70,10 +70,9 @@ export interface FrostKeyShareRecord {
 }
 
 /**
- * The agent→user linkage captured at registration. The pre-authorization ticket
- * (issued by the CELLO Operations Agent) binds this agent to a user; recording it
- * here is the M7 "capture-now-or-lose-it" requirement — *using* the link (trust
- * signals that attach to the user) is future trust-layer work.
+ * The agent→user linkage captured at registration. `preAuthToken` holds the
+ * credential the registration presented (a paired device's grant), which binds
+ * this agent to its account.
  */
 export interface AgentUserLinkRecord {
   agentId: string;

@@ -1899,7 +1899,8 @@ def interactive_setup() -> None:
 
     print_info("Bind this Hermes instance to a registered CELLO agent.")
     print_info("If you have not set up CELLO yet, run: cello login, then")
-    print_info("cello create-agent <name> and cello register-agent <name> <token>.")
+    print_info("cello create-agent <name> and cello register-agent <name>")
+    print_info("(it shows a link to approve this device).")
     print()
 
     agent = prompt("CELLO agent name", default=existing or "")
@@ -2139,8 +2140,8 @@ Trigger: /cello-bridge-setup, or "install the CELLO bridge".
 1. **Check CELLO is set up.** Run \`cello status\`. If the CLI is missing or the daemon
    is not running, walk the user through CELLO onboarding first:
    \`npx --yes @cello-protocol/cli@latest login\`, then \`cello create-agent <name>\`,
-   then \`cello register-agent <name> <pre-auth-token>\` (token from the CELLO Operations
-   Agent on Telegram). Confirm with \`cello status\`.
+   then \`cello register-agent <name>\` (it shows a link to approve this device).
+   Confirm with \`cello status\`.
 2. **Pick the agent.** Ask the user which registered CELLO agent this Hermes instance
    should bind to (the \`cello status\` output lists them).
 3. **Run the installer** — one command does all the work (plugin scaffold, env binding,

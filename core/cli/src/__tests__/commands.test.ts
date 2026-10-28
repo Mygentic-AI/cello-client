@@ -19,6 +19,7 @@ import { PassthroughGatewayClient } from "@cello-protocol/daemon/testing";
 import type { Logger, DaemonConfig } from "@cello-protocol/daemon";
 import { createServer, type Server } from "node:net";
 import { login, logout, status, register, createAgent, browserOpener } from "../commands.js";
+import { startFakeDaemon } from "./helpers/fake-daemon.js";
 import { monikerSet, settingsGet, settingsSet, startAgent } from "../parity-commands.js";
 import {
   consortiumFingerprintShort,
@@ -447,9 +448,8 @@ describe("cli commands", () => {
   });
 
   describe("register", () => {
-    // A well-formed pre-auth token ("CELLO-" + 33 base58 chars) so the client-side format checks
-    // pass and the call reaches the daemon path (M8C-ONBOARD-ERRORS-1).
-    const VALID_TOKEN = "CELLO-" + "1".repeat(33);
+    // The local test directory's sentinel, so a call reaches the daemon without pairing.
+    const DEV_TOKEN = "DEV-local-test-token";
 
     it("returns exit 1 with usage when the agent is missing", async () => {
       const result = await register(tempDir, "", "");
@@ -474,46 +474,57 @@ describe("cli commands", () => {
       expect(browserOpener("win32", { DISPLAY: ":0" })).toBeNull();
     });
 
-    // M8C-ONBOARD-ERRORS-1 (R4): a malformed token is caught client-side with a specific message,
-    // BEFORE any pointless DKG round-trip to a generic dkg_failed. The classic case: pasting the
-    // literal words "CELLO_PREAUTH_TOKEN" (underscore) instead of a real "CELLO-" token.
-    it("catches a malformed token client-side (CELLO_PREAUTH_TOKEN typo) with a specific message", async () => {
-      const result = await register(tempDir, "alice", "CELLO_PREAUTH_TOKEN");
-      expect(result.exitCode).toBe(1);
-      expect(result.output).toContain("start with 'CELLO-'");
-      // …and the literal words are still caught: they are not decodable as a capability either.
-      expect(result.output).not.toContain("No daemon running"); // short-circuited before the daemon
+    // A retired CELLO- code is refused in the terminal with the pairing instruction, and the daemon
+    // is never asked: the recorder starts undefined and must stay so.
+    it("refuses a CELLO- code client-side with token_retired and never contacts the daemon", async () => {
+      const fake = await startFakeDaemon(tempDir, { cello_register: { ok: true } });
+      try {
+        const result = await register(tempDir, "alice", "CELLO-" + "3xY7abcdefghijkmnopqrstuvwxyzABCD");
+        expect(result.exitCode).toBe(1);
+        const parsed = JSON.parse(result.output) as { ok: boolean; reason: string; guidance: string };
+        expect(parsed.ok).toBe(false);
+        expect(parsed.reason).toBe("token_retired");
+        expect(parsed.guidance).toContain("cello register-agent");
+        expect(fake.requests).toBeUndefined();
+      } finally {
+        await fake.close();
+      }
     });
 
-    // M12: a pre-auth CAPABILITY has neither legacy prefix — it is base64url JSON. Gating on the
-    // prefixes alone rejected the very artifact preauth-capability.ts says to paste here, so a
-    // capability could be minted, signed and accepted by every directory and still never get past
-    // the client. It must reach the daemon, where the signature and validity window are verified.
-    it("lets a pre-auth CAPABILITY through the client gate to the daemon", async () => {
+    // The exemplar is the shape the old client let through as a capability: base64url JSON with
+    // sig, nonce and expires_at.
+    it("refuses a capability-shaped value the same way", async () => {
       const capability = Buffer.from(
-        JSON.stringify({
-          nonce: "0".repeat(32),
-          phone_stub_hash: "a".repeat(64),
-          email_domain: "example.com",
-          issued_at: "2026-07-29T00:00:00.000Z",
-          expires_at: "2030-07-29T00:00:00.000Z",
-          sig: "b".repeat(128),
-        }),
+        JSON.stringify({ nonce: "0".repeat(32), expires_at: "2030-07-29T00:00:00.000Z", sig: "b".repeat(128) }),
         "utf8",
       ).toString("base64url");
-      const result = await register(tempDir, "alice", capability);
-      // Reached the daemon (absent here) rather than being refused as malformed by the CLI.
-      expect(result.output).toContain("No daemon running");
-      expect(result.output).not.toContain("look like a pre-auth token");
+      const fake = await startFakeDaemon(tempDir, { cello_register: { ok: true } });
+      try {
+        const result = await register(tempDir, "alice", capability);
+        expect(result.exitCode).toBe(1);
+        const parsed = JSON.parse(result.output) as { reason: string; guidance: string };
+        expect(parsed.reason).toBe("token_retired");
+        expect(parsed.guidance).toContain("cello register-agent");
+        expect(fake.requests).toBeUndefined();
+      } finally {
+        await fake.close();
+      }
     });
 
-    // A CELLO- token of the wrong length passes the client-side prefix gate (D13: the client checks
-    // only the stable brand prefix; the directory is the authority on the full format) and reaches
-    // the daemon — here there's no daemon, so it surfaces "No daemon running", not a client "malformed".
-    it("lets a wrong-length CELLO- token through the client gate to the daemon", async () => {
-      const result = await register(tempDir, "alice", "CELLO-tooshort");
-      expect(result.exitCode).toBe(1);
-      expect(result.output).toContain("No daemon running");
+    it("forwards a DEV- token to cello_register as preAuthToken, exactly", async () => {
+      const fake = await startFakeDaemon(tempDir, {
+        cello_register: { ok: true, agent_id: "id-1", primary_pubkey: "pk-1" },
+        cello_list_agents: { agents: [{ name: "alice", pubkey: "local-pk" }] },
+      });
+      try {
+        const result = await register(tempDir, "alice", "DEV-x");
+        expect(result.exitCode).toBe(0);
+        const reg = fake.requests?.find((r) => r.method === "cello_register");
+        expect(reg?.params).toEqual({ agent: "alice", preAuthToken: "DEV-x" });
+        expect(fake.requests?.some((r) => r.method === "cello_pair_start")).toBe(false);
+      } finally {
+        await fake.close();
+      }
     });
 
     // The "DEV-" sentinel is the local DevTokenValidator's prefix. The CLI must NOT reject it client-side —
@@ -523,13 +534,7 @@ describe("cli commands", () => {
       const result = await register(tempDir, "alice", "DEV-local-test-token");
       expect(result.exitCode).toBe(1);
       expect(result.output).toContain("No daemon running");
-      expect(result.output).not.toContain("start with 'CELLO-'"); // NOT rejected client-side as malformed
-    });
-
-    it("returns exit 1 'No daemon running' when no daemon is up (well-formed token)", async () => {
-      const result = await register(tempDir, "alice", VALID_TOKEN);
-      expect(result.exitCode).toBe(1);
-      expect(result.output).toContain("No daemon running");
+      expect(result.output).not.toContain("token_retired");
     });
 
     it("round-trips to the daemon and returns agent_not_found for an unknown agent", async () => {
@@ -538,7 +543,7 @@ describe("cli commands", () => {
 
       // No agents are loaded in this temp dir → the daemon's cello_register
       // handler rejects with agent_not_found (full CLI → IPC → handler path).
-      const result = await register(tempDir, "ghost-agent", VALID_TOKEN);
+      const result = await register(tempDir, "ghost-agent", DEV_TOKEN);
       expect(result.exitCode).toBe(1);
       const parsed = JSON.parse(result.output);
       expect(parsed.ok).toBe(false);
@@ -550,25 +555,13 @@ describe("cli commands", () => {
     // legibility. A fake daemon returns ok so the success branch is exercised (a real register
     // needs the directory's DKG). Guards against a regression that drops the guidance.
     it("puts next-step guidance on STDERR, and NEVER inside the JSON", async () => {
-      const socketPath = join(tempDir, "fake-daemon.sock");
-      const server: Server = createServer((socket) => {
-        socket.on("data", (chunk: Buffer) => {
-          const line = chunk.toString("utf-8").trim();
-          if (!line) return;
-          const req = JSON.parse(line) as { id: string | number; method: string };
-          if (req.method === "cello_register") {
-            socket.write(JSON.stringify({ id: req.id, result: { ok: true, agent_id: "id-1", primary_pubkey: "pk-1" } }) + "\n");
-          }
-          if (req.method === "cello_list_agents") {
-            socket.write(JSON.stringify({ id: req.id, result: { agents: [{ name: "bob", pubkey: "pk-bob" }, { name: "alice", pubkey: "local-pk" }] } }) + "\n");
-          }
-        });
+      const fake = await startFakeDaemon(tempDir, {
+        cello_register: { ok: true, agent_id: "id-1", primary_pubkey: "pk-1" },
+        cello_list_agents: { agents: [{ name: "bob", pubkey: "pk-bob" }, { name: "alice", pubkey: "local-pk" }] },
       });
-      await new Promise<void>((resolve) => server.listen(socketPath, resolve));
-      await acquireLock(join(tempDir, "daemon.lock"), { pid: process.pid, socketPath, version: "0.0.1-test" });
 
       try {
-        const result = await register(tempDir, "alice", VALID_TOKEN);
+        const result = await register(tempDir, "alice", DEV_TOKEN);
         expect(result.exitCode).toBe(0);
 
         /**
@@ -611,7 +604,7 @@ describe("cli commands", () => {
         // 087 Part A: the guidance names the key to give to others.
         expect(guidance).toContain("Give this key to others: local-pk");
       } finally {
-        await new Promise<void>((resolve) => server.close(() => resolve()));
+        await fake.close();
       }
     });
   });

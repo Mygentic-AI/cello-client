@@ -51,8 +51,8 @@ export function topLevelFlag(command: string | undefined): "version" | "help" | 
 export const USAGE =
   "CELLO — a peer-to-peer identity & trust layer for agent-to-agent communication.\n" +
   "\n" +
-  "First-time setup:  cello login  →  cello create-agent <name>  →  cello register-agent <name> <token>  →  cello status\n" +
-  "  (get <token> from the CELLO Operations Agent on Telegram; 'cello login' starts the local daemon.)\n" +
+  "First-time setup:  cello login  →  cello create-agent <name>  →  cello register-agent <name>  →  cello status\n" +
+  "  ('cello login' starts the local daemon. The first registration on this machine prints a link and a code: open it on any device, sign in with your invited email, and approve.)\n" +
   "\n" +
   "Usage: cello <command> [args]\n" +
   "\n" +

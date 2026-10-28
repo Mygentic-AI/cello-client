@@ -44,6 +44,7 @@ vi.mock("../network-directory-node.js", async (importOriginal) => {
 });
 
 import { RegistrationManager, type RegistrationContext, type SignalingSendResult } from "../registration-manager.js";
+import { registrationGuidance } from "../operator-guidance.js";
 import { runNetworkDkg, PreAuthRejectedError, type NetworkDirectoryNode } from "../network-directory-node.js";
 import { decode as cborDecode } from "cbor-x";
 import * as lp from "it-length-prefixed";
@@ -645,5 +646,12 @@ describe("directory refusals reach the caller with the directory's guidance", ()
     const U = "The directory could not attach this agent to your account. Nothing was registered.";
     h.deliverReg({ type: "register_error", reason: "account_unresolved", guidance: U });
     expect(await promise).toEqual({ error: "account_unresolved", detail: U });
+  });
+});
+
+describe("a directory's PAIRING_REQUIRED refusal reaches the operator verbatim", () => {
+  it("renders the directory's detail as the whole guidance", () => {
+    const D = "Registration needs a paired device. Run 'cello register-agent <name>' and approve this device at the link it prints.";
+    expect(registrationGuidance("PAIRING_REQUIRED", D)).toBe(D);
   });
 });

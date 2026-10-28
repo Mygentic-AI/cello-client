@@ -799,19 +799,17 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
     group: "Setup",
     summary: "Publish an agent to the directory so others can reach it. Step 2 of 2.",
     help:
-      "Usage: cello register-agent <agent> [pre-auth-token]  — register a LOCAL agent with the directory.\n" +
+      "Usage: cello register-agent <agent>  — register a LOCAL agent with the directory.\n" +
       "  The two-step onboarding: (1) 'cello create-agent <name>' makes the identity on this machine; (2) 'cello register-agent <name>' publishes it to the directory so others can find and reach it.\n" +
-      "  With no token, the first registration on this machine shows a link to approve this device; later ones need nothing.\n" +
+      "  The first registration on this machine shows a link to approve this device; later ones need nothing.\n" +
       "  Example:  cello register-agent alice\n" +
-      "  A pre-auth token, if you have one, still works:  cello register-agent alice CELLO-3xY7...  (or CELLO_PREAUTH_TOKEN=CELLO-3xY7... cello register-agent alice)\n" +
-      "  Quoting is only needed if a value contains spaces (agent names and tokens never do).",
+      "  Quoting is only needed if a value contains spaces (agent names do not).",
     async run(ctx, args) {
-      // cello register-agent <agent> [preAuthToken]  (token falls back to CELLO_PREAUTH_TOKEN so it
-      // need not appear in shell history). Optional phone stub follows.
+      // A second argument is accepted only as a local test directory's `DEV-` sentinel; register()
+      // refuses anything else.
       const agent = args[0] ?? "";
-      const preAuthToken = args[1] ?? process.env.CELLO_PREAUTH_TOKEN ?? "";
-      const phoneStub = args[2] ?? "";
-      return legacy(await register(ctx.celloDir, agent, preAuthToken, phoneStub, ctx.onProgress));
+      const devToken = args[1] ?? "";
+      return legacy(await register(ctx.celloDir, agent, devToken, ctx.onProgress));
     },
   },
   {

@@ -214,11 +214,8 @@ export function formatLoginSummary(result: {
       "Run 'cello status' to check; a failed agent stays offline and can be retried with cello_use_agent.",
     );
   }
-  // The empty case is a NEW OPERATOR'S FIRST SCREEN far more often than it is a veteran's, and
-  // "No registered agents to start." told them nothing: not the next command, not that a token is
-  // needed, and not that tokens only exist for someone a cohort has admitted. That last omission
-  // is the expensive one — it sent people to the Telegram operations agent to ask for something it
-  // could not give them, with nothing in the product having warned them. See onboarding-guidance.ts.
+  // The empty case is usually a new operator's first screen, so it names the next two commands
+  // and what the first registration asks of them. See onboarding-guidance.ts.
   if (result.started.length === 0 && result.failed.length === 0 && startedChannels.length === 0 && failedChannels.length === 0) parts.push(noAgentsGuidance());
   return parts.join("\n");
 }
@@ -429,32 +426,16 @@ export async function logout(
 }
 
 /**
- * register(celloDir, agent, preAuthToken, phoneStub):
- *  - Read lock file to find socket path (daemon must be running)
- *  - Connect to daemon, send 'cello_register' with { agent, preAuthToken, phoneStub }
- *  - The daemon runs ML-DSA keygen → FROST DKG → register_success and persists
- *    the agent's key material + registration state + agent→user link.
+ * register(celloDir, agent, devToken):
+ *  - Refuse any token other than the local test directory's `DEV-` sentinel, before the daemon
+ *    is asked.
+ *  - Read the lock file to find the daemon's socket (the daemon must be running).
+ *  - With no token, pair this device first if it is not yet paired: print the approve link and
+ *    code, then wait for the approval.
+ *  - Send 'cello_register'. The daemon runs keygen and the FROST DKG with the directory, then
+ *    persists the agent's key material and registration state.
  *  - Print structured JSON; exit 0 on success, 1 on failure.
  */
-/**
- * Does this look like a pre-auth capability rather than a mis-paste?
- *
- * A capability (M8B-PREAUTH-CAP) is base64url JSON carrying a signed authorization. This decodes
- * far enough to tell it apart from someone pasting the literal words "CELLO_PREAUTH_TOKEN", and no
- * further: the directory verifies the signature, the issuer and the window. Anything stricter here
- * would let a client-side "malformed" strand a capability the consortium would have accepted.
- */
-function hasCapabilityShape(value: string): boolean {
-  try {
-    const parsed: unknown = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
-    if (typeof parsed !== "object" || parsed === null) return false;
-    const c = parsed as Record<string, unknown>;
-    return typeof c["sig"] === "string" && typeof c["nonce"] === "string" && typeof c["expires_at"] === "string";
-  } catch {
-    return false;
-  }
-}
-
 /**
  * The OS opener for the approve link, or null where there is no browser to open: a Linux machine
  * with no display, or any session over SSH. Opening is best effort and never blocks the wait.
@@ -488,18 +469,11 @@ function displayCode(code: string): string {
 export async function register(
   celloDir: string,
   agent: string,
-  preAuthToken: string,
-  phoneStub = "",
+  devToken: string,
   onProgress?: (line: string) => void,
 ): Promise<CommandResult> {
-  // M8C-ONBOARD-ERRORS-1 (R3/R4): specific, actionable errors on the core onboarding path — never a
-  // bare Usage dump, never a pointless DKG round-trip to a generic dkg_failed for an obviously
-  // malformed token. Client-side because a typo'd token and a missing one are knowable without the
-  // directory. (Unknown-agent stays the daemon's job — it already returns a good agent_not_found.)
-  // DOD-M15-CLIJSON-1: the FAILURE branches emit JSON too, with the prose intact in `guidance` on
-  // stderr. These four are the ones a person scripting onboarding actually hits — an unset $TOKEN,
-  // a daemon that is not up — and prose on stdout breaks their pipe with a byte-offset parse error
-  // that hides the real problem. Same defect as the success path, one branch over.
+  // Failures print JSON on stdout, with the prose in `guidance` on stderr, so a script that parses
+  // the output reads the reason instead of a parse error.
   const fail = (reason: string, guidance: string): CommandResult => ({
     exitCode: 1,
     output: JSON.stringify({ ok: false, reason, guidance }, null, 2),
@@ -507,33 +481,14 @@ export async function register(
   });
 
   if (!agent) {
-    return fail("missing_agent_name", "You didn't name an agent to register. Usage: cello register-agent <agent> [pre-auth-token]. See your agents with 'cello status'.");
+    return fail("missing_agent_name", "You didn't name an agent to register. Usage: cello register-agent <agent>. See your agents with 'cello status'.");
   }
-  // Client-side gate on the STABLE brand prefix only (real tokens are "CELLO-" + 33 base58 chars).
-  // Checking just the prefix catches the common typo (pasting the literal words "CELLO_PREAUTH_TOKEN")
-  // without hard-coding the exact length/alphabet — the directory stays the authority on the full format,
-  // so a future format bump can't strand a valid token behind a client-side "malformed". The "DEV-"
-  // sentinel is ALSO allowed: it is the dev/local pre-auth prefix that DevTokenValidator accepts
-  // (CELLO_ENV=local), and it is unmistakably intentional, not a paste error. A wrong token of either
-  // prefix reaches the daemon and is rejected there with a structured reason (the local DevTokenValidator
-  // rejects non-DEV-, the prod PgTokenValidator rejects non-CELLO-). Without this, local CLI registration
-  // is impossible — the CLI rejects the very DEV- tokens the local validator requires (it broke the whole
-  // spine suite).
-  // A pre-auth CAPABILITY (M8B-PREAUTH-CAP) is also valid here and has neither prefix: it is
-  // base64url JSON, and preauth-capability.ts specifies it is "carried in the existing round-1
-  // preAuthToken string field and pasted into `cello register`". Gating on the two legacy prefixes
-  // alone rejected the very artifact the capability design says to paste — a capability could be
-  // minted, signed and accepted by every directory, and never got past the client.
-  //
-  // Shape only, and deliberately NOT by importing @cello-protocol/crypto: the CLI does not depend
-  // on it, and adding a package to the operator's install for a paste-error guard is the wrong
-  // trade. The signature, the issuer and the validity window stay the directory's to verify — this
-  // must never become a second authority on whether a capability is valid.
-  const looksLikeCapability = preAuthToken !== "" && hasCapabilityShape(preAuthToken);
-  if (preAuthToken !== "" && !looksLikeCapability && !preAuthToken.startsWith("CELLO-") && !preAuthToken.startsWith("DEV-")) {
+  // A `DEV-` token is the sentinel a local test directory (CELLO_ENV=local) accepts; production
+  // directories refuse it, and every real registration pairs this device instead.
+  if (devToken !== "" && !devToken.startsWith("DEV-")) {
     return fail(
-      "malformed_preauth_token",
-      "That doesn't look like a pre-auth token or capability — tokens start with 'CELLO-' followed by 33 characters, and a capability is a long base64url blob. (Did you paste the words 'CELLO_PREAUTH_TOKEN' instead of the value itself?) Get one from the CELLO Operations Agent on Telegram, then retry.",
+      "token_retired",
+      "CELLO no longer uses registration tokens. Run 'cello register-agent <name>' with no token; the first time on this machine it shows a link to approve this device.",
     );
   }
 
@@ -550,8 +505,8 @@ export async function register(
     // from the same list, over the same connection, so the two outputs can never disagree.
     type RegisterReply = { ok: boolean; reason?: string; guidance?: string; agent_id?: string; primary_pubkey?: string };
     const { result, sharePubkey } = await withIpc(lock.socketPath, async (client): Promise<{ result: RegisterReply; sharePubkey: string | undefined }> => {
-      if (!preAuthToken) {
-        // No token: this device presents its own credential, pairing first if it has none.
+      if (!devToken) {
+        // This device presents its own credential, pairing first if it has none.
         const start = (await client.send("cello_pair_start")) as {
           ok: boolean; paired?: boolean; reason?: string; guidance?: string; pairing_code?: string; approve_url?: string;
         };
@@ -565,7 +520,7 @@ export async function register(
           onProgress?.("This device is paired.");
         }
       }
-      const reg = (await client.send("cello_register", { agent, phoneStub, ...(preAuthToken ? { preAuthToken } : {}) })) as {
+      const reg = (await client.send("cello_register", { agent, ...(devToken ? { preAuthToken: devToken } : {}) })) as {
         ok: boolean;
         reason?: string;
         guidance?: string;

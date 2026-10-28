@@ -377,10 +377,10 @@ describe("daemon", () => {
 
     expect(res.agents, "precondition: a fresh daemon has no agents").toEqual([]);
     expect(res.onboarding, "the empty list must arrive WITH words explaining it").toBeTypeOf("string");
-    expect(res.onboarding).toMatch(/cohort/i);
     expect(res.onboarding).toContain("cello create-agent");
+    expect(res.onboarding).toContain("cello register-agent <name>");
     expect(res.onboarding).toContain("https://celloprotocol.com/waitlist");
-    expect(res.onboarding, "the bot must be named by handle, not described").toMatch(/@CelloConnect/);
+    expect(res.onboarding).not.toMatch(/telegram|token/i);
   });
 
   it("DOD-M15-IPCVISIBLE-1: the disconnect line carries WHO was attending, in ONE line", async () => {
