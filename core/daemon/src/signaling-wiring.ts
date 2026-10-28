@@ -72,7 +72,7 @@ export interface SignalingWiringDeps {
    * M16 021-WAKE: the channel doorbell arrived on THIS agent's stream. Late-bound because the
    * collector is built in the channel wiring, which is constructed after this one.
    */
-  onChannelWake?: (agentName: string) => void;
+  onChannelWake?: (agentName: string) => void; onAccountNotice?: (agentName: string, kind: unknown) => void; // kind is unvalidated wire data
   onChannelJoinBell?: (agentName: string, frame: Record<string, unknown>) => void; // 046-JOINBELL: parsed by the membership half
   /** C2, late-bound; built in outbound-sessions. See trust-signal-sweep.ts. */
   getSweepTrustSignals: () => ((n: string, k: KeyProvider, p: string) => Promise<unknown>) | undefined;
@@ -303,7 +303,7 @@ export function createSignalingWiring(deps: SignalingWiringDeps) {
      * by the fetch — signatures, positions, gaps — exactly as it was before this existed.
      */
     mgr.registerInboundHandler((frame) => {
-      if (frame["type"] === "channel_wake") deps.onChannelWake?.(agentName);
+      if (frame["type"] === "channel_wake") deps.onChannelWake?.(agentName); else if (frame["type"] === "account_notice") deps.onAccountNotice?.(agentName, frame["kind"]); // a kind code only
       else if (frame["type"] === "channel_join_bell") deps.onChannelJoinBell?.(agentName, frame); // 046: names only which slot to read
     });
 
