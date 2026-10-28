@@ -254,14 +254,14 @@ server.tool("cello_attestations_written", "List the reviews the selected agent h
   return jsonText(result);
 });
 
-server.tool("cello_attestations_readers_list", "List the readers of one of the selected agent's PRIVATE attestation namespaces — the agents who receive a sealed copy of each private review. Only the namespace owner may read this; it is never shown to a reviewer. Returns the current readers and the list version.", {
+server.tool("cello_attestations_readers_list", "Only the namespace's owner can run this. List the readers of one of the selected agent's PRIVATE attestation namespaces — the agents who receive a sealed copy of each private review. Only the owner, and the CELLO portal that delivers the reviews, can read this list; it is never shown to a reviewer. Returns the current readers and the list version.", {
   namespace: z.string().describe("The private namespace, e.g. support.qa"),
 }, async ({ namespace }) => {
   const result = await proxy.call("cello_attestations_readers_list", { namespace });
   return jsonText(result);
 });
 
-server.tool("cello_attestations_readers_add", "Add a reader to one of the selected agent's PRIVATE attestation namespaces — an agent who will receive a sealed copy of each private review. This signs the next version of the reader list; the directory announces the change to every reader, old and new, so nobody is dropped silently. A reviewer never learns who the readers are.", {
+server.tool("cello_attestations_readers_add", "Only the namespace's owner can run this. Add a reader to one of the selected agent's PRIVATE attestation namespaces — an agent who will receive a sealed copy of each private review written from now on; it does not receive earlier ones. This signs the next version of the reader list; the directory announces the change to every reader, old and new, so nobody is dropped silently. A reviewer never learns who the readers are.", {
   namespace: z.string().describe("The private namespace, e.g. support.qa"),
   pubkey: z.string().describe("The reader's pubkey to add, 64 hex"),
 }, async ({ namespace, pubkey }) => {
@@ -269,7 +269,7 @@ server.tool("cello_attestations_readers_add", "Add a reader to one of the select
   return jsonText(result);
 });
 
-server.tool("cello_attestations_readers_remove", "Remove a reader from one of the selected agent's PRIVATE attestation namespaces. This signs the next version of the reader list; the directory announces the change to every reader, including the one removed, so a supervisor is never dropped silently.", {
+server.tool("cello_attestations_readers_remove", "Only the namespace's owner can run this. Remove a reader from one of the selected agent's PRIVATE attestation namespaces. The reader stops receiving new reviews but keeps the copies already delivered to it, so tell the operator that before removing someone. This signs the next version of the reader list; the directory announces the change to every reader, including the one removed, so a supervisor is never dropped silently.", {
   namespace: z.string().describe("The private namespace, e.g. support.qa"),
   pubkey: z.string().describe("The reader's pubkey to remove, 64 hex"),
 }, async ({ namespace, pubkey }) => {
