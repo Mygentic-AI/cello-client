@@ -22,7 +22,7 @@ import type { SessionNodeManager } from "./session-node-manager.js";
 import type { AgentInfo, Logger, SessionRecord } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
 import { frameValueToHex } from "./frame-values.js";
-import { computeGenesisPrevRoot, computeChainAnchor, decodeTrustSignalEnvelope, hashTrustSignalEnvelope, verifyTrustSignalHash, decodeCbor, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
+import { computeGenesisPrevRoot, computeChainAnchor, decodeTrustSignalEnvelope, hashTrustSignalEnvelope, verifyTrustSignalHash, decodeCbor, ATTESTATION_SIGNAL_TYPE, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
 import { TrustSignalStore } from "./trust-signal-store.js";
 import { AttestationNotices, READERS_CHANGED_SIGNAL_KIND } from "./attestation-notices.js";
 import { verifyInboundAssignment } from "./assignment-verify.js";
@@ -1802,6 +1802,21 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       logger.error("daemon.trust_signal.envelope_undecodable", { origin,
         agentName, signalKind, correlationId, error: extractErrorMessage(err),
       });
+      return;
+    }
+    // M10E 016: a delivered PRIVATE attestation (a review someone wrote ABOUT this agent) is something
+    // to READ, not a signal to present. Route it to the inbox as quoted, untrusted data — the same
+    // path as the readers-changed notice — and NEVER into the trust-signal wallet. The ack follows the
+    // inbox write: `store_failed` is NOT acked (the directory re-delivers), `stored`/`malformed` are.
+    if (envelope.type === ATTESTATION_SIGNAL_TYPE) {
+      const notices = new AttestationNotices({ db: () => sessionNodeManager.getDb(), logger, now: Date.now });
+      const outcome = notices.notePrivateReview(sessionNodeManager.resolveAgentId(agentName), envelope, signalHash);
+      if (outcome === "store_failed") {
+        logger.error("daemon.trust_signal.private_review_store_failed", { origin, agentName, signalKind, correlationId });
+        return;
+      }
+      logger.info("daemon.trust_signal.private_review_inboxed", { origin, agentName, signalKind, correlationId });
+      await ackPickup(mgr, id, agentName, signalKind, origin);
       return;
     }
     try {
