@@ -28,6 +28,9 @@ import { prepareGatewayStoreEnv } from "../gateway-store-env.js";
 import { registerGatewayConfigHandlers } from "../gateway-config-handlers.js";
 import { createBackup, restoreBackup } from "../backup-restore.js";
 import type { IpcHandler } from "../ipc-server.js";
+import { migrateToEncryptedIfNeeded } from "../identity-migration.js";
+import { FileKeyProvider } from "@cello-protocol/crypto";
+import { DatabaseSync } from "node:sqlite";
 
 const silent: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 
@@ -194,6 +197,28 @@ describe("002-KEYPATH — the key path", () => {
     await second.shutdown?.();
     expect(keyBefore).toBe(true);
     expect(existsSync(`${dbPath}.key`)).toBe(true);
+  });
+
+  it("9a. migrating a legacy flat-file identity with the setting: the key stays off the volume", async () => {
+    const keyFile = await configuredKey();
+    const dbPath = join(dir, "sessions.db");
+    await FileKeyProvider.load(join(dir, "key")); // legacy single-file key → in-place import path
+    expect(migrateToEncryptedIfNeeded(dbPath, silent).migrated).toBe(true);
+    expect((await readdir(dir)).filter((f) => f.endsWith(".key")), "a key file reached the volume").toEqual([]);
+    const db = openEncryptedDatabase(dbPath, resolveDbKey(dbPath, keyFile, { configured: true }));
+    db.close();
+  });
+
+  it("9b. migrating a legacy PLAINTEXT database with the setting: the swapped-in DB opens with the configured key", async () => {
+    const keyFile = await configuredKey();
+    const dbPath = join(dir, "sessions.db");
+    const old = new DatabaseSync(dbPath);
+    old.exec("CREATE TABLE probe (m TEXT)");
+    old.close();
+    expect(migrateToEncryptedIfNeeded(dbPath, silent).migrated).toBe(true);
+    expect((await readdir(dir)).filter((f) => f.endsWith(".key")), "a key file reached the volume").toEqual([]);
+    const db = openEncryptedDatabase(dbPath, resolveDbKey(dbPath, keyFile, { configured: true }));
+    db.close();
   });
 
   it("logs the key's SOURCE once, and never the key or its path", async () => {
