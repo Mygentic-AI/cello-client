@@ -195,6 +195,10 @@ export async function readReviews(args: {
   // Page on the first node that will serve the collection at all.
   for (const target of args.targets) {
     const reviews: ReviewView[] = [];
+    // Each index once. Counting entries alone let a node serve one review twice in place of the
+    // one it wanted buried: the total still matched the signed count (015 review, HIGH).
+    const seen = new Set<number>();
+    let duplicated = false;
     let removed: RemovedView[] = [];
     let after: string | undefined;
     let answered = false;
@@ -219,6 +223,8 @@ export async function readReviews(args: {
           view = decodeReview(envelope, index);
         } catch { continue; } // an undecodable row is not a verified entry
         if (!verifyInclusion(leaf, index, count, proof, root)) continue; // not under the majority root
+        if (seen.has(index)) { duplicated = true; continue; }
+        seen.add(index);
         reviews.push(view);
       }
       const next = typeof reply["next"] === "string" ? reply["next"] : null;
@@ -227,11 +233,11 @@ export async function readReviews(args: {
     }
     if (!answered) continue; // ask the next node
 
-    if (reviews.length !== count) {
-      args.logger.warn("attestation.reviews.incomplete", { namespace: args.namespace, node: target.nodeId, verified: reviews.length, expected: count, correlationId });
+    if (duplicated || seen.size !== count) {
+      args.logger.warn("attestation.reviews.incomplete", { namespace: args.namespace, node: target.nodeId, verified: seen.size, duplicated, expected: count, correlationId });
       return {
         ok: false, reason: "incomplete_page",
-        guidance: `Directory '${target.nodeId}' served ${reviews.length} verifiable reviews but the signed head says ${count}. Some are missing or do not verify against the majority root — the result is refused. Try another directory, or try again shortly.`,
+        guidance: `Directory '${target.nodeId}' served ${seen.size} distinct verifiable reviews${duplicated ? " (and repeated some)" : ""} but the signed head says ${count}. Some are missing or do not verify against the majority root — the result is refused. Try another directory, or try again shortly.`,
       };
     }
     args.logger.info("attestation.reviews.verified", { namespace: args.namespace, node: target.nodeId, count: reviews.length, removed: removed.length, correlationId });

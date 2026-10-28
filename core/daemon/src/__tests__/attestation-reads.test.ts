@@ -209,6 +209,14 @@ describe("015-READ — summary / reviews", () => {
     // leaf is not the one the majority root commits to. Its inclusion proof fails, so it is NOT
     // counted → verified 1 ≠ 2 → incomplete_page. (This is the case the inclusion check alone catches,
     // the one a short-count check would miss.)
+    // R4b (015 review, HIGH): serve review 1 twice in place of review 0. Both proofs verify and the
+    // entry count still equals the signed count, so a count-only check returned ok and review 0 was
+    // buried. Each index must appear exactly once.
+    const dupPage = { ...fullPage, entries: [fullPage.entries[1]!, fullPage.entries[1]!] };
+    const dup = await readReviews({ query: queryWithCollection(summaryByNode, { n0: dupPage }), targets, validators, owner_pubkey: OWNER, namespace: NS, logger });
+    expect(dup.ok).toBe(false);
+    if (!dup.ok) expect(dup.reason).toBe("incomplete_page");
+
     const forged = reviewEnvelope(reviewer, 1, "planted by a troll");
     const tamperedPage = { ...fullPage, entries: [{ envelope: forged.envelope, index: 0, inclusion_proof: inclusionProof(tree, 0) }, fullPage.entries[1]!] };
     const tampered = await readReviews({ query: queryWithCollection(summaryByNode, { n0: tamperedPage }), targets, validators, owner_pubkey: OWNER, namespace: NS, logger });
@@ -242,6 +250,19 @@ describe("015-READ — deals", () => {
 });
 
 describe("015-READ — judge ruling submit", () => {
+  it("R6b. the client's ruling bytes equal the DIRECTORY's encodeAttestationRuling (frozen vector)", () => {
+    // Produced by trustless-cello packages/directory/src/attestation-ruling.ts encodeAttestationRuling
+    // for exactly these inputs (2026-10-28). Comparing against the client's own encoder, as R6 does,
+    // could not catch a field-order or type drift between the two sides (015 review, MEDIUM).
+    const GOLDEN =
+      "b90007706174746573746174696f6e5f68617368582007070707070707070707070707070707070707070707070707070707070707076c6f776e65725f7075626b6579784061316131613161316131613161316131613161316131613161316131613161316131613161316131613161316131613161316131613161316131613161316131696e616d6573706163656e726576696577732e676f6c64656e66726561736f6e6a666162726963617465646f65766964656e63655f68617368657381582009090909090909090909090909090909090909090909090909090909090909096c6a756467655f7075626b6579582003030303030303030303030303030303030303030303030303030303030303036872756c65645f61741a6b49d200";
+    const bytes = encodeRuling({
+      attestation_hash: new Uint8Array(32).fill(7), owner_pubkey: "a1".repeat(32), namespace: "reviews.golden", reason: "fabricated",
+      evidence_hashes: [new Uint8Array(32).fill(9)], judge_pubkey: new Uint8Array(32).fill(3), ruled_at: 1_800_000_000,
+    });
+    expect(hex(bytes)).toBe(GOLDEN);
+  });
+
   it("R6. submits to every node and reports in_force once T countersign", async () => {
     const judge = generateKeypair();
     const judgeHex = hex(await judge.getPublicKey());
