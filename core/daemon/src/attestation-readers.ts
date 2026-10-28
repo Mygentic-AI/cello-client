@@ -18,13 +18,12 @@
  *
  * Crypto: Ed25519 → RFC 8032, CBOR → RFC 8949, SHA-256 → FIPS 180-4.
  */
-import { Encoder } from "cbor-x";
 import { createHash } from "node:crypto";
 import { randomUUID } from "node:crypto";
+import { encodeCbor, decodeCbor } from "@cello-protocol/protocol-types";
 import { serialize, sendAndAwait, toU8, type NamespaceDeps } from "./attestation-namespaces.js";
 
 export const READER_LIST_DOMAIN = "CELLO-ARDRS-v1";
-const ENC = new Encoder({ tagUint8Array: false, useRecords: false });
 const HEX64 = /^[0-9a-f]{64}$/;
 
 export interface ReaderListRecord {
@@ -36,7 +35,9 @@ export interface ReaderListRecord {
 }
 
 export function encodeReaderList(r: ReaderListRecord): Uint8Array {
-  return new Uint8Array(ENC.encode([READER_LIST_DOMAIN, r.owner, r.namespace, r.readers, r.version, r.issued_at]));
+  // The ONE CBOR encoder (protocol-types). It is configured tagUint8Array:false, useRecords:false —
+  // byte-identical to the directory's encoder for this all-scalar array, which the golden test pins.
+  return new Uint8Array(encodeCbor([READER_LIST_DOMAIN, r.owner, r.namespace, r.readers, r.version, r.issued_at]));
 }
 
 export function hashReaderList(r: ReaderListRecord): Uint8Array {
@@ -45,7 +46,7 @@ export function hashReaderList(r: ReaderListRecord): Uint8Array {
 
 /** Decode a reader list the directory returned, strictly (the same shape the directory enforces). */
 export function decodeReaderList(raw: Uint8Array): ReaderListRecord {
-  const a = ENC.decode(raw) as unknown;
+  const a = decodeCbor(raw) as unknown;
   if (!Array.isArray(a) || a.length !== 6 || a[0] !== READER_LIST_DOMAIN) throw new Error("reader list: not a CELLO-ARDRS-v1 array");
   const readers = a[3];
   if (!Array.isArray(readers) || !readers.every((r) => typeof r === "string" && HEX64.test(r))) throw new Error("reader list: readers must be 64-hex");

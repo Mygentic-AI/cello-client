@@ -239,6 +239,37 @@ server.tool("cello_attestations_activity", "The public activity counts for an ow
   return jsonText(result);
 });
 
+server.tool("cello_attestations_claim", "Write a review using a right the selected agent holds (earned from a service event a provider marked). The review cannot be refused or withdrawn by its subject. For a scored namespace pass a 1–5 rating; optionally name the channel the deal began in so the deal is credited to it. One right mints exactly one review.", {
+  right_id: z.string().describe("The right to use, from cello_attestations_rights, 64 hex"),
+  text: z.string().describe("The review text"),
+  rating: z.number().optional().describe("1–5, required for a scored namespace"),
+  origin_channel: z.string().optional().describe("The channel pubkey the deal began in, 64 hex, to credit the deal"),
+}, async ({ right_id, text, rating, origin_channel }) => {
+  const result = await proxy.call("cello_attestations_claim", { right_id, text, rating, origin_channel });
+  return jsonText(result);
+});
+
+server.tool("cello_attestations_claimed", "List the reviews the selected agent has written, each with the directory's outcome for it (minted, rejected, or pending). This is how a reviewer confirms a review they wrote actually landed.", {}, async () => {
+  const result = await proxy.call("cello_attestations_claimed", {});
+  return jsonText(result);
+});
+
+server.tool("cello_attestations_readers_list", "List the readers of one of the selected agent's PRIVATE attestation namespaces — the agents who receive a sealed copy of each private review. Only the namespace owner may read this; it is never shown to a reviewer. Returns the current readers and the list version.", {
+  namespace: z.string().describe("The private namespace, e.g. support.qa"),
+}, async ({ namespace }) => {
+  const result = await proxy.call("cello_attestations_readers_list", { namespace });
+  return jsonText(result);
+});
+
+server.tool("cello_attestations_readers_set", "Add and/or remove readers of one of the selected agent's PRIVATE attestation namespaces. This builds and signs the next version of the reader list; the directory announces the change to every reader, old and new, so nobody is dropped silently. A reviewer never learns who the readers are.", {
+  namespace: z.string().describe("The private namespace, e.g. support.qa"),
+  add: z.array(z.string()).optional().describe("Reader pubkeys to add, each 64 hex"),
+  remove: z.array(z.string()).optional().describe("Reader pubkeys to remove, each 64 hex"),
+}, async ({ namespace, add, remove }) => {
+  const result = await proxy.call("cello_attestations_readers_set", { namespace, add, remove });
+  return jsonText(result);
+});
+
 server.tool("cello_trust_signals_list", "List the trust signals held in this wallet — verifiable claims about you (GitHub account age, phone, email, endorsements from others) that are presented to contacts during sessions. Each row carries TWO independent answers: `status` is the directory's (is the notarization live) and `consent_state` is yours (may it be shown at all). Only an 'accepted' signal is presentable, whatever `default_present` says.", {}, async () => {
   const result = await proxy.call("wallet_list_signals", {});
   return jsonText(result);
