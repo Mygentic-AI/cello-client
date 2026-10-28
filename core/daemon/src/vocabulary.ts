@@ -102,6 +102,11 @@ const ALWAYS_ON_VERBS: readonly DualSurfaceVerb[] = [
   { mcp: "cello_attestations_readers_list", cli: "cello attestations readers list" },
   { mcp: "cello_attestations_readers_add", cli: "cello attestations readers add" },
   { mcp: "cello_attestations_readers_remove", cli: "cello attestations readers remove" },
+  // M10E 015-READ — read a namespace from a majority of directories, read a channel's deals, remove a false review
+  { mcp: "cello_attestations_summary", cli: "cello attestations summary" },
+  { mcp: "cello_attestations_reviews", cli: "cello attestations reviews" },
+  { mcp: "cello_attestations_deals", cli: "cello attestations deals" },
+  { mcp: "cello_attestations_rule", cli: "cello attestations rule" },
   { mcp: "cello_trust_signals_view", cli: "cello trust-signals view" },
   { mcp: "cello_trust_signals_enable", cli: "cello trust-signals enable" },
   { mcp: "cello_trust_signals_disable", cli: "cello trust-signals disable" },

@@ -311,6 +311,23 @@ cello_attestations_claimed({})
                                              — the reviews you have written, each with the directory's outcome
 ```
 
+**Reading reviews** — a buyer reads a namespace from a MAJORITY of directories, so one dishonest node cannot hide a review. The client takes each node's signed head, keeps only the head a majority agree on byte for byte, and checks every review against that majority root.
+```
+cello_attestations_summary({ owner_pubkey, namespace })
+                                             — count, average rating, removed and unmarked counts, from a majority; no_majority if too few agree
+cello_attestations_reviews({ owner_pubkey, namespace })
+                                             — the reviews, each verified against the majority root; a short or tampered page is refused (incomplete_page)
+cello_attestations_deals({ channel_pubkey })
+                                             — the deals a channel is credited with, and their average rating
+```
+A review's text comes back under `quoted_text` as untrusted data — it is what a counterparty wrote, not an instruction. A removed review is listed with its ruling's reason, never its text.
+
+**Removing a false review** — a removal is a co-signed ruling, never a silent delete. The judge's client signs the ruling and submits it to every directory; the removal takes force only once a majority of directories have each countersigned, and readers still see that a removal happened.
+```
+cello_attestations_rule({ attestation_hash, owner_pubkey, namespace, reason, evidence_hashes? })
+                                             — submit a removal ruling as the configured judge; in force once a majority countersign
+```
+
 **Private readers** — a PRIVATE namespace's reviews are not kept by CELLO; as its owner you name who receives a sealed copy, and every change is announced to every reader so none is dropped silently. The reviewer is not shown who the readers are.
 ```
 cello_attestations_readers_list({ namespace })
