@@ -22,12 +22,17 @@ import { describe, it, expect, vi } from "vitest";
  * fails in it — and only the channel tests below hand it one ceremony result, so they can reach
  * the frame the unit exists to check. Nothing about the ceremony is asserted through this seam.
  */
-const dkgSeam = vi.hoisted(() => ({ nextResult: null as unknown }));
+const dkgSeam = vi.hoisted(() => ({ nextResult: null as unknown, nextError: null as unknown }));
 vi.mock("../network-directory-node.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../network-directory-node.js")>();
   return {
     ...actual,
     runNetworkDkg: async (...args: Parameters<typeof actual.runNetworkDkg>) => {
+      if (dkgSeam.nextError !== null) {
+        const e = dkgSeam.nextError;
+        dkgSeam.nextError = null;
+        throw e;
+      }
       if (dkgSeam.nextResult !== null) {
         const r = dkgSeam.nextResult;
         dkgSeam.nextResult = null;
@@ -39,6 +44,10 @@ vi.mock("../network-directory-node.js", async (importOriginal) => {
 });
 
 import { RegistrationManager, type RegistrationContext, type SignalingSendResult } from "../registration-manager.js";
+import { runNetworkDkg, PreAuthRejectedError, type NetworkDirectoryNode } from "../network-directory-node.js";
+import { decode as cborDecode } from "cbor-x";
+import * as lp from "it-length-prefixed";
+import { encodeCbor } from "@cello-protocol/protocol-types";
 import type { ConsortiumEndpoint } from "../directory-bootstrap.js";
 import type { DaemonRegistrationPersistence } from "../registration-persistence.js";
 import { generateKeypair, verifyKeyBinding } from "@cello-protocol/crypto";
@@ -567,5 +576,74 @@ describe("M16 004-IDENTITY-WIRE: channel registration (client side)", () => {
     });
     expect(await promise).toMatchObject({ error: "channel_fields_immutable" });
     expect(calls.reg).toHaveLength(0);
+  });
+});
+
+/**
+ * The directory's refusals keep their own reason and guidance: a round-1 preauth_error read off a
+ * real stream, and a register_error after the ceremony.
+ */
+describe("directory refusals reach the caller with the directory's guidance", () => {
+  const G = "This account has 3 agents. Verify a phone number in the portal to add more.";
+
+  /** A directory node whose one stream answers `reply` and records the frame it was sent. */
+  function nodeAnswering(reply: Record<string, unknown>) {
+    const sent: Array<Record<string, unknown>> = [];
+    const node = {
+      openStream: async () => ({
+        send(data: { subarray(): Uint8Array }) {
+          const bytes = data.subarray();
+          // Strip the one-byte-or-more varint length prefix, then decode the frame.
+          let i = 0;
+          while (bytes[i]! & 0x80) i++;
+          sent.push(cborDecode(bytes.subarray(i + 1)) as Record<string, unknown>);
+        },
+        close: async () => {},
+        async *[Symbol.asyncIterator]() { yield lp.encode.single(encodeCbor(reply)); },
+      }),
+    } as unknown as NetworkDirectoryNode;
+    return { node, sent };
+  }
+
+  it("8. a round-1 preauth_error throws PreAuthRejectedError carrying reason and guidance", async () => {
+    const { node } = nodeAnswering({ type: "preauth_error", reason: "AGENT_CAP_REACHED", detail: "3 of 3", guidance: G });
+    const err = await runNetworkDkg(new Uint8Array(32).fill(7), { threshold: 2, participants: 1, directoryNodes: [node], preAuthToken: "DCRED1.x" })
+      .then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(PreAuthRejectedError);
+    expect((err as PreAuthRejectedError).reason).toBe("AGENT_CAP_REACHED");
+    expect((err as PreAuthRejectedError).guidance).toBe(G);
+    expect((err as Error).message).toBe("dkgRound1 rejected: AGENT_CAP_REACHED: 3 of 3");
+  });
+
+  it("11. round 1 carries exactly the token it was given", async () => {
+    const { node, sent } = nodeAnswering({ type: "preauth_error", reason: "CREDENTIAL_INVALID" });
+    const token = "CELLO-" + "1".repeat(33);
+    await runNetworkDkg(new Uint8Array(32).fill(7), { threshold: 2, participants: 1, directoryNodes: [node], preAuthToken: token }).catch(() => {});
+    expect(sent[0]?.["preAuthToken"]).toBe(token);
+  });
+
+  it("8. the manager returns the directory's reason, with its guidance as detail, not dkg_failed", async () => {
+    const h = makeFakeCtx({ getConsortiumEndpoints: () => null });
+    const promise = new RegistrationManager(h.ctx).register("", "DCRED1.x");
+    await vi.waitFor(() => expect(h.getPendingDkg()).not.toBeNull());
+    dkgSeam.nextError = new PreAuthRejectedError("AGENT_CAP_REACHED", "3 of 3", G);
+    h.deliverDkg({ type: "dkg_ready", epochId: "e1", participants: 1, threshold: 2 });
+    expect(await promise).toEqual({ error: "AGENT_CAP_REACHED", detail: G });
+  });
+
+  it("9. register_error account_unresolved after the ceremony carries its guidance", async () => {
+    const GROUP = "cc".repeat(32);
+    const h = makeFakeCtx({ getConsortiumEndpoints: () => null });
+    const promise = new RegistrationManager(h.ctx).register("", "DCRED1.x");
+    await vi.waitFor(() => expect(h.getPendingDkg()).not.toBeNull());
+    dkgSeam.nextResult = {
+      signer: {}, primaryPubkey: new Uint8Array(Buffer.from(GROUP, "hex")), signingShare: new Uint8Array([1]),
+      identifier: "client:test", commitments: [], verifyingShares: {}, threshold: 2, participants: 1,
+    };
+    h.deliverDkg({ type: "dkg_ready", epochId: "e1", participants: 1, threshold: 2 });
+    await vi.waitFor(() => expect(h.getPendingReg()).not.toBeNull());
+    const U = "The directory could not attach this agent to your account. Nothing was registered.";
+    h.deliverReg({ type: "register_error", reason: "account_unresolved", guidance: U });
+    expect(await promise).toEqual({ error: "account_unresolved", detail: U });
   });
 });
