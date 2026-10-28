@@ -1609,7 +1609,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
     name: "attestation-consent",
     group: "Attestations",
     summary: "Renamed to 'cello endorsement-consent'.",
-    help: "Renamed: use 'cello endorsement-consent'.",
+    help: "'cello attestation-consent' was renamed: use 'cello endorsement-consent'.",
     async run() {
       return { stdout: "renamed: use `cello endorsement-consent`", stderr: "", exitCode: 1 };
     },

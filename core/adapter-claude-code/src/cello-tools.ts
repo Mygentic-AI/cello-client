@@ -19,30 +19,26 @@ export interface ToolProxy {
   call(method: string, params?: Record<string, unknown>): Promise<unknown>;
 }
 
+type IssuedList = {
+  ok: boolean; reason?: string; guidance?: string;
+  issued?: Array<{ submission_id: string }>;
+  in_flight?: Array<{ submission_id: string; delivery: string }>;
+};
+type FetchResults = {
+  ok: boolean; reason?: string; guidance?: string;
+  results?: Array<{ submission_id: string }>;
+  unreachable_nodes?: string[];
+};
+
 /**
- * 008-ENDRENAME — the composed body behind `cello_endorsements_issued` (formerly
- * `cello_attestations_issued`). Extracted so the deprecated `cello_attestations_issued` ALIAS reuses
- * it verbatim rather than duplicating the two-call merge. Two calls, not one: `wallet_list_issued` is
- * a local read of what was submitted, `wallet_fetch_results` a network sweep for outcomes — joined so
- * a submission still in flight is VISIBLE as pending rather than read as "nothing waiting".
+ * 008-ENDRENAME — the pure result-shaping behind `cello_endorsements_issued` (formerly
+ * `cello_attestations_issued`), shared by the real tool and its deprecated alias. Only the SHAPING is
+ * extracted: the two wire reads (`wallet_list_issued` + `wallet_fetch_results`) stay INLINE at each
+ * call site, because the "every dual-surface tool is backed by a daemon handler" guard reads the
+ * tool's own body for its `proxy.call`. Two reads, not one, so a submission still in flight is VISIBLE
+ * as pending rather than read as "nothing waiting".
  */
-async function endorsementsIssued(proxy: ToolProxy): Promise<Record<string, unknown>> {
-  const [issued, fetched] = await Promise.all([
-    proxy.call("wallet_list_issued", {}) as Promise<{
-      ok: boolean;
-      reason?: string;
-      guidance?: string;
-      issued?: Array<{ submission_id: string }>;
-      in_flight?: Array<{ submission_id: string; delivery: string }>;
-    }>,
-    proxy.call("wallet_fetch_results", {}) as Promise<{
-      ok: boolean;
-      reason?: string;
-      guidance?: string;
-      results?: Array<{ submission_id: string }>;
-      unreachable_nodes?: string[];
-    }>,
-  ]);
+function mergeIssued(issued: IssuedList, fetched: FetchResults): Record<string, unknown> {
   const primaryError = !issued.ok ? issued : !fetched.ok ? fetched : undefined;
   const byId = new Map((fetched.results ?? []).map((r) => [r.submission_id, r]));
   return {
@@ -173,7 +169,7 @@ server.tool("cello_contact_set_tier", "Set a contact's reachability tier: 0=bloc
 // These existed on the CLI only, which is the DOD-SETTINGS-SURFACE-1 mistake: an agent driving CELLO
 // through MCP could hold signals it could neither read nor control.
 
-server.tool("cello_endorsements_issue", "ENDORSE another agent — your own words vouching for something you have seen them do. This is the person-to-person primitive: trust signals are what the NETWORK verifies about you (GitHub age, phone, email), an endorsement is what a PERSON says about a person. It is submitted to the CELLO portal (sealed; the directory cannot read it), scanned, and minted; the SUBJECT must then accept it before anyone else can see it, so nothing here is final until they decide. You cannot endorse yourself. (NOT the M10E review system — that is cello_attestations_*.)", {
+server.tool("cello_endorsements_issue", "ENDORSE another agent — your own words vouching for something you have seen them do. This is the person-to-person primitive: trust signals are what the NETWORK verifies about you (GitHub age, phone, email), an endorsement is what a PERSON says about a person. It is submitted to the CELLO portal (sealed; the directory cannot read it), scanned, and minted; the SUBJECT must then accept it before anyone else can see it, so nothing here is final until they decide. You cannot endorse yourself. (The M10E review system — marks, rights, namespaces — is a separate thing.)", {
   subject_pubkey: z.string().describe("The counterparty's public key, 64 hex characters — see cello_contacts"),
   body: z.string().describe("What you are vouching for, in your own words. MAXIMUM 500 CHARACTERS — an endorsement is a testimonial, not a document. Line breaks are fine; no other control characters and no < or >. Scanned at intake; it reaches readers quoted and attributed to you, never restated in CELLO's voice."),
 }, async ({ subject_pubkey, body }) => {
@@ -253,7 +249,11 @@ server.tool("cello_trust_signals_list", "List the trust signals held in this wal
 // is a network sweep for outcomes. Joined here so a submission still in flight is VISIBLE as pending —
 // reporting only outcomes would print "nothing waiting" while three submissions sat unanswered.
 server.tool("cello_endorsements_issued", "What happened to endorsements YOU wrote about other agents — the outgoing direction. NOT the wallet of signals held about you (that is cello_trust_signals_list). Each submission is minted, refused by the subject, rejected by the screening scan, or still pending. A refusal is the subject declining to stand behind your wording — not a fault in the claim — and it may carry a message from them explaining why; re-submitting a corrected version is the intended next step. `in_flight` holds submissions that have not reached any directory node yet: `delivery: \"retrying\"` means the daemon is re-sending it for you and you should NOT send it again, `delivery: \"gave_up\"` means it never got there and each entry carries the reason and what to do. These are held IN MEMORY only — a daemon restart loses anything still retrying, and it has to be written again. `unreachable_nodes` means some directory node did not answer, so the list may be incomplete — it never means 'no result'.", {}, async () => {
-  return jsonText(await endorsementsIssued(proxy));
+  const [issued, fetched] = await Promise.all([
+    proxy.call("wallet_list_issued", {}) as Promise<IssuedList>,
+    proxy.call("wallet_fetch_results", {}) as Promise<FetchResults>,
+  ]);
+  return jsonText(mergeIssued(issued, fetched));
 });
 
 server.tool("cello_trust_signals_view", "Decode and display one trust signal's full payload — the actual claim, its issuer, and its framing. For a signal someone else issued ABOUT you, this is the text you are being asked to stand behind; read it before accepting.", {
@@ -313,37 +313,46 @@ server.tool("cello_endorsement_consent_refuse", "Refuse an endorsement issued ab
 // ─── 008-ENDRENAME — deprecated endorsement tool ALIASES ────────────────────────────────────────
 // The pre-rename tool names, kept for ONE release so permission allowlists and hooks keyed on them
 // keep matching silently. Each proxies the NEW IPC method (the real tools above) and flags itself
-// `deprecated` in its result. Defined in ONE table so the next release removes them in one deletion.
-// Do NOT add an alias for any M10E review tool (cello_attestations_namespace_*, _mark, _rights,
-// _index, _claim_service, _activity) — the rename exists to keep the two systems apart.
-const ENDORSEMENT_ALIASES: ReadonlyArray<{
-  old: string;
-  now: string;
-  schema: z.ZodRawShape;
-  run: (args: Record<string, unknown>) => Promise<Record<string, unknown>>;
-}> = [
-  { old: "cello_attestations_issue", now: "cello_endorsements_issue",
-    schema: { subject_pubkey: z.string(), body: z.string() },
-    run: (a) => proxy.call("cello_endorsements_issue", a) as Promise<Record<string, unknown>> },
-  { old: "cello_attestations_issued", now: "cello_endorsements_issued",
-    schema: {},
-    run: () => endorsementsIssued(proxy) },
-  { old: "cello_attestation_consent_list", now: "cello_endorsement_consent_list",
-    schema: {},
-    run: () => proxy.call("cello_endorsement_consent_list", {}) as Promise<Record<string, unknown>> },
-  { old: "cello_attestation_consent_accept", now: "cello_endorsement_consent_accept",
-    schema: { hash_prefix: z.string() },
-    run: (a) => proxy.call("cello_endorsement_consent_accept", a) as Promise<Record<string, unknown>> },
-  { old: "cello_attestation_consent_refuse", now: "cello_endorsement_consent_refuse",
-    schema: { hash_prefix: z.string(), message: z.string().optional() },
-    run: (a) => proxy.call("cello_endorsement_consent_refuse", a) as Promise<Record<string, unknown>> },
-];
-for (const { old, now, schema, run } of ENDORSEMENT_ALIASES) {
-  server.tool(old, `DEPRECATED — renamed to ${now}. This old name still works for one release; switch to ${now}. The result carries a 'deprecated' field.`, schema, async (args: Record<string, unknown>) => {
-    const result = await run(args);
-    return jsonText({ ...result, deprecated: `renamed to ${now}; this name is removed in the next release` });
-  });
-}
+// `deprecated` in its result. This whole block is DELETED in the next release — one deletion.
+// Registered as literal `server.tool("name", "desc", …)` calls (not a loop) because the surface's
+// description-regression extractor reads literal names and descriptions. Do NOT add an alias for any
+// M10E review tool (cello_attestations_namespace_*, _mark, _rights, _index, _claim_service,
+// _activity) — the rename exists to keep the two systems apart.
+server.tool("cello_attestations_issue", "DEPRECATED — renamed to cello_endorsements_issue. This old name still works for one release; switch to cello_endorsements_issue. The result carries a 'deprecated' field.", {
+  subject_pubkey: z.string(),
+  body: z.string(),
+}, async ({ subject_pubkey, body }) => {
+  const result = await proxy.call("cello_endorsements_issue", { subject_pubkey, body }) as Record<string, unknown>;
+  return jsonText({ ...result, deprecated: "renamed to cello_endorsements_issue; this name is removed in the next release" });
+});
+
+server.tool("cello_attestations_issued", "DEPRECATED — renamed to cello_endorsements_issued. This old name still works for one release; switch to cello_endorsements_issued. The result carries a 'deprecated' field.", {}, async () => {
+  const [issued, fetched] = await Promise.all([
+    proxy.call("wallet_list_issued", {}) as Promise<IssuedList>,
+    proxy.call("wallet_fetch_results", {}) as Promise<FetchResults>,
+  ]);
+  return jsonText({ ...mergeIssued(issued, fetched), deprecated: "renamed to cello_endorsements_issued; this name is removed in the next release" });
+});
+
+server.tool("cello_attestation_consent_list", "DEPRECATED — renamed to cello_endorsement_consent_list. This old name still works for one release; switch to cello_endorsement_consent_list. The result carries a 'deprecated' field.", {}, async () => {
+  const result = await proxy.call("cello_endorsement_consent_list", {}) as Record<string, unknown>;
+  return jsonText({ ...result, deprecated: "renamed to cello_endorsement_consent_list; this name is removed in the next release" });
+});
+
+server.tool("cello_attestation_consent_accept", "DEPRECATED — renamed to cello_endorsement_consent_accept. This old name still works for one release; switch to cello_endorsement_consent_accept. The result carries a 'deprecated' field.", {
+  hash_prefix: z.string(),
+}, async ({ hash_prefix }) => {
+  const result = await proxy.call("cello_endorsement_consent_accept", { hash_prefix }) as Record<string, unknown>;
+  return jsonText({ ...result, deprecated: "renamed to cello_endorsement_consent_accept; this name is removed in the next release" });
+});
+
+server.tool("cello_attestation_consent_refuse", "DEPRECATED — renamed to cello_endorsement_consent_refuse. This old name still works for one release; switch to cello_endorsement_consent_refuse. The result carries a 'deprecated' field.", {
+  hash_prefix: z.string(),
+  message: z.string().optional(),
+}, async ({ hash_prefix, message }) => {
+  const result = await proxy.call("cello_endorsement_consent_refuse", message ? { hash_prefix, message } : { hash_prefix }) as Record<string, unknown>;
+  return jsonText({ ...result, deprecated: "renamed to cello_endorsement_consent_refuse; this name is removed in the next release" });
+});
 
 server.tool("cello_contact_set_signal", "Choose whether ONE trust signal is presented to ONE counterparty — finer than the signal's global default, because an endorsement that is right for a prospective client is not necessarily right for a competitor. Pass present:null to CLEAR the choice (fall back to the signal's default), which is different from false (never show it to this person). This can only NARROW what is presented: it cannot show a signal you have not accepted.", {
   pubkey: z.string().describe("The counterparty's public key, 64 hex characters"),

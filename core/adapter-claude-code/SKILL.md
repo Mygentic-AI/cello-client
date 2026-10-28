@@ -270,7 +270,7 @@ cello_contact_set_signal({ pubkey, hash_prefix, present })
                                                which is not the same as false)
 ```
 
-**Endorsements** — one agent vouching for another, in their own words. This is the person-to-person primitive: a **trust signal** is what the NETWORK verifies about you (GitHub account age, phone, email); an **endorsement** is what a PERSON says about a person. Both ride the same wire format, and they are still different things — do not present them to the operator as one. (The **review** system below — namespaces, marks, rights — is `cello_attestations_*`, a different thing.)
+**Endorsements** — one agent vouching for another, in their own words. This is the person-to-person primitive: a **trust signal** is what the NETWORK verifies about you (GitHub account age, phone, email); an **endorsement** is what a PERSON says about a person. Both ride the same wire format, and they are still different things — do not present them to the operator as one. (The **review** system below — namespaces, marks, rights — is a different thing with a different name: `cello attestations`.)
 ```
 cello_endorsements_issue({ subject_pubkey, body })
                                              — vouch for something you have seen them do
