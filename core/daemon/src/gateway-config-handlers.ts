@@ -58,7 +58,7 @@ import { GatewayConfigStore, GatewayRecordStore, type ConfigDirection } from "@c
 import type { IpcHandler } from "./ipc-server.js";
 import type { Logger } from "./types.js";
 import { SCRIPTS, isScript } from "@cello-protocol/gateway";
-import { dbKeyPathFor } from "./sqlcipher-db.js";
+import { sessionsDbKeyPath } from "./sqlcipher-db.js";
 import { extractErrorMessage } from "./error-message.js";
 
 /** The keys the gateway reads. Kept here so the surface can list them without a store open. */
@@ -201,7 +201,7 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): G
     if (!configStore) {
       configStore = new GatewayConfigStore(
         join(celloDir, "gateway.db"),
-        dbKeyPathFor(join(celloDir, "sessions.db")),
+        sessionsDbKeyPath(join(celloDir, "sessions.db")),
         // INV-7: the daemon logs through its injected logger and nowhere else. Without this sink the
         // store would write raw lines to the daemon's stderr.
         (event, context) => logger.info(event, context),
@@ -215,7 +215,7 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): G
     if (!recordStore) {
       recordStore = new GatewayRecordStore(
         join(celloDir, "gateway.db"),
-        dbKeyPathFor(join(celloDir, "sessions.db")),
+        sessionsDbKeyPath(join(celloDir, "sessions.db")),
         (event, context) => logger.info(event, context),
       );
     }

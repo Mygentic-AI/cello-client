@@ -31,8 +31,8 @@ import { CONTENT_ENCRYPTION_REASONS, CONTENT_ENCRYPTION_GUIDANCE } from "./conte
 import {
   type DaemonDatabase,
   openEncryptedDatabase,
-  resolveDbKey,
-  dbKeyPathFor,
+  resolveSessionsDbKey,
+  configuredDbKeyFile,
 } from "./sqlcipher-db.js";
 import { migrateToEncryptedIfNeeded } from "./identity-migration.js";
 import { ensureIdentitySchema } from "./db-identity-store.js";
@@ -1548,7 +1548,8 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     // the encrypted store, BEFORE the key is resolved and the DB opened. A no-op on a fresh install
     // or an already-encrypted DB. Throws identity_migration_failed on a failed migration (DB-002).
     const migration = migrateToEncryptedIfNeeded(this.#dbPath, this.#logger);
-    const dbKey = resolveDbKey(this.#dbPath, dbKeyPathFor(this.#dbPath));
+    const dbKey = resolveSessionsDbKey(this.#dbPath);
+    this.#logger.info("daemon.db_key.source", { source: configuredDbKeyFile() !== undefined ? "configured" : "default" });
     this.#db = openEncryptedDatabase(this.#dbPath, dbKey, this.#logger);
     this.#logger.info("persist.db.opened", { encrypted: true, migrated: migration.migrated });
     // PERSIST-002: the identity store (agents + manifest_state) lives in the same encrypted DB.
