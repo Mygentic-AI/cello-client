@@ -97,6 +97,13 @@ describe("015-READ — majority head", () => {
     if (out.ok) { expect(out.head.count).toBe(2); expect(out.agreed).toBe(3); expect(out.answered).toBe(3); }
   });
 
+  it("R1c. heads that differ only in each node's as_of stamp still agree", async () => {
+    const votes = await Promise.all(nodeKeys.map((k, i) => vote(k, `n${i}`, head({ as_of: NOW_S + i * 7 }))));
+    const out = chooseMajorityHead(votes, validators);
+    expect(out.ok).toBe(true);
+    if (out.ok) expect(out.agreed).toBe(3);
+  });
+
   it("R2. one head differs → majority (2) is shown, agreed: 2", async () => {
     const votes = [
       await vote(nodeKeys[0]!, "n0", head()),

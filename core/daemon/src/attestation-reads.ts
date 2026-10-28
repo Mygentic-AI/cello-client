@@ -5,7 +5,7 @@
  * directory. The defence is the signed head:
  *   - `readSummary` asks every reachable validator for its signed head, verifies each signature
  *     against that node's manifest key, and returns the head a MAJORITY of the manifest's validators
- *     agree on byte for byte. Fewer than a majority agree (or answer) ⇒ `no_majority`. A single
+ *     agree on byte for byte, apart from each node's own `as_of` clock stamp. Fewer than a majority agree (or answer) ⇒ `no_majority`. A single
  *     node's head is NEVER shown as the answer.
  *   - `readReviews` pages the collection on one node and checks every inclusion proof against the
  *     MAJORITY root. The verified entries must number the majority count; a dropped entry fails that
@@ -31,6 +31,7 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import {
   encodeCbor,
   decodeAttestationHead,
+  encodeAttestationHead,
   hashAttestationHead,
   decodeTrustSignalEnvelope,
   hashTrustSignalEnvelope,
@@ -91,7 +92,9 @@ export function chooseMajorityHead(votes: readonly HeadVote[], validators: reado
     try { head = decodeAttestationHead(v.head); } catch { continue; }
     if (!verify(Buffer.from(pub, "hex"), hashAttestationHead(head), v.node_signature)) continue;
     counted.add(v.node_id);
-    const k = Buffer.from(v.head).toString("hex"); // byte-for-byte grouping
+    // Byte-for-byte grouping over everything except `as_of`: each sovereign node stamps its own clock,
+    // so including it would make agreement depend on two nodes answering in the same second.
+    const k = Buffer.from(encodeAttestationHead({ ...head, as_of: 0 })).toString("hex");
     const g = groups.get(k) ?? { head, nodes: new Set<string>() };
     g.nodes.add(v.node_id);
     groups.set(k, g);
