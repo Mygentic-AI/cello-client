@@ -104,7 +104,7 @@ beforeEach(() => {
 describe("T2: the registry forwards EXACTLY what the old switch forwarded", () => {
   it("register-agent: positional agent + token + phone stub, in order", async () => {
     await run("register-agent", ["alice", "CELLO-tok", "+15551234"]);
-    expect(commands.register).toHaveBeenCalledWith(CELLO_DIR, "alice", "CELLO-tok", "+15551234");
+    expect(commands.register).toHaveBeenCalledWith(CELLO_DIR, "alice", "CELLO-tok", "+15551234", undefined);
   });
 
   it("register-agent: falls back to CELLO_PREAUTH_TOKEN when the token argument is absent", async () => {
@@ -112,7 +112,7 @@ describe("T2: the registry forwards EXACTLY what the old switch forwarded", () =
     // argv[3..5] → args[0..2] translation is precisely where this fallback could be lost.
     process.env.CELLO_PREAUTH_TOKEN = "CELLO-from-env";
     await run("register-agent", ["alice"]);
-    expect(commands.register).toHaveBeenCalledWith(CELLO_DIR, "alice", "CELLO-from-env", "");
+    expect(commands.register).toHaveBeenCalledWith(CELLO_DIR, "alice", "CELLO-from-env", "", undefined);
   });
 
   it("create-agent / remove-agent / refresh / receipts: the name positional", async () => {
