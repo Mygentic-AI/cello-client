@@ -215,7 +215,7 @@ server.tool("cello_attestations_mark", "Mark a service event (a record that you 
   return jsonText(result);
 });
 
-server.tool("cello_attestations_rights", "List the rights to review that the selected agent holds — each earned from a service event a provider marked during a session. Expired rights are listed and flagged, never hidden. `next` is a cursor — pass it as `after` for the following page.", {
+server.tool("cello_attestations_rights", "List the rights to review (permission to write one review of that provider, until it expires) that the selected agent holds — each earned from a service event a provider marked during a session. Expired rights are listed and flagged, never hidden. `next` is a cursor — pass it as `after` for the following page.", {
   after: z.string().optional().describe("A page cursor from a previous call's `next`"),
 }, async ({ after }) => {
   const result = await proxy.call("cello_attestations_rights", { after });
