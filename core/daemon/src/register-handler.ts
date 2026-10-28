@@ -71,7 +71,6 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
 
   handlers.set("cello_register", async (params, _connectionId) => {
     const name = params?.agent as string | undefined;
-    const explicitToken = params?.preAuthToken as string | undefined;
     const phoneStub = (params?.phoneStub as string | undefined) ?? "";
     // M16 024-CREATE: a channel create passes its own correlationId so one id spans create.started,
     // the registration events under it, and create.completed. Absent for an ordinary register-agent.
@@ -85,11 +84,10 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
     const channelParam = params?.channel;
     const adminPubkeyParam = params?.adminPubkeyHex;
     const adminSignatureParam = params?.adminSignature as string | undefined;
-    // An ordinary agent presents an explicit token if one is given, otherwise this device's
-    // credential with a proof over the agent's key. A CHANNEL presents neither: the admin's
-    // signature is its authorization.
-    const credential = channelParam !== true && !explicitToken ? pairingStore.credential() : null;
-    if (channelParam !== true && !explicitToken && credential === null) {
+    // An ordinary agent presents this device's credential with a proof over the agent's key. A
+    // CHANNEL presents none: the admin's signature is its authorization.
+    const credential = channelParam !== true ? pairingStore.credential() : null;
+    if (channelParam !== true && credential === null) {
       return { ok: false, reason: "not_paired", guidance: "This device is not paired yet. Run 'cello register-agent <name>' in a terminal; it shows a link to approve this device." };
     }
     if (channelParam !== undefined && channelParam !== true) {
@@ -176,7 +174,7 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
             credential,
             proof: await signWithDaemonKey(registrationProofBytes(agentPubkeyHex, credential.nonce), pairingStore.daemonKey().keyProvider),
           })
-        : explicitToken;
+        : undefined;
 
       // A non-primary agent's stream connects lazily — wait for it before the DKG
       // (RegistrationManager returns directory_unreachable if signaling isn't connected).

@@ -167,7 +167,8 @@ describe("REMOVE-001 DOD-REMOVE-1 — retire-and-keep + name reuse (local)", () 
     // BEHAVIORAL (2): the key provider is gone — cello_register can no longer resolve nora (it checks
     // keyProviders before anything else). A stub that left keyProviders intact would get past this check
     // (to directory_unreachable here), so agent_not_found proves keyProviders.delete actually ran.
-    const regGone = (await client.send("cello_register", { agent: "nora", preAuthToken: "DEV-x" })) as { ok: boolean; reason?: string };
+    // Channel-shaped params get past the pairing check (a channel needs no credential) to the key lookup.
+    const regGone = (await client.send("cello_register", { agent: "nora", channel: true, adminPubkeyHex: "ab".repeat(32), adminSignature: "cd".repeat(64) })) as { ok: boolean; reason?: string };
     expect(regGone.ok).toBe(false);
     expect(regGone.reason, "the retired identity's signing key must be gone (register can't resolve it)").toBe("agent_not_found");
 

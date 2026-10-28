@@ -102,7 +102,8 @@ async function main(): Promise<void> {
     celloDir,
     daemonBin,
     logger,
-    onProgress: (line) => process.stdout.write(line + "\n"),
+    // DOD-M15-CLIJSON-1: progress is for the human, so it goes to stderr; stdout is the JSON result.
+    onProgress: (line) => process.stderr.write(line + "\n"),
   };
 
   const result = await spec.run(ctx, args);

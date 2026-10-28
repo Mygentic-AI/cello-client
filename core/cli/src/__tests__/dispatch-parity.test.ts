@@ -102,13 +102,13 @@ beforeEach(() => {
 });
 
 describe("T2: the registry forwards EXACTLY what the old switch forwarded", () => {
-  it("register-agent: positional agent + DEV- token, in order", async () => {
-    await run("register-agent", ["alice", "DEV-tok"]);
-    expect(commands.register).toHaveBeenCalledWith(CELLO_DIR, "alice", "DEV-tok", undefined);
+  it("register-agent: positional agent + a (retired) token, in order", async () => {
+    await run("register-agent", ["alice", "tok"]);
+    expect(commands.register).toHaveBeenCalledWith(CELLO_DIR, "alice", "tok", undefined);
   });
 
   it("register-agent: no token argument forwards an empty token, whatever the environment holds", async () => {
-    process.env.CELLO_PREAUTH_TOKEN = "DEV-from-env";
+    process.env.CELLO_PREAUTH_TOKEN = "from-env";
     await run("register-agent", ["alice"]);
     expect(commands.register).toHaveBeenCalledWith(CELLO_DIR, "alice", "", undefined);
   });

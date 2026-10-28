@@ -426,9 +426,8 @@ export async function logout(
 }
 
 /**
- * register(celloDir, agent, devToken):
- *  - Refuse any token other than the local test directory's `DEV-` sentinel, before the daemon
- *    is asked.
+ * register(celloDir, agent, token):
+ *  - Refuse any token, before the daemon is asked: registration tokens are retired.
  *  - Read the lock file to find the daemon's socket (the daemon must be running).
  *  - With no token, pair this device first if it is not yet paired: print the approve link and
  *    code, then wait for the approval.
@@ -469,7 +468,7 @@ function displayCode(code: string): string {
 export async function register(
   celloDir: string,
   agent: string,
-  devToken: string,
+  token: string,
   onProgress?: (line: string) => void,
 ): Promise<CommandResult> {
   // Failures print JSON on stdout, with the prose in `guidance` on stderr, so a script that parses
@@ -483,9 +482,8 @@ export async function register(
   if (!agent) {
     return fail("missing_agent_name", "You didn't name an agent to register. Usage: cello register-agent <agent>. See your agents with 'cello status'.");
   }
-  // A `DEV-` token is the sentinel a local test directory (CELLO_ENV=local) accepts; production
-  // directories refuse it, and every real registration pairs this device instead.
-  if (devToken !== "" && !devToken.startsWith("DEV-")) {
+  // Every registration pairs this device; no directory accepts a token.
+  if (token !== "") {
     return fail(
       "token_retired",
       "CELLO no longer uses registration tokens. Run 'cello register-agent <name>' with no token; the first time on this machine it shows a link to approve this device.",
@@ -505,7 +503,7 @@ export async function register(
     // from the same list, over the same connection, so the two outputs can never disagree.
     type RegisterReply = { ok: boolean; reason?: string; guidance?: string; agent_id?: string; primary_pubkey?: string };
     const { result, sharePubkey } = await withIpc(lock.socketPath, async (client): Promise<{ result: RegisterReply; sharePubkey: string | undefined }> => {
-      if (!devToken) {
+      {
         // This device presents its own credential, pairing first if it has none.
         const start = (await client.send("cello_pair_start")) as {
           ok: boolean; paired?: boolean; reason?: string; guidance?: string; pairing_code?: string; approve_url?: string;
@@ -520,7 +518,7 @@ export async function register(
           onProgress?.("This device is paired.");
         }
       }
-      const reg = (await client.send("cello_register", { agent, ...(devToken ? { preAuthToken: devToken } : {}) })) as {
+      const reg = (await client.send("cello_register", { agent })) as {
         ok: boolean;
         reason?: string;
         guidance?: string;
