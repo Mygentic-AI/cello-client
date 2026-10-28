@@ -8,10 +8,14 @@
  */
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { AttestationNotices, makeAttestationNoticer } from "./attestation-notices.js";
-import type { NamespaceDeps } from "./attestation-namespaces.js";
+import { readIndex, type NamespaceDeps } from "./attestation-namespaces.js";
 import type { ServiceEventDeps } from "./attestation-service-events.js";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
+import { extractErrorMessage } from "./error-message.js";
 import type { Logger } from "./types.js";
+
+/** Bounded so a mode lookup inside the pickup handler cannot wedge a stream teardown. */
+const NAMESPACE_MODE_TIMEOUT_MS = 10_000;
 
 export interface AttestationWiringCtx {
   logger: Logger;
@@ -27,6 +31,7 @@ export interface AttestationWiringCtx {
 export function wireAttestationNoticer(ctx: AttestationWiringCtx): {
   store: AttestationNotices;
   noticer: ReturnType<typeof makeAttestationNoticer>;
+  resolveNamespaceMode: (agentName: string, ownerPubkeyHex: string, namespace: string) => Promise<"public" | "private" | "unknown">;
 } {
   const store = new AttestationNotices({ db: () => ctx.db() ?? null, logger: ctx.logger, now: Date.now });
   const namespaceDepsFor = (agentName: string): NamespaceDeps | null => {
@@ -61,5 +66,25 @@ export function wireAttestationNoticer(ctx: AttestationWiringCtx): {
     resolveAgentId: ctx.resolveAgentId,
     logger: ctx.logger,
   });
-  return { store, noticer };
+  /**
+   * M10E 016: read the MODE of `namespace` from `ownerPubkeyHex`'s public, append-only directory
+   * index — the review subject owns the namespace and its mode is public even for a private one. Only
+   * a VERIFIED entry's mode is trusted (a forged entry is shown `verified:false`, never as genuine).
+   * Any failure — the agent not being online, the lookup not succeeding, the namespace being absent,
+   * or the entry not verifying — returns "unknown", and the caller refuses rather than guesses.
+   */
+  const resolveNamespaceMode = async (agentName: string, ownerPubkeyHex: string, namespace: string): Promise<"public" | "private" | "unknown"> => {
+    const deps = namespaceDepsFor(agentName);
+    if (!deps) return "unknown";
+    try {
+      const res = await readIndex({ ...deps, timeoutMs: NAMESPACE_MODE_TIMEOUT_MS }, ownerPubkeyHex.toLowerCase());
+      if (!res.ok) return "unknown";
+      const entry = res.entries.find((e) => e.namespace === namespace && e.verified);
+      return entry && entry.mode !== null ? entry.mode : "unknown";
+    } catch (err: unknown) {
+      ctx.logger.debug("attestation.mode.lookup_failed", { namespace, reason: extractErrorMessage(err) });
+      return "unknown";
+    }
+  };
+  return { store, noticer, resolveNamespaceMode };
 }

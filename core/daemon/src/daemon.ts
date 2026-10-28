@@ -439,7 +439,7 @@ async function startDaemonHoldingLock(
     sessionNodeManager.getStandingReceiverAutoNat() ??
     new LocalAutoNatStub();
 
-  const { store: attestationNoticeStore, noticer: attestationNoticer } = wireAttestationNoticer({ logger, isOnline: (a) => onlineAgents.has(a), keyProvider: (a) => keyProviders.get(a), ownerPubkeyHex: (a) => loadedAgents.find((x) => x.name === a)?.pubkey, signalingFor: (a, kp, pub) => getAgentSignaling(a, kp, pub).signaling, db: () => sessionNodeManager.getDb(), resolveAgentId: (a) => sessionNodeManager.resolveAgentId(a), screenInbound: async (text, agentName, sessionId) => securityGateway.screenInbound(new TextEncoder().encode(text), { direction: "inbound", agentName, sessionId }) }); // M10E 007 (attestation-wiring.ts)
+  const { store: attestationNoticeStore, noticer: attestationNoticer, resolveNamespaceMode: resolveAttestationNamespaceMode } = wireAttestationNoticer({ logger, isOnline: (a) => onlineAgents.has(a), keyProvider: (a) => keyProviders.get(a), ownerPubkeyHex: (a) => loadedAgents.find((x) => x.name === a)?.pubkey, signalingFor: (a, kp, pub) => getAgentSignaling(a, kp, pub).signaling, db: () => sessionNodeManager.getDb(), resolveAgentId: (a) => sessionNodeManager.resolveAgentId(a), screenInbound: async (text, agentName, sessionId) => securityGateway.screenInbound(new TextEncoder().encode(text), { direction: "inbound", agentName, sessionId }) }); // M10E 007 (attestation-wiring.ts)
   // The OUTBOUND session path (outbound-sessions.ts): discovery, the session request, and cross-node
   // setup via a transient VISITING connection to the counterparty's home node.
   const { openVisitingConnection, crossNodeBrokerBySession, resolvedSessionNegotiator, runDiscoveryLookup, sweepTrustSignalsAndTick, trustSignalSweepTicker } = createOutboundSessions({
@@ -554,7 +554,7 @@ async function startDaemonHoldingLock(
      */
     isSubscribedChannel: (agentName, counterpartyPubkeyHex) =>
       new ChannelSubscriptionStore(sessionNodeManager.getDb(), logger)
-        .isSubscribedChannel(sessionNodeManager.resolveAgentId(agentName), counterpartyPubkeyHex),
+        .isSubscribedChannel(sessionNodeManager.resolveAgentId(agentName), counterpartyPubkeyHex), resolveAttestationNamespaceMode, // M10E 016 subject index → private review (inbox) / public (wallet)
   });
 
   if (!sharedSignaling) {

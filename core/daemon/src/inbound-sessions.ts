@@ -22,7 +22,7 @@ import type { SessionNodeManager } from "./session-node-manager.js";
 import type { AgentInfo, Logger, SessionRecord } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
 import { frameValueToHex } from "./frame-values.js";
-import { computeGenesisPrevRoot, computeChainAnchor, decodeTrustSignalEnvelope, hashTrustSignalEnvelope, verifyTrustSignalHash, decodeCbor, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
+import { computeGenesisPrevRoot, computeChainAnchor, decodeTrustSignalEnvelope, hashTrustSignalEnvelope, verifyTrustSignalHash, decodeCbor, decodeAttestationPayload, ATTESTATION_SIGNAL_TYPE, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
 import { TrustSignalStore } from "./trust-signal-store.js";
 import { AttestationNotices, READERS_CHANGED_SIGNAL_KIND } from "./attestation-notices.js";
 import { verifyInboundAssignment } from "./assignment-verify.js";
@@ -180,6 +180,15 @@ export interface InboundSessionDeps {
    * contract — it must never delay or fail the session.
    */
   onSessionOpened?: (agentName: string, sessionIdHex: string, counterpartyPubkeyHex: string) => void;
+  /**
+   * M10E 016: the MODE of the namespace a delivered attestation names, resolved from the review
+   * SUBJECT's public directory index. Public and private attestations share the envelope type, so
+   * only the namespace's mode tells a presentable testimonial (wallet) from a private review (inbox).
+   * Returns "unknown" when the mode cannot be established — a failed/absent/unverified index entry —
+   * and the pickup handler then refuses rather than guessing. Omitted (test paths that never deliver
+   * an attestation) ⇒ the handler treats every attestation as "unknown" and refuses it.
+   */
+  resolveAttestationNamespaceMode?: (agentName: string, ownerPubkeyHex: string, namespace: string) => Promise<"public" | "private" | "unknown">;
 }
 
 /**
@@ -480,6 +489,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     handleInboundSealInterruptedRequest, reapDeadHalfOpenSessions,
     sendAwayResponse, dispatchSessionStateChangedWithTelegram, sendTelegramDoorbell,
     isDeliveryOpenToAgent, isChannelAgent, isSubscribedChannel,
+    resolveAttestationNamespaceMode,
   } = deps;
 
   // ─── Seam 2: inbound session establishment (counterparty side) ─────────────
@@ -1803,6 +1813,46 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         agentName, signalKind, correlationId, error: extractErrorMessage(err),
       });
       return;
+    }
+    // M10E 016: public AND private attestations share this envelope type — the mode lives on the
+    // namespace, not the envelope. A PRIVATE review is something to READ: it goes to the inbox as
+    // quoted, untrusted data (the readers-changed path), NEVER to the wallet. A PUBLIC testimonial is
+    // something to PRESENT: it stays on the wallet path below (consent-pending for an agent issuer).
+    // The mode comes from the review SUBJECT's (the reviewed agent's) public directory index. When it
+    // cannot be established we REFUSE rather than guess — guessing private hides a presentable
+    // testimonial; guessing public presents a private review as a signal.
+    if (envelope.type === ATTESTATION_SIGNAL_TYPE) {
+      let namespace: string;
+      try {
+        namespace = decodeAttestationPayload(envelope.payload).namespace;
+      } catch (err) {
+        // A payload that will never decode is malformed: ack (a retry is pointless) and drop it.
+        logger.warn("daemon.trust_signal.attestation_malformed", { origin, agentName, signalKind, correlationId, error: extractErrorMessage(err) });
+        await ackPickup(mgr, id, agentName, signalKind, origin);
+        return;
+      }
+      const mode = resolveAttestationNamespaceMode
+        ? await resolveAttestationNamespaceMode(agentName, envelope.subject.toLowerCase(), namespace)
+        : "unknown";
+      if (mode === "unknown") {
+        // Not acked → the directory re-delivers once the owner's index can be read.
+        logger.warn("daemon.trust_signal.attestation_mode_unknown", { origin, agentName, signalKind, correlationId, namespace });
+        return;
+      }
+      if (mode === "private") {
+        const notices = new AttestationNotices({ db: () => sessionNodeManager.getDb(), logger, now: Date.now });
+        const outcome = notices.notePrivateReview(sessionNodeManager.resolveAgentId(agentName), envelope, signalHash);
+        // `stored`/`malformed` are acked (a retry would not help a malformed payload); anything else
+        // is NOT acked, so the directory keeps the pickup for a later retry.
+        if (outcome !== "stored" && outcome !== "malformed") {
+          logger.error("daemon.trust_signal.private_review_not_inboxed", { origin, agentName, signalKind, correlationId, outcome });
+          return;
+        }
+        logger.info("daemon.trust_signal.private_review_inboxed", { origin, agentName, signalKind, correlationId });
+        await ackPickup(mgr, id, agentName, signalKind, origin);
+        return;
+      }
+      // mode === "public": fall through to the wallet path — a presentable testimonial.
     }
     try {
       const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);

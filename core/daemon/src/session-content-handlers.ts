@@ -14,7 +14,7 @@
 // (`DOD-M15-SEALWIRE-1` part B2b). A direct call would be a hash computed without deciding — or
 // recording — how it was made, which is the state that made a version skew look like a tamper.
 import { randomUUID } from "node:crypto";
-import { AttestationNotices, attestationNoticesField, type AttestationNoticeView, type ReaderChangeNoticeView } from "./attestation-notices.js";
+import { AttestationNotices, attestationNoticesField, type AttestationNoticeView, type ReaderChangeNoticeView, type PrivateReviewNoticeView } from "./attestation-notices.js";
 import { LEAF_KIND_MSG } from "./session-relay-client.js";
 import { MAX_CONTENT_BYTES } from "@cello-protocol/protocol-types";
 import { TIER } from "./contacts-tier-migration.js";
@@ -337,7 +337,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
 
   // M10E 007-NOTICES: the undelivered notices for this agent, spread into a receive reply beside the
   // refusals. Destructive and agent-wide — one drain per receive, whichever return point runs.
-  const attNoticesFor = (agentName: string): { attestationNotices?: Array<AttestationNoticeView | ReaderChangeNoticeView> } =>
+  const attNoticesFor = (agentName: string): { attestationNotices?: Array<AttestationNoticeView | ReaderChangeNoticeView | PrivateReviewNoticeView> } =>
     attestationNotices ? attestationNoticesField(attestationNotices, sessionNodeManager.resolveAgentId(agentName)) : {};
 
   /**

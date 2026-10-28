@@ -1039,4 +1039,23 @@ export function ensureSessionSchema(
       PRIMARY KEY (agent_id, owner, namespace, version)
     )
   `);
+
+  // M10E 016-INBOX: a delivered PRIVATE attestation (a review someone wrote ABOUT one of this
+  // daemon's agents) is something to READ, not a signal to present. It lands here as a quoted,
+  // untrusted inbox notice — NEVER in `wallet_trust_signals` — and is read back by the same
+  // destructive `takeUndelivered` path as the reader-change notice. Its own table because
+  // `attestation_notices.kind` is CHECK-constrained and cannot be widened without a rebuild. Keyed on
+  // (agent_id, signal_hash) so a re-delivered pickup stores nothing new and the ack can be re-sent
+  // safely. The review text lives ONLY here, for the notice's normal lifetime — it is not copied into
+  // the wallet or anywhere a signal is presented from. Additive (N8).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS attestation_private_review_notices (
+      agent_id    TEXT NOT NULL,
+      signal_hash TEXT NOT NULL,
+      payload     BLOB NOT NULL,
+      created_at  INTEGER NOT NULL,
+      delivered   INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (agent_id, signal_hash)
+    )
+  `);
 }
