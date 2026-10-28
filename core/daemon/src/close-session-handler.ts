@@ -1228,7 +1228,9 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
           return {
             ok: false,
             reason: submit.reason,
-            guidance: "The SEAL leaf could not be submitted to the relay witness. Retry once the relay is reachable (cello status).",
+            guidance: submit.reason === "rate_limited"
+              ? "The relay is throttling this agent's sign-ins after too many sessions in a minute. It clears on its own; close again in a minute."
+              : "The SEAL leaf could not be submitted to the relay witness. Retry once the relay is reachable (cello status).",
           };
         }
         // Both parties must close for the directory to notarize. Await session_sealed; a

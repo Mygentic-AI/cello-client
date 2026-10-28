@@ -140,6 +140,54 @@ export function createInboundSealRequestHandler(deps: InboundSealRequestDeps) {
         // only safe default: guessing wrong either strands the session or mints a leaf that can
         // never be joined.
       }
+      /**
+       * 017-SEAL — BOTH SIDES FELL BACK TO THE DIRECTORY-ONLY SEAL AT ONCE, so each had already
+       * recorded its own half (`seal_interrupted_pending`) by the time the other's request landed.
+       * Refusing it here is the deadlock the live stall produced: each side answered the other
+       * `session_seal_already_pending` and both closes failed.
+       *
+       * So the side that holds its half ANSWERS the late request instead of refusing — it co-signs
+       * its own half again (idempotent: it signs over its own unchanged tree root and does NOT
+       * re-persist) and acks, which completes the counterparty's initiator commitment. A
+       * deterministic tie-break on the two pubkeys — the HIGHER answers, the lower still refuses —
+       * means exactly one co-sign completes rather than both sides answering each other in a loop.
+       * It needs no coordination and is stable across a restart, because both sides already hold
+       * both pubkeys.
+       *
+       * Scoped to `seal_interrupted` (the directory-only fallback we hold an artifact for), never
+       * `relay_bilateral`: a relay-witnessed half is completed by the relay's leaf log, not by an
+       * ack here, so answering there would mint a leaf that can never be joined.
+       */
+      // Only for THIS session's counterparty: the initiator check below runs after this early
+      // branch, and a pending session must not sign its half for a stranger who names it.
+      if (
+        pendingCeremony === "seal_interrupted" &&
+        localRecord.counterparty_pubkey === initiatorPubkey &&
+        counterpartyPubkey > initiatorPubkey
+      ) {
+        const kp = getKeyProvider(localAgent.name);
+        if (kp) {
+          const ownTree = sessionNodeManager.getSessionTree(localAgent.name, sessionId);
+          const ownLeaf = await buildSignedSealInterruptedLeaf(kp, {
+            sessionId,
+            leafCount: ownTree.size(),
+            merkleRootAtInterruption: sessionNodeManager.getSessionTreeRootHex(localAgent.name, sessionId),
+            signerPubkeyHex: counterpartyPubkey,
+          });
+          const answered = await sendOver(localAgent.name, {
+            type: "seal_interrupted_ack", sessionId, initiatorPubkey, nonce, sealInterruptedLeaf: ownLeaf,
+          });
+          if (answered.ok) {
+            logger.info("session.interrupted.answered_while_pending", {
+              sessionId, agentName: localAgent.name, leafCount: ownTree.size(), correlationId,
+            });
+            clearFrontierMismatch(localAgent.name, sessionId);
+            return;
+          }
+          // The answer could not be sent — fall through and refuse, so the initiator is not left
+          // waiting on an ack that never left.
+        }
+      }
       // Own-property lookup (review MEDIUM-5): `??` does not protect against inherited keys, and a
       // status that happened to name one would rename the refusal to a function.
       await reject(

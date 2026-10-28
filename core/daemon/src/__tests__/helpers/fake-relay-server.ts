@@ -48,10 +48,19 @@ export interface FakeRelayOpts {
    * `hash_submit_error` with that reason, taking no position. Default: never refuses.
    */
   refuseSubmit?: (leafKind: number, structure1?: Uint8Array) => string | { reason: string; awaited_seq?: number } | undefined;
+  /**
+   * 017-SEAL: refuse the AUTH handshake instead of answering `relay_auth_ok`. Called with the
+   * 1-based count of auth responses this relay has seen (shared across every stream, because the
+   * real relay's rate limiter is keyed per agent, not per connection). Returning a refusal makes
+   * it answer `relay_auth_failed` with that reason and `retry_after_ms`; returning undefined lets
+   * the auth through. Default: every auth succeeds — exactly the prior behaviour.
+   */
+  onAuth?: (attempt: number) => { reason: string; retry_after_ms?: number } | undefined;
 }
 
 export function makeFakeRelayServer(opts: FakeRelayOpts = {}) {
   let seq = 0;
+  let authAttempts = 0;
   const ordered: OrderedLeaf[] = [];
   const streams: Array<(frame: Record<string, unknown>) => void> = [];
   /**
@@ -80,7 +89,19 @@ export function makeFakeRelayServer(opts: FakeRelayOpts = {}) {
           for await (const chunk of lp.decode([bytes] as unknown as AsyncIterable<Uint8Array>)) {
             const u8 = chunk instanceof Uint8Array ? chunk : (chunk as { subarray(): Uint8Array }).subarray();
             const frame = decode(u8) as Record<string, unknown>;
-            if (frame["type"] === "relay_auth_response") push({ type: "relay_auth_ok" });
+            if (frame["type"] === "relay_auth_response") {
+              authAttempts += 1;
+              const refusal = opts.onAuth?.(authAttempts);
+              if (refusal !== undefined) {
+                push({
+                  type: "relay_auth_failed",
+                  reason: refusal.reason,
+                  ...(refusal.retry_after_ms !== undefined ? { retry_after_ms: refusal.retry_after_ms } : {}),
+                });
+              } else {
+                push({ type: "relay_auth_ok" });
+              }
+            }
             // 069-ORDERPROOF: a session registered with its assignment anchor presents it and waits
             // for this answer before it will submit. A real relay answers; so does this one.
             else if (frame["type"] === "client_record_assignment") push({ type: "assignment_ok" });
