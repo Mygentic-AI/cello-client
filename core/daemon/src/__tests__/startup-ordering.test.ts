@@ -335,7 +335,10 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // and `cello channel notify` answers method_not_found — a channel set to pull would keep ringing
     // the agent while the operator believes it is quiet, every suite green. Both land in `checked`,
     // not EXEMPT.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(127);
+    // 127 → 131 for device pairing: `registerPairingHandlers` (daemon.ts), `ensurePairingSchema`
+    // (pairing-store.ts), `openPairing` and `pollOnce` (pairing-handler.ts). Unwired, a person with no
+    // token can never pair and never register. All four land in `checked`, not EXEMPT.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(131);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",
