@@ -1051,9 +1051,9 @@ export async function attestations(
         return { exitCode: 1, output: `Usage: cello attestations readers ${action} <ns> <pubkey-64hex>` };
       }
       try {
-        const params = action === "add" ? { namespace: ns, add: [pubkey.toLowerCase()] } : { namespace: ns, remove: [pubkey.toLowerCase()] };
+        const verb = action === "add" ? "cello_attestations_readers_add" : "cello_attestations_readers_remove";
         const result = (await withIpc(lock.socketPath, (client) =>
-          client.send("cello_attestations_readers_set", params))) as { ok: boolean; reason?: string; guidance?: string };
+          client.send(verb, { namespace: ns, pubkey: pubkey.toLowerCase() }))) as { ok: boolean; reason?: string; guidance?: string };
         if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
         return { exitCode: 0, output: result.guidance ?? "Reader list updated." };
       } catch (err: unknown) {

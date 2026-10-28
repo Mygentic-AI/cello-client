@@ -312,22 +312,28 @@ export function registerAttestationNamespaceHandlers(args: {
     };
   });
 
-  handlers.set("cello_attestations_readers_set", async (params, connectionId) => {
+  const pubkeysOf = (params: Record<string, unknown> | undefined): string[] => {
+    const out: string[] = [];
+    if (typeof params?.pubkey === "string" && /^[0-9a-f]{64}$/i.test(params.pubkey)) out.push(params.pubkey.toLowerCase());
+    if (Array.isArray(params?.pubkeys)) for (const x of params.pubkeys) if (typeof x === "string" && /^[0-9a-f]{64}$/i.test(x)) out.push(x.toLowerCase());
+    return out;
+  };
+
+  async function readersChange(params: Record<string, unknown> | undefined, connectionId: string, field: "add" | "remove") {
     const r = resolveNamespaceDeps(connectionId);
     if (!r.ok) return r;
     const namespace = typeof params?.namespace === "string" ? params.namespace : "";
     if (namespace.length === 0) return { ok: false, reason: "invalid_namespace", guidance: "Pass the private namespace, e.g. support.qa." };
-    const toHexArr = (v: unknown): string[] => Array.isArray(v) ? v.filter((x): x is string => typeof x === "string" && /^[0-9a-f]{64}$/i.test(x)).map((x) => x.toLowerCase()) : [];
-    const add = toHexArr(params?.add);
-    const remove = toHexArr(params?.remove);
-    if (add.length === 0 && remove.length === 0) {
-      return { ok: false, reason: "no_change", guidance: "Pass at least one reader pubkey to add or remove (64-hex)." };
-    }
-    const res = await readersUpdate(r.deps, namespace, { add, remove });
+    const pubkeys = pubkeysOf(params);
+    if (pubkeys.length === 0) return { ok: false, reason: "no_reader", guidance: "Pass a reader pubkey (64-hex) to " + field + "." };
+    const res = await readersUpdate(r.deps, namespace, { [field]: pubkeys });
     if (!res.ok) return res;
     return {
       ok: true, status: res.status, namespace, version: res.version, readers: res.readers,
       guidance: `Reader list for '${namespace}' is now version ${res.version} with ${res.readers.length} reader(s). Every reader, old and new, is told what changed.`,
     };
-  });
+  }
+
+  handlers.set("cello_attestations_readers_add", (params, connectionId) => readersChange(params, connectionId, "add"));
+  handlers.set("cello_attestations_readers_remove", (params, connectionId) => readersChange(params, connectionId, "remove"));
 }

@@ -303,6 +303,24 @@ cello_attestations_activity({ owner_pubkey, namespace })
                                              — a namespace's public counts: service events marked, and unmarked claims filed
 ```
 
+**Writing a review** — a right you hold lets you write exactly one review, which the subject cannot refuse or withdraw.
+```
+cello_attestations_claim({ right_id, text, rating?, origin_channel? })
+                                             — write the one review this right earns; pass a 1–5 rating for a scored namespace
+cello_attestations_claimed({})
+                                             — the reviews you have written, each with the directory's outcome
+```
+
+**Private readers** — a PRIVATE namespace's reviews are never stored by CELLO; as its owner you name who receives a sealed copy, and every change is announced to every reader so none is dropped silently. A reviewer never learns who the readers are.
+```
+cello_attestations_readers_list({ namespace })
+                                             — the readers of your private namespace (owner only)
+cello_attestations_readers_add({ namespace, pubkey })
+                                             — add a reader; every reader, old and new, is told what changed
+cello_attestations_readers_remove({ namespace, pubkey })
+                                             — remove a reader; the removed one is told too
+```
+
 **Consent** — the receiving direction. Anyone can write an endorsement **about** your agent, and it lands in your wallet unbidden. It is **inert until you accept it**: nothing pending is presented, counted, or visible to a counterparty. When you select an agent that has items waiting, `cello_use_agent` returns `pending_consent` with a count.
 ```
 cello_endorsement_consent_list()                            — items awaiting your decision, WITH the issuer's text
