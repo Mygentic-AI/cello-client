@@ -305,9 +305,9 @@ cello_attestations_activity({ owner_pubkey, namespace })
 
 **Writing a review** — a right you hold lets you write exactly one review, and the subject has no refuse or withdraw step.
 ```
-cello_attestations_claim({ right_id, text, rating?, origin_channel? })
+cello_attestations_write({ right_id, text, rating?, origin_channel? })
                                              — write the one review this right earns; pass a 1–5 rating for a scored namespace
-cello_attestations_claimed({})
+cello_attestations_written({})
                                              — the reviews you have written, each with the directory's outcome
 ```
 

@@ -154,13 +154,13 @@ export function registerAttestationNamespaceHandlers(args: {
 
   // M10E 011-CLAIM — the holder of a right writes the review; the daemon seals it as an `attest`
   // submission and keeps the author's own copy. The subject has no refuse step.
-  handlers.set("cello_attestations_claim", async (params, connectionId) => {
+  handlers.set("cello_attestations_write", async (params, connectionId) => {
     const r = resolveServiceEventDeps(connectionId);
     if (!r.ok) return r;
     const right_id = typeof params?.right_id === "string" ? params.right_id : "";
     const text = typeof params?.text === "string" ? params.text : "";
     if (!/^[0-9a-f]{64}$/i.test(right_id) || text.length === 0) {
-      return { ok: false, reason: "invalid_input", guidance: "Pass the 64-hex right id and the review text, e.g. cello attestations claim <right-id> -- Great to work with." };
+      return { ok: false, reason: "invalid_input", guidance: "Pass the 64-hex right id and the review text, e.g. cello attestations write <right-id> -- Great to work with." };
     }
     const rating = typeof params?.rating === "number" ? params.rating : undefined;
     const origin_channel = typeof params?.origin_channel === "string" ? params.origin_channel : null;
@@ -185,7 +185,7 @@ export function registerAttestationNamespaceHandlers(args: {
   });
 
   // M10E 011-CLAIM — the reviews this agent has written, each with its submission outcome.
-  handlers.set("cello_attestations_claimed", async (_params, connectionId) => {
+  handlers.set("cello_attestations_written", async (_params, connectionId) => {
     const r = resolveServiceEventDeps(connectionId);
     if (!r.ok) return r;
     const agentId = r.agentId;

@@ -195,7 +195,7 @@ describe("074-DOCSFLAG clauses 2/5/6/9 — the daemon's three document surfaces,
   // `cello_attestations_rights`. Registered unconditionally, so the 14-verb document gap is unchanged.
   // 91/105 → 93/107 for M10E 007-NOTICES's `cello_attestations_claim_service` and
   // `cello_attestations_activity`. Registered unconditionally, so the 14-verb document gap is unchanged.
-  // 93/107 → 95/109 for M10E 011-CLAIM's `cello_attestations_claim` and `cello_attestations_claimed`.
+  // 93/107 → 95/109 for M10E 011-CLAIM's `cello_attestations_write` and `cello_attestations_written`.
   // Registered unconditionally, so the 14-verb document gap is unchanged.
   // 95/109 → 98/112 for M10E 013-PRIVATE's `cello_attestations_readers_list`,
   // `cello_attestations_readers_add` and `cello_attestations_readers_remove`. Registered

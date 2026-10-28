@@ -140,10 +140,10 @@ export async function claimRight(deps: ClaimDeps, input: ClaimInput): Promise<Cl
     retrying: res.retrying === true,
     stored: res.stored === true,
     guidance: res.retrying
-      ? `The review for '${right.namespace}' is held and will be sent when the directory is reachable; you do not need to run it again. Run \`cello attestations claimed\` to see where it got to. The subject cannot refuse it.`
+      ? `The review for '${right.namespace}' is held and will be sent when the directory is reachable; you do not need to run it again. Run \`cello attestations written\` to see where it got to. The subject cannot refuse it.`
       : res.storedWarning
         ? `Submitted the review for '${right.namespace}'. ${res.storedWarning}`
-        : `Submitted the review for '${right.namespace}'. The portal scans and publishes it to the public store; the subject cannot refuse or withdraw it. Run \`cello attestations claimed\` to see the outcome.`,
+        : `Submitted the review for '${right.namespace}'. The portal scans and publishes it to the public store; the subject cannot refuse or withdraw it. Run \`cello attestations written\` to see the outcome.`,
   };
 }
 

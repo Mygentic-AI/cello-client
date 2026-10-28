@@ -1064,8 +1064,8 @@ export async function attestations(
   }
 
   // M10E 011-CLAIM — write a review for a right you hold. Text after `--`, so it can contain flags
-  // or dashes without being parsed. `cello attestations claim <right-id> [--rating N] [--origin-channel pk] -- <text…>`
-  if (sub === "claim") {
+  // or dashes without being parsed. `cello attestations write <right-id> [--rating N] [--origin-channel pk] -- <text…>`
+  if (sub === "write") {
     const [rightId, ...rest] = args;
     let rating: number | undefined;
     let originChannel: string | undefined;
@@ -1078,14 +1078,14 @@ export async function attestations(
     }
     const text = textParts.join(" ").trim();
     if (!rightId || text.length === 0) {
-      return { exitCode: 1, output: 'Usage: cello attestations claim <right-id> [--rating <1-5>] [--origin-channel <pubkey>] -- <review text>' };
+      return { exitCode: 1, output: 'Usage: cello attestations write <right-id> [--rating <1-5>] [--origin-channel <pubkey>] -- <review text>' };
     }
     try {
       const params: Record<string, unknown> = { right_id: rightId, text };
       if (rating !== undefined) params.rating = rating;
       if (originChannel) params.origin_channel = originChannel;
       const result = (await withIpc(lock.socketPath, (client) =>
-        client.send("cello_attestations_claim", params))) as { ok: boolean; reason?: string; guidance?: string };
+        client.send("cello_attestations_write", params))) as { ok: boolean; reason?: string; guidance?: string };
       if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
       return { exitCode: 0, output: result.guidance ?? "Review submitted." };
     } catch (err: unknown) {
@@ -1094,10 +1094,10 @@ export async function attestations(
   }
 
   // M10E 011-CLAIM — the reviews you have written, each with its submission outcome.
-  if (sub === "claimed") {
+  if (sub === "written") {
     try {
       const result = (await withIpc(lock.socketPath, (client) =>
-        client.send("cello_attestations_claimed", {}))) as {
+        client.send("cello_attestations_written", {}))) as {
         ok: boolean; reason?: string; guidance?: string; results_unavailable?: string;
         claimed?: Array<{ namespace: string; subject_pubkey: string; rating: number | null; outcome: string; submission_id: string }>;
       };
@@ -1254,8 +1254,8 @@ export async function attestations(
       "  cello attestations index [<pubkey>]        — list an owner's namespaces\n" +
       "  cello attestations mark <session-id> <ns>  — mark a service event during a session\n" +
       "  cello attestations rights                  — the rights to review that you hold\n" +
-      "  cello attestations claim <right-id> -- <text> — write a review for a right you hold\n" +
-      "  cello attestations claimed                 — the reviews you have written, with outcomes\n" +
+      "  cello attestations write <right-id> -- <text> — write a review for a right you hold\n" +
+      "  cello attestations written                 — the reviews you have written, with outcomes\n" +
       "  cello attestations claim-service <sid> <ns> — claim a dodged service event (no right)\n" +
       "  cello attestations activity <pubkey> <ns>  — service-event and unmarked-claim counts\n" +
       "  cello attestations summary <owner> <ns>    — a namespace's review summary, from a majority of directories\n" +

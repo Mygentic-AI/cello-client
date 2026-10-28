@@ -96,8 +96,8 @@ const ALWAYS_ON_VERBS: readonly DualSurfaceVerb[] = [
   { mcp: "cello_attestations_claim_service", cli: "cello attestations claim-service" },
   { mcp: "cello_attestations_activity", cli: "cello attestations activity" },
   // M10E 011-CLAIM — write a review you earned, and read the ones you have written
-  { mcp: "cello_attestations_claim", cli: "cello attestations claim" },
-  { mcp: "cello_attestations_claimed", cli: "cello attestations claimed" },
+  { mcp: "cello_attestations_write", cli: "cello attestations write" },
+  { mcp: "cello_attestations_written", cli: "cello attestations written" },
   // M10E 013-PRIVATE — the readers of a private namespace (owner only)
   { mcp: "cello_attestations_readers_list", cli: "cello attestations readers list" },
   { mcp: "cello_attestations_readers_add", cli: "cello attestations readers add" },
