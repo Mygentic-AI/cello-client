@@ -27,6 +27,8 @@ import { RegistrationManager } from "./registration-manager.js";
 import { validatorNodes } from "@cello-protocol/protocol-types";
 import { classifyManifestValidity } from "./manifest-validity.js";
 import { extractErrorMessage } from "./error-message.js";
+import { encodeRegistrationGrant, registrationProofBytes, signWithDaemonKey } from "@cello-protocol/crypto";
+import type { DbPairingStore } from "./pairing-store.js";
 
 export interface RegisterHandlerDeps {
   handlers: Map<string, IpcHandler>;
@@ -47,13 +49,15 @@ export interface RegisterHandlerDeps {
   loadedAgents: Array<{ name: string; pubkey: string; keyProvider: KeyProvider }>;
   registrationGuidance: (reason: string, detail?: string) => string;
   manifestProvider?: IManifestProvider;
+  /** The daemon key and the credential a directory signed for it, presented when no token is given. */
+  pairingStore: DbPairingStore;
 }
 
 export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
   const {
     handlers, logger, keyProviders, getPersistence,
     getAgentSignaling, waitForSignalingConnected, dropAgentSignaling, startAgentInternal,
-    directoryEndpointResolver, loadedAgents, registrationGuidance, manifestProvider,
+    directoryEndpointResolver, loadedAgents, registrationGuidance, manifestProvider, pairingStore,
   } = deps;
 
   // Single-flight guard (M1): the directory's registration reply frames (dkg_ready /
@@ -67,25 +71,26 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
 
   handlers.set("cello_register", async (params, _connectionId) => {
     const name = params?.agent as string | undefined;
-    const preAuthToken = params?.preAuthToken as string | undefined;
+    const explicitToken = params?.preAuthToken as string | undefined;
     const phoneStub = (params?.phoneStub as string | undefined) ?? "";
     // M16 024-CREATE: a channel create passes its own correlationId so one id spans create.started,
     // the registration events under it, and create.completed. Absent for an ordinary register-agent.
     const correlationId = params?.correlationId as string | undefined;
     const cid = correlationId !== undefined ? { correlationId } : {};
     if (!name) {
-      return { ok: false, reason: "missing_params", guidance: "Provide 'agent' (the agent name to register) and 'preAuthToken' (the pre-authorization ticket from the CELLO Operations Agent)." };
+      return { ok: false, reason: "missing_params", guidance: "Provide 'agent' (the agent name to register)." };
     }
     // M16: a broadcast channel is registered with `channel: true` AND the administering agent's
     // pubkey. The two travel together or not at all. The manager checks the pubkey's shape.
     const channelParam = params?.channel;
     const adminPubkeyParam = params?.adminPubkeyHex;
     const adminSignatureParam = params?.adminSignature as string | undefined;
-    // M16 024-CREATE: an ordinary agent registers against a pre-auth token; a CHANNEL presents no
-    // token — the admin's signature is its authorization. So the token is required only when this is
-    // NOT a channel registration.
-    if (channelParam !== true && !preAuthToken) {
-      return { ok: false, reason: "missing_preauth_token", guidance: "Registration requires a 'preAuthToken' issued by the CELLO Operations Agent (Telegram). Obtain one, then retry 'cello register-agent'." };
+    // An ordinary agent presents an explicit token if one is given, otherwise this device's
+    // credential with a proof over the agent's key. A CHANNEL presents neither: the admin's
+    // signature is its authorization.
+    const credential = channelParam !== true && !explicitToken ? pairingStore.credential() : null;
+    if (channelParam !== true && !explicitToken && credential === null) {
+      return { ok: false, reason: "not_paired", guidance: "This device is not paired yet. Run 'cello register-agent <name>' in a terminal; it shows a link to approve this device." };
     }
     if (channelParam !== undefined && channelParam !== true) {
       return { ok: false, reason: "invalid_channel_registration", guidance: "'channel' must be true to register a broadcast channel, or omitted for an ordinary agent." };
@@ -164,6 +169,14 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
       const agentRecord = loadedAgents.find((a) => a.name === name);
       const agentPubkeyHex = agentRecord?.pubkey ?? Buffer.from(await keyProvider.getPublicKey()).toString("hex");
       const { signaling: agentSignaling, getNode: agentGetNode } = getAgentSignaling(name, keyProvider, agentPubkeyHex);
+      // The grant is bound to THIS agent's key: the proof cannot register another agent, and the
+      // credential is useless without the daemon key that makes the proof.
+      const preAuthToken = credential !== null
+        ? encodeRegistrationGrant({
+            credential,
+            proof: await signWithDaemonKey(registrationProofBytes(agentPubkeyHex, credential.nonce), pairingStore.daemonKey().keyProvider),
+          })
+        : explicitToken;
 
       // A non-primary agent's stream connects lazily — wait for it before the DKG
       // (RegistrationManager returns directory_unreachable if signaling isn't connected).
@@ -286,6 +299,11 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
         const result = await new RegistrationManager(ctx).register(phoneStub, preAuthToken, channelOpts);
         if ("error" in result) {
           logger.warn("registration.failed", { ...cid, agentName: name, reason: result.error });
+          if (result.error === "CREDENTIAL_INVALID" && credential !== null) {
+            // The directory's guidance tells the person to run the command again, which re-pairs.
+            pairingStore.clearCredential();
+            logger.warn("pairing.credential.cleared", { ...cid, reason: result.error });
+          }
           // Terminal failure for THIS agent — drop its dedicated signaling manager so it
           // does not reconnect forever for an unregistered agent (re-created on retry).
           await dropAgentSignaling(name);

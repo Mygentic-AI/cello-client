@@ -17,7 +17,7 @@ import { encodeCbor } from "@cello-protocol/protocol-types";
 import { mlDsaKeygen, mlDsaKeygenWithBytes, FileMlDsaKeyProvider, buildKeyBindingTbs } from "@cello-protocol/crypto";
 import type { IThresholdSigner, MlDsaKeyProvider } from "@cello-protocol/crypto";
 import type { RegistrationState } from "@cello-protocol/protocol-types";
-import { NetworkDirectoryNode, runNetworkDkg } from "./network-directory-node.js";
+import { NetworkDirectoryNode, PreAuthRejectedError, runNetworkDkg } from "./network-directory-node.js";
 import type { ConsortiumEndpoint } from "./directory-bootstrap.js";
 
 import type { DaemonRegistrationPersistence } from "./registration-persistence.js";
@@ -434,7 +434,8 @@ export class RegistrationManager {
         this.#mlDsaProvider = mlDsaProvider;
         return state;
       }
-      return { error: reason };
+      const guidance = dkgReadyFrame["guidance"];
+      return typeof guidance === "string" ? { error: reason, detail: guidance } : { error: reason };
     }
 
     // Step 5b: run real FROST DKG
@@ -577,6 +578,12 @@ export class RegistrationManager {
         // frame that names the node.
         stack: err instanceof Error ? err.stack : undefined,
       });
+      // A refused authorization is the directory's answer, not a ceremony failure: its own reason
+      // and guidance reach the caller (a cap reached, a credential to re-pair).
+      if (err instanceof PreAuthRejectedError) {
+        const detail = err.guidance ?? err.detail;
+        return { error: err.reason, ...(detail !== undefined ? { detail } : {}) };
+      }
       // The cause travels WITH the code. `dkg_failed` is the closed protocol union the wire needs;
       // `detail` is what lets the operator-facing guidance say which failure it actually was.
       return { error: "dkg_failed", detail: extractErrorMessage(err) };
@@ -661,7 +668,8 @@ export class RegistrationManager {
         this.#mlDsaProvider = mlDsaProvider;
         return state;
       }
-      return { error: reason };
+      const guidance = responseWithTimeout["guidance"];
+      return typeof guidance === "string" ? { error: reason, detail: guidance } : { error: reason };
     }
 
     // Step 6a (M16): the echo check. A channel the directory did not store as a channel is a failed

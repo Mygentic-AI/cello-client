@@ -18,8 +18,14 @@ import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { registerRegisterHandler } from "../register-handler.js";
 import { connectToDaemon } from "../ipc-client.js";
-import { FileKeyProvider } from "@cello-protocol/crypto";
+import {
+  FileKeyProvider, generateKeypair, signDaemonCredential, decodeRegistrationGrant, verifyDaemonSignature, registrationProofBytes,
+} from "@cello-protocol/crypto";
+import type { DaemonCredential } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig } from "../types.js";
+import { openEncryptedDatabase, resolveDbKey, dbKeyPathFor, type DaemonDatabase } from "../sqlcipher-db.js";
+import { DbPairingStore } from "../pairing-store.js";
+import { registrationGuidance } from "../operator-guidance.js";
 
 describe("cello_register single-flight guard", () => {
   let tempDir: string;
@@ -84,7 +90,7 @@ describe("cello_register single-flight guard", () => {
     client.close();
   });
 
-  it("returns missing_preauth_token when the token is absent", async () => {
+  it("7. an unpaired daemon with no token answers not_paired, naming the command that pairs", async () => {
     const agentsDir = join(tempDir, "agents");
     await mkdir(join(agentsDir, "alice"), { recursive: true });
     await FileKeyProvider.load(join(agentsDir, "alice", "key"));
@@ -99,9 +105,10 @@ describe("cello_register single-flight guard", () => {
     };
     handle = await startDaemon(config);
     const client = await connectToDaemon(config.socketPath);
-    const result = (await client.send("cello_register", { agent: "alice" })) as { ok: boolean; reason?: string };
+    const result = (await client.send("cello_register", { agent: "alice" })) as { ok: boolean; reason?: string; guidance?: string };
     expect(result.ok).toBe(false);
-    expect(result.reason).toBe("missing_preauth_token");
+    expect(result.reason).toBe("not_paired");
+    expect(result.guidance).toContain("cello register-agent");
     client.close();
   });
 });
@@ -152,6 +159,7 @@ describe("DOD-M15-EXPIRY-CONSUMER-POLICY-1: a lapsed manifest is reported, and d
       directoryEndpointResolver: async () => ({ peerId: "12D3KooWX", multiaddr: "/ip4/127.0.0.1/tcp/1" }) as never,
       loadedAgents: [{ name: "alice", pubkey: "11".repeat(32), keyProvider: {} as never }],
       registrationGuidance: () => "guidance",
+      pairingStore: {} as never,
       manifestProvider: {
         loadAndVerify: async () => expired as never,
         getCurrentManifest: () => { reachedRoster = true; return expired as never; },
@@ -204,6 +212,7 @@ describe("M16 004-IDENTITY-WIRE: cello_register channel params", () => {
       directoryEndpointResolver: async () => ({ peerId: "12D3KooWX", multiaddr: "/ip4/127.0.0.1/tcp/1" }) as never,
       loadedAgents: [{ name: "alice", pubkey: "11".repeat(32), keyProvider: {} as never }],
       registrationGuidance: () => "guidance",
+      pairingStore: {} as never,
     });
     return handlers.get("cello_register")!;
   }
@@ -254,5 +263,117 @@ describe("M16 004-IDENTITY-WIRE: cello_register channel params", () => {
     // The token argument is undefined for a channel; the channel opts carry the signature.
     expect(received![1]).toBeUndefined();
     expect(received![2]).toEqual({ channel: true, adminPubkeyHex: ADMIN, adminSignature: ADMIN_SIG });
+  });
+});
+
+/**
+ * Registration with this device's credential: the grant presented in round 1, and what the
+ * directory's refusals become at the IPC surface.
+ */
+describe("cello_register with the device credential", () => {
+  const ACCOUNT = "3f0c8a2e-1b7d-4e5f-9a6b-2c4d6e8f0a1b";
+  let dir: string;
+  let db: DaemonDatabase;
+  let store: DbPairingStore;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "cello-reg-cred-"));
+    const dbPath = join(dir, "cello.db");
+    db = openEncryptedDatabase(dbPath, resolveDbKey(dbPath, dbKeyPathFor(dbPath)));
+    store = new DbPairingStore(db, { debug() {}, info() {}, warn() {}, error() {} });
+  });
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    db.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  async function pair(): Promise<DaemonCredential> {
+    const cred = await signDaemonCredential(
+      { v: 1, daemon_pubkey: store.daemonKey().pubkeyHex, account_id: ACCOUNT, nonce: "cd".repeat(16), issued_at: "2026-10-28T00:00:00Z" },
+      generateKeypair(),
+    );
+    store.saveCredential(cred);
+    return cred;
+  }
+
+  function makeHandler(agents: Array<{ name: string; pubkey: string }>) {
+    const handlers = new Map<string, (p: Record<string, unknown> | undefined, c: string) => Promise<unknown>>();
+    registerRegisterHandler({
+      handlers: handlers as never,
+      logger: { debug() {}, info() {}, warn() {}, error() {} },
+      keyProviders: new Map(agents.map((a) => [a.name, {} as never])),
+      getPersistence: () => ({ persistAgentUserLink: async () => {} }) as never,
+      getAgentSignaling: () => ({ signaling: { registerInboundHandler: () => () => {} } as never, getNode: () => null }),
+      waitForSignalingConnected: async () => true,
+      dropAgentSignaling: async () => {},
+      startAgentInternal: () => ({ ok: true }),
+      directoryEndpointResolver: async () => ({ peerId: "12D3KooWX", multiaddr: "/ip4/127.0.0.1/tcp/1" }) as never,
+      loadedAgents: agents.map((a) => ({ ...a, keyProvider: {} as never })),
+      registrationGuidance,
+      pairingStore: store,
+    });
+    return handlers.get("cello_register")!;
+  }
+
+  const ALICE = "11".repeat(32);
+  const BOB = "22".repeat(32);
+
+  it("6. two agents on one paired daemon present one credential and two proofs, each bound to its own agent", async () => {
+    const cred = await pair();
+    const tokens: string[] = [];
+    vi.spyOn(RegistrationManager.prototype, "register").mockImplementation(async (_phone, token) => {
+      tokens.push(token as string);
+      return { error: "stopped_here_by_test" };
+    });
+    const register = makeHandler([{ name: "alice", pubkey: ALICE }, { name: "bob", pubkey: BOB }]);
+    await register({ agent: "alice" }, "c");
+    await register({ agent: "bob" }, "c");
+    const [a, b] = tokens.map((t) => decodeRegistrationGrant(t));
+    expect(a!.credential).toEqual(cred);
+    expect(b!.credential).toEqual(cred);
+    const daemonPub = store.daemonKey().pubkeyHex;
+    expect(verifyDaemonSignature(registrationProofBytes(ALICE, cred.nonce), a!.proof, daemonPub), "A verifies for alice").toBe(true);
+    expect(verifyDaemonSignature(registrationProofBytes(BOB, cred.nonce), b!.proof, daemonPub), "B verifies for bob").toBe(true);
+    expect(verifyDaemonSignature(registrationProofBytes(BOB, cred.nonce), a!.proof, daemonPub), "A must FAIL for bob").toBe(false);
+  });
+
+  it("8. AGENT_CAP_REACHED reaches the response as that reason, with the directory's guidance verbatim", async () => {
+    await pair();
+    const G = "This account has 3 agents. Verify a phone number in the portal to add more.";
+    vi.spyOn(RegistrationManager.prototype, "register").mockResolvedValue({ error: "AGENT_CAP_REACHED", detail: G });
+    const r = (await makeHandler([{ name: "alice", pubkey: ALICE }])({ agent: "alice" }, "c")) as Record<string, unknown>;
+    expect(r).toEqual({ ok: false, reason: "AGENT_CAP_REACHED", guidance: G });
+  });
+
+  it("9. account_unresolved reaches the response with its guidance", async () => {
+    await pair();
+    const G = "The directory could not find your account. Run 'cello register-agent <name>' again.";
+    vi.spyOn(RegistrationManager.prototype, "register").mockResolvedValue({ error: "account_unresolved", detail: G });
+    const r = (await makeHandler([{ name: "alice", pubkey: ALICE }])({ agent: "alice" }, "c")) as Record<string, unknown>;
+    expect(r).toEqual({ ok: false, reason: "account_unresolved", guidance: G });
+  });
+
+  it("11. an explicit CELLO- or DEV- token passes through unchanged, even on a paired daemon", async () => {
+    await pair();
+    const tokens: unknown[] = [];
+    vi.spyOn(RegistrationManager.prototype, "register").mockImplementation(async (_p, token) => {
+      tokens.push(token);
+      return { error: "stopped_here_by_test" };
+    });
+    const register = makeHandler([{ name: "alice", pubkey: ALICE }]);
+    const cello = "CELLO-" + "1".repeat(33);
+    await register({ agent: "alice", preAuthToken: cello }, "c");
+    await register({ agent: "alice", preAuthToken: "DEV-local" }, "c");
+    expect(tokens).toEqual([cello, "DEV-local"]);
+  });
+
+  it("12. CREDENTIAL_INVALID clears the credential and keeps the daemon key", async () => {
+    await pair();
+    const key = store.daemonKey().pubkeyHex;
+    vi.spyOn(RegistrationManager.prototype, "register").mockResolvedValue({ error: "CREDENTIAL_INVALID", detail: "Run 'cello register-agent <name>' again to re-pair." });
+    await makeHandler([{ name: "alice", pubkey: ALICE }])({ agent: "alice" }, "c");
+    expect(store.credential()).toBeNull();
+    expect(store.daemonKey().pubkeyHex).toBe(key);
   });
 });

@@ -380,6 +380,23 @@ export class NetworkDirectoryNode implements DirectoryNodeStub {
 // over /cello/frost/1.0.0 streams. They are internal to the DKG coordinator flow.
 
 /**
+ * A directory refused this registration's authorization in round 1. `reason` is the directory's
+ * code and `guidance` its sentence for the person; both reach the IPC response unchanged.
+ */
+export class PreAuthRejectedError extends Error {
+  readonly reason: string;
+  readonly detail: string | undefined;
+  readonly guidance: string | undefined;
+  constructor(reason: string, detail?: string, guidance?: string) {
+    super(`dkgRound1 rejected: ${reason}${detail ? `: ${detail}` : ""}`);
+    this.name = "PreAuthRejectedError";
+    this.reason = reason;
+    this.detail = detail;
+    this.guidance = guidance;
+  }
+}
+
+/**
  * Run DKG round 1 with this directory node.
  * Opens a new stream, sends frost_dkg_round1_request, returns the broadcast.
  */
@@ -410,7 +427,7 @@ async function dkgRound1WithNode(
       const bytes = chunk instanceof Uint8Array ? chunk : (chunk as unknown as { slice(): Uint8Array }).slice();
       const parsed = parseDkgRound1Response(bytes);
       if (parsed.kind === "invalid") throw new Error("dkgRound1: invalid response");
-      if (parsed.kind === "preauth_error") throw new Error(`dkgRound1 rejected: ${parsed.reason}${parsed.detail ? `: ${parsed.detail}` : ""}`);
+      if (parsed.kind === "preauth_error") throw new PreAuthRejectedError(parsed.reason, parsed.detail, parsed.guidance);
       const resp = parsed.response;
       if (!resp.ok) throw new Error(`dkgRound1 failed: ${resp.reason}`);
       return resp.broadcast;
@@ -504,7 +521,7 @@ async function dkgRound3WithNode(
 /** Structured result for parseDkgRound1Response — distinguishes normal responses from preauth rejections */
 type DkgRound1ParseResult =
   | { kind: "response"; response: FrostDkgRound1Response }
-  | { kind: "preauth_error"; reason: string; detail?: string }
+  | { kind: "preauth_error"; reason: string; detail?: string; guidance?: string }
   | { kind: "invalid" };
 
 function parseDkgRound1Response(bytes: Uint8Array): DkgRound1ParseResult {
@@ -520,7 +537,13 @@ function parseDkgRound1Response(bytes: Uint8Array): DkgRound1ParseResult {
     // 024-CREATE item 4: carry the directory's `detail` (e.g. "admin signature does not verify") so
     // the operator sees WHY a channel registration was refused, not just the generic reason label.
     const detail = typeof o["detail"] === "string" ? o["detail"] : undefined;
-    return { kind: "preauth_error", reason, ...(detail !== undefined ? { detail } : {}) };
+    // The directory's own next step for the person (re-pair, verify a phone). Carried, never rewritten.
+    const guidance = typeof o["guidance"] === "string" ? o["guidance"] : undefined;
+    return {
+      kind: "preauth_error", reason,
+      ...(detail !== undefined ? { detail } : {}),
+      ...(guidance !== undefined ? { guidance } : {}),
+    };
   }
 
   if (o["type"] !== "frost_dkg_round1_response") return { kind: "invalid" };

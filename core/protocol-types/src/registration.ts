@@ -190,11 +190,14 @@ export interface RegisterError {
   agent_id?: string;
   primary_pubkey?: string;
   ml_dsa_pubkey?: string;
+  /** The directory's sentence for the person: what to do next. */
+  guidance?: string;
 }
 
 export type RegisterErrorReason =
   | "already_registered"     // same k_local_pubkey already has a profile
-  | "phone_already_claimed"  // SHA-256(phone_stub) matches an existing profile
+  | "phone_already_claimed"  // no directory sends this any more; kept because older clients know the value
+  | "account_unresolved"     // the directory could not attach the agent to an account; nothing registered
   | "invalid_verification"   // phone_stub is empty or otherwise invalid
   | "dkg_failed"             // FROST DKG below threshold or ceremony failure
   | "not_authenticated"      // register_request arrived before signaling_auth_ok

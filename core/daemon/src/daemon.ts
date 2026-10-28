@@ -101,6 +101,9 @@ import { registerInclusionProofHandlers } from "./inclusion-proof-handlers.js";
 import { pullSealCertificate } from "./seal-certificate-pull.js";
 import { registerAgentHandlers } from "./agent-handlers.js";
 import { registerRegisterHandler } from "./register-handler.js";
+import { registerPairingHandlers } from "./pairing-handler.js";
+import { DbPairingStore } from "./pairing-store.js";
+import { directoryBases } from "./pairing-client.js";
 import { registerInitiateSessionHandler } from "./initiate-session-handler.js";
 import { createInboundSealRequestHandler } from "./inbound-seal-request.js";
 import { registerNotificationHandlers } from "./notification-handlers.js";
@@ -656,6 +659,7 @@ async function startDaemonHoldingLock(
 
   // cello_register (register-handler.ts): T-of-N DKG with the consortium. NO SINGLE NODE can
   // complete it alone — that is the sovereign-node invariant, and it is the point of the protocol.
+  const pairingStore = new DbPairingStore(sessionNodeManager.getDb(), logger);
   registerRegisterHandler({
     handlers,
     logger,
@@ -669,7 +673,12 @@ async function startDaemonHoldingLock(
     loadedAgents,
     registrationGuidance,
     manifestProvider,
+    pairingStore,
   });
+
+  // cello_pair_start / cello_pair_await (pairing-handler.ts): pair this daemon with an account via
+  // a directory; the approval itself happens in a browser, on this machine or any other.
+  registerPairingHandlers({ handlers, logger, pairingStore, getBases: () => directoryBases(manifestProvider) });
 
 
   // 040-DAEMONROOT unit 3: share rotation and relay receipts → agent-admin-handlers.ts.
