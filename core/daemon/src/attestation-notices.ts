@@ -20,7 +20,7 @@
  * a dodged service event visible (`unmarked_claims`, 006), and the screener closes the condition-text
  * injection route.
  */
-import { decodeCbor, decodeAttestationPayload, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
+import { decodeCbor, decodeAttestationPayload, verifyTrustSignalHash, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
 import { extractErrorMessage } from "./error-message.js";
 import { readIndex, type NamespaceDeps } from "./attestation-namespaces.js";
 import { listRights, type ServiceEventDeps } from "./attestation-service-events.js";
@@ -183,7 +183,16 @@ export class AttestationNotices {
    * re-delivers. The envelope is already decoded by the caller — here only its ATTESTATION PAYLOAD is
    * read out, and the text is kept ONLY as a quoted inbox field, never written to the wallet.
    */
-  notePrivateReview(agentId: string, envelope: TrustSignalEnvelope, signalHash: string): "stored" | "malformed" | "store_failed" {
+  notePrivateReview(agentId: string, envelope: TrustSignalEnvelope, signalHash: string): "stored" | "malformed" | "store_failed" | "hash_mismatch" {
+    // M10E 016 (M2): RE-DERIVE the DOD-CBOR-1 hash and REFUSE a mismatch, exactly as
+    // `deliverWalletSignal` does — the daemon never trusts the `signalHash` the frame carried. A
+    // delivery whose bytes do not hash to the claim is corrupt or tampered; it is NOT stored. Like the
+    // wallet path, a mismatch is NOT acked by the caller (the signal is re-mintable), so the directory
+    // keeps the pickup for a later retry rather than losing a signal this daemon could not verify.
+    if (!/^[0-9a-f]{64}$/.test(signalHash) || !verifyTrustSignalHash(envelope, new Uint8Array(Buffer.from(signalHash, "hex")))) {
+      this.#logger.error("attestation.private_review.hash_mismatch", { agentId, signalHash });
+      return "hash_mismatch";
+    }
     let rating: number | null = null;
     let text = "";
     let namespace: string;
