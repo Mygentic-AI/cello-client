@@ -40,7 +40,7 @@ import { SessionNodeManager } from "./session-node-manager.js";
 import { registerGatewayConfigHandlers } from "./gateway-config-handlers.js"; import { registerPolicyHandlers } from "./policy-handlers.js";
 import { NonceDedupStore } from "./nonce-dedup.js";
 import { NotificationDispatcher } from "./notification-dispatcher.js";
-import { AccountNoticeBox, receiveAccountNotice, type AccountNoticeKind } from "./account-notices.js";
+import { AccountNoticeWiring } from "./account-notices.js";
 import { DbIdentityStore, channelAgentLookup } from "./db-identity-store.js";
 
 // CELLO-M7-MSG-001 (AC-013/AC-018): the single application content-size cap, enforced
@@ -297,9 +297,7 @@ async function startDaemonHoldingLock(
    */
   let channelCollectNow: ((agentId: string) => void) | null = null;
   let channelJoinBell: ((frame: Record<string, unknown>) => void) | null = null; // 046: late-bound like the collector
-  // Account notices: held in memory for the inbox; the doorbell is late-bound to the dispatcher built below.
-  const accountNotices = new AccountNoticeBox();
-  let ringAccountNotice: ((agentName: string, kind: AccountNoticeKind) => void) | null = null;
+  const accountNotices = new AccountNoticeWiring(logger, (n) => sessionNodeManager.resolveAgentId(n)); // held in memory for the inbox
   let channelReconnect: ((agentName: string) => void) | undefined; // 047: late-bound like the join bell
 
   // 040-DAEMONROOT unit 5: per-agent directory signaling → signaling-wiring.ts.
@@ -335,14 +333,7 @@ async function startDaemonHoldingLock(
     onChannelWake: (agentName: string) => {
       channelCollectNow?.(sessionNodeManager.resolveAgentId(agentName));
     },
-    onChannelJoinBell: (_agentName: string, frame: Record<string, unknown>) => { channelJoinBell?.(frame); },
-    onAccountNotice: (agentName: string, kind: unknown) => {
-      receiveAccountNotice({
-        box: accountNotices, logger,
-        resolveAgentId: (n) => sessionNodeManager.resolveAgentId(n),
-        dispatch: (n, k) => { ringAccountNotice?.(n, k); },
-      }, agentName, kind);
-    },
+    onChannelJoinBell: (_agentName: string, frame: Record<string, unknown>) => { channelJoinBell?.(frame); }, onAccountNotice: (n: string, k: unknown) => accountNotices.receive(n, k),
   });
 
   // CELLO-M7-CONN-001 (DOD-CONN-1, code-review HIGH): in PRODUCTION, bring up EACH loaded agent's OWN
@@ -434,8 +425,6 @@ async function startDaemonHoldingLock(
     getOfferedMonikers: () => offeredMonikers,
     getOfferKey: () => offerKey,
   });
-
-
 
   // SessionNodeManager was constructed + initialized at the top of startDaemon (PERSIST-002 — the
   // encrypted store must open before agents load from the `agents` table). Its standing receiver +
@@ -1062,7 +1051,7 @@ async function startDaemonHoldingLock(
     reapExpiredInboundSessions,
     inboundSessionQueues,
     expiredSessionRequests,
-    refusedSessionRequests,
+    refusedSessionRequests, accountNotices: accountNotices.box,
     // §16.5's passive notification, wired 2026-08-08. Both halves existed with no production caller
     // — nothing wrote a notice and nothing read one — so an agent learned a document had changed
     // only by polling, and `cello_doc_read` cleared rows that could never exist.
@@ -1072,7 +1061,6 @@ async function startDaemonHoldingLock(
     ...(documentsEnabled()
       ? { documentNotices: (ownerAgentId: string) => documentLayer!.notifications.pending(ownerAgentId) }
       : {}),
-    accountNotices,
     ownerKeyFor: (agentName) =>
       loadedAgents.find((a) => a.name === agentName)?.pubkey?.toLowerCase() ?? null,
   });
@@ -1109,12 +1097,11 @@ async function startDaemonHoldingLock(
   // parked content — all of it arriving before the document frame hook exists.
 
   // MCP-002: Instantiate NotificationDispatcher (wired to IPC server)
-  const notificationDispatcher = new NotificationDispatcher({
+  const notificationDispatcher = accountNotices.ringWith(new NotificationDispatcher({
     logger,
     sendNotification: (connectionId, notification) => ipcServer.sendNotification(connectionId, notification),
     getConnectionIds: () => ipcServer.getConnectionIds(),
-  });
-  ringAccountNotice = (n, k) => { notificationDispatcher.dispatchAccountNotice(n, k); };
+  }));
 
   // M7-SESSION-001 (M-1 PUSH): now that the dispatcher exists, wire the session
   // node manager so that an active→interrupted transition pushes a

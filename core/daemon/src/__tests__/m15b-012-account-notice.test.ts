@@ -5,7 +5,7 @@
 import { describe, it, expect } from "vitest";
 import { NotificationDispatcher } from "../notification-dispatcher.js";
 import { registerNotificationHandlers, type NotificationHandlerDeps } from "../notification-handlers.js";
-import { AccountNoticeBox, ACCOUNT_NOTICE_TEXT, receiveAccountNotice } from "../account-notices.js";
+import { AccountNoticeWiring, ACCOUNT_NOTICE_TEXT } from "../account-notices.js";
 import type { IpcHandler } from "../ipc-server.js";
 import type { IpcNotification } from "../types.js";
 
@@ -16,19 +16,20 @@ function harness() {
   const warns: Array<[string, Record<string, unknown>]> = [];
   const logger = { debug() {}, info() {}, warn: (e: string, f: Record<string, unknown>) => { warns.push([e, f]); }, error() {} };
   const sent: IpcNotification[] = [];
-  const dispatcher = new NotificationDispatcher({
+  const resolveAgentId = (name: string) => (name === AGENT ? AGENT_ID : name);
+  const wiring = new AccountNoticeWiring(logger, resolveAgentId);
+  const dispatcher = wiring.ringWith(new NotificationDispatcher({
     logger, sendNotification: (_c, n) => { sent.push(n); return true; }, getConnectionIds: () => ["c1"],
-  });
+  }));
   dispatcher.registerConnection("c1");
   dispatcher.setCurrentAgent("c1", AGENT);
-  const box = new AccountNoticeBox();
   const handlers = new Map<string, IpcHandler>();
   const sessionNodeManager = {
     getUnreadSummary: () => [], getEndedUnread: () => [], getRenameNotices: () => [], listKnocks: () => [],
     isTierNotAccepting: () => false, takeAgentContentRefusals: () => ({ notices: [], truncated: false }),
     getWitnessAlerts: () => [], getWitnessUnreadable: () => [], getConsentRequests: () => [],
     listSessions: () => [], getPendingAttestationConsents: () => [],
-    resolveAgentId: (name: string) => (name === AGENT ? AGENT_ID : name),
+    resolveAgentId,
   };
   registerNotificationHandlers({
     handlers, logger, sessionNodeManager,
@@ -37,13 +38,9 @@ function harness() {
     agents: [{ name: AGENT, pubkey: "bb".repeat(32), state: "online" }],
     reapExpiredInboundSessions: () => {}, inboundSessionQueues: new Map(),
     expiredSessionRequests: new Map(), refusedSessionRequests: new Map(),
-    accountNotices: box,
+    accountNotices: wiring.box,
   } as unknown as NotificationHandlerDeps);
-  const receive = (frame: Record<string, unknown>) =>
-    receiveAccountNotice({
-      box, logger, resolveAgentId: sessionNodeManager.resolveAgentId,
-      dispatch: (a, k) => dispatcher.dispatchAccountNotice(a, k),
-    }, AGENT, frame["kind"]);
+  const receive = (frame: Record<string, unknown>) => wiring.receive(AGENT, frame["kind"]);
   const inbox = async () => {
     const res = (await handlers.get("cello_check_notifications")!({}, "c1")) as { agents?: Array<Record<string, unknown>> };
     return res.agents!.find((a) => a["agent"] === AGENT)!;

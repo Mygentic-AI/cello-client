@@ -46,6 +46,32 @@ export function receiveAccountNotice(
   deps.dispatch(agentName, kind);
 }
 
+/**
+ * The daemon's account-notice state: the box the inbox reads, and the doorbell, bound to the
+ * notification dispatcher once it exists. A notice that arrives before then is still held.
+ */
+export class AccountNoticeWiring {
+  readonly box = new AccountNoticeBox();
+  #ring: ((agentName: string, kind: AccountNoticeKind) => void) | null = null;
+
+  constructor(
+    private readonly logger: Parameters<typeof receiveAccountNotice>[0]["logger"],
+    private readonly resolveAgentId: (agentName: string) => string,
+  ) {}
+
+  receive(agentName: string, kind: unknown): void {
+    receiveAccountNotice(
+      { box: this.box, logger: this.logger, resolveAgentId: this.resolveAgentId, dispatch: (n, k) => this.#ring?.(n, k) },
+      agentName, kind,
+    );
+  }
+
+  ringWith<D extends { dispatchAccountNotice(agentName: string, kind: string): void }>(dispatcher: D): D {
+    this.#ring = (n, k) => dispatcher.dispatchAccountNotice(n, k);
+    return dispatcher;
+  }
+}
+
 /** At most one held notice per (agent, kind); taking them clears them. */
 export class AccountNoticeBox {
   readonly #held = new Map<string, Set<AccountNoticeKind>>();
