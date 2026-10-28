@@ -10,7 +10,9 @@ import { randomUUID } from "node:crypto";
 import type { IpcHandler } from "./ipc-server.js";
 import type { Logger } from "./types.js";
 import type { DbPairingStore, PendingPairing } from "./pairing-store.js";
-import { deviceFacts, openPairing, pollOnce, type DeviceFacts, type FetchFn } from "./pairing-client.js";
+import type { IManifestProvider } from "@cello-protocol/transport";
+import { extractErrorMessage } from "./error-message.js";
+import { directoryBases, deviceFacts, openPairing, pollOnce, type DeviceFacts, type FetchFn } from "./pairing-client.js";
 
 export const PAIRING_POLL_INTERVAL_MS = 3_000;
 const GUIDANCE_NEW_CODE = "The code was not approved in time. Run 'cello register-agent <name>' again for a new code.";
@@ -23,8 +25,9 @@ export interface PairingHandlerDeps {
   handlers: Map<string, IpcHandler>;
   logger: Logger;
   pairingStore: DbPairingStore;
-  /** Directory HTTP bases, in the order to try them. */
-  getBases: () => string[];
+  manifestProvider?: IManifestProvider;
+  /** Directory HTTP bases, in the order to try them. Defaults to every directory of the manifest. */
+  getBases?: () => string[];
   fetchFn?: FetchFn;
   pollIntervalMs?: number;
   now?: () => number;
@@ -40,7 +43,8 @@ interface RunningPairing {
 }
 
 export function registerPairingHandlers(deps: PairingHandlerDeps): void {
-  const { handlers, logger, pairingStore, getBases } = deps;
+  const { handlers, logger, pairingStore } = deps;
+  const getBases = deps.getBases ?? (() => directoryBases(deps.manifestProvider));
   const fetchFn: FetchFn = deps.fetchFn ?? ((url, init) => fetch(url, init));
   const intervalMs = deps.pollIntervalMs ?? PAIRING_POLL_INTERVAL_MS;
   const now = deps.now ?? Date.now;
@@ -114,7 +118,7 @@ export function registerPairingHandlers(deps: PairingHandlerDeps): void {
       .catch((err: unknown) => end(pending, correlationId, {
         ok: false,
         reason: "pairing_failed",
-        guidance: `Pairing stopped on a local error (${err instanceof Error ? err.message : String(err)}). Run 'cello register-agent <name>' again.`,
+        guidance: `Pairing stopped on a local error (${extractErrorMessage(err)}). Run 'cello register-agent <name>' again.`,
       }))
       .finally(() => { if (running === run) running = null; });
     running = run;

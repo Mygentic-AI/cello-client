@@ -103,7 +103,6 @@ import { registerAgentHandlers } from "./agent-handlers.js";
 import { registerRegisterHandler } from "./register-handler.js";
 import { registerPairingHandlers } from "./pairing-handler.js";
 import { DbPairingStore } from "./pairing-store.js";
-import { directoryBases } from "./pairing-client.js";
 import { registerInitiateSessionHandler } from "./initiate-session-handler.js";
 import { createInboundSealRequestHandler } from "./inbound-seal-request.js";
 import { registerNotificationHandlers } from "./notification-handlers.js";
@@ -672,13 +671,9 @@ async function startDaemonHoldingLock(
     directoryEndpointResolver,
     loadedAgents,
     registrationGuidance,
-    manifestProvider,
-    pairingStore,
+    manifestProvider, pairingStore,
   });
-
-  // cello_pair_start / cello_pair_await (pairing-handler.ts): pair this daemon with an account via
-  // a directory; the approval itself happens in a browser, on this machine or any other.
-  registerPairingHandlers({ handlers, logger, pairingStore, getBases: () => directoryBases(manifestProvider) });
+  registerPairingHandlers({ handlers, logger, pairingStore, manifestProvider }); // pairing-handler.ts
 
 
   // 040-DAEMONROOT unit 3: share rotation and relay receipts → agent-admin-handlers.ts.

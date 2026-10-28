@@ -418,7 +418,9 @@ export default [
     // holds. Each function only maps agent id → name and routes; INV-CONTENTFREE lives downstream.
     // 1,482 → 1,483 (+1, M16 043-POSTERS): the membership wiring re-deposits the info record through
     // the publishing wiring (late-bound, like pruneAllPosts) — a seam only the root can pass.
-    rules: { "max-lines": ["error", { max: 1483, skipBlankLines: false, skipComments: false }] },
+    // 1,483 → 1,487 (+4, device pairing): the pairing store is built from the session DB handle
+    // the root holds and is shared by registration and the pairing handlers.
+    rules: { "max-lines": ["error", { max: 1487, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/daemon-handle.ts"],
@@ -470,7 +472,8 @@ export default [
   },
   {
     files: ["core/daemon/src/operator-guidance.ts"],
-    rules: { "max-lines": ["error", { max: 51, skipBlankLines: false, skipComments: false }] },
+    // 51 → 54 (+3, device pairing): the four directory refusals whose guidance is passed through verbatim.
+    rules: { "max-lines": ["error", { max: 54, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/disconnect-cleanup.ts"],

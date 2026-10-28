@@ -41,10 +41,7 @@ export const registrationGuidance = (reason: string, detail?: string): string =>
       return detail
         ? `The FROST DKG ceremony with the directory failed: ${detail}`
         : "The FROST DKG ceremony with the directory failed, and no underlying cause was captured. Check the daemon log for registration.dkg.failed, which carries the reason.";
-    case "CREDENTIAL_INVALID":
-    case "AGENT_CAP_REACHED":
-    case "ACCOUNT_CHECK_FAILED":
-    case "account_unresolved":
+    case "CREDENTIAL_INVALID": case "AGENT_CAP_REACHED": case "ACCOUNT_CHECK_FAILED": case "account_unresolved":
       // The directory's own sentence for the person; a prefix adds nothing.
       return detail ?? `Registration failed: ${reason}. Check the daemon logs (registration.* events).`;
     case "timeout":
