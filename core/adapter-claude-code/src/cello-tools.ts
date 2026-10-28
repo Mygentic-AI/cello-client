@@ -222,7 +222,7 @@ server.tool("cello_attestations_rights", "List the rights to review (permission 
   return jsonText(result);
 });
 
-server.tool("cello_attestations_claim_service", "File a service-received claim for a sealed session that earned you NO review right — the provider never marked a service event. It grants you no right. It records that you say you received the service and counts against the provider's namespace as an unmarked claim, which anyone can see with the activity counts, until the provider marks a service event for that session. One claim per session+namespace. Use the namespace the counterparty named in the offer notice at session open.", {
+server.tool("cello_attestations_claim_service", "File a service-received claim (your statement that this provider served you but did not give you a right to review) for a sealed session in which the provider never marked a service event. It grants you no right to review. It adds one to the provider's unmarked-claims count for that namespace, which anyone can see in its activity counts, and the provider cannot clear it. One claim per session and namespace. Use the namespace the provider named in the offer notice at session open.", {
   cello_session_id: z.string().describe("The sealed session's id, as cello_sessions reports it"),
   namespace: z.string().describe("The counterparty's namespace the right was owed in, e.g. reviews.prop_8821"),
 }, async ({ cello_session_id, namespace }) => {
