@@ -2903,6 +2903,33 @@ export class AgentRelayClient {
         }
         return { ok: false, reason: refusal.reason };
       }
+      /**
+       * 017-SEAL — A RATE-LIMITED SIGN-IN IS BACK-PRESSURE, NOT AN OUTAGE, and it must reach the
+       * caller WEARING ITS OWN NAME.
+       *
+       * The relay refuses the auth handshake `rate_limited` (with a `retry_after_ms`) once this
+       * agent has signed in more than the window allows — a provider that opens and seals more than
+       * twenty sessions a minute hits it on the sign-in its next SEAL leaf needs. `#authenticate`
+       * stores that classified refusal, but every refusal the boundary could not name locally used
+       * to collapse to `relay_unavailable` here — and `relay_unavailable` is precisely the reason
+       * `close-session-handler` falls back to the directory-only seal. Both parties fell back at
+       * once and then refused each other's co-sign, so the seal never completed (measured 017-SEAL
+       * Step 0: `relay.auth.rate_limited` at the stuck session, `seal_rejected_by_counterparty` on
+       * both closes).
+       *
+       * Returning `rate_limited` with the relay's own window hands this to the `#doSubmit` throttle
+       * loop below, which waits the window out and resubmits — the sign-in succeeds on the retry and
+       * the seal takes the ordinary relay-witnessed path. It never reaches the directory-only
+       * fallback. A throttle is self-clearing and the relay said when; this is the one refusal that
+       * is safely retried rather than surfaced.
+       */
+      if (refusal?.reason === "rate_limited") {
+        return {
+          ok: false,
+          reason: "rate_limited",
+          ...(refusal.retryAfterMs !== undefined ? { retry_after_ms: refusal.retryAfterMs } : {}),
+        };
+      }
       return { ok: false, reason: "relay_unavailable" };
     }
 
