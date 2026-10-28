@@ -50,11 +50,11 @@ Registration is a CLI flow. The MCP tools operate an agent that already exists.
 ```bash
 cello login                                  # start the local daemon
 cello create-agent alice                     # step 1: create the identity on this machine
-cello register-agent alice CELLO-XXXX...     # step 2: publish it to the directory
+cello register-agent alice                   # step 2: publish it to the directory
 cello status
 ```
 
-Get the agent token from **@CelloConnectBot** on Telegram (format `CELLO-` + 33 characters, single-use, valid 24h). The first time you message the bot it asks for your *waitlist* token — a separate, one-time grant from being admitted to a launch cohort at https://celloprotocol.com/waitlist. `cello --help` lists every command with a description.
+The first registration on a machine prints a link and a code: open it on any device, sign in with your invited email, and approve this device. Later agents register at once. `cello --help` lists every command with a description.
 
 Then, from MCP:
 

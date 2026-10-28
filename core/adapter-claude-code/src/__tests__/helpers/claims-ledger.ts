@@ -1082,19 +1082,6 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   },
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
-    claim: "'Quoting is only needed if a value contains spaces (agent names and tokens never do).'",
-    excerpts: ["(agent names and tokens never do)"],
-    enforcedBy: "structural",
-    verdict: "true",
-    evidence:
-      "Enforced by a shared charset rule rather than by convention: `protocol-types/src/moniker.ts` " +
-      "is the single home of `MONIKER_RE`, which governs agent names and monikers alike and is " +
-      "described there as a WIRE CONTRACT, and `validateMoniker` is applied on the write paths " +
-      "(`addContact`/`setContactMoniker` throw on a non-matching value). A space cannot reach a " +
-      "stored agent name, so the parenthetical is a property of the code and not advice.",
-  },
-  {
-    surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "doc propose: 'for a running log; it does NOT make the document tamper-evident.'",
     excerpts: ["it does NOT make the document tamper-evident"],
     enforcedBy: "nobody-yet",
@@ -1396,34 +1383,6 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
       "the delivery path. Counted here rather than reworded because stating accurately what a " +
       "protection does still spends claim vocabulary, and a guard that charges for honest disclosure " +
       "teaches people to delete the disclosure.",
-  },
-  {
-    surface: "plugins/cello/skills/setup/SKILL.md",
-    claim: "The bot asks for a waitlist token once, then never asks again",
-    // The whole sentence, though only the third line carries vocabulary. Quoting just the line with
-    // the hit would leave this row's own claim half-stated, which is the arithmetic this ledger
-    // switched to verbatim excerpts to make visible.
-    excerpts: [
-      "> **Waitlist token** — what the bot asks *you* for, once, the first time you talk to it. It comes",
-      "> from being admitted to a launch cohort at **https://celloprotocol.com/waitlist**, and it is",
-      "> burned on use: after that the bot knows your Telegram account and never asks again.",
-    ],
-    verdict: "true",
-    // The gate is a waitlist/portal Lambda the ops agent calls before it will start a DKG — a party
-    // other than the operator, and not their own daemon.
-    enforcedBy: "directory",
-    evidence:
-      "Read against `trustless-cello/infra/lambda/waitlist-gate/handler.py` (cross-repo, which is why " +
-      "the file is named in full). The gate's FIRST step is `SELECT waitlist_user_id, source FROM " +
-      "telegram_accounts WHERE telegram_id = %s`; a hit proceeds without a token ever being " +
-      "considered. A successful redemption writes exactly that row — `INSERT INTO telegram_accounts " +
-      "(telegram_id, waitlist_user_id, source) VALUES (%s, %s, 'waitlist_token')` — so the second " +
-      "visit takes the short-circuit by construction, not by a branch that could be skipped. " +
-      "The 'once' half is the same guarantee from the other side: the burn is `UPDATE waitlist_tokens " +
-      "... WHERE token = %s AND used_at IS NULL AND expires_at > now() RETURNING`, one atomic " +
-      "statement, so the token cannot be redeemed twice even by two simultaneous attempts. " +
-      "M11-D5 makes the step-1 lookup serve staff overrides through the same row, so there is no " +
-      "second table and no flag that could disagree with it.",
   },
   {
     surface: "README.md",
