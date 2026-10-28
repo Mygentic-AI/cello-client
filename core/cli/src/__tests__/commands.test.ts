@@ -18,7 +18,7 @@ import { startDaemon, acquireLock, readLock, connectToDaemon, isProcessAlive, ac
 import { PassthroughGatewayClient } from "@cello-protocol/daemon/testing";
 import type { Logger, DaemonConfig } from "@cello-protocol/daemon";
 import { createServer, type Server } from "node:net";
-import { login, logout, status, register, createAgent } from "../commands.js";
+import { login, logout, status, register, createAgent, browserOpener } from "../commands.js";
 import { monikerSet, settingsGet, settingsSet, startAgent } from "../parity-commands.js";
 import {
   consortiumFingerprintShort,
@@ -457,13 +457,21 @@ describe("cli commands", () => {
       expect(result.output).toContain("Usage: cello register");
     });
 
-    // M8C-ONBOARD-ERRORS-1 (R3): a missing token gets a specific, actionable message — NOT a bare
-    // Usage dump — that names what's missing and how to get it.
-    it("returns a specific missing-token message (not a Usage dump)", async () => {
+    // No token is not an error: the daemon pairs this device. With no daemon up, that is the refusal.
+    it("an empty token is not refused client-side; it goes to the daemon to pair", async () => {
       const result = await register(tempDir, "alice", "");
       expect(result.exitCode).toBe(1);
-      expect(result.output).toContain("missing the pre-auth token");
-      expect(result.output).toContain("CELLO_PREAUTH_TOKEN");
+      expect(JSON.parse(result.output).reason).toBe("daemon_not_running");
+      expect(result.output).not.toContain("pre-auth token");
+    });
+
+    it("opens a browser only where there is one: darwin, or linux with a display and not over SSH", () => {
+      expect(browserOpener("darwin", {})).toBe("open");
+      expect(browserOpener("linux", { DISPLAY: ":0" })).toBe("xdg-open");
+      expect(browserOpener("linux", { WAYLAND_DISPLAY: "wayland-0" })).toBe("xdg-open");
+      expect(browserOpener("linux", { DISPLAY: ":0", SSH_CONNECTION: "1.2.3.4 22 5.6.7.8 22" })).toBeNull();
+      expect(browserOpener("linux", {})).toBeNull();
+      expect(browserOpener("win32", { DISPLAY: ":0" })).toBeNull();
     });
 
     // M8C-ONBOARD-ERRORS-1 (R4): a malformed token is caught client-side with a specific message,

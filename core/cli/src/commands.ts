@@ -3,6 +3,7 @@
  */
 
 import { join } from "node:path";
+import { spawn } from "node:child_process";
 import { CO_OWNERSHIP_NOTE } from "@cello-protocol/protocol-types";
 import { screenerState, screenerModelDir, runtimeAvailable } from "@cello-protocol/gateway";
 import { DOWNLOAD_MB } from "./screener-commands.js";
@@ -454,11 +455,42 @@ function hasCapabilityShape(value: string): boolean {
   }
 }
 
+/**
+ * The OS opener for the approve link, or null where there is no browser to open: a Linux machine
+ * with no display, or any session over SSH. Opening is best effort and never blocks the wait.
+ */
+export function browserOpener(
+  platform: NodeJS.Platform = process.platform,
+  env: Record<string, string | undefined> = process.env,
+): string | null {
+  if (platform === "darwin") return "open";
+  if (platform === "linux" && (env["DISPLAY"] || env["WAYLAND_DISPLAY"]) && !env["SSH_CONNECTION"]) return "xdg-open";
+  return null;
+}
+
+function openBrowser(url: string): void {
+  const cmd = browserOpener();
+  if (!cmd) return;
+  try {
+    const child = spawn(cmd, [url], { detached: true, stdio: "ignore" });
+    child.on("error", () => {});
+    child.unref();
+  } catch {
+    // Best effort: the link is already printed.
+  }
+}
+
+/** `KQ7M4TXP` → `KQ7M-4TXP`, the way the approval page shows it. */
+function displayCode(code: string): string {
+  return code.length === 8 ? `${code.slice(0, 4)}-${code.slice(4)}` : code;
+}
+
 export async function register(
   celloDir: string,
   agent: string,
   preAuthToken: string,
   phoneStub = "",
+  onProgress?: (line: string) => void,
 ): Promise<CommandResult> {
   // M8C-ONBOARD-ERRORS-1 (R3/R4): specific, actionable errors on the core onboarding path — never a
   // bare Usage dump, never a pointless DKG round-trip to a generic dkg_failed for an obviously
@@ -475,13 +507,7 @@ export async function register(
   });
 
   if (!agent) {
-    return fail("missing_agent_name", "You didn't name an agent to register. Usage: cello register-agent <agent> <pre-auth-token>. See your agents with 'cello status'.");
-  }
-  if (!preAuthToken) {
-    return fail(
-      "missing_preauth_token",
-      `You're missing the pre-auth token. Get a single-use token from the CELLO Operations Agent on Telegram, then run:\n  cello register-agent ${agent} <token>\nor set it in the environment:\n  CELLO_PREAUTH_TOKEN=<token> cello register-agent ${agent}\nThe token is single-use and expires in 24 hours.`,
-    );
+    return fail("missing_agent_name", "You didn't name an agent to register. Usage: cello register-agent <agent> [pre-auth-token]. See your agents with 'cello status'.");
   }
   // Client-side gate on the STABLE brand prefix only (real tokens are "CELLO-" + 33 base58 chars).
   // Checking just the prefix catches the common typo (pasting the literal words "CELLO_PREAUTH_TOKEN")
@@ -503,8 +529,8 @@ export async function register(
   // on it, and adding a package to the operator's install for a paste-error guard is the wrong
   // trade. The signature, the issuer and the validity window stay the directory's to verify — this
   // must never become a second authority on whether a capability is valid.
-  const looksLikeCapability = hasCapabilityShape(preAuthToken);
-  if (!looksLikeCapability && !preAuthToken.startsWith("CELLO-") && !preAuthToken.startsWith("DEV-")) {
+  const looksLikeCapability = preAuthToken !== "" && hasCapabilityShape(preAuthToken);
+  if (preAuthToken !== "" && !looksLikeCapability && !preAuthToken.startsWith("CELLO-") && !preAuthToken.startsWith("DEV-")) {
     return fail(
       "malformed_preauth_token",
       "That doesn't look like a pre-auth token or capability — tokens start with 'CELLO-' followed by 33 characters, and a capability is a long base64url blob. (Did you paste the words 'CELLO_PREAUTH_TOKEN' instead of the value itself?) Get one from the CELLO Operations Agent on Telegram, then retry.",
@@ -522,8 +548,24 @@ export async function register(
     // `primary_pubkey` the threshold (FROST group) key the directory co-signs with. The key a person
     // hands to others is the agent's own K_local key, which is what `cello agents` lists. Read it
     // from the same list, over the same connection, so the two outputs can never disagree.
-    const { result, sharePubkey } = await withIpc(lock.socketPath, async (client) => {
-      const reg = (await client.send("cello_register", { agent, preAuthToken, phoneStub })) as {
+    type RegisterReply = { ok: boolean; reason?: string; guidance?: string; agent_id?: string; primary_pubkey?: string };
+    const { result, sharePubkey } = await withIpc(lock.socketPath, async (client): Promise<{ result: RegisterReply; sharePubkey: string | undefined }> => {
+      if (!preAuthToken) {
+        // No token: this device presents its own credential, pairing first if it has none.
+        const start = (await client.send("cello_pair_start")) as {
+          ok: boolean; paired?: boolean; reason?: string; guidance?: string; pairing_code?: string; approve_url?: string;
+        };
+        if (!start.ok) return { result: start, sharePubkey: undefined };
+        if (start.paired === false) {
+          onProgress?.(`Open ${start.approve_url} and enter ${displayCode(start.pairing_code ?? "")}`);
+          onProgress?.("Approve it there, on this machine or any other. The code expires in 10 minutes. Waiting...");
+          openBrowser(start.approve_url ?? "");
+          const done = (await client.send("cello_pair_await")) as { ok: boolean; reason?: string; guidance?: string };
+          if (!done.ok) return { result: done, sharePubkey: undefined };
+          onProgress?.("This device is paired.");
+        }
+      }
+      const reg = (await client.send("cello_register", { agent, phoneStub, ...(preAuthToken ? { preAuthToken } : {}) })) as {
         ok: boolean;
         reason?: string;
         guidance?: string;

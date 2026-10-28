@@ -789,7 +789,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "Usage: cello create-agent <name>  — create a new LOCAL agent identity (does not touch the directory).\n" +
       // MONIKER-0 AC2: the regex text is DERIVED from the shared constant, never hand-typed.
       `  Name rule: 1–64 characters, letters/digits/'-'/'_' only, no spaces (regex ${MONIKER_RE.source}).\n` +
-      "  Next step: 'cello register-agent <name> <pre-auth-token>' to register it with the directory.",
+      "  Next step: 'cello register-agent <name>' to register it with the directory.",
     async run(ctx, args) {
       return legacy(await createAgent(ctx.celloDir, args[0] ?? ""));
     },
@@ -799,11 +799,11 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
     group: "Setup",
     summary: "Publish an agent to the directory so others can reach it. Step 2 of 2.",
     help:
-      "Usage: cello register-agent <agent> <pre-auth-token>  — register a LOCAL agent with the directory.\n" +
-      "  The two-step onboarding: (1) 'cello create-agent <name>' makes the identity on this machine; (2) 'cello register-agent <name> <token>' publishes it to the directory so others can find and reach it.\n" +
-      "  The token is a single-use pre-authorization ticket from the CELLO Operations Agent on Telegram, format 'CELLO-' + 33 characters, valid 24h.\n" +
-      "  Example:  cello register-agent alice CELLO-3xY7...\n" +
-      "  Env-var form (avoids retyping):  CELLO_PREAUTH_TOKEN=CELLO-3xY7... cello register-agent alice\n" +
+      "Usage: cello register-agent <agent> [pre-auth-token]  — register a LOCAL agent with the directory.\n" +
+      "  The two-step onboarding: (1) 'cello create-agent <name>' makes the identity on this machine; (2) 'cello register-agent <name>' publishes it to the directory so others can find and reach it.\n" +
+      "  With no token, the first registration on this machine shows a link to approve this device; later ones need nothing.\n" +
+      "  Example:  cello register-agent alice\n" +
+      "  A pre-auth token, if you have one, still works:  cello register-agent alice CELLO-3xY7...  (or CELLO_PREAUTH_TOKEN=CELLO-3xY7... cello register-agent alice)\n" +
       "  Quoting is only needed if a value contains spaces (agent names and tokens never do).",
     async run(ctx, args) {
       // cello register-agent <agent> [preAuthToken]  (token falls back to CELLO_PREAUTH_TOKEN so it
@@ -811,7 +811,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       const agent = args[0] ?? "";
       const preAuthToken = args[1] ?? process.env.CELLO_PREAUTH_TOKEN ?? "";
       const phoneStub = args[2] ?? "";
-      return legacy(await register(ctx.celloDir, agent, preAuthToken, phoneStub));
+      return legacy(await register(ctx.celloDir, agent, preAuthToken, phoneStub, ctx.onProgress));
     },
   },
   {
