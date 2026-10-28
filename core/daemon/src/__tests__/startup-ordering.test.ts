@@ -338,7 +338,17 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // 127 → 131 for device pairing: `registerPairingHandlers` (daemon.ts), `ensurePairingSchema`
     // (pairing-store.ts), `openPairing` and `pollOnce` (pairing-handler.ts). Unwired, a person with no
     // token can never pair and never register. All four land in `checked`, not EXEMPT.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(131);
+    // 131 → 133 for M10E 003-NSCLIENT: `createNamespace` (attestation-namespaces.ts) and
+    // `registerAttestationNamespaceHandlers` (attestation-namespace-handlers.ts). Both land in
+    // `checked` — createNamespace is called from the handlers module, the handlers module is
+    // registered from signal-handlers.ts.
+    // 133 → 134 for M10E 007-NOTICES's `makeAttestationNoticer` (attestation-notices.ts). It lands in
+    // `checked` — daemon.ts calls it to build the customer's offer/no-right noticer. Unwired it is
+    // silent in this corpus's own way: no session would ever leave an offer or a no-right notice, so a
+    // customer would never learn a review right was due — every suite green.
+    // 134 → 135 for M10E 007's review fix: `wireAttestationNoticer` (attestation-wiring.ts), which
+    // moved the noticer's composition out of daemon.ts. It is called from daemon.ts, so it is wired.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(135);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",

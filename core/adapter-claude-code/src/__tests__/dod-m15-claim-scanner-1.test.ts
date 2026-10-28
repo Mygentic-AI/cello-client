@@ -221,7 +221,7 @@ const UNADJUDICATED_BASELINE: Record<string, number> = {
   //     not who may issue. Nothing in `core/` refuses a self-attestation; either the portal does or
   //     nothing does. It went back in the backlog rather than staying quietly true, which is why
   //     this number is 4 and not 3.
-  "core/cli/src/registry.ts (operator-facing strings)": 4,
+  "core/cli/src/registry.ts (operator-facing strings)": 3,
   "plugins/cello/agents/cello-receptionist.md": 8,
   "plugins/cello/skills/cello/SKILL.md": 29,
   "plugins/cello/skills/receptionist/SKILL.md": 11,

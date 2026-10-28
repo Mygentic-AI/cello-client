@@ -31,7 +31,7 @@
  * IN MEMORY, FOR THE LIFE OF THE PROCESS, and stated rather than implied. The queue holds sealed
  * ciphertext, and persisting it would mean a new table, a client-side migration, and a blob at rest
  * whose retention outlives the intake key it is sealed to. A daemon restart therefore loses the
- * pending retries — the operator sees them disappear from `cello_attestations_issued` rather than
+ * pending retries — the operator sees them disappear from `cello_endorsements_issued` rather than
  * seeing a lie, they are NAMED in the log on the way out (`retry.dropped_on_shutdown`), and
  * re-submitting is safe by the same content-derived id.
  *
@@ -244,7 +244,7 @@ const DEFAULT_QUEUE_CAP = 32;
 const RETRYING_GUIDANCE =
   "The daemon is retrying this submission on its own — it is sealed and held, and it goes out as " +
   "soon as the directory signaling stream is back. You do not need to send it again. Run " +
-  "cello_attestations_issued to see where it got to. It is held IN MEMORY: if the daemon restarts " +
+  "cello_endorsements_issued to see where it got to. It is held IN MEMORY: if the daemon restarts " +
   "before it lands, it is gone and you will have to write it again — re-sending is safe either way, " +
   "the submission id is derived from the content.";
 
@@ -252,7 +252,7 @@ function gaveUpGuidance(reason: SubmissionGiveUpReason, last: SubmissionSendFail
   const shared =
     "Nothing was minted and nothing was recorded at a directory. Re-submitting is safe — the " +
     "submission id is derived from the content, so a re-send is stored once, not twice — but the " +
-    "text is not kept on this machine, so you have to write it again: run cello_attestations_issue " +
+    "text is not kept on this machine, so you have to write it again: run cello_endorsements_issue " +
     "with the same subject.";
   switch (reason) {
     case "attempts_exhausted":
@@ -426,7 +426,7 @@ export class SubmissionRetryQueue {
 
   /**
    * What this agent still has in flight, and what was given up on. Read by `wallet_list_issued`,
-   * which is the surface behind `cello_attestations_issued` — the verb whose whole question is
+   * which is the surface behind `cello_endorsements_issued` — the verb whose whole question is
    * "what happened to what I sent?".
    */
   list(agentId: string): PendingSubmissionView[] {
@@ -688,7 +688,7 @@ export class SubmissionRetryQueue {
       // WHY it stopped, not just that it did — "we ran out of tries" and "the network never came
       // back" lead to different operator actions.
       stoppedBecause: because,
-      impact: "this trust signal reached no directory node; it is visible as gave_up in cello_attestations_issued",
+      impact: "this trust signal reached no directory node; it is visible as gave_up in cello_endorsements_issued",
     });
     this.#armIfWork();
   }

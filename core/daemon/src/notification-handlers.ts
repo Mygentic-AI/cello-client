@@ -9,6 +9,7 @@
  * Which is why it is poll-only and reads the store: a reconciler that depended on the same channel
  * it exists to backstop would be no reconciler at all.
  */
+import { AttestationNotices, attestationNoticesField } from "./attestation-notices.js";
 import type { IpcHandler } from "./ipc-server.js";
 import { REFUSAL_COUNT_GUIDANCE, REFUSAL_GUIDANCE, REFUSAL_KIND_GUIDANCE, type RefusalKind } from "./refusal-reasons.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
@@ -47,14 +48,26 @@ export interface NotificationHandlerDeps {
   documentNotices?: (ownerAgentId: string) => Array<{ documentId: string; pending: number; noticedAtMs: number }>;
   /** Owner key for an agent NAME — document rows are keyed by the owner's pubkey, never the name. */
   ownerKeyFor?: (agentName: string) => string | null;
+  /**
+   * M10E 007-NOTICES: the customer's offer/no-right notices, surfaced in the inbox the way refusals
+   * are — the door for an agent nobody is attending. Drained once (single `delivered` flag), so
+   * whichever door reads first shows it. Optional: omitted, the field never appears.
+   */
+  attestationNotices?: AttestationNotices;
 }
 
 export function registerNotificationHandlers(deps: NotificationHandlerDeps): void {
   const {
     handlers, logger, sessionNodeManager, getConnState, resolveCurrentAgent,
     loadedAgents, agents: allAgents, reapExpiredInboundSessions, inboundSessionQueues, expiredSessionRequests, refusedSessionRequests,
-    documentNotices, ownerKeyFor,
+    documentNotices, ownerKeyFor, attestationNotices,
   } = deps;
+
+  /** M10E 007-NOTICES: the customer's offer/no-right notices for an agent, for the inbox door. */
+  function attestationNoticeSection(agentName: string): Record<string, unknown> {
+    if (!attestationNotices) return {};
+    return attestationNoticesField(attestationNotices, sessionNodeManager.resolveAgentId(agentName));
+  }
 
   /** The document half of an agent's inbox, or nothing when no document layer is wired. */
   function documentSection(agentName: string): Record<string, unknown> {
@@ -501,6 +514,7 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
           unread,
           total_unread, rename_notices, ...documentSection(agent), ...witnessSection(agent),
           ...refusalSection(agent, connectionId),
+          ...attestationNoticeSection(agent),
           // DOD-SEALED-INBOX-2 + M12-P17 review F2 — BOTH properties, neither dropped in the merge.
           //
           // The rename half: `session_state` was HARDCODED to "sealed" for every row, on a list that
@@ -545,7 +559,7 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
       }
       return { agent, pending_session_requests: pending, expired_session_requests: expired,
         ...(screeningNotice && (pending.length > 0 || unread.length > 0) ? { screening_notice: screeningNotice } : {}),
-        ...pendingGuidance, ...expiredGuidance, ...(refused.length > 0 ? { refused_session_requests: refused } : {}), ...(knocks.length > 0 ? { knocks } : {}), unread, total_unread, rename_notices, ...documentSection(agent), ...witnessSection(agent), ...refusalSection(agent, connectionId) };
+        ...pendingGuidance, ...expiredGuidance, ...(refused.length > 0 ? { refused_session_requests: refused } : {}), ...(knocks.length > 0 ? { knocks } : {}), unread, total_unread, rename_notices, ...documentSection(agent), ...witnessSection(agent), ...refusalSection(agent, connectionId), ...attestationNoticeSection(agent) };
     });
 
     const totalUnread = agents.reduce((sum, a) => sum + a.total_unread, 0);

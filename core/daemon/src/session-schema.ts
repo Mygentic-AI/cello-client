@@ -970,4 +970,73 @@ export function ensureSessionSchema(
   // would not fail here, it would fail on the first insert, which is a far worse place to find out.
   ensureTrustSignalSchema(db, logger);
 
+  // M10E 005-SVCCLIENT: the proof of every session whose assignment this daemon verified, kept so a
+  // provider can mark a service event while the session is open. Additive and keyed on agent_id,
+  // never agent_name — a mark may only be made from a proof THIS agent stored (the repo guide's
+  // stable-key rule). Appended after every existing statement; an existing database gains it empty
+  // at the next start and its prior rows are untouched.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS session_proofs (
+      agent_id   TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      proof      BLOB NOT NULL,
+      stored_at  INTEGER NOT NULL,
+      PRIMARY KEY (agent_id, session_id)
+    )
+  `);
+
+  // M10E 007-NOTICES: the one-time notices a CUSTOMER's daemon leaves itself about a counterparty's
+  // review namespaces — an `offer` at session open (naming the condition under which a right is
+  // granted) and a `no_right` at close when no right was issued. Additive and keyed on agent_id,
+  // never agent_name (the repo guide's stable-key rule). `delivered` is a single flag: a notice is
+  // surfaced once in the next receive and not after (`takeUndelivered`). Appended after every
+  // existing statement; an existing database gains it empty at the next start and its prior rows are
+  // untouched (N8).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS attestation_notices (
+      agent_id   TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      namespace  TEXT NOT NULL,
+      kind       TEXT NOT NULL CHECK (kind IN ('offer','no_right')),
+      payload    BLOB NOT NULL,
+      created_at INTEGER NOT NULL,
+      delivered  INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (agent_id, session_id, namespace, kind)
+    )
+  `);
+
+  // M10E 011-CLAIM: the reviewer's own encrypted-at-rest copy of a review it wrote (spec 6.4). The
+  // whole database is SQLCipher, so storing the AttestationPayload bytes here IS the encrypted copy —
+  // and keeping it is deliberate, unlike an endorsement's body: this is the author's record of their
+  // OWN review, and `cello attestations written` reads it back to show where each submission got to.
+  // Keyed on agent_id + submission_id (the content-derived handle), never agent_name (the repo
+  // guide's stable-key rule). Additive; an existing database gains it empty at the next start (N8).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS claimed_attestations (
+      agent_id       TEXT NOT NULL,
+      submission_id  TEXT NOT NULL,
+      right_id       TEXT NOT NULL,
+      subject_pubkey TEXT NOT NULL,
+      payload        BLOB NOT NULL,
+      created_at     INTEGER NOT NULL,
+      PRIMARY KEY (agent_id, submission_id)
+    )
+  `);
+
+  // M10E 013-PRIVATE: a reader-list change notice from the directory, kept until the next receive
+  // shows it. Its own table because `attestation_notices.kind` is CHECK-constrained and an existing
+  // database cannot widen that without a rebuild. One row per (owner, namespace, version), so a
+  // re-delivered pickup stores nothing new. Keyed on agent_id. Additive (N8).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS attestation_reader_notices (
+      agent_id   TEXT NOT NULL,
+      owner      TEXT NOT NULL,
+      namespace  TEXT NOT NULL,
+      version    INTEGER NOT NULL,
+      payload    BLOB NOT NULL,
+      created_at INTEGER NOT NULL,
+      delivered  INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (agent_id, owner, namespace, version)
+    )
+  `);
 }

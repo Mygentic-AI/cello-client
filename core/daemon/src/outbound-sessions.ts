@@ -26,6 +26,7 @@ import { classifyOnlineResult, type DiscoveryOutcome } from "./cross-node-negoti
 import { parseDiscoveryLookupResult, discoveryLookupErrorReason, parseSessionAssignment, sessionRequestErrorReason, sessionRequestErrorGuidance, resolveOutboundMoniker } from "./session-assignment-parser.js";
 import { DbIdentityStore } from "./db-identity-store.js";
 import { verifyAssignmentSignature } from "./assignment-verify.js";
+import { persistSessionProof } from "./attestation-session-proof.js";
 import { createSignalingConnect } from "./signaling-connect.js";
 import type { IDirectoryChallengeVerifier } from "@cello-protocol/transport";
 import { wireSessionCeremonyHandler, wireSealCeremonyHandler } from "./session-ceremony.js";
@@ -37,6 +38,12 @@ import { extractErrorMessage } from "./error-message.js";
 export interface OutboundSessionDeps {
   logger: Logger;
   sessionNodeManager: SessionNodeManager;
+  /**
+   * M10E 007-NOTICES: fired after the initiator keeps the session proof, so the customer's daemon can
+   * look up the counterparty's open public namespaces and leave offer notices. Fire-and-forget by
+   * contract — it must never delay or fail the session.
+   */
+  onSessionOpened?: (agentName: string, sessionIdHex: string, counterpartyPubkeyHex: string) => void;
   getKeyProvider: (agentName: string) => KeyProvider | undefined;
   getPersistence: (agentName: string) => DbRegistrationPersistence;
   getAgentSignaling: (agentName: string, keyProvider: KeyProvider, pubkeyHex: string) => { signaling: SignalingManager; getNode: () => CelloNode | null };
@@ -530,6 +537,41 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
        * first.
        */
       const verified = await verifyAssignmentSignature(assignment, getPersistence(agentName), logger, agentName, correlationId);
+      // M10E 005-SVCCLIENT — keep the proof of every session we verified, so this agent can mark a
+      // service event while the session is open. Gated on ok inside persistSessionProof (a failed
+      // verification stores nothing). The WHOLE block is wrapped: resolving the db or the agent id
+      // must never throw into the session path — keeping the proof is best-effort, and a session that
+      // cannot store it still opens; only a later mark of it is refused `no_session_proof`.
+      if (assignment.signature_type === "frost" && verified.ok) {
+        try {
+          persistSessionProof(
+            sessionNodeManager.getDb(),
+            sessionNodeManager.resolveAgentId(agentName),
+            Buffer.from(assignment.session_id).toString("hex"),
+            assignment,
+            verified,
+            Date.now,
+            logger,
+            correlationId,
+          );
+        } catch (err: unknown) {
+          logger.error("attestation.session_proof.store_failed", {
+            session_id: Buffer.from(assignment.session_id).toString("hex"), reason: extractErrorMessage(err),
+          });
+        }
+        // M10E 007-NOTICES: the customer (initiator) leaves itself offer notices for the
+        // counterparty's open public namespaces. The counterparty is participant B (the target).
+        // Fire-and-forget: a throw here must never reach the session path.
+        try {
+          deps.onSessionOpened?.(
+            agentName,
+            Buffer.from(assignment.session_id).toString("hex"),
+            Buffer.from(assignment.participant_b.pubkey).toString("hex").toLowerCase(),
+          );
+        } catch (err: unknown) {
+          logger.debug("attestation.notice.lookup_skipped", { session_id: Buffer.from(assignment.session_id).toString("hex"), reason: extractErrorMessage(err) });
+        }
+      }
       if (!verified.ok) {
         return { ok: false, reason: verified.reason, guidance: verified.guidance };
       }

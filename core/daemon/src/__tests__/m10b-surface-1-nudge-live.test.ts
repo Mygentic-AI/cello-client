@@ -105,26 +105,27 @@ describe("DOD-END-SURFACE-1 — the pending-consent nudge, over a live daemon", 
  */
 describe("DOD-ONBOARD-HELP-1 §5 — every *_guidance key is renderable, whatever its prefix", () => {
   it("rewrites pending_consent_guidance for a CLI caller", () => {
+    // 008-ENDRENAME: the dual-surface name is cello_endorsement_consent_list, so that is what renders.
     const out = renderForSurface(
-      { ok: true, pending_consent: 3, pending_consent_guidance: "Run cello_attestation_consent_list to read them." },
+      { ok: true, pending_consent: 3, pending_consent_guidance: "Run cello_endorsement_consent_list to read them." },
       "cli",
     ) as Record<string, unknown>;
-    expect(out.pending_consent_guidance).toBe("Run cello attestation-consent list to read them.");
+    expect(out.pending_consent_guidance).toBe("Run cello endorsement-consent list to read them.");
   });
 
   it("rewrites an arbitrary NEW *_guidance key — the fix closes the class, not the instance", () => {
     // A key nobody has written yet. If this fails, someone narrowed the rule back to a literal set
     // and the next handler to invent a key will ship the same defect.
     const out = renderForSurface(
-      { ok: false, quota_guidance: "Run cello_attestation_consent_accept to decide." },
+      { ok: false, quota_guidance: "Run cello_endorsement_consent_accept to decide." },
       "cli",
     ) as Record<string, unknown>;
-    expect(out.quota_guidance).toBe("Run cello attestation-consent accept to decide.");
+    expect(out.quota_guidance).toBe("Run cello endorsement-consent accept to decide.");
   });
 
   it("still leaves `reason` alone — scripts branch on it", () => {
-    const out = renderForSurface({ ok: false, reason: "cello_attestation_consent_accept" }, "cli") as Record<string, unknown>;
-    expect(out.reason).toBe("cello_attestation_consent_accept");
+    const out = renderForSurface({ ok: false, reason: "cello_endorsement_consent_accept" }, "cli") as Record<string, unknown>;
+    expect(out.reason).toBe("cello_endorsement_consent_accept");
   });
 });
 
@@ -136,7 +137,7 @@ describe("DOD-ONBOARD-HELP-1 §5 — every *_guidance key is renderable, whateve
  * verbs DEAD on both surfaces for exactly that reason. These drive a real socket and assert on the
  * responses.
  */
-describe("DOD-END-SURFACE-1 — cello_attestations_issue, over a live daemon", () => {
+describe("DOD-END-SURFACE-1 — cello_endorsements_issue, over a live daemon", () => {
   let handle: DaemonHandle | undefined;
   let tempDir: string | undefined;
   const clients: IpcClient[] = [];
@@ -170,7 +171,7 @@ describe("DOD-END-SURFACE-1 — cello_attestations_issue, over a live daemon", (
 
   it("is REGISTERED — the handler exists under the name both surfaces call", async () => {
     const c = await client();
-    const res = (await c.send("cello_attestations_issue", {})) as Record<string, unknown>;
+    const res = (await c.send("cello_endorsements_issue", {})) as Record<string, unknown>;
     // An unregistered method would come back as an unknown-method error rather than the handler's
     // own verdict. Reaching `no_current_agent` proves the handler ran.
     expect(res.reason).toBe("no_current_agent");
@@ -180,7 +181,7 @@ describe("DOD-END-SURFACE-1 — cello_attestations_issue, over a live daemon", (
     const c = await client();
     // With no agent selected the selection guard fires first, so this cannot assert the subject
     // gate directly — but it CAN assert the handler does not reject the parameter shape itself.
-    const res = (await c.send("cello_attestations_issue", {
+    const res = (await c.send("cello_endorsements_issue", {
       subject_pubkey: "ab".repeat(32), body: "worked with them on the migration",
     })) as Record<string, unknown>;
     expect(res.ok).toBe(false);

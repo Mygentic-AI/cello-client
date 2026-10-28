@@ -51,6 +51,33 @@ describe("DOD-ONBOARD-HELP-1 §2b — the vocabulary obeys its own rule", () => 
     expect(new Set(cliNames).size).toBe(cliNames.length);
   });
 
+  it("E6 (008-ENDRENAME): every new endorsement MCP name maps to its new CLI name", () => {
+    const want: Record<string, string> = {
+      cello_endorsements_issue: "cello endorsements issue",
+      cello_endorsements_issued: "cello endorsements issued",
+      cello_endorsement_consent_list: "cello endorsement-consent list",
+      cello_endorsement_consent_accept: "cello endorsement-consent accept",
+      cello_endorsement_consent_refuse: "cello endorsement-consent refuse",
+    };
+    const byMcp = new Map(DUAL_SURFACE_VERBS.map((v) => [v.mcp, v.cli]));
+    for (const [mcp, cli] of Object.entries(want)) {
+      expect(byMcp.get(mcp), `${mcp} must be a dual-surface verb`).toBe(cli);
+    }
+    // The pre-rename names leave DUAL_SURFACE (their CLI twin is now a rename-stub) but stay known as
+    // deprecated aliases, so the shim may register them and the audit tolerates them.
+    const known = knownToolNames();
+    for (const old of [
+      "cello_attestations_issue",
+      "cello_attestations_issued",
+      "cello_attestation_consent_list",
+      "cello_attestation_consent_accept",
+      "cello_attestation_consent_refuse",
+    ]) {
+      expect(byMcp.has(old), `${old} must NOT be a dual-surface verb any more`).toBe(false);
+      expect(known.has(old), `${old} must stay known as a deprecated alias`).toBe(true);
+    }
+  });
+
   it("the old, pre-rename tool names are GONE from the vocabulary", () => {
     const stale = [
       "cello_list_agents",

@@ -57,8 +57,8 @@ function makeHandler(loadedAgents: LoadedAgent[], selected: string): Handler {
     getConnState: () => ({ currentAgent: selected }),
   } as unknown as SignalHandlerDeps;
   registerSignalHandlers(deps);
-  const h = handlers.get("cello_attestations_issue");
-  if (!h) throw new Error("cello_attestations_issue is not registered");
+  const h = handlers.get("cello_endorsements_issue");
+  if (!h) throw new Error("cello_endorsements_issue is not registered");
   return h as Handler;
 }
 

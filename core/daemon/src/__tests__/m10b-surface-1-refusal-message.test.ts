@@ -17,8 +17,8 @@ describe("M10B-D4 — refusing with a message", () => {
   // changed; the property asserted below did not.
   const daemon = readFileSync(resolve(here, "../signal-handlers.ts"), "utf8");
   const handler = (() => {
-    const start = daemon.indexOf('handlers.set("cello_attestation_consent_refuse"');
-    expect(start, "cello_attestation_consent_refuse is registered").toBeGreaterThan(-1);
+    const start = daemon.indexOf('handlers.set("cello_endorsement_consent_refuse"');
+    expect(start, "cello_endorsement_consent_refuse is registered").toBeGreaterThan(-1);
     const next = daemon.indexOf("handlers.set(", start + 1);
     return daemon.slice(start, next === -1 ? daemon.length : next);
   })();

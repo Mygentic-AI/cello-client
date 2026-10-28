@@ -865,21 +865,417 @@ export async function sessions(
  *  daemon-wide bot credentials (narrow, dedicated surface; NOT folded into the parked `cello
  *  config`, since a bot token has no sensible default and can't wait for M9-CFG-001). */
 /**
- * `cello attestations` — YOUR words about ANOTHER agent, and what became of them.
+ * `cello attestations` — the M10E REVIEW system (008-ENDRENAME).
  *
- * SEPARATE FROM `trust-signals` ON PURPOSE. On the wire an attestation IS a trust signal, so folding
- * the two together is the obvious move — and it is the wrong one. A trust signal is the NETWORK
- * verifying an attribute of yours; an attestation is a PERSON vouching for a PERSON. That second
- * thing is the primitive collaboration rests on, and filing it as a subcommand of a wallet listing
- * makes the most important capability the hardest one to find.
- *
- * Subcommands:
- *   issue <pubkey> <text…>  — attest to something you have seen them do
- *   issued                  — what happened to the ones you wrote
- *
- * The receiving direction — what others wrote about YOU — is `cello attestation-consent`.
+ * Namespaces, service-event marks, rights, the owner index, claim-service and activity counts — a
+ * review earned at a service event, which nothing can refuse or withdraw. The person-to-person
+ * ENDORSEMENT (vouch + accept/refuse) that used to live under `issue`/`issued` here is now
+ * `cello endorsements`; those two sub-verbs refuse with a rename line.
  */
 export async function attestations(
+  celloDir: string,
+  sub: string,
+  args: string[],
+): Promise<CommandResult> {
+  // 008-ENDRENAME — `issue`/`issued` are the person-to-person ENDORSEMENT, now `cello endorsements`.
+  // A CLI is typed by a person, so point them at the new name and act on nothing, rather than
+  // silently aliasing. The MCP tools keep deprecated aliases; a typed command does not need one.
+  if (sub === "issue" || sub === "issued") {
+    return { exitCode: 1, output: `renamed: use \`cello endorsements ${sub}\`` };
+  }
+  const lockFilePath = join(celloDir, "daemon.lock");
+  const lock = await readLock(lockFilePath);
+  if (!lock) {
+    return { exitCode: 1, output: "No daemon running. Run 'cello login' first." };
+  }
+
+  // M10E 003-NSCLIENT — attestation namespaces.
+  if (sub === "namespace") {
+    const [action, ns, ...flags] = args;
+    if (action === "create") {
+      let mode: string | undefined;
+      let condition: string | undefined;
+      let scored = false;
+      let ttl: number | undefined;
+      for (let i = 0; i < flags.length; i++) {
+        if (flags[i] === "--mode") mode = flags[++i];
+        else if (flags[i] === "--scored") scored = true;
+        else if (flags[i] === "--ttl") ttl = Number(flags[++i]);
+        else if (flags[i] === "--condition") condition = flags[++i];
+      }
+      if (!ns || !mode || !condition) {
+        return {
+          exitCode: 1,
+          output:
+            'Usage: cello attestations namespace create <ns> --mode <public|private> [--scored] [--ttl <days>] --condition "<words>"\n' +
+            "\n" +
+            "  <ns>          1–3 dotted segments, e.g. reviews.prop_8821\n" +
+            "  --mode        public (anyone reads the reviews) or private (chosen readers)\n" +
+            "  --scored      a 1–5 rating plus text; omit for text-only\n" +
+            "  --ttl         how many days a reviewer has, 7–180 (default 30)\n" +
+            "  --condition   the plain-words rule under which the right to review is granted",
+        };
+      }
+      try {
+        const params: Record<string, unknown> = { namespace: ns, mode, scored, condition };
+        if (ttl !== undefined) params.ttl_days = ttl;
+        const result = (await withIpc(lock.socketPath, (client) =>
+          client.send("cello_attestations_namespace_create", params))) as { ok: boolean; reason?: string; guidance?: string };
+        if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+        return { exitCode: 0, output: result.guidance ?? "Created." };
+      } catch (err: unknown) {
+        return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+      }
+    }
+    if (action === "close") {
+      if (!ns) return { exitCode: 1, output: "Usage: cello attestations namespace close <ns>" };
+      try {
+        const result = (await withIpc(lock.socketPath, (client) =>
+          client.send("cello_attestations_namespace_close", { namespace: ns }))) as { ok: boolean; reason?: string; guidance?: string };
+        if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+        return { exitCode: 0, output: result.guidance ?? "Closed." };
+      } catch (err: unknown) {
+        return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+      }
+    }
+    return { exitCode: 1, output: "Usage:\n  cello attestations namespace create <ns> --mode <public|private> [--scored] [--ttl <days>] --condition \"<words>\"\n  cello attestations namespace close <ns>" };
+  }
+
+  if (sub === "index") {
+    let owner: string | undefined;
+    let after: string | undefined;
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === "--after") after = args[++i];
+      else if (!args[i]!.startsWith("--")) owner = args[i];
+    }
+    try {
+      const params: Record<string, unknown> = {};
+      if (owner) params.owner_pubkey = owner;
+      if (after) params.after = after;
+      const result = (await withIpc(lock.socketPath, (client) =>
+        client.send("cello_attestations_index", params))) as {
+        ok: boolean; reason?: string; guidance?: string; next?: string | null;
+        entries?: Array<{ namespace: string; mode: string | null; template: string | null; right_ttl_days: number | null; closed_at: number | null; verified: boolean }>;
+      };
+      if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+      const entries = result.entries ?? [];
+      if (entries.length === 0) return { exitCode: 0, output: "No namespaces." };
+      const lines = entries.map((e) => {
+        const ttl = e.right_ttl_days === null ? "—" : `${e.right_ttl_days}d`;
+        const state = e.closed_at === null ? "open" : "closed";
+        const flag = e.verified ? "" : "  UNVERIFIED";
+        return `  ${e.namespace.padEnd(28)}  ${(e.mode ?? "—").padEnd(8)}  ${(e.template ?? "—").padEnd(7)}  ${ttl.padEnd(5)}  ${state}${flag}`;
+      });
+      const more = result.next ? `\n\n  More — cello attestations index ${owner ?? ""} --after ${result.next}` : "";
+      return { exitCode: 0, output: lines.join("\n") + more };
+    } catch (err: unknown) {
+      return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
+  // M10E 005-SVCCLIENT — mark a service event while a session is open.
+  if (sub === "mark") {
+    const [sessionId, ns, ...flags] = args;
+    let originChannel: string | undefined;
+    for (let i = 0; i < flags.length; i++) {
+      if (flags[i] === "--origin-channel") originChannel = flags[++i];
+    }
+    if (!sessionId || !ns) {
+      return { exitCode: 1, output: "Usage: cello attestations mark <session-id> <namespace> [--origin-channel <pubkey>]" };
+    }
+    try {
+      const params: Record<string, unknown> = { session_id: sessionId, namespace: ns };
+      if (originChannel) params.origin_channel = originChannel;
+      const result = (await withIpc(lock.socketPath, (client) =>
+        client.send("cello_attestations_mark", params))) as { ok: boolean; reason?: string; guidance?: string };
+      if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+      return { exitCode: 0, output: result.guidance ?? "Marked." };
+    } catch (err: unknown) {
+      return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
+  // M10E 005-SVCCLIENT — the rights this agent holds (expired ones shown, flagged).
+  if (sub === "rights") {
+    let after: string | undefined;
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === "--after") after = args[++i];
+    }
+    try {
+      const params: Record<string, unknown> = {};
+      if (after) params.after = after;
+      const result = (await withIpc(lock.socketPath, (client) =>
+        client.send("cello_attestations_rights", params))) as {
+        ok: boolean; reason?: string; guidance?: string; next?: string | null;
+        rights?: Array<{ right_id: string; subject_pubkey: string; namespace: string; expires_at: number; expired: boolean; template: string | null }>;
+      };
+      if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+      const rights = result.rights ?? [];
+      if (rights.length === 0) return { exitCode: 0, output: "No rights." };
+      const lines = rights.map((r) => {
+        const flag = r.expired ? "  EXPIRED" : "";
+        return `  ${r.namespace.padEnd(28)}  ${(r.template ?? "—").padEnd(7)}  ${r.subject_pubkey.slice(0, 16)}…  ${r.right_id.slice(0, 16)}…${flag}`;
+      });
+      const more = result.next ? `\n\n  More — cello attestations rights --after ${result.next}` : "";
+      return { exitCode: 0, output: lines.join("\n") + more };
+    } catch (err: unknown) {
+      return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
+  // M10E 013-PRIVATE — the readers of a PRIVATE namespace (owner only).
+  //   cello attestations readers list <ns>
+  //   cello attestations readers add|remove <ns> <pubkey>
+  if (sub === "readers") {
+    const [action, ns, pubkey] = args;
+    if (action === "list") {
+      if (!ns) return { exitCode: 1, output: "Usage: cello attestations readers list <ns>" };
+      try {
+        const result = (await withIpc(lock.socketPath, (client) =>
+          client.send("cello_attestations_readers_list", { namespace: ns }))) as {
+          ok: boolean; reason?: string; guidance?: string; version?: number | null; readers?: string[];
+        };
+        if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+        const readers = result.readers ?? [];
+        const body = readers.length === 0 ? "No readers." : readers.map((r) => `  ${r}`).join("\n");
+        return { exitCode: 0, output: `${body}\n\n  ${result.guidance ?? ""}`.trimEnd() };
+      } catch (err: unknown) {
+        return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+      }
+    }
+    if (action === "add" || action === "remove") {
+      if (!ns || !pubkey || !/^[0-9a-f]{64}$/i.test(pubkey)) {
+        return { exitCode: 1, output: `Usage: cello attestations readers ${action} <ns> <pubkey-64hex>` };
+      }
+      try {
+        const verb = action === "add" ? "cello_attestations_readers_add" : "cello_attestations_readers_remove";
+        const result = (await withIpc(lock.socketPath, (client) =>
+          client.send(verb, { namespace: ns, pubkey: pubkey.toLowerCase() }))) as { ok: boolean; reason?: string; guidance?: string };
+        if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+        return { exitCode: 0, output: result.guidance ?? "Reader list updated." };
+      } catch (err: unknown) {
+        return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+      }
+    }
+    return { exitCode: 1, output: "Usage:\n  cello attestations readers list <ns>\n  cello attestations readers add <ns> <pubkey>\n  cello attestations readers remove <ns> <pubkey>" };
+  }
+
+  // M10E 011-CLAIM — write a review for a right you hold. Text after `--`, so it can contain flags
+  // or dashes without being parsed. `cello attestations write <right-id> [--rating N] [--origin-channel pk] -- <text…>`
+  if (sub === "write") {
+    const [rightId, ...rest] = args;
+    let rating: number | undefined;
+    let originChannel: string | undefined;
+    const textParts: string[] = [];
+    for (let i = 0; i < rest.length; i++) {
+      if (rest[i] === "--rating") rating = Number(rest[++i]);
+      else if (rest[i] === "--origin-channel") originChannel = rest[++i];
+      else if (rest[i] === "--") { textParts.push(...rest.slice(i + 1)); break; }
+      else textParts.push(rest[i]!);
+    }
+    const text = textParts.join(" ").trim();
+    if (!rightId || text.length === 0) {
+      return { exitCode: 1, output: 'Usage: cello attestations write <right-id> [--rating <1-5>] [--origin-channel <pubkey>] -- <review text>' };
+    }
+    try {
+      const params: Record<string, unknown> = { right_id: rightId, text };
+      if (rating !== undefined) params.rating = rating;
+      if (originChannel) params.origin_channel = originChannel;
+      const result = (await withIpc(lock.socketPath, (client) =>
+        client.send("cello_attestations_write", params))) as { ok: boolean; reason?: string; guidance?: string };
+      if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+      return { exitCode: 0, output: result.guidance ?? "Review submitted." };
+    } catch (err: unknown) {
+      return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
+  // M10E 011-CLAIM — the reviews you have written, each with its submission outcome.
+  if (sub === "written") {
+    try {
+      const result = (await withIpc(lock.socketPath, (client) =>
+        client.send("cello_attestations_written", {}))) as {
+        ok: boolean; reason?: string; guidance?: string; results_unavailable?: string;
+        claimed?: Array<{ namespace: string; subject_pubkey: string; rating: number | null; outcome: string; submission_id: string }>;
+      };
+      if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+      const claimed = result.claimed ?? [];
+      if (claimed.length === 0) return { exitCode: 0, output: "No reviews written." };
+      const lines = claimed.map((c) => {
+        const score = c.rating === null ? "—" : `${c.rating}/5`;
+        return `  ${c.namespace.padEnd(28)}  ${c.subject_pubkey.slice(0, 16)}…  ${score.padEnd(4)}  ${c.outcome.padEnd(8)}  ${c.submission_id.slice(0, 16)}…`;
+      });
+      const note = result.results_unavailable ? `\n\n  Outcomes could not be read now (${result.results_unavailable}); they show 'pending'. Nothing is lost.` : "";
+      return { exitCode: 0, output: lines.join("\n") + note };
+    } catch (err: unknown) {
+      return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
+  // M10E 007-NOTICES — file a service-received claim for a session that earned no right.
+  if (sub === "claim-service") {
+    const [sessionId, ns] = args;
+    if (!sessionId || !ns) {
+      return { exitCode: 1, output: "Usage: cello attestations claim-service <session-id> <namespace>" };
+    }
+    try {
+      const result = (await withIpc(lock.socketPath, (client) =>
+        client.send("cello_attestations_claim_service", { session_id: sessionId, namespace: ns }))) as { ok: boolean; reason?: string; guidance?: string };
+      if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+      return { exitCode: 0, output: result.guidance ?? "Claim filed." };
+    } catch (err: unknown) {
+      return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
+  // M10E 015-READ — a buyer reads a namespace's summary from a MAJORITY of directories.
+  //   cello attestations summary <owner> <namespace>
+  if (sub === "summary") {
+    const [owner, ns] = args;
+    if (!owner || !ns) return { exitCode: 1, output: "Usage: cello attestations summary <owner-pubkey> <namespace>" };
+    try {
+      const result = (await withIpc(lock.socketPath, (client) =>
+        client.send("cello_attestations_summary", { owner_pubkey: owner, namespace: ns }))) as {
+        ok: boolean; reason?: string; guidance?: string; count?: number; average_rating?: number | null;
+        removed_count?: number; unmarked_claims?: number; agreed?: number; validators?: number;
+      };
+      if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+      const avg = result.average_rating === null || result.average_rating === undefined ? "—" : result.average_rating.toFixed(2);
+      return { exitCode: 0, output: `  ${ns}\n  reviews: ${result.count ?? 0}\n  average rating: ${avg}\n  removed by ruling: ${result.removed_count ?? 0}\n  unmarked claims: ${result.unmarked_claims ?? 0}\n  directories agreed: ${result.agreed ?? 0} of ${result.validators ?? 0}` };
+    } catch (err: unknown) {
+      return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
+  // M10E 015-READ — the reviews themselves, each verified against the majority root.
+  //   cello attestations reviews <owner> <namespace>
+  if (sub === "reviews") {
+    const [owner, ns] = args;
+    if (!owner || !ns) return { exitCode: 1, output: "Usage: cello attestations reviews <owner-pubkey> <namespace>" };
+    try {
+      const result = (await withIpc(lock.socketPath, (client) =>
+        client.send("cello_attestations_reviews", { owner_pubkey: owner, namespace: ns }))) as {
+        ok: boolean; reason?: string; guidance?: string; count?: number; agreed?: number; node_id?: string;
+        reviews?: Array<{ index: number; rating: number | null; quoted_text: string; origin_channel: string | null }>;
+        removed?: Array<{ attestation_hash: string; reason: string; evidence_hashes: string[] }>;
+      };
+      if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+      const reviews = result.reviews ?? [];
+      const removed = result.removed ?? [];
+      // Review text is quoted, untrusted data — shown indented under a label, never as a bare line
+      // that could read as an instruction.
+      const body = reviews.length === 0 ? "No reviews." : reviews.map((r) => {
+        const score = r.rating === null ? "—" : `${r.rating}/5`;
+        return `  [${r.index}] ${score}  review (quoted, untrusted):\n      ${r.quoted_text.replace(/\n/g, "\n      ")}`;
+      }).join("\n");
+      const removedBlock = removed.length === 0 ? "" : "\n\n  Removed by ruling:\n" + removed.map((rm) => `    ${rm.attestation_hash.slice(0, 16)}…  reason: ${rm.reason}`).join("\n");
+      return { exitCode: 0, output: `  ${ns} — ${result.count ?? 0} verified, ${result.agreed ?? 0} directories agreed\n${body}${removedBlock}` };
+    } catch (err: unknown) {
+      return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
+  // M10E 015-READ — a channel's deals and average rating, read from the home directory.
+  //   cello attestations deals <channel-pubkey>
+  if (sub === "deals") {
+    const [channel] = args;
+    if (!channel) return { exitCode: 1, output: "Usage: cello attestations deals <channel-pubkey>" };
+    try {
+      const result = (await withIpc(lock.socketPath, (client) =>
+        client.send("cello_attestations_deals", { channel_pubkey: channel }))) as {
+        ok: boolean; reason?: string; guidance?: string; deals?: number; average_rating?: number | null;
+      };
+      if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+      const avg = result.average_rating === null || result.average_rating === undefined ? "—" : result.average_rating.toFixed(2);
+      return { exitCode: 0, output: `  channel ${channel.slice(0, 16)}…\n  deals: ${result.deals ?? 0}\n  average rating: ${avg}` };
+    } catch (err: unknown) {
+      return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
+  // M10E 015-READ — the judge's client: build, sign and submit a removal ruling to every node.
+  //   cello attestations rule <attestation-hash> --owner <pubkey> --namespace <ns> --reason <text> [--evidence <hash>…]
+  if (sub === "rule") {
+    const [attHash, ...rest] = args;
+    let owner: string | undefined;
+    let ns: string | undefined;
+    let reason: string | undefined;
+    const evidence: string[] = [];
+    for (let i = 0; i < rest.length; i++) {
+      if (rest[i] === "--owner") owner = rest[++i];
+      else if (rest[i] === "--namespace") ns = rest[++i];
+      else if (rest[i] === "--reason") reason = rest[++i];
+      else if (rest[i] === "--evidence") { const h = rest[++i]; if (h) evidence.push(h); }
+    }
+    if (!attHash || !owner || !ns || !reason) {
+      return { exitCode: 1, output: "Usage: cello attestations rule <attestation-hash> --owner <pubkey> --namespace <ns> --reason <text> [--evidence <hash>…]" };
+    }
+    try {
+      const result = (await withIpc(lock.socketPath, (client) =>
+        client.send("cello_attestations_rule", { attestation_hash: attHash, owner_pubkey: owner, namespace: ns, reason, evidence_hashes: evidence }))) as {
+        ok: boolean; reason?: string; guidance?: string; countersigns?: number; in_force?: boolean;
+        results?: Array<{ node_id: string; in_force?: boolean; countersigns?: number; error?: string }>;
+      };
+      if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+      const rows = (result.results ?? []).map((n) => `    ${n.node_id.padEnd(16)}  ${n.error ? `error: ${n.error}` : `countersigns: ${n.countersigns ?? 0}${n.in_force ? " (in force)" : ""}`}`).join("\n");
+      return { exitCode: 0, output: `  ${rows}\n\n  ${result.guidance ?? ""}`.trimEnd() };
+    } catch (err: unknown) {
+      return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
+  // M10E 007-NOTICES — the public activity counts for an owner's namespace.
+  if (sub === "activity") {
+    const [owner, ns] = args;
+    if (!owner || !ns) {
+      return { exitCode: 1, output: "Usage: cello attestations activity <pubkey> <namespace>" };
+    }
+    try {
+      const result = (await withIpc(lock.socketPath, (client) =>
+        client.send("cello_attestations_activity", { owner_pubkey: owner, namespace: ns }))) as {
+        ok: boolean; reason?: string; guidance?: string; service_events?: number; unmarked_claims?: number;
+      };
+      if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+      return { exitCode: 0, output: `  ${ns}\n  service events: ${result.service_events ?? 0}\n  unmarked claims: ${result.unmarked_claims ?? 0}` };
+    } catch (err: unknown) {
+      return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
+  return {
+    exitCode: 1,
+    output:
+      "Usage:\n" +
+      "  cello attestations namespace create <ns> …  — open a review namespace\n" +
+      "  cello attestations namespace close <ns>    — stop a namespace granting new rights\n" +
+      "  cello attestations index [<pubkey>]        — list an owner's namespaces\n" +
+      "  cello attestations mark <session-id> <ns>  — mark a service event during a session\n" +
+      "  cello attestations rights                  — the rights to review that you hold\n" +
+      "  cello attestations write <right-id> -- <text> — write a review for a right you hold\n" +
+      "  cello attestations written                 — the reviews you have written, with outcomes\n" +
+      "  cello attestations claim-service <sid> <ns> — claim a dodged service event (no right)\n" +
+      "  cello attestations activity <pubkey> <ns>  — service-event and unmarked-claim counts\n" +
+      "  cello attestations summary <owner> <ns>    — a namespace's review summary, from a majority of directories\n" +
+      "  cello attestations reviews <owner> <ns>    — the reviews, each verified against the majority root\n" +
+      "  cello attestations deals <channel>         — the deals a channel is credited with\n" +
+      "  cello attestations rule <att-hash> --owner <pk> --namespace <ns> --reason <text> — a judge removes a false review\n" +
+      "\n" +
+      "To vouch for another agent in your own words, that is 'cello endorsements' (008-ENDRENAME).",
+  };
+}
+
+/**
+ * `cello endorsements` — YOUR words about ANOTHER agent, and what became of them (008-ENDRENAME).
+ *
+ * Split from `cello attestations` so the two systems stop sharing a word. `cello attestations` is
+ * the M10E review system, where nothing can be refused; an ENDORSEMENT is a PERSON vouching for a
+ * PERSON, which the subject accepts or refuses. The receiving direction is `cello endorsement-consent`.
+ *
+ * Subcommands:
+ *   issue <pubkey> <text…>  — vouch for something you have seen them do
+ *   issued                  — what happened to the ones you wrote
+ */
+export async function endorsements(
   celloDir: string,
   sub: string,
   args: string[],
@@ -993,19 +1389,19 @@ export async function attestations(
       return {
         exitCode: 1,
         output:
-          "Usage: cello attestations issue <subject-pubkey> <what you are endorsing them for…>\n" +
+          "Usage: cello endorsements issue <subject-pubkey> <what you are endorsing them for…>\n" +
           "\n" +
           "The text: MAXIMUM 500 CHARACTERS — a testimonial, not a document. Line breaks are fine;\n" +
           "no other control characters, and no < or >.\n" +
           "\n" +
           "If your text contains something that looks like a flag (a leading '-', or '-h'), put `--`\n" +
           "before it so it is read as text:\n" +
-          "  cello attestations issue <pubkey> -- cut p99 by -30ms on the auth path",
+          "  cello endorsements issue <pubkey> -- cut p99 by -30ms on the auth path",
       };
     }
     try {
       const result = (await withIpc(lock.socketPath, (client) =>
-        client.send("cello_attestations_issue", { subject_pubkey: subject, body }))) as {
+        client.send("cello_endorsements_issue", { subject_pubkey: subject, body }))) as {
         ok: boolean; reason?: string; guidance?: string; submission_id?: string;
       };
       if (!result.ok) {
@@ -1021,10 +1417,10 @@ export async function attestations(
     exitCode: 1,
     output:
       "Usage:\n" +
-      "  cello attestations issue <pubkey> <text…>  — attest to something you have seen them do\n" +
-      "  cello attestations issued                  — what happened to the ones you wrote\n" +
+      "  cello endorsements issue <pubkey> <text…>  — vouch for something you have seen them do\n" +
+      "  cello endorsements issued                  — what happened to the ones you wrote\n" +
       "\n" +
-      "What others wrote about YOU is 'cello attestation-consent'.",
+      "What others wrote about YOU is 'cello endorsement-consent'.",
   };
 }
 
