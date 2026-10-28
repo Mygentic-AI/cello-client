@@ -179,7 +179,7 @@ export function isPlaintextSqliteFile(dbPath: string): boolean {
  *                                      existing DB with a new key — that would be data loss; and
  *                                      a legacy PLAINTEXT DB must be migrated first, not opened).
  */
-export function resolveDbKey(dbPath: string, keyPath: string): Uint8Array {
+export function resolveDbKey(dbPath: string, keyPath: string, _opts: { configured?: boolean } = {}): Uint8Array {
   if (existsSync(keyPath)) {
     const key = readFileSync(keyPath);
     if (key.length !== DB_KEY_BYTES) {
@@ -450,4 +450,10 @@ export function openEncryptedDatabaseAtPath(dbPath: string, keyPath?: string): D
 /** The key file path the daemon uses for a given DB path — the one plaintext key file. */
 export function dbKeyPathFor(dbPath: string): string {
   return `${dbPath}.key`;
+}
+
+export const DB_KEY_FILE_ENV = "CELLO_DB_KEY_FILE";
+
+export function sessionsDbKeyPath(dbPath: string): string {
+  return dbKeyPathFor(dbPath);
 }
