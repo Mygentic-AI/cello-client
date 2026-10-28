@@ -142,6 +142,10 @@ const SENDRAW_SELECTORS = [
  * 3447 -> 3450 (the `onSessionSealed` setter + ctx getter mirroring `onSessionStateChanged`), and
  * `session-seal.ts` 1209 -> 1220 (fire the seal hook in `markSealed`). Feature work in exactly the
  * files these ratchets pin.
+ *
+ * M10E merge into main, 2026-10-28. `session-node-manager.ts` 3450 -> 3451: M15B's additions to
+ * this file (absent on the M10E branch, which capped at 3450) stack on M10E's seal setter/getter, so
+ * the merged file carries one line more than either branch alone.
  */
 const ERROR_FORMAT_SELECTORS = [
   {
@@ -322,6 +326,7 @@ export default [
     //       count of it true, so it is deliberately given as a magnitude rather than a figure that
     //       silently rots.)
     files: ["core/daemon/src/session-node-manager.ts"],
+    // 3450 -> 3451 at the M10E merge: M15B lines (not on the M10E branch) stack on M10E's seal setter.
     // 3,387 → 3,390 (069-ORDERPROOF, +3): the delegator for the session's relay anchor — the key its
     // ordering attestations verify under, which the seal and revive paths read from the session row.
     // 3,392 → 3,296 (DOD-M15-CLOSEDSESSION-1): thirty-seven trivial delegators collapsed to the
@@ -372,7 +377,7 @@ export default [
     // — record the counterparty's refusal, read it back on the next send or read, and find which
     // local agent owns a session id. Same argument as the line above: the data and the reasoning are
     // in `session-records.ts` and `session-queries.ts`; this file is the handle every consumer holds.
-    rules: { "max-lines": ["error", { max: 3450, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 3451, skipBlankLines: false, skipComments: false }] },
   },
   {
     // 040-DAEMONROOT, lowered every unit; the target is under 1,000 and this pin is what stops the
