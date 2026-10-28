@@ -134,6 +134,16 @@ describe("pairing handlers", () => {
     expect(store.pending()).toBeNull();
   });
 
+  it("a cello_pair_await that arrives after the pairing already ended still gets its reason", async () => {
+    const expired = await startFakeDirectory({ onPoll: () => ({ status: 410, body: { status: "expired", guidance: "run setup again to get a new code" } }) });
+    dirs.push(expired);
+    const h = handlersFor([expired.base]);
+    await h.start(undefined, "c");
+    await expect.poll(() => store.pending()).toBeNull();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(await h.wait(undefined, "c")).toEqual({ ok: false, reason: "pairing_expired", guidance: "run setup again to get a new code" });
+  });
+
   it("cello_pair_await with nothing pending and no credential → not_pairing with the command", async () => {
     const h = handlersFor([]);
     expect(await h.wait(undefined, "c")).toEqual({ ok: false, reason: "not_pairing", guidance: "Run 'cello register-agent <name>' to pair this device." });

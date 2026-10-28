@@ -50,9 +50,12 @@ export function registerPairingHandlers(deps: PairingHandlerDeps): void {
   const now = deps.now ?? Date.now;
   const facts = deps.facts ?? deviceFacts;
   let running: RunningPairing | null = null;
+  // The last refusal, kept for a cello_pair_await that arrives after the poller already ended.
+  let lastRefusal: PairingOutcome | null = null;
 
   const end = (pending: PendingPairing, correlationId: string, outcome: PairingOutcome): PairingOutcome => {
     if (pairingStore.pending()?.code === pending.code) pairingStore.clearPending();
+    lastRefusal = outcome.ok ? null : outcome;
     logger.info("pairing.ended", { reason: outcome.ok ? "approved" : outcome.reason, correlationId });
     return outcome;
   };
@@ -156,6 +159,7 @@ export function registerPairingHandlers(deps: PairingHandlerDeps): void {
     if (running) return await running.outcome;
     const credential = pairingStore.credential();
     if (credential) return { ok: true, account_id: credential.account_id };
+    if (lastRefusal) return lastRefusal;
     return { ok: false, reason: "not_pairing", guidance: "Run 'cello register-agent <name>' to pair this device." };
   });
 }
