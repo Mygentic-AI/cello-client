@@ -36,8 +36,6 @@ export interface PairingHandlerDeps {
 
 interface RunningPairing {
   pending: PendingPairing;
-  /** Null for a pairing resumed after a restart: the link is not stored, so it cannot be shown again. */
-  approveUrl: string | null;
   cancelled: boolean;
   outcome: Promise<PairingOutcome>;
 }
@@ -114,9 +112,9 @@ export function registerPairingHandlers(deps: PairingHandlerDeps): void {
     return end(pending, correlationId, { ok: false, reason: "pairing_expired", guidance: GUIDANCE_NEW_CODE });
   }
 
-  function startPoller(pending: PendingPairing, approveUrl: string | null, correlationId: string): RunningPairing {
+  function startPoller(pending: PendingPairing, correlationId: string): RunningPairing {
     if (running) running.cancelled = true;
-    const run: RunningPairing = { pending, approveUrl, cancelled: false, outcome: Promise.resolve(null as never) };
+    const run: RunningPairing = { pending, cancelled: false, outcome: Promise.resolve(null as never) };
     run.outcome = poll(run, correlationId)
       .catch((err: unknown) => end(pending, correlationId, {
         ok: false,
@@ -131,14 +129,15 @@ export function registerPairingHandlers(deps: PairingHandlerDeps): void {
   // A pairing left open by a previous daemon run is resumed, so its approval is still collected.
   const leftOver = pairingStore.pending();
   if (leftOver && pairingStore.credential() === null && now() < leftOver.expiresAt) {
-    startPoller(leftOver, null, randomUUID());
+    startPoller(leftOver, randomUUID());
   }
 
   handlers.set("cello_pair_start", async () => {
     if (pairingStore.credential() !== null) return { ok: true, paired: true };
     const stored = pairingStore.pending();
-    if (stored && now() < stored.expiresAt && running && running.pending.code === stored.code && running.approveUrl) {
-      return { ok: true, paired: false, pairing_code: stored.code, approve_url: running.approveUrl, expires_at: stored.expiresAt };
+    if (stored && now() < stored.expiresAt) {
+      if (running?.pending.code !== stored.code) startPoller(stored, randomUUID());
+      return { ok: true, paired: false, pairing_code: stored.code, approve_url: stored.approveUrl, expires_at: stored.expiresAt };
     }
     const correlationId = randomUUID();
     const { pubkeyHex } = pairingStore.daemonKey();
@@ -148,10 +147,10 @@ export function registerPairingHandlers(deps: PairingHandlerDeps): void {
       logger.info("pairing.ended", { reason: opened.reason, correlationId });
       return { ok: false, reason: opened.reason, guidance: opened.guidance };
     }
-    pairingStore.savePending(opened.pairing_code, opened.base, opened.expires_at);
+    const pending = { code: opened.pairing_code, base: opened.base, expiresAt: opened.expires_at, approveUrl: opened.approve_url };
+    pairingStore.savePending(pending);
     logger.info("pairing.opened", { codePrefix: opened.pairing_code.slice(0, 4), base: opened.base, correlationId });
-    const pending = { code: opened.pairing_code, base: opened.base, expiresAt: opened.expires_at };
-    startPoller(pending, opened.approve_url, correlationId);
+    startPoller(pending, correlationId);
     return { ok: true, paired: false, pairing_code: opened.pairing_code, approve_url: opened.approve_url, expires_at: opened.expires_at };
   });
 

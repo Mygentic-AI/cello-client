@@ -22,6 +22,7 @@ export function ensurePairingSchema(db: DaemonDatabase): void {
       pairing_code       TEXT,
       pairing_base       TEXT,
       pairing_expires_at INTEGER,
+      pairing_approve_url TEXT,
       paired_at          INTEGER
     )
   `);
@@ -32,6 +33,8 @@ export interface PendingPairing {
   base: string;
   /** Epoch milliseconds. */
   expiresAt: number;
+  /** The portal link the directory returned, kept so a restarted daemon can show the same code. */
+  approveUrl: string;
 }
 
 export interface DaemonKey {
@@ -46,6 +49,7 @@ interface PairingRow {
   pairing_code: string | null;
   pairing_base: string | null;
   pairing_expires_at: number | null;
+  pairing_approve_url: string | null;
 }
 
 export class DbPairingStore {
@@ -61,7 +65,7 @@ export class DbPairingStore {
 
   #row(): PairingRow | undefined {
     return this.#db
-      .prepare("SELECT daemon_seed, daemon_pubkey, credential, pairing_code, pairing_base, pairing_expires_at FROM daemon_pairing WHERE id = 1")
+      .prepare("SELECT daemon_seed, daemon_pubkey, credential, pairing_code, pairing_base, pairing_expires_at, pairing_approve_url FROM daemon_pairing WHERE id = 1")
       .get() as PairingRow | undefined;
   }
 
@@ -101,22 +105,22 @@ export class DbPairingStore {
     this.#db.prepare("UPDATE daemon_pairing SET credential = NULL, paired_at = NULL WHERE id = 1").run();
   }
 
-  savePending(code: string, base: string, expiresAt: number): void {
+  savePending(p: PendingPairing): void {
     this.daemonKey();
     this.#db
-      .prepare("UPDATE daemon_pairing SET pairing_code = ?, pairing_base = ?, pairing_expires_at = ? WHERE id = 1")
-      .run(code, base, expiresAt);
+      .prepare("UPDATE daemon_pairing SET pairing_code = ?, pairing_base = ?, pairing_expires_at = ?, pairing_approve_url = ? WHERE id = 1")
+      .run(p.code, p.base, p.expiresAt, p.approveUrl);
   }
 
   pending(): PendingPairing | null {
     const row = this.#row();
-    if (!row || row.pairing_code === null || row.pairing_base === null || row.pairing_expires_at === null) return null;
-    return { code: row.pairing_code, base: row.pairing_base, expiresAt: Number(row.pairing_expires_at) };
+    if (!row || row.pairing_code === null || row.pairing_base === null || row.pairing_expires_at === null || row.pairing_approve_url === null) return null;
+    return { code: row.pairing_code, base: row.pairing_base, expiresAt: Number(row.pairing_expires_at), approveUrl: row.pairing_approve_url };
   }
 
   clearPending(): void {
     this.#db
-      .prepare("UPDATE daemon_pairing SET pairing_code = NULL, pairing_base = NULL, pairing_expires_at = NULL WHERE id = 1")
+      .prepare("UPDATE daemon_pairing SET pairing_code = NULL, pairing_base = NULL, pairing_expires_at = NULL, pairing_approve_url = NULL WHERE id = 1")
       .run();
   }
 }

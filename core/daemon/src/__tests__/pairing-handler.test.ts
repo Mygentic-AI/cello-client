@@ -70,6 +70,20 @@ describe("pairing handlers", () => {
     expect(await h.wait(undefined, "c")).toMatchObject({ ok: false, reason: "pairing_expired" });
   });
 
+  it("3. after a daemon restart, cello_pair_start returns the pending code instead of opening a second", async () => {
+    const d = await startFakeDirectory({
+      onPair: () => ({ status: 201, body: { pairing_code: "KQ7M4TXP", expires_at: new Date(Date.now() + 300).toISOString(), approve_url: "https://portal.example.test/device?code=KQ7M-4TXP" } }),
+    });
+    dirs.push(d);
+    const before = handlersFor([d.base]);
+    const first = await before.start(undefined, "c");
+    const after = handlersFor([d.base]); // a fresh daemon over the same database
+    expect(await after.start(undefined, "c")).toEqual(first);
+    expect(d.pairBodies).toHaveLength(1);
+    await before.wait(undefined, "c");
+    await after.wait(undefined, "c");
+  });
+
   it("4. the poller collects an approval and stores the credential; polls are really signed", async () => {
     const key = store.daemonKey().pubkeyHex;
     const cred = await credentialFor(key);
