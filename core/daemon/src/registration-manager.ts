@@ -532,7 +532,7 @@ export class RegistrationManager {
         directoryNodes,
         // M16 024-CREATE: a channel presents NO token — the admin's signature over this channel's
         // K_local is its round-1 authorization, verified by every node. An ordinary agent presents
-        // its pre-auth token. One or the other, never both.
+        // its device credential. One or the other, never both.
         ...(channelOpts
           ? { channel: true as const, adminPubkeyHex: channelOpts.adminPubkeyHex, adminSignatureHex: channelOpts.adminSignature }
           : { preAuthToken }),

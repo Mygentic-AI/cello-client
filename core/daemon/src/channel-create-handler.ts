@@ -10,8 +10,8 @@
  *   2. record its two relays and access locally (the same code `cello_channel_config` runs);
  *   3. deposit its info record (the same code `cello_channel_info_set` runs).
  *
- * A channel costs a full registration, same as an agent — the pre-auth token is the same kind
- * `cello register-agent` takes. There is no partial success: if a step fails, the answer names WHICH
+ * A channel costs a full registration, same as an agent, authorized by the admin agent's
+ * signature rather than by a device credential. There is no partial success: if a step fails, the answer names WHICH
  * step and the command that finishes the job by hand. A register failure means nothing exists yet.
  *
  * The three steps are INJECTED (`registerChannel`, `applyChannelConfig`, `depositChannelInfo`) so
@@ -88,7 +88,7 @@ export function registerChannelCreateHandler(deps: ChannelCreateDeps): void {
     if (params?.["preAuthToken"] !== undefined || params?.["relays"] !== undefined) {
       return {
         ok: false, reason: "channel_needs_no_token",
-        guidance: "A channel takes NO pre-auth token and NO relay argument. The admin agent's identity is the basis of the right, and the directory picks the two relays. Run: cello channel create <name> <access> [--guidance <text>].",
+        guidance: "A channel takes no token and no relay argument. The admin agent's identity is the basis of the right, and the directory picks the two relays. Run: cello channel create <name> <access> [--guidance <text>].",
       };
     }
     const adminPubkeyHex = deps.agentPubkey(adminName);

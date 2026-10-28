@@ -271,7 +271,7 @@ export class FileRegistrationPersistence implements DaemonRegistrationPersistenc
   /**
    * Capture the agent→user link at registration (M7 capture-now-or-lose-it). Not
    * part of the RegistrationManager seam — called by the cello_register handler
-   * after a successful register(), since only the handler holds the pre-auth ticket.
+   * after a successful register(), since only the handler holds the credential.
    */
   async persistAgentUserLink(opts: { agentId: string; preAuthToken: string; linkedAt: number }): Promise<void> {
     // SI: the preAuthToken is a bearer ticket — written to disk only, never logged.

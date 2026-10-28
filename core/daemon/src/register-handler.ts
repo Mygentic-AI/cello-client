@@ -345,7 +345,7 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
         const relays = (result as { relays?: string[] }).relays;
         const relaysOut = relays !== undefined ? { relays } : {};
         // M16 024-CREATE: a channel presents no token, so there is no agent→user link to capture —
-        // the link is keyed on the pre-auth token. Skip it and report success with the relays.
+        // the link is keyed on the credential. Skip it and report success with the relays.
         if (preAuthToken === undefined) {
           logger.info("registration.succeeded", { ...cid, agentName: name, agentId: result.agent_id, primaryPubkey: result.primary_pubkey });
           return { ok: true, agent_id: result.agent_id, primary_pubkey: result.primary_pubkey, ...relaysOut };

@@ -404,7 +404,7 @@ const CHANNEL_DOCS: ReadonlyArray<{
     usage: ["cello channel create <name> <access> [--guidance <text>] [--agent <agent>]"],
     paragraph:
       "Make a new channel you run. One command registers the channel identity <name>, the directory picks " +
-      "its two relays, and the description is published. It takes no pre-auth token and no relay: the agent " +
+      "its two relays, and the description is published. It takes no token and no relay: the agent " +
       "you are running is already registered, and that identity is the whole basis of the channel's right. " +
       "Do this first. <access> is public (anyone reads), open (anyone may ask to join) or invite_only.",
   },
@@ -1902,7 +1902,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
     async run(ctx, args) {
       const { agent, positional } = parityOpts(args);
       // `--guidance <text>` is the channel's description (create/setup). A value flag rather than a
-      // positional so it cannot be confused with a relay or the pre-auth token.
+      // positional so it cannot be confused with a relay or a token.
       const { value: guidanceFlag, rest: afterGuidance } = takeValueFlag(positional, "--guidance");
       const [sub, channel, a, b, ...rest] = afterGuidance;
       const withAgent = (p: Record<string, unknown>) => (agent ? { ...p, agent } : p);
@@ -1914,7 +1914,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
         if (!ACCESS.includes(a)) {
           return usage("<access> must be public (anyone reads), open (anyone may ask to join) or invite_only.");
         }
-        // Catch the OLD habit — trailing positionals were relays or a pre-auth token. Route them
+        // Catch the OLD habit — trailing positionals were relays or a token. Route them
         // through as `relays` so the daemon answers with the one canonical `channel_needs_no_token`,
         // rather than the CLI inventing a second message that could drift from it.
         const strays = [b, ...rest].filter((x) => x !== undefined);
