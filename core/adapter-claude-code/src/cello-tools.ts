@@ -239,7 +239,7 @@ server.tool("cello_attestations_activity", "The public activity counts for an ow
   return jsonText(result);
 });
 
-server.tool("cello_attestations_claim", "Write a review using a right the selected agent holds (earned from a service event a provider marked). The review cannot be refused or withdrawn by its subject. For a scored namespace pass a 1–5 rating; optionally name the channel the deal began in so the deal is credited to it. One right mints exactly one review.", {
+server.tool("cello_attestations_claim", "Write a review using a right the selected agent holds (earned from a service event a provider marked). The review cannot be refused or withdrawn by its subject; only the CELLO judge can remove it, by a ruling. It cannot be edited or taken back once written, and it uses up the right, so show the operator the exact text and rating and get their approval before calling this. For a scored namespace pass a 1–5 rating; optionally name the channel the deal began in so the deal is credited to it. One right mints exactly one review.", {
   right_id: z.string().describe("The right to use, from cello_attestations_rights, 64 hex"),
   text: z.string().describe("The review text"),
   rating: z.number().optional().describe("1–5, required for a scored namespace"),
