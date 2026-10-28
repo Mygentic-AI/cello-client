@@ -278,7 +278,7 @@ server.tool("cello_attestations_readers_remove", "Only the namespace's owner can
 });
 
 // M10E 015-READ — reading a namespace from a majority of directories, and the judge's removal submit.
-server.tool("cello_attestations_summary", "Read a namespace's review summary from a MAJORITY of the consortium's directories. The client asks every reachable directory for its signed head, verifies each signature, and returns only the head a majority agree on byte for byte — the review count, average rating, how many were removed by ruling, and how many unmarked claims stand. Fewer than a majority agree, or too few answer, and it refuses with no_majority rather than showing one node's count.", {
+server.tool("cello_attestations_summary", "Read a namespace's review summary from a MAJORITY of the consortium's directories. The client asks every reachable directory for its signed head (that directory's signed summary of the namespace), verifies each signature, and returns only the head a majority agree on exactly, apart from each directory's own timestamp — the review count, average rating, how many were removed by ruling, and how many unmarked claims stand. Fewer than a majority agree, or too few answer, and it refuses with no_majority rather than showing one node's count. On no_majority, tell the operator the score could not be confirmed; do not guess one.", {
   owner_pubkey: z.string().describe("The namespace owner's pubkey, 64 hex"),
   namespace: z.string().describe("The namespace, e.g. reviews.prop_8821"),
 }, async ({ owner_pubkey, namespace }) => {
