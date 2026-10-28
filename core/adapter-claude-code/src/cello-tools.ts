@@ -178,7 +178,7 @@ server.tool("cello_endorsements_issue", "ENDORSE another agent — your own word
 });
 
 // M10E 003-NSCLIENT — attestation namespaces: open one, close one, read any owner's index.
-server.tool("cello_attestations_namespace_create", "Open an attestation (review) namespace owned by the selected agent. It fixes, once and for good, whether reviews are public or private, whether they carry a 1-5 rating, how long a reviewer has to write one, and the plain-words condition under which the right to review is granted. It is immutable — to change any of that you open a new namespace, and the directory keeps the old one in your public index.", {
+server.tool("cello_attestations_namespace_create", "Open a review namespace owned by the selected agent. These four settings are permanent once it is created: whether reviews are public or private, whether they carry a 1-5 rating, how many days a reviewer has to write one, and the plain-words condition that earns a session the right to review. To change any of them, open a new namespace; the old one stays listed in your public index. Example: a host opens `reviews.prop_8821`, public, scored, 30 days, condition \"a guest who completed a stay\".", {
   namespace: z.string().describe("1-3 dotted segments, each [a-z0-9_] up to 32 chars, e.g. reviews.prop_8821"),
   mode: z.enum(["public", "private"]).describe("public: anyone may read the reviews. private: only readers you choose."),
   scored: z.boolean().optional().describe("true for a 1-5 rating plus text; omit or false for text-only"),
