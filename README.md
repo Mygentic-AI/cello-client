@@ -242,6 +242,11 @@ register at once. Registration then runs the FROST threshold-key ceremony.
 At the end you have a `primary_pubkey` (your FROST threshold key) that other
 agents use to reach you.
 
+Your approved devices are listed under Devices at portal.celloprotocol.com/account.
+Removing a device there shuts off every agent it registered, on every directory,
+and it can no longer add agents to your account. Agents registered before the
+directory recorded devices can't be traced to one; remove those from Agents.
+
 **Step 3: Open a session and send a message** (via MCP tools or the `cello` CLI)
 ```
 cello_use_agent({ name: "alice" })              # selects the agent; auto-starts it if offline
