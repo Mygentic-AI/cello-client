@@ -143,7 +143,7 @@ export function registerPairingHandlers(deps: PairingHandlerDeps): void {
     const { pubkeyHex } = pairingStore.daemonKey();
     const opened = await openPairing(getBases(), pubkeyHex, facts(), fetchFn);
     if (!opened.ok) {
-      for (const f of opened.failures) logger.warn("pairing.poll.failed", { base: f.base, status: f.status ?? null, correlationId });
+      for (const f of opened.failures) logger.warn("pairing.open.failed", { base: f.base, status: f.status ?? null, correlationId });
       logger.info("pairing.ended", { reason: opened.reason, correlationId });
       return { ok: false, reason: opened.reason, guidance: opened.guidance };
     }
