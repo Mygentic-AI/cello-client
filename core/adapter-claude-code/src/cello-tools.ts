@@ -249,7 +249,7 @@ server.tool("cello_attestations_write", "Write a review using a right the select
   return jsonText(result);
 });
 
-server.tool("cello_attestations_written", "List the reviews the selected agent has written, each with the directory's outcome for it (minted, rejected, or pending). This is how a reviewer confirms a review they wrote actually landed.", {}, async () => {
+server.tool("cello_attestations_written", "List the reviews the selected agent has written, each with its outcome (minted, rejected, or pending; rejected means the portal's screening refused it, and the reason is included). This is how a reviewer confirms a review they wrote actually landed.", {}, async () => {
   const result = await proxy.call("cello_attestations_written", {});
   return jsonText(result);
 });
