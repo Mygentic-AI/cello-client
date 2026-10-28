@@ -2857,21 +2857,13 @@ export class AgentRelayClient {
       /**
        * ─── OUR OWN DEAD CREDENTIAL IS NOT A RELAY OUTAGE — `DOD-M15-TOKENSTALE-1` ───────────────
        *
-       * `#ensureConnected` answers with a BOOLEAN, so every reason a relay ever gave for refusing
-       * us arrived here as `false` and left as `relay_unavailable`. That word is a claim about the
-       * RELAY: unreachable, transient, someone else's, and the documented grounds on which a send
-       * appends an unwitnessed leaf and still reports success.
-       *
-       * An expired online token is the opposite on all four counts, and the cost of the mislabel is
-       * not cosmetic. Measured live 2026-09-10: an agent ran for over two days answering
-       * `ok:true, delivered:true` to every send while the relay refused all thirteen of its
-       * authentications. Nothing it said in that time could ever produce a receipt, and no surface
-       * anywhere said so — because the one place that knew called it a relay problem.
-       *
-       * `#lastAuthRefusal` already held the truth (`cello status` reads it); the submit path simply
-       * never looked. Only LOCAL refusals are promoted: a genuine relay fault keeps
-       * `relay_unavailable`, so this is a split rather than a rename, and the caller's existing
-       * degradation for a real outage is untouched.
+       * `#ensureConnected` answers with a BOOLEAN, so every relay refusal used to arrive here as
+       * `false` and leave as `relay_unavailable` — a claim about the RELAY, on which a send appends
+       * an unwitnessed leaf and still reports success. An expired online token is the opposite:
+       * measured live 2026-09-10, an agent ran for two days answering `ok:true` while the relay
+       * refused all thirteen of its authentications, and nothing could produce a receipt. So LOCAL
+       * refusals are promoted from `#lastAuthRefusal` (which `cello status` reads); a genuine relay
+       * fault keeps `relay_unavailable`, leaving the real-outage degradation untouched.
        */
       const refusal = this.#lastAuthRefusal;
       if (refusal && isLocalCredentialRefusal(refusal.reason)) {
@@ -2903,32 +2895,13 @@ export class AgentRelayClient {
         }
         return { ok: false, reason: refusal.reason };
       }
-      /**
-       * 017-SEAL — A RATE-LIMITED SIGN-IN IS BACK-PRESSURE, NOT AN OUTAGE, and it must reach the
-       * caller WEARING ITS OWN NAME.
-       *
-       * The relay refuses the auth handshake `rate_limited` (with a `retry_after_ms`) once this
-       * agent has signed in more than the window allows — a provider that opens and seals more than
-       * twenty sessions a minute hits it on the sign-in its next SEAL leaf needs. `#authenticate`
-       * stores that classified refusal, but every refusal the boundary could not name locally used
-       * to collapse to `relay_unavailable` here — and `relay_unavailable` is precisely the reason
-       * `close-session-handler` falls back to the directory-only seal. Both parties fell back at
-       * once and then refused each other's co-sign, so the seal never completed (measured 017-SEAL
-       * Step 0: `relay.auth.rate_limited` at the stuck session, `seal_rejected_by_counterparty` on
-       * both closes).
-       *
-       * Returning `rate_limited` with the relay's own window hands this to the `#doSubmit` throttle
-       * loop below, which waits the window out and resubmits — the sign-in succeeds on the retry and
-       * the seal takes the ordinary relay-witnessed path. It never reaches the directory-only
-       * fallback. A throttle is self-clearing and the relay said when; this is the one refusal that
-       * is safely retried rather than surfaced.
-       */
+      // 017-SEAL — a rate-limited sign-in is back-pressure, not an outage. Collapsing it to
+      // `relay_unavailable` here is what made `close-session-handler` fall back to the directory-only
+      // seal (both parties at once, then each refusing the other's co-sign — Step 0). Surfaced under
+      // its own name, the `#doSubmit` throttle loop below waits the relay's window out and resubmits;
+      // the sign-in succeeds on the retry and never reaches the fallback.
       if (refusal?.reason === "rate_limited") {
-        return {
-          ok: false,
-          reason: "rate_limited",
-          ...(refusal.retryAfterMs !== undefined ? { retry_after_ms: refusal.retryAfterMs } : {}),
-        };
+        return { ok: false, reason: "rate_limited", ...(refusal.retryAfterMs !== undefined ? { retry_after_ms: refusal.retryAfterMs } : {}) };
       }
       return { ok: false, reason: "relay_unavailable" };
     }
