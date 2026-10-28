@@ -194,18 +194,25 @@ export class AttestationNotices {
       return "hash_mismatch";
     }
     let rating: number | null = null;
-    let text = "";
+    let text: string;
     let namespace: string;
     let originChannel: string | null;
     try {
       const payload = decodeAttestationPayload(envelope.payload);
       namespace = payload.namespace;
       originChannel = payload.origin_channel;
-      if (payload.body.length === 2) {
-        rating = typeof payload.body[0] === "number" ? payload.body[0] : null;
-        text = typeof payload.body[1] === "string" ? payload.body[1] : "";
-      } else if (payload.body.length === 1) {
-        text = typeof payload.body[0] === "string" ? payload.body[0] : "";
+      // M10E 016 (L3): a review body is a scored [rating, text] (2) or a text [text] (1). The shared
+      // decoder already enforces this against the template, but we do NOT lean on that silently: any
+      // other shape is MALFORMED, never stored with an empty `quoted_text` that reads as a blank
+      // review. A stored empty review is a buried defect; a loud malformed is not.
+      if (payload.body.length === 2 && typeof payload.body[0] === "number" && typeof payload.body[1] === "string") {
+        rating = payload.body[0];
+        text = payload.body[1];
+      } else if (payload.body.length === 1 && typeof payload.body[0] === "string") {
+        text = payload.body[0];
+      } else {
+        this.#logger.error("attestation.private_review.malformed", { agentId, reason: `unexpected body shape (length ${payload.body.length})` });
+        return "malformed";
       }
     } catch (err: unknown) {
       this.#logger.error("attestation.private_review.malformed", { agentId, reason: extractErrorMessage(err) });
