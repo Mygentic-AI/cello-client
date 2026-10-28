@@ -105,7 +105,7 @@ describe("002-KEYPATH — the key path", () => {
     const dbPath = join(dir, "sessions.db");
     const err = await initManager(dbPath).then(() => undefined, (e: unknown) => e);
     expect(err).toBeInstanceOf(DbEncryptionError);
-    expect((err as DbEncryptionError).reason).toBe("db_key_file_missing");
+    expect((err as DbEncryptionError).code).toBe("db_key_file_missing");
     expect(String((err as Error).message) + String((err as DbEncryptionError).guidance)).toContain(keyFile);
     expect(existsSync(keyFile), "a key was minted at the configured path").toBe(false);
     expect(existsSync(`${dbPath}.key`), "a key was minted beside the database").toBe(false);
@@ -123,7 +123,7 @@ describe("002-KEYPATH — the key path", () => {
     await writeFile(keyFile, randomBytes(31), { mode: 0o600 });
     process.env[DB_KEY_FILE_ENV] = keyFile;
     const err = await initManager(join(dir, "sessions.db")).then(() => undefined, (e: unknown) => e);
-    expect((err as DbEncryptionError).reason).toBe("db_encryption_key_mismatch");
+    expect((err as DbEncryptionError).code).toBe("db_encryption_key_mismatch");
   });
 
   it("6a. the gateway sidecar is handed the CONFIGURED path, and the daemon mints nothing on the volume", async () => {

@@ -69,7 +69,7 @@ export interface DaemonDatabase {
 
 // ─── Tagged error (distinct code per failure cause) ─────────────────────────────
 
-export type DbErrorCode = "db_encryption_key_mismatch" | "db_sqlcipher_unavailable" | "db_open_failed";
+export type DbErrorCode = "db_encryption_key_mismatch" | "db_key_file_missing" | "db_sqlcipher_unavailable" | "db_open_failed";
 
 export class DbEncryptionError extends Error {
   readonly code: DbErrorCode;
@@ -178,8 +178,11 @@ export function isPlaintextSqliteFile(dbPath: string): boolean {
  *   key absent + DB present          → THROW db_encryption_key_mismatch (never overwrite an
  *                                      existing DB with a new key — that would be data loss; and
  *                                      a legacy PLAINTEXT DB must be migrated first, not opened).
+ *   key absent + `configured`        → THROW db_key_file_missing. The key's supplier owns that path;
+ *                                      a key minted there (tmpfs) is gone at the next restart, and
+ *                                      the database written under it with it.
  */
-export function resolveDbKey(dbPath: string, keyPath: string, _opts: { configured?: boolean } = {}): Uint8Array {
+export function resolveDbKey(dbPath: string, keyPath: string, opts: { configured?: boolean } = {}): Uint8Array {
   if (existsSync(keyPath)) {
     const key = readFileSync(keyPath);
     if (key.length !== DB_KEY_BYTES) {
@@ -190,6 +193,14 @@ export function resolveDbKey(dbPath: string, keyPath: string, _opts: { configure
       );
     }
     return new Uint8Array(key);
+  }
+
+  if (opts.configured === true) {
+    throw new DbEncryptionError(
+      "db_key_file_missing",
+      `${DB_KEY_FILE_ENV} points at ${keyPath}, which does not exist`,
+      `${DB_KEY_FILE_ENV} points at ${keyPath}, which does not exist. The key is provided by whoever set that variable; the daemon will not create one there.`,
+    );
   }
 
   if (existsSync(dbPath)) {
@@ -452,8 +463,24 @@ export function dbKeyPathFor(dbPath: string): string {
   return `${dbPath}.key`;
 }
 
+/**
+ * Where the key may be supplied from outside, instead of living beside the database. A hosted
+ * daemon's key is unwrapped into tmpfs by its host and must never reach the user's volume.
+ */
 export const DB_KEY_FILE_ENV = "CELLO_DB_KEY_FILE";
 
+/** The configured key path, or undefined when unset. An empty value is unset, never "here". */
+export function configuredDbKeyFile(): string | undefined {
+  const v = process.env[DB_KEY_FILE_ENV];
+  return v !== undefined && v !== "" ? v : undefined;
+}
+
+/** The key path for sessions.db (and gateway.db, which shares its key). */
 export function sessionsDbKeyPath(dbPath: string): string {
-  return dbKeyPathFor(dbPath);
+  return configuredDbKeyFile() ?? dbKeyPathFor(dbPath);
+}
+
+/** Resolve the sessions.db key, refusing to mint when the path was supplied from outside. */
+export function resolveSessionsDbKey(dbPath: string): Uint8Array {
+  return resolveDbKey(dbPath, sessionsDbKeyPath(dbPath), { configured: configuredDbKeyFile() !== undefined });
 }

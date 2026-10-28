@@ -17,7 +17,7 @@ import { mkdirSync } from "node:fs";
 import { installSafeNetworkInterfacesGuard } from "@cello-protocol/transport";
 import { LocalSidecarGatewayClient, spawnGatewaySidecar, type SpawnedGateway } from "@cello-protocol/gateway";
 import { startDaemon } from "../daemon.js";
-import { resolveDbKey, dbKeyPathFor } from "../sqlcipher-db.js";
+import { prepareGatewayStoreEnv } from "../gateway-store-env.js";
 import { createDirectoryEndpointResolver } from "../directory-bootstrap.js";
 import { buildManifestDeps } from "../manifest-deps.js";
 import { RandomizedPollScheduler } from "../manifest-poll-scheduler.js";
@@ -108,21 +108,14 @@ async function startSecurityLayer(correlationId?: string): Promise<{ client: Loc
   const socketPath = getGatewayIpcEndpoint(celloDir);
   const client = new LocalSidecarGatewayClient({ socketPath, logger });
 
-  // The sidecar opens the encrypted store at startup, but the key file is only created when the
-  // daemon first opens its own database — which happens AFTER this. So resolve it here (M9B-D13):
-  // the same idempotent call the daemon makes, which on a fresh install is the one that generates
-  // the key. The bytes are deliberately unused; only the side effect matters, and the key never
-  // travels to the child — the child gets the PATH (M9B-D8).
-  const keyFilePath = dbKeyPathFor(join(celloDir, "sessions.db"));
+  // The key is resolved before the sidecar starts (M9B-D13); the child gets the PATH only (M9B-D8).
   let sidecar: SpawnedGateway | undefined;
   try {
     mkdirSync(celloDir, { recursive: true, mode: 0o700 });
-    resolveDbKey(join(celloDir, "sessions.db"), keyFilePath);
     sidecar = await spawnGatewaySidecar({
       socketPath,
       env: {
-        CELLO_GATEWAY_STORE_DB: join(celloDir, "gateway.db"),
-        CELLO_GATEWAY_STORE_KEY_FILE: keyFilePath,
+        ...prepareGatewayStoreEnv(celloDir),
         // Review M2: the child's own boot lines join the flow that RESTARTED it. Without this the
         // operator sees `gateway.config.applied{correlationId}` and, on the next line, a sidecar
         // that failed to open its store with no way to tie the two together — which is the exact

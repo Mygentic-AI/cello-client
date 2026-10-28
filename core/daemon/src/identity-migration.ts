@@ -38,7 +38,8 @@ import {
   openEncryptedDatabase,
   isPlaintextSqliteFile,
   resolveDbKey,
-  dbKeyPathFor,
+  sessionsDbKeyPath,
+  configuredDbKeyFile,
   type DaemonDatabase,
 } from "./sqlcipher-db.js";
 import { ensureIdentitySchema } from "./db-identity-store.js";
@@ -144,7 +145,8 @@ function importManifestVersion(celloDir: string, db: DaemonDatabase, logger: Log
  */
 export function migrateToEncryptedIfNeeded(dbPath: string, logger: Logger): MigrationResult {
   const celloDir = dirname(dbPath);
-  const keyPath = dbKeyPathFor(dbPath);
+  const keyPath = sessionsDbKeyPath(dbPath);
+  const configured = configuredDbKeyFile() !== undefined;
   const migratingPath = `${dbPath}.migrating`;
 
   // Resume a crash in the tiny window between the backup-rename and the swap-rename: a COMPLETED
@@ -184,7 +186,7 @@ export function migrateToEncryptedIfNeeded(dbPath: string, logger: Logger): Migr
   if (!plaintextDb) {
     let key: Uint8Array;
     try {
-      key = resolveDbKey(dbPath, keyPath); // loads the existing key, or generates one if the DB is absent
+      key = resolveDbKey(dbPath, keyPath, { configured }); // loads the existing key, or generates one if the DB is absent
     } catch (err) {
       throw new IdentityMigrationError(
         `could not open the encrypted DB for in-place identity import: ${extractErrorMessage(err)}`,
@@ -227,7 +229,7 @@ export function migrateToEncryptedIfNeeded(dbPath: string, logger: Logger): Migr
   try {
     dbKey = existsSync(keyPath)
       ? new Uint8Array(readFileSync(keyPath))
-      : resolveDbKey(migratingPath, keyPath); // generates + writes keyPath (migrating DB absent → fresh)
+      : resolveDbKey(migratingPath, keyPath, { configured }); // generates + writes keyPath (migrating DB absent → fresh)
   } catch (err) {
     throw new IdentityMigrationError(
       `could not establish a SQLCipher key for migration: ${extractErrorMessage(err)}`,

@@ -48,7 +48,7 @@ import { gzipSync, gunzipSync } from "node:zlib";
 import { readFile, writeFile, rm, mkdir, chmod, open as fsOpen, rename } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { openEncryptedDatabase, dbKeyPathFor } from "./sqlcipher-db.js";
+import { openEncryptedDatabase, sessionsDbKeyPath } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
 import { extractErrorMessage } from "./error-message.js";
 
@@ -118,7 +118,7 @@ export async function createBackup(opts: {
   /** A backup is not a scratch file: replacing one is deliberate, never incidental. */
   overwrite?: boolean;
 }): Promise<BackupResult> {
-  const keyPath = opts.keyPath ?? dbKeyPathFor(opts.dbPath);
+  const keyPath = opts.keyPath ?? sessionsDbKeyPath(opts.dbPath);
 
   if (!existsSync(opts.dbPath)) {
     return {
@@ -292,7 +292,7 @@ export async function restoreBackup(opts: {
   logger: Logger;
   keyPath?: string;
 }): Promise<RestoreResult> {
-  const keyPath = opts.keyPath ?? dbKeyPathFor(opts.dbPath);
+  const keyPath = opts.keyPath ?? sessionsDbKeyPath(opts.dbPath);
 
   const parsed = await parseArchive(opts.archivePath);
   if (!parsed.ok) {
