@@ -204,7 +204,7 @@ server.tool("cello_attestations_index", "List every review namespace an owner ha
   return jsonText(result);
 });
 
-server.tool("cello_attestations_mark", "Mark a service event during an open session with your counterparty, in one of the selected agent's own namespaces. It is the moment that grants the counterparty a right to review you — marked before the outcome is known, during the session, and refused once the session is sealed.", {
+server.tool("cello_attestations_mark", "Mark a service event (a record that you served this counterparty: a stay, a sale, a support case) during an open session with them, in one of the selected agent's own namespaces. It is the moment that grants the counterparty a right to review you — marked before the outcome is known, during the session, and refused once the session is sealed. Mark every session that meets the namespace's condition, not only the ones that went well.", {
   cello_session_id: z.string().describe("The open session's id, as cello_sessions reports it"),
   namespace: z.string().describe("One of YOUR namespaces, e.g. reviews.prop_8821"),
   origin_channel: z.string().optional().describe("The channel pubkey this deal began in, 64 hex, when crediting a channel"),
