@@ -294,14 +294,14 @@ server.tool("cello_attestations_reviews", "Read a namespace's reviews, each chec
   return jsonText(result);
 });
 
-server.tool("cello_attestations_deals", "Read the deals a channel is credited with — public reviews whose provider and reviewer both named that channel — and their average rating, from the home directory.", {
+server.tool("cello_attestations_deals", "Read the deals a channel is credited with — public reviews whose provider and reviewer both named that channel — and their average rating, from the home directory. This count comes from one directory, not a majority.", {
   channel_pubkey: z.string().describe("The channel's pubkey, 64 hex"),
 }, async ({ channel_pubkey }) => {
   const result = await proxy.call("cello_attestations_deals", { channel_pubkey });
   return jsonText(result);
 });
 
-server.tool("cello_attestations_rule", "Submit a removal ruling as the selected agent, who must be the judge the directories are configured to trust. It builds and signs the ruling and submits it to every reachable directory; each independently verifies it and countersigns, and the removal takes force only once a majority of distinct directories have countersigned. The review is never deleted — the head counts it as removed and readers see the ruling's reason, never the removed text. Whether a ruling is in force follows the current manifest.", {
+server.tool("cello_attestations_rule", "Submit a removal ruling as the selected agent, who must be the judge the directories are configured to trust. It builds and signs the ruling and submits it to every reachable directory; each independently verifies it and countersigns, and the removal takes force only once a majority of distinct directories have countersigned. The review is never deleted — the head counts it as removed and readers see the ruling's reason, never the removed text. If directories are added later, the majority needed grows, so a ruling may need countersigning again by the new directories.", {
   attestation_hash: z.string().describe("The 64-hex hash of the review to remove"),
   owner_pubkey: z.string().describe("The namespace owner's pubkey the review lives under, 64 hex"),
   namespace: z.string().describe("The namespace the review lives in"),
