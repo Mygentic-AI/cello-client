@@ -448,9 +448,6 @@ describe("cli commands", () => {
   });
 
   describe("register", () => {
-    // The local test directory's sentinel, so a call reaches the daemon without pairing.
-    const DEV_TOKEN = "DEV-local-test-token";
-
     it("returns exit 1 with usage when the agent is missing", async () => {
       const result = await register(tempDir, "", "");
       expect(result.exitCode).toBe(1);
@@ -511,44 +508,17 @@ describe("cli commands", () => {
       }
     });
 
-    it("forwards a DEV- token to cello_register as preAuthToken, exactly", async () => {
-      const fake = await startFakeDaemon(tempDir, {
-        cello_register: { ok: true, agent_id: "id-1", primary_pubkey: "pk-1" },
-        cello_list_agents: { agents: [{ name: "alice", pubkey: "local-pk" }] },
-      });
+    // DEV- was the local test directory's sentinel. No directory accepts it now, so it is refused
+    // like any other token, and the daemon is never asked.
+    it("refuses a DEV- token client-side with token_retired and never contacts the daemon", async () => {
+      const fake = await startFakeDaemon(tempDir, { cello_register: { ok: true }, cello_list_agents: { agents: [] } });
       try {
-        const result = await register(tempDir, "alice", "DEV-x");
-        expect(result.exitCode).toBe(0);
-        const reg = fake.requests?.find((r) => r.method === "cello_register");
-        expect(reg?.params).toEqual({ agent: "alice", preAuthToken: "DEV-x" });
-        expect(fake.requests?.some((r) => r.method === "cello_pair_start")).toBe(false);
+        const result = await register(tempDir, "alice", "DEV-local-test-token");
+        expect(fake.requests, "the daemon must not be asked").toBeUndefined();
+        expect(JSON.parse(result.output).reason).toBe("token_retired");
       } finally {
         await fake.close();
       }
-    });
-
-    // The "DEV-" sentinel is the local DevTokenValidator's prefix. The CLI must NOT reject it client-side —
-    // rejecting DEV- broke ALL local/spine registration (the CLI wanted CELLO-, the local validator wanted
-    // DEV-, so no token satisfied both). It passes the gate and reaches the daemon (the real authority).
-    it("lets a DEV- sentinel token through the client gate to the daemon (local dev registration)", async () => {
-      const result = await register(tempDir, "alice", "DEV-local-test-token");
-      expect(result.exitCode).toBe(1);
-      expect(result.output).toContain("No daemon running");
-      expect(result.output).not.toContain("token_retired");
-    });
-
-    it("round-trips to the daemon and returns agent_not_found for an unknown agent", async () => {
-      const config = makeConfig();
-      handle = await startDaemon(config);
-
-      // No agents are loaded in this temp dir → the daemon's cello_register
-      // handler rejects with agent_not_found (full CLI → IPC → handler path).
-      const result = await register(tempDir, "ghost-agent", DEV_TOKEN);
-      expect(result.exitCode).toBe(1);
-      const parsed = JSON.parse(result.output);
-      expect(parsed.ok).toBe(false);
-      expect(parsed.reason).toBe("agent_not_found");
-      expect(typeof parsed.guidance).toBe("string");
     });
 
     // M8C-ONBOARD-NEXTSTEP-1 (reviewer F1): on SUCCESS the output carries next-step + state
@@ -556,12 +526,13 @@ describe("cli commands", () => {
     // needs the directory's DKG). Guards against a regression that drops the guidance.
     it("puts next-step guidance on STDERR, and NEVER inside the JSON", async () => {
       const fake = await startFakeDaemon(tempDir, {
+        cello_pair_start: { ok: true, paired: true },
         cello_register: { ok: true, agent_id: "id-1", primary_pubkey: "pk-1" },
         cello_list_agents: { agents: [{ name: "bob", pubkey: "pk-bob" }, { name: "alice", pubkey: "local-pk" }] },
       });
 
       try {
-        const result = await register(tempDir, "alice", DEV_TOKEN);
+        const result = await register(tempDir, "alice", "");
         expect(result.exitCode).toBe(0);
 
         /**

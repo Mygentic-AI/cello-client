@@ -805,11 +805,10 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "  Example:  cello register-agent alice\n" +
       "  Quoting is only needed if a value contains spaces (agent names do not).",
     async run(ctx, args) {
-      // A second argument is accepted only as a local test directory's `DEV-` sentinel; register()
-      // refuses anything else.
+      // A second argument is a retired registration token; register() refuses it.
       const agent = args[0] ?? "";
-      const devToken = args[1] ?? "";
-      return legacy(await register(ctx.celloDir, agent, devToken, ctx.onProgress));
+      const token = args[1] ?? "";
+      return legacy(await register(ctx.celloDir, agent, token, ctx.onProgress));
     },
   },
   {

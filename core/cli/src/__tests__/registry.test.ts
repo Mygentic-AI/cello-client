@@ -363,7 +363,7 @@ describe("register-agent ignores CELLO_PREAUTH_TOKEN", () => {
   it("with only the env var set, it pairs and sends no preAuthToken", async () => {
     const dir = await mkdtemp(join(tmpdir(), "cello-registry-test-"));
     const prior = process.env["CELLO_PREAUTH_TOKEN"];
-    process.env["CELLO_PREAUTH_TOKEN"] = "DEV-env";
+    process.env["CELLO_PREAUTH_TOKEN"] = "CELLO-env";
     const fake = await startFakeDaemon(dir, {
       cello_pair_start: { ok: true, paired: true },
       cello_register: { ok: true, agent_id: "id-1", primary_pubkey: "pk-1" },

@@ -71,12 +71,12 @@ describe("cello_register single-flight guard", () => {
     const client = await connectToDaemon(config.socketPath);
 
     // First registration: passes validation, claims the slot, parks in the resolver.
-    const first = client.send("cello_register", { agent: "alice", preAuthToken: "t1" }) as Promise<{ ok: boolean; reason?: string }>;
+    const first = client.send("cello_register", { agent: "alice", channel: true, adminPubkeyHex: "ab".repeat(32), adminSignature: "cd".repeat(64) }) as Promise<{ ok: boolean; reason?: string }>;
     // Let the daemon process the first request and reach the resolver await.
     await new Promise((r) => setTimeout(r, 80));
 
     // Second registration while the first holds the slot → rejected.
-    const second = (await client.send("cello_register", { agent: "alice", preAuthToken: "t2" })) as { ok: boolean; reason?: string };
+    const second = (await client.send("cello_register", { agent: "alice", channel: true, adminPubkeyHex: "ab".repeat(32), adminSignature: "cd".repeat(64) })) as { ok: boolean; reason?: string };
     expect(second.ok).toBe(false);
     expect(second.reason).toBe("registration_already_in_progress");
 
@@ -159,7 +159,7 @@ describe("DOD-M15-EXPIRY-CONSUMER-POLICY-1: a lapsed manifest is reported, and d
       directoryEndpointResolver: async () => ({ peerId: "12D3KooWX", multiaddr: "/ip4/127.0.0.1/tcp/1" }) as never,
       loadedAgents: [{ name: "alice", pubkey: "11".repeat(32), keyProvider: {} as never }],
       registrationGuidance: () => "guidance",
-      pairingStore: {} as never,
+      pairingStore: { credential: () => ({ nonce: "00" }), daemonKey: () => { throw new Error("stub: no daemon key") } } as never,
       manifestProvider: {
         loadAndVerify: async () => expired as never,
         getCurrentManifest: () => { reachedRoster = true; return expired as never; },
@@ -169,7 +169,7 @@ describe("DOD-M15-EXPIRY-CONSUMER-POLICY-1: a lapsed manifest is reported, and d
 
     const handler = handlers.get("cello_register")!;
     expect(handler, "the handler must be registered").toBeDefined();
-    await handler({ agent: "alice", preAuthToken: "t1" }, "conn-1").catch(() => undefined);
+    await handler({ agent: "alice", channel: true, adminPubkeyHex: "ab".repeat(32), adminSignature: "cd".repeat(64) }, "conn-1").catch(() => undefined);
 
     const lapsed = warns.find((w) => w.event === "registration.manifest.lapsed");
     expect(
@@ -212,7 +212,7 @@ describe("M16 004-IDENTITY-WIRE: cello_register channel params", () => {
       directoryEndpointResolver: async () => ({ peerId: "12D3KooWX", multiaddr: "/ip4/127.0.0.1/tcp/1" }) as never,
       loadedAgents: [{ name: "alice", pubkey: "11".repeat(32), keyProvider: {} as never }],
       registrationGuidance: () => "guidance",
-      pairingStore: {} as never,
+      pairingStore: { credential: () => ({ nonce: "00" }), daemonKey: () => { throw new Error("stub: no daemon key") } } as never,
     });
     return handlers.get("cello_register")!;
   }
@@ -221,7 +221,7 @@ describe("M16 004-IDENTITY-WIRE: cello_register channel params", () => {
 
   it("channel without adminPubkeyHex is refused", async () => {
     const spy = vi.spyOn(RegistrationManager.prototype, "register");
-    const result = (await makeHandler()({ agent: "alice", preAuthToken: "t", channel: true }, "c")) as {
+    const result = (await makeHandler()({ agent: "alice", channel: true }, "c")) as {
       ok: boolean; reason?: string;
     };
     expect(result.ok).toBe(false);
@@ -231,7 +231,7 @@ describe("M16 004-IDENTITY-WIRE: cello_register channel params", () => {
 
   it("adminPubkeyHex without channel is refused", async () => {
     const spy = vi.spyOn(RegistrationManager.prototype, "register");
-    const result = (await makeHandler()({ agent: "alice", preAuthToken: "t", adminPubkeyHex: ADMIN }, "c")) as {
+    const result = (await makeHandler()({ agent: "alice", adminPubkeyHex: ADMIN }, "c")) as {
       ok: boolean; reason?: string;
     };
     expect(result.ok).toBe(false);
@@ -354,7 +354,7 @@ describe("cello_register with the device credential", () => {
     expect(r).toEqual({ ok: false, reason: "account_unresolved", guidance: G });
   });
 
-  it("11. an explicit CELLO- or DEV- token passes through unchanged, even on a paired daemon", async () => {
+  it("11. a caller-supplied token is ignored: a paired daemon always presents its own grant", async () => {
     await pair();
     const tokens: unknown[] = [];
     vi.spyOn(RegistrationManager.prototype, "register").mockImplementation(async (_p, token) => {
@@ -362,10 +362,14 @@ describe("cello_register with the device credential", () => {
       return { error: "stopped_here_by_test" };
     });
     const register = makeHandler([{ name: "alice", pubkey: ALICE }]);
-    const cello = "CELLO-" + "1".repeat(33);
-    await register({ agent: "alice", preAuthToken: cello }, "c");
     await register({ agent: "alice", preAuthToken: "DEV-local" }, "c");
-    expect(tokens).toEqual([cello, "DEV-local"]);
+    expect(tokens).toHaveLength(1);
+    expect(String(tokens[0])).toMatch(/^DCRED1\./);
+  });
+
+  it("11b. an unpaired daemon given a token is refused not_paired", async () => {
+    const register = makeHandler([{ name: "alice", pubkey: ALICE }]);
+    expect(await register({ agent: "alice", preAuthToken: "DEV-local" }, "c")).toMatchObject({ ok: false, reason: "not_paired" });
   });
 
   it("12. CREDENTIAL_INVALID clears the credential and keeps the daemon key", async () => {

@@ -60,9 +60,8 @@ export interface DkgRound2Share {
  * The directory node generates its own secret polynomial and returns
  * its public broadcast.
  *
- * preAuthToken carries a paired device's `DCRED1.` grant, or a local test
- * directory's `DEV-` token (CELLO_ENV=local). The directory checks it before
- * any crypto computation.
+ * preAuthToken carries a paired device's `DCRED1.` grant. The directory
+ * checks it before any crypto computation.
  */
 export interface FrostDkgRound1Request {
   type: "frost_dkg_round1_request";
@@ -73,10 +72,8 @@ export interface FrostDkgRound1Request {
   /** Threshold parameters for the DKG group */
   signers: { min: number; max: number };
   /**
-   * OPS-AGENT-001: Pre-authorization token issued by POST /internal/pre-authorize.
-   * Must be present for all new registrations after M6. The directory consumes
-   * the token atomically before any crypto computation.
-   * Local/test: use any 'DEV-' prefixed token (accepted by DevTokenValidator).
+   * The paired device's `DCRED1.` registration grant. Every directory verifies it
+   * before any crypto computation.
    *
    * M16 024-CREATE: ABSENT for a channel registration. A channel presents no token —
    * `channel: true` with a valid `admin_signature` is the basis of its right, so its round-1

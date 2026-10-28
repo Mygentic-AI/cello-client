@@ -686,7 +686,7 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
   // Registers a LOADED agent (one with a K_local `key` under ~/.cello/agents/<name>/)
   // with the directory: ML-DSA keygen → register_request → FROST DKG → register_success,
   // persisting the ML-DSA keypair, FROST share, registration state, and agent→user link.
-  // Invoked with a paired device's grant, or a local test directory's `DEV-` token.
+  // Invoked with a paired device's grant.
   // Single-flight guard (M1): the directory's registration reply frames
   // (dkg_ready / register_success / register_error) carry NO agent identifier, so
   // two concurrent registrations over the one shared directory signaling stream
