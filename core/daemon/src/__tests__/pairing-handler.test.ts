@@ -177,3 +177,54 @@ describe("pairing handlers", () => {
     expect(urls.some((u) => new URL(u).host === new URL(start.approve_url).host)).toBe(false);
   });
 });
+
+describe("cello_pair_status — the reliable, non-log 'approved?' signal", () => {
+  let dir: string;
+  let db: DaemonDatabase;
+  let store: DbPairingStore;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "cello-pair-status-"));
+    const dbPath = join(dir, "cello.db");
+    db = openEncryptedDatabase(dbPath, resolveDbKey(dbPath, dbKeyPathFor(dbPath)));
+    store = new DbPairingStore(db, logger);
+  });
+  afterEach(async () => {
+    db.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  // The store starts empty, so registration never resumes a poller — the handler only READS.
+  function statusHandler(nowMs: number): IpcHandler {
+    const handlers = new Map<string, IpcHandler>();
+    registerPairingHandlers({ handlers, logger, pairingStore: store, getBases: () => [], fetchFn: (u, i) => fetch(u, i), pollIntervalMs: 10, now: () => nowMs });
+    return handlers.get("cello_pair_status")!;
+  }
+
+  it("reports paired:true with the account id once a device credential is stored (approved)", async () => {
+    const cred = await credentialFor(store.daemonKey().pubkeyHex);
+    store.saveCredential(cred);
+    expect(await statusHandler(1_000)(undefined, "c")).toEqual({ ok: true, paired: true, account_id: ACCOUNT });
+  });
+
+  it("paired:false, pending:true while a device code is live but unapproved", async () => {
+    store.savePending({ code: "ABCD1234", base: "https://d.example", expiresAt: 61_000, approveUrl: "https://p/approve" });
+    expect(await statusHandler(1_000)(undefined, "c")).toEqual({ ok: true, paired: false, pending: true });
+  });
+
+  it("paired:false, pending:false when no pairing has been opened", async () => {
+    store.daemonKey(); // the daemon-key row exists, but no credential and no pending
+    expect(await statusHandler(1_000)(undefined, "c")).toEqual({ ok: true, paired: false, pending: false });
+  });
+
+  it("paired:false, pending:false once the code has expired — an expired code is not 'pending'", async () => {
+    store.savePending({ code: "ABCD1234", base: "https://d.example", expiresAt: 500, approveUrl: "https://p/approve" });
+    expect(await statusHandler(1_000)(undefined, "c")).toEqual({ ok: true, paired: false, pending: false });
+  });
+
+  it("credential present wins even if a stale pending row is also live — it never blocks or polls", async () => {
+    store.savePending({ code: "ABCD1234", base: "https://d.example", expiresAt: 61_000, approveUrl: "https://p/approve" });
+    store.saveCredential(await credentialFor(store.daemonKey().pubkeyHex));
+    expect(await statusHandler(1_000)(undefined, "c")).toEqual({ ok: true, paired: true, account_id: ACCOUNT });
+  });
+});
