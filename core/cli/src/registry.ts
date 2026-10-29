@@ -821,7 +821,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "Usage: cello pair-status  — print JSON: paired (a directory-signed device credential is stored,\n" +
       "  i.e. the owner approved this device), pending (a device code is live but not yet approved), and\n" +
       "  account_id once paired.\n" +
-      "  Read-only: it never opens, refreshes or waits on a pairing. A hosted host agent reads it to tell\n" +
+      "  Read-only: it does not open, refresh or wait on a pairing. A hosted host agent reads it to tell\n" +
       "  an approved-but-unregistered agent (finish 'register-agent') from one still awaiting approval.",
     async run(ctx) {
       return legacy(await pairStatus(ctx.celloDir));
