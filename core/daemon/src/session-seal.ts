@@ -100,6 +100,13 @@ export interface SessionSealContext {
   readonly onSessionStateChanged:
     | ((agentName: string, sessionId: string, state: string, counterpartyPubkey: string | null) => void)
     | null;
+  /**
+   * M10E 007-NOTICES — fired when this agent's session reaches sealed, so the customer's daemon can
+   * leave a no-right notice. Fire-and-forget: it must never throw into or delay the seal path.
+   */
+  readonly onSessionSealed:
+    | ((agentName: string, sessionId: string) => void)
+    | null;
   readonly ownChainStore: SessionOwnChainStore | null;
   /**
    * ⚠️ THE `stores` ARGUMENT IS NOT OPTIONAL DECORATION. A client built without it has no receipt
@@ -360,7 +367,11 @@ export class SessionSeal {
     // The terminal guard (abandoned/sealed must not be overwritten) lives in #updateSessionStatus,
     // so it holds for destroySessionNode and retireSession too — not only for callers of this
     // wrapper.
-    return this.#ctx.updateSessionStatus(agentName, sessionId, "sealed");
+    const flipped = this.#ctx.updateSessionStatus(agentName, sessionId, "sealed");
+    // M10E 007-NOTICES: only on the transition TO sealed (true), so a retried close that finds the
+    // session already terminal does not re-run the rights lookup. Fire-and-forget by contract.
+    if (flipped) this.#ctx.onSessionSealed?.(agentName, sessionId);
+    return flipped;
   }
 
   /**

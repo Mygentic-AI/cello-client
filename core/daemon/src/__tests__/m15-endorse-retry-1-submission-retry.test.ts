@@ -305,7 +305,7 @@ describe("DOD-M15-ENDORSE-RETRY-1 — the retry (clauses 1, 4, 5)", () => {
     expect(listed[0].delivery.gaveUpBecause).toBe("attempts_exhausted");
     expect(listed[0].delivery.lastReason).toBe("submission_write_timeout");
     // A TERMINAL STATE WITH A NEXT STEP, not a bare code. The operator can act on this one.
-    expect(listed[0].delivery.guidance).toMatch(/cello_attestations_issue/);
+    expect(listed[0].delivery.guidance).toMatch(/cello_endorsements_issue/);
     const gaveUp = h.events.filter((e) => e.event === "signal.submission.retry.gave_up");
     expect(gaveUp).toHaveLength(1);
     expect(gaveUp[0].ctx["stoppedBecause"]).toBe("attempts_exhausted");
@@ -329,7 +329,7 @@ describe("DOD-M15-ENDORSE-RETRY-1 — the retry (clauses 1, 4, 5)", () => {
     const listed = h.queue.list("agent-alice");
     expect(listed[0].delivery.state).toBe("gave_up");
     expect(listed[0].delivery.gaveUpBecause).toBe("retry_window_elapsed");
-    expect(listed[0].delivery.guidance).toMatch(/cello_attestations_issue/);
+    expect(listed[0].delivery.guidance).toMatch(/cello_endorsements_issue/);
   });
 
   it("CLAUSE 4 — in a MIXED run, only the failures that reached a node are counted", async () => {

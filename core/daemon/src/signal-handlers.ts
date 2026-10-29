@@ -29,6 +29,7 @@ import type { SignalingManager } from "@cello-protocol/transport";
 import { CONSENT_ACCEPTED } from "./consent-migration.js";
 import { revocabilityOf } from "./signal-revocability.js";
 import { composeSealedSubmission, fetchSubmissionResults, sendSealedSubmission } from "./signal-submission.js";
+import { registerAttestationNamespaceHandlers } from "./attestation-namespace-handlers.js";
 import { DEFAULT_RETRY_WINDOW_MS, isRetryableSendFailure } from "./submission-retry.js";
 import type { SubmissionRetryQueue } from "./submission-retry.js";
 import { TrustSignalStore } from "./trust-signal-store.js";
@@ -289,7 +290,6 @@ export function registerSignalHandlers(deps: SignalHandlerDeps): void {
     return { ok: true, name, pubkey: rec.pubkey };
   };
 
-
   /**
    * Compose → seal → send ONE submission on behalf of the selected agent, applying every guard that
    * must hold for any of them.
@@ -433,7 +433,7 @@ export function registerSignalHandlers(deps: SignalHandlerDeps): void {
                 `${context.replace(/:$/, "")} — not yet. It did not reach a directory node ` +
                 `(${sent.reason}), so the daemon is holding it and will send it as soon as the ` +
                 "directory signaling stream is back, on whichever node that is. You do NOT need to " +
-                "run this again. Run cello_attestations_issued to see where it got to. It is held IN " +
+                "run this again. Run cello_endorsements_issued to see where it got to. It is held IN " +
                 "MEMORY, so if the daemon restarts before it lands you will have to write it again.",
             };
           }
@@ -616,7 +616,6 @@ export function registerSignalHandlers(deps: SignalHandlerDeps): void {
     };
   });
 
-
   handlers.set("wallet_list_issued", async (_params, connectionId) => {
     const sel = resolveSelectedAgent(connectionId);
     if (!sel.ok) return sel;
@@ -669,7 +668,7 @@ export function registerSignalHandlers(deps: SignalHandlerDeps): void {
     };
   });
 
-  handlers.set("cello_attestations_issue", async (params, connectionId) => {
+  handlers.set("cello_endorsements_issue", async (params, connectionId) => {
     const sel = resolveSelectedAgent(connectionId);
     if (!sel.ok) return sel;
     const subject = typeof params?.subject_pubkey === "string" ? params.subject_pubkey.toLowerCase() : "";
@@ -724,6 +723,8 @@ export function registerSignalHandlers(deps: SignalHandlerDeps): void {
     };
   });
 
+  registerAttestationNamespaceHandlers({ handlers, resolveSelectedAgent, onlineAgents, keyProviders, getAgentSignaling, logger, getDb: () => sessionNodeManager.getDb(), resolveAgentId: (a) => sessionNodeManager.resolveAgentId(a), submitForAgent, verifiedManifest, resolveConsortiumRoster, openVisitingConnection, waitForSignalingConnected }); // M10E 003-NSCLIENT namespaces + 005-SVCCLIENT mark/rights + 011-CLAIM claim/claimed + 015-READ summary/reviews/deals/rule
+
   /**
    * M10B / DOD-END-SURFACE-1 — per-counterparty presentation choice.
    *
@@ -768,7 +769,7 @@ export function registerSignalHandlers(deps: SignalHandlerDeps): void {
     };
   });
 
-  handlers.set("cello_attestation_consent_list", async (_params, connectionId) => {
+  handlers.set("cello_endorsement_consent_list", async (_params, connectionId) => {
     const sel = resolveSelectedAgent(connectionId);
     if (!sel.ok) return sel;
     const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
@@ -807,7 +808,7 @@ export function registerSignalHandlers(deps: SignalHandlerDeps): void {
     return { ok: true, agent: sel.name, pending: items };
   });
 
-  handlers.set("cello_attestation_consent_accept", async (params, connectionId) => {
+  handlers.set("cello_endorsement_consent_accept", async (params, connectionId) => {
     const sel = resolveSelectedAgent(connectionId);
     if (!sel.ok) return sel;
     const prefix = typeof params?.hash_prefix === "string" ? params.hash_prefix : null;
@@ -827,12 +828,12 @@ export function registerSignalHandlers(deps: SignalHandlerDeps): void {
     // was not, and the next presentation would silently omit it.
     if (!store.setConsentState(item.signalHash, "accepted")) {
       return { ok: false, reason: "consent_write_failed",
-        guidance: `The acceptance was NOT recorded — the signal row changed underneath this call. Run cello_attestation_consent_list and retry.` };
+        guidance: `The acceptance was NOT recorded — the signal row changed underneath this call. Run cello_endorsement_consent_list and retry.` };
     }
     return { ok: true, signal_hash: item.signalHash, consent_state: "accepted" };
   });
 
-  handlers.set("cello_attestation_consent_refuse", async (params, connectionId) => {
+  handlers.set("cello_endorsement_consent_refuse", async (params, connectionId) => {
     const sel = resolveSelectedAgent(connectionId);
     if (!sel.ok) return sel;
     const prefix = typeof params?.hash_prefix === "string" ? params.hash_prefix : null;
@@ -859,7 +860,7 @@ export function registerSignalHandlers(deps: SignalHandlerDeps): void {
           `No pending or accepted attestation for '${sel.name}' with prefix '${prefix}'. Refusal ` +
           `applies to attestations another party issued ABOUT you — signals the portal issued (your ` +
           `track record, verified email and phone, GitHub links, security factors) are not refused ` +
-          `here. Run cello_attestation_consent_list to see what is decidable.`,
+          `here. Run cello_endorsement_consent_list to see what is decidable.`,
       };
     }
     const wasAccepted = item.consentState === "accepted";
@@ -873,7 +874,7 @@ export function registerSignalHandlers(deps: SignalHandlerDeps): void {
     // decision that is not in the database.
     if (!store.setConsentState(item.signalHash, "refused")) {
       return { ok: false, reason: "consent_write_failed",
-        guidance: `The refusal was NOT recorded — the signal row changed underneath this call. Run cello_attestation_consent_list and retry.` };
+        guidance: `The refusal was NOT recorded — the signal row changed underneath this call. Run cello_endorsement_consent_list and retry.` };
     }
     const refused = {
       ok: true as const,
@@ -1061,7 +1062,7 @@ export function registerSignalHandlers(deps: SignalHandlerDeps): void {
     // THE LOCAL COPY SURVIVES. It used to be deleted unconditionally, so a failed retraction also
     // destroyed the ability to retry — and since the directory half never worked, that was every
     // retraction. The signal stays until the portal confirms the revocation; the operator can see
-    // the outcome with cello_attestations_issued and the wallet reflects it on the next refresh.
+    // the outcome with cello_endorsements_issued and the wallet reflects it on the next refresh.
     return {
       ok: true,
       signal_hash: signalHash,
@@ -1081,7 +1082,7 @@ export function registerSignalHandlers(deps: SignalHandlerDeps): void {
         `signal is one you may retract, and revokes it at the directory; the outcome comes back on ` +
         `the results channel. Your local copy is KEPT — deliberately, so a failure leaves you able to ` +
         `retry. Nothing removes it automatically even on success: check the outcome with ` +
-        `cello_attestations_issued.`,
+        `cello_endorsements_issued.`,
     };
   });
 }

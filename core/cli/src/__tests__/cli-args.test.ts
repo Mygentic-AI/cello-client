@@ -67,8 +67,9 @@ describe("F1: usage string lists every command", () => {
         "doc",
         // Contacts
         "contacts", "contact",
-        // Trust & endorsements
-        "attestations", "trust-signals", "attestation-consent",
+        // Trust & endorsements (008-ENDRENAME: endorsements/endorsement-consent split out of
+        // attestations; the old attestation-consent name survives as a rename stub)
+        "attestations", "endorsements", "trust-signals", "attestation-consent", "endorsement-consent",
         // Broadcast channels (M16). Terminal-only on purpose: a post carries the operator's own
         // signature to every subscriber, so it is not a tool an agent may reach for.
         // M16 022: the plural LIST, beside the singular that acts on one — the shape `contacts` /
@@ -250,26 +251,26 @@ describe("F2: unknown flags are rejected, not coerced to positionals", () => {
   describe("the `--` terminator protects prose from flag parsing", () => {
     it("a dash-leading token after `--` is text, not an unknown flag", () => {
       // "cut p99 by -30ms" is a perfectly ordinary thing to write in an endorsement.
-      expect(checkArgs("attestations", ["issue", "ab", "--", "cut", "p99", "by", "-30ms"]))
+      expect(checkArgs("endorsements", ["issue", "ab", "--", "cut", "p99", "by", "-30ms"]))
         .toEqual({ kind: "ok" });
     });
 
     it("`-h` after `--` does NOT hijack the command into printing help", () => {
       // This was the surprising half: the terminator was honoured for unknown flags and ignored for
       // help, so mentioning a flag in prose silently replaced the operator's action with a help page.
-      expect(checkArgs("attestations", ["issue", "ab", "--", "she", "explained", "the", "-h", "flag"]))
+      expect(checkArgs("endorsements", ["issue", "ab", "--", "she", "explained", "the", "-h", "flag"]))
         .toEqual({ kind: "ok" });
     });
 
     it("still reports help when `-h` comes BEFORE any terminator", () => {
       // The counterpart. Without this, "fixing" the above by deleting the help check entirely would
       // pass — and `cello attestations -h` would stop working.
-      expect(checkArgs("attestations", ["issue", "-h"])).toEqual({ kind: "help" });
-      expect(checkArgs("attestations", ["-h", "--", "text"])).toEqual({ kind: "help" });
+      expect(checkArgs("endorsements", ["issue", "-h"])).toEqual({ kind: "help" });
+      expect(checkArgs("endorsements", ["-h", "--", "text"])).toEqual({ kind: "help" });
     });
 
     it("still rejects an unknown flag that appears BEFORE the terminator", () => {
-      expect(checkArgs("attestations", ["issue", "--bogus", "--", "text"]))
+      expect(checkArgs("endorsements", ["issue", "--bogus", "--", "text"]))
         .toEqual({ kind: "unknown_flag", flag: "--bogus" });
     });
   });

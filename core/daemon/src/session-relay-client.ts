@@ -2857,21 +2857,13 @@ export class AgentRelayClient {
       /**
        * ─── OUR OWN DEAD CREDENTIAL IS NOT A RELAY OUTAGE — `DOD-M15-TOKENSTALE-1` ───────────────
        *
-       * `#ensureConnected` answers with a BOOLEAN, so every reason a relay ever gave for refusing
-       * us arrived here as `false` and left as `relay_unavailable`. That word is a claim about the
-       * RELAY: unreachable, transient, someone else's, and the documented grounds on which a send
-       * appends an unwitnessed leaf and still reports success.
-       *
-       * An expired online token is the opposite on all four counts, and the cost of the mislabel is
-       * not cosmetic. Measured live 2026-09-10: an agent ran for over two days answering
-       * `ok:true, delivered:true` to every send while the relay refused all thirteen of its
-       * authentications. Nothing it said in that time could ever produce a receipt, and no surface
-       * anywhere said so — because the one place that knew called it a relay problem.
-       *
-       * `#lastAuthRefusal` already held the truth (`cello status` reads it); the submit path simply
-       * never looked. Only LOCAL refusals are promoted: a genuine relay fault keeps
-       * `relay_unavailable`, so this is a split rather than a rename, and the caller's existing
-       * degradation for a real outage is untouched.
+       * `#ensureConnected` answers with a BOOLEAN, so every relay refusal used to arrive here as
+       * `false` and leave as `relay_unavailable` — a claim about the RELAY, on which a send appends
+       * an unwitnessed leaf and still reports success. An expired online token is the opposite:
+       * measured live 2026-09-10, an agent ran for two days answering `ok:true` while the relay
+       * refused all thirteen of its authentications, and nothing could produce a receipt. So LOCAL
+       * refusals are promoted from `#lastAuthRefusal` (which `cello status` reads); a genuine relay
+       * fault keeps `relay_unavailable`, leaving the real-outage degradation untouched.
        */
       const refusal = this.#lastAuthRefusal;
       if (refusal && isLocalCredentialRefusal(refusal.reason)) {
@@ -2902,6 +2894,14 @@ export class AgentRelayClient {
           });
         }
         return { ok: false, reason: refusal.reason };
+      }
+      // 017-SEAL — a rate-limited sign-in is back-pressure, not an outage. Collapsing it to
+      // `relay_unavailable` here is what made `close-session-handler` fall back to the directory-only
+      // seal (both parties at once, then each refusing the other's co-sign — Step 0). Surfaced under
+      // its own name, the `#doSubmit` throttle loop below waits the relay's window out and resubmits;
+      // the sign-in succeeds on the retry and never reaches the fallback.
+      if (refusal?.reason === "rate_limited") {
+        return { ok: false, reason: "rate_limited", ...(refusal.retryAfterMs !== undefined ? { retry_after_ms: refusal.retryAfterMs } : {}) };
       }
       return { ok: false, reason: "relay_unavailable" };
     }

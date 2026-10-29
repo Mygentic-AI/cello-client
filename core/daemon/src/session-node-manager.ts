@@ -871,6 +871,10 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       ) => void)
     | null = null;
 
+  // M10E 007-NOTICES: fired when a session reaches sealed for this agent, so the customer's daemon can
+  // leave a no-right notice when a promised review right never arrived. Fire-and-forget; never throws.
+  #onSessionSealed: ((agentName: string, sessionId: string) => void) | null = null;
+
   // M8C-MSGWAKE-1 (channel stage 2): fired when a verified inbound message is buffered for
   // cello_receive, so the daemon can push a content-free `cello_message` doorbell. Wired in
   // daemon.ts (depends on the notification dispatcher). Content-free by signature — carries only
@@ -1394,6 +1398,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       get ensureSealBroker() { return mgr.#ensureSealBroker; },
       set ensureSealBroker(v) { mgr.#ensureSealBroker = v; },
       get onSessionStateChanged() { return mgr.#onSessionStateChanged; },
+      get onSessionSealed() { return mgr.#onSessionSealed; },
       get ownChainStore() { return mgr.#ownChainStore; },
       get detachedRelayClientBuilder() { return mgr.#detachedRelayClientBuilder; },
 
@@ -1746,6 +1751,11 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     ) => void,
   ): void {
     this.#onSessionStateChanged = cb;
+  }
+
+  /** M10E 007-NOTICES: the no-right noticer hook, set once by the daemon composition root. */
+  setOnSessionSealed(cb: (agentName: string, sessionId: string) => void): void {
+    this.#onSessionSealed = cb;
   }
 
   /**

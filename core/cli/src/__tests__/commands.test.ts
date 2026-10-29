@@ -18,7 +18,7 @@ import { startDaemon, acquireLock, readLock, connectToDaemon, isProcessAlive, ac
 import { PassthroughGatewayClient } from "@cello-protocol/daemon/testing";
 import type { Logger, DaemonConfig } from "@cello-protocol/daemon";
 import { createServer, type Server } from "node:net";
-import { login, logout, status, register, createAgent, browserOpener } from "../commands.js";
+import { login, logout, status, register, createAgent, browserOpener, attestations } from "../commands.js";
 import { startFakeDaemon } from "./helpers/fake-daemon.js";
 import { monikerSet, settingsGet, settingsSet, startAgent } from "../parity-commands.js";
 import {
@@ -578,5 +578,39 @@ describe("cli commands", () => {
         await fake.close();
       }
     });
+  });
+});
+
+/**
+ * 008-ENDRENAME — `cello attestations issue`/`issued` are the person-to-person ENDORSEMENT, moved to
+ * `cello endorsements`. The old sub-verbs refuse with a rename line and touch nothing; the M10E
+ * REVIEW sub-verbs under `cello attestations` are untouched.
+ */
+describe("008-ENDRENAME — the attestations issue/issued rename stub", () => {
+  // A directory with no daemon.lock: the stub must answer BEFORE any lock read or IPC, so the rename
+  // line is what comes back — not "No daemon running" and never a send.
+  const NO_DAEMON = join(tmpdir(), "cello-endrename-nodaemon-does-not-exist");
+
+  it("E4: `cello attestations issue` prints the rename line, exits non-zero, and sends nothing", async () => {
+    const res = await attestations(NO_DAEMON, "issue", ["ab".repeat(32), "--", "great work"]);
+    expect(res.exitCode).toBe(1);
+    expect(res.output).toBe("renamed: use `cello endorsements issue`");
+    // It did NOT fall through to the daemon path, which with no lock would say "No daemon running".
+    expect(res.output).not.toContain("No daemon running");
+  });
+
+  it("E4: `cello attestations issued` prints the rename line and exits non-zero", async () => {
+    const res = await attestations(NO_DAEMON, "issued", []);
+    expect(res.exitCode).toBe(1);
+    expect(res.output).toBe("renamed: use `cello endorsements issued`");
+  });
+
+  it("E5: a REVIEW sub-verb (`namespace`) is NOT caught by the stub — it reaches the daemon path", async () => {
+    // Proof the stub fires only for issue/issued: `namespace` falls through to the lock read, which
+    // with no daemon running answers "No daemon running" — never the rename line.
+    const res = await attestations(NO_DAEMON, "namespace", ["create"]);
+    expect(res.exitCode).toBe(1);
+    expect(res.output).toContain("No daemon running");
+    expect(res.output).not.toContain("renamed");
   });
 });

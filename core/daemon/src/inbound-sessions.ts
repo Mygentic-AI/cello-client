@@ -22,8 +22,9 @@ import type { SessionNodeManager } from "./session-node-manager.js";
 import type { AgentInfo, Logger, SessionRecord } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
 import { frameValueToHex } from "./frame-values.js";
-import { computeGenesisPrevRoot, computeChainAnchor, decodeTrustSignalEnvelope, hashTrustSignalEnvelope, verifyTrustSignalHash, decodeCbor, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
+import { computeGenesisPrevRoot, computeChainAnchor, decodeTrustSignalEnvelope, hashTrustSignalEnvelope, verifyTrustSignalHash, decodeCbor, decodeAttestationPayload, ATTESTATION_SIGNAL_TYPE, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
 import { TrustSignalStore } from "./trust-signal-store.js";
+import { AttestationNotices, READERS_CHANGED_SIGNAL_KIND } from "./attestation-notices.js";
 import { verifyInboundAssignment } from "./assignment-verify.js";
 import { REFUSAL_REASONS, NOT_ACCEPTING_CALLER_GUIDANCE, type RefusalReason, type AnyRefusalReason } from "./refusal-reasons.js";
 import { WIRE_REASON_RE } from "./counterparty-refusal.js";
@@ -33,6 +34,7 @@ import { TIER } from "./contacts-tier-migration.js";
 import type { RelayConnectParams } from "./session-node-manager.js";
 import type { RelayAssignmentCarry } from "./session-relay-client.js";
 import { extractErrorMessage } from "./error-message.js";
+import { persistSessionProof } from "./attestation-session-proof.js";
 
 /**
  * DOD-CAP-SELF-HEAL-1 — how often the operator's own cap may raise an alarm about one counterparty.
@@ -172,6 +174,21 @@ export interface InboundSessionDeps {
    * is a channel only because it subscribed to it.
    */
   isSubscribedChannel: (agentName: string, counterpartyPubkeyHex: string) => boolean;
+  /**
+   * M10E 007-NOTICES: fired after the responder keeps the session proof, so the customer's daemon can
+   * look up the counterparty's open public namespaces and leave offer notices. Fire-and-forget by
+   * contract — it must never delay or fail the session.
+   */
+  onSessionOpened?: (agentName: string, sessionIdHex: string, counterpartyPubkeyHex: string) => void;
+  /**
+   * M10E 016: the MODE of the namespace a delivered attestation names, resolved from the review
+   * SUBJECT's public directory index. Public and private attestations share the envelope type, so
+   * only the namespace's mode tells a presentable testimonial (wallet) from a private review (inbox).
+   * Returns "unknown" when the mode cannot be established — a failed/absent/unverified index entry —
+   * and the pickup handler then refuses rather than guessing. Omitted (test paths that never deliver
+   * an attestation) ⇒ the handler treats every attestation as "unknown" and refuses it.
+   */
+  resolveAttestationNamespaceMode?: (agentName: string, ownerPubkeyHex: string, namespace: string) => Promise<"public" | "private" | "unknown">;
 }
 
 /**
@@ -472,6 +489,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     handleInboundSealInterruptedRequest, reapDeadHalfOpenSessions,
     sendAwayResponse, dispatchSessionStateChangedWithTelegram, sendTelegramDoorbell,
     isDeliveryOpenToAgent, isChannelAgent, isSubscribedChannel,
+    resolveAttestationNamespaceMode,
   } = deps;
 
   // ─── Seam 2: inbound session establishment (counterparty side) ─────────────
@@ -1569,6 +1587,25 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       });
       return;
     }
+    // M10E 005-SVCCLIENT — the RESPONDER keeps the proof too. A customer usually opens the session
+    // with the provider, so without this the provider could not mark a service event in the most
+    // common case. Same rules as the initiator: success path only, and a failure to keep it never
+    // fails the session.
+    if (rawAssignment !== null && rawAssignment.signature_type === "frost") {
+      try {
+        persistSessionProof(
+          sessionNodeManager.getDb(), sessionNodeManager.resolveAgentId(localAgent.name), parsed.sessionIdHex,
+          rawAssignment, { ok: true }, Date.now, logger, correlationId,
+        );
+      } catch (err: unknown) {
+        logger.error("attestation.session_proof.store_failed", { session_id: parsed.sessionIdHex, reason: extractErrorMessage(err) });
+      }
+      // M10E 007-NOTICES: the customer (responder) leaves itself offer notices for the counterparty's
+      // open public namespaces. The counterparty is participant A (the initiator). Fire-and-forget: a
+      // throw here must never reach the session path.
+      try { deps.onSessionOpened?.(localAgent.name, parsed.sessionIdHex, parsed.participantAPubkeyHex.toLowerCase()); }
+      catch (err: unknown) { logger.debug("attestation.notice.lookup_skipped", { session_id: parsed.sessionIdHex, reason: extractErrorMessage(err) }); }
+    }
     /**
      * ONE event, and `internal` is loud.
      *
@@ -1754,6 +1791,14 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       logger.warn("daemon.trust_signal.open_failed", { origin, agentName, signalKind, correlationId });
       return;
     }
+    // M10E 013: a reader-list change is a plain CBOR notice, not an envelope. Decoding it as one threw
+    // and never acked, so nobody saw the change and the directory re-delivered it forever.
+    if (signalKind === READERS_CHANGED_SIGNAL_KIND) {
+      const notices = new AttestationNotices({ db: () => sessionNodeManager.getDb(), logger, now: Date.now });
+      if (notices.noteReaderChange(sessionNodeManager.resolveAgentId(agentName), recovered) === "store_failed") return;
+      await ackPickup(mgr, id, agentName, signalKind, origin);
+      return;
+    }
     // M10-D18 / M10-D22: the recovered bytes are a canonical CBOR trust-signal envelope (NOT the M8
     // canonical-JSON record). Decode with the SHARED decoder (INV-CANONICAL — same code the portal/directory
     // encode with), then hand it to the holder's own chokepoint: `deliverWalletSignal` RE-DERIVES the
@@ -1768,6 +1813,46 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         agentName, signalKind, correlationId, error: extractErrorMessage(err),
       });
       return;
+    }
+    // M10E 016: public AND private attestations share this envelope type — the mode lives on the
+    // namespace, not the envelope. A PRIVATE review is something to READ: it goes to the inbox as
+    // quoted, untrusted data (the readers-changed path), NEVER to the wallet. A PUBLIC testimonial is
+    // something to PRESENT: it stays on the wallet path below (consent-pending for an agent issuer).
+    // The mode comes from the review SUBJECT's (the reviewed agent's) public directory index. When it
+    // cannot be established we REFUSE rather than guess — guessing private hides a presentable
+    // testimonial; guessing public presents a private review as a signal.
+    if (envelope.type === ATTESTATION_SIGNAL_TYPE) {
+      let namespace: string;
+      try {
+        namespace = decodeAttestationPayload(envelope.payload).namespace;
+      } catch (err) {
+        // A payload that will never decode is malformed: ack (a retry is pointless) and drop it.
+        logger.warn("daemon.trust_signal.attestation_malformed", { origin, agentName, signalKind, correlationId, error: extractErrorMessage(err) });
+        await ackPickup(mgr, id, agentName, signalKind, origin);
+        return;
+      }
+      const mode = resolveAttestationNamespaceMode
+        ? await resolveAttestationNamespaceMode(agentName, envelope.subject.toLowerCase(), namespace)
+        : "unknown";
+      if (mode === "unknown") {
+        // Not acked → the directory re-delivers once the owner's index can be read.
+        logger.warn("daemon.trust_signal.attestation_mode_unknown", { origin, agentName, signalKind, correlationId, namespace });
+        return;
+      }
+      if (mode === "private") {
+        const notices = new AttestationNotices({ db: () => sessionNodeManager.getDb(), logger, now: Date.now });
+        const outcome = notices.notePrivateReview(sessionNodeManager.resolveAgentId(agentName), envelope, signalHash);
+        // `stored`/`malformed` are acked (a retry would not help a malformed payload); anything else
+        // is NOT acked, so the directory keeps the pickup for a later retry.
+        if (outcome !== "stored" && outcome !== "malformed") {
+          logger.error("daemon.trust_signal.private_review_not_inboxed", { origin, agentName, signalKind, correlationId, outcome });
+          return;
+        }
+        logger.info("daemon.trust_signal.private_review_inboxed", { origin, agentName, signalKind, correlationId });
+        await ackPickup(mgr, id, agentName, signalKind, origin);
+        return;
+      }
+      // mode === "public": fall through to the wallet path — a presentable testimonial.
     }
     try {
       const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
@@ -1784,6 +1869,10 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       return;
     }
     logger.info("daemon.trust_signal.received", { origin, agentName, signalKind, verified: true, correlationId });
+    await ackPickup(mgr, id, agentName, signalKind, origin);
+  }
+
+  async function ackPickup(mgr: SignalingManager, id: string, agentName: string, signalKind: string, origin: string): Promise<void> {
     // DOD-SENDRAW-1: sendRaw never throws — a discarded result hid every failed ack, leaving the
     // sender to retransmit against a daemon that believed it had answered.
     const ackRes = await mgr.sendRaw({ type: "trust_signal_ack", id });
@@ -1791,7 +1880,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       logger.warn("daemon.trust_signal.ack_send_failed", { origin,
         agentName,
         signalKind,
-        correlationId,
+        correlationId: id,
         detail: ackRes.reason ?? "send_not_ok",
         ...(ackRes.guidance ? { guidance: ackRes.guidance } : {}),
       });

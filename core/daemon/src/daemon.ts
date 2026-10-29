@@ -97,6 +97,7 @@ import { createSealFlows } from "./seal-flows.js";
 import { registerCloseSessionHandler } from "./close-session-handler.js";
 import { createInboundSessions } from "./inbound-sessions.js";
 import { createOutboundSessions } from "./outbound-sessions.js";
+import { wireAttestationNoticer } from "./attestation-wiring.js";
 import { registerSessionReadHandlers } from "./session-read-handlers.js";
 import { registerInclusionProofHandlers } from "./inclusion-proof-handlers.js";
 import { pullSealCertificate } from "./seal-certificate-pull.js";
@@ -112,7 +113,6 @@ import { DbRegistryVersionStore } from "./registry-version-store-db.js";
 import { startRegistryPoll } from "./registry-poll.js";
 import { countAttendance } from "./co-attendance.js";
 import { FrontierMismatchStore } from "./frontier-mismatch.js";
-
 
 // 040-DAEMONROOT unit 8: three things that were never composition — the handle's shape, the session
 // node factory, and a duplicate constant — left this file. Re-exported so every importer, including
@@ -441,11 +441,13 @@ async function startDaemonHoldingLock(
     sessionNodeManager.getStandingReceiverAutoNat() ??
     new LocalAutoNatStub();
 
+  const { store: attestationNoticeStore, noticer: attestationNoticer, resolveNamespaceMode: resolveAttestationNamespaceMode } = wireAttestationNoticer({ logger, isOnline: (a) => onlineAgents.has(a), keyProvider: (a) => keyProviders.get(a), ownerPubkeyHex: (a) => loadedAgents.find((x) => x.name === a)?.pubkey, signalingFor: (a, kp, pub) => getAgentSignaling(a, kp, pub).signaling, db: () => sessionNodeManager.getDb(), resolveAgentId: (a) => sessionNodeManager.resolveAgentId(a), screenInbound: async (text, agentName, sessionId) => securityGateway.screenInbound(new TextEncoder().encode(text), { direction: "inbound", agentName, sessionId }) }); // M10E 007 (attestation-wiring.ts)
   // The OUTBOUND session path (outbound-sessions.ts): discovery, the session request, and cross-node
   // setup via a transient VISITING connection to the counterparty's home node.
   const { openVisitingConnection, crossNodeBrokerBySession, resolvedSessionNegotiator, runDiscoveryLookup, sweepTrustSignalsAndTick, trustSignalSweepTicker } = createOutboundSessions({
     logger,
     sessionNodeManager,
+    onSessionOpened: (a, s, c) => attestationNoticer.onSessionOpened(a, s, c),
     getKeyProvider: (agentName: string) => keyProviders.get(agentName),
     getPersistence,
     getAgentSignaling: (agentName: string, kp, pubkeyHex: string) => getAgentSignaling(agentName, kp, pubkeyHex),
@@ -478,7 +480,6 @@ async function startDaemonHoldingLock(
       // earlier version passed getters and said the opposite in three places.
       openVisitingConnection, crossNodeBrokerBySession,
     });
-
 
   // The inbound seal-interrupted REQUEST (inbound-seal-request.ts): the counterparty asks us to
   // co-sign the seal of a session neither side can finish normally. We answer with our own signed
@@ -524,6 +525,7 @@ async function startDaemonHoldingLock(
   } = createInboundSessions({
     logger,
     sessionNodeManager,
+    onSessionOpened: (a, s, c) => attestationNoticer.onSessionOpened(a, s, c),
     agents,
     isExplicitlyOffline: (agentName: string) => explicitlyOfflineAgents.has(agentName),
     // M12-P18: lets the responder send a refusal reason back to a TRUSTED sender.
@@ -554,7 +556,7 @@ async function startDaemonHoldingLock(
      */
     isSubscribedChannel: (agentName, counterpartyPubkeyHex) =>
       new ChannelSubscriptionStore(sessionNodeManager.getDb(), logger)
-        .isSubscribedChannel(sessionNodeManager.resolveAgentId(agentName), counterpartyPubkeyHex),
+        .isSubscribedChannel(sessionNodeManager.resolveAgentId(agentName), counterpartyPubkeyHex), resolveAttestationNamespaceMode, // M10E 016 subject index → private review (inbox) / public (wallet)
   });
 
   if (!sharedSignaling) {
@@ -674,7 +676,6 @@ async function startDaemonHoldingLock(
     manifestProvider, pairingStore,
   });
   registerPairingHandlers({ handlers, logger, pairingStore, manifestProvider }); // pairing-handler.ts
-
 
   // 040-DAEMONROOT unit 3: share rotation and relay receipts → agent-admin-handlers.ts.
   registerAgentAdminHandlers({
@@ -803,7 +804,6 @@ async function startDaemonHoldingLock(
   // Do not add an "accept" or "join" tool — CELLO has no such step. Inbound sessions are
   // auto-accepted by the standing receiver.
   const SESSION_TOOLS_REQUIRING_AGENT: string[] = [];
-
 
   for (const tool of SESSION_TOOLS_REQUIRING_AGENT) {
     handlers.set(tool, async (_params, connectionId) => {
@@ -1007,14 +1007,10 @@ async function startDaemonHoldingLock(
   contentPark.registerHandlers(handlers);
   registerInboundSessionHandlers(handlers);
 
-
   // CELLO-M7-CONN-001 (DOD-CONN-2): the inbound seal_interrupted_request responder is now
   // wired PER-AGENT (wirePerAgentSessionInbound, below) onto each agent's own signaling
   // manager — not once on the keystone — so every agent (not just the primary) receives it
   // on its own authenticated stream.
-
-
-
 
   // cello_send + cello_receive — the content path (session-content-handlers.ts). Two halves of one
   // state machine (the read cursor: send writes the tree, receive advances the cursor + watermark),
@@ -1035,6 +1031,7 @@ async function startDaemonHoldingLock(
     attendanceCount,
     // M16 031: the known public keys in an outbound message the gateway must pass untouched.
     knownPublicKeys: createKnownPublicKeysIn(knownPublicKeysDepsFromDaemon(sessionNodeManager, logger)),
+    attestationNotices: attestationNoticeStore, // M10E 007: spread into every receive reply
   });
 
   // cello_check_notifications (notification-handlers.ts): the push-loss reconciler. Notifications are
@@ -1063,6 +1060,7 @@ async function startDaemonHoldingLock(
       : {}),
     ownerKeyFor: (agentName) =>
       loadedAgents.find((a) => a.name === agentName)?.pubkey?.toLowerCase() ?? null,
+    attestationNotices: attestationNoticeStore, // M10E 007: the inbox door
   });
 
   // The address book — contacts, tiers, monikers, settings, the telegram token. Ten handlers, now
@@ -1091,7 +1089,6 @@ async function startDaemonHoldingLock(
     getStop: () => stop,
   });
 
-
   // THE SOCKET OPENS LAST — see the deferred start below. Accepting clients here would accept
   // `cello_start_agent`, which brings an agent online, creates its standing receiver, and drains
   // parked content — all of it arriving before the document frame hook exists.
@@ -1111,6 +1108,8 @@ async function startDaemonHoldingLock(
   sessionNodeManager.setOnSessionStateChanged((agentName, sessionId, state, counterpartyPubkey) => {
     dispatchSessionStateChangedWithTelegram(agentName, sessionId, state, counterpartyPubkey);
   });
+
+  sessionNodeManager.setOnSessionSealed((a, s) => attestationNoticer.onSessionSealed(a, s)); // M10E 007: no-right notice
 
   // M8C-MSGWAKE-1 (channel stage 2): per-message wake — a verified inbound message fires a
   // content-free `cello_message` doorbell to the current-agent connection(s). The shim's generic
@@ -1170,7 +1169,6 @@ async function startDaemonHoldingLock(
     await removeLockIfOwned(lockFilePath, process.pid, logger);
     throw err;
   }
-
 
   // 040-DAEMONROOT unit 20: what the daemon forgets, and what it says, when a connection closes →
   // disconnect-cleanup.ts.

@@ -29,6 +29,7 @@ import {
   telegramSetToken,
   channelVerb,
   attestations,
+  endorsements,
   trustSignals,
   type CommandResult,
 } from "./commands.js";
@@ -57,9 +58,9 @@ import {
   docPublish,
   docClose,
   docKill,
-  attestationConsentList,
-  attestationConsentAccept,
-  attestationConsentRefuse,
+  endorsementConsentList,
+  endorsementConsentAccept,
+  endorsementConsentRefuse,
   contactSetAway,
   listAgents,
   startAgent,
@@ -142,8 +143,8 @@ export const GROUP_ORDER = [
   // find, join and read a channel did not exist and nobody noticed for five orders.
   "Channels",
   // TWO GROUPS, NOT ONE. On the wire an attestation is a trust signal, and they sat together for
-  // exactly that reason — which made the person-to-person primitive read as a wallet chore. What the
-  // NETWORK verifies about you and what a PERSON says about a person are different affordances, and
+  // exactly that reason — which made the agent-to-agent primitive read as a wallet chore. What the
+  // NETWORK verifies about you and what an AGENT says about an agent are different affordances, and
   // the help is where an operator learns which is which. Attestations come first: it is the one that
   // needs two people, and the one nothing else here can substitute for.
   "Attestations",
@@ -1450,22 +1451,67 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
     },
   },
 
-  // ═══ Attestations — the person-to-person primitive ══════════════════════════════════════════
-  // ITS OWN GROUP, deliberately. An attestation is a PERSON vouching for a PERSON; a trust signal is
+  // ═══ Attestations — the agent-to-agent primitive ══════════════════════════════════════════
+  // ITS OWN GROUP, deliberately. An attestation is an AGENT vouching for an AGENT; a trust signal is
   // the NETWORK verifying an attribute (GitHub age, phone, email). The wire format is the same, so it
   // is tempting to file them together — but they are different affordances, and burying attestation
   // under a wallet listing hides the one capability that makes collaboration possible.
   {
     name: "attestations",
     group: "Attestations",
-    summary: "Endorse agents, issue general attestations, and check their status.",
+    summary: "Open review namespaces, mark service events, and read the rights and activity they create.",
     help:
       "Usage:\n" +
-      "  cello attestations issue <pubkey> <text\u2026>\n" +
-      "                                        \u2014 endorse them for something you have seen them do\n" +
-      "  cello attestations issued             \u2014 the status of every attestation you have issued\n" +
+      "  cello attestations namespace create <ns> --mode <public|private> [--scored] [--ttl <days>] --condition \"<words>\"\n" +
+      "                                        \u2014 open a review namespace others can review you in\n" +
+      "  cello attestations namespace close <ns>\n" +
+      "                                        \u2014 stop a namespace granting new rights; it stays listed\n" +
+      "  cello attestations index [<pubkey>] [--after <ns>]\n" +
+      "                                        \u2014 list every namespace an owner has ever opened\n" +
+      "  cello attestations mark <session-id> <namespace> [--origin-channel <pubkey>]\n" +
+      "                                        \u2014 mark a service event during an open session; it grants the counterparty a right to review you\n" +
+      "  cello attestations rights [--after <cursor>]\n" +
+      "                                        \u2014 the rights to review you hold; expired ones are shown and flagged\n" +
+      "  cello attestations claim-service <session-id> <namespace>\n" +
+      "                                        \u2014 claim a session the provider left unmarked; grants no right, counts as an unmarked claim\n" +
+      "  cello attestations activity <pubkey> <namespace>\n" +
+      "                                        \u2014 the service-event and unmarked-claim counts for a namespace\n" +
+      "  cello attestations readers list <ns>\n" +
+      "                                        \u2014 the readers of a PRIVATE namespace (owner only)\n" +
+      "  cello attestations readers add|remove <ns> <pubkey>\n" +
+      "                                        \u2014 name who receives its private feedback; every change is announced to all readers\n" +
       "\n" +
-      "An attestation is YOUR words about ANOTHER agent \u2014 the person-to-person half of trust. The\n" +
+      "A namespace fixes, for good, whether its reviews are public or private, their shape, how long a\n" +
+      "reviewer has, and the rule under which the right to review is granted. It is immutable: a new\n" +
+      "rule means a new namespace, and the index is public so an old one stays on show. Reading an\n" +
+      "index, the client checks each entry's owner signature itself; an entry that fails that check is\n" +
+      "shown flagged, not dropped.\n" +
+      "\n" +
+      "This is the M10E REVIEW system: a review is earned at a service event and nothing can refuse or\n" +
+      "withdraw it. To vouch for another agent in your OWN words \u2014 which they accept or refuse \u2014 that\n" +
+      "is a different thing with its own name: 'cello endorsements' (008-ENDRENAME).",
+    async run(ctx, args) {
+      const [sub, ...rest] = args;
+      return legacy(await attestations(ctx.celloDir, sub ?? "", rest));
+    },
+  },
+
+  // \u2550\u2550\u2550 Endorsements \u2014 the agent-to-agent vouch (008-ENDRENAME) \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+  // Split out of `cello attestations` so the two systems stop sharing a word. An endorsement is a
+  // AGENT vouching for an AGENT, which the subject accepts or refuses; the M10E review system under
+  // `cello attestations` has no refusal. The old `cello attestations issue`/`issued` now refuse with
+  // a rename line (see attestations() in commands.ts).
+  {
+    name: "endorsements",
+    group: "Attestations",
+    summary: "Vouch for another agent in your own words, and check what became of it.",
+    help:
+      "Usage:\n" +
+      "  cello endorsements issue <pubkey> <text\u2026>\n" +
+      "                                        \u2014 vouch for something you have seen them do\n" +
+      "  cello endorsements issued             \u2014 the status of every endorsement you have issued\n" +
+      "\n" +
+      "An endorsement is YOUR words about ANOTHER agent \u2014 the agent-to-agent half of trust. The\n" +
       "network's own claims about you (GitHub account age, phone, email) are 'cello trust-signals'.\n" +
       "\n" +
       "Nothing you write is final on your say-so. It is sealed to the CELLO portal (the directory\n" +
@@ -1473,14 +1519,16 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "accepts it. They are free to refuse, and a refusal may carry their reasoning back to you \u2014\n" +
       "it is them declining to stand behind your wording, not a fault in the claim.\n" +
       "\n" +
-      "The receiving direction \u2014 attestations others wrote about YOU \u2014 is 'cello attestation-consent'.\n" +
-      "You cannot attest about yourself.\n" +
+      "The receiving direction \u2014 endorsements others wrote about YOU \u2014 is 'cello endorsement-consent'.\n" +
+      "The portal refuses an endorsement an agent writes about itself. An agent can endorse\n" +
+      "another agent with the same owner; that endorsement is labelled as coming from an agent\n" +
+      "with the same owner and does not count toward endorsement minimums.\n" +
       "\n" +
       "Prose contains things that look like flags, so use -- to end flag parsing:\n" +
-      "  cello attestations issue b23c24dd\u2026 -- cut p99 by -30ms on the auth path",
+      "  cello endorsements issue b23c24dd\u2026 -- cut p99 by -30ms on the auth path",
     async run(ctx, args) {
       const [sub, ...rest] = args;
-      return legacy(await attestations(ctx.celloDir, sub ?? "", rest));
+      return legacy(await endorsements(ctx.celloDir, sub ?? "", rest));
     },
   },
 
@@ -1501,7 +1549,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "Trust signals are verifiable claims about you (GitHub account age, phone, email, etc.) that your\n" +
       "agent presents to contacts during sessions. They are issued by the CELLO portal, notarized by\n" +
       "the directory, and held in your local encrypted wallet. To vouch for SOMEONE ELSE in your own\n" +
-      "words, that is 'cello attestations issue' \u2014 a different thing with a different name.\n" +
+      "words, that is 'cello endorsements issue' \u2014 a different thing with a different name.\n" +
       "\n" +
       "'list' shows the whole wallet, including attestations others wrote about you once you accepted\n" +
       "them. The 'def' column shows whether a signal is in the default bundle (\u2713 = yes, \u2013 = no).\n" +
@@ -1520,21 +1568,21 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
   },
 
   {
-    name: "attestation-consent",
+    name: "endorsement-consent",
     group: "Attestations",
-    summary: "Accept or refuse attestations others have written about you.",
+    summary: "Accept or refuse endorsements others have written about you.",
     help:
       "Usage:\n" +
-      "  cello attestation-consent list                    — attestations others wrote about you, awaiting your decision\n" +
-      "  cello attestation-consent accept <hash>           — accept one: it becomes presentable to counterparties\n" +
-      "  cello attestation-consent refuse <hash> [why…]    — refuse one: it stays inert and is never presented.\n" +
+      "  cello endorsement-consent list                    — endorsements others wrote about you, awaiting your decision\n" +
+      "  cello endorsement-consent accept <hash>           — accept one: it becomes presentable to counterparties\n" +
+      "  cello endorsement-consent refuse <hash> [why…]    — refuse one: it stays inert and is never presented.\n" +
       "                                                    Anything after the hash is a message back to the\n" +
       "                                                    issuer (optional). With no message they are told\n" +
       "                                                    nothing.\n" +
       "\n" +
-      "Anyone can write an attestation ABOUT your agent — it lands in your wallet unbidden. It is INERT\n" +
+      "Anyone can write an endorsement ABOUT your agent — it lands in your wallet unbidden. It is INERT\n" +
       "until you accept it: nothing pending is presented, counted, or visible to a counterparty. That is\n" +
-      "the point of this command. Read the attester's words in 'list' before accepting, because\n" +
+      "the point of this command. Read the issuer's words in 'list' before accepting, because\n" +
       "accepting is what puts your name behind someone else's claim about you.\n" +
       "\n" +
       "Refusing is not a deletion — the record stays so the decision is auditable — but a refused signal\n" +
@@ -1547,14 +1595,26 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       const { pretty, positional } = parityOpts(args);
       const o = { pretty };
       const [sub, hash] = positional;
-      if (sub === "list") return attestationConsentList(ctx.celloDir, o);
-      if (sub === "accept" && hash) return attestationConsentAccept(ctx.celloDir, hash, o);
+      if (sub === "list") return endorsementConsentList(ctx.celloDir, o);
+      if (sub === "accept" && hash) return endorsementConsentAccept(ctx.celloDir, hash, o);
       if (sub === "refuse" && hash) {
         // Everything after the hash is the message — free text, so it is joined rather than parsed.
         const msg = positional.slice(2).join(" ");
-        return attestationConsentRefuse(ctx.celloDir, hash, msg.length > 0 ? msg : null, o);
+        return endorsementConsentRefuse(ctx.celloDir, hash, msg.length > 0 ? msg : null, o);
       }
-      return { stdout: helpForSpec("attestation-consent"), stderr: "", exitCode: 1 };
+      return { stdout: helpForSpec("endorsement-consent"), stderr: "", exitCode: 1 };
+    },
+  },
+
+  // 008-ENDRENAME — the old `attestation-consent` name refuses with a rename line. A CLI is typed by
+  // a person, so point them at the new name rather than silently aliasing.
+  {
+    name: "attestation-consent",
+    group: "Attestations",
+    summary: "Renamed to 'cello endorsement-consent'.",
+    help: "'cello attestation-consent' was renamed: use 'cello endorsement-consent'.",
+    async run() {
+      return { stdout: "renamed: use `cello endorsement-consent`", stderr: "", exitCode: 1 };
     },
   },
 

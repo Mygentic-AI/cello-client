@@ -36,7 +36,7 @@ describe("DOD-END-SURFACE-1 — consent verb parameters reach the handler", () =
   }
 
   for (const verb of ["accept", "refuse"] as const) {
-    const method = `cello_attestation_consent_${verb}`;
+    const method = `cello_endorsement_consent_${verb}`; // 008-ENDRENAME
 
     it(`${method}: the MCP tool sends a parameter the handler reads`, () => {
       // The call may be an inline literal OR a conditional (`cond ? {a, b} : {a}`), so read every
@@ -56,8 +56,8 @@ describe("DOD-END-SURFACE-1 — consent verb parameters reach the handler", () =
     it(`${method}: the CLI sends a parameter the handler reads`, () => {
       // Same: the CLI may pass a literal or build a `params` record first (optional fields are
       // OMITTED rather than sent empty), so read the whole function body.
-      const at = cli.indexOf(`export function attestationConsent${verb[0].toUpperCase()}${verb.slice(1)}(`);
-      expect(at, `attestation-consent-${verb} is dispatched by the CLI`).toBeGreaterThan(-1);
+      const at = cli.indexOf(`export function endorsementConsent${verb[0].toUpperCase()}${verb.slice(1)}(`);
+      expect(at, `endorsement-consent-${verb} is dispatched by the CLI`).toBeGreaterThan(-1);
       // Start AFTER the signature line — the function's own opening brace is not an object literal,
       // and reading it as one made `params:` (a type annotation) look like a parameter being sent.
       const sigEnd = cli.indexOf("\n", at);
@@ -78,6 +78,6 @@ describe("DOD-END-SURFACE-1 — consent verb parameters reach the handler", () =
     // If paramsReadBy silently returned an empty set, every assertion above would pass by vacuity on
     // the `for` loop never running... except it wouldn't, because `sent` is non-empty and each name is
     // checked against `read`. Pin the extractor directly anyway.
-    expect(paramsReadBy("cello_attestation_consent_accept")).toContain("hash_prefix");
+    expect(paramsReadBy("cello_endorsement_consent_accept")).toContain("hash_prefix");
   });
 });

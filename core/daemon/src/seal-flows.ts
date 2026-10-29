@@ -668,6 +668,26 @@ export function createSealFlows(deps: SealFlowDeps) {
     // Wait for the counterparty's bilateral ack (or rejection / timeout).
     const ackResult = await awaitSealAck(sessionId, signalingFor(record.agent_name));
     if (ackResult.type === "timeout" || ackResult.type === "seal_interrupted_rejection") {
+      /**
+       * 017-SEAL — OUR OWN HALF IS ALREADY RECORDED, so a `session_seal_already_pending` refusal is
+       * not a failure. Both sides fell back at once; we co-signed the counterparty's request (which
+       * advanced us to `seal_interrupted_pending`) and it, being the lower pubkey, refused ours by
+       * the tie-break. The bilateral exchange succeeded — the counterparty holds both halves and
+       * will carry the seal — so report the success we already have rather than the rejection that
+       * only means "I already have your half".
+       */
+      if (
+        ackResult.type === "seal_interrupted_rejection"
+        && ackResult.reason === "session_seal_already_pending"
+        && sessionNodeManager.getSessionRecord(record.agent_name, sessionId)?.status === "seal_interrupted_pending"
+      ) {
+        logger.info("session.seal.already_committed_locally", {
+          sessionId, role: "initiator", because: ackResult.reason, correlationId,
+        });
+        await sessionNodeManager.retireSessionNode(record.agent_name, sessionId);
+        clearFrontierMismatch(record.agent_name, sessionId);
+        return { ok: true, sessionId, status: "seal_interrupted_pending", rootHex: ownRootHex };
+      }
       const reason = ackResult.type === "timeout" ? "seal_counterparty_unavailable" : "seal_rejected_by_counterparty";
       logger.error("session.seal.initiate.failed", {
         sessionId,
@@ -721,6 +741,22 @@ export function createSealFlows(deps: SealFlowDeps) {
       nonce,
     });
     if (!advanced) {
+      /**
+       * 017-SEAL — ALREADY PENDING IS NOT A FAILED PERSIST. When both sides fall back at once we may
+       * have co-signed the counterparty's request (advancing us to `seal_interrupted_pending`)
+       * before our own ack arrived; the guarded UPDATE then changes no row. But we just VERIFIED the
+       * counterparty's half over our own root, so the bilateral commitment is real — report success
+       * rather than a persist failure that would strand a seal both sides actually completed. Any
+       * other non-pending state (sealed, abandoned) still falls through to the error below.
+       */
+      if (sessionNodeManager.getSessionRecord(record.agent_name, sessionId)?.status === "seal_interrupted_pending") {
+        logger.info("session.seal.already_committed_locally", {
+          sessionId, role: "initiator", because: "already_pending_at_commit", correlationId,
+        });
+        await sessionNodeManager.retireSessionNode(record.agent_name, sessionId);
+        clearFrontierMismatch(record.agent_name, sessionId);
+        return { ok: true, sessionId, status: "seal_interrupted_pending", rootHex: ownRootHex };
+      }
       logger.error("session.seal.initiate.failed", {
         sessionId,
         reason: "seal_persist_failed",
