@@ -260,6 +260,39 @@ describe("049-BRIDGEREPLY Part B — a session the agent opens belongs to the ch
     expect(v.evicted_agents).toContain("agent:cello_muse:cello:dm:CELLO_Muse");
   });
 
+  it("B8c: a session opened from a desktop chat (bound to a Hermes SESSION ID) routes the reply to that chat, not a new one", () => {
+    const OPENER = "20261008_131602_61c09780";
+    const landingJson = join(dir, "landing-session-opener.json");
+    writeFileSync(landingJson, JSON.stringify({ session_id: "20261016_124142_4228ad" }));
+
+    const v = runDriver(dir, {
+      op: "notify",
+      agent: "CELLO_Muse",
+      profile: "cello_muse",
+      delivery_mode: "explicit",
+      session_scope: "agent",
+      landing_session_path: landingJson,
+      bindings: { [SID]: OPENER }, bindings_path: bpath(),
+      kind: "cello_message", data: { session_id: SID, from: PUB },
+    });
+    // Routed under the normal agent chat key, never a key built from the Hermes session ID.
+    expect(v.delivered![0].chat_id).toBe("CELLO_Muse");
+    // The route is pointed at the OPENING session, not the configured landing session.
+    expect(v.switched_sessions).toEqual([
+      ["agent:cello_muse:cello:dm:CELLO_Muse", OPENER],
+    ]);
+  });
+
+  it("B8d: a binding that is NOT a Hermes session ID (a real chat id) still routes to that chat unchanged", () => {
+    const v = runDriver(dir, {
+      op: "notify", delivery_mode: "explicit", session_scope: "agent",
+      bindings: { [SID]: "caller-chat-42" }, bindings_path: bpath(),
+      kind: "cello_message", data: { session_id: SID, from: PUB },
+    });
+    expect(v.delivered![0].chat_id).toBe("caller-chat-42");
+    expect(v.switched_sessions ?? []).toEqual([]);
+  });
+
   it("B9: cross-process: post_tool_call binds session using HERMES_SESSION_ID when no CelloAdapter instance is bound", () => {
     const bpath = join(dir, "cross-proc-bindings.json");
     runDriver(dir, {

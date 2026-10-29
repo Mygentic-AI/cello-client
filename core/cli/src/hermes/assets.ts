@@ -1198,6 +1198,18 @@ class CelloAdapter(BasePlatformAdapter):
             self._bindings = self._load_bindings()
         bound_chat = self._bindings.get(session_id)
         chat_id = bound_chat if bound_chat is not None else self._chat_id_for(counterparty)
+        # A session opened from a desktop/TUI chat is bound to that chat's Hermes SESSION ID (no
+        # HERMES_SESSION_CHAT_ID exists there). Using it as the chat_id builds a route key nothing
+        # maps to, so the peer's reply spawned a brand-new chat. Route under the normal agent chat
+        # and point it at the opening session instead.
+        bound_sid = None
+        if (
+            bound_chat is not None
+            and self._session_scope == "agent"
+            and re.fullmatch(r"\d{8}_\d{6}_[0-9a-f]{4,}", bound_chat)
+        ):
+            bound_sid = bound_chat
+            chat_id = self._chat_id_for(counterparty)
         if chat_id is None:
             # peer scope with nothing to attribute this to. A MESSAGE must be dropped: bucketing
             # it under a placeholder would put one customer's words in another's context, which is
@@ -1243,8 +1255,8 @@ class CelloAdapter(BasePlatformAdapter):
         # member and the guard silently protected nothing - a check that reports safety it does
         # not provide is worse than no check. Computed once here and reused below.
         session_key = self._session_key_for(source)
-        if bound_chat is None and self._session_scope == "agent":
-            landing_sid = self._get_landing_session_id()
+        if (bound_chat is None or bound_sid is not None) and self._session_scope == "agent":
+            landing_sid = bound_sid or self._get_landing_session_id()
             if landing_sid:
                 self._sync_gateway_landing_session(source, session_key, landing_sid)
         text = None
