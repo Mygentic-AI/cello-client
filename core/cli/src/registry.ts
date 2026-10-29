@@ -519,6 +519,94 @@ function channelHelpPage(): string {
 }
 
 /**
+ * The `attestations` verbs, following CHANNEL_DOCS: ONE source for `cello -h`, `cello attestations -h`
+ * and `cello attestations <verb> -h`, so a verb added to the handler cannot again go unlisted (write,
+ * written, reviews, summary, deals and rule did). Ordered by when they are used: the owner opens a
+ * namespace before anyone can review, a reviewer writes before anyone can read, the judge rules last.
+ */
+const ATTESTATION_DOCS: ReadonlyArray<{ name: string; summary: string; usage: readonly string[] }> = [
+  {
+    name: "namespace",
+    summary: "Open a namespace others can review you in, or close one. Its rules are fixed for good.",
+    usage: [
+      "cello attestations namespace create <ns> --mode <public|private> [--scored] [--ttl <days>] --condition \"<words>\"",
+      "cello attestations namespace close <ns>",
+    ],
+  },
+  {
+    name: "mark",
+    summary: "Mark a service event in an open session. It gives the other side a right to review you.",
+    usage: ["cello attestations mark <session-id> <namespace> [--origin-channel <pubkey>]"],
+  },
+  {
+    name: "readers",
+    summary: "Name who receives a private namespace's feedback. Every change is announced to all readers.",
+    usage: ["cello attestations readers list <ns>", "cello attestations readers add|remove <ns> <pubkey>"],
+  },
+  {
+    name: "rights",
+    summary: "Your rights to review others. Expired ones are shown and flagged.",
+    usage: ["cello attestations rights [--after <cursor>]"],
+  },
+  {
+    name: "write",
+    summary: "Write a review using a right you hold.",
+    usage: ["cello attestations write <right-id> [--rating <1-5>] [--origin-channel <pubkey>] -- <review text>"],
+  },
+  {
+    name: "written",
+    summary: "The reviews you wrote, and whether each one stood.",
+    usage: ["cello attestations written"],
+  },
+  {
+    name: "claim-service",
+    summary: "Record a session the provider left unmarked. It grants no right to review.",
+    usage: ["cello attestations claim-service <session-id> <namespace>"],
+  },
+  {
+    name: "index",
+    summary: "Every namespace an agent has ever opened, closed ones included.",
+    usage: ["cello attestations index [<pubkey>] [--after <ns>]"],
+  },
+  {
+    name: "reviews",
+    summary: "Read the reviews about an agent in one namespace.",
+    usage: ["cello attestations reviews <owner-pubkey> <namespace>"],
+  },
+  {
+    name: "summary",
+    summary: "One namespace in numbers: reviews, average rating, removals, unmarked claims.",
+    usage: ["cello attestations summary <owner-pubkey> <namespace>"],
+  },
+  {
+    name: "activity",
+    summary: "How many service events and unmarked claims a namespace has.",
+    usage: ["cello attestations activity <pubkey> <namespace>"],
+  },
+  {
+    name: "deals",
+    summary: "How many deals an agent closed through a channel, and their average rating.",
+    usage: ["cello attestations deals <channel-pubkey>"],
+  },
+  {
+    name: "rule",
+    summary: "Remove a review by ruling. Refused everywhere until the judge is set up.",
+    usage: [
+      "cello attestations rule <attestation-hash> --owner <pubkey> --namespace <ns> --reason <text> [--evidence <hash>…]",
+    ],
+  },
+];
+
+function attestationVerbHelp(v: (typeof ATTESTATION_DOCS)[number]): string {
+  return ["Usage:", ...v.usage.map((u) => `  ${u}`), "", `  ${v.summary}`].join("\n");
+}
+
+function attestationHelpPage(): string {
+  const rows = ATTESTATION_DOCS.flatMap((v) => [...v.usage.map((u) => `  ${u}`), `      — ${v.summary}`]);
+  return ["Usage:", ...rows].join("\n");
+}
+
+/**
  * 008-POLICY Part H — the `policy` verbs, following 041-HELPTRUTH's CHANNEL_DOCS: ONE source the page
  * (`cello policy -h`) and each verb's help (`cello policy <verb> -h`) are both assembled from, so
  * they cannot drift. Rendered through `subHelp`, not `verbs`, so `cello -h` keeps `policy` on one
@@ -1475,27 +1563,10 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
     name: "attestations",
     group: "Attestations",
     summary: "Open review namespaces, mark service events, and read the rights and activity they create.",
+    verbs: ATTESTATION_DOCS.map((v) => ({ name: v.name, summary: v.summary, help: attestationVerbHelp(v) })),
     help:
-      "Usage:\n" +
-      "  cello attestations namespace create <ns> --mode <public|private> [--scored] [--ttl <days>] --condition \"<words>\"\n" +
-      "                                        \u2014 open a review namespace others can review you in\n" +
-      "  cello attestations namespace close <ns>\n" +
-      "                                        \u2014 stop a namespace granting new rights; it stays listed\n" +
-      "  cello attestations index [<pubkey>] [--after <ns>]\n" +
-      "                                        \u2014 list every namespace an owner has ever opened\n" +
-      "  cello attestations mark <session-id> <namespace> [--origin-channel <pubkey>]\n" +
-      "                                        \u2014 mark a service event during an open session; it grants the counterparty a right to review you\n" +
-      "  cello attestations rights [--after <cursor>]\n" +
-      "                                        \u2014 the rights to review you hold; expired ones are shown and flagged\n" +
-      "  cello attestations claim-service <session-id> <namespace>\n" +
-      "                                        \u2014 claim a session the provider left unmarked; grants no right, counts as an unmarked claim\n" +
-      "  cello attestations activity <pubkey> <namespace>\n" +
-      "                                        \u2014 the service-event and unmarked-claim counts for a namespace\n" +
-      "  cello attestations readers list <ns>\n" +
-      "                                        \u2014 the readers of a PRIVATE namespace (owner only)\n" +
-      "  cello attestations readers add|remove <ns> <pubkey>\n" +
-      "                                        \u2014 name who receives its private feedback; every change is announced to all readers\n" +
-      "\n" +
+      attestationHelpPage() +
+      "\n\n" +
       "A namespace fixes, for good, whether its reviews are public or private, their shape, how long a\n" +
       "reviewer has, and the rule under which the right to review is granted. It is immutable: a new\n" +
       "rule means a new namespace, and the index is public so an old one stays on show. Reading an\n" +
