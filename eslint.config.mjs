@@ -146,6 +146,9 @@ const SENDRAW_SELECTORS = [
  * M10E merge into main, 2026-10-28. `session-node-manager.ts` 3450 -> 3451: M15B's additions to
  * this file (absent on the M10E branch, which capped at 3450) stack on M10E's seal setter/getter, so
  * the merged file carries one line more than either branch alone.
+ *
+ * Post-M15B release merge, 2026-10-29. `daemon.ts` 1483 -> 1485: the release's account-notice
+ * wiring (012-NUDGES) stacks on M10E's noticer wiring, two lines more than either branch alone.
  */
 const ERROR_FORMAT_SELECTORS = [
   {
@@ -435,7 +438,7 @@ export default [
     // 1,487 → 1,483 (−4, M10E 007-NOTICES): `wireAttestationNoticer` moved the attestation noticer's
     // composition out of daemon.ts into attestation-wiring.ts, so the root nets four lines shorter
     // after both device pairing and M10E land.
-    rules: { "max-lines": ["error", { max: 1483, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 1485, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/daemon-handle.ts"],
