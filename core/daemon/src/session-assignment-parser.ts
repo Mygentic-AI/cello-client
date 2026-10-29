@@ -334,6 +334,15 @@ export function sessionRequestErrorGuidance(reason: string): string {
   if (reason === "channel_check_failed") {
     return "The directory refused the session request (channel_check_failed): it could not check whether either side is a broadcast channel, and does not broker a session it could not check. Retry; if it repeats, the directory node is failing to read its own records.";
   }
+  // The directory sends these for EITHER side and does not say which, so the guidance names both.
+  // "Ensure the counterparty is registered" sent an owner whose own agent was shut off (its device
+  // removed in the portal) to debug the other side.
+  if (reason === "agent_suspended") {
+    return "The directory refused the session request (agent_suspended): your agent or the counterparty's has been shut off. An agent is shut off when its owner removes its device or pauses it in the portal. If it is yours, check portal.celloprotocol.com/account; a removed device's agents stay off, so register a new agent from a paired device.";
+  }
+  if (reason === "agent_revoked") {
+    return "The directory refused the session request (agent_revoked): your agent or the counterparty's has been permanently revoked by its owner. If it is yours, register a new agent.";
+  }
   return `The directory refused the session request (${reason}). Ensure the counterparty is registered and online.`;
 }
 

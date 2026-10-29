@@ -32,6 +32,15 @@ describe("M16: channel refusals survive the daemon's reason mapper", () => {
     expect(g).toMatch(/[Rr]etry/);
   });
 
+  it("a shut-off or revoked agent names BOTH sides, never only the counterparty", () => {
+    for (const reason of ["agent_suspended", "agent_revoked"]) {
+      const g = sessionRequestErrorGuidance(reason);
+      expect(g).toMatch(/your agent or the counterparty's/);
+      expect(g).not.toMatch(/Ensure the counterparty is registered/);
+    }
+    expect(sessionRequestErrorGuidance("agent_suspended")).toMatch(/removes its device/);
+  });
+
   it("every other reason keeps the existing guidance", () => {
     expect(sessionRequestErrorGuidance("target_offline")).toBe(
       "The directory refused the session request (target_offline). Ensure the counterparty is registered and online.",
