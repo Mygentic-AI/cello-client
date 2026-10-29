@@ -130,63 +130,8 @@ async function withDaemon(
         );
       }
 
-      const selected = opts.agent ?? (await readCurrentAgent(celloDir));
-      if (selected) {
-        // The replay must not RESURRECT a stopped agent. cello_use_agent auto-starts an offline
-        // agent (AUTOSTART-1), so replaying it blindly would let `cello set-agent-offline alice` be
-        // silently undone by the very next read-only command (`cello inbox`), bringing alice back
-        // online and reachable with no signal. Stopping an agent is kill-switch-adjacent; a command
-        // that reads must never re-arm it. The MCP surface never does this — the daemon clears the
-        // agent from every connection on stop, and later calls get no_current_agent.
-        //
-        // So: only replay an agent that is ALREADY ONLINE. An offline selection fails loud, naming
-        // the remedy, rather than quietly starting it or quietly running as someone else.
-        if (!(await isAgentOnline(client, selected))) {
-          return emitTransportError(
-            "selected_agent_offline",
-            `Agent '${selected}' is not online, so this command was not run as it. Bring it online with 'cello start-agent ${selected}' (or select another with 'cello use-agent <name>'). It is NOT auto-started here: that would silently undo a deliberate 'cello set-agent-offline'.`,
-            opts,
-          );
-        }
-        // The agent is online — claim it for this connection. A refusal (retired/unknown) stops the
-        // command: continuing would let the sole-online fallback run it as a DIFFERENT agent.
-        const used = (await client.send("cello_use_agent", { name: selected })) as Record<string, unknown>;
-        if (used.ok !== true) {
-          // Defensive: cello_use_agent is ok-bearing on every path today, but if it ever returned an
-          // ok-less body, emitIpcResult would print IT as this command's successful result. Fail loud
-          // on any shape that is not an explicit ok:false, rather than pass off the wrong body.
-          if (used.ok === false) return emitIpcResult(used, opts);
-          return emitTransportError(
-            "unexpected_replay_response",
-            `Selecting agent '${selected}' returned an unrecognized response, so the command was not run. This is a daemon/CLI version mismatch — check 'cello status'.`,
-            opts,
-          );
-        }
-      } else {
-        // NO selection. The daemon's fallback is "the sole ONLINE agent", and it refuses only when
-        // two or more are online — so with several agents known and exactly one up, it runs the
-        // command as that one. `cello set-agent-offline <selected>` clears the selection, which walks
-        // straight into it: the next command silently re-targets whoever else happens to be online.
-        //
-        // With ONE known agent the fallback is unambiguous and useful (a fresh operator who never ran
-        // `use-agent` still works). With more than one it is a guess about intent, and a guess must
-        // not be made silently on the operator's behalf.
-        const known = await listKnownAgents(client);
-        if (known === null) {
-          return emitTransportError(
-            "agent_list_unavailable",
-            "The daemon's agent list could not be read, so this command was not run — without it there is no way to tell whether an unselected command would target the agent you meant. Check 'cello status'.",
-            opts,
-          );
-        }
-        if (known.length > 1) {
-          return emitTransportError(
-            "no_agent_selected",
-            `No agent is selected and the daemon knows ${known.length} (${known.join(", ")}), so this command was not run — it would otherwise have silently targeted whichever agent happened to be online. Choose one with 'cello use-agent <name>', or pass --agent <name>.`,
-            opts,
-          );
-        }
-      }
+      const refused = await replaySelectedAgent(client, celloDir, opts.agent);
+      if (refused) return refused.daemonReply ? emitIpcResult(refused.daemonReply, opts) : emitTransportError(refused.reason, refused.guidance, opts);
     }
 
     const result = await fn(client);
@@ -200,6 +145,76 @@ async function withDaemon(
   } finally {
     client.close();
   }
+}
+
+/**
+ * Establish the current agent on a fresh CLI connection — explicit name > the persisted
+ * `use-agent` selection > the daemon's own fallback, refused when it would be a guess. Returns
+ * null when the connection may proceed, or why it may not. Exported so commands that open their
+ * own connection (the attestation and endorsement verbs) resolve the agent by the SAME rule —
+ * a second rule would make one operator gesture mean two things.
+ */
+export async function replaySelectedAgent(
+  client: IpcClient,
+  celloDir: string,
+  explicit?: string,
+): Promise<{ reason: string; guidance: string; daemonReply?: Record<string, unknown> } | null> {
+      const selected = explicit ?? (await readCurrentAgent(celloDir));
+      if (selected) {
+        // The replay must not RESURRECT a stopped agent. cello_use_agent auto-starts an offline
+        // agent (AUTOSTART-1), so replaying it blindly would let `cello set-agent-offline alice` be
+        // silently undone by the very next read-only command (`cello inbox`), bringing alice back
+        // online and reachable with no signal. Stopping an agent is kill-switch-adjacent; a command
+        // that reads must never re-arm it. The MCP surface never does this — the daemon clears the
+        // agent from every connection on stop, and later calls get no_current_agent.
+        //
+        // So: only replay an agent that is ALREADY ONLINE. An offline selection fails loud, naming
+        // the remedy, rather than quietly starting it or quietly running as someone else.
+        if (!(await isAgentOnline(client, selected))) {
+          return {
+            reason: "selected_agent_offline",
+            guidance: `Agent '${selected}' is not online, so this command was not run as it. Bring it online with 'cello start-agent ${selected}' (or select another with 'cello use-agent <name>'). It is NOT auto-started here: that would silently undo a deliberate 'cello set-agent-offline'.`,
+          };
+        }
+        // The agent is online — claim it for this connection. A refusal (retired/unknown) stops the
+        // command: continuing would let the sole-online fallback run it as a DIFFERENT agent.
+        const used = (await client.send("cello_use_agent", { name: selected })) as Record<string, unknown>;
+        if (used.ok !== true) {
+          // Defensive: cello_use_agent is ok-bearing on every path today, but if it ever returned an
+          // ok-less body, emitIpcResult would print IT as this command's successful result. Fail loud
+          // on any shape that is not an explicit ok:false, rather than pass off the wrong body.
+          if (used.ok === false) {
+            return { reason: String(used.reason ?? "use_agent_refused"), guidance: String(used.guidance ?? ""), daemonReply: used };
+          }
+          return {
+            reason: "unexpected_replay_response",
+            guidance: `Selecting agent '${selected}' returned an unrecognized response, so the command was not run. This is a daemon/CLI version mismatch — check 'cello status'.`,
+          };
+        }
+      } else {
+        // NO selection. The daemon's fallback is "the sole ONLINE agent", and it refuses only when
+        // two or more are online — so with several agents known and exactly one up, it runs the
+        // command as that one. `cello set-agent-offline <selected>` clears the selection, which walks
+        // straight into it: the next command silently re-targets whoever else happens to be online.
+        //
+        // With ONE known agent the fallback is unambiguous and useful (a fresh operator who never ran
+        // `use-agent` still works). With more than one it is a guess about intent, and a guess must
+        // not be made silently on the operator's behalf.
+        const known = await listKnownAgents(client);
+        if (known === null) {
+          return {
+            reason: "agent_list_unavailable",
+            guidance: "The daemon's agent list could not be read, so this command was not run — without it there is no way to tell whether an unselected command would target the agent you meant. Check 'cello status'.",
+          };
+        }
+        if (known.length > 1) {
+          return {
+            reason: "no_agent_selected",
+            guidance: `No agent is selected and the daemon knows ${known.length} (${known.join(", ")}), so this command was not run — it would otherwise have silently targeted whichever agent happened to be online. Choose one with 'cello use-agent <name>', or pass --agent <name>.`,
+          };
+        }
+      }
+  return null;
 }
 
 /**

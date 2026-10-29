@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 import { CO_OWNERSHIP_NOTE } from "@cello-protocol/protocol-types";
 import { screenerState, screenerModelDir, runtimeAvailable } from "@cello-protocol/gateway";
 import { DOWNLOAD_MB } from "./screener-commands.js";
+import { replaySelectedAgent } from "./parity-commands.js";
 import {
   connectOrStart,
   connectToDaemon,
@@ -51,6 +52,20 @@ async function withIpc<T>(socketPath: string, fn: (client: IpcClient) => Promise
   } finally {
     client.close();
   }
+}
+
+/**
+ * withIpc for an AGENT-SCOPED verb: the daemon's current agent is per-connection, so a fresh CLI
+ * connection must replay the `cello use-agent` selection first, by the same rule as every parity
+ * command. A refusal comes back as the `{ ok: false, reason, guidance }` these verbs already print.
+ */
+async function withAgentIpc<T>(celloDir: string, socketPath: string, fn: (client: IpcClient) => Promise<T>): Promise<T> {
+  return withIpc(socketPath, async (client) => {
+    await client.send("ipc.connect", { clientType: "cli" });
+    const refused = await replaySelectedAgent(client, celloDir);
+    if (refused) return (refused.daemonReply ?? { ok: false, reason: refused.reason, guidance: refused.guidance }) as T;
+    return fn(client);
+  });
 }
 
 /**
@@ -920,7 +935,7 @@ export async function attestations(
       try {
         const params: Record<string, unknown> = { namespace: ns, mode, scored, condition };
         if (ttl !== undefined) params.ttl_days = ttl;
-        const result = (await withIpc(lock.socketPath, (client) =>
+        const result = (await withAgentIpc(celloDir, lock.socketPath, (client) =>
           client.send("cello_attestations_namespace_create", params))) as { ok: boolean; reason?: string; guidance?: string };
         if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
         return { exitCode: 0, output: result.guidance ?? "Created." };
@@ -931,7 +946,7 @@ export async function attestations(
     if (action === "close") {
       if (!ns) return { exitCode: 1, output: "Usage: cello attestations namespace close <ns>" };
       try {
-        const result = (await withIpc(lock.socketPath, (client) =>
+        const result = (await withAgentIpc(celloDir, lock.socketPath, (client) =>
           client.send("cello_attestations_namespace_close", { namespace: ns }))) as { ok: boolean; reason?: string; guidance?: string };
         if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
         return { exitCode: 0, output: result.guidance ?? "Closed." };
@@ -953,7 +968,7 @@ export async function attestations(
       const params: Record<string, unknown> = {};
       if (owner) params.owner_pubkey = owner;
       if (after) params.after = after;
-      const result = (await withIpc(lock.socketPath, (client) =>
+      const result = (await withAgentIpc(celloDir, lock.socketPath, (client) =>
         client.send("cello_attestations_index", params))) as {
         ok: boolean; reason?: string; guidance?: string; next?: string | null;
         entries?: Array<{ namespace: string; mode: string | null; template: string | null; right_ttl_days: number | null; closed_at: number | null; verified: boolean }>;
@@ -987,7 +1002,7 @@ export async function attestations(
     try {
       const params: Record<string, unknown> = { session_id: sessionId, namespace: ns };
       if (originChannel) params.origin_channel = originChannel;
-      const result = (await withIpc(lock.socketPath, (client) =>
+      const result = (await withAgentIpc(celloDir, lock.socketPath, (client) =>
         client.send("cello_attestations_mark", params))) as { ok: boolean; reason?: string; guidance?: string };
       if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
       return { exitCode: 0, output: result.guidance ?? "Marked." };
@@ -1005,7 +1020,7 @@ export async function attestations(
     try {
       const params: Record<string, unknown> = {};
       if (after) params.after = after;
-      const result = (await withIpc(lock.socketPath, (client) =>
+      const result = (await withAgentIpc(celloDir, lock.socketPath, (client) =>
         client.send("cello_attestations_rights", params))) as {
         ok: boolean; reason?: string; guidance?: string; next?: string | null;
         rights?: Array<{ right_id: string; subject_pubkey: string; namespace: string; expires_at: number; expired: boolean; template: string | null }>;
@@ -1032,7 +1047,7 @@ export async function attestations(
     if (action === "list") {
       if (!ns) return { exitCode: 1, output: "Usage: cello attestations readers list <ns>" };
       try {
-        const result = (await withIpc(lock.socketPath, (client) =>
+        const result = (await withAgentIpc(celloDir, lock.socketPath, (client) =>
           client.send("cello_attestations_readers_list", { namespace: ns }))) as {
           ok: boolean; reason?: string; guidance?: string; version?: number | null; readers?: string[];
         };
@@ -1050,7 +1065,7 @@ export async function attestations(
       }
       try {
         const verb = action === "add" ? "cello_attestations_readers_add" : "cello_attestations_readers_remove";
-        const result = (await withIpc(lock.socketPath, (client) =>
+        const result = (await withAgentIpc(celloDir, lock.socketPath, (client) =>
           client.send(verb, { namespace: ns, pubkey: pubkey.toLowerCase() }))) as { ok: boolean; reason?: string; guidance?: string };
         if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
         return { exitCode: 0, output: result.guidance ?? "Reader list updated." };
@@ -1082,7 +1097,7 @@ export async function attestations(
       const params: Record<string, unknown> = { right_id: rightId, text };
       if (rating !== undefined) params.rating = rating;
       if (originChannel) params.origin_channel = originChannel;
-      const result = (await withIpc(lock.socketPath, (client) =>
+      const result = (await withAgentIpc(celloDir, lock.socketPath, (client) =>
         client.send("cello_attestations_write", params))) as { ok: boolean; reason?: string; guidance?: string };
       if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
       return { exitCode: 0, output: result.guidance ?? "Review submitted." };
@@ -1094,7 +1109,7 @@ export async function attestations(
   // M10E 011-CLAIM — the reviews you have written, each with its submission outcome.
   if (sub === "written") {
     try {
-      const result = (await withIpc(lock.socketPath, (client) =>
+      const result = (await withAgentIpc(celloDir, lock.socketPath, (client) =>
         client.send("cello_attestations_written", {}))) as {
         ok: boolean; reason?: string; guidance?: string; results_unavailable?: string;
         claimed?: Array<{ namespace: string; subject_pubkey: string; rating: number | null; outcome: string; submission_id: string }>;
@@ -1120,7 +1135,7 @@ export async function attestations(
       return { exitCode: 1, output: "Usage: cello attestations claim-service <session-id> <namespace>" };
     }
     try {
-      const result = (await withIpc(lock.socketPath, (client) =>
+      const result = (await withAgentIpc(celloDir, lock.socketPath, (client) =>
         client.send("cello_attestations_claim_service", { session_id: sessionId, namespace: ns }))) as { ok: boolean; reason?: string; guidance?: string };
       if (!result.ok) return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
       return { exitCode: 0, output: result.guidance ?? "Claim filed." };
@@ -1135,7 +1150,7 @@ export async function attestations(
     const [owner, ns] = args;
     if (!owner || !ns) return { exitCode: 1, output: "Usage: cello attestations summary <owner-pubkey> <namespace>" };
     try {
-      const result = (await withIpc(lock.socketPath, (client) =>
+      const result = (await withAgentIpc(celloDir, lock.socketPath, (client) =>
         client.send("cello_attestations_summary", { owner_pubkey: owner, namespace: ns }))) as {
         ok: boolean; reason?: string; guidance?: string; count?: number; average_rating?: number | null;
         removed_count?: number; unmarked_claims?: number; agreed?: number; validators?: number;
@@ -1154,7 +1169,7 @@ export async function attestations(
     const [owner, ns] = args;
     if (!owner || !ns) return { exitCode: 1, output: "Usage: cello attestations reviews <owner-pubkey> <namespace>" };
     try {
-      const result = (await withIpc(lock.socketPath, (client) =>
+      const result = (await withAgentIpc(celloDir, lock.socketPath, (client) =>
         client.send("cello_attestations_reviews", { owner_pubkey: owner, namespace: ns }))) as {
         ok: boolean; reason?: string; guidance?: string; count?: number; agreed?: number; node_id?: string;
         reviews?: Array<{ index: number; rating: number | null; quoted_text: string; origin_channel: string | null }>;
@@ -1182,7 +1197,7 @@ export async function attestations(
     const [channel] = args;
     if (!channel) return { exitCode: 1, output: "Usage: cello attestations deals <channel-pubkey>" };
     try {
-      const result = (await withIpc(lock.socketPath, (client) =>
+      const result = (await withAgentIpc(celloDir, lock.socketPath, (client) =>
         client.send("cello_attestations_deals", { channel_pubkey: channel }))) as {
         ok: boolean; reason?: string; guidance?: string; deals?: number; average_rating?: number | null;
       };
@@ -1212,7 +1227,7 @@ export async function attestations(
       return { exitCode: 1, output: "Usage: cello attestations rule <attestation-hash> --owner <pubkey> --namespace <ns> --reason <text> [--evidence <hash>…]" };
     }
     try {
-      const result = (await withIpc(lock.socketPath, (client) =>
+      const result = (await withAgentIpc(celloDir, lock.socketPath, (client) =>
         client.send("cello_attestations_rule", { attestation_hash: attHash, owner_pubkey: owner, namespace: ns, reason, evidence_hashes: evidence }))) as {
         ok: boolean; reason?: string; guidance?: string; countersigns?: number; in_force?: boolean;
         results?: Array<{ node_id: string; in_force?: boolean; countersigns?: number; error?: string }>;
@@ -1232,7 +1247,7 @@ export async function attestations(
       return { exitCode: 1, output: "Usage: cello attestations activity <pubkey> <namespace>" };
     }
     try {
-      const result = (await withIpc(lock.socketPath, (client) =>
+      const result = (await withAgentIpc(celloDir, lock.socketPath, (client) =>
         client.send("cello_attestations_activity", { owner_pubkey: owner, namespace: ns }))) as {
         ok: boolean; reason?: string; guidance?: string; service_events?: number; unmarked_claims?: number;
       };
@@ -1296,9 +1311,9 @@ export async function endorsements(
       // is the network sweep for outcomes. Showing only the second made a submission still awaiting the
       // subject INVISIBLE — three in flight printed as "no outcomes waiting", which reads as "nothing
       // was ever sent" rather than "nobody has answered yet".
-      const [issued, res] = (await withIpc(lock.socketPath, (client) =>
+      const [issued, res] = (await withAgentIpc(celloDir, lock.socketPath, async (client) =>
         Promise.all([client.send("wallet_list_issued"), client.send("wallet_fetch_results")]),
-      )) as [
+      ).then((r) => (Array.isArray(r) ? r : [r, r]))) as [
         {
           ok: boolean; reason?: string; guidance?: string;
           issued?: Array<{ submission_id: string; subject_pubkey: string; op: string; submitted_at: number }>;
@@ -1401,7 +1416,7 @@ export async function endorsements(
       };
     }
     try {
-      const result = (await withIpc(lock.socketPath, (client) =>
+      const result = (await withAgentIpc(celloDir, lock.socketPath, (client) =>
         client.send("cello_endorsements_issue", { subject_pubkey: subject, body }))) as {
         ok: boolean; reason?: string; guidance?: string; submission_id?: string;
       };
