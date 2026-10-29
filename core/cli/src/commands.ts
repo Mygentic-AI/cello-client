@@ -590,6 +590,39 @@ export async function register(
 }
 
 /**
+ * pairStatus(celloDir): report whether THIS DEVICE is paired — i.e. whether a directory-signed
+ * daemon credential has been stored because the owner approved the device. Read-only and
+ * non-blocking: it reads the pairing store, never opening, polling or waiting on a pairing, so it is
+ * safe to call on every status poll. A hosted host agent uses it as the reliable, non-log signal
+ * for "approved but not registered": paired:true plus an agent the directory does not yet know means
+ * step 2 ('cello register-agent') can be finished with the stored credential WITHOUT opening a new
+ * pairing (which would kill a live code). pending distinguishes "a code is live, still waiting" from
+ * "no pairing at all".
+ */
+export async function pairStatus(celloDir: string): Promise<CommandResult> {
+  const lockFilePath = join(celloDir, "daemon.lock");
+  const lock = await readLock(lockFilePath);
+  if (!lock) {
+    return {
+      exitCode: 1,
+      output: JSON.stringify({ ok: false, reason: "daemon_not_running", guidance: "No daemon running. Run 'cello login' first, then retry." }, null, 2),
+    };
+  }
+  try {
+    const result = (await withIpc(lock.socketPath, (client) => client.send("cello_pair_status"))) as {
+      ok: boolean; paired?: boolean; pending?: boolean; account_id?: string;
+    };
+    return { exitCode: 0, output: JSON.stringify(result, null, 2) };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      exitCode: 1,
+      output: JSON.stringify({ ok: false, reason: "pair_status_failed", guidance: `Could not read pairing status: ${message}` }, null, 2),
+    };
+  }
+}
+
+/**
  * createAgent(celloDir, name):
  *  - Connect to the daemon, send 'cello_create_agent' with { name }.
  *  - The daemon generates a fresh K_local seed, writes it as an `agents` row in the encrypted DB

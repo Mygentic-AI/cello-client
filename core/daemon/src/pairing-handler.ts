@@ -161,4 +161,17 @@ export function registerPairingHandlers(deps: PairingHandlerDeps): void {
     if (lastRefusal) return lastRefusal;
     return { ok: false, reason: "not_pairing", guidance: "Run 'cello register-agent <name>' to pair this device." };
   });
+
+  // The reliable, non-blocking "is this device approved?" read. It only READS the pairing store —
+  // it never opens, polls or waits on a pairing, so it is safe to call on every status poll. A
+  // hosted host agent uses it as the signal for "approved but not registered": paired:true means a
+  // directory-signed credential is stored (the owner clicked approve), so re-running
+  // `cello register-agent` finishes registration with the stored credential and never opens a new
+  // pairing. pending:true distinguishes "a code is live, still waiting" from "no pairing at all".
+  handlers.set("cello_pair_status", async () => {
+    const credential = pairingStore.credential();
+    if (credential) return { ok: true, paired: true, account_id: credential.account_id };
+    const stored = pairingStore.pending();
+    return { ok: true, paired: false, pending: !!stored && now() < stored.expiresAt };
+  });
 }

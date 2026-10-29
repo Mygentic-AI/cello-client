@@ -81,6 +81,7 @@ const EXEMPT = new Map<string, string>([
   ["cello_register", "onboarding runs in the terminal; the first registration pairs the device in a browser"],
   ["cello_pair_start", "onboarding runs in the terminal; it prints the link that approves this device"],
   ["cello_pair_await", "onboarding runs in the terminal; it waits for the approval cello_pair_start asked for"],
+  ["cello_pair_status", "terminal/host-agent only: a read-only check of whether this device is approved yet, used by onboarding and by the hosted host agent to finish registration — never an agent capability"],
   ["cello_remove_agent", "destructive and irreversible — deliberately requires the terminal"],
   ["cello_status", "`cello status` serves this from `cello_list_agents`; both surfaces have the verb"],
   ["wallet_list_issued", "not its own verb — joined into the results verb on BOTH surfaces so a submission awaiting the subject shows as pending"],

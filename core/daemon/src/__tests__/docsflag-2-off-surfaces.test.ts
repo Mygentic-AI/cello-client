@@ -203,11 +203,12 @@ describe("074-DOCSFLAG clauses 2/5/6/9 — the daemon's three document surfaces,
   // `cello_attestations_readers_add` and `cello_attestations_readers_remove`. Registered
   // unconditionally, so the 14-verb document gap is unchanged.
   // 100/114 → 104/118 for M10E 015-READ's `cello_attestations_summary`, `_reviews`, `_deals` and
-  // `_rule`. Registered unconditionally, so the 14-verb document gap is unchanged.
-  it("OFF: the operator's socket answers 104 verbs, exactly 14 fewer than ON, and no doc verb", async () => {
+  // `_rule`. 104/118 → 105/119 for M15C's `cello_pair_status`. Registered unconditionally, so the
+  // 14-verb document gap is unchanged.
+  it("OFF: the operator's socket answers 105 verbs, exactly 14 fewer than ON, and no doc verb", async () => {
     const off = await start("off");
     const offKeys = productionVerbs(off);
-    expect(offKeys).toHaveLength(104);
+    expect(offKeys).toHaveLength(105);
     expect(offKeys.filter((k) => k.startsWith("cello_doc_"))).toEqual([]);
     for (const verb of DOC_VERBS) expect(offKeys).not.toContain(verb);
 
@@ -216,7 +217,7 @@ describe("074-DOCSFLAG clauses 2/5/6/9 — the daemon's three document surfaces,
 
     const on = await start("on");
     const onKeys = productionVerbs(on);
-    expect(onKeys).toHaveLength(118);
+    expect(onKeys).toHaveLength(119);
     // The three assertions that survive any unrelated verb being added or removed.
     expect(onKeys.length - offKeys.length).toBe(14);
     expect(onKeys.filter((k) => k.startsWith("cello_doc_")).sort()).toEqual([...DOC_VERBS].sort());
