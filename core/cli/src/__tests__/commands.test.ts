@@ -469,6 +469,10 @@ describe("cli commands", () => {
       expect(browserOpener("linux", { DISPLAY: ":0", SSH_CONNECTION: "1.2.3.4 22 5.6.7.8 22" })).toBeNull();
       expect(browserOpener("linux", {})).toBeNull();
       expect(browserOpener("win32", { DISPLAY: ":0" })).toBeNull();
+      // CELLO_NO_BROWSER switches it off everywhere, macOS included; an empty value counts as unset.
+      expect(browserOpener("darwin", { CELLO_NO_BROWSER: "1" })).toBeNull();
+      expect(browserOpener("linux", { DISPLAY: ":0", CELLO_NO_BROWSER: "1" })).toBeNull();
+      expect(browserOpener("darwin", { CELLO_NO_BROWSER: "" })).toBe("open");
     });
 
     // A retired CELLO- code is refused in the terminal with the pairing instruction, and the daemon

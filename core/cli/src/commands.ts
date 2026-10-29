@@ -437,12 +437,15 @@ export async function logout(
  */
 /**
  * The OS opener for the approve link, or null where there is no browser to open: a Linux machine
- * with no display, or any session over SSH. Opening is best effort and never blocks the wait.
+ * with no display, any session over SSH, or anywhere CELLO_NO_BROWSER is set non-empty (test
+ * harnesses). Opening is best effort and never blocks the wait.
  */
 export function browserOpener(
   platform: NodeJS.Platform = process.platform,
   env: Record<string, string | undefined> = process.env,
 ): string | null {
+  // Test harnesses register many agents and must not fill the operator's screen with pairing pages.
+  if (env["CELLO_NO_BROWSER"]) return null;
   if (platform === "darwin") return "open";
   if (platform === "linux" && (env["DISPLAY"] || env["WAYLAND_DISPLAY"]) && !env["SSH_CONNECTION"]) return "xdg-open";
   return null;

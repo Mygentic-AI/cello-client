@@ -30,6 +30,8 @@ export default defineConfig({
      * `docsflag-2-suite-env` asserts THIS key actually arrived, because a vitest config key that does
      * not exist is ignored in silence and a poisoned default would pass unnoticed.
      */
-    env: { CELLO_DOCUMENTS: "1" },
+    // CELLO_NO_BROWSER: a spawned `cello register-agent` must not open pairing pages on the
+    // operator's screen (agreed across the shared-laptop sessions, 2026-10-29).
+    env: { CELLO_DOCUMENTS: "1", CELLO_NO_BROWSER: "1" },
   },
 });
