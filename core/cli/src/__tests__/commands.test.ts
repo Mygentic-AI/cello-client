@@ -18,7 +18,7 @@ import { startDaemon, acquireLock, readLock, connectToDaemon, isProcessAlive, ac
 import { PassthroughGatewayClient } from "@cello-protocol/daemon/testing";
 import type { Logger, DaemonConfig } from "@cello-protocol/daemon";
 import { createServer, type Server } from "node:net";
-import { login, logout, status, register, createAgent, browserOpener, attestations } from "../commands.js";
+import { login, logout, status, register, createAgent, browserOpener, attestations, pairStatus } from "../commands.js";
 import { startFakeDaemon } from "./helpers/fake-daemon.js";
 import { monikerSet, settingsGet, settingsSet, startAgent } from "../parity-commands.js";
 import {
@@ -351,6 +351,26 @@ describe("cli commands", () => {
       } finally {
         held.release();
       }
+    });
+  });
+
+  describe("pair-status", () => {
+    it("round-trips the daemon's cello_pair_status answer (approved device)", async () => {
+      const fake = await startFakeDaemon(tempDir, { cello_pair_status: { ok: true, paired: true, account_id: "acct-1" } });
+      try {
+        const result = await pairStatus(tempDir);
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.output)).toEqual({ ok: true, paired: true, account_id: "acct-1" });
+        expect(fake.requests).toEqual([{ method: "cello_pair_status" }]);
+      } finally {
+        await fake.close();
+      }
+    });
+
+    it("with no daemon running, exits non-zero with structured daemon_not_running and never dials", async () => {
+      const result = await pairStatus(tempDir);
+      expect(result.exitCode).toBe(1);
+      expect(JSON.parse(result.output).reason).toBe("daemon_not_running");
     });
   });
 

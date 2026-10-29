@@ -49,7 +49,7 @@ describe("F1: usage string lists every command", () => {
     expect([...KNOWN_COMMANDS].sort()).toEqual(
       [
         // Setup
-        "login", "logout", "status", "create-agent", "register-agent", "remove-agent",
+        "login", "logout", "status", "create-agent", "register-agent", "pair-status", "remove-agent",
         // DOD-M15-BACKUP-1: a lost machine used to lose the agent permanently.
         "backup", "restore",
         // DOD-M9C-SCREENINSTALL-1: the classifier is asked for, never assumed.
