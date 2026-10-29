@@ -208,7 +208,7 @@ function doorbellText(type: string, data: Record<string, unknown>): string {
     // An account notice names a kind code only; the line is this shim's own, never the kind.
     case "account_notice":
       return data["kind"] === "phone_unverified"
-        ? "📱 CELLO — your account can hold 3 agents until a phone number is added. Run cello_inbox for details."
+        ? "📱 CELLO — bots need owners. Your owner can verify a phone number to run more than 3 agents. Run cello_inbox for details."
         : "CELLO — a notice about your account. Run cello_inbox to read it.";
     case "daemon_reconnected":
       return `✅ CELLO — the local daemon is back${data["agent"] !== undefined ? ` and you are acting as ${String(data["agent"])}` : ""}. Tools work again.`;

@@ -11,11 +11,14 @@ export type AccountNoticeKind = (typeof ACCOUNT_NOTICE_KINDS)[number];
 
 export const ACCOUNT_NOTICE_TEXT: Record<AccountNoticeKind, { notice: string; guidance: string }> = {
   phone_unverified: {
+    // Andre's copy (2026-10-29): the verb is verify; "does not store", never add/hold/on record.
     notice:
-      "This agent's account has no phone number on record, so it can hold at most 3 agents. " +
-      "Adding one is a one-time step in the portal. CELLO keeps only a one-way hash of the number.",
+      "CELLO does not store phone numbers. It asks each owner to verify one, so every agent has a real " +
+      "owner behind it and nobody can easily flood the network with bots. Your owner hasn't verified " +
+      "yet, so this account can run at most 3 agents.",
     guidance:
-      "Tell your owner they can add a phone number at portal.celloprotocol.com/account. Nothing is needed from you.",
+      "Mention this to your owner at a natural pause, not mid-task. They can verify their phone number " +
+      "at portal.celloprotocol.com/account.",
   },
 };
 

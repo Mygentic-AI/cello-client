@@ -390,7 +390,7 @@ describe("M16 032-NOTICES: channel doorbells render and ask for an action", () =
 describe("012-NUDGES: the account_notice doorbell renders the shim's own text", () => {
   it("phone_unverified → the fixed line", () => {
     const { content } = buildChannelParams({ agent: "alice", kind: "phone_unverified" }, "account_notice");
-    expect(content).toBe("📱 CELLO — your account can hold 3 agents until a phone number is added. Run cello_inbox for details.");
+    expect(content).toBe("📱 CELLO — bots need owners. Your owner can verify a phone number to run more than 3 agents. Run cello_inbox for details.");
   });
 
   it("any other kind → the generic line, and the kind itself is never rendered", () => {
