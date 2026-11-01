@@ -102,6 +102,7 @@ describe("DOD-M12B-INBOX-TRUTH-1: the inbox does not report accepted sessions as
     const config = await setupWithAgents("alice");
     handle = await startDaemon(config);
     const client = await connect(config.socketPath);
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
 
     const s = SID64("d");
@@ -117,6 +118,7 @@ describe("DOD-M12B-INBOX-TRUTH-1: the inbox does not report accepted sessions as
     const config = await setupWithAgents("alice");
     handle = await startDaemon(config);
     const client = await connect(config.socketPath);
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
     await client.send("__test_enqueue_inbound_session", { agentName: "alice", sessionId: SID64("d"), counterpartyPubkey: "cp" });
 
@@ -135,6 +137,7 @@ describe("DOD-M12B-INBOX-TRUTH-1: the inbox does not report accepted sessions as
     const config = await setupWithAgents("alice");
     handle = await startDaemon(config);
     const client = await connect(config.socketPath);
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
 
     const box = await inboxFor(client, "alice");
@@ -146,6 +149,7 @@ describe("DOD-M12B-INBOX-TRUTH-1: the inbox does not report accepted sessions as
     const config = await setupWithAgents("alice");
     handle = await startDaemon(config);
     const client = await connect(config.socketPath);
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
 
     const s = SID64("e");
@@ -169,6 +173,7 @@ describe("DOD-M12B-INBOX-TRUTH-1: the inbox does not report accepted sessions as
     const config = await setupWithAgents("alice");
     handle = await startDaemon(config);
     const client = await connect(config.socketPath);
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
 
     const s = SID64("f");
@@ -186,6 +191,7 @@ describe("DOD-M12B-INBOX-TRUTH-1: the inbox does not report accepted sessions as
     const config = await setupWithAgents("alice");
     handle = await startDaemon(config);
     const client = await connect(config.socketPath);
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
 
     const s = SID64("t");
@@ -208,6 +214,7 @@ describe("DOD-M12B-INBOX-TRUTH-1: the inbox does not report accepted sessions as
     const config = await setupWithAgents("alice");
     handle = await startDaemon(config);
     const client = await connect(config.socketPath);
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
 
     const snm = handle.getSessionNodeManager();

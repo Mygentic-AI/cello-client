@@ -459,6 +459,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the refusal reaches cello_receive
    */
   async function quietReceive(session: string): Promise<Record<string, unknown>> {
     const client = await connect(join(tempDir, "daemon.sock"));
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
     insertSessionRow("alice", session);
     return (await client.send("cello_receive", {
@@ -545,6 +546,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the refusal reaches cello_receive
      */
     handle = await startDaemon(await setup("alice"));
     const client = await connect(join(tempDir, "daemon.sock"));
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
 
     const db = handle.getSessionNodeManager().getDb()!;
@@ -594,6 +596,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the refusal reaches cello_receive
      */
     handle = await startDaemon(await setup("alice"));
     const client = await connect(join(tempDir, "daemon.sock"));
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
 
     const db = handle.getSessionNodeManager().getDb()!;

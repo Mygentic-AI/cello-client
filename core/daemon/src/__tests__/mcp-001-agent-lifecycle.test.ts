@@ -314,7 +314,9 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     await client1.send("cello_start_agent", { name: "bob" });
 
     // Set current agents per connection
+    await client1.send("cello_start_agent", { name: "alice" });
     await client1.send("cello_use_agent", { name: "alice" });
+    await client2.send("cello_start_agent", { name: "bob" });
     await client2.send("cello_use_agent", { name: "bob" });
 
     // Verify isolation
@@ -351,11 +353,14 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     await client1.send("cello_start_agent", { name: "bob" });
 
     // Set alice as current for connection 1
+    await client1.send("cello_start_agent", { name: "alice" });
     await client1.send("cello_use_agent", { name: "alice" });
     // Set bob as current for connection 2
+    await client2.send("cello_start_agent", { name: "bob" });
     await client2.send("cello_use_agent", { name: "bob" });
 
     // Now switch connection 2 to also use alice
+    await client2.send("cello_start_agent", { name: "alice" });
     const switchResult = await client2.send("cello_use_agent", { name: "alice" }) as { ok: boolean };
     expect(switchResult.ok).toBe(true); // M8C-AUTOSTART-1: may also carry a not_registered warning
 
@@ -723,6 +728,7 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     const client = await connect(config.socketPath);
 
     // Agent exists but is not online (still Registered) — use_agent must bring it online + select it.
+    await client.send("cello_start_agent", { name: "alice" });
     const result = await client.send("cello_use_agent", { name: "alice" }) as { ok: boolean };
     expect(result.ok).toBe(true);
 
@@ -736,6 +742,8 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     const config = await setupWithAgents("alice");
     handle = await startDaemon(config);
     const client = await connect(config.socketPath);
+
+    await client.send("cello_start_agent", { name: "nonexistent" });
 
     const result = await client.send("cello_use_agent", { name: "nonexistent" }) as { ok: boolean; reason: string; guidance: string };
     expect(result.ok).toBe(false);
@@ -753,6 +761,7 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     await client.send("cello_use_agent", { name: "alice" });
 
     // Call again — already current
+    await client.send("cello_start_agent", { name: "alice" });
     const result = await client.send("cello_use_agent", { name: "alice" }) as { ok: boolean; reason: string; guidance: string };
     expect(result.ok).toBe(false);
     expect(result.reason).toBe("agent_already_current");
@@ -793,6 +802,7 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
 
       // use_agent auto-starts + selects an unregistered agent, and its non-blocking warning
       // carries next-step guidance (register to enable sessions).
+      await client.send("cello_start_agent", { name: "alice" });
       const r = await client.send("cello_use_agent", { name: "alice" }) as { ok: boolean; warning?: string; warning_guidance?: string };
       expect(r.ok).toBe(true);
       expect(r.warning).toBe("not_registered");
@@ -806,6 +816,7 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
 
       await client.send("cello_start_agent", { name: "alice" });
       await client.send("cello_use_agent", { name: "alice" });
+      await client.send("cello_start_agent", { name: "alice" });
       const r = await client.send("cello_use_agent", { name: "alice" }) as { ok: boolean; guidance: string };
       expect(r.ok).toBe(false);
       expect(r.guidance.length).toBeGreaterThan(20);
@@ -857,6 +868,7 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     await client1.send("cello_start_agent", { name: "bob" });
 
     await client1.send("cello_use_agent", { name: "alice" });
+    await client2.send("cello_start_agent", { name: "bob" });
     await client2.send("cello_use_agent", { name: "bob" });
 
     // Connection 2 calls cello_list_agents and sees bob as current, not alice
@@ -880,6 +892,7 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
 
     await client1.send("cello_start_agent", { name: "alice" });
     await client1.send("cello_use_agent", { name: "alice" });
+    await client2.send("cello_start_agent", { name: "alice" });
     await client2.send("cello_use_agent", { name: "alice" });
 
     // Stop alice from connection 1

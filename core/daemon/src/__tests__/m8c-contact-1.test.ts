@@ -148,6 +148,7 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     clients.push(client);
     await client.send("ipc.connect", { clientType: "test" });
+    await client.send("cello_start_agent", { name: agent });
     await client.send("cello_use_agent", { name: agent });
     return client;
   }

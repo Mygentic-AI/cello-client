@@ -96,6 +96,7 @@ describe("M8C-INBOX-1: cello_check_notifications + watermark + F4", () => {
     const config = await setupWithAgents("alice");
     handle = await startDaemon(config);
     const client = await connect(config.socketPath);
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
 
     const s = SID64("a");
@@ -124,6 +125,7 @@ describe("M8C-INBOX-1: cello_check_notifications + watermark + F4", () => {
     const config = await setupWithAgents("alice");
     handle = await startDaemon(config);
     const client = await connect(config.socketPath);
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
 
     const s = SID64("b");
@@ -150,6 +152,7 @@ describe("M8C-INBOX-1: cello_check_notifications + watermark + F4", () => {
     const config = await setupWithAgents("alice");
     handle = await startDaemon(config);
     const client = await connect(config.socketPath);
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
 
     const s = SID64("e");
@@ -220,6 +223,7 @@ describe("M8C-INBOX-1: cello_check_notifications + watermark + F4", () => {
     expect(res["reason"], "a stopped selection must not silently become another agent").toBe("no_current_agent");
 
     // ...and choosing again must restore normal service — the refusal is not a permanent state.
+    await client.send("cello_start_agent", { name: "bob" });
     await client.send("cello_use_agent", { name: "bob" });
     const after = (await client.send("cello_check_notifications", {})) as R;
     expect(after["ok"]).toBe(true);
@@ -231,6 +235,7 @@ describe("M8C-INBOX-1: cello_check_notifications + watermark + F4", () => {
     const config = await setupWithAgents("alice");
     handle = await startDaemon(config);
     const client = await connect(config.socketPath);
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
 
     const s = SID64("d");
@@ -250,6 +255,7 @@ describe("M8C-INBOX-1: cello_check_notifications + watermark + F4", () => {
     const config = await setupWithAgents("alice", "bob");
     handle = await startDaemon(config);
     const client = await connect(config.socketPath);
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
 
     const aliceSession = SID64("a");

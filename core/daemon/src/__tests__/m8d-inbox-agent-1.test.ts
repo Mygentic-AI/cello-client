@@ -59,6 +59,7 @@ describe("DOD-INBOX-AGENT-1: cello_check_notifications honours an explicit agent
 
     // B re-points ITS connection; A's selection is untouched, but the explicit param is what must
     // make A's answer independent of any of it.
+    await connB.send("cello_start_agent", { name: "alice" });
     await connB.send("cello_use_agent", { name: "alice" });
 
     const a = (await connA.send("cello_check_notifications", { agent: "alice", scope: "current" })) as Record<string, unknown>;

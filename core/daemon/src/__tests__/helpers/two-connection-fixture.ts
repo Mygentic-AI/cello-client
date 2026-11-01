@@ -252,10 +252,16 @@ export async function startTwoConnectionFixture(
   }
   const clients: IpcClient[] = [];
 
-  async function connect(): Promise<IpcClient> {
+  async function connect(clientType = "test"): Promise<IpcClient> {
     const client = await connectToDaemon(socketPath);
     clients.push(client);
-    await client.send("ipc.connect", { clientType: "test" });
+    await client.send("ipc.connect", { clientType });
+    return client;
+  }
+  async function connectEndpoint(caller: { id: string; label: string }): Promise<IpcClient> {
+    const client = await connectToDaemon(socketPath, { caller });
+    clients.push(client);
+    await client.send("ipc.connect", { clientType: "endpoint" });
     return client;
   }
 
@@ -265,8 +271,11 @@ export async function startTwoConnectionFixture(
     snm: handle.getSessionNodeManager(),
     events,
     connect,
+    connectEndpoint,
     async connectAs(agent: string): Promise<IpcClient> {
       const client = await connect();
+      // `cello_use_agent` no longer auto-starts (M15D): an offline agent is refused.
+      await client.send("cello_start_agent", { name: agent });
       await client.send("cello_use_agent", { name: agent });
       return client;
     },

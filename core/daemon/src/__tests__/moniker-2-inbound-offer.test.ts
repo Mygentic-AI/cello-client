@@ -155,6 +155,7 @@ describe("MONIKER-2: inbound assignment moniker → wire-boundary validation →
     const notifications: IpcNotification[] = [];
     client.onNotification((n) => notifications.push(n));
     await client.send("ipc.connect", { clientType: "mcp" });
+    await client.send("cello_start_agent", { name: agentName });
     await client.send("cello_use_agent", { name: agentName });
     return { client, notifications };
   }

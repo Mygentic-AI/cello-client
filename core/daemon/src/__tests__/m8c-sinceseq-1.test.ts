@@ -99,6 +99,7 @@ describe("M8C-SINCESEQ-1: transcript-only and document-leaf reads", () => {
       const config = await setupWithAgents("alice");
       handle = await startDaemon(config);
       const client = await connect(config.socketPath);
+      await client.send("cello_start_agent", { name: "alice" });
       await client.send("cello_use_agent", { name: "alice" });
 
       const s = "e".repeat(64);
@@ -129,6 +130,7 @@ describe("M8C-SINCESEQ-1: transcript-only and document-leaf reads", () => {
       const config = await setupWithAgents("alice");
       handle = await startDaemon(config);
       const client = await connect(config.socketPath);
+      await client.send("cello_start_agent", { name: "alice" });
       await client.send("cello_use_agent", { name: "alice" });
 
       const s = "f".repeat(64);
@@ -146,6 +148,7 @@ describe("M8C-SINCESEQ-1: transcript-only and document-leaf reads", () => {
       const config = await setupWithAgents("alice");
       handle = await startDaemon(config);
       const client = await connect(config.socketPath);
+      await client.send("cello_start_agent", { name: "alice" });
       await client.send("cello_use_agent", { name: "alice" });
 
       const s = "9".repeat(64);
@@ -160,6 +163,7 @@ describe("M8C-SINCESEQ-1: transcript-only and document-leaf reads", () => {
       const config = await setupWithAgents("alice");
       handle = await startDaemon(config);
       const client = await connect(config.socketPath);
+      await client.send("cello_start_agent", { name: "alice" });
       await client.send("cello_use_agent", { name: "alice" });
 
       const s = "e".repeat(64);

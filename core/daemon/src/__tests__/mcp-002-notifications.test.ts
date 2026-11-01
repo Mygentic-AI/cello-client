@@ -183,12 +183,14 @@ describe("MCP-002: notification routing", () => {
     await clientA.send("cello_start_agent", { name: "bob" });
 
     // Set bob as current for A first so we can switch from bob to alice
+    await clientA.send("cello_start_agent", { name: "bob" });
     await clientA.send("cello_use_agent", { name: "bob" });
 
     const notifA = collectNotifications(clientA);
     const notifB = collectNotifications(clientB);
 
     // Switch A from bob to alice
+    await clientA.send("cello_start_agent", { name: "alice" });
     await clientA.send("cello_use_agent", { name: "alice" });
     await waitForNotifications();
 
@@ -218,6 +220,7 @@ describe("MCP-002: notification routing", () => {
 
     await clientA.send("cello_start_agent", { name: "alice" });
     await clientA.send("cello_use_agent", { name: "alice" });
+    await clientB.send("cello_start_agent", { name: "alice" });
     await clientB.send("cello_use_agent", { name: "alice" });
 
     const notifA = collectNotifications(clientA);
@@ -265,6 +268,7 @@ describe("MCP-002: notification routing", () => {
     await clientA.send("cello_start_agent", { name: "alice" });
     await clientA.send("cello_start_agent", { name: "bob" });
     await clientA.send("cello_use_agent", { name: "alice" });
+    await clientB.send("cello_start_agent", { name: "bob" });
     await clientB.send("cello_use_agent", { name: "bob" });
 
     const notifA = collectNotifications(clientA);
@@ -300,6 +304,7 @@ describe("MCP-002: notification routing", () => {
 
     await clientA.send("cello_start_agent", { name: "alice" });
     await clientA.send("cello_use_agent", { name: "alice" });
+    await clientB.send("cello_start_agent", { name: "alice" });
     await clientB.send("cello_use_agent", { name: "alice" });
 
     const notifA = collectNotifications(clientA);
@@ -343,6 +348,7 @@ describe("MCP-002: notification routing", () => {
 
     await clientA.send("cello_start_agent", { name: "alice" });
     await clientA.send("cello_use_agent", { name: "alice" });
+    await clientB.send("cello_start_agent", { name: "alice" });
     await clientB.send("cello_use_agent", { name: "alice" });
 
     const notifA = collectNotifications(clientA);
@@ -390,6 +396,7 @@ describe("MCP-002: notification routing", () => {
     await waitForNotifications();
 
     // 2. agent_current_changed — use alice (first use: fromAgent=null, toAgent=alice)
+    await clientA.send("cello_start_agent", { name: "bob" });
     await clientA.send("cello_use_agent", { name: "bob" });
     await waitForNotifications();
 
@@ -607,6 +614,7 @@ describe("MCP-002: notification routing", () => {
     await clientX.send("cello_start_agent", { name: "alice" });
     await clientX.send("cello_start_agent", { name: "bob" });
     await clientX.send("cello_use_agent", { name: "alice" });
+    await clientY.send("cello_start_agent", { name: "bob" });
     await clientY.send("cello_use_agent", { name: "bob" });
 
     const notifY = collectNotifications(clientY);
@@ -845,6 +853,8 @@ describe("MCP-002: notification routing", () => {
     handle = await startDaemon(config);
     markChannel("chan");
     const client = await connect(config.socketPath);
+
+    await client.send("cello_start_agent", { name: "chan" });
 
     const res = await client.send("cello_use_agent", { name: "chan" }) as {
       ok?: boolean; reason?: string; guidance?: string;

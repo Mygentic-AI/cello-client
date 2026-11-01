@@ -168,6 +168,7 @@ describe("DOD-M15-ENDORSE-RETRY-1 — over a live daemon", () => {
     const c = await connectToDaemon(join(dir, "daemon.sock"));
     clients.push(c);
     await c.send("ipc.connect", { clientType: "mcp" });
+    await c.send("cello_start_agent", { name: agent });
     await c.send("cello_use_agent", { name: agent });
     await c.send("cello_start_agent", { name: agent });
     return c;

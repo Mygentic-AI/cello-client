@@ -101,6 +101,7 @@ describe("M8C-MSGWAKE-1: cello_message doorbell on inbound content", () => {
     const clientB = await connect(config.socketPath); // will be current=bob
     await clientA.send("cello_start_agent", { name: "alice" });
     await clientA.send("cello_use_agent", { name: "alice" });
+    await clientB.send("cello_start_agent", { name: "bob" });
     await clientB.send("cello_use_agent", { name: "bob" });
 
     const notifA = collect(clientA);
@@ -149,6 +150,7 @@ describe("M8C-MSGWAKE-1: cello_message doorbell on inbound content", () => {
     const config = await setupWithAgents("alice");
     handle = await startDaemon(config);
     const client = await connect(config.socketPath);
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
     const notif = collect(client);
 
@@ -179,6 +181,7 @@ describe("M8C-MSGWAKE-1: cello_message doorbell on inbound content", () => {
     const config = await setupWithAgents("alice");
     handle = await startDaemon(config);
     const client = await connect(config.socketPath);
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
     const notif = collect(client);
 

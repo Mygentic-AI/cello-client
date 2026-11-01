@@ -345,6 +345,8 @@ describe("DOD-M15-SELECTION-1 diagnosis: what a release actually leaves behind",
       "PRECONDITION: and it must have FALLEN BACK before throwing, or the notice never existed",
     ).toBe(true);
 
+    await c.send("cello_start_agent", { name: "solo" });
+
     const after = (await c.send("cello_use_agent", { name: "solo" })) as Record<string, unknown>;
     c.close();
 

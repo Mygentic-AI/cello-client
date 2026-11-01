@@ -107,6 +107,7 @@ describe("seal_stale: a close signed before a filed message is re-signed once it
     const client = await connectToDaemon(join(tempDir, "d.sock"));
     clients.push(client);
     await client.send("ipc.connect", { clientType: "test" });
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
     const sent = await client.send("cello_send", { session_id: SID_HEX, content: "hello" }) as Record<string, unknown>;
     expect(sent.ok, JSON.stringify(sent)).toBe(true);

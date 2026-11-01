@@ -129,6 +129,7 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
 
   /** The inbox for `alice`, as an operator's window would see it. */
   async function inbox(client: IpcClient): Promise<Record<string, unknown>> {
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
     const res = (await client.send("cello_check_notifications", {})) as {
       agents: Array<Record<string, unknown>>;
@@ -778,6 +779,7 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     });
 
     const client = await connect();
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
     const res = (await client.send("cello_dismiss", { session_id: "s-dismiss" })) as Record<string, unknown>;
     expect(
@@ -833,6 +835,7 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     });
 
     const client = await connect();
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
     const res = (await client.send("cello_receive", { session_id: "s-gone", timeout_ms: 150 })) as Record<string, unknown>;
     expect(res["reason"], "the exit under test").toBe("counterparty_gone");

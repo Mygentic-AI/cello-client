@@ -67,6 +67,7 @@ describe("DOD-COATTEND-VISIBLE-1: two sessions on one agent — the loser is tol
 
     // The SECOND attach reports the count it is joining — this is the return the operator reads.
     const connB = await fx.connect();
+    await connB.send("cello_start_agent", { name: "alice" });
     const attach = (await connB.send("cello_use_agent", { name: "alice" })) as Record<string, unknown>;
     expect(attach.ok).toBe(true);
     expect(attach.attendance).toBe(2);
@@ -99,6 +100,8 @@ describe("DOD-COATTEND-VISIBLE-1: two sessions on one agent — the loser is tol
   it("C5 (AC4): a second attach is TOLD it is not alone — and is NOT refused (exclusivity by the back door)", async () => {
     await fx.connectAs("alice");
     const connB = await fx.connect();
+
+    await connB.send("cello_start_agent", { name: "alice" });
 
     const attach = (await connB.send("cello_use_agent", { name: "alice" })) as Record<string, unknown>;
     // Refusing here would be exclusivity, rejected permanently (spec §3). It must SUCCEED.

@@ -115,7 +115,10 @@ describe("M8C-AUTOSTART-1: use_agent auto-start + F5/F18", () => {
     handle = await startDaemon(config);
     const client = await connect(config.socketPath);
 
+    await client.send("cello_start_agent", { name: "alice" });
+
     await client.send("cello_use_agent", { name: "alice" }); // alice now current
+    await client.send("cello_start_agent", { name: "ghost" });
     const bad = (await client.send("cello_use_agent", { name: "ghost" })) as Result;
     expect(bad["ok"]).toBe(false);
 
@@ -128,6 +131,8 @@ describe("M8C-AUTOSTART-1: use_agent auto-start + F5/F18", () => {
     const config = await setupWithAgents("alice"); // setupWithAgents does NOT register
     handle = await startDaemon(config);
     const client = await connect(config.socketPath);
+
+    await client.send("cello_start_agent", { name: "alice" });
 
     const res = (await client.send("cello_use_agent", { name: "alice" })) as Result;
     expect(res["ok"]).toBe(true); // NON-blocking — still selected
@@ -153,6 +158,8 @@ describe("M8C-AUTOSTART-1: use_agent auto-start + F5/F18", () => {
       registeredAt: 1_700_000_000_000,
       keyBinding: "cc".repeat(64),
     });
+
+    await client.send("cello_start_agent", { name: "reggie" });
 
     const res = (await client.send("cello_use_agent", { name: "reggie" })) as Result;
     expect(res["ok"]).toBe(true);

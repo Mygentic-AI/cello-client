@@ -174,6 +174,8 @@ describe("DOD-RELEASE-1: cello_stop_using_agent", () => {
     await client.send("cello_use_agent", { name: "alice" });
     await client.send("cello_stop_using_agent", {});
 
+    await client.send("cello_start_agent", { name: "alice" });
+
     const reselect = await client.send("cello_use_agent", { name: "alice" }) as { ok: boolean };
     expect(reselect.ok).toBe(true);
     const list = await client.send("cello_list_agents") as AgentList;
@@ -212,6 +214,7 @@ describe("DOD-RELEASE-1: cello_stop_using_agent", () => {
 
     await connA.send("cello_start_agent", { name: "alice" });
     await connA.send("cello_use_agent", { name: "alice" });
+    await connB.send("cello_start_agent", { name: "alice" });
     await connB.send("cello_use_agent", { name: "alice" });
 
     await connA.send("cello_stop_using_agent", {});

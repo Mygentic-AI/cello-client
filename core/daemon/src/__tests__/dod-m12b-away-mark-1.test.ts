@@ -159,6 +159,7 @@ describe("DOD-M12B-AWAY-MARK-1: the receiving side is told, and is never silence
     const config = await setup("alice");
     handle = await startDaemon(config);
     const client = await connect(config.socketPath);
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
 
     const s = SID64("a");
@@ -178,6 +179,7 @@ describe("DOD-M12B-AWAY-MARK-1: the receiving side is told, and is never silence
     const config = await setup("alice");
     handle = await startDaemon(config);
     const client = await connect(config.socketPath);
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
 
     const s = SID64("b");
@@ -193,6 +195,7 @@ describe("DOD-M12B-AWAY-MARK-1: the receiving side is told, and is never silence
     const config = await setup("alice");
     handle = await startDaemon(config);
     const client = await connect(config.socketPath);
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
 
     const s = SID64("c");
@@ -258,6 +261,7 @@ describe("DOD-M12B-AWAY-MARK-1: the LIVE receive exit, not just the batch one", 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     clients.push(client);
     await client.send("ipc.connect", { clientType: "mcp" });
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
 
     const s = SID64("l");
@@ -293,6 +297,7 @@ describe("DOD-M12B-AWAY-MARK-1: the LIVE receive exit, not just the batch one", 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     clients.push(client);
     await client.send("ipc.connect", { clientType: "mcp" });
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
 
     const s = SID64("m");

@@ -157,15 +157,18 @@ describe("DOD-M15-SEALPRECOND-1: the counterparty's chain must not be left one l
     const bClient = await connectToDaemon(join(bob.dir, "d.sock"));
     clients.push(bClient);
     await bClient.send("ipc.connect", { clientType: "test" });
+    await bClient.send("cello_start_agent", { name: "bob" });
     await bClient.send("cello_use_agent", { name: "bob" });
 
     const aClient = await connectToDaemon(join(alice.dir, "d.sock"));
     clients.push(aClient);
     await aClient.send("ipc.connect", { clientType: "test" });
+    await aClient.send("cello_start_agent", { name: "alice" });
     await aClient.send("cello_use_agent", { name: "alice" });
     const aCloser = await connectToDaemon(join(alice.dir, "d.sock"));
     clients.push(aCloser);
     await aCloser.send("ipc.connect", { clientType: "cli" });
+    await aCloser.send("cello_start_agent", { name: "alice" });
     await aCloser.send("cello_use_agent", { name: "alice" });
 
     for (const text of ["first", "second"]) {

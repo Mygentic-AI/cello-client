@@ -41,6 +41,8 @@ export class IpcError extends Error {
 
 export interface IpcClientOptions {
   onFrameError?: (error: string) => void;
+  /** Web-endpoint sockets only: stamped on every request's envelope (contract C2). */
+  caller?: { id: string; label: string };
 }
 
 export function connectToDaemon(socketPath: string, opts?: IpcClientOptions): Promise<IpcClient> {
@@ -62,7 +64,7 @@ export function connectToDaemon(socketPath: string, opts?: IpcClientOptions): Pr
           }
           const id = randomUUID();
           pending.set(id, { resolve: res, reject: rej });
-          const request: IpcRequest = { id, method, params };
+          const request: IpcRequest = { id, method, params, ...(opts?.caller ? { caller: opts.caller } : {}) };
           socket.write(JSON.stringify(request) + "\n");
         });
       },

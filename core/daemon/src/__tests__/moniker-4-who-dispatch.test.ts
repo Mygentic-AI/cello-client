@@ -151,6 +151,7 @@ describe("MONIKER-4 AC2 e2e — the created doorbell carries the resolved who", 
     const notifications: IpcNotification[] = [];
     client.onNotification((n) => notifications.push(n));
     await client.send("ipc.connect", { clientType: "mcp" });
+    await client.send("cello_start_agent", { name: "bob" });
     await client.send("cello_use_agent", { name: "bob" });
     return { inject: injectRef.inject!, client, bobPubkey, notifications };
   }

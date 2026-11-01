@@ -94,6 +94,7 @@ describe("the document verbs answer over the daemon socket", () => {
     handles.push(h);
     const client = await connectToDaemon(join(dir, "daemon.sock"));
     await client.send("ipc.connect", { clientType: "cli" });
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
     return { client, pubkey, handle: h };
   }

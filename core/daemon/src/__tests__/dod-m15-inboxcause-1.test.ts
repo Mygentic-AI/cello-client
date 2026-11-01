@@ -369,6 +369,7 @@ describe("DOD-M15-INBOXCAUSE-1: every park refusal reason has a path to cello_in
   };
 
   async function inboxRefusals(client: IpcClient): Promise<Refusal[]> {
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
     const res = (await client.send("cello_check_notifications", {})) as {
       agents: Array<{ refusals?: Refusal[] }>;
@@ -455,6 +456,7 @@ describe("DOD-M15-INBOXCAUSE-1: every park refusal reason has a path to cello_in
     ).run(now - 10 * 60_000, now, sid, PARK_REFUSAL_REASONS.ANNEX_SALT_UNAVAILABLE);
 
     const client = await connect();
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
     // since_seq is gone; the QUIET exit (live row, nothing unread, timeout 0) carries `refusalsField`.
     const res = (await client.send("cello_receive", { session_id: sid, timeout_ms: 0 })) as {

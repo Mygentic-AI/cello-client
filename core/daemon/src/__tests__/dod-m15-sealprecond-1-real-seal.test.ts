@@ -130,6 +130,7 @@ describe("DOD-M15-SEALPRECOND-1 Done When 1: the signed root covers every messag
     const client = await connectToDaemon(join(tempDir, "d.sock"));
     clients.push(client);
     await client.send("ipc.connect", { clientType: "test" });
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
 
     // The CLOSER is a second connection, as it was on 2026-09-11: the seal came from a `cello
@@ -137,6 +138,7 @@ describe("DOD-M15-SEALPRECOND-1 Done When 1: the signed root covers every messag
     const closer = await connectToDaemon(join(tempDir, "d.sock"));
     clients.push(closer);
     await closer.send("ipc.connect", { clientType: "cli" });
+    await closer.send("cello_start_agent", { name: "alice" });
     await closer.send("cello_use_agent", { name: "alice" });
 
     // Two ordinary messages, fully settled.

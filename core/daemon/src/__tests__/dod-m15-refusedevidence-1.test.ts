@@ -214,6 +214,7 @@ describe("DOD-M15-REFUSEDEVIDENCE-1 — a refused message is kept, flagged, and 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     try {
       await client.send("ipc.connect", { clientType: "mcp" });
+      await client.send("cello_start_agent", { name: "alice" });
       await client.send("cello_use_agent", { name: "alice" });
       // The IPC method takes `session_id`; `cello_session_id` is the MCP shim's argument name.
       const res = (await client.send("cello_receive", { session_id: sid, timeout_ms: 200 })) as { ok?: boolean; reason?: string };
@@ -403,6 +404,7 @@ describe("DOD-M15-REFUSEDEVIDENCE-1 — a refused message is kept, flagged, and 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     try {
       await client.send("ipc.connect", { clientType: "mcp" });
+      await client.send("cello_start_agent", { name: "alice" });
       await client.send("cello_use_agent", { name: "alice" });
       // since_seq is gone: the plain read hands over everything unread and crosses holes.
       const res = await client.send("cello_receive", { session_id: SID, timeout_ms: 500 }) as { messages?: Array<{ sequence: number; content: string }> };

@@ -55,6 +55,7 @@ describe("008-POLICY through a live daemon", () => {
       const c = await connectToDaemon(config.socketPath);
       clients.push(c);
       await c.send("ipc.connect", { clientType });
+      await c.send("cello_start_agent", { name: "alice" });
       await c.send("cello_use_agent", { name: "alice" });
       return c;
     };

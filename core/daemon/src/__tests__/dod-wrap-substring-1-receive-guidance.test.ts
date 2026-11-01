@@ -71,6 +71,7 @@ describe("DOD-WRAP-SUBSTRING-1: the close signal is read at the END, not found a
       const client = await connectToDaemon(join(tempDir, "daemon.sock"));
       clients.push(client);
       await client.send("ipc.connect", { clientType: "mcp" });
+      await client.send("cello_start_agent", { name: "alice" });
       await client.send("cello_use_agent", { name: "alice" });
     }
     const s = SID64(sessionSeed);

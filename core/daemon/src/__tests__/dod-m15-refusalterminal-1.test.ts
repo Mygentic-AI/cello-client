@@ -137,6 +137,7 @@ describe("DOD-M15-REFUSALTERMINAL-1", () => {
 
   /** The inbox for `alice`, as an operator's window would see it. */
   async function inbox(client: IpcClient): Promise<Record<string, unknown>> {
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
     const res = (await client.send("cello_check_notifications", {})) as {
       agents: Array<Record<string, unknown>>;

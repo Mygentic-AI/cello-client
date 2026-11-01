@@ -132,6 +132,7 @@ describe("DOD-M15-AWAYSCOPE-1: the daemon announces its own attendance, and neve
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     clients.push(client);
     await client.send("ipc.connect", { clientType: "test" });
+    await client.send("cello_start_agent", { name: agent });
     await client.send("cello_use_agent", { name: agent });
     return client;
   }

@@ -64,6 +64,7 @@ describe("DOD-END-SURFACE-1 — the pending-consent nudge, over a live daemon", 
     // ANY guidance this handler emits is renderable. The bug was structural: `pending_consent_
     // guidance` was not in the renderer's key set, so it passed through untranslated whatever it
     // said. Assert the property across every instruction key the response carries.
+    await cli.send("cello_start_agent", { name: "nobody" });
     const res = (await cli.send("cello_use_agent", { name: "nobody" })) as Record<string, unknown>;
     for (const [key, value] of Object.entries(res)) {
       if (typeof value !== "string") continue;
@@ -75,6 +76,7 @@ describe("DOD-END-SURFACE-1 — the pending-consent nudge, over a live daemon", 
   it("an MCP caller keeps the underscored tool names — the rewrite is one-directional", async () => {
     await boot();
     const mcp = await connectAs("mcp");
+    await mcp.send("cello_start_agent", { name: "nobody" });
     const res = (await mcp.send("cello_use_agent", { name: "nobody" })) as Record<string, unknown>;
     // The counterpart assertion. Without it, a renderer that stripped tool names from BOTH surfaces
     // would satisfy the test above while leaving an MCP agent with a shell command it cannot run.
