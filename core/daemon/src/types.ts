@@ -175,13 +175,8 @@ export interface AgentInfo {
    * as different readiness levels. A selected agent reads `state: "online"` + `selected: true`.
    */
   selected?: boolean;
-  /**
-   * DOD-COATTEND-VISIBLE-1: how many live connections attend this agent right now, including the
-   * requesting one. Several sessions on one agent is legitimate (co-attendance, spec §3) but was
-   * completely invisible, so an operator whose messages were being taken by another window had no
-   * way to see why. Live, not cumulative — it falls when a session disconnects.
-   */
-  attendance?: number;
+  /** M15D: who holds this agent, if anyone. Absent on surfaces that do not report it. */
+  holder?: { label: string; since: string } | null;
 }
 
 // --- Connection state ---
@@ -382,6 +377,8 @@ export interface DaemonConfig {
   socketPath: string;
   lockFilePath: string;
   maxConnections: number;
+  /** M15D: how many of `maxConnections` only the CLI may use (default 4). */
+  reservedCliConnections?: number;
   version: string;
   logger: Logger;
   /**

@@ -111,7 +111,7 @@ import { registerNotificationHandlers } from "./notification-handlers.js";
 import { TypeRegistry } from "./type-registry.js";
 import { DbRegistryVersionStore } from "./registry-version-store-db.js";
 import { startRegistryPoll } from "./registry-poll.js";
-import { countAttendance } from "./co-attendance.js";
+import { createAttendanceRoot } from "./attendance-root.js";
 import { FrontierMismatchStore } from "./frontier-mismatch.js";
 
 // 040-DAEMONROOT unit 8: three things that were never composition — the handle's shape, the session
@@ -352,28 +352,17 @@ async function startDaemonHoldingLock(
     safeWatermarkAdvance,
   } = startBootConnectionState({ sessionNodeManager });
 
-  /**
-   * DOD-M15-AWAYSCOPE-1 — the one answer to "is anyone attending this agent", wired once here.
-   *
-   * It lives in the composition root because it needs both halves and neither owns the other: the
-   * per-connection selections (an IPC-layer fact) and the operator's explicit offline switch.
-   * `offline` is checked FIRST — an agent taken down on purpose is not merely unwatched, and
-   * reporting it as `unattended` tells the counterparty their message will be read later, which is
-   * the opposite of what the switch means.
-   */
-  const currentAttendance = (agentName: string): "attended" | "unattended" | "offline" =>
-    explicitlyOfflineAgents.has(agentName)
-      ? "offline"
-      : countAttendance(perConnectionState, agentName) > 0
-        ? "attended"
-        : "unattended";
+  // M15D 001-DAEMON: who holds each agent, reachable-now, and the request guard → attendance-root.ts.
+  const { holderRegistry, currentAttendance, holderFor, admit } = createAttendanceRoot({
+    logger, sessionNodeManager, loadedAgents, onlineAgents, explicitlyOfflineAgents, perConnectionState,
+  });
   sessionNodeManager.setCurrentAttendanceSource(currentAttendance);
 
   // 040-DAEMONROOT unit 6: attendance and the away reply → attendance-wiring.ts.
   // DOD-M15-AWAYSCOPE-1 took the one-shot rejection out, and with it every seal dependency this
   // wiring used to hold — it can no longer initiate a seal at all, which is the point.
-  const { attendanceCount, sendAwayResponse, backgroundSeals, awayAckSent } =
-    createAttendanceWiring({ logger, sessionNodeManager, perConnectionState, securityGateway });
+  const { sendAwayResponse, backgroundSeals, awayAckSent } =
+    createAttendanceWiring({ logger, sessionNodeManager, isReachable: (a) => holderRegistry.isReachable(a), securityGateway });
   // DOD-INBOX-ONESHOT-1 enforces what the away reply promised, in its own file — merging it with the
   // greeting is how both were deleted together. `sendClaims` is shared with cello_send.
   const sendClaims = createSendClaims();  const { closeInboxIfIgnored } = createAwayInboxOneshot({ logger, sessionNodeManager, awayAckSent, sendClaims,
@@ -572,7 +561,7 @@ async function startDaemonHoldingLock(
 
   // 040-DAEMONROOT unit 12: the agent list from ONE connection's point of view → connection-agents.ts.
   const { getAgentsForConnection, getChannelsForConnection } = createConnectionAgents({
-    agents, perConnectionState, onlineAgents, sessionNodeManager, isChannelAgent: channelAgentLookup(sessionNodeManager, logger), // M16 033
+    agents, perConnectionState, holderFor, onlineAgents, sessionNodeManager, isChannelAgent: channelAgentLookup(sessionNodeManager, logger), // M16 033
     // A getter: the session views are constructed below this call, and the agent list is only ever
     // built while serving a request.
     agentStateFor: (a) => agentStateFor(a),
@@ -584,7 +573,8 @@ async function startDaemonHoldingLock(
     buildInterruptedSessions, reapDeadHalfOpenSessions, buildActiveSessionsWithAttendance,
     agentStateFor,
   } = createSessionViews({
-    logger, sessionNodeManager, perConnectionState, onlineAgents, explicitlyOfflineAgents,
+    logger, sessionNodeManager, onlineAgents, explicitlyOfflineAgents,
+    isReachable: (agentName: string) => holderRegistry.isReachable(agentName),
     perAgentSignaling, sharedSignaling, frontierMismatches, sealKey, sealInterruptedInProgress,
     pendingSealWaiters,
   });
@@ -612,8 +602,6 @@ async function startDaemonHoldingLock(
   handlers.set("ipc.connect", async (params, connectionId) => {
     const clientType = (params?.clientType as string) ?? "cli";
     perConnectionState.set(connectionId, { currentAgent: null, clientType });
-    // MCP-002: Register connection with notification dispatcher
-    notificationDispatcher.registerConnection(connectionId);
     // Re-log with correct clientType (overrides the default "cli" from handleConnection)
     logger.info("daemon.ipc.connected", { connectionId, clientType });
     return { connectionId };
@@ -645,6 +633,7 @@ async function startDaemonHoldingLock(
     getNotificationDispatcher: () => notificationDispatcher,
     getConnState: (connectionId) => perConnectionState.get(connectionId),
     perConnectionState,
+    registry: holderRegistry,
     getAgentsForConnection,
     startAgentInternal,
     dropAgentSignaling, stopSweepTick: (n: string) => trustSignalSweepTicker.stop(n),
@@ -968,7 +957,7 @@ async function startDaemonHoldingLock(
     safeWatermarkAdvance,
     reapDeadHalfOpenSessions,
     frontierMismatches,
-    attendanceCount,
+    holderFor,
     // DOD-TERMINAL-STATE-DIVERGENCE-1: the pull twin of the session_sealed push. Wired HERE, at the
     // composition root, because it needs the agent's own signaling stream and its persistence — the
     // read handlers hold neither, and giving them the whole daemon to reach one function is how a
@@ -1028,7 +1017,7 @@ async function startDaemonHoldingLock(
     getConnectionCursor,
     advanceConnectionCursor,
     clearTelegramRung,
-    attendanceCount,
+    holderFor,
     // M16 031: the known public keys in an outbound message the gateway must pass untouched.
     knownPublicKeys: createKnownPublicKeysIn(knownPublicKeysDepsFromDaemon(sessionNodeManager, logger)),
     attestationNotices: attestationNoticeStore, // M10E 007: spread into every receive reply
@@ -1087,6 +1076,8 @@ async function startDaemonHoldingLock(
     logger, socketPath, maxConnections, handlers, perConnectionState, fallbackNoticeStore,
     // A GETTER: `stop` is defined below this surface and the `shutdown` verb calls it.
     getStop: () => stop,
+    admit,
+    reservedForCli: config.reservedCliConnections ?? 4,
   });
 
   // THE SOCKET OPENS LAST — see the deferred start below. Accepting clients here would accept
@@ -1098,6 +1089,8 @@ async function startDaemonHoldingLock(
     logger,
     sendNotification: (connectionId, notification) => ipcServer.sendNotification(connectionId, notification),
     getConnectionIds: () => ipcServer.getConnectionIds(),
+    routeFor: (agentName) => holderRegistry.routeFor(agentName),
+    isRegistered: (connectionId) => perConnectionState.has(connectionId),
   }));
 
   // M7-SESSION-001 (M-1 PUSH): now that the dispatcher exists, wire the session
@@ -1175,13 +1168,9 @@ async function startDaemonHoldingLock(
   wireDisconnectCleanup({
     ipcServer,
     getConnState: (connectionId: string) => perConnectionState.get(connectionId),
-    countAttendanceFor: (agentName: string) => countAttendance(perConnectionState, agentName),
+    registry: holderRegistry,
     forgetConnection,
-    announceAttendance: (agentName, attendance) => sessionNodeManager.announceAttendance(agentName, attendance),
     inboundSessionWaiters,
-    // A GETTER, though the dispatcher is a const 82 lines ABOVE — so that moving its construction
-    // below this line cannot break the disconnect path silently. Reason in full at the dep.
-    getNotificationDispatcher: () => notificationDispatcher,
   });
 
   // Log daemon.login.validation.complete (stub — all unverified until SIGNAL-001)

@@ -38,6 +38,7 @@ import type { AgentInfo } from "./types.js";
 export interface ConnState {
   currentAgent: string | null;
   clearedAgent?: string;
+  clientType?: string;
 }
 
 export interface ContactHandlerDeps {

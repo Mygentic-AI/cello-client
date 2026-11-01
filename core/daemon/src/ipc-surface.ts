@@ -14,7 +14,9 @@
  * version skew, so an operator would re-pin, reinstall and restart, and find both sides matching.
  * Late binding makes that unrepresentable rather than forbidden by a comment.
  */
-import { createIpcServer, type IpcHandler, type IpcServer, type HandlerLookup } from "./ipc-server.js";
+import { createIpcServer, DeferredUntilWritten, type IpcHandler, type IpcServer, type HandlerLookup } from "./ipc-server.js";
+import { callerContext } from "./caller-identity.js";
+import type { Admission } from "./attendance-guard.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { renderForSurface } from "./vocabulary.js";
 import type { Logger } from "./types.js";
@@ -36,10 +38,14 @@ export interface IpcSurfaceDeps {
    * that cannot happen, which is the wrong lesson: the silent shape is a `let` assigned below.
    */
   getStop: () => (reason: string) => Promise<void>;
+  /** M15D: who is calling, and may they act as the agent this call names (`attendance-guard.ts`). */
+  admit: (method: string, params: Record<string, unknown> | undefined, connectionId: string, rawCaller: unknown) => Admission;
+  /** M15D: how many of the connection slots only the CLI may use. */
+  reservedForCli: number;
 }
 
 export function createIpcSurface(deps: IpcSurfaceDeps) {
-  const { logger, socketPath, maxConnections, handlers, perConnectionState, fallbackNoticeStore, getStop } = deps;
+  const { logger, socketPath, maxConnections, handlers, perConnectionState, fallbackNoticeStore, getStop, admit, reservedForCli } = deps;
 
   let shutdownPromise: Promise<void> | null = null;
   handlers.set("shutdown", async (_params, _connectionId) => {
@@ -64,21 +70,20 @@ export function createIpcSurface(deps: IpcSurfaceDeps) {
   // Wrapping the handler map is the ONE choke point that has both the response and the connection's
   // clientType. Doing it per-handler would mean 60+ call sites, and the 61st would forget.
   //
-  // RESOLVED AT DISPATCH, not copied at construction. This was a `for…of` that snapshotted
-  // `handlers` into a second map, which made the ORDER of registration load-bearing in a file
-  // 3,500 lines long: anything registered after this line was written into a map nothing
-  // dispatched from. The document surface landed 245 lines below it and every `cello_doc_*` verb
-  // answered `method_not_found` — whose guidance blames version skew between the shim and the
-  // daemon, so an operator would re-pin, reinstall and restart, and find both sides matching.
-  //
-  // A comment saying "register above this line" would have been one more rule to remember. Late
-  // binding makes the ordering unrepresentable instead: the map below reads `handlers` when a
-  // request arrives, so a handler registered at any point before the first request is dispatchable.
+  // RESOLVED AT DISPATCH, not copied at construction: a snapshot made registration order
+  // load-bearing, and every `cello_doc_*` verb registered after it answered `method_not_found`.
+  // Reading `handlers` per request makes a handler registered before the first request dispatchable.
   const renderedHandlers: HandlerLookup = {
     get(method: string): IpcHandler | undefined {
       const handler = handlers.get(method);
       if (!handler) return undefined;
-      return async (params, connectionId) => {
+      return async (params, connectionId, meta) => {
+        // The web endpoint speaks for MCP clients; a connection with no hello renders for the CLI.
+        const clientType = perConnectionState.get(connectionId)?.clientType;
+        const surface = clientType === "mcp" || clientType === "endpoint" ? "mcp" : "cli";
+        const admission = admit(method, params, connectionId, meta?.caller);
+        if (!admission.ok) return renderForSurface(admission.response, surface);
+        try {
         /**
          * ONE request, ONE store — and the fallback notice is spread in BEFORE `renderForSurface`.
          *
@@ -91,7 +96,8 @@ export function createIpcSurface(deps: IpcSurfaceDeps) {
          * built to prevent. Annotating here puts it back in front of the renderer.
          */
         const store: { notice?: Record<string, unknown> } = {};
-        const result = await fallbackNoticeStore.run(store, () => handler(params, connectionId));
+        const outcome = await callerContext.run(admission.caller, () => fallbackNoticeStore.run(store, () => handler(params, connectionId, meta)));
+        const deferred = outcome instanceof DeferredUntilWritten ? outcome : null, result = deferred ? deferred.result : outcome;
         /**
          * ⚠️ **THE NOTICE GOES FIRST, AND THAT ORDERING IS A SECURITY PROPERTY — review F2.**
          *
@@ -101,31 +107,25 @@ export function createIpcSurface(deps: IpcSurfaceDeps) {
          * structural guarantee is that nothing follows the payload. Three keys of genuine
          * CELLO-authored prose landing after it is exactly the shape a forged ending imitates, and
          * once a reader has seen real framing follow the payload, a forged one is credible.
-         *
-         * Not a corner case: `withIpc` in the CLI never sends `ipc.connect`, so a single-agent
-         * daemon takes the sole-online fallback on EVERY plain `cello quarantined` invocation.
-         *
-         * Spreading first is safe in general and needs no per-handler knowledge: these keys cannot
-         * collide with a handler's own (a collision would mean a handler already answered the
-         * question the notice exists to answer), and every response then keeps its own key order at
-         * the tail — which is where a payload-terminal key has to stay.
+         * Spreading first needs no per-handler knowledge, and every response keeps its own key order
+         * at the tail — which is where a payload-terminal key has to stay.
          */
         const annotated =
           store.notice && result !== null && typeof result === "object" && !Array.isArray(result)
             ? { ...store.notice, ...(result as Record<string, unknown>) }
             : result;
-        // Default to "cli": a connection that never sent ipc.connect has no recorded surface, and
-        // the CLI verb is the safe answer — it is at least a real command an operator can run,
-        // whereas an MCP tool name is useless in a terminal.
-        const surface = perConnectionState.get(connectionId)?.clientType === "mcp" ? "mcp" : "cli";
-        return renderForSurface(annotated, surface);
+        const rendered = renderForSurface(annotated, surface);
+        return deferred ? new DeferredUntilWritten(rendered, deferred.afterWrite) : rendered;
+        } finally {
+          admission.finish();
+        }
       };
     },
   };
 
   // Create and start IPC server
   const ipcServer: IpcServer = createIpcServer(
-    { socketPath, maxConnections, logger },
+    { socketPath, maxConnections, reservedForCli, logger },
     renderedHandlers,
   );
 

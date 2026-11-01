@@ -25,7 +25,8 @@ import type { SignalingManager, CelloNode } from "@cello-protocol/transport";
 import { generateKLocalSeed, InMemoryKeyProvider } from "@cello-protocol/crypto";
 
 import { TrustSignalStore } from "./trust-signal-store.js";
-import { countAttendance } from "./co-attendance.js";
+import { currentCaller } from "./caller-identity.js";
+import type { HolderRegistry } from "./holder-registry.js";
 import { noAgentsGuidance } from "./onboarding-guidance.js";
 import { extractErrorMessage } from "./error-message.js";
 
@@ -75,6 +76,8 @@ export interface AgentHandlerDeps {
    * channel is administered by an agent, never selected as one. Reads the DB row live.
    */
   isChannelAgent: (agentName: string) => boolean;
+  /** M15D: who holds each agent. `cello_use_agent` takes a hold; release and stop drop it. */
+  registry: HolderRegistry;
 }
 
 export function registerAgentHandlers(deps: AgentHandlerDeps): void {
@@ -82,7 +85,7 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
     handlers, logger, sessionNodeManager, agents, onlineAgents, explicitlyOfflineAgents, getNotificationDispatcher,
     getConnState, perConnectionState, getAgentsForConnection, startAgentInternal,
     dropAgentSignaling, stopSweepTick, awayAckSent, keyProviders, loadedAgents, getAgentSignaling,
-    waitForSignalingConnected, perAgentSignaling, isChannelAgent,
+    waitForSignalingConnected, perAgentSignaling, isChannelAgent, registry,
   } = deps;
 
   // ─── MCP-001: cello_start_agent handler ───
@@ -282,6 +285,7 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
       // 048-SWEEPTICK: and its collection tick, which would otherwise outlive the agent for the life
       // of the daemon — skipping every five minutes for a name that no longer exists.
       stopSweepTick(name);
+      registry.clearAgent(name); // before the roster forgets its key
       keyProviders.delete(name);
       const li = loadedAgents.findIndex((a) => a.name === name);
       if (li >= 0) loadedAgents.splice(li, 1);
@@ -297,7 +301,6 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
         if (state.currentAgent === name) {
           state.currentAgent = null;
           state.clearedAgent = name; // this connection HAD an intent; do not guess a replacement
-          getNotificationDispatcher().setCurrentAgent(connId, null);
           getNotificationDispatcher().dispatchAgentCurrentChanged(connId, name, null);
         }
       }
@@ -430,12 +433,12 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
     // 033-CHANNELVIEW): a channel is not an agent and rings no online/offline doorbell.
     if (!isChannelAgent(name)) getNotificationDispatcher().dispatchAgentStateChanged(name, "offline", "stopped");
 
-    // Clear current agent for all connections that had this agent as current
+    // Nobody holds or listens to a stopped agent; clear it from every connection that had it.
+    registry.clearAgent(name);
     for (const [connId, state] of perConnectionState) {
       if (state.currentAgent === name) {
         state.currentAgent = null;
         state.clearedAgent = name; // this connection HAD an intent; do not guess a replacement
-        getNotificationDispatcher().setCurrentAgent(connId, null);
         getNotificationDispatcher().dispatchAgentCurrentChanged(connId, name, null);
         logger.info("agent.current.switched", { connectionId: connId, fromAgent: name, toAgent: null });
       }
@@ -462,49 +465,27 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
     if (!connState) {
       return { ok: false, reason: "connection_not_registered", guidance: "Send ipc.connect frame before calling agent tools." };
     }
-    const fromAgent = connState.currentAgent;
+    const caller = currentCaller();
+    const fromAgent = connState.currentAgent ?? registry.heldBy(caller.key) ?? null;
 
-    // CLEARED ON BOTH BRANCHES, including the one that releases nothing. `clearedAgent` means "this
-    // connection's choice was taken away from it, do not guess a replacement" — it is set when an
-    // agent is taken offline or removed UNDERNEATH a connection. A release is the opposite: the
-    // operator is deliberately choosing to hold nothing. Leaving the flag set would mean the one
-    // gesture that explicitly says "I hold nothing, on purpose" left the connection locked out of
-    // the sole-online fallback for the rest of the session, which only cello_use_agent could undo.
-    // (Review finding 6 — the original code cleared it on neither branch while its own comment
-    // argued it should.)
+    // CLEARED ON BOTH BRANCHES. `clearedAgent` means "this connection's choice was taken away from
+    // it, do not guess a replacement". A release is the opposite: the operator chose to hold nothing.
     delete connState.clearedAgent;
 
     if (!fromAgent) {
-      // Idempotent, and says so — releasing nothing is not an error worth failing a script over.
       return { ok: true, released: null, guidance: "This connection was not attending any agent. Nothing to release." };
     }
     connState.currentAgent = null;
-    /**
-     * DOD-M15-AWAYSCOPE-1 — AND THE COUNTERPARTY IS TOLD. Review finding: this was the one gesture
-     * an operator makes ON PURPOSE to step away, and it announced nothing.
-     *
-     * The only other `unattended` producer is the socket closing. So an operator who finished a
-     * conversation, released the agent and left the terminal open left their counterparty reading
-     * `attended` — "a person is watching" — indefinitely. That is the exact false reassurance the
-     * three-value design exists to prevent, arriving from the most deliberate action of the three.
-     *
-     * Read AFTER the selection is cleared, for the same reason the disconnect path reads after
-     * `forgetConnection`: a co-attended agent is legitimate and permanent, and a count taken before
-     * would report an absence while a sibling connection is still reading.
-     */
-    if (countAttendance(perConnectionState, fromAgent) === 0) {
-      sessionNodeManager.announceAttendance(fromAgent, "unattended");
-    }
-    getNotificationDispatcher().setCurrentAgent(connectionId, null);
+    const held = connState.clientType === "hermes"
+      ? registry.dropListener(fromAgent, connectionId)
+      : registry.release(fromAgent, caller);
     getNotificationDispatcher().dispatchAgentCurrentChanged(connectionId, fromAgent, null);
-    logger.info("agent.current.released", { connectionId, fromAgent });
+    logger.info("agent.current.released", { connectionId, fromAgent, held });
     return {
       ok: true,
       released: fromAgent,
-      // The fallback caveat is stated because omitting it is how this tool would mislead the very
-      // operator it was built for. "Step away" reads as "nothing I do now acts as that agent" — but
-      // if it is the ONLY agent online, agent-scoped calls with no explicit `agent` still resolve to
-      // it via the sole-online fallback, and cello_send would happily send as them, ok:true.
+      // The sole-online fallback still resolves an unnamed call to this agent if it is the only one
+      // online, so "step away" is said with that caveat rather than as "nothing acts as it now".
       guidance:
         `No longer attending '${fromAgent}'. It stays ONLINE and reachable — inbound sessions now get ` +
         `its away message instead of a live reply. NOTE: if it is the only agent online, agent-scoped ` +
@@ -513,7 +494,11 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
     };
   });
 
-  // ─── MCP-001: cello_use_agent handler ───
+  // ─── cello_use_agent: take the agent's hold (M15D exclusive attendance) ───
+  //
+  // An agent has zero or one holder (`holder-registry.ts`). Another caller's hold is refused
+  // `agent_held` unless `force: true`, which takes it and tells the old holder. The Hermes cello
+  // bridge listens instead of holding. Nothing auto-starts: an offline agent is refused.
   handlers.set("cello_use_agent", async (params, connectionId) => {
     const name = params?.name as string | undefined;
     if (!name) {
@@ -523,8 +508,8 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
     if (!agent || agent.state === "load_failed") {
       return { ok: false, reason: "agent_not_found", guidance: `Agent '${name}' does not exist. Create it with 'cello create-agent ${name}', register it, then retry — or check names with cello_agents.` };
     }
-    // M16 033-CHANNELVIEW: a channel is administered by an agent, never selected AS an agent. Refuse
-    // before any auto-start so nothing half-selects a channel; the guidance names what to do instead.
+    // M16 033-CHANNELVIEW: a channel is an identity the daemon administers, not an agent anyone
+    // attends.
     if (isChannelAgent(name)) {
       return { ok: false, reason: "channel_not_an_agent", guidance: `'${name}' is a channel, not an agent. Select the agent that administers it; channel commands take the channel's key.` };
     }
@@ -532,96 +517,87 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
     if (!connState) {
       return { ok: false, reason: "connection_not_registered", guidance: "Send ipc.connect frame before calling agent tools." };
     }
-    // M8C-AUTOSTART-1 (A1): auto-start the agent if it is not online, so the incantation collapses
-    // to `login → use_agent` (no separate cello_start_agent). On a start failure, return a
-    // structured agent_start_failed and leave the current selection UNCHANGED — no half-selected
-    // state (A3). cello_start_agent stays available for bring-online-without-claiming.
     if (!onlineAgents.has(name)) {
-      logger.info("agent.autostart.attempted", { connectionId, agentName: name });
-      const startRes = startAgentInternal(name);
-      if (!startRes.ok) {
-        // Structured failure envelope (D6). Today `startAgentInternal` is permissive (D12) and its
-        // only failure — agent_not_found — is already caught by the existence pre-check above, so
-        // this branch is currently unreachable. It is the RESERVED structured-failure surface for
-        // when auto-start gains a synchronous failure mode (e.g. D12's reverse: a bounded
-        // waitForSignalingConnected making `directory_unreachable` a real start failure). Kept so
-        // that extension surfaces the reason + guidance here with the selection left unchanged.
-        // See M8C-DECISIONS D12 + BUILD-JOURNAL Entry 8.
-        logger.warn("agent.autostart.failed", { connectionId, agentName: name, reason: startRes.reason });
-        return {
-          ok: false,
-          reason: "agent_start_failed",
-          start_reason: startRes.reason,
-          guidance: `Could not start agent '${name}' to select it: ${startRes.guidance} Your current agent is unchanged.`,
-        };
-      }
+      return {
+        ok: false,
+        reason: "agent_offline",
+        agent: name,
+        guidance: `'${name}' is offline. Start it with cello_start_agent, then select it. Your current agent is unchanged.`,
+      };
     }
-    if (connState.currentAgent === name) {
-      return { ok: false, reason: "agent_already_current", guidance: `Agent '${name}' is already the current agent for this connection. No action needed — you can proceed with session operations.` };
-    }
-    const fromAgent = connState.currentAgent;
-    connState.currentAgent = name;
-    // A fresh choice supersedes any earlier one that was taken away. Without this a connection that
-    // ever had an agent stopped under it would be refused the sole-online fallback forever, even
-    // after the operator selected again.
-    delete connState.clearedAgent;
-    // M8C-AWAY-1: this agent just became attended — clear its away-ack dedup entries so the NEXT
-    // away period (after this attended stretch ends) gets a fresh ack instead of staying silent.
-    for (const key of Array.from(awayAckSent)) {
-      if (key.startsWith(`${name}:`)) awayAckSent.delete(key);
-    }
-    /**
-     * DOD-M15-AWAYSCOPE-1 — and the COUNTERPARTY is told, out of band, that somebody arrived.
-     *
-     * This is the half that replaced the away reply. An unattended agent used to announce itself by
-     * sending its greeting INTO the conversation, which took a hash-chain leaf and destroyed the
-     * receipt. Attendance is a fact about the session, so it travels on the liveness frame instead:
-     * no leaf, no transcript row, and the far agent never sees a message it has to answer.
-     *
-     * Fired on the TRANSITION rather than on a timer. A poll would tell the counterparty the same
-     * thing repeatedly and still be late; the moment an operator attaches is the moment worth
-     * reporting, and the relay holds it until asked.
-     */
-    sessionNodeManager.announceAttendance(name, "attended");
-    // MCP-002: Update dispatcher's routing table and send notification to this connection only
-    getNotificationDispatcher().setCurrentAgent(connectionId, name);
-    getNotificationDispatcher().dispatchAgentCurrentChanged(connectionId, fromAgent, name);
-    // DOD-AGENT-SELECTION-UNWARRANTED-1: WHO asked. The names were always logged; what was missing
-    // is that an operator's explicit selection and the shim's reconnect replay arrive here
-    // identically, so a switch nobody made could not be told apart from one they did. Two switches
-    // fired one second after a reconnect on 2026-08-09 and neither could be attributed.
-    //
-    // Whitelisted, not passed through: this is a caller-supplied string that lands in the log, and
-    // an unrecognised value is recorded as such rather than echoed.
+    const caller = currentCaller();
+    const force = params?.["force"] === true;
+    // `trigger: "replay"` is the plugin re-selecting after a reconnect, or the CLI re-selecting its
+    // saved agent for one command. A replay never takes a held agent: it selects it for reading, and
+    // the guard refuses anything that acts as it.
     const claimed = params?.trigger;
     const trigger = claimed === undefined ? "explicit" : claimed === "replay" ? "replay" : "unrecognized";
-    logger.info("agent.current.switched", { connectionId, fromAgent, toAgent: name, trigger });
-    // ─── DOD-COATTEND-VISIBLE-1 AC4: you find out at ATTACH time that you are not alone ───
-    //
-    // Attach is NOT refused, and must never become refusable: exclusivity is rejected permanently
-    // (spec §3 — connections die constantly, so a refusal only relocates the hard part into a
-    // takeover protocol; it buys no cryptographic property; and it forecloses listener mode). The
-    // count is set AFTER the assignment above, so it includes this connection: joining a lone
-    // session reads 2, which is the number the operator can act on.
-    const attendance = countAttendance(perConnectionState, name);
-    if (attendance > 1) {
-      logger.info("agent.attend.coattended", { connectionId, agentName: name, attendance });
+    const fromAgent = connState.currentAgent;
+    const listener = connState.clientType === "hermes";
+    let role: "holder" | "listener" | "reader";
+    let tookOverFrom: string | undefined;
+
+    if (listener) {
+      if (fromAgent === name) {
+        return { ok: false, reason: "agent_already_current", guidance: `Agent '${name}' is already the current agent for this connection. No action needed — you can proceed with session operations.` };
+      }
+      if (fromAgent) registry.dropListener(fromAgent, connectionId);
+      registry.setListener(name, connectionId);
+      role = "listener";
+    } else {
+      if (fromAgent === name && registry.check(name, caller).ok && registry.holderView(name) !== null) {
+        return { ok: false, reason: "agent_already_current", guidance: `Agent '${name}' is already the current agent for this connection. No action needed — you can proceed with session operations.` };
+      }
+      // Sockets that stay open receive doorbells. A CLI command or a one-shot web call does not.
+      const channel = connState.clientType === "endpoint" || connState.clientType === "cli" ? undefined : connectionId;
+      const taken = registry.take(name, caller, { force, ...(channel !== undefined ? { channel } : {}) });
+      if (!taken.ok) {
+        const h = taken.holder;
+        if (trigger === "replay") {
+          role = "reader";
+        } else {
+          logger.info("agent.attend.refused", { connectionId, method: "cello_use_agent", agentName: name, reason: "agent_held", holderLabel: h.label, callerLabel: caller.label });
+          return {
+            ok: false,
+            reason: "agent_held",
+            agent: name,
+            holder: h,
+            guidance:
+              `'${name}' is being used by ${h.label} (since ${h.since}, last active ${h.last_active}). Nothing changed. ` +
+              `To take it over, call cello_use_agent again with force: true (cello use-agent --force) — ${h.label} will be told. ` +
+              `Or choose a different agent.`,
+          };
+        }
+      } else {
+        role = "holder";
+        if (taken.displaced) {
+          tookOverFrom = taken.displaced.label;
+          for (const ch of taken.displaced.channels) getNotificationDispatcher().dispatchAgentDisplaced(ch, name, caller.label);
+          logger.warn("agent.attend.displaced", { connectionId, agentName: name, fromLabel: taken.displaced.label, byLabel: caller.label });
+        }
+      }
     }
-    // M8C-AUTOSTART-1 (A3, D12): not_registered is a NON-BLOCKING warning — the agent is selected
-    // and usable locally, but it cannot establish directory sessions until registered. Surface the
-    // next step (ONBOARD-NEXTSTEP style) without stranding the selection. One-row read.
-    const result: Record<string, unknown> = { ok: true, attendance };
-    if (attendance > 1) {
-      // Says what is true and what to do about it, in that order — and does NOT tell the operator
-      // to go away, because co-attending is allowed. What they need to know is that a message can
-      // be delivered to the OTHER session, and where it will still be readable when it is.
-      // No separate `co_attendance: true` flag — `attendance > 1` already IS that boolean, and a
-      // second field carrying the same fact is one more thing that can drift out of agreement.
-      result["co_attendance_guidance"] =
-        `${attendance} sessions are attending '${name}' (including this one). That is allowed — but an ` +
-        `arriving message is delivered to whichever session reads it first, so cello_receive here may ` +
-        `return nothing while the other session gets it. Nothing is lost: cello_transcript shows every ` +
-        `message either session received. Use cello_stop_using_agent if you did not intend to share it.`;
+
+    connState.currentAgent = name;
+    delete connState.clearedAgent;
+    if (role !== "reader") {
+      // A fresh hold opens a fresh away period: the next one gets its own ack.
+      for (const key of Array.from(awayAckSent)) {
+        if (key.startsWith(`${name}:`)) awayAckSent.delete(key);
+      }
+    }
+    getNotificationDispatcher().dispatchAgentCurrentChanged(connectionId, fromAgent, name);
+    logger.info("agent.current.switched", { connectionId, fromAgent, toAgent: name, trigger, role });
+    const result: Record<string, unknown> = { ok: true, role, holder: registry.holderView(name) };
+    if (tookOverFrom !== undefined) {
+      result["took_over_from"] = tookOverFrom;
+      result["took_over_guidance"] = `You took '${name}' over from ${tookOverFrom}, which has been told and can no longer send, receive or close as it.`;
+    }
+    if (role === "reader") {
+      const h = registry.holderView(name)!;
+      result["holder_guidance"] =
+        `'${name}' is held by ${h.label}. This connection can read as it, but sending, receiving and closing are refused ` +
+        `until you take it over with cello_use_agent and force: true (cello use-agent --force).`;
     }
     try {
       const reg = await new DbRegistrationPersistence({ db: sessionNodeManager.getDb(), agentName: name, logger }).loadRegistrationState();
@@ -671,6 +647,36 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
   });
 
   // ─── MCP-001: cello_list_agents handler ───
+  /**
+   * M15D: a stream-holding web session registers its socket as this agent's live event channel, so
+   * doorbells reach it and the agent counts as reachable. Endpoint sockets only; the caller must
+   * hold the agent or find it unheld (no force here — taking over is `cello_use_agent`).
+   */
+  handlers.set("agent.attend", async (params, connectionId) => {
+    const connState = getConnState(connectionId);
+    if (connState?.clientType !== "endpoint") {
+      return { ok: false, reason: "endpoint_only", guidance: "agent.attend is for the web endpoint's stream sessions. A local session uses cello_use_agent." };
+    }
+    const caller = currentCaller();
+    const name = typeof params?.["agent"] === "string" ? (params["agent"] as string) : registry.heldBy(caller.key);
+    if (!name || !loadedAgents.some((a) => a.name === name)) {
+      return { ok: false, reason: "no_current_agent", guidance: "Name the agent to attend, or select one with cello_use_agent first." };
+    }
+    if (!onlineAgents.has(name)) {
+      return { ok: false, reason: "agent_offline", agent: name, guidance: `'${name}' is offline. Start it with cello_start_agent, then retry.` };
+    }
+    const taken = registry.take(name, caller, { channel: connectionId });
+    if (!taken.ok) {
+      return {
+        ok: false, reason: "agent_held", agent: name, holder: taken.holder,
+        guidance: `'${name}' is being used by ${taken.holder.label}. Take it over with cello_use_agent and force: true, then retry.`,
+      };
+    }
+    connState.currentAgent = name;
+    logger.info("agent.attend.channel", { connectionId, agentName: name, callerLabel: caller.label });
+    return { ok: true, agent: name, holder: registry.holderView(name) };
+  });
+
   handlers.set("cello_list_agents", async (_params, connectionId) => {
     const agents = getAgentsForConnection(connectionId);
     // An empty roster is the one answer that needs words rather than data. The CLI imports

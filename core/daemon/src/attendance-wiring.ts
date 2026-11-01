@@ -10,10 +10,9 @@
  * rides the out-of-band liveness frame; it never takes a chain leaf. The only trigger left here is
  * an inbound session REQUEST.
  *
- * "Attended" means a live client has claimed the agent with `cello_use_agent`. Several sessions
- * attending one agent at once is legitimate and permanent — co-attendance, not exclusivity — which
- * is why the COUNT is kept separate from the boolean and both read the same `currentAgent` map the
- * doorbell routes on. They cannot disagree about who is present.
+ * "Attended" means REACHABLE NOW (`holder-registry.ts`): the holder has a live event channel or a
+ * receive/await waiting, or the Hermes cello bridge is listening. The doorbell routes on the same
+ * registry, so the away reply and the wake-up cannot disagree about who is present.
  *
  * ⚠️ IT PLACES ITS OWN LEAVES. The greeting is content: it is sent, it takes a leaf and it records
  * a transcript row, exactly as a voicemail outgoing message belongs on the tape. So this file stays
@@ -24,7 +23,6 @@ import { randomUUID } from "node:crypto";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { Logger } from "./types.js";
 import type { SecurityGatewayClient } from "@cello-protocol/gateway";
-import { countAttendance } from "./co-attendance.js";
 import { markAsAutoReply, systemAwayText } from "./away-detection.js";
 import { LEAF_KIND_MSG } from "./session-relay-client.js";
 import { sentAuthorship } from "./session-content-handlers.js";
@@ -33,39 +31,17 @@ import { extractErrorMessage } from "./error-message.js";
 export interface AttendanceWiringDeps {
   logger: Logger;
   sessionNodeManager: SessionNodeManager;
-  /**
-   * The per-connection agent selection, read whole: "is anyone attending X" is a scan of the live
-   * selections, and the count is the same scan. Read-only — this surface never changes a selection.
-   */
-  perConnectionState: ReadonlyMap<string, { currentAgent: string | null }>;
+  /** Is anyone reachable as this agent right now — the holder registry's answer. */
+  isReachable: (agentName: string) => boolean;
   /** The away reply is outbound content and takes the same screen every other send takes. */
   securityGateway: SecurityGatewayClient;
 }
 
 export function createAttendanceWiring(deps: AttendanceWiringDeps) {
-  const { logger, sessionNodeManager, perConnectionState, securityGateway } = deps;
+  const { logger, sessionNodeManager, isReachable, securityGateway } = deps;
 
-  // M8C-AWAY-1: away response — an unattended Primary auto-answers session requests
-  // with the default transparent away text and queues them (the DoD's own mandated default).
-  // CORE ships now; the operator-configurable custom-text / opaque-privacy-mode SWITCH is PARKED
-  // on M9-CFG-001, journaled as D15 (M8C-DECISIONS.md, mirrors D14) — a genuine per-agent operator
-  // preference that needs the deferred config store, whereas transparent is already the correct,
-  // non-fake default this unit must ship regardless.
-  // "Attended" per the design doc (2026-07-01 command-surface discussion, Agent State Model):
-  // Primary + a live client session has claimed the agent via use_agent. Scanning
-  // perConnectionState is cheap (a handful of connections) and needs no separate tracked state.
-  function isAttended(agentName: string): boolean {
-    for (const s of perConnectionState.values()) if (s.currentAgent === agentName) return true;
-    return false;
-  }
-  // DOD-COATTEND-VISIBLE-1: the COUNT, deliberately kept separate from the boolean above. Several
-  // sessions attending one agent is legitimate and permanent (co-attendance, not exclusivity — spec
-  // §3); what was missing is that nobody was ever TOLD. `isAttended` is left byte-identical because
-  // M8C-AWAY-1's auto-ack suppression hangs off its early return, and both read the same
-  // `currentAgent` map the doorbell routes on, so the count can never disagree with who gets woken.
-  function attendanceCount(agentName: string): number {
-    return countAttendance(perConnectionState, agentName);
-  }
+  // M8C-AWAY-1: an unreachable agent auto-answers a session request with the transparent away text
+  // and queues it. The operator-configurable text is resolved below (DOD-AWAY-TIER-1).
   /**
    * In-flight background seal ceremonies — `DOD-M15-CLOSEWAIT-1` review MEDIUM-6.
    *
@@ -75,10 +51,8 @@ export function createAttendanceWiring(deps: AttendanceWiringDeps) {
    */
   const backgroundSeals = new Set<Promise<unknown>>();
   // Coalescing: one away ack per (agent, session, kind) per away period — cleared when the agent
-  // becomes attended again (cello_use_agent) so the NEXT away period gets a fresh ack rather than
-  // staying silent forever. Known imprecision (journaled, not silent): clearing fires on ANY
-  // use_agent selecting this name, even if another connection kept it attended throughout — an
-  // edge case, not a correctness gap in the core "queue + one calm ack while genuinely away" promise.
+  // is taken with cello_use_agent, so the NEXT away period gets a fresh ack rather than staying
+  // silent forever.
   const awayAckSent = new Set<string>();
   /**
    * DOD-M15-AWAYSCOPE-1 — THIS ANSWERS A CALL. It does not answer a conversation.
@@ -96,7 +70,7 @@ export function createAttendanceWiring(deps: AttendanceWiringDeps) {
   const markGreeted = (agentName: string, sessionId: string): void => void awayAckSent.add(`${agentName}:${sessionId}:greeted`);
 
   async function sendAwayResponse(agentName: string, sessionId: string): Promise<void> {
-    if (isAttended(agentName)) return;
+    if (isReachable(agentName)) return;
     /**
      * The log keeps saying which kind it was, and that is deliberate now that there is only one.
      * The live failure this order closes is READ OFF a daemon log line — `kind: "message"` at
@@ -252,8 +226,5 @@ export function createAttendanceWiring(deps: AttendanceWiringDeps) {
     }
   }
 
-  // `isAttended` is NOT returned: its only caller in the repo is `sendAwayResponse`, which moved
-  // with it. Returning it would make a private local reachable through an exported factory for no
-  // consumer — new surface, which Rule D forbids.
-  return { attendanceCount, sendAwayResponse, backgroundSeals, awayAckSent };
+  return { sendAwayResponse, backgroundSeals, awayAckSent };
 }

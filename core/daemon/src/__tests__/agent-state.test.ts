@@ -16,7 +16,7 @@ const HEALTHY: AgentStateInputs = {
   deliberatelyOffline: false,
   started: true,
   signalingConnected: true,
-  attendance: 1,
+  reachable: true,
 };
 
 describe("the agent-state ladder", () => {
@@ -28,7 +28,7 @@ describe("the agent-state ladder", () => {
     // The rung that did not exist. A caller reaching this agent gets the away message, and the away
     // flow ENDS a session — which is how two unattended agents once sealed a conversation nobody
     // had. It rendered identically to a live agent.
-    expect(resolveAgentState({ ...HEALTHY, attendance: 0 })).toBe("unattended");
+    expect(resolveAgentState({ ...HEALTHY, reachable: false })).toBe("unattended");
   });
 
   it("connecting: started, not yet on the directory", () => {
@@ -58,11 +58,11 @@ describe("precedence — the worst fact wins, and that is what stops the lie", (
   it("attendance NEVER masks a dead signaling stream", () => {
     // The whole point. If attendance could win, an attended agent with no directory connection would
     // read `online` — which is the exact "looks healthy, cannot work" state the enum replaces.
-    expect(resolveAgentState({ ...HEALTHY, signalingConnected: false, attendance: 3 })).toBe("connecting");
+    expect(resolveAgentState({ ...HEALTHY, signalingConnected: false, reachable: true })).toBe("connecting");
   });
 
   it("attendance NEVER masks an agent that was never registered", () => {
-    expect(resolveAgentState({ ...HEALTHY, hasFrostShare: false, attendance: 3 })).toBe("unregistered");
+    expect(resolveAgentState({ ...HEALTHY, hasFrostShare: false, reachable: true })).toBe("unregistered");
   });
 
   it("paused outranks connecting — a deliberate switch-off is not a fault to diagnose", () => {
@@ -89,6 +89,6 @@ describe("precedence — the worst fact wins, and that is what stops the lie", (
   });
 
   it("a stopped agent is stopped, not unattended — nobody attends a thing that is not running", () => {
-    expect(resolveAgentState({ ...HEALTHY, started: false, attendance: 0 })).toBe("stopped");
+    expect(resolveAgentState({ ...HEALTHY, started: false, reachable: false })).toBe("stopped");
   });
 });

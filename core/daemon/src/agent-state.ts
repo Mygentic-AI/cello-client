@@ -62,8 +62,8 @@ export interface AgentStateInputs {
   started: boolean;
   /** This agent's own directory signaling stream is connected. */
   signalingConnected: boolean;
-  /** How many live connections are attending this agent right now. */
-  attendance: number;
+  /** Someone is reachable as this agent right now (holder registry: a channel, a waiting call, or a listener). */
+  reachable: boolean;
 }
 
 /**
@@ -89,5 +89,5 @@ export function resolveAgentState(i: AgentStateInputs): AgentState {
   if (!i.signalingConnected) return "connecting";
 
   // Ready either way from here. The only question left is whether anyone is there to answer.
-  return i.attendance > 0 ? "online" : "unattended";
+  return i.reachable ? "online" : "unattended";
 }

@@ -14,6 +14,8 @@
 // (`DOD-M15-SEALWIRE-1` part B2b). A direct call would be a hash computed without deciding — or
 // recording — how it was made, which is the state that made a version skew look like a tamper.
 import { randomUUID } from "node:crypto";
+import { ReceiveCommits } from "./receive-commit.js";
+import { deferUntilWritten } from "./ipc-server.js";
 import { AttestationNotices, attestationNoticesField, type AttestationNoticeView, type ReaderChangeNoticeView, type PrivateReviewNoticeView } from "./attestation-notices.js";
 import { LEAF_KIND_MSG } from "./session-relay-client.js";
 import { MAX_CONTENT_BYTES } from "@cello-protocol/protocol-types";
@@ -309,7 +311,8 @@ export interface SessionContentDeps {
   /** M8C-TGDOOR-1: a read clears the doorbell's ring-once-until-read. */
   clearTelegramRung: (agentName: string, sessionId: string) => void;
   /** DOD-COATTEND-VISIBLE-1: how many connections attend this agent right now (reporting only). */
-  attendanceCount: (agentName: string) => number;
+  /** M15D: who holds this agent, if anyone (holder registry). */
+  holderFor: (agentName: string) => { label: string; since: string } | null;
   /** Sends on the wire right now — shared with the away one-shot, which must not close under one. */
   sendClaims: SendClaims;
   /**
@@ -332,7 +335,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     handlers, logger, sessionNodeManager, securityGateway, retryQueue,
     getConnState, resolveCurrentAgent, NO_CURRENT_AGENT_RESPONSE,
     getConnectionCursor, advanceConnectionCursor, clearTelegramRung,
-    attendanceCount, sendClaims, knownPublicKeys, attestationNotices,
+    holderFor, sendClaims, knownPublicKeys, attestationNotices,
   } = deps;
 
   // M10E 007-NOTICES: the undelivered notices for this agent, spread into a receive reply beside the
@@ -359,20 +362,6 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
    * Keyed (agent, session): the race is two connections replying into ONE conversation. Held in the
    * factory closure, which runs once per daemon, so it is exactly as long-lived as the handler set.
    */
-  /**
-   * DOD-COATTEND-VISIBLE-1 AC6 (review F2) — attendance as reported ON A RESPONSE.
-   *
-   * `attendanceCount` walks the connections that explicitly called `cello_use_agent`. A connection
-   * can reach these handlers WITHOUT having done so, through `resolveCurrentAgent`'s sole-online
-   * fallback — which is not exotic: it is every `cello` CLI invocation with no persisted selection,
-   * and any MCP client that skipped the call. Such a reader was not counted, INCLUDING ITSELF, and
-   * was handed `attendance: 0` — told that zero sessions attend the agent it is reading.
-   *
-   * That is worse than the missing field this AC set out to fix: not absent, but a definite
-   * negative that is false. The caller is holding the response, so at least one session is on this
-   * agent by construction. A response can never honestly say 0.
-   */
-  const attendingNow = (agentName: string): number => Math.max(1, attendanceCount(agentName));
 
 
   // ─── CELLO-M7-DAEMON-004: cello_send (live send + daemon-owned tree append) ──
@@ -1137,7 +1126,38 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
   // it accepted or joined nothing (inbound sessions are auto-accepted by the standing receiver),
   // so it was a second name for a step that does not exist, and its help said otherwise.
   const RECEIVE_DEFAULT_TIMEOUT_MS = 30000; // matches the cello-mcp shim's documented default
-  const handleReceive: IpcHandler = async (params, connectionId) => {
+  /**
+   * M15D (contract C3/C4): `cello_receive` marks messages read only once they reached the caller.
+   * On a local socket that is the write callback (`deferUntilWritten`); on a web-endpoint socket it
+   * is the endpoint's `session.receive.commit`, because its client is one HTTP hop further away.
+   */
+  const receiveCommits = new ReceiveCommits(logger);
+  handlers.set("session.receive.commit", async (params) => {
+    const token = params?.["token"];
+    if (typeof token === "string" && receiveCommits.redeem(token)) return { ok: true };
+    return {
+      ok: false,
+      reason: "commit_unknown",
+      guidance: "That delivery token is unknown, expired or already used. Nothing was marked read by it; the next cello_receive returns any message still unread.",
+    };
+  });
+
+  const handleReceive: IpcHandler = async (params, connectionId, meta) => {
+    const taken: { commit?: () => void; ctx?: Record<string, unknown> } = {};
+    const result = await receiveOnce(params, connectionId, meta?.signal, taken);
+    if (!taken.commit || result === null || typeof result !== "object") return result;
+    if (getConnState(connectionId)?.clientType === "endpoint") {
+      return { ...(result as Record<string, unknown>), commit: receiveCommits.issue(taken.commit, taken.ctx ?? {}) };
+    }
+    return deferUntilWritten(result, taken.commit);
+  };
+
+  const receiveOnce = async (
+    params: Record<string, unknown> | undefined,
+    connectionId: string,
+    signal: AbortSignal | undefined,
+    taken: { commit?: () => void; ctx?: Record<string, unknown> },
+  ): Promise<unknown> => {
     const connState = getConnState(connectionId);
     // CC-3 / M8C-AUTOSTART-1 F18: explicit { agent } > current > sole online agent.
     const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined);
@@ -1272,7 +1292,8 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
      * every new one — so after catching up the next read re-served the old message, and every `/mcp`
      * reconnect or `cello` CLI command started over at the oldest message in the conversation.
      *
-     * The bookmark moves to the LAST message handed over, not through a gap-stopping walk. A hole —
+     * The bookmark moves to the LAST message handed over — once the hand-over is confirmed (M15D) —
+     * not through a gap-stopping walk. A hole —
      * a blocked message, a document frame, a row that could not be decrypted — would otherwise strand
      * every later message, re-served on every call. A row that could not be written is reported on
      * the empty answer (`content_undeliverable`) rather than by holding the bookmark behind it.
@@ -1287,15 +1308,20 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
       const unread = sessionNodeManager.readTranscript(agentName, sessionId).messages
         .filter((m) => m.direction === "received" && m.sequence > watermark);
       if (unread.length === 0) return null;
-      sessionNodeManager.advanceLastDeliveredSeq(agentName, sessionId, unread[unread.length - 1]!.sequence);
-      clearTelegramRung(agentName, sessionId); // M8C-TGDOOR-1: read clears the ring
+      const lastSeq = unread[unread.length - 1]!.sequence;
+      // Saved only once the reply reached the caller — see handleReceive.
+      taken.commit = () => {
+        sessionNodeManager.advanceLastDeliveredSeq(agentName, sessionId, lastSeq);
+        clearTelegramRung(agentName, sessionId); // M8C-TGDOOR-1: read clears the ring
+      };
+      taken.ctx = { agentName, sessionId, connectionId, lastSequence: lastSeq };
       return Object.assign(unread, { previousWatermark: watermark });
     };
     const deliver = (unread: Taken, correlationId: string) => {
       logger.info("session.receive.delivered", {
         sessionId, agentName, connectionId, count: unread.length,
         firstSequence: unread[0]!.sequence, lastSequence: unread[unread.length - 1]!.sequence,
-        attendance: attendanceCount(agentName), correlationId,
+        holder: holderFor(agentName)?.label ?? null, correlationId,
       });
       const lastText = unread[unread.length - 1]!.text.trimEnd();
       // The turn signal belongs to the LAST message: it is what says whose move it is now.
@@ -1340,7 +1366,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         ...(autoReplyCount > 0 ? { auto_reply_guidance: AUTO_REPLY_GUIDANCE } : {}),
         ...refusalsField(sessionNodeManager, agentName, sessionId, connectionId),
         ...attNoticesFor(agentName),
-        attendance: attendingNow(agentName),
+        holder: holderFor(agentName),
         ...(signalGuidance !== undefined ? { guidance: signalGuidance } : {}),
         // 008-POLICY: the operator's conduct rule, beside the messages and never inside them.
         ...(from !== null ? conductPolicyFor(sessionNodeManager, logger, agentName, sessionId, from, unread.length, correlationId) : {}),
@@ -1355,7 +1381,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
       return {
         ok: false,
         reason: "session_not_live",
-        attendance: attendingNow(agentName),
+        holder: holderFor(agentName),
         guidance: "This session exists only as a stored transcript and nothing in it is unread. Read the whole conversation with cello_transcript.",
       };
     }
@@ -1378,6 +1404,11 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     // over a handful of entries; there is nothing to save by caching it.
 
     for (;;) {
+      // C4: the caller hung up. Stop now and mark nothing read — the reply has nowhere to go.
+      if (signal?.aborted) {
+        logger.info("session.receive.cancelled", { sessionId, agentName, connectionId, correlationId: receiveCorrelationId });
+        return { ok: false, reason: "caller_gone", guidance: "The caller disconnected before anything was delivered; nothing was marked read." };
+      }
       // TERMINAL FIRST (DOD-COATTEND-1). Reading the DURABLE RECORD means a sealed session's rows
       // are still present, so a content read would keep delivering on a session that has already
       // terminated — and F1-b's `session_sealed` answer would never be reached. Under the old
@@ -1397,7 +1428,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         // AC3 covers "both outcomes" — got something / got nothing. This is the third exit from the
         // same silent handler, and leaving it silent would reproduce the defect one branch over.
         logger.info("session.receive.sealed", {
-          sessionId, agentName, connectionId, attendance: attendanceCount(agentName),
+          sessionId, agentName, connectionId, holder: holderFor(agentName)?.label ?? null,
           unreadCount: terminal.unreadCount, correlationId: receiveCorrelationId,
         });
         return {
@@ -1406,7 +1437,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
           session_id: sessionId,
           ...(sealedRoot ? { sealed_root: sealedRoot } : {}),
           unread_count: terminal.unreadCount,
-          attendance: attendingNow(agentName),
+          holder: holderFor(agentName),
           // DOD-M15-REFUSED-INBOUND-SILENT-1: the LAST door, and without this it is a closed one.
           // This check runs FIRST in the loop, so once a session is sealed the quiet exit is
           // unreachable for it forever — and the guidance here sends the operator to
@@ -1437,14 +1468,14 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         if (undeliverable.length > 0) {
           logger.error("session.receive.undeliverable", {
             sessionId, agentName, connectionId, sequences: undeliverable,
-            attendance: attendanceCount(agentName), correlationId: receiveCorrelationId,
+            holder: holderFor(agentName)?.label ?? null, correlationId: receiveCorrelationId,
           });
           return {
             ok: true,
             count: 0,
             messages: [],
             reason: "content_undeliverable",
-            attendance: attendingNow(agentName),
+            holder: holderFor(agentName),
             // A local write failure and a refused message look identical from the operator's chair —
             // nothing arrived. Carrying the refusal here keeps the two distinguishable.
             ...refusalsField(sessionNodeManager, agentName, sessionId, connectionId),
@@ -1454,20 +1485,20 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
           };
         }
         const liveness = sessionNodeManager.getSessionLiveness(agentName, sessionId);
-        const attendance = attendanceCount(agentName);
+        const holder = holderFor(agentName)?.label ?? null;
         // M8B F16: a dead session must not return the SAME null timeout as a
         // quiet-but-healthy one. The liveness signal (session.liveness.changed → gone,
         // tracked per session by the node manager) finally reaches the MCP surface here.
         if (liveness === "gone") {
           logger.info("session.receive.empty", {
-            sessionId, agentName, connectionId, timeoutMs, attendance,
+            sessionId, agentName, connectionId, timeoutMs, holder,
             liveness, correlationId: receiveCorrelationId,
           });
           return {
             ok: true,
             count: 0,
             messages: [],
-            attendance: attendingNow(agentName),
+            holder: holderFor(agentName),
             // DOD-M15-NO-SILENT-REFUSAL-1 — the exit that does not merely stay silent, it MISLEADS.
             // A version-skewed peer never gets an ACK, so it eventually drops the direct path and
             // lands HERE, pre-empting the quiet exit. A wrong explanation plus an action is worse
@@ -1504,7 +1535,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         if (liveness === "impaired") {
           const impairment = sessionNodeManager.getSessionImpairment(agentName, sessionId);
           logger.info("session.receive.empty", {
-            sessionId, agentName, connectionId, timeoutMs, attendance,
+            sessionId, agentName, connectionId, timeoutMs, holder,
             liveness, impairmentCause: impairment?.cause, impairmentRetained: impairment?.retained,
             correlationId: receiveCorrelationId,
           });
@@ -1532,7 +1563,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
             ok: true,
             count: 0,
             messages: [],
-            attendance: attendingNow(agentName),
+            holder: holderFor(agentName),
             reason: "delivery_impaired",
             liveness: "impaired",
             // DOD-M15-REFUSED-INBOUND-SILENT-1, the item I filed POST-LAUNCH as "deferred, not
@@ -1546,7 +1577,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
           };
         }
         logger.info("session.receive.empty", {
-          sessionId, agentName, connectionId, timeoutMs, attendance,
+          sessionId, agentName, connectionId, timeoutMs, holder,
           liveness, correlationId: receiveCorrelationId,
         });
         // AC6: the QUIET answer carries it too. This is the exit a session with no doorbell to
@@ -1568,7 +1599,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
           // The same shape as a read that found messages, so a caller reads `messages` either way.
           count: 0,
           messages: [],
-          attendance: attendingNow(agentName),
+          holder: holderFor(agentName),
           ...quietRefusals,
           ...attNoticesFor(agentName),
           // ONE source for the refusal advice (see `refusalsField`). It used to be written out

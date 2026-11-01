@@ -5,7 +5,6 @@
  * collapsing that into a daemon-wide list is how an operator ends up reading another connection's
  * state as their own.
  */
-import { countAttendance } from "./co-attendance.js";
 import type { AgentInfo, AgentState, ChannelSummary } from "./types.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
 
@@ -22,10 +21,12 @@ export interface ConnectionAgentsDeps {
    * into agents and channels — no separate state, no separate list to fall out of sync.
    */
   isChannelAgent: (agentName: string) => boolean;
+  /** M15D: who holds this agent, if anyone — the holder registry's display view. */
+  holderFor: (agentName: string) => { label: string; since: string } | null;
 }
 
 export function createConnectionAgents(deps: ConnectionAgentsDeps) {
-  const { agents, perConnectionState, onlineAgents, sessionNodeManager, agentStateFor, isChannelAgent } = deps;
+  const { agents, perConnectionState, onlineAgents, sessionNodeManager, agentStateFor, isChannelAgent, holderFor } = deps;
 
   // Build agent list from this connection's perspective
   function getAgentsForConnection(connectionId: string): AgentInfo[] {
@@ -49,19 +50,13 @@ export function createConnectionAgents(deps: ConnectionAgentsDeps) {
           state,
           /**
            * `selected` IS THIS CONNECTION'S VIEW, NOT THE AGENT'S — `DOD-M15-IPCVISIBLE-1` clause 3.
-           *
-           * Every `cello` CLI invocation opens a FRESH connection, which starts with no current
-           * agent. So a client asking about its own state through the CLI always reads `false`, for
-           * an agent it genuinely has selected in another session. Both Andre and a Hermes agent
-           * misread it that way during one investigation, in opposite directions.
-           *
-           * The field name cannot be changed without breaking every reader, so it is ANNOTATED: the
-           * sibling below says whose view this is, and `attended_by` says how many connections hold
-           * this agent at all — which is the question people were actually asking.
+           * Every `cello` CLI invocation opens a fresh connection, so it reads `false` for an agent
+           * held elsewhere. `holder` says who holds the agent at all, which is the question people
+           * were actually asking.
            */
           selected,
           selected_by_this_connection: selected,
-          attended_by: countAttendance(perConnectionState, a.name),
+          holder: holderFor(a.name),
           pubkey: a.pubkey,
           // M8B F14 (fix 5): per-agent standing-receiver readiness on the MCP surface
           // (cello_status / cello_list_agents), so a deaf agent is visible to the operator.
@@ -80,10 +75,6 @@ export function createConnectionAgents(deps: ConnectionAgentsDeps) {
           ...(sessionNodeManager.getStandingReceiverRefusal(a.name)
             ? { standing_receiver_refusal: sessionNodeManager.getStandingReceiverRefusal(a.name) }
             : {}),
-          // DOD-COATTEND-VISIBLE-1 AC2: how many sessions are driving this agent, including this
-          // one. Live, not a high-water mark — it drops when a session disconnects. `selected` says
-          // whether YOU hold it; this says whether anyone else does too.
-          attendance: countAttendance(perConnectionState, a.name),
         };
       });
   }

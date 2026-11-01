@@ -141,7 +141,7 @@ describe("M15D ipc-server: slots, delivery, cancellation", () => {
     const startedAt = Date.now();
     const handlers = new Map<string, IpcHandler>([
       ["wait", (_p, _c, meta) => new Promise((resolve) => {
-        meta.signal.addEventListener("abort", () => { aborted = Date.now() - startedAt; resolve({ ok: false }); });
+        meta!.signal.addEventListener("abort", () => { aborted = Date.now() - startedAt; resolve({ ok: false }); });
         setTimeout(() => resolve({ ok: true }), 5000);
       })],
     ]);
@@ -157,7 +157,7 @@ describe("M15D ipc-server: slots, delivery, cancellation", () => {
 
   it("passes the envelope's caller to the handler verbatim, and undefined when absent", async () => {
     const seen: unknown[] = [];
-    const handlers = new Map<string, IpcHandler>([["who", async (_p, _c, meta) => { seen.push(meta.caller); return { ok: true }; }]]);
+    const handlers = new Map<string, IpcHandler>([["who", async (_p, _c, meta) => { seen.push(meta!.caller); return { ok: true }; }]]);
     await start(handlers, 4, 0);
     const s = await open();
     await request(s, { id: "1", method: "who", caller: { id: "oauth:x", label: "ChatGPT" } });

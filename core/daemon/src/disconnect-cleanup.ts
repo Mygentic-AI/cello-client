@@ -11,46 +11,28 @@
  * neither carrying the whole picture and doubled every count.
  */
 import type { IpcServer } from "./ipc-server.js";
-import type { NotificationDispatcher } from "./notification-dispatcher.js";
 import type { InboundSessionWaiter } from "./inbound-sessions.js";
+import type { HolderRegistry } from "./holder-registry.js";
 
 export interface DisconnectCleanupDeps {
   ipcServer: IpcServer;
   /** Read this connection's selection before it is forgotten — the log needs what it was attending. */
   getConnState: (connectionId: string) => { currentAgent: string | null; clientType?: string } | undefined;
-  /** How many connections still attend an agent, after this one goes. */
-  countAttendanceFor: (agentName: string) => number;
   /**
-   * DOD-M15-AWAYSCOPE-1 — tell this agent's counterparties that the last attendee just left.
-   *
-   * Injected as a function rather than the whole manager: this module's job is releasing
-   * connection-scoped state, and handing it a session manager would invite it to grow one.
+   * Who holds each agent. A closing socket ends a socket caller's hold and removes the socket's
+   * channel and waits; the registry tells counterparties when that makes the agent unreachable.
    */
-  announceAttendance: (agentName: string, attendance: "attended" | "unattended" | "offline") => void;
+  registry: HolderRegistry;
   /** Releases the three per-connection maps. Lives with the maps, not here. */
   forgetConnection: (connectionId: string) => void;
   /** Callers blocked in `cello_await_session` for an agent, so a dying connection releases them. */
   inboundSessionWaiters: Map<string, InboundSessionWaiter[]>;
-  /**
-   * ⚠️ A GETTER, AND THE REASON IS NOT THE OBVIOUS ONE. The dispatcher is a `const` 82 lines ABOVE
-   * this wiring, so passing it by value would work today. The getter is there so that moving the
-   * construction below cannot break the disconnect path silently — the same shape as `getStop` in
-   * `ipc-surface.ts`.
-   *
-   * An earlier version of this comment said the dispatcher was constructed BELOW. It was not, and a
-   * false worked example of late binding is worse than none: the rule this order paid for is that a
-   * value assigned below a call site must be read through a getter, and the silent shape is a `let`
-   * (a `const` crashes loudly on TDZ). Teaching "getter because it is below" from a value that is
-   * above hands the next reader the wrong discriminator.
-   */
-  getNotificationDispatcher: () => NotificationDispatcher;
 }
 
 export function wireDisconnectCleanup(deps: DisconnectCleanupDeps): void {
   const {
-    ipcServer, getConnState, countAttendanceFor, forgetConnection, announceAttendance,
+    ipcServer, getConnState, registry, forgetConnection,
     inboundSessionWaiters,
-    getNotificationDispatcher,
   } = deps;
 
   // MCP-001: Clean up per-connection state when a connection disconnects
@@ -66,43 +48,26 @@ export function wireDisconnectCleanup(deps: DisconnectCleanupDeps): void {
      * diagnosable from the log rather than by guesswork.
      */
     const closing = getConnState(connectionId);
-    const stillAttending = closing?.currentAgent
-      ? countAttendanceFor(closing.currentAgent) - 1
-      : null;
+    const attended = closing?.currentAgent ?? null;
+    registry.dropConnection(connectionId);
+    const reachable = attended !== null && registry.isReachable(attended);
     // RETURNED, not logged here — `ipcServer` merges this into its single
     // `daemon.ipc.disconnected` line. A second line under the same name left neither carrying the
     // whole picture and doubled every count (review F8).
     const disconnectContext: Record<string, unknown> = {
       clientType: closing?.clientType ?? "unknown",
-      attendedAgent: closing?.currentAgent ?? null,
-      ...(stillAttending !== null ? { remainingAttendance: stillAttending } : {}),
-      ...(stillAttending === 0
+      attendedAgent: attended,
+      ...(attended !== null && !reachable
         ? {
             impact:
-              "that agent has no attending session left — inbound sessions are now answered with " +
-              "its away message rather than a live reply, and its doorbells reach nobody",
+              "that agent is no longer reachable — inbound sessions are now answered with its away " +
+              "message rather than a live reply, and its doorbells reach nobody",
           }
         : {}),
     };
-    // The three per-connection maps are released by the module that owns them; the reasons each
-    // must die with its connection live there, beside the containers.
+    // The per-connection maps are released by the module that owns them; the reasons each must die
+    // with its connection live there, beside the containers.
     forgetConnection(connectionId);
-    /**
-     * DOD-M15-AWAYSCOPE-1 — the counterparty is told, the moment the LAST attendee leaves.
-     *
-     * ⚠️ AFTER `forgetConnection`, and that ordering is the whole correctness of this line. The count
-     * above is computed as "minus one" precisely because this connection is still in the map; here
-     * it is gone, so `countAttendanceFor` reads the truth and a co-attended agent — legitimate and
-     * permanent — does not get reported as unattended because one of several clients closed.
-     *
-     * This is what the away reply used to do by sending a message into the conversation, which took
-     * a hash-chain leaf and cost a completed exchange its receipt. Saying it out of band costs
-     * nothing and is readable by the counterparty whenever they ask.
-     */
-    if (closing?.currentAgent && countAttendanceFor(closing.currentAgent) === 0) {
-      announceAttendance(closing.currentAgent, "unattended");
-    }
-    getNotificationDispatcher().unregisterConnection(connectionId);
     // Seam 2 (review H2): evict any cello_await_session waiters owned by this connection.
     // Otherwise enqueueInboundSession would hand the next inbound session to a closed
     // connection's waiter and the event would be lost. deliver(null) clears the waiter's

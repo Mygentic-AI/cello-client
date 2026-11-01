@@ -7,16 +7,11 @@
  *   - agent_current_changed → triggering connection ONLY
  *   - session_state_changed → connections where affected agent is current
  *
+ * WHO receives an agent's notifications is not kept here: `routeFor` reads the holder registry
+ * (the holder's channels plus the Hermes listener), so the doorbell and the attendance state cannot
+ * disagree. `isRegistered` is "this connection sent ipc.connect".
+ *
  * Pseudocode (SPARC Phase P):
- *
- * registerConnection(connectionId, socket):
- *   1. Add entry to routing table: { connectionId → { socket, currentAgent: null } }
- *
- * unregisterConnection(connectionId):
- *   1. Remove entry from routing table
- *
- * setCurrentAgent(connectionId, agentName):
- *   1. Update currentAgent for the connection entry
  *
  * dispatchAgentStateChanged(agentName, state, reason):
  *   1. Build notification: { notification: "agent_state_changed", data: { agent, type, agentName, state, reason } }
@@ -30,7 +25,7 @@
  *
  * dispatchSessionStateChanged(agentName, sessionId, state, counterpartyPubkey):
  *   1. Build notification: { notification: "session_state_changed", data: { agent, type, agentName, sessionId, state, counterpartyPubkey } }
- *   2. For each connection where currentAgent === agentName: write notification
+ *   2. For each connection in routeFor(agentName): write notification
  *   3. On write error: log notification.dispatch.failed at DEBUG, discard for that connection
  */
 
@@ -43,34 +38,29 @@ export interface NotificationDispatcherConfig {
   logger: Logger;
   sendNotification: NotificationSender;
   getConnectionIds: () => string[];
+  /** Connections that receive this agent's notifications, from the holder registry. */
+  routeFor: (agentName: string) => string[];
+  /** Has this connection completed `ipc.connect`? */
+  isRegistered: (connectionId: string) => boolean;
 }
 
 export class NotificationDispatcher {
   readonly #logger: Logger;
   readonly #sendNotification: NotificationSender;
   readonly #getConnectionIds: () => string[];
-  // Maps connectionId → currentAgent name (null if not set)
-  readonly #currentAgentMap = new Map<string, string | null>();
+  readonly #routeFor: (agentName: string) => string[];
+  readonly #isRegistered: (connectionId: string) => boolean;
 
   constructor(config: NotificationDispatcherConfig) {
     this.#logger = config.logger;
     this.#sendNotification = config.sendNotification;
     this.#getConnectionIds = config.getConnectionIds;
+    this.#routeFor = config.routeFor;
+    this.#isRegistered = config.isRegistered;
   }
 
-  registerConnection(connectionId: string): void {
-    this.#currentAgentMap.set(connectionId, null);
-  }
 
-  unregisterConnection(connectionId: string): void {
-    this.#currentAgentMap.delete(connectionId);
-  }
 
-  setCurrentAgent(connectionId: string, agentName: string | null): void {
-    if (this.#currentAgentMap.has(connectionId)) {
-      this.#currentAgentMap.set(connectionId, agentName);
-    }
-  }
 
   /**
    * Broadcast agent_state_changed to ALL active IPC connections.
@@ -89,7 +79,7 @@ export class NotificationDispatcher {
     };
 
     for (const connectionId of this.#getConnectionIds()) {
-      if (!this.#currentAgentMap.has(connectionId)) continue;
+      if (!this.#isRegistered(connectionId)) continue;
       this.#safeSend(connectionId, notification, "agent_state_changed");
     }
   }
@@ -117,6 +107,19 @@ export class NotificationDispatcher {
    * Routing rule: only connections with currentAgent === agentName receive this.
    */
   /**
+   * M15D: tell a connection that another caller forced its agent away. Sent to the old holder's
+   * channels only; its next guarded call is also refused `agent_displaced`, so a client that misses
+   * this frame is still told.
+   */
+  dispatchAgentDisplaced(connectionId: string, agentName: string, byLabel: string): void {
+    const notification: IpcNotification = {
+      notification: "agent_displaced",
+      data: { agent: agentName, type: "agent_displaced", by_label: byLabel },
+    };
+    this.#safeSend(connectionId, notification, "agent_displaced");
+  }
+
+  /**
    * DOD-DOC-WATCH-1 — the ONE doorbell a document update may ring, and only for an agent that asked
    * for it by naming the paths.
    *
@@ -140,10 +143,8 @@ export class NotificationDispatcher {
         paths: [...paths],
       },
     };
-    for (const connectionId of this.#getConnectionIds()) {
-      if (this.#currentAgentMap.get(connectionId) === agentName) {
-        this.#safeSend(connectionId, notification, "document_watch");
-      }
+    for (const connectionId of this.#routeFor(agentName)) {
+      this.#safeSend(connectionId, notification, "document_watch");
     }
   }
 
@@ -169,11 +170,8 @@ export class NotificationDispatcher {
       },
     };
 
-    for (const connectionId of this.#getConnectionIds()) {
-      const currentAgent = this.#currentAgentMap.get(connectionId);
-      if (currentAgent === agentName) {
-        this.#safeSend(connectionId, notification, "session_state_changed");
-      }
+    for (const connectionId of this.#routeFor(agentName)) {
+      this.#safeSend(connectionId, notification, "session_state_changed");
     }
   }
 
@@ -190,16 +188,6 @@ export class NotificationDispatcher {
     // MONIKER-4 AC2: same additive label contract as dispatchSessionStateChanged; `from` anchors.
     who?: { who: string; whoKnown: boolean },
   ): void {
-    // DOD-COATTEND-VISIBLE-1 AC2: the arrival alert carries the attendance count. Counted from the
-    // SAME map the loop below routes on, so the number is exactly "how many sessions this doorbell
-    // is about to wake" — it cannot drift from reality the way a separately-maintained counter could.
-    //
-    // INV-CONTENTFREE holds: a count of attending sessions is ROUTING metadata. It says nothing
-    // about what arrived, who sent it, or how big it is. Anything that identified the content would
-    // not be permitted here no matter how useful.
-    let attendance = 0;
-    for (const current of this.#currentAgentMap.values()) if (current === agentName) attendance += 1;
-
     const notification: IpcNotification = {
       notification: "cello_message",
       data: {
@@ -207,15 +195,12 @@ export class NotificationDispatcher {
         type: "cello_message",
         from,
         session_id: sessionId,
-        attendance,
         ...(who !== undefined ? { who: who.who, whoKnown: who.whoKnown } : {}),
       },
     };
 
-    for (const connectionId of this.#getConnectionIds()) {
-      if (this.#currentAgentMap.get(connectionId) === agentName) {
-        this.#safeSend(connectionId, notification, "cello_message");
-      }
+    for (const connectionId of this.#routeFor(agentName)) {
+      this.#safeSend(connectionId, notification, "cello_message");
     }
   }
 
@@ -294,10 +279,8 @@ export class NotificationDispatcher {
   /** Route a frame to every connection where `agentName` is current — the cello_message rule. */
   #dispatchToCurrent(agentName: string, notificationType: string, data: Record<string, unknown>): void {
     const notification: IpcNotification = { notification: notificationType, data };
-    for (const connectionId of this.#getConnectionIds()) {
-      if (this.#currentAgentMap.get(connectionId) === agentName) {
-        this.#safeSend(connectionId, notification, notificationType);
-      }
+    for (const connectionId of this.#routeFor(agentName)) {
+      this.#safeSend(connectionId, notification, notificationType);
     }
   }
 

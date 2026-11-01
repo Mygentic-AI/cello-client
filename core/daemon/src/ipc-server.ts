@@ -53,7 +53,7 @@ export interface IpcRequestMeta {
   signal: AbortSignal;
 }
 
-export type IpcHandler = (params: Record<string, unknown> | undefined, connectionId: string, meta: IpcRequestMeta) => Promise<unknown>;
+export type IpcHandler = (params: Record<string, unknown> | undefined, connectionId: string, meta?: IpcRequestMeta) => Promise<unknown>;
 
 /**
  * A reply whose side effect must wait until the reply has been written — `cello_receive` marks

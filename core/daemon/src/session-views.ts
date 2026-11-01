@@ -20,7 +20,6 @@ import type { SessionNodeManager } from "./session-node-manager.js";
 import type { SignalingManager } from "@cello-protocol/transport";
 import type { SealCompletion } from "./seal-coordinator.js";
 import type { FrontierMismatchStore } from "./frontier-mismatch.js";
-import { countAttendance } from "./co-attendance.js";
 import { renderFrontierMismatch } from "./frontier-mismatch.js";
 import { resolveAgentState } from "./agent-state.js";
 import { extractErrorMessage } from "./error-message.js";
@@ -28,8 +27,8 @@ import { extractErrorMessage } from "./error-message.js";
 export interface SessionViewsDeps {
   logger: Logger;
   sessionNodeManager: SessionNodeManager;
-  /** Live containers, shared by reference: a copy freezes attendance and every agent reads unattended. */
-  perConnectionState: ReadonlyMap<string, { currentAgent: string | null }>;
+  /** M15D: reachable now, from the holder registry. */
+  isReachable: (agentName: string) => boolean;
   onlineAgents: ReadonlySet<string>;
   explicitlyOfflineAgents: ReadonlySet<string>;
   perAgentSignaling: ReadonlyMap<string, { signaling: SignalingManager }>;
@@ -43,7 +42,7 @@ export interface SessionViewsDeps {
 
 export function createSessionViews(deps: SessionViewsDeps) {
   const {
-    logger, sessionNodeManager, perConnectionState, onlineAgents, explicitlyOfflineAgents,
+    logger, sessionNodeManager, isReachable, onlineAgents, explicitlyOfflineAgents,
     perAgentSignaling, sharedSignaling, frontierMismatches, sealKey, sealInterruptedInProgress,
     pendingSealWaiters,
   } = deps;
@@ -238,7 +237,7 @@ export function createSessionViews(deps: SessionViewsDeps) {
       // real commands with `selected_agent_offline`. Absent is not the same as disconnected.
       signalingConnected:
         (perAgentSignaling.get(a.name)?.signaling.status ?? sharedSignaling?.status) === "connected",
-      attendance: countAttendance(perConnectionState, a.name),
+      reachable: isReachable(a.name),
     });
   }
 
