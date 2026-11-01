@@ -229,7 +229,9 @@ describe("Phases 1-2: parity commands forward the MCP params exactly", () => {
     await run("set-agent-offline", ["alice"]);
     expect(parity.setAgentOffline).toHaveBeenCalledWith(CELLO_DIR, "alice", { pretty: false });
     await run("use-agent", ["alice"]);
-    expect(parity.useAgent).toHaveBeenCalledWith(CELLO_DIR, "alice", { pretty: false });
+    expect(parity.useAgent).toHaveBeenCalledWith(CELLO_DIR, "alice", { pretty: false, force: false });
+    await run("use-agent", ["alice", "--force"]);
+    expect(parity.useAgent).toHaveBeenCalledWith(CELLO_DIR, "alice", { pretty: false, force: true });
   });
 
   it("inbox: --scope is passed through; an unrecognized scope is not invented", async () => {

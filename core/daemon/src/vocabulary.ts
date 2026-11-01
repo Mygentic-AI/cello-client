@@ -51,6 +51,8 @@ export interface DualSurfaceVerb {
 const ALWAYS_ON_VERBS: readonly DualSurfaceVerb[] = [
   // Agents
   { mcp: "cello_agents", cli: "cello agents" },
+  { mcp: "cello_create_agent", cli: "cello create-agent" },
+  { mcp: "cello_register_agent", cli: "cello register-agent" },
   { mcp: "cello_start_agent", cli: "cello start-agent" },
   { mcp: "cello_set_agent_offline", cli: "cello set-agent-offline" },
   { mcp: "cello_use_agent", cli: "cello use-agent" },

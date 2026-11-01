@@ -43,52 +43,26 @@ describe("buildChannelParams — Claude Code channel contract", () => {
   // the operator's agent reads — the BODY is. The whole point of this line is that a session which
   // gets nothing back from cello_receive should already know a sibling might have taken it, and
   // that only works if the doorbell says so in the sentence Claude actually sees.
-  describe("co-attendance on the cello_message doorbell", () => {
-    it("says nothing about sharing when this session is alone", () => {
-      const { content } = buildChannelParams(
-        { type: "cello_message", from: "aa".repeat(32), session_id: "s1", attendance: 1 }, "cello_message");
-      expect(content).toMatch(/sent a message/);
-      expect(content).not.toMatch(/attending/);
+  describe("the cello_message doorbell no longer speaks of sharing (M15D: one holder per agent)", () => {
+    it("an OLDER daemon's attendance count is ignored — no 'sessions are attending' line", () => {
+      for (const attendance of [undefined, 1, 2, 3]) {
+        const { content } = buildChannelParams(
+          { type: "cello_message", from: "aa".repeat(32), session_id: "s1", ...(attendance !== undefined ? { attendance } : {}) }, "cello_message");
+        expect(content).toMatch(/sent a message/);
+        expect(content).not.toMatch(/attending|whichever reads first/);
+      }
+    });
+  });
+
+  describe("release and takeover notices (M15D)", () => {
+    it("a release says you are no longer acting as an agent — never 'your agent'", () => {
+      const { content } = buildChannelParams({ type: "agent_current_changed", fromAgent: "alice", toAgent: null, agent: null }, "agent_current_changed");
+      expect(content).toBe("CELLO — you are no longer acting as an agent.");
     });
 
-    it("says whichever session reads first receives it, and names the transcript for the rest", () => {
-      // 2026-09-13: one bookmark per agent, so only the first reader gets the message from
-      // cello_receive. Promising every window its own copy would send the others waiting.
-      const { content, meta } = buildChannelParams(
-        { type: "cello_message", from: "aa".repeat(32), session_id: "s1", attendance: 2 }, "cello_message");
-      expect(content).toMatch(/2 sessions are attending/);
-      expect(content).toMatch(/whichever reads first receives this message/);
-      expect(content).toMatch(/cello_transcript/);
-      expect(content, "the old promise must be gone").not.toMatch(/does not take it from the others/);
-      expect(meta.attendance).toBe("2"); // and it stays machine-readable on the tag attributes
-    });
-
-    it("stays correct for MORE than two — 'the other one' would name a session that does not exist", () => {
-      const { content } = buildChannelParams(
-        { type: "cello_message", from: "aa".repeat(32), session_id: "s1", attendance: 3 }, "cello_message");
-      expect(content).toMatch(/3 sessions are attending/);
-      expect(content).not.toMatch(/the other one/);
-    });
-
-    it("an OLDER daemon that sends no count says nothing — absent is not 'you are alone'", () => {
-      // CLAUDE.md forbids pinning versions, so a shim newer than the daemon is the expected state.
-      // `Number(undefined)` is NaN; without an explicit guard the sentence would vanish silently on
-      // a co-attended agent, which is the failure mode, not the safe default. Saying nothing is
-      // correct here — asserting solitude would not be.
-      const { content } = buildChannelParams(
-        { type: "cello_message", from: "aa".repeat(32), session_id: "s1" }, "cello_message");
-      expect(content).toMatch(/sent a message/);
-      expect(content).not.toMatch(/attending/);
-      expect(content).not.toMatch(/NaN/);
-    });
-
-    it("INV-CONTENTFREE holds: the count says how many sessions, never what arrived", () => {
-      const { content, meta } = buildChannelParams({
-        type: "cello_message", from: "aa".repeat(32), session_id: "s1", attendance: 2,
-        content: "secret message body that must never ride the push",
-      }, "cello_message");
-      expect(content).not.toContain("secret message body");
-      expect(JSON.stringify(meta)).not.toContain("secret message body");
+    it("a takeover names the agent and who took it, with the way back", () => {
+      const { content } = buildChannelParams({ type: "agent_displaced", agent: "alice", by_label: "ChatGPT" }, "agent_displaced");
+      expect(content).toBe("CELLO — alice was taken over by ChatGPT. Use cello_use_agent with force to take it back.");
     });
   });
 
