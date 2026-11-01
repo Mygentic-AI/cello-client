@@ -61,28 +61,7 @@ function renderWho(data: Record<string, unknown>): string {
 function doorbellText(type: string, data: Record<string, unknown>): string {
   switch (type) {
     case "cello_message": {
-      // DOD-COATTEND-VISIBLE-1 AC2: when more than one session attends this agent, the doorbell says
-      // so IN THE BODY. The count already rides as a `meta` attribute, but the body is what the
-      // operator's agent actually reads, and the whole point of this line is that a session which
-      // gets nothing back from cello_receive should already know why. Still content-free: a count of
-      // attending sessions is routing metadata and says nothing about what arrived.
-      //
-      // An OLDER daemon sends no `attendance` at all, and versions skew by design (CLAUDE.md
-      // forbids pinning, so shim-newer-than-daemon is the expected state, not the exception).
-      // `Number(undefined)` is NaN, so the guard is explicit: absent means "this daemon cannot
-      // tell me", which is not "you are alone" — say nothing rather than assert solitude.
-      const raw = data["attendance"];
-      const attending = typeof raw === "number" && Number.isFinite(raw) ? raw : null;
-      const shared = attending !== null && attending > 1
-        // Correct for any N: with 3 sessions "the other one" names a session that does not exist.
-        //
-        // 2026-09-13: cello_receive reads against ONE bookmark per agent, so whichever session
-        // reads first receives the message and the others get nothing from cello_receive. The
-        // transcript is where every session sees the whole conversation, including what the other
-        // sessions replied.
-        ? ` ${attending} sessions are attending this agent — whichever reads first receives this message. The others can see it, and each other's replies, with cello_transcript.`
-        : "";
-      return `📩 CELLO — ${renderWho(data)} sent a message. Run cello_receive to read it.${shared}`;
+      return `📩 CELLO — ${renderWho(data)} sent a message. Run cello_receive to read it.`;
     }
     case "cello_session_request":
       return `📞 CELLO — ${renderWho(data)} wants to connect. Run cello_await_session to accept.`;
@@ -198,8 +177,17 @@ function doorbellText(type: string, data: Record<string, unknown>): string {
     }
     case "agent_state_changed":
       return `CELLO: agent ${String(data["agent"] ?? "your agent")} is now ${String(data["state"] ?? "changed")}.`;
-    case "agent_current_changed":
-      return `CELLO — you are now acting as ${String(data["toAgent"] ?? data["agent"] ?? "your agent")}.`;
+    // An empty new agent is a RELEASE. Filling it with "your agent" told an operator who had just let
+    // go that they were now acting as one.
+    case "agent_current_changed": {
+      const to = data["toAgent"] ?? data["agent"];
+      return typeof to === "string" && to !== ""
+        ? `CELLO — you are now acting as ${to}.`
+        : "CELLO — you are no longer acting as an agent.";
+    }
+    // M15D: another session forced this agent away; this one's next send/receive/close is refused.
+    case "agent_displaced":
+      return `CELLO — ${String(data["agent"] ?? "your agent")} was taken over by ${String(data["by_label"] ?? "another session")}. Use cello_use_agent with force to take it back.`;
     // The counterpart to `shutdown`, and the reason this exists: after `cello logout && cello login`
     // the operator was told the daemon STOPPED and never told it came back. The reconnect only wrote
     // to the shim's stderr, which no agent reads. The only thing that did arrive was the
@@ -299,6 +287,7 @@ const HOUSEKEEPING_TYPES = new Set([
   "shutdown",
   "agent_state_changed",
   "agent_current_changed",
+  "agent_displaced",
 ]);
 
 /**

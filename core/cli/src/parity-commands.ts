@@ -178,7 +178,9 @@ export async function replaySelectedAgent(
         }
         // The agent is online — claim it for this connection. A refusal (retired/unknown) stops the
         // command: continuing would let the sole-online fallback run it as a DIFFERENT agent.
-        const used = (await client.send("cello_use_agent", { name: selected })) as Record<string, unknown>;
+        // A replay never takes an agent another session holds (M15D): reads still run as it, and a
+        // send/receive/close is refused naming the holder.
+        const used = (await client.send("cello_use_agent", { name: selected, trigger: "replay" })) as Record<string, unknown>;
         if (used.ok !== true) {
           // Defensive: cello_use_agent is ok-bearing on every path today, but if it ever returned an
           // ok-less body, emitIpcResult would print IT as this command's successful result. Fail loud
@@ -408,13 +410,13 @@ export async function stopUsingAgent(celloDir: string, opts: ParityOptions): Pro
 }
 
 /**
- * `cello use-agent <name>` → cello_use_agent, and — only if the daemon accepts it — persists the
- * selection so it survives this process. The handler auto-starts the agent if offline (AUTOSTART-1).
- * A rejected selection is NEVER written: a later command must not silently act as an agent the
- * daemon refused.
+ * `cello use-agent <name> [--force]` → cello_use_agent, and — only if the daemon accepts it —
+ * persists the selection so it survives this process. An offline agent is refused (start it first);
+ * an agent another session holds is refused unless `--force`. A rejected selection is NEVER written:
+ * a later command must not silently act as an agent the daemon refused.
  */
-export async function useAgent(celloDir: string, name: string, opts: ParityOptions): Promise<CliOutput> {
-  const out = await ipcCommand(celloDir, IPC_METHODS["use-agent"], { name }, opts, false);
+export async function useAgent(celloDir: string, name: string, opts: ParityOptions & { force?: boolean }): Promise<CliOutput> {
+  const out = await ipcCommand(celloDir, IPC_METHODS["use-agent"], { name, ...(opts.force ? { force: true } : {}) }, opts, false);
   if (out.exitCode === 0) await writeCurrentAgent(celloDir, name);
   return out;
 }

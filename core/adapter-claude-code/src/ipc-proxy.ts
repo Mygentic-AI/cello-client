@@ -284,7 +284,8 @@ export class IpcProxy {
       // `agent_already_current` is SUCCESS: it means this connection already holds it. Anything
       // else means the daemon did not give it back, so the cache must stop claiming it — a stale
       // mirror is worse than an empty one, because the operator reads the mirror.
-      // `trigger` is diagnostic, not behavioural — the daemon logs it and changes nothing on it.
+      // `trigger: "replay"` is BEHAVIOURAL since M15D: a replay never takes an agent another session
+      // now holds — it gets `role: "reader"`, and sends are refused naming the holder.
       // DOD-AGENT-SELECTION-UNWARRANTED-1: a connection changed identity twice and neither switch
       // could be attributed, because an operator's explicit cello_use_agent and this replay reach
       // the same handler byte-identical. The daemon could log the name but never who asked.

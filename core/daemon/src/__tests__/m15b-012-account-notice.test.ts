@@ -18,7 +18,7 @@ function harness() {
   const sent: IpcNotification[] = [];
   const resolveAgentId = (name: string) => (name === AGENT ? AGENT_ID : name);
   const wiring = new AccountNoticeWiring(logger, resolveAgentId);
-  const dispatcher = wiring.ringWith(new NotificationDispatcher({
+  wiring.ringWith(new NotificationDispatcher({
     logger, sendNotification: (_c, n) => { sent.push(n); return true; }, getConnectionIds: () => ["c1"],
     routeFor: (agent) => (agent === AGENT ? ["c1"] : []), isRegistered: (c) => c === "c1",
   }));

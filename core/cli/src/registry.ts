@@ -960,8 +960,9 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
     group: "Agents",
     summary: "Select the agent that later commands operate through.",
     help:
-      "Usage: cello use-agent <name> [--pretty]  — select the CURRENT agent for later commands.\n" +
-      "  Brings the agent online first if it is offline (AUTOSTART-1).\n" +
+      "Usage: cello use-agent <name> [--force] [--pretty]  — select the CURRENT agent for later commands.\n" +
+      "  The agent must be online (cello start-agent). If another session holds it, this is refused\n" +
+      "  naming that session; --force takes it over, and that session is told.\n" +
       "  The selection PERSISTS across invocations (recorded in <cello-dir>/current-agent), because\n" +
       "  each CLI command opens its own daemon connection — a selection that lived only on the socket\n" +
       "  would vanish the moment the command exited. Override per-command with '--agent <name>'.\n" +
@@ -970,7 +971,8 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
     jsonOut: true,
     async run(ctx, args) {
       const { pretty, positional } = parityOpts(args);
-      return useAgent(ctx.celloDir, positional[0] ?? "", { pretty });
+      const force = positional.includes("--force");
+      return useAgent(ctx.celloDir, positional.filter((a) => a !== "--force")[0] ?? "", { pretty, force });
     },
   },
   {
