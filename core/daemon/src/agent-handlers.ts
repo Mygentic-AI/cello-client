@@ -506,7 +506,7 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
     }
     const agent = agents.find((a) => a.name === name);
     if (!agent || agent.state === "load_failed") {
-      return { ok: false, reason: "agent_not_found", guidance: `Agent '${name}' does not exist. Create it with 'cello create-agent ${name}', register it, then retry — or check names with cello_agents.` };
+      return { ok: false, reason: "agent_not_found", guidance: `Agent '${name}' does not exist. Create it with cello_create_agent, register it with cello_register_agent, then retry — or check names with cello_agents.` };
     }
     // M16 033-CHANNELVIEW: a channel is an identity the daemon administers, not an agent anyone
     // attends.
@@ -603,7 +603,7 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
       const reg = await new DbRegistrationPersistence({ db: sessionNodeManager.getDb(), agentName: name, logger }).loadRegistrationState();
       if (!reg || reg.status !== "active") {
         result["warning"] = "not_registered";
-        result["warning_guidance"] = `Agent '${name}' is now selected but is not registered with the directory — run 'cello register-agent ${name}' to enable sessions with peers. Run 'cello status' to watch registration complete.`;
+        result["warning_guidance"] = `Agent '${name}' is now selected but is not registered with the directory — run cello_register_agent for it to enable sessions with peers. Run 'cello status' to watch registration complete.`;
       }
     } catch (err: unknown) {
       // A failed registration read must not break selection (the agent IS selected). Log the real

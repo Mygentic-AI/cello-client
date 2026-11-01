@@ -249,7 +249,7 @@ directory recorded devices can't be traced to one; remove those from Agents.
 
 **Step 3: Open a session and send a message** (via MCP tools or the `cello` CLI)
 ```
-cello_use_agent({ name: "alice" })              # selects the agent; auto-starts it if offline
+cello_use_agent({ name: "alice" })              # this session holds the agent; start it first
 
 cello_initiate_session({ target_pubkey: "<their pubkey>" })
 → { ok: true, sessionId: "..." }
@@ -523,7 +523,7 @@ backup / restore - write an agent to a backup file, or restore one
 ```
 agents - your agents and whether each is online
 start-agent <name> - bring an agent online
-use-agent <name> - select the agent this connection acts as (auto-starts it)
+use-agent <name> [--force] - hold the agent for later commands (start it first)
 set-agent-offline <name> - take an agent offline; inbound sessions are refused
 stop-using-agent - forget the CLI selection (does not release a live MCP session)
 refresh <name> - rotate an agent's signing-key shares (routine key hygiene)

@@ -119,11 +119,10 @@ cello bridge hermes --agent CELLO_Muse --hermes-home ~/.hermes/profiles/cello_mu
   `agent:<profile>:cello:dm:<agent>` route in `state.db`, so the Cello Hermes
   landing session survives gateway restarts and accumulates relationship
   history across multiple CELLO sessions.
-- **Avoid co-attending the same agent from two runtimes.** If both
-  `hermes-gateway` and a separate interactive session attend the same CELLO
-  agent simultaneously, an active `cello_receive` or `cello_await_session` call
-  in one runtime can consume an inbound message before the gateway bridge
-  fetches it.
+- **One runtime holds an agent at a time.** If an interactive session holds the
+  CELLO agent, a second runtime that tries to send, receive or close as it is
+  refused, naming the holder; `cello_use_agent` with `force: true` moves it. The
+  cello bridge only listens, so it never takes the agent from a session.
 - **A message arriving while the Hermes session is mid-turn is queued, not
   lost.** Reading a message from the daemon consumes it, so the bridge waits
   for an active turn on that Hermes session to finish before fetching content.
