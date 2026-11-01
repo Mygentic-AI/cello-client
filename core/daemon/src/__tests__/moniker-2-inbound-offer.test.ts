@@ -144,6 +144,8 @@ describe("MONIKER-2: inbound assignment moniker → wire-boundary validation →
     const client = await connectToDaemon(config.socketPath);
     clients.push(client);
     await client.send("ipc.connect", { clientType: "mcp" });
+    // `cello login` starts every registered agent; a call naming one that is not started is refused.
+    await client.send("cello_start_agent", { name: "bob" });
     return { events, inject: injectRef.inject!, client, bobPubkey, alicePubkey, socketPath: config.socketPath, snm };
   }
 

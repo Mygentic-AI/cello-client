@@ -355,6 +355,7 @@ async function startDaemonHoldingLock(
   // M15D 001-DAEMON: who holds each agent, reachable-now, and the request guard → attendance-root.ts.
   const { holderRegistry, currentAttendance, holderFor, admit } = createAttendanceRoot({
     logger, sessionNodeManager, loadedAgents, onlineAgents, explicitlyOfflineAgents, perConnectionState,
+    isChannelAgent: channelAgentLookup(sessionNodeManager, logger),
   });
   sessionNodeManager.setCurrentAttendanceSource(currentAttendance);
 

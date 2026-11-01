@@ -210,8 +210,8 @@ describe("MCP-002: notification routing", () => {
     expect(currentChangedB).toHaveLength(0);
   });
 
-  // ─── AC-004: session_state_changed sent to both connections with same current agent ───
-  it("AC-004: both connections with alice as current receive session_state_changed", async () => {
+  // ─── AC-004 (M15D): only the holder receives session_state_changed; a second session is refused ───
+  it("AC-004: the holder receives session_state_changed; a second connection is refused alice and gets nothing", async () => {
     const config = await setupWithAgents("alice");
     handle = await startDaemon(config);
 
@@ -220,8 +220,8 @@ describe("MCP-002: notification routing", () => {
 
     await clientA.send("cello_start_agent", { name: "alice" });
     await clientA.send("cello_use_agent", { name: "alice" });
-    await clientB.send("cello_start_agent", { name: "alice" });
-    await clientB.send("cello_use_agent", { name: "alice" });
+    // M15D exclusive attendance: the second connection is refused, so it is never a doorbell target.
+    expect(await clientB.send("cello_use_agent", { name: "alice" })).toMatchObject({ ok: false, reason: "agent_held" });
 
     const notifA = collectNotifications(clientA);
     const notifB = collectNotifications(clientB);
@@ -241,7 +241,7 @@ describe("MCP-002: notification routing", () => {
     const sessionB = notifB.filter((n) => n.notification === "session_state_changed");
 
     expect(sessionA).toHaveLength(1);
-    expect(sessionB).toHaveLength(1);
+    expect(sessionB).toHaveLength(0);
 
     expect(sessionA[0].data).toEqual({
       agent: "alice",
@@ -254,7 +254,6 @@ describe("MCP-002: notification routing", () => {
       who: "agent deadbeef…",
       whoKnown: false,
     });
-    expect(sessionB[0].data).toEqual(sessionA[0].data);
   });
 
   // ─── AC-005: session_state_changed NOT sent to connection with different current agent ───
@@ -304,8 +303,8 @@ describe("MCP-002: notification routing", () => {
 
     await clientA.send("cello_start_agent", { name: "alice" });
     await clientA.send("cello_use_agent", { name: "alice" });
-    await clientB.send("cello_start_agent", { name: "alice" });
-    await clientB.send("cello_use_agent", { name: "alice" });
+    // M15D exclusive attendance: the second connection is refused, so it is never a doorbell target.
+    expect(await clientB.send("cello_use_agent", { name: "alice" })).toMatchObject({ ok: false, reason: "agent_held" });
 
     const notifA = collectNotifications(clientA);
     const notifB = collectNotifications(clientB);
@@ -324,7 +323,7 @@ describe("MCP-002: notification routing", () => {
     const sessionB = notifB.filter((n) => n.notification === "session_state_changed");
 
     expect(sessionA).toHaveLength(1);
-    expect(sessionB).toHaveLength(1);
+    expect(sessionB).toHaveLength(0);
 
     expect(sessionA[0].data).toEqual({
       agent: "alice",
@@ -348,8 +347,8 @@ describe("MCP-002: notification routing", () => {
 
     await clientA.send("cello_start_agent", { name: "alice" });
     await clientA.send("cello_use_agent", { name: "alice" });
-    await clientB.send("cello_start_agent", { name: "alice" });
-    await clientB.send("cello_use_agent", { name: "alice" });
+    // M15D exclusive attendance: the second connection is refused, so it is never a doorbell target.
+    expect(await clientB.send("cello_use_agent", { name: "alice" })).toMatchObject({ ok: false, reason: "agent_held" });
 
     const notifA = collectNotifications(clientA);
     const notifB = collectNotifications(clientB);
@@ -368,7 +367,7 @@ describe("MCP-002: notification routing", () => {
     const sessionB = notifB.filter((n) => n.notification === "session_state_changed");
 
     expect(sessionA).toHaveLength(1);
-    expect(sessionB).toHaveLength(1);
+    expect(sessionB).toHaveLength(0);
 
     expect(sessionA[0].data).toEqual({
       agent: "alice",
@@ -658,9 +657,10 @@ describe("MCP-002: notification routing", () => {
       logger: unitLogger,
       sendNotification: throwingSender,
       getConnectionIds: () => ["conn-1"],
+      routeFor: () => [],
+      isRegistered: (c) => c === "conn-1",
     });
 
-    dispatcher.registerConnection("conn-1");
     dispatcher.dispatchAgentStateChanged("alice", "online", "started");
 
     const dispatchFailed = unitLogEvents.filter((e) => e.event === "notification.dispatch.failed");
@@ -721,9 +721,10 @@ describe("MCP-002: notification routing", () => {
       logger: unitLogger,
       sendNotification: falseSender,
       getConnectionIds: () => ["conn-1"],
+      routeFor: () => [],
+      isRegistered: (c) => c === "conn-1",
     });
 
-    dispatcher.registerConnection("conn-1");
     dispatcher.dispatchAgentStateChanged("alice", "online", "started");
 
     const dispatchFailed = unitLogEvents.filter((e) => e.event === "notification.dispatch.failed");
@@ -741,12 +742,10 @@ describe("MCP-002: notification routing", () => {
       logger: silentUnit,
       sendNotification: (connectionId, notification) => { captured.push({ connectionId, notification }); return true; },
       getConnectionIds: () => ["conn-current", "conn-other"],
+      // Two connections; alice is held on one, bob on the other. Same routing as cello_message.
+      routeFor: (agent) => (agent === "alice" ? ["conn-current"] : agent === "bob" ? ["conn-other"] : []),
+      isRegistered: () => true,
     });
-    // Two connections; alice is current on one, bob on the other. Same routing as cello_message.
-    dispatcher.registerConnection("conn-current");
-    dispatcher.registerConnection("conn-other");
-    dispatcher.setCurrentAgent("conn-current", "alice");
-    dispatcher.setCurrentAgent("conn-other", "bob");
 
     const CH = "ab".repeat(32); // a 64-hex channel key
     const SUB = "cd".repeat(32);

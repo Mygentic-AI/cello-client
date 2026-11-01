@@ -35,10 +35,12 @@ export interface AttendanceGuardDeps {
   getConnState: (connectionId: string) => { currentAgent: string | null; clearedAgent?: string; clientType?: string } | undefined;
   /** Agents this daemon knows (loaded). An unknown name is left to the handler's own refusal. */
   isKnownAgent: (agentName: string) => boolean;
+  /** A channel is administered, never attended: its handlers give their own refusals. */
+  isChannelAgent: (agentName: string) => boolean;
 }
 
 export function createAttendanceGuard(deps: AttendanceGuardDeps) {
-  const { logger, registry, onlineAgents, getConnState, isKnownAgent } = deps;
+  const { logger, registry, onlineAgents, getConnState, isKnownAgent, isChannelAgent } = deps;
 
   function admit(method: string, params: Record<string, unknown> | undefined, connectionId: string, rawCaller: unknown): Admission {
     const connState = getConnState(connectionId);
@@ -65,7 +67,7 @@ export function createAttendanceGuard(deps: AttendanceGuardDeps) {
 
     const explicit = typeof params?.["agent"] === "string" ? (params["agent"] as string) : undefined;
     const agent = resolveCurrentAgentFor({ connState, onlineAgents, ...(explicit ? { explicitAgent: explicit } : {}) });
-    if (!agent || !isKnownAgent(agent)) return { ok: true, caller, finish: () => {} };
+    if (!agent || !isKnownAgent(agent) || isChannelAgent(agent)) return { ok: true, caller, finish: () => {} };
 
     if (!onlineAgents.has(agent)) {
       logger.warn("agent.attend.refused", { connectionId, method, agentName: agent, reason: "agent_offline", callerLabel: caller.label });

@@ -37,9 +37,9 @@ describe("MONIKER-4 AC2 — dispatcher stamps who/whoKnown on the two counterpar
       logger: silentLogger(),
       sendNotification: (_c, n) => { sent.push(n); return true; },
       getConnectionIds: () => ["c1"],
+      routeFor: (agent) => (agent === "alice" ? ["c1"] : []),
+      isRegistered: (c) => c === "c1",
     });
-    d.registerConnection("c1");
-    d.setCurrentAgent("c1", "alice");
     return { d, sent };
   }
 

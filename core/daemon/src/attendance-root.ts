@@ -18,11 +18,12 @@ export interface AttendanceRootDeps {
   loadedAgents: ReadonlyArray<LoadedAgent>;
   onlineAgents: ReadonlySet<string>;
   explicitlyOfflineAgents: ReadonlySet<string>;
+  isChannelAgent: (agentName: string) => boolean;
   perConnectionState: Map<string, { currentAgent: string | null; clearedAgent?: string; clientType?: string }>;
 }
 
 export function createAttendanceRoot(deps: AttendanceRootDeps) {
-  const { logger, sessionNodeManager, loadedAgents, onlineAgents, explicitlyOfflineAgents, perConnectionState } = deps;
+  const { logger, sessionNodeManager, loadedAgents, onlineAgents, explicitlyOfflineAgents, perConnectionState, isChannelAgent } = deps;
 
   // A counterparty is told the moment an agent becomes reachable or stops being reachable.
   const holderRegistry = new HolderRegistry({
@@ -52,6 +53,7 @@ export function createAttendanceRoot(deps: AttendanceRootDeps) {
     logger, registry: holderRegistry, onlineAgents,
     getConnState: (connectionId) => perConnectionState.get(connectionId),
     isKnownAgent: (agentName) => loadedAgents.some((a) => a.name === agentName),
+    isChannelAgent,
   });
 
   return { holderRegistry, currentAttendance, holderFor, admit };

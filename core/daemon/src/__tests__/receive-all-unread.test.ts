@@ -59,7 +59,10 @@ describe("cello_receive — every unread message, one bookmark per agent", () =>
     await fx.ingestReceived("alice", SID, "old");
     expect(texts((await first.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Answer)).toEqual(["old"]);
 
-    // A fresh connection — what `/mcp`, a restarted Claude Code, and every CLI command are.
+    // A fresh connection — what `/mcp`, a restarted Claude Code, and every CLI command are. The old
+    // one is gone first: a socket's hold dies with it, and exclusive attendance refuses a second.
+    first.close();
+    await new Promise((r) => setTimeout(r, 50));
     const second = await fx.connectAs("alice");
     await fx.ingestReceived("alice", SID, "new");
     expect(texts((await second.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Answer)).toEqual(["new"]);

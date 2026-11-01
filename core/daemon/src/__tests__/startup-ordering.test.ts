@@ -348,7 +348,10 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // customer would never learn a review right was due — every suite green.
     // 134 → 135 for M10E 007's review fix: `wireAttestationNoticer` (attestation-wiring.ts), which
     // moved the noticer's composition out of daemon.ts. It is called from daemon.ts, so it is wired.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(135);
+    // 135 → 137 for M15D 001-DAEMON: `createAttendanceRoot` (attendance-root.ts) and
+    // `createAttendanceGuard` (attendance-guard.ts). The root is called from daemon.ts and the guard
+    // from the root; unwired, every agent would read unattended and no call would be guarded.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(137);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",
