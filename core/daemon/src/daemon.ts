@@ -112,6 +112,7 @@ import { TypeRegistry } from "./type-registry.js";
 import { DbRegistryVersionStore } from "./registry-version-store-db.js";
 import { startRegistryPoll } from "./registry-poll.js";
 import { createAttendanceRoot } from "./attendance-root.js";
+import { currentCaller } from "./caller-identity.js";
 import { FrontierMismatchStore } from "./frontier-mismatch.js";
 
 // 040-DAEMONROOT unit 8: three things that were never composition — the handle's shape, the session
@@ -959,6 +960,7 @@ async function startDaemonHoldingLock(
     reapDeadHalfOpenSessions,
     frontierMismatches,
     holderFor,
+    mayActAs: (agentName: string) => holderRegistry.check(agentName, currentCaller()).ok,
     // DOD-TERMINAL-STATE-DIVERGENCE-1: the pull twin of the session_sealed push. Wired HERE, at the
     // composition root, because it needs the agent's own signaling stream and its persistence — the
     // read handlers hold neither, and giving them the whole daemon to reach one function is how a

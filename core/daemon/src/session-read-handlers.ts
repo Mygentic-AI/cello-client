@@ -68,6 +68,8 @@ export interface SessionReadDeps {
   /** Never vaults a cursor/watermark past a hole in the delivered sequence. */
   safeCursorAdvance: (connectionId: string, sessionId: string, deliveredSeqs: ReadonlySet<number>) => void;
   safeWatermarkAdvance: (agentName: string, sessionId: string, deliveredSeqs: ReadonlySet<number>) => void;
+  /** M15D: may this request's caller act as the agent? A caller that may not reads without marking anything read. */
+  mayActAs: (agentName: string) => boolean;
   /**
    * DOD-COATTEND-VISIBLE-1 AC6: how many connections are attending this agent right now.
    *
@@ -143,7 +145,7 @@ const SEAL_NOTE = "Attests that this conversation took place between these two a
 export function registerSessionReadHandlers(deps: SessionReadDeps): void {
   const {
     handlers, logger, sessionNodeManager, loadedAgents, getConnState, resolveCurrentAgent,
-    NO_CURRENT_AGENT_RESPONSE, resolveWho, safeCursorAdvance, safeWatermarkAdvance, holderFor,
+    NO_CURRENT_AGENT_RESPONSE, resolveWho, safeCursorAdvance, safeWatermarkAdvance, holderFor, mayActAs,
     reapDeadHalfOpenSessions,
       frontierMismatches,
       isSealing, getSealFailure,
@@ -379,7 +381,8 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
     // process still presents an unread count. Same contiguous-run safety as the cursor — never vault
     // past a gap (an undecryptable row is absent from `messages`, so the walk stops there and those
     // messages correctly stay unread).
-    safeWatermarkAdvance(agentName, sessionId, deliveredSeqs);
+    // Reading another caller's held agent marks nothing read — its holder would lose the messages.
+    if (mayActAs(agentName)) safeWatermarkAdvance(agentName, sessionId, deliveredSeqs);
     // DOD-SESSION-NAME-1 (AC-A12): the name rides along so a transcript dump says what it is of.
     const transcriptName = sessionNodeManager.getSessionRecord(agentName, sessionId)?.session_name ?? null;
     // M12-P17: the annex read surface. Content that arrived for this session AFTER it ended is

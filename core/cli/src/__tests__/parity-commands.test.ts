@@ -120,6 +120,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
   describe("`cello use-agent` is DURABLE (not a no-op that lies)", () => {
     it("persists the selection so a LATER, SEPARATE invocation acts on that agent", async () => {
       await createAgent(tempDir, "alice");
+      await startAgent(tempDir, "alice", {}); // use-agent no longer auto-starts (M15D)
       const used = await useAgent(tempDir, "alice", {});
       expect(used.exitCode).toBe(0);
       expect(await readCurrentAgent(tempDir)).toBe("alice");
@@ -134,6 +135,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
     });
 
     it("does NOT persist a selection the daemon REJECTED (no fabricated state)", async () => {
+      await startAgent(tempDir, "nonexistent", {}); // use-agent no longer auto-starts (M15D)
       const out = await useAgent(tempDir, "nonexistent", {});
       expect(out.exitCode).toBe(1);
       expect(out.stdout).toBe("");
@@ -144,6 +146,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
     it("an explicit --agent overrides the persisted default", async () => {
       await createAgent(tempDir, "alice");
       await createAgent(tempDir, "bob");
+      await startAgent(tempDir, "alice", {}); // use-agent no longer auto-starts (M15D)
       await useAgent(tempDir, "alice", {});
       expect(await readCurrentAgent(tempDir)).toBe("alice");
 
@@ -158,6 +161,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
       // The silent-fallback trap: if the replayed cello_use_agent fails and we shrug and continue,
       // the daemon's sole-online fallback could quietly run the command as a DIFFERENT agent.
       await createAgent(tempDir, "alice");
+      await startAgent(tempDir, "alice", {}); // use-agent no longer auto-starts (M15D)
       await useAgent(tempDir, "alice", {});
       const out = await inbox(tempDir, { agent: "ghost" }); // explicit, unknown
       expect(out.exitCode).toBe(1);
@@ -179,6 +183,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
 
     it("`cello transcript <session-id>` reports the daemon's verdict faithfully — whatever it is", async () => {
       await createAgent(tempDir, "alice");
+      await startAgent(tempDir, "alice", {}); // use-agent no longer auto-starts (M15D)
       await useAgent(tempDir, "alice", {});
       const out = await transcript(tempDir, "deadbeef", {});
       // NOTE (observed, not assumed): the daemon answers an UNKNOWN session id with a successful,
@@ -193,6 +198,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
 
     it("`cello contact set-moniker` reaches cello_contact_set_moniker (the per-CONTACT pet name)", async () => {
       await createAgent(tempDir, "alice");
+      await startAgent(tempDir, "alice", {}); // use-agent no longer auto-starts (M15D)
       await useAgent(tempDir, "alice", {});
       const out = await contactSetMoniker(tempDir, "ab".repeat(32), "Sup", {});
       const body = JSON.parse(out.exitCode === 0 ? out.stdout : out.stderr);
@@ -206,6 +212,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
   describe("Group B — session commands mirror the MCP tools exactly", () => {
     it("`cello send` honors read-before-write: the cursor error is surfaced VERBATIM, never auto-fixed", async () => {
       await createAgent(tempDir, "alice");
+      await startAgent(tempDir, "alice", {}); // use-agent no longer auto-starts (M15D)
       await useAgent(tempDir, "alice", {});
       const out = await send(tempDir, "deadbeef", "hello", {});
       expect(out.exitCode).toBe(1);
@@ -218,6 +225,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
 
     it("`cello receive` honors --timeout-ms (mirrors the MCP timeout semantics)", async () => {
       await createAgent(tempDir, "alice");
+      await startAgent(tempDir, "alice", {}); // use-agent no longer auto-starts (M15D)
       await useAgent(tempDir, "alice", {});
       const out = await receive(tempDir, "deadbeef", { timeoutMs: 500 });
       expect(out.exitCode).toBe(1);
@@ -226,6 +234,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
 
     it("`cello await-session --timeout-ms N` blocks then reports — no fabricated session", async () => {
       await createAgent(tempDir, "alice");
+      await startAgent(tempDir, "alice", {}); // use-agent no longer auto-starts (M15D)
       await useAgent(tempDir, "alice", {});
       const started = Date.now();
       const out = await awaitSession(tempDir, { timeoutMs: 600 });
@@ -241,6 +250,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
 
     it("`cello initiate-session <target>` reaches cello_initiate_session with target_pubkey", async () => {
       await createAgent(tempDir, "alice");
+      await startAgent(tempDir, "alice", {}); // use-agent no longer auto-starts (M15D)
       await useAgent(tempDir, "alice", {});
       const out = await initiate(tempDir, "ab".repeat(32), {});
       const body = JSON.parse(out.exitCode === 0 ? out.stdout : out.stderr);
@@ -251,6 +261,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
 
     it("`cello close-session` reaches its handler and reports the verdict", async () => {
       await createAgent(tempDir, "alice");
+      await startAgent(tempDir, "alice", {}); // use-agent no longer auto-starts (M15D)
       await useAgent(tempDir, "alice", {});
       const closed = await closeSession(tempDir, "deadbeef", {});
       expect(closed.exitCode).toBe(1);
@@ -266,6 +277,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
       // agent. So taking alice offline, then `cello inbox`, brought her back online — reachable
       // again — with no signal. Stopping an agent is kill-switch-adjacent; reading must never re-arm it.
       await createAgent(tempDir, "alice");
+      await startAgent(tempDir, "alice", {}); // use-agent no longer auto-starts (M15D)
       await useAgent(tempDir, "alice", {});
       expect(await readCurrentAgent(tempDir)).toBe("alice");
 
@@ -283,6 +295,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
       // persisted selection was in fact deleted. A success message for the opposite of what
       // happened, which is the same class of defect as the name that started all of this.
       await createAgent(tempDir, "alice");
+      await startAgent(tempDir, "alice", {}); // use-agent no longer auto-starts (M15D)
       await useAgent(tempDir, "alice", {});
       expect(await readCurrentAgent(tempDir)).toBe("alice");
 
@@ -310,6 +323,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
       await createAgent(tempDir, "alice");
       // Persist a selection, then take the agent offline WITHOUT going through setAgentOffline (so the
       // selection file survives — the exact state a crash or a direct MCP stop would leave).
+      await startAgent(tempDir, "alice", {}); // use-agent no longer auto-starts (M15D)
       await useAgent(tempDir, "alice", {});
       // Take alice offline via the daemon's OWN handler, leaving the persisted selection in place —
       // exactly the state an MCP-side stop, or a crash, would leave behind.
@@ -334,6 +348,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
       // suppressed the persisted selection AND skipped the replay, so the daemon's sole-online
       // fallback ran the command as whatever agent happened to be up — exit 0, wrong identity.
       await createAgent(tempDir, "alice");
+      await startAgent(tempDir, "alice", {}); // use-agent no longer auto-starts (M15D)
       await useAgent(tempDir, "alice", {});
 
       const out = await inbox(tempDir, { agent: "" });
@@ -359,6 +374,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
       // coverage: swapping it to the relay-receipts handler would have kept every test green.
       // A bogus session id must produce the SEAL handler's own distinctive verdict.
       await createAgent(tempDir, "alice");
+      await startAgent(tempDir, "alice", {}); // use-agent no longer auto-starts (M15D)
       await useAgent(tempDir, "alice", {});
       const out = await sealedReceipt(tempDir, "deadbeef", {});
       const body = JSON.parse(out.exitCode === 0 ? out.stdout : out.stderr);
@@ -429,6 +445,8 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
       // which layer produced it.
       expect(unscoped.stderr).toMatch(/no_agent_selected|no_current_agent/);
 
+      await startAgent(tempDir, "alice", {}); // use-agent no longer auto-starts (M15D)
+
       await useAgent(tempDir, "alice", {});
       const scoped = await listSessions(tempDir, {});
       expect(scoped.exitCode, `sessions must honor use-agent, got: ${scoped.stderr}`).toBe(0);
@@ -463,6 +481,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
       await createAgent(tempDir, "bob");
       await startAgent(tempDir, "alice", {});
       await startAgent(tempDir, "bob", {});
+      await startAgent(tempDir, "alice", {}); // use-agent no longer auto-starts (M15D)
       await useAgent(tempDir, "alice", {});
 
       // Two agents online → the daemon's sole-online fallback CANNOT resolve this. Only a replayed
@@ -483,6 +502,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
       await createAgent(tempDir, "bob");
       await startAgent(tempDir, "alice", {});
       await startAgent(tempDir, "bob", {});
+      await startAgent(tempDir, "alice", {}); // use-agent no longer auto-starts (M15D)
       await useAgent(tempDir, "alice", {});
 
       const out = await monikerSet(tempDir, "ali", {});
@@ -505,7 +525,8 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
       await createAgent(tempDir, "alice");
       await createAgent(tempDir, "bob");
       await startAgent(tempDir, "bob", {});
-      await useAgent(tempDir, "alice", {});   // use-agent AUTO-STARTS alice (AUTOSTART-1)...
+      await startAgent(tempDir, "alice", {}); // use-agent no longer auto-starts (M15D)
+      await useAgent(tempDir, "alice", {});   // selects alice (started just above)...
       await setAgentOffline(tempDir, "alice", {});  // ...so stop her. This also clears the selection.
 
       const out = await settingsSet(tempDir, "away.default", "must not land on bob", {});
@@ -557,6 +578,7 @@ describe("current-agent persistence is a plain file", () => {
       });
       try {
         await createAgent(dir, "alice");
+        await startAgent(dir, "alice", {}); // use-agent no longer auto-starts (M15D)
         await useAgent(dir, "alice", {});
         const raw = await readFile(join(dir, "current-agent"), "utf8");
         expect(raw.trim()).toBe("alice");

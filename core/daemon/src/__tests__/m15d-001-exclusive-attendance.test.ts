@@ -99,7 +99,7 @@ describe("M15D 001-DAEMON: exclusive attendance and a delivery-safe receive", ()
     expect(fx.snm.getLastDeliveredSeq("alice", SID), "nothing was marked read").toBe(watermark);
     expect(fx.snm.getSessionRecord("alice", SID)?.status, "nothing was closed").toBe("active");
     // Reads are never guarded.
-    expect(await other.send("cello_transcript", { session_id: SID, agent: "alice" })).toMatchObject({ ok: true });
+    expect(await other.send("cello_get_transcript", { session_id: SID, agent: "alice" })).toMatchObject({ ok: true });
     // The holder is untouched.
     expect(texts((await holder.send("cello_receive", { session_id: SID, timeout_ms: 500 })) as R)).toEqual(["unread"]);
   });
