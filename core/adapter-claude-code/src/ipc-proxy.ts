@@ -271,7 +271,7 @@ export class IpcProxy {
       //
       // Observed live 2026-08-01: a session was told "the daemon is back and you are acting as
       // Miss_Chelly" while the daemon held no current agent for that connection at all
-      // (`cello_stop_using_agent` → released: null; `cello_agents` → selected:false, attendance:0).
+      // (`cello_stop_using_agent` → released: null; `cello_agents` → selected:false).
       // The replay had been REFUSED and nobody looked. `#currentAgent` is otherwise only cleared on
       // an explicit de-selection, so the cache went on asserting an agent the daemon never
       // attached — and `onReconnect` builds its announcement from that cache, so the claim was

@@ -116,7 +116,17 @@ export class HolderRegistry {
     return undefined;
   }
 
-  /** May `caller` act as `agentName`? Reads never ask; send/receive/close/initiate/await do. */
+  /** Would `caller` be allowed to act as `agentName`? Changes nothing — for reads deciding a side effect. */
+  mayAct(agentName: string, caller: Caller): boolean {
+    const key = this.#key(agentName);
+    const h = key === undefined ? undefined : this.#holders.get(key);
+    return !h || h.callerKey === caller.key;
+  }
+
+  /**
+   * May `caller` act as `agentName`? Asked by send/receive/close/initiate/await only: a refusal
+   * CONSUMES the one-shot displaced mark, so a read must use `mayAct`.
+   */
   check(agentName: string, caller: Caller): HoldCheck {
     const key = this.#key(agentName);
     if (key === undefined) return { ok: true };

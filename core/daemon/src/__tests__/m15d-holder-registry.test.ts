@@ -29,6 +29,8 @@ describe("M15D holder registry", () => {
     expect(forced).toMatchObject({ ok: true, displaced: { callerKey: "socket:conn-a", label: "Claude Code", channels: ["conn-a"] } });
     expect(reg.holderView("alice")?.label).toBe("ChatGPT");
     // The displaced caller is told who took it, on its next call; after that it is plainly held.
+    // A read asks mayAct, which must not spend the displaced mark.
+    expect(reg.mayAct("alice", A)).toBe(false);
     expect(reg.check("alice", A)).toMatchObject({ ok: false, reason: "agent_displaced", by_label: "ChatGPT" });
     expect(reg.check("alice", A)).toMatchObject({ ok: false, reason: "agent_held" });
     expect(reg.check("alice", B)).toEqual({ ok: true });

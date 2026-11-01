@@ -960,7 +960,7 @@ async function startDaemonHoldingLock(
     reapDeadHalfOpenSessions,
     frontierMismatches,
     holderFor,
-    mayActAs: (agentName: string) => holderRegistry.check(agentName, currentCaller()).ok,
+    mayActAs: (agentName: string) => holderRegistry.mayAct(agentName, currentCaller()),
     // DOD-TERMINAL-STATE-DIVERGENCE-1: the pull twin of the session_sealed push. Wired HERE, at the
     // composition root, because it needs the agent's own signaling stream and its persistence — the
     // read handlers hold neither, and giving them the whole daemon to reach one function is how a
