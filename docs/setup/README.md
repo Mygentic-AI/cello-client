@@ -1,4 +1,4 @@
-# Setting up CELLO in your client
+# Setting up Local CELLO in your client
 
 Every client reaches CELLO the same way: through the `cello_*` MCP tools, which talk to the CELLO daemon
 on your machine. What differs is how each client is told about those tools.
