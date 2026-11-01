@@ -128,10 +128,10 @@ describe("DOD-M15-AWAYSCOPE-1: the daemon announces its own attendance, and neve
     return { h, snm, fake };
   }
 
-  async function connectAs(agent: string): Promise<IpcClient> {
+  async function connectAs(agent: string, clientType = "test"): Promise<IpcClient> {
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     clients.push(client);
-    await client.send("ipc.connect", { clientType: "test" });
+    await client.send("ipc.connect", { clientType });
     await client.send("cello_start_agent", { name: agent });
     await client.send("cello_use_agent", { name: agent });
     return client;
@@ -166,23 +166,22 @@ describe("DOD-M15-AWAYSCOPE-1: the daemon announces its own attendance, and neve
     expect(snm.getSessionRecord("alice", SID_HEX)?.status, "and the session stays open for the return").toBe("active");
   });
 
-  it("★★ a CO-ATTENDED agent losing one client announces nothing — attendance did not change", async () => {
+  it("★★ the holder leaving while the Hermes cello bridge listens announces nothing — the agent is still reachable", async () => {
     /**
-     * Co-attendance is legitimate and permanent, and this is where a naive "on disconnect, say
-     * unattended" would lie: one of two clients closing would tell the counterparty nobody is
-     * reading while somebody still is. The count is read AFTER the connection is released, which is
-     * what makes the difference visible at all.
+     * M15D: an agent has one holder, but the Hermes cello bridge LISTENS and wakes it. A naive "on
+     * disconnect, say unattended" would tell the counterparty nobody is reading while the bridge
+     * would still wake the agent. Reachability is read AFTER the connection is released.
      */
     const { fake } = await setup();
-    const first = await connectAs("alice");
-    await connectAs("alice");
+    const holder = await connectAs("alice");
+    await connectAs("alice", "hermes");
     await wait(50);
     fake.announced.length = 0;
 
-    first.close();
+    holder.close();
     await wait(150);
 
-    expect(fake.announced, "one of two clients closing is not an absence").toEqual([]);
+    expect(fake.announced, "the listener still wakes the agent, so this is not an absence").toEqual([]);
   });
 
   it("★★ going OFFLINE announces 'offline', and does it BEFORE the sessions are torn down", async () => {
@@ -223,17 +222,17 @@ describe("DOD-M15-AWAYSCOPE-1: the daemon announces its own attendance, and neve
     expect(fake.announced.map((a) => a.attendance)).toEqual(["unattended"]);
   });
 
-  it("★★ releasing ONE of two attendees announces nothing — the other is still reading", async () => {
+  it("★★ releasing the hold while the Hermes cello bridge listens announces nothing", async () => {
     const { fake } = await setup();
-    const first = await connectAs("alice");
-    await connectAs("alice");
+    const holder = await connectAs("alice");
+    await connectAs("alice", "hermes");
     await wait(50);
     fake.announced.length = 0;
 
-    await first.send("cello_stop_using_agent", {});
+    await holder.send("cello_stop_using_agent", {});
     await wait(100);
 
-    expect(fake.announced, "co-attendance is legitimate and permanent").toEqual([]);
+    expect(fake.announced, "the listener keeps the agent reachable").toEqual([]);
   });
 
   it("★★ cello_status reports the far side as online-but-unattended, with what the relay observed", async () => {

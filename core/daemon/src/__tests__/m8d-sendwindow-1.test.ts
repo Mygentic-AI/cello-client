@@ -28,6 +28,8 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+// M15D: two DIFFERENT callers can no longer both act as one agent, so the race left to close is one
+// caller on two sockets — `connectEndpointAs`.
 import { startTwoConnectionFixture, FakeNode, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
 import type { Stream } from "@libp2p/interface";
 import type { CelloNode } from "@cello-protocol/transport";
@@ -117,8 +119,8 @@ describe("DOD-COATTEND-SENDWINDOW-1: two sessions cannot both reply to one messa
 
   it("S1 (AC5, THE LINE): both pass the gate, both stall in screening — exactly ONE reply is committed", async () => {
     await fx.createSession(SID, "alice");
-    const connA = await fx.connectAs("alice");
-    const connB = await fx.connectAs("alice");
+    const connA = await fx.connectEndpointAs("alice");
+    const connB = await fx.connectEndpointAs("alice");
 
     // One counterparty message, read once for the AGENT (one bookmark per agent since 2026-09-13).
     // Nothing is unread, so both sessions legitimately pass the gate — two callers who were both
@@ -148,8 +150,8 @@ describe("DOD-COATTEND-SENDWINDOW-1: two sessions cannot both reply to one messa
 
   it("S2 (AC2): the loser is refused LOUDLY, and told which authority refused it", async () => {
     await fx.createSession(SID, "alice");
-    const connA = await fx.connectAs("alice");
-    const connB = await fx.connectAs("alice");
+    const connA = await fx.connectEndpointAs("alice");
+    const connB = await fx.connectEndpointAs("alice");
     await fx.ingestReceived("alice", SID, "one question");
     for (const c of [connA, connB]) await c.send("cello_receive", { session_id: SID, timeout_ms: 2_000 });
 
@@ -200,8 +202,8 @@ describe("DOD-COATTEND-SENDWINDOW-1: two sessions cannot both reply to one messa
     // shape it exists for. Here A's leaf lands while B is still screened, so B's frontier snapshot
     // is stale and the comparison catches it — the in-flight claim is already released.
     await fx.createSession(SID, "alice");
-    const connA = await fx.connectAs("alice");
-    const connB = await fx.connectAs("alice");
+    const connA = await fx.connectEndpointAs("alice");
+    const connB = await fx.connectEndpointAs("alice");
     await fx.ingestReceived("alice", SID, "one question");
     for (const c of [connA, connB]) await c.send("cello_receive", { session_id: SID, timeout_ms: 2_000 });
 
@@ -248,8 +250,8 @@ describe("DOD-COATTEND-SENDWINDOW-1: two sessions cannot both reply to one messa
     });
     try {
       await fx2.createSession(SID, "alice");
-      const a = await fx2.connectAs("alice");
-      const b = await fx2.connectAs("alice");
+      const a = await fx2.connectEndpointAs("alice");
+      const b = await fx2.connectEndpointAs("alice");
       await fx2.ingestReceived("alice", SID, "one question");
       for (const c of [a, b]) await c.send("cello_receive", { session_id: SID, timeout_ms: 2_000 });
 
@@ -286,8 +288,8 @@ describe("DOD-COATTEND-SENDWINDOW-1: two sessions cannot both reply to one messa
     // The clause exists so that if someone later decides retry should be blocked, they change a
     // test that says so out loud rather than discovering this by accident in production.
     await fx.createSession(SID, "alice");
-    const connA = await fx.connectAs("alice");
-    const connB = await fx.connectAs("alice");
+    const connA = await fx.connectEndpointAs("alice");
+    const connB = await fx.connectEndpointAs("alice");
     await fx.ingestReceived("alice", SID, "one question");
     for (const c of [connA, connB]) await c.send("cello_receive", { session_id: SID, timeout_ms: 2_000 });
 
@@ -328,8 +330,8 @@ describe("DOD-COATTEND-SENDWINDOW-1: two sessions cannot both reply to one messa
     });
     try {
       await fx2.createSession(SID, "alice");
-      const a = await fx2.connectAs("alice");
-      const b = await fx2.connectAs("alice");
+      const a = await fx2.connectEndpointAs("alice");
+      const b = await fx2.connectEndpointAs("alice");
       await fx2.ingestReceived("alice", SID, "one question");
       for (const c of [a, b]) await c.send("cello_receive", { session_id: SID, timeout_ms: 2_000 });
 
@@ -357,7 +359,7 @@ describe("DOD-COATTEND-SENDWINDOW-1: two sessions cannot both reply to one messa
     // which is almost all of them. The re-check compares the frontier against the value it snapshot
     // at gate time; with no sibling writing, that value is unchanged and the send proceeds.
     await fx.createSession(SID, "alice");
-    const conn = await fx.connectAs("alice");
+    const conn = await fx.connectEndpointAs("alice");
     await fx.ingestReceived("alice", SID, "one question");
     await conn.send("cello_receive", { session_id: SID, timeout_ms: 2_000 });
 

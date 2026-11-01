@@ -258,8 +258,24 @@ export async function startTwoConnectionFixture(
     await client.send("ipc.connect", { clientType });
     return client;
   }
-  async function connectEndpoint(caller: { id: string; label: string }): Promise<IpcClient> {
-    const client = await connectToDaemon(socketPath, { caller });
+  /**
+   * Behaves like the web endpoint: after a `cello_receive` that returns a delivery token, it confirms
+   * delivery with `session.receive.commit` (contract C3). Pass `autoCommit: false` to test the
+   * uncommitted case.
+   */
+  async function connectEndpoint(caller: { id: string; label: string }, autoCommit = true): Promise<IpcClient> {
+    const raw = await connectToDaemon(socketPath, { caller });
+    const client: IpcClient = autoCommit ? {
+      ...raw,
+      async send(method, params) {
+        const result = await raw.send(method, params);
+        const token = (result as { commit?: unknown } | null)?.commit;
+        if (method === "cello_receive" && typeof token === "string") await raw.send("session.receive.commit", { token });
+        return result;
+      },
+      close: () => raw.close(),
+      onNotification: (h) => raw.onNotification(h),
+    } : raw;
     clients.push(client);
     await client.send("ipc.connect", { clientType: "endpoint" });
     return client;
@@ -272,6 +288,12 @@ export async function startTwoConnectionFixture(
     events,
     connect,
     connectEndpoint,
+    async connectEndpointAs(agent: string): Promise<IpcClient> {
+      const client = await connectEndpoint({ id: "fixture-endpoint", label: "Fixture endpoint" });
+      await client.send("cello_start_agent", { name: agent });
+      await client.send("cello_use_agent", { name: agent });
+      return client;
+    },
     async connectAs(agent: string): Promise<IpcClient> {
       const client = await connect();
       // `cello_use_agent` no longer auto-starts (M15D): an offline agent is refused.
