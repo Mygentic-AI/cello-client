@@ -56,7 +56,8 @@ describe("008-POLICY through a live daemon", () => {
       clients.push(c);
       await c.send("ipc.connect", { clientType });
       await c.send("cello_start_agent", { name: "alice" });
-      await c.send("cello_use_agent", { name: "alice" });
+      // M15D: one holder per agent. The MCP session holds alice; the CLI reads and sets policy.
+      if (clientType === "mcp") await c.send("cello_use_agent", { name: "alice" });
       return c;
     };
     return { cli: await open("cli"), mcp: await open("mcp") };

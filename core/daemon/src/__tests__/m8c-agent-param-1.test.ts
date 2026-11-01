@@ -98,6 +98,9 @@ describe("DOD-AGENT-PARAM-1: the agent selector is `agent`, on all ten handlers"
     const client = await connectToDaemon(config.socketPath);
     clients.push(client);
     await client.send("ipc.connect", { clientType: "mcp" });
+    // `cello login` starts every registered agent; a call naming one that is not started is refused.
+    await client.send("cello_start_agent", { name: "alice" });
+    await client.send("cello_start_agent", { name: "bob" });
     return client;
   }
 

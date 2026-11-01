@@ -238,6 +238,7 @@ describe("DOD-AGENT-ID-JOINKEY-1 AC4 — a recreated name inherits NOTHING from 
     const id1 = first.agentId!;
     const pub1 = first.pubkey!;
 
+    await client.send("cello_start_agent", { name: "ada" });
     expect(((await client.send("cello_use_agent", { name: "ada" })) as { ok: boolean }).ok).toBe(true);
     expect(((await client.send("cello_contact_add", { pubkey: STRANGER })) as { ok: boolean }).ok).toBe(true);
     snm.recordTranscriptMessage("ada", SESSION, 0, "received", Buffer.from("the dead identity's secret"));

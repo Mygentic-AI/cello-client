@@ -25,6 +25,7 @@ function build(agents: AgentInfo[], channels: Set<string>) {
     onlineAgents: new Set(),
     sessionNodeManager: snmStub,
     agentStateFor: (a: AgentInfo): AgentState => a.state,
+    holderFor: () => null,
     isChannelAgent: (name: string) => channels.has(name),
   });
 }
