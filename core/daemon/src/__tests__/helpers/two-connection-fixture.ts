@@ -160,10 +160,20 @@ export interface TwoConnectionFixture {
   readonly snm: SessionNodeManager;
   /** Every log line the daemon emitted, in order. Empty when `opts.logger` was supplied. */
   readonly events: CapturedEvent[];
-  /** Open ANOTHER IPC connection and attend `agent` on it. Call twice for the M8D case. */
+  /**
+   * Open another IPC connection, start `agent` if needed, and take its hold. A second call for the
+   * same agent is refused `agent_held` (M15D exclusive attendance).
+   */
   connectAs(agent: string): Promise<IpcClient>;
   /** Open a connection WITHOUT attending — the un-attended observer case. */
-  connect(): Promise<IpcClient>;
+  connect(clientType?: string): Promise<IpcClient>;
+  /** A web-endpoint socket (M15D C1/C2): every request carries `caller`; receives auto-commit unless told not to. */
+  connectEndpoint(caller: { id: string; label: string }, autoCommit?: boolean): Promise<IpcClient>;
+  /**
+   * An endpoint socket for ONE fixed caller that holds `agent`. Several of these are one caller on
+   * several sockets — the case where two calls can still race as the same agent.
+   */
+  connectEndpointAs(agent: string): Promise<IpcClient>;
   /**
    * `relay: true` configures the session with a relay target and real signing key material, which is
    * what makes the PARK route reachable — without it a failed direct send returns

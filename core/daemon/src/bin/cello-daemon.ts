@@ -30,7 +30,9 @@ import { createCollapsingLogger } from "../log-collapse.js";
 import { extractErrorMessage } from "../error-message.js";
 import { recordGatewayLayer2 } from "../screening-status.js";
 
-const MAX_CONNECTIONS = 16;
+// 24 slots, the last 4 for the CLI only (`reservedCliConnections`, default 4), so `cello status`
+// gets in even when long-lived sessions fill the rest.
+const MAX_CONNECTIONS = 24;
 
 // DOD-REGISTRY-1: build-time-pinned registry signer pubkey. The daemon polls GET /registry
 // on the directory and verifies the inner Ed25519 signature against this key. A registry

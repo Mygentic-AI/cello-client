@@ -330,7 +330,7 @@ describe("daemon", () => {
      * Andre and a Hermes agent misread it during one investigation, in opposite directions.
      *
      * The name cannot change without breaking every reader, so a sibling says whose view it is and
-     * `attended_by` answers the question people were actually asking.
+     * `holder` (M15D) answers the question people were actually asking: who holds this agent.
      */
     const config = makeConfig();
     handle = await startDaemon(config);
@@ -349,7 +349,7 @@ describe("daemon", () => {
         "`selected` must be annotated as connection-scoped, or a fresh CLI connection reads false " +
           "for an agent it has selected in another session",
       ).toBe(row["selected"]);
-      expect(typeof row["attended_by"], "how many connections hold this agent at all").toBe("number");
+      expect("holder" in row, "who holds this agent at all — null when nobody does").toBe(true);
     }
   });
 

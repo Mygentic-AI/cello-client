@@ -222,7 +222,7 @@ describe("DOD-M15-SEAL-FAILED-TERMINAL-1: the daemon actually wires the store", 
       getSealFailure: () => failure,
       safeCursorAdvance: () => {},
       safeWatermarkAdvance: () => {},
-      attendanceCount: () => 0,
+      holderFor: () => null,
       reapDeadHalfOpenSessions: () => {},
       frontierMismatches: { get: () => undefined },
     } as never);
