@@ -4,7 +4,7 @@
  * ACs tested:
  * - IPC framing: JSON-newline-delimited requests/responses
  * - Socket permissions: 0o600 (SI-001)
- * - Max 16 concurrent IPC connections
+ * - Max concurrent IPC connections; the one beyond the cap is told ipc_full
  * - Graceful shutdown: finish in-flight, send shutdown frame, remove socket
  * - Method dispatch: unknown method returns error with guidance
  * - daemon.ipc.connected / daemon.ipc.disconnected events logged
@@ -201,11 +201,14 @@ describe("ipc-server", () => {
       }
       await new Promise((r) => setTimeout(r, 50));
 
-      // Third connection should be destroyed immediately
+      // Third connection is told ipc_full, then closed. Read it: a paused socket never sees the FIN.
       const rejected = await connectToSocket(socketPath);
+      let refusal = "";
+      rejected.on("data", (c: Buffer) => { refusal += c.toString("utf-8"); });
       await new Promise<void>((resolve) => {
         rejected.on("close", () => resolve());
       });
+      expect(JSON.parse(refusal.trim())).toMatchObject({ error: { code: "ipc_full" } });
       expect(rejected.destroyed).toBe(true);
 
       const warnEvents = logEvents.filter((e) => e.event === "daemon.ipc.connection.limit.reached");

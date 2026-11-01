@@ -58,6 +58,8 @@ export interface IpcRequest {
   id: string;
   method: string;
   params?: Record<string, unknown>;
+  /** Set only by the web endpoint (`clientType: "endpoint"`); refused on any other socket. */
+  caller?: unknown;
 }
 
 export interface IpcResponseOk {

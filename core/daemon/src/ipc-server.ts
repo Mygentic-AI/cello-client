@@ -43,11 +43,40 @@ export interface HandlerLookup {
   get(method: string): IpcHandler | undefined;
 }
 
-export type IpcHandler = (params: Record<string, unknown> | undefined, connectionId: string) => Promise<unknown>;
+/**
+ * What a request carries besides its params. `caller` is the envelope field exactly as it arrived —
+ * the daemon decides whether this socket may carry one (`caller-identity.ts`). `signal` aborts when
+ * the socket closes, so a call whose caller has gone stops instead of running to its timeout.
+ */
+export interface IpcRequestMeta {
+  caller?: unknown;
+  signal: AbortSignal;
+}
+
+export type IpcHandler = (params: Record<string, unknown> | undefined, connectionId: string, meta: IpcRequestMeta) => Promise<unknown>;
+
+/**
+ * A reply whose side effect must wait until the reply has been written — `cello_receive` marks
+ * messages read this way. `afterWrite` runs only when the socket's write callback reports success;
+ * a failed write skips it, so the messages stay unread.
+ */
+export class DeferredUntilWritten {
+  constructor(readonly result: unknown, readonly afterWrite: () => void) {}
+}
+
+export function deferUntilWritten(result: unknown, afterWrite: () => void): DeferredUntilWritten {
+  return new DeferredUntilWritten(result, afterWrite);
+}
 
 export interface IpcServerConfig {
   socketPath: string;
   maxConnections: number;
+  /**
+   * The last N slots admit only the CLI, so `cello status` (and the hosted health check's operator)
+   * always gets in. A connection in a reserved slot is refused `ipc_full` if it introduces itself as
+   * anything but `clientType: "cli"`; one that sends no hello is a plain `cello` command.
+   */
+  reservedForCli?: number;
   logger: Logger;
 }
 
@@ -73,6 +102,21 @@ interface ActiveConnection {
   socket: Socket;
   inFlightCount: number;
   shutdownReason: string | null;
+  /** Admitted into a CLI-reserved slot: its first request decides whether it may stay. */
+  reservedSlot: boolean;
+  /** Aborted when the socket closes; every in-flight request on it is handed this signal. */
+  closed: AbortController;
+}
+
+/** The refusal a client gets when no slot is free — before the socket closes, never instead of it. */
+function ipcFullFrame(): { error: { code: string; message: string; guidance: string } } {
+  return {
+    error: {
+      code: "ipc_full",
+      message: "The daemon has no free connection slot.",
+      guidance: "Too many clients are connected to this daemon. Close an idle session, or run 'cello status' (the CLI has reserved slots) to see what is connected.",
+    },
+  };
 }
 
 export function createIpcServer(
@@ -85,6 +129,7 @@ export function createIpcServer(
   handlers: HandlerLookup,
 ): IpcServer {
   const { maxConnections, logger } = config;
+  const reservedForCli = config.reservedForCli ?? 0;
   const rawPath = config.socketPath;
   const socketPath = process.platform === "win32" && !rawPath.startsWith("\\\\.\\pipe\\")
     ? getDaemonIpcEndpoint(dirname(rawPath))
@@ -135,15 +180,18 @@ export function createIpcServer(
         currentCount: connections.size,
         maxCount: maxConnections,
       });
-      // Destroy immediately — the client has no pending requests to correlate
-      // an error response against. Client's connectToDaemon() will reject with
-      // a socket error, which is the correct signal.
-      socket.destroy();
+      // TOLD, then closed. A silent drop reads to the client as the daemon being down — on a hosted
+      // container that is what made the health check kill a healthy daemon.
+      socket.end(JSON.stringify(ipcFullFrame()) + "\n", () => socket.destroy());
       return;
     }
 
     const connectionId = randomUUID();
-    const conn: ActiveConnection = { id: connectionId, socket, inFlightCount: 0, shutdownReason: null };
+    const conn: ActiveConnection = {
+      id: connectionId, socket, inFlightCount: 0, shutdownReason: null,
+      reservedSlot: connections.size >= maxConnections - reservedForCli,
+      closed: new AbortController(),
+    };
     connections.set(connectionId, conn);
 
     logger.info("daemon.ipc.accepted", { connectionId });
@@ -182,6 +230,7 @@ export function createIpcServer(
 
     socket.on("close", () => {
       connections.delete(connectionId);
+      conn.closed.abort();
       const reason = conn.shutdownReason || "client_closed";
       /**
        * ONE LINE, and the handler contributes to it — review F8.
@@ -206,6 +255,32 @@ export function createIpcServer(
     });
   }
 
+  /**
+   * Write one reply. A failed write is LOGGED (`daemon.ipc.write.failed`) and `afterWrite` is
+   * skipped — that is what keeps a fetched message unread when its caller has gone. Success here
+   * means the bytes reached the kernel, which is why the web endpoint confirms delivery itself.
+   */
+  function writeReply(conn: ActiveConnection, request: IpcRequest, resp: IpcResponse, afterWrite?: () => void): void {
+    const failed = (error: string): void => {
+      logger.warn("daemon.ipc.write.failed", {
+        connectionId: conn.id, method: request.method, requestId: request.id, error,
+        ...(afterWrite ? { impact: "the reply never reached its caller, so what it carried was not marked read" } : {}),
+      });
+    };
+    if (conn.socket.destroyed || !conn.socket.writable) {
+      failed("socket_closed");
+      return;
+    }
+    try {
+      conn.socket.write(JSON.stringify(resp) + "\n", (err) => {
+        if (err) { failed(extractErrorMessage(err)); return; }
+        afterWrite?.();
+      });
+    } catch (err: unknown) {
+      failed(extractErrorMessage(err));
+    }
+  }
+
   function handleMessage(conn: ActiveConnection, line: string): void {
     let request: IpcRequest;
     try {
@@ -225,6 +300,20 @@ export function createIpcServer(
       logger.warn("daemon.ipc.invalid.request", { connectionId: conn.id, hasId: !!request.id, hasMethod: !!request.method });
       conn.socket.destroy();
       return;
+    }
+
+    if (conn.reservedSlot) {
+      // Only the first request decides: a CLI hello or a hello-less `cello` command stays.
+      conn.reservedSlot = false;
+      const clientType = request.method === "ipc.connect" ? request.params?.["clientType"] : "cli";
+      if (clientType !== "cli") {
+        logger.warn("daemon.ipc.connection.limit.reached", {
+          connectionId: conn.id, currentCount: connections.size, maxCount: maxConnections,
+          reservedForCli, clientType: typeof clientType === "string" ? clientType : "unknown",
+        });
+        conn.socket.end(JSON.stringify({ id: request.id, ...ipcFullFrame() }) + "\n", () => conn.socket.destroy());
+        return;
+      }
     }
 
     const handler = handlers.get(request.method);
@@ -290,19 +379,14 @@ export function createIpcServer(
     }
 
     conn.inFlightCount++;
-    Promise.resolve(handler(request.params, conn.id))
-      .then((result) => {
-        try {
-          // `DOD-M15-SELECTION-1`'s fallback notice used to be spread in HERE. It moved up into the
-          // daemon's `renderedHandlers` wrapper: this point is downstream of `renderForSurface`, so
-          // the notice's own guidance never got translated and a CLI operator was told to run
-          // `cello_use_agent`, which is not a command. It also sits outside the request's async
-          // context, which is what let a notice ride a concurrent call's response.
-          const resp: IpcResponse = { id: request.id, result };
-          conn.socket.write(JSON.stringify(resp) + "\n");
-        } catch {
-          // Socket closed before response could be written
-        }
+    const meta: IpcRequestMeta = { caller: request.caller, signal: conn.closed.signal };
+    Promise.resolve(handler(request.params, conn.id, meta))
+      .then((outcome) => {
+        // `DOD-M15-SELECTION-1`'s fallback notice is added in the daemon's `renderedHandlers`
+        // wrapper, upstream of `renderForSurface` and inside the request's async context.
+        const deferred = outcome instanceof DeferredUntilWritten ? outcome : null;
+        const resp: IpcResponse = { id: request.id, result: deferred ? deferred.result : outcome };
+        writeReply(conn, request, resp, deferred?.afterWrite);
       })
       .catch((err: unknown) => {
         // extractErrorMessage, NOT String(err): handlers reject with structured plain objects as
@@ -327,20 +411,14 @@ export function createIpcServer(
           error: message,
           ...(reason !== undefined ? { reason } : {}),
         });
-        try {
-          const resp: IpcResponse = {
-            id: request.id,
-            error: {
-              code: "internal_error",
-              message,
-              guidance: "An unexpected error occurred. Check daemon logs for details.",
-            },
-          };
-          conn.socket.write(JSON.stringify(resp) + "\n");
-        } catch {
-          // Socket closed before error could be written
-        }
-      })
+        writeReply(conn, request, {
+          id: request.id,
+          error: {
+            code: "internal_error",
+            message,
+            guidance: "An unexpected error occurred. Check daemon logs for details.",
+          },
+        });      })
       .finally(() => {
         conn.inFlightCount--;
       });
