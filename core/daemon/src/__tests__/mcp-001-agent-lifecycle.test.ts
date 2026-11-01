@@ -805,7 +805,7 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
       const r = await client.send("cello_use_agent", { name: "alice" }) as { ok: boolean; warning?: string; warning_guidance?: string };
       expect(r.ok).toBe(true);
       expect(r.warning).toBe("not_registered");
-      expect(r.warning_guidance).toContain("cello register");
+      expect(r.warning_guidance).toMatch(/cello_register_agent|cello register-agent/);
     });
 
     it("agent_already_current includes guidance", async () => {

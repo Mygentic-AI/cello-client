@@ -122,7 +122,7 @@ cello bridge hermes --agent CELLO_Muse --hermes-home ~/.hermes/profiles/cello_mu
 - **One runtime holds an agent at a time.** If an interactive session holds the
   CELLO agent, a second runtime that tries to send, receive or close as it is
   refused, naming the holder; `cello_use_agent` with `force: true` moves it. The
-  cello bridge only listens, so it never takes the agent from a session.
+  cello bridge only listens, so it does not take the agent from a session.
 - **A message arriving while the Hermes session is mid-turn is queued, not
   lost.** Reading a message from the daemon consumes it, so the bridge waits
   for an active turn on that Hermes session to finish before fetching content.
