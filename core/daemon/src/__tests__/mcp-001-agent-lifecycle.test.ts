@@ -7,7 +7,7 @@
  * - AC-003: cello_use_agent sets current agent per-connection
  * - AC-004: cello_set_agent_offline transitions Online→Registered
  * - AC-005: Multi-connection isolation (2 connections, different current agents)
- * - AC-006: Two connections can have same agent as current independently
+ * - AC-006 (M15D): a second connection is refused a held agent; force takes it and the first is told
  * - AC-007: no_current_agent guard on 5 session tools (separate test per tool)
  * - AC-009: ipc_connection_lost after daemon stops
  * - AC-011: agent_not_online vs agent_not_found distinction
@@ -341,42 +341,41 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     expect(connectEvents[0].context.connectionId).not.toBe(connectEvents[1].context.connectionId);
   });
 
-  // ─── AC-006: Two connections can have same agent as current independently ───
-  it("AC-006: two connections can both have the same agent as current", async () => {
+  // ─── AC-006 (M15D): one holder per agent; force takes it over and the old holder is told ───
+  it("AC-006: a second connection is refused a held agent; force takes it and the first is told and refused", async () => {
     const config = await setupWithAgents("alice", "bob");
     handle = await startDaemon(config);
 
     const client1 = await connect(config.socketPath);
     const client2 = await connect(config.socketPath);
-
     await client1.send("cello_start_agent", { name: "alice" });
     await client1.send("cello_start_agent", { name: "bob" });
-
-    // Set alice as current for connection 1
-    await client1.send("cello_start_agent", { name: "alice" });
     await client1.send("cello_use_agent", { name: "alice" });
-    // Set bob as current for connection 2
-    await client2.send("cello_start_agent", { name: "bob" });
     await client2.send("cello_use_agent", { name: "bob" });
+    const pushed: Array<{ notification: string; data?: Record<string, unknown> }> = [];
+    client1.onNotification((n) => pushed.push(n as unknown as { notification: string; data?: Record<string, unknown> }));
 
-    // Now switch connection 2 to also use alice
-    await client2.send("cello_start_agent", { name: "alice" });
-    const switchResult = await client2.send("cello_use_agent", { name: "alice" }) as { ok: boolean };
-    expect(switchResult.ok).toBe(true); // M8C-AUTOSTART-1: may also carry a not_registered warning
+    // Unforced: refused, naming the holder, with the way to take it over.
+    const refused = await client2.send("cello_use_agent", { name: "alice" }) as Record<string, unknown>;
+    expect(refused).toMatchObject({ ok: false, reason: "agent_held", agent: "alice", holder: { label: "an MCP session" } });
+    expect(String(refused["guidance"])).toMatch(/force: true/);
 
-    // Connection 2 sees alice as current
-    const list2 = await client2.send("cello_list_agents") as { agents: Array<{ name: string; state: string; selected?: boolean }> };
-    expect(list2.agents.find((a) => a.name === "alice")?.selected).toBe(true);
+    // Forced: taken, and connection 1 is told at once.
+    const forced = await client2.send("cello_use_agent", { name: "alice", force: true }) as Record<string, unknown>;
+    expect(forced).toMatchObject({ ok: true, role: "holder", took_over_from: "an MCP session" });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(pushed.filter((n) => n.notification === "agent_displaced").map((n) => n.data)).toEqual([
+      { agent: "alice", type: "agent_displaced", by_label: "an MCP session" },
+    ]);
 
-    // Connection 1 still sees alice as current (independent)
-    const list1 = await client1.send("cello_list_agents") as { agents: Array<{ name: string; state: string; selected?: boolean }> };
-    expect(list1.agents.find((a) => a.name === "alice")?.selected).toBe(true);
-
-    // Verify agent.current.switched only fired for connection 2 (not connection 1)
-    const switchEvents = logEvents.filter(
-      (e) => e.event === "agent.current.switched" && e.context.toAgent === "alice" && e.context.fromAgent === "bob"
-    );
-    expect(switchEvents).toHaveLength(1);
+    // Connection 1's next guarded call is refused naming who took it; after that it is plainly held.
+    const first = await client1.send("cello_receive", { session_id: "ab".repeat(32), timeout_ms: 50 }) as Record<string, unknown>;
+    expect(first).toMatchObject({ ok: false, reason: "agent_displaced", agent: "alice", by_label: "an MCP session" });
+    const second = await client1.send("cello_receive", { session_id: "ab".repeat(32), timeout_ms: 50 }) as Record<string, unknown>;
+    expect(second).toMatchObject({ ok: false, reason: "agent_held", agent: "alice" });
+    expect(logEvents.filter((e) => e.event === "agent.attend.displaced")).toHaveLength(1);
+    expect(logEvents.filter((e) => e.event === "agent.attend.refused").map((e) => e.context.reason))
+      .toEqual(["agent_held", "agent_displaced", "agent_held"]);
   });
 
   // ─── AC-007: no_current_agent guard on 5 session tools ───

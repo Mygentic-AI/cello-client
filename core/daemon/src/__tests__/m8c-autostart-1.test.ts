@@ -79,19 +79,20 @@ describe("M8C-AUTOSTART-1: use_agent auto-start + F5/F18", () => {
   const agentsOf = (r: Result) => (r["agents"] as AgentInfo[]);
 
   // ─── A1: use_agent auto-starts a loaded-but-offline agent ───
-  it("A1: cello_use_agent auto-starts an offline agent then selects it", async () => {
+  it("A1 (M15D): cello_use_agent REFUSES an offline agent and does not start it", async () => {
     const config = await setupWithAgents("alice");
     handle = await startDaemon(config);
     const client = await connect(config.socketPath);
 
-    // No cello_start_agent first — use_agent alone must bring alice online AND select her.
+    // Andre's ruling (2026-11-01): a call naming an offline agent is refused, never auto-started.
     const res = (await client.send("cello_use_agent", { name: "alice" })) as Result;
-    expect(res["ok"]).toBe(true);
+    expect(res).toMatchObject({ ok: false, reason: "agent_offline", agent: "alice" });
+    expect(String(res["guidance"])).toMatch(/cello_start_agent/);
 
     const status = (await client.send("cello_status", {})) as Result;
     const alice = agentsOf(status).find((a) => a.name === "alice")!;
-    expect(isAgentRunning(alice.state), "auto-start must leave it RUNNING; which rung depends on attendance and the directory").toBe(true);
-    expect(alice.selected).toBe(true);
+    expect(isAgentRunning(alice.state), "refusing must not have started it").toBe(false);
+    expect(alice.selected ?? false).toBe(false);
   });
 
   // ─── A2: cello_start_agent brings online WITHOUT selecting ───
@@ -198,6 +199,7 @@ describe("M8C-AUTOSTART-1: use_agent auto-start + F5/F18", () => {
     const client = await connect(config.socketPath);
 
     await client.send("cello_start_agent", { name: "bob" }); // online, not selected
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" }); // online + selected
 
     const status = (await client.send("cello_status", {})) as Result;

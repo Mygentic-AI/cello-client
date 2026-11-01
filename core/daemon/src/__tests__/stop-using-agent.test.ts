@@ -206,7 +206,7 @@ describe("DOD-RELEASE-1: cello_stop_using_agent", () => {
 
   // Attendance is PER-CONNECTION: one session releasing must not yank the agent out from under
   // another that is still driving it. This is the two-attendants case that surfaced the whole gap.
-  it("only releases this connection's selection, never another connection's", async () => {
+  it("a connection that does not hold the agent releases nothing — the holder keeps it", async () => {
     const config = await setupWithAgents("alice");
     handle = await startDaemon(config);
     const connA = await connect(config.socketPath);
@@ -214,14 +214,11 @@ describe("DOD-RELEASE-1: cello_stop_using_agent", () => {
 
     await connA.send("cello_start_agent", { name: "alice" });
     await connA.send("cello_use_agent", { name: "alice" });
-    await connB.send("cello_start_agent", { name: "alice" });
-    await connB.send("cello_use_agent", { name: "alice" });
-
-    await connA.send("cello_stop_using_agent", {});
+    // connB never held alice (M15D: a second holder is refused), so its release touches nothing.
+    expect(await connB.send("cello_stop_using_agent", {})).toMatchObject({ ok: true, released: null });
 
     const listA = await connA.send("cello_list_agents") as AgentList;
-    const listB = await connB.send("cello_list_agents") as AgentList;
-    expect(listA.agents.find((a) => a.name === "alice")?.selected).toBe(false);
-    expect(listB.agents.find((a) => a.name === "alice")?.selected).toBe(true);
+    expect(listA.agents.find((a) => a.name === "alice")?.selected).toBe(true);
+    expect((listA.agents.find((a) => a.name === "alice") as { holder?: unknown } | undefined)?.holder).not.toBeNull();
   });
 });
