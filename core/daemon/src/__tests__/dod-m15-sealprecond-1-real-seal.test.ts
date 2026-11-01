@@ -129,7 +129,8 @@ describe("DOD-M15-SEALPRECOND-1 Done When 1: the signed root covers every messag
 
     const client = await connectToDaemon(join(tempDir, "d.sock"));
     clients.push(client);
-    await client.send("ipc.connect", { clientType: "test" });
+    // Both connections are the CLI — one caller (M15D), so the close is not refused as a second holder.
+    await client.send("ipc.connect", { clientType: "cli" });
     await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
 

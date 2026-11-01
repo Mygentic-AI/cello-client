@@ -76,9 +76,9 @@ describe("DOD-M15-SELECTION-1 diagnosis: what a release actually leaves behind",
      * Clause 1, measured rather than argued.
      *
      * `clearedAgent` is per-connection and dies with the connection, so a reconnect carries none —
-     * which is why this looked like it must be broken. But `attended_by` counts connections whose
-     * REGISTERED current agent is this one, and the fallback never registers: it answers "which
-     * agent is this call about" and stops there.
+     * which is why this looked like it must be broken. But `holder` is set only by
+     * `cello_use_agent` or a waiting receive/await (M15D), and the fallback never takes a hold: it
+     * answers "which agent is this call about" and stops there.
      *
      * If this passes, the clause already holds and the remaining work is clause 2 only. If it
      * fails, the release is being undone by the fallback and that is the defect to fix.
@@ -102,9 +102,9 @@ describe("DOD-M15-SELECTION-1 diagnosis: what a release actually leaves behind",
     /**
      * THE FALLBACK MUST ACTUALLY RUN FIRST, or this test measures nothing. Review F1: the original
      * asked only `cello_list_agents`, which returns `getAgentsForConnection` and never resolves an
-     * agent at all. So `attended_by` was 0 for a reason with no connection to the property — and
-     * the mutation this test exists to catch (`connState.currentAgent = agent` inside the fallback
-     * branch) left it green.
+     * agent at all. So the attendance read was empty for a reason with no connection to the property
+     * — and the mutation this test exists to catch (a hold taken inside the fallback branch) left it
+     * green.
      *
      * `cello_list_sessions` is the cheapest call that DOES resolve, proven by the next test. Making
      * it the first call is what turns this from a restatement into a measurement.
@@ -124,11 +124,11 @@ describe("DOD-M15-SELECTION-1 diagnosis: what a release actually leaves behind",
     const solo = (listed.agents ?? []).find((a) => a["name"] === "solo");
     expect(solo, "the agent must still exist — releasing attends nothing, it does not remove").toBeDefined();
     expect(
-      solo?.["attended_by"],
+      solo?.["holder"],
       "After a release and a reconnect the agent is being ATTENDED by a connection that never " +
         "asked for it — so doorbells route to a session the operator deliberately let go of, and " +
         "an inbound session gets a live reply from a session that is not watching.",
-    ).toBe(0);
+    ).toBeNull();
     expect(
       solo?.["selected_by_this_connection"],
       "and the reconnected connection must not report it as its own selection",

@@ -117,11 +117,13 @@ describe("M8C-CURSOR-1: per-connection read cursor", () => {
   //
   // The clauses below are rewritten to lock the NEW boundary — including, explicitly, that the
   // counterparty half did NOT weaken.
+  // M15D: several connections on one agent are now ONE caller on several sockets (`connectEndpointAs`);
+  // two callers cannot share an agent.
   it("C4/C5 (rewritten, DOD-CURSOR-DURABLE-1): a second connection on the same agent is NO LONGER blocked by the first connection's own SENT message — but IS still blocked by unread COUNTERPARTY content", async () => {
     await fx.createSession(SID, "alice");
 
-    const connA = await fx.connectAs("alice");
-    const connB = await fx.connectAs("alice"); // second attended connection, SAME agent
+    const connA = await fx.connectEndpointAs("alice");
+    const connB = await fx.connectEndpointAs("alice"); // second attended connection, SAME agent
 
     const sendA = (await connA.send("cello_send", { session_id: SID, content: "from A" })) as Record<string, unknown>;
     expect(sendA.ok).toBe(true); // A's own send is never blocked
@@ -162,8 +164,8 @@ describe("M8C-CURSOR-1: per-connection read cursor", () => {
   it("C7 (reviewer HIGH fix, live reproduction of the reported bypass): draining ONLY a later counterparty-received message must not silently unblock a send that skips an unread local-sent leaf", async () => {
     await fx.createSession(SID, "alice");
 
-    const connA = await fx.connectAs("alice");
-    const connB = await fx.connectAs("alice");
+    const connA = await fx.connectEndpointAs("alice");
+    const connB = await fx.connectEndpointAs("alice");
 
     // leaf 0: connA sends (a LOCAL sent message connB has not read).
     const sendA = (await connA.send("cello_send", { session_id: SID, content: "from A" })) as Record<string, unknown>;
@@ -230,7 +232,7 @@ describe("M8C-CURSOR-1: per-connection read cursor", () => {
 
       // Attend FIRST (as C8 does): seeding while unattended trips M8C-AWAY-1's auto-ack, which
       // appends its own SENT leaf and muddies the exact sequence numbers this clause is about.
-      const attendant = await fx.connectAs("alice");
+      const attendant = await fx.connectEndpointAs("alice");
 
       seedReceived("alice", SID, "bob 1"); // received leaf 0
       expect(fx.snm.getLastDeliveredSeq("alice", SID)).toBe(-1); // nothing read yet
@@ -238,13 +240,13 @@ describe("M8C-CURSOR-1: per-connection read cursor", () => {
       // A fresh connection reads the TRANSCRIPT (not cello_receive) — the remedy the gate's guidance
       // names. Before AC3 this advanced only the dying connection cursor, so the next process was
       // still blocked and the documented remedy was a dead end for any stateless client.
-      const reader = await fx.connectAs("alice");
+      const reader = await fx.connectEndpointAs("alice");
       await reader.send("cello_get_transcript", { session_id: SID });
       reader.close();
       expect(fx.snm.getLastDeliveredSeq("alice", SID)).toBe(0); // PERSISTED — survives the socket
       expect(fx.snm.getUnreadReceivedCount("alice", SID)).toBe(0);
 
-      const sender = await fx.connectAs("alice");
+      const sender = await fx.connectEndpointAs("alice");
       const res = (await sender.send("cello_send", { session_id: SID, content: "reply" })) as Record<string, unknown>;
       expect(res.ok).toBe(true); // sent leaf (seq 2 after the reply)
 
@@ -254,7 +256,7 @@ describe("M8C-CURSOR-1: per-connection read cursor", () => {
       fx.snm.appendSessionLeaf("alice", SID, "msg", "bb".repeat(32), "hole"); // no transcript row
       const bob2Seq = seedReceived("alice", SID, "bob 2 (beyond the hole)");
 
-      const reader2 = await fx.connectAs("alice");
+      const reader2 = await fx.connectEndpointAs("alice");
       await reader2.send("cello_get_transcript", { session_id: SID });
       // The walk may advance THROUGH rows it actually saw (the reply it sent), but it must STOP at
       // the hole — so the watermark never reaches bob 2, and bob 2 stays unread. That is the whole

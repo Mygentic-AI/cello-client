@@ -215,7 +215,8 @@ describe("M8C-INBOX-1: cello_check_notifications + watermark + F4", () => {
     const client = await connect(config.socketPath);
 
     await client.send("cello_start_agent", { name: "bob" });
-    await client.send("cello_use_agent", { name: "alice" });   // an explicit choice (auto-starts alice)
+    await client.send("cello_start_agent", { name: "alice" });
+    await client.send("cello_use_agent", { name: "alice" });   // an explicit choice
     await client.send("cello_set_agent_offline", { name: "alice" });  // ...taken away. bob is now sole-online.
 
     // The dangerous outcome is ok:true carrying BOB's inbox.
