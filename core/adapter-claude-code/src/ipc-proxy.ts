@@ -29,6 +29,11 @@ export interface IpcProxyResult {
 export interface IpcProxyOptions {
   /** Replayed as `ipc.connect { clientType }` after a reconnect. */
   clientType?: string;
+  /**
+   * Web endpoint only (`clientType: "endpoint"`): stamped on every request's envelope (M15D contract
+   * C2). The endpoint sets it from the verified OAuth token; the daemon refuses it on any other socket.
+   */
+  caller?: { id: string; label: string };
 }
 
 const IPC_CONNECTION_LOST = {
@@ -69,6 +74,7 @@ const HANDSHAKE_TIMEOUT_MS = 5_000;
 export class IpcProxy {
   readonly #socketPath: string;
   readonly #clientType: string | undefined;
+  readonly #caller: { id: string; label: string } | undefined;
   #socket: Socket | null = null;
   /** True only after close() — an operator-initiated shutdown never reconnects. */
   #closedByUs = false;
@@ -98,6 +104,7 @@ export class IpcProxy {
       ? getDaemonIpcEndpoint(dirname(socketPath))
       : socketPath;
     this.#clientType = opts.clientType;
+    this.#caller = opts.caller;
   }
 
   /**
@@ -412,7 +419,7 @@ export class IpcProxy {
 
       this.#pending.set(id, { resolve: done, reject: () => done(IPC_RECONNECTING) });
 
-      const frame = JSON.stringify({ id, method, params }) + "\n";
+      const frame = JSON.stringify({ id, method, params, ...(this.#caller ? { caller: this.#caller } : {}) }) + "\n";
       try {
         this.#socket!.write(frame);
       } catch (err: unknown) {
