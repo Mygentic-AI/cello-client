@@ -933,6 +933,7 @@ export function send(
     governanceDecisions?: Record<string, string>;
     signal?: "over" | "standby" | "wrap";
     estMinutes?: number;
+    redactFlagged?: boolean;
   },
 ): Promise<CliOutput> {
   const { signal, estMinutes } = opts;
@@ -941,12 +942,38 @@ export function send(
     signal === "wrap" ? " [[WRAP]]" :
     signal === "standby" ? ` [[STANDBY EST:${estMinutes}m]]` :
     "";
-  return ipcCommand(
-    celloDir,
-    "cello_send",
-    defined({ session_id: sessionId, content: content + token, governance_decisions: opts.governanceDecisions }),
-    opts,
-  );
+  const params = defined({ session_id: sessionId, content: content + token, governance_decisions: opts.governanceDecisions });
+  if (opts.redactFlagged) {
+    return withDaemon(celloDir, opts, true, (client) => sendRedactingFlagged(client, params));
+  }
+  return ipcCommand(celloDir, "cello_send", params, opts);
+}
+
+/**
+ * `--redact-flagged`: a privacy warning costs the flagged value, not the message.
+ *
+ * The daemon holds a flagged message and names each flag, and only a re-send carrying a decision per
+ * flag lets it go. A script has no second step to take, so without this it loses the message.
+ *
+ * `redact` is the one decision an agent may always make, because the value is replaced by a typed
+ * placeholder and never leaves. This never sends `allow_once` or `allow_always`, so it can't loosen
+ * anything. Anything it can't answer comes back as it arrived, and nothing is sent.
+ */
+export async function sendRedactingFlagged(
+  client: { send(method: string, params?: Record<string, unknown>): Promise<unknown> },
+  params: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const first = (await client.send("cello_send", params)) as Record<string, unknown>;
+  if (first["reason"] !== "governance_warn") return first;
+
+  const flags = Array.isArray(first["flags"]) ? (first["flags"] as Array<Record<string, unknown>>) : [];
+  const answerable = flags.length > 0 && flags.every((f) => typeof f["flagId"] === "string" && f["flagId"] !== "");
+  if (!answerable) return first;
+
+  const decisions = Object.fromEntries(flags.map((f) => [f["flagId"] as string, "redact"]));
+  const second = (await client.send("cello_send", { ...params, governance_decisions: decisions })) as Record<string, unknown>;
+  if (second["ok"] !== true) return second;
+  return { ...second, redacted_flags: flags.map((f) => String(f["category"])) };
 }
 
 /**

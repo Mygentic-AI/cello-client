@@ -281,6 +281,11 @@ describe("Phases 1-2: parity commands forward the MCP params exactly", () => {
     expect(parity.send).toHaveBeenCalledWith(CELLO_DIR, "sid1", "hello", { agent: undefined, pretty: false, signal: "standby", estMinutes: 5 });
   });
 
+  it("send: --redact-flagged reaches parity.send and is not part of the message", async () => {
+    await run("send", ["sid1", "hello", "--standby", "5", "--redact-flagged"]);
+    expect(parity.send).toHaveBeenCalledWith(CELLO_DIR, "sid1", "hello", { agent: undefined, pretty: false, signal: "standby", estMinutes: 5, redactFlagged: true });
+  });
+
   it("send: --standby with no value returns invalid_est_minutes, not missing_signal", async () => {
     const result = await runOut("send", ["sid1", "hello", "--standby"]);
     expect(result.exitCode).toBe(1);

@@ -1170,7 +1170,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
     group: "Messaging",
     summary: "Send a message. Requires --over, --standby <min>, or --wrap. Blocked if you have unread messages.",
     help:
-      "Usage: cello send <session-id> <message…> --over|--standby <min>|--wrap [--stdin] [--agent <name>] [--pretty]\n\n" +
+      "Usage: cello send <session-id> <message…> --over|--standby <min>|--wrap [--stdin] [--redact-flagged] [--agent <name>] [--pretty]\n\n" +
       "  Every send REQUIRES exactly one signal flag declaring your next action:\n\n" +
       "    --over\n" +
       "        Your turn is complete. You are now entering read mode and waiting for\n" +
@@ -1189,20 +1189,26 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "  (for text with newlines/quotes).\n\n" +
       "  If the other side has said something you have not read, the send is REFUSED and tells you\n" +
       "  how many messages are waiting. Read them ('cello receive <session-id>', or 'cello transcript\n" +
-      "  <session-id>' for the whole conversation) and send again.",
+      "  <session-id>' for the whole conversation) and send again.\n\n" +
+      "  If the privacy check flags something in the message (an email, a phone number), the send is\n" +
+      "  HELD and nothing goes out. With --redact-flagged it goes out anyway, with each flagged value\n" +
+      "  replaced by a placeholder such as [REDACTED:pii:email], and the reply lists what was masked.\n" +
+      "  Use it in scripts, which cannot answer the warning. It never lets a flagged value through.",
     flags: [
       { name: "--agent", consumesValue: false },
       { name: "--stdin", consumesValue: false },
       { name: "--over", consumesValue: false },
       { name: "--standby", consumesValue: true },
       { name: "--wrap", consumesValue: false },
+      { name: "--redact-flagged", consumesValue: false },
     ],
     ipcMethod: IPC_METHODS.send,
     jsonOut: true,
     async run(ctx, args) {
       const { agent, pretty, positional } = parityOpts(args);
       const useStdin = positional.includes("--stdin");
-      const rest = positional.filter((a) => a !== "--stdin");
+      const redactFlagged = positional.includes("--redact-flagged");
+      const rest = positional.filter((a) => a !== "--stdin" && a !== "--redact-flagged");
 
       // Extract signal flags.
       // takeValueFlag consumes "--standby" from `rest` regardless of whether a value follows — it
@@ -1267,7 +1273,7 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
 
       const sessionId = positionalOnly[0] ?? "";
       const content = useStdin ? await readStdin() : positionalOnly.slice(1).join(" ");
-      return send(ctx.celloDir, sessionId, content, { agent, pretty, signal, estMinutes });
+      return send(ctx.celloDir, sessionId, content, { agent, pretty, signal, estMinutes, ...(redactFlagged ? { redactFlagged } : {}) });
     },
   },
   {
