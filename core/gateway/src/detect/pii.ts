@@ -90,6 +90,33 @@ function isPlausiblePhone(value: string): boolean {
   return digits.length >= 7;
 }
 
+/**
+ * A HASH IS NOT A PHONE NUMBER, and agents quote hashes constantly.
+ *
+ * `PHONE_RE` is the one pattern with no word boundary, so the digits `857081282` inside a SHA-256
+ * matched. Whether a message went through depended on what a hash happened to contain: a live report
+ * holding only a transcript hash was refused for it (2026-11-02).
+ *
+ * Masked before `PHONE_RE` runs, the same way valid IPs are, so a number beside a hash is still
+ * caught and its reported value does not swallow the hash.
+ *
+ * The token must be at least 32 hex characters, the shortest hash we send, or a UUID. It must also
+ * contain a hex letter, so a long run of digits still warns: padding a number with zeros must not
+ * hide it (review F4 above).
+ *
+ * The limit, accepted: a number deliberately buried in 32 hex characters now passes. That is no new
+ * hole, because this guard catches contact details sent in the open and hex-encoding a number has
+ * always passed it. It does not stop deliberate exfiltration.
+ */
+const LONG_HEX_RE = /\b[0-9a-fA-F]{32,}\b/g;
+const UUID_RE = /\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/g;
+const HEX_LETTER_RE = /[a-fA-F]/;
+
+function maskHashes(text: string): string {
+  const mask = (m: string) => (HEX_LETTER_RE.test(m) ? "_".repeat(m.length) : m);
+  return text.replace(UUID_RE, mask).replace(LONG_HEX_RE, mask);
+}
+
 function flagIdFor(category: string, value: string): string {
   return createHash("sha256").update(`${category}:${value}`).digest("hex").slice(0, 12);
 }
@@ -189,7 +216,7 @@ export class OutboundPIIScreener {
     // falls through as pii:phone, and PHONE_RE never greedily bridges across an IP into an adjacent
     // phone number (which would either collide with pii:ip and drop the phone warn, or pollute the
     // phone candidate's value/span with the preceding IP).
-    const phoneText = text.replace(IP_RE, (m) => (parseIpv4Octets(m) !== null ? "_".repeat(m.length) : m));
+    const phoneText = maskHashes(text.replace(IP_RE, (m) => (parseIpv4Octets(m) !== null ? "_".repeat(m.length) : m)));
     collect(phoneText, PHONE_RE, "pii:phone", 4, isPlausiblePhone);
 
     // Resolve overlaps: a higher-priority (more specific) match wins its character span.
