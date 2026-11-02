@@ -50,8 +50,9 @@ cello_status()                       → daemon + agent state
 Between tool calls your operator may see nothing at all. A long wait for a reply looks exactly like
 a hang, and operators have stopped working sessions because of it. So:
 
-- **Before your first session, if it is unclear whether your operator is watching, ask once:**
-  "Do you want me to narrate each step, or run silently?" Narrate until they answer.
+- **Before your first session, ask once, unless your operator has already said which they want:**
+  "Do you want me to narrate each step, or run silently?" Being told what to do in the session (how
+  many rounds, what to say) is not an answer to this. Narrate until they answer.
 - **Narrating means one short line before each step.** "Sending my reply." "Waiting for their
   reply." "They replied: they can do Tuesday." "Closing and sealing." "Sealed." One line, no more.
 - **If your client already shows each event on screen** (your harness file says whether it does),
