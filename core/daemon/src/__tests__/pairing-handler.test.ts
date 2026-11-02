@@ -204,27 +204,27 @@ describe("cello_pair_status — the reliable, non-log 'approved?' signal", () =>
   it("reports paired:true with the account id once a device credential is stored (approved)", async () => {
     const cred = await credentialFor(store.daemonKey().pubkeyHex);
     store.saveCredential(cred);
-    expect(await statusHandler(1_000)(undefined, "c")).toEqual({ ok: true, paired: true, account_id: ACCOUNT });
+    expect(await statusHandler(1_000)(undefined, "c")).toEqual({ ok: true, paired: true, account_id: ACCOUNT, daemon_pubkey: store.daemonKey().pubkeyHex });
   });
 
   it("paired:false, pending:true while a device code is live but unapproved", async () => {
     store.savePending({ code: "ABCD1234", base: "https://d.example", expiresAt: 61_000, approveUrl: "https://p/approve" });
-    expect(await statusHandler(1_000)(undefined, "c")).toEqual({ ok: true, paired: false, pending: true });
+    expect(await statusHandler(1_000)(undefined, "c")).toEqual({ ok: true, paired: false, pending: true, daemon_pubkey: store.daemonKey().pubkeyHex });
   });
 
   it("paired:false, pending:false when no pairing has been opened", async () => {
     store.daemonKey(); // the daemon-key row exists, but no credential and no pending
-    expect(await statusHandler(1_000)(undefined, "c")).toEqual({ ok: true, paired: false, pending: false });
+    expect(await statusHandler(1_000)(undefined, "c")).toEqual({ ok: true, paired: false, pending: false, daemon_pubkey: store.daemonKey().pubkeyHex });
   });
 
   it("paired:false, pending:false once the code has expired — an expired code is not 'pending'", async () => {
     store.savePending({ code: "ABCD1234", base: "https://d.example", expiresAt: 500, approveUrl: "https://p/approve" });
-    expect(await statusHandler(1_000)(undefined, "c")).toEqual({ ok: true, paired: false, pending: false });
+    expect(await statusHandler(1_000)(undefined, "c")).toEqual({ ok: true, paired: false, pending: false, daemon_pubkey: store.daemonKey().pubkeyHex });
   });
 
   it("credential present wins even if a stale pending row is also live — it never blocks or polls", async () => {
     store.savePending({ code: "ABCD1234", base: "https://d.example", expiresAt: 61_000, approveUrl: "https://p/approve" });
     store.saveCredential(await credentialFor(store.daemonKey().pubkeyHex));
-    expect(await statusHandler(1_000)(undefined, "c")).toEqual({ ok: true, paired: true, account_id: ACCOUNT });
+    expect(await statusHandler(1_000)(undefined, "c")).toEqual({ ok: true, paired: true, account_id: ACCOUNT, daemon_pubkey: store.daemonKey().pubkeyHex });
   });
 });

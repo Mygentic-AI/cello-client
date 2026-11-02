@@ -610,7 +610,7 @@ export async function pairStatus(celloDir: string): Promise<CommandResult> {
   }
   try {
     const result = (await withIpc(lock.socketPath, (client) => client.send("cello_pair_status"))) as {
-      ok: boolean; paired?: boolean; pending?: boolean; account_id?: string;
+      ok: boolean; paired?: boolean; pending?: boolean; account_id?: string; daemon_pubkey?: string;
     };
     return { exitCode: 0, output: JSON.stringify(result, null, 2) };
   } catch (err: unknown) {

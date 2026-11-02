@@ -168,10 +168,14 @@ export function registerPairingHandlers(deps: PairingHandlerDeps): void {
   // directory-signed credential is stored (the owner clicked approve), so re-running
   // `cello register-agent` finishes registration with the stored credential and never opens a new
   // pairing. pending:true distinguishes "a code is live, still waiting" from "no pairing at all".
+  // daemon_pubkey is this device's own key — the one the owner approves and the portal lists. The
+  // hosting provisioner records it so the portal can label the device "CELLO hosted"; an agent's
+  // key is a different key and never matches the devices list.
   handlers.set("cello_pair_status", async () => {
+    const daemon_pubkey = pairingStore.daemonKey().pubkeyHex;
     const credential = pairingStore.credential();
-    if (credential) return { ok: true, paired: true, account_id: credential.account_id };
+    if (credential) return { ok: true, paired: true, account_id: credential.account_id, daemon_pubkey };
     const stored = pairingStore.pending();
-    return { ok: true, paired: false, pending: !!stored && now() < stored.expiresAt };
+    return { ok: true, paired: false, pending: !!stored && now() < stored.expiresAt, daemon_pubkey };
   });
 }
