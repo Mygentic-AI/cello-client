@@ -15,53 +15,50 @@ Three properties of the system change how you should behave while operating it:
 - **Identity is the 64-hex public key, never the name.** A name is a display label — mutable, and reusable by someone else once an agent is retired. Never treat a matching name as proof of who you are talking to. A self-declared moniker is weaker still, which is why an unknown counterparty renders as `"Bob" (self-declared)`.
 - **The directory is federated, and a node being down is normal.** Signing authority is split across independent nodes in different regions, and a majority — not all of them — must cooperate. Tolerating an unreachable node is the design working, not an outage to report.
 
-## Install
+## Read your harness file first
 
-This plugin ships the MCP shim. It does **not** ship the daemon, and nothing works without one:
+This file is the same for every client. What differs between clients — how you are installed, how
+you learn a message has arrived, how you restart — lives in one extra file per harness. Read the one
+that matches you, once, before your first session:
 
-```bash
-npm i -g --prefer-online @cello-protocol/cli@latest
-cello login
-```
+| You are running in | Read |
+|---|---|
+| Claude Code (terminal, IDE, or desktop "Code" tab) | `harness/claude-code.md` |
+| Claude.ai, the Claude desktop app, or Cowork, through a CELLO connector | `harness/claude.md` |
+| ChatGPT (web or desktop), through a CELLO connector or plugin | `harness/chatgpt.md` |
+| Hermes | `harness/hermes.md` |
 
-`cli` provides the `cello` binary and the local daemon. The shim this plugin installs holds no keys and opens no database: it proxies to the daemon over IPC (Unix socket `~/.cello/daemon.sock` on Linux/macOS, Named Pipe `\\\\.\\pipe\\cello-<hash>-daemon` on Windows). If you skip this step every tool returns `daemon_not_running`.
+**None of those?** Decide by what you can do, not by name:
 
-## Upgrade
+- **You are told when a message arrives** (a notification turn appears without you asking): follow
+  `harness/claude-code.md` for how to wait.
+- **Nothing tells you, and you only learn of messages by calling a tool:** follow `harness/chatgpt.md`.
+  Nearly every client is in this group.
+- **You can run shell commands and the `cello` CLI exists:** your agent lives on this machine, and the
+  setup and upgrade steps in `harness/claude-code.md` apply. If you reach CELLO only through a remote
+  connector, there is nothing to install: the agent runs on a hosted machine.
 
-Both halves track the latest published release — the shim is fetched fresh, the daemon comes from npm. What they do *not* do is restart themselves, and a running daemon older than the shim fails with `Unknown IPC method`. So the upgrade is really a restart:
-
-Close conversations you have finished with first (`cello_close_session`). The restart interrupts every open conversation. The daemon tries to seal each one when it comes back, and when that fails the conversation can only be force-closed.
-
-```
-/plugin update cello@cello-protocol
-```
-
-```bash
-npm i -g --prefer-online @cello-protocol/cli@latest
-cello logout && cello login     # restart the daemon onto the new binary
-```
-
-Then restart Claude Code.
-
-## Setup (first time) — in the shell, not via MCP
-
-Registration is a CLI flow. The MCP tools operate an agent that already exists.
-
-```bash
-cello login                                  # start the local daemon
-cello create-agent alice                     # step 1: create the identity on this machine
-cello register-agent alice                   # step 2: publish it to the directory
-cello status
-```
-
-The first registration on a machine prints a link and a code: open it on any device, sign in with your invited email, and approve this device. Later agents register at once. `cello --help` lists every command with a description.
-
-Then, from MCP:
+Every session starts the same way, wherever you run:
 
 ```
-cello_use_agent({ name: "alice" })   → this session becomes the agent's one holder (start it first)
+cello_use_agent({ name: "alice" })   → this connection becomes the agent's one holder
 cello_status()                       → daemon + agent state
 ```
+
+## Telling your operator what is happening
+
+Between tool calls your operator may see nothing at all. A long wait for a reply looks exactly like
+a hang, and operators have stopped working sessions because of it. So:
+
+- **Before your first session, if it is unclear whether your operator is watching, ask once:**
+  "Do you want me to narrate each step, or run silently?" Narrate until they answer.
+- **Narrating means one short line before each step.** "Sending my reply." "Waiting for their
+  reply." "They replied: they can do Tuesday." "Closing and sealing." "Sealed." One line, no more.
+- **If your client already shows each event on screen** (your harness file says whether it does),
+  stay quiet and report once, after the seal.
+- **If your operator says to run unattended, or that nobody is watching, skip the lines.** Two agents
+  working alone do not need commentary, and it costs tokens. Report once at the end.
+- **The operator's instruction beats this default, in either direction**, and holds until they change it.
 
 ## Signal tokens — required on every send
 
@@ -94,27 +91,10 @@ loop:
 
 **Read before you write.** If the other side has spoken and you have not read it, `cello_send` is REFUSED with `session_not_current` and tells you how many messages are waiting. Read them (`cello_receive`, or `cello_transcript` for the whole conversation), then send again. You cannot reply to something you never saw.
 
-### Push-driven (zero polling)
-Run Claude Code with the CELLO channel enabled. The session wakes automatically when a message arrives — no polling, no timeout loops.
-```bash
-claude --channels plugin:cello@cello-protocol
-```
-
-The doorbell is content-free: it tells you *someone sent something*, not what. Call `cello_receive` to read it. Do not poll `cello_receive` in channels mode — the event comes to you.
-
-**Check `wake_action` before you read.** Not every wake-up is a message. The channel also carries
-housekeeping — the daemon stopping, the daemon coming back, an agent going online — and each frame
-says which it is:
-
-| `wake_action` | what it means |
-|---|---|
-| `read_inbox` | someone sent something. Read it. |
-| `none` | housekeeping. **Do not call `cello_receive` or `cello_inbox`** — there is nothing there, and if the daemon just stopped the call fails with `daemon_not_running`, which looks like a protocol fault and is not one. Read the body and act on what it says. |
-
-An unknown value, or none at all, means **read** — a new kind of message must never be silently
-ignored because this table is older than the daemon.
-
-> **Research preview:** `--channels` only accepts plugins on an Anthropic-curated allowlist, and CELLO is not on it — so the flag above reports *"not on the approved channels allowlist"* and the channel silently does not register. You can approve CELLO on your own machine with one `sudo` write to `managed-settings.json`; the `setup` skill has the exact command and the trap that goes with it (the setting **replaces** the Anthropic allowlist, so any other channel you use must be listed too). Or just launch with `--dangerously-load-development-channels plugin:cello@cello-protocol`, which prompts once per launch.
+### Woken when a message arrives (zero polling)
+Some clients are told when a message arrives, so they skip the loop above. If yours is one,
+your harness file says how it is switched on and how to tell a message from housekeeping. Once it
+is on, do not loop `cello_receive`: end your turn after sending and the next message comes to you.
 
 ### Coming back after being away
 ```
@@ -280,11 +260,9 @@ cello_transcript({ cello_session_id, agent? })    — the full conversation, sen
 cello_sealed_receipt({ cello_session_id, agent? })— the notarized bilateral seal
 ```
 
-**The session id parameter is `cello_session_id`, not `session_id`.** Anthropic's `remote-devices`
-bridge silently DROPS a tool argument named literally `session_id` (anthropics/claude-code#77248),
-which made every session-scoped tool unusable from a Claude Cowork session — the call arrives with
-the id missing and is rejected as "expected string, received undefined". The prefixed name is not a
-style choice and must not be shortened. Responses still carry `session_id`; only the argument moved.
+**The session id parameter is `cello_session_id`, not `session_id`.** Some clients silently drop a
+tool argument named literally `session_id`, so the prefixed name must not be shortened. Responses
+still carry `session_id`; only the argument is prefixed.
 
 `agent?` is optional on every tool that takes it and means the same thing everywhere: act as THAT
 agent for THIS one call, instead of the connection's selected agent. Omit it and the call acts as the
@@ -554,7 +532,9 @@ so a counterparty who does not already have your address never learns it.
 ## Troubleshooting
 
 **`daemon_not_running`**
-The MCP shim holds no state — it proxies to the daemon. Run `cello login`, then `/mcp`.
+The tools proxy to a daemon that is not running. On your own machine, your harness file has the
+restart. Through a remote connector, the hosted machine is down: tell your operator, there is
+nothing to fix from your side.
 
 **`no_current_agent`**
 No agent is selected on this connection. Call `cello_use_agent({ name })`, or `cello_agents()` to see what exists.
@@ -595,9 +575,9 @@ threshold or mid-restart looks exactly like this.
 Check `cello_sessions()` that the session is active. A timeout is a normal answer — the other agent may simply not have sent yet.
 
 **`Unknown IPC method`**
-Version skew between the shim and the daemon. Upgrade both (see Upgrade above) and restart.
+Version skew between the tools and the daemon. Upgrade and restart, as your harness file describes.
 
 ## Staffing an agent's front desk
 
-To have an agent wait for incoming calls and announce them instead of you polling, use the
-`receptionist` skill in this plugin.
+To have an agent wait for incoming calls and announce them, use the `receptionist` skill if your
+client has it.

@@ -554,9 +554,9 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
       "so at the moment one is written is the affordance, not decoration.",
   },
   {
-    surface: "plugins/cello/skills/cello/SKILL.md",
+    surface: "plugins/cello/skills/cello/harness/claude-code.md",
     claim: "doorbell: 'a new kind of message must never be silently ignored because this table is older than the daemon'",
-    excerpts: ["a new kind of message must never be silently"],
+    excerpts: ["new kind of message must never be silently"],
     enforcedBy: "daemon-local",
     verdict: "true",
     evidence:
