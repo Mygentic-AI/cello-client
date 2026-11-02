@@ -201,6 +201,13 @@ describe("launch triage item 5 — a plugin install must not dead-end at a missi
 
       // Order: the install must come before the login in the text read top to bottom.
       expect(guidance.indexOf("npm i -g")).toBeLessThan(guidance.indexOf("cello login"));
+
+      // ChatGPT desktop can install CELLO locally (this plugin) or hosted (a connector URL), and
+      // someone who wanted hosted lands here with nothing installed. The message must say what
+      // this plugin is, before any command, and name the hosted route as the way out.
+      expect(guidance).toMatch(/^This plugin runs CELLO on your computer/);
+      expect(guidance).toMatch(/hosted agent/i);
+      expect(guidance).toMatch(/connector URL/i);
     } finally {
       cleanup();
     }

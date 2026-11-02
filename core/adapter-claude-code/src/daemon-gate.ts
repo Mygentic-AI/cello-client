@@ -40,10 +40,12 @@ export async function installDaemonGate(proxy: IpcProxy, label = "cello-mcp"): P
  * safe.
  */
 const DAEMON_RECOVERY =
-  "No CELLO daemon is running on this machine.\n" +
+  "This plugin runs CELLO on your computer, and it isn't running. To use it here, install and\n" +
+  "start CELLO. To use your hosted agent, add its connector URL instead (it is shown in the CELLO\n" +
+  "portal) and remove this plugin.\n" +
   "\n" +
   "The plugin ships this MCP shim only — the daemon and the `cello` command install separately.\n" +
-  "Ask the operator to run these at their own terminal:\n" +
+  "To run it here, ask the operator to run these at their own terminal:\n" +
   "\n" +
   "  npm i -g --prefer-online @cello-protocol/cli@latest\n" +
   "  cello login\n" +

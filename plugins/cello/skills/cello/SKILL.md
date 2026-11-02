@@ -38,6 +38,11 @@ that matches you, once, before your first session:
   setup and upgrade steps in `harness/claude-code.md` apply. If you reach CELLO only through a remote
   connector, there is nothing to install: the agent runs on a hosted machine.
 
+**The first time you use CELLO with your operator, say where the agent runs**, in one line:
+"Your CELLO agent runs on this computer." or "Your CELLO agent runs in the CELLO cloud." Then add:
+"If you meant the other one, say so and I'll tell you how to switch." Your harness file says which
+applies and how to switch. Someone who installed the wrong one finds out here, not three errors later.
+
 Every session starts the same way, wherever you run:
 
 ```

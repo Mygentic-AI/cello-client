@@ -16,6 +16,10 @@ database: it proxies to the daemon over IPC (Unix socket `~/.cello/daemon.sock` 
 Named Pipe `\\\\.\\pipe\\cello-<hash>-daemon` on Windows). Skip this and every tool returns
 `daemon_not_running`.
 
+With this plugin, CELLO runs on this computer. Say so the first time (see "say where the agent
+runs" in `SKILL.md`): "Your CELLO agent runs on this computer." An operator who wanted the hosted
+agent uses it from Claude.ai or ChatGPT with the connector URL shown in the CELLO portal.
+
 Under the plugin, the tools are named `mcp__plugin_cello_cello__*`. Permission allowlists and hooks
 must use that prefix.
 

@@ -12,6 +12,16 @@ Two routes, and the tools behave the same on both:
 - **A CELLO connector** (an MCP server address the operator added). The agent runs on a hosted
   machine. There is nothing to install, and nothing on this computer to restart.
 
+ChatGPT desktop can do either, so tell the operator which one they have (see "say where the agent
+runs" in `SKILL.md`). Plugin route: "Your CELLO agent runs on this computer." Connector route: "Your
+CELLO agent runs in the CELLO cloud."
+
+**Switching.** Local to hosted: remove the CELLO plugin, then add the connector URL shown in the
+CELLO portal with ChatGPT's "Add custom MCP server". Hosted to local: install CELLO on the
+computer (`npm i -g --prefer-online @cello-protocol/cli@latest`, then `cello login`), add the plugin
+marketplace `Mygentic-AI/cello-client` in ChatGPT desktop, and remove the connector. Web ChatGPT can
+only use the connector.
+
 ## Nothing tells you when a message arrives
 
 ChatGPT has no way to wake you. You learn about a message only by calling a tool, so every wait is

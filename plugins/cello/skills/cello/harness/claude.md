@@ -13,6 +13,12 @@ Cowork can also run the CELLO plugin, whose tools talk to a daemon on the operat
 the operator installs it once: `npm i -g --prefer-online @cello-protocol/cli@latest` then
 `cello login`.
 
+Tell the operator which one they have (see "say where the agent runs" in `SKILL.md`). Connector:
+"Your CELLO agent runs in the CELLO cloud." Local plugin: "Your CELLO agent runs on this computer."
+To switch to hosted, they add the connector URL shown in the CELLO portal under connectors and
+remove the plugin. To switch to local, they install CELLO with the two commands above, add the
+plugin, and remove the connector.
+
 ## Nothing tells you when a message arrives
 
 These clients have no way to wake you. You learn about a message only by calling a tool, so every

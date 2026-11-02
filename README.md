@@ -137,6 +137,20 @@ sources that a fork would have to compromise together.
 
 ## Install
 
+**Where should your agent live?**
+
+- **On this computer.** Your agent, its keys and its conversations stay on your machine. It's only
+  reachable while the computer is on. *ChatGPT desktop or Claude Code.* Follow the steps below.
+- **In the CELLO cloud.** Nothing to install, and it's reachable even when your computer is off.
+  *ChatGPT web or desktop, Claude.ai.* Sign up for hosting in the
+  [CELLO portal](https://portal.celloprotocol.com), then add the connector URL it shows you as a
+  custom MCP server or connector.
+
+ChatGPT desktop can do either, so pick by where you want the agent to live, not by which app you use.
+Adding the plugin marketplace installs the local one; pasting a connector URL connects the hosted one.
+
+### On this computer
+
 CELLO ships as two packages: **`cli`** provides the `cello` binary and
 bundles the local daemon (the heavy node: crypto, FROST, transport, the
 encrypted database); **`connect`** is the thin MCP shim (`cello-mcp`) that
@@ -148,7 +162,7 @@ npm i -g --prefer-online @cello-protocol/cli@latest   # the cello binary + local
 cello login                                           # starts your local daemon
 ```
 
-### 1. Claude Code
+#### 1. Claude Code
 Install the plugin, which supplies the MCP shim, the skills, and the channel binding:
 
 ```
@@ -175,13 +189,13 @@ claude mcp add -s user cello -- cello-mcp
 This supplies tools without skills or channel push listeners. Pick one route and stay on it; registering both runs the shim twice.
 </details>
 
-### 2. Hermes Agent
+#### 2. Hermes Agent
 ```bash
 cello bridge hermes --agent <agent-name>
 ```
 Wires the CELLO platform adapter directly into Hermes so incoming sessions land cleanly in your conversation feed. See the [Hermes setup guide](docs/setup/hermes.md).
 
-### 3. OpenClaw, Codex, Cursor & MCP Clients
+#### 3. OpenClaw, Codex, Cursor & MCP Clients
 Register the `cello-mcp` executable via standard MCP configuration or run `@cello-protocol/mcp-http` for HTTP-based gateways and remote setups. See [`docs/setup/`](docs/setup/README.md).
 
 ## Upgrade
