@@ -22,6 +22,7 @@ import { addColumnIfMissing } from "./column-birth.js";
 import { migrateSessionTablesToAgentId } from "./agent-id-migration.js";
 import { migrateContactsAddTierMetadata } from "./contacts-tier-migration.js";
 import { migrateCborBlobsToCanonical } from "./cbor-blob-migration.js";
+import { migrateRetiredRelayDomain } from "./retired-relay-domain.js";
 import { foldContactPubkeyCase } from "./contact-pubkey-case.js";
 import { ensureTrustSignalSchema } from "./trust-signal-store.js";
 import { ensurePolicySchema } from "./policy-store.js";
@@ -739,6 +740,9 @@ export function ensureSessionSchema(
   // undecodable share is LEFT ALONE, never dropped — losing key material is worse than an old
   // encoding cbor-x still reads).
   migrateCborBlobsToCanonical(db, logger);
+
+  // Stored relay addresses naming the retired domain fail every dial. Runs before anything reads them.
+  migrateRetiredRelayDomain(db, logger);
 
   // M8C-TGDOOR-1: daemon-wide Telegram settings (bot token + allowlisted operator chat). A
   // NEW dedicated table — NOT folded into the parked M9-CFG-001 config store, because a bot
