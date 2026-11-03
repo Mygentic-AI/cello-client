@@ -21,6 +21,7 @@ import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
 import { spawnGatewaySidecar } from "../spawn.js";
 import { LocalSidecarGatewayClient } from "../client.js";
+import { GatewayConfigStore } from "../config/config-store.js";
 
 const PKG_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
@@ -76,6 +77,11 @@ describe("DOD-M9B-ENV-1 — the environment is not a config surface", () => {
     try {
       const keyPath = join(dir, "store.key");
       await writeFile(keyPath, randomBytes(32), { mode: 0o600 });
+      // The email check is off by default, so turn it on: otherwise this message passes with the
+      // environment doing nothing, and the assertion below proves nothing about the bypass.
+      const store = new GatewayConfigStore(join(dir, "gateway.db"), keyPath);
+      expect(store.set("pii_check_email", true).ok).toBe(true);
+      store.close();
       const sidecar = await spawnGatewaySidecar({
         socketPath: join(dir, "gw.sock"),
         // The BUILT bin: this test runs from source, where the spawner's default entry
