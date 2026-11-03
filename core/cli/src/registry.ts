@@ -1190,10 +1190,10 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "  If the other side has said something you have not read, the send is REFUSED and tells you\n" +
       "  how many messages are waiting. Read them ('cello receive <session-id>', or 'cello transcript\n" +
       "  <session-id>' for the whole conversation) and send again.\n\n" +
-      "  If the privacy check flags something in the message (an email, a phone number), the send is\n" +
-      "  HELD and nothing goes out. With --redact-flagged it goes out anyway, with each flagged value\n" +
-      "  replaced by a placeholder such as [REDACTED:pii:email], and the reply lists what was masked.\n" +
-      "  Use it in scripts, which cannot answer the warning. It never lets a flagged value through.",
+      "  If the privacy check flags something in the message (a card number, say), the send is HELD\n" +
+      "  and nothing goes out. With --redact-flagged it goes out with each flagged value replaced by a\n" +
+      "  placeholder such as [REDACTED:pii:credit_card], and the reply lists what was masked. Use it in\n" +
+      "  scripts, which have no way to answer the warning.",
     flags: [
       { name: "--agent", consumesValue: false },
       { name: "--stdin", consumesValue: false },
