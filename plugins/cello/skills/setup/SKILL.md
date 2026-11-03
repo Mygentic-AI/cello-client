@@ -165,11 +165,15 @@ cello config list
 ```
 
 Every guard ships **unset** (`value: null`, `confirmed: false`), running on built-in defaults:
-`autonomous_override`, `pii_whitelist`, `language_allow`, `rate_max_per_window`, `rate_window_ms`.
+`autonomous_override`, `pii_whitelist`, `pii_check_email`, `pii_check_phone`, `language_allow`,
+`rate_max_per_window`, `rate_window_ms`.
+
+Outbound messages are not checked for email addresses or phone numbers unless you turn that on with
+`pii_check_email` or `pii_check_phone`. Card numbers, SSNs, IP addresses and secrets are always checked.
 
 You can read them and make them **stricter** from any surface. Making them **looser** — enabling
-`autonomous_override`, adding to the PII whitelist, allowing another language, raising the rate cap
-or shortening its window — is refused from the agent surface and must be done by a human at their own
+`autonomous_override`, adding to the PII whitelist, turning an email or phone check back off, allowing
+another language, raising the rate cap or shortening its window — is refused from the agent surface and must be done by a human at their own
 terminal. That is deliberate: an agent must not be able to weaken its own guards, least of all
 because an incoming message asked it to.
 

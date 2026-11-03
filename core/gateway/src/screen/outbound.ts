@@ -44,6 +44,9 @@ export interface OutboundScreenerOptions {
   rateLimit?: RateLimitConfig;
   piiBulkThreshold?: number;
   piiCumulativeThreshold?: number;
+  /** Whether to check for email addresses and phone numbers. See `PIIScreenerOptions`. */
+  piiCheckEmail?: boolean;
+  piiCheckPhone?: boolean;
   /** Injectable clock (for the rate limiter) — tests pass a controllable one. */
   now?: () => number;
   /**
@@ -153,6 +156,8 @@ export class OutboundScreener {
       whitelist: opts.piiWhitelist ?? [],
       ...(opts.piiBulkThreshold !== undefined ? { bulkThreshold: opts.piiBulkThreshold } : {}),
       ...(opts.piiCumulativeThreshold !== undefined ? { cumulativeThreshold: opts.piiCumulativeThreshold } : {}),
+      ...(opts.piiCheckEmail !== undefined ? { checkEmail: opts.piiCheckEmail } : {}),
+      ...(opts.piiCheckPhone !== undefined ? { checkPhone: opts.piiCheckPhone } : {}),
     });
   }
 

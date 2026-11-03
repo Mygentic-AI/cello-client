@@ -1943,6 +1943,8 @@ const ALL_COMMANDS: readonly CommandSpec[] = [
       "Usage: cello config list | cello config get <key> | cello config set <key> <value>\n" +
       "  The security layer's own guards. Per-INSTALL, not per-agent — they apply to every agent here.\n" +
       "  Keys: autonomous_override (true|false), pii_whitelist (comma-separated, empty string clears),\n" +
+      "        pii_check_email, pii_check_phone (true/false, default false: hold messages containing\n" +
+      "        an email address or what looks like a phone number),\n" +
       "        language_allow (comma-separated scripts), language_enforce (true/false, default false:\n" +
       "        mail outside your languages is delivered with a note instead of refused),\n" +
       "        rate_max_per_window (number, 0 = no cap), rate_window_ms.\n" +

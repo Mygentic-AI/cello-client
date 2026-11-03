@@ -65,6 +65,8 @@ import { extractErrorMessage } from "./error-message.js";
 export const GATEWAY_CONFIG_KEYS = [
   "autonomous_override",
   "pii_whitelist",
+  "pii_check_email",
+  "pii_check_phone",
   "language_allow",
   "language_enforce",
   "rate_max_per_window",
@@ -74,7 +76,9 @@ export const GATEWAY_CONFIG_KEYS = [
 /** What each key controls, in the words an operator needs to decide whether to change it. */
 const KEY_HELP: Record<string, string> = {
   autonomous_override: "whether the agent may send a flagged value with no human present",
-  pii_whitelist: "values (e.g. your own email) that pass outbound without a warning",
+  pii_whitelist: "values (e.g. your own email) that pass outbound without a warning when their check is on",
+  pii_check_email: "hold outbound messages containing an email address (default: off)",
+  pii_check_phone: "hold outbound messages containing what looks like a phone number; also catches lists of numbers such as versions (default: off)",
   language_allow: "which scripts count as your languages (latin, cyrillic, greek, arabic, hebrew, han, kana, hangul, devanagari, thai) — only used when language_enforce is on",
   language_enforce: "refuse mail outside your languages instead of delivering it with a note (default: off)",
   rate_max_per_window: "how many outbound messages are allowed per window (0 = no cap)",
@@ -96,7 +100,7 @@ export interface GatewayConfigHandlerDeps {
 
 /** Parse a wire value into the type the store's validator expects for that key. */
 function coerce(key: string, raw: unknown): { ok: true; value: unknown } | { ok: false; reason: string } {
-  if (key === "autonomous_override" || key === "language_enforce") {
+  if (key === "autonomous_override" || key === "language_enforce" || key === "pii_check_email" || key === "pii_check_phone") {
     if (typeof raw === "boolean") return { ok: true, value: raw };
     if (raw === "true" || raw === "false") return { ok: true, value: raw === "true" };
     return { ok: false, reason: `${key} is a boolean — pass true or false.` };

@@ -213,6 +213,23 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     return spawnGateway(tag, { CELLO_GATEWAY_STORE_DB: db, CELLO_GATEWAY_STORE_KEY_FILE: keyFile });
   }
 
+  /**
+   * The email check is off by default (owner decision, 2026-11-03). These tests guard the warn,
+   * whitelist and re-send machinery, which still has to work for an operator who turns it on, so
+   * they turn it on rather than assume it. `extra` seeds further settings on the same store.
+   */
+  async function spawnEmailCheckingGateway(tag: string, extra?: (store: GatewayConfigStore) => void) {
+    const db = join(tempDir, `${tag}-email.db`);
+    const keyFile = join(tempDir, `${tag}-email.key`);
+    writeFileSync(keyFile, randomBytes(32), { mode: 0o600 });
+    const store = new GatewayConfigStore(db, keyFile);
+    // Turning a check on TIGHTENS, so it needs no confirmation.
+    expect(store.set("pii_check_email", true).ok).toBe(true);
+    extra?.(store);
+    store.close();
+    return spawnGateway(tag, { CELLO_GATEWAY_STORE_DB: db, CELLO_GATEWAY_STORE_KEY_FILE: keyFile });
+  }
+
   async function bringUpSession(opts: { aGatewaySock?: string; bGatewaySock?: string; aGatewayClient?: SecurityGatewayClient; bGatewayClient?: SecurityGatewayClient }): Promise<{
     clientA: Awaited<ReturnType<typeof connectToDaemon>>;
     clientB: Awaited<ReturnType<typeof connectToDaemon>>;
@@ -519,8 +536,26 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       expect(recvText(recv)!).toContain("ok");
     }, 40_000);
 
-    it("warn (non-whitelisted PII) → NOT sent: governance_warn + flags; the peer receives nothing", async () => {
+    it("by default an email and a phone number go through intact: both checks are off", async () => {
       const a = await spawnGateway("ga");
+      const b = await spawnGateway("gb");
+      const { clientA, clientB } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
+      const content = "reach me at stranger@other.example or 415-555-2671";
+      const sent = await clientA.send("cello_send", { session_id: SID_HEX, content }) as Record<string, unknown>;
+      expect(sent.ok).toBe(true);
+      expect(sent.modified).toBe(false);
+      let recv: Record<string, unknown> | null = null;
+      for (let i = 0; i < 160; i++) {
+        recv = await clientB.send("cello_receive", { session_id: SID_HEX, timeout_ms: 0 }) as Record<string, unknown>;
+        if (recv && recvText(recv) !== null) break;
+        await wait(25);
+      }
+      expect(recvText(recv)!).toContain("stranger@other.example");
+      expect(recvText(recv)!).toContain("415-555-2671");
+    }, 40_000);
+
+    it("warn (non-whitelisted PII) → NOT sent: governance_warn + flags; the peer receives nothing", async () => {
+      const a = await spawnEmailCheckingGateway("ga");
       const b = await spawnGateway("gb");
       const { clientA, clientB } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
       const sent = await clientA.send("cello_send", { session_id: SID_HEX, content: "reach me at stranger@other.example" }) as Record<string, unknown>;
@@ -542,13 +577,10 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       // env fallbacks (policy D-5). Whitelisting is a LOOSENING, so it is written confirmed: the
       // test stands in for the human at the CLI prompt. Sharing your own email must be frictionless
       // — passes silently, no governance round-trip — the done-condition's silent-pass.
-      const wlDb = join(tempDir, "gw-wl.db");
-      const wlKey = join(tempDir, "gw-wl.key");
-      writeFileSync(wlKey, randomBytes(32), { mode: 0o600 });
-      const wlStore = new GatewayConfigStore(wlDb, wlKey);
-      expect(wlStore.set("pii_whitelist", ["owner@self.example"], { confirmed: true }).ok).toBe(true);
-      wlStore.close();
-      const a = await spawnGateway("ga", { CELLO_GATEWAY_STORE_DB: wlDb, CELLO_GATEWAY_STORE_KEY_FILE: wlKey });
+      // The email check is on, or this would pass with the whitelist doing nothing.
+      const a = await spawnEmailCheckingGateway("ga", (wlStore) => {
+        expect(wlStore.set("pii_whitelist", ["owner@self.example"], { confirmed: true }).ok).toBe(true);
+      });
       const b = await spawnGateway("gb");
       const { clientA, clientB } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
       const sent = await clientA.send("cello_send", { session_id: SID_HEX, content: "contact me at owner@self.example anytime" }) as Record<string, unknown>;
@@ -565,7 +597,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     }, 40_000);
 
     it("OUT-002 bulk: a contact DUMP warns ONCE (one governance_warn covering all the flagged contacts), not sent", async () => {
-      const a = await spawnGateway("ga"); // empty whitelist — every contact is non-whitelisted
+      const a = await spawnEmailCheckingGateway("ga"); // empty whitelist — every contact is non-whitelisted
       const b = await spawnGateway("gb");
       const { clientA, clientB } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
       // 6 distinct non-whitelisted emails (≥ the bulk threshold of 5) — a CRM-dump shape.
@@ -636,6 +668,8 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       const cfgKeyFile = join(tempDir, "gw-config.key");
       writeFileSync(cfgKeyFile, randomBytes(32), { mode: 0o600 });
       const cstore = new GatewayConfigStore(cfgDb, cfgKeyFile);
+      // The email check is on, or this would pass with the whitelist doing nothing.
+      expect(cstore.set("pii_check_email", true).ok).toBe(true);
       const r = cstore.set("pii_whitelist", ["owner@self.example"], { confirmed: true });
       expect(r.ok).toBe(true);
       expect(r.ok && r.direction).toBe("loosen"); // adding to the [] baseline is a loosen — confirmed here
@@ -682,7 +716,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     }, 40_000);
 
     it("FEED-001 inc4 re-send {flagId: redact}: the warned PII email is RE-SENT redacted and the peer gets the placeholder", async () => {
-      const a = await spawnGateway("ga");
+      const a = await spawnEmailCheckingGateway("ga");
       const b = await spawnGateway("gb");
       const { clientA, clientB } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
       const content = "reach me at stranger@other.example";
@@ -706,7 +740,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     }, 40_000);
 
     it("FEED-001 inc4 SI-002: re-send {flagId: allow_once} with autonomous_override OFF (default) → RE-WARNED, NOT sent", async () => {
-      const a = await spawnGateway("ga");
+      const a = await spawnEmailCheckingGateway("ga");
       const b = await spawnGateway("gb");
       const { clientA, clientB } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
       const content = "reach me at stranger@other.example";

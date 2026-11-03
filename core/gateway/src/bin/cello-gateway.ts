@@ -106,6 +106,12 @@ async function main(): Promise<void> {
   // autonomous_override defaults OFF — the agent's only autonomous lever over a PII warn is `redact`;
   // allowing a value out is a human action (loosening the store requires confirmation).
   const autonomousOverride = cfg<boolean>("autonomous_override", false);
+  // The email and phone checks default OFF, the same exception as `language_enforce` above: the store
+  // BASELINE is on, so turning one back off asks a person, while the RUNTIME default is off. People
+  // sending an email address usually mean to, and the phone pattern reads ordinary coding text such as
+  // `0.0.260 0.0.133` as a number, which held the whole message (owner decision, 2026-11-03).
+  const piiCheckEmail = cfg<boolean>("pii_check_email", false);
+  const piiCheckPhone = cfg<boolean>("pii_check_phone", false);
   // OUT-004 per-agent outbound rate cap. A positive cap enables it. NOTE: "no cap" is the LOOSEST state,
   // not the tightest — so rate-limiting is OFF by default (the operator opts in to a cap). If a cap IS
   // set but the window is missing/invalid, do NOT silently disable the cap (code-review M1) — fall back
@@ -117,7 +123,7 @@ async function main(): Promise<void> {
   const rateLimit = Number.isFinite(rateMax) && rateMax > 0
     ? { maxPerWindow: rateMax, windowMs: rateWindowMs }
     : undefined;
-  const outbound = new OutboundScreener({ piiWhitelist, autonomousOverride, ...(rateLimit ? { rateLimit } : {}) });
+  const outbound = new OutboundScreener({ piiWhitelist, autonomousOverride, piiCheckEmail, piiCheckPhone, ...(rateLimit ? { rateLimit } : {}) });
   // DOD-DOC-SCREEN-CLASSIFIER-1 — Layer 2, wired at last.
   //
   // This line was `new InboundScreener()` with no arguments, so the scanner fell back to its null

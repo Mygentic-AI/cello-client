@@ -61,6 +61,9 @@ const CLASSIFIERS: Record<string, Classifier> = {
   pii_whitelist: membershipDirection,
   // More allowed languages = looser.
   language_allow: membershipDirection,
+  // Checking for a kind of personal data TIGHTENS; turning the check off loosens.
+  pii_check_email: (prev, next) => (!prev && next ? "tighten" : prev && !next ? "loosen" : "neutral"),
+  pii_check_phone: (prev, next) => (!prev && next ? "tighten" : prev && !next ? "loosen" : "neutral"),
   // Refusing mail outside the allowlist TIGHTENS; turning the refusal off loosens.
   language_enforce: (prev, next) => (!prev && next ? "tighten" : prev && !next ? "loosen" : "neutral"),
   // 0 = no cap = loosest; a higher cap = looser. Lowering the cap tightens.
@@ -87,7 +90,11 @@ const CLASSIFIERS: Record<string, Classifier> = {
 const BASELINE: Record<string, unknown> = {
   autonomous_override: false,      // the agent cannot self-authorize
   pii_whitelist: [] as string[],   // nothing passes silently
-  language_allow: ["latin"],       // the allowlist used when language_enforce is ON (more scripts = looser)
+  // Like `language_enforce` below: the tightest value, deliberately NOT the product default, which is
+  // off. Turning a check on stays free and turning it off asks a person at the terminal.
+  pii_check_email: true,
+  pii_check_phone: true,
+  language_allow: ["latin"],      // the allowlist used when language_enforce is ON (more scripts = looser)
   // The TIGHTEST value is "refuse everything outside the allowlist". It is deliberately NOT the
   // product default: that default refused 11% of ordinary benign traffic (DOD-M9C-SCREENBASE-1).
   // The baseline exists to gate CHANGES, so turning enforcement on stays free and turning it back
@@ -101,6 +108,8 @@ const BASELINE: Record<string, unknown> = {
 const VALIDATORS: Record<string, (v: unknown) => boolean> = {
   autonomous_override: (v) => typeof v === "boolean",
   pii_whitelist: (v) => Array.isArray(v) && v.every((x) => typeof x === "string"),
+  pii_check_email: (v) => typeof v === "boolean",
+  pii_check_phone: (v) => typeof v === "boolean",
   // Every member must be a REAL script name. `language_allow=klingon` used to be stored, gated and
   // hash-chained like a real setting, then match nothing — a guard that reads as configured and
   // screens as though it were not.

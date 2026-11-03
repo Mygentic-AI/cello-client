@@ -65,6 +65,21 @@ describe("DOD-M9B-SURFACE-1 — gateway config surface + the loosen gate", () =>
     expect(restarts).toBe(0);
   });
 
+  it("an agent can turn the email and phone checks on, but not back off", async () => {
+    for (const key of ["pii_check_email", "pii_check_phone"]) {
+      expect((await call("cello_config_set", { key, value: true }, "mcp-conn")).ok).toBe(true);
+
+      const off = await call("cello_config_set", { key, value: false }, "mcp-conn");
+      expect(off.ok).toBe(false);
+      expect(off.reason).toBe("loosen_requires_cli");
+      expect(String(off.guidance)).toContain(`cello config set ${key}`);
+
+      const store = openStore();
+      expect(store.get(key)).toBe(true);
+      store.close();
+    }
+  });
+
   it("F1: a connection that NEVER declared a client type cannot confirm a loosening", async () => {
     // The hole this closes: `getClientType` returns undefined for a raw socket that skipped
     // `ipc.connect`, and the daemon ALSO defaults a handshake with no clientType to "cli". With

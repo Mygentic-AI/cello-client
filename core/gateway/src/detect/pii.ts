@@ -32,6 +32,13 @@ export interface PIIResult {
 export interface PIIScreenerOptions {
   /** The operator's whitelisted PII values (own email/phone …). Normalized on construction. */
   whitelist: string[];
+  /**
+   * Whether to check for email addresses and phone numbers. Both default ON here, so the class on its
+   * own checks everything. The product default is OFF, and that decision lives in the gateway binary,
+   * which reads `pii_check_email` and `pii_check_phone` from the config store.
+   */
+  checkEmail?: boolean;
+  checkPhone?: boolean;
   /** Distinct non-whitelisted values in ONE message at/above which the warn is bulk. Default 5. */
   bulkThreshold?: number;
   /** Distinct non-whitelisted values across a SESSION at/above which warns escalate to bulk (drip). Default 20. */
@@ -177,6 +184,8 @@ export class OutboundPIIScreener {
   readonly #whitelist: Set<string>;
   readonly #bulkThreshold: number;
   readonly #cumulativeThreshold: number;
+  readonly #checkEmail: boolean;
+  readonly #checkPhone: boolean;
   // sessionId → the distinct (category:value) keys of non-whitelisted PII seen across the session.
   readonly #sessionDistinct = new Map<string, Set<string>>();
 
@@ -188,6 +197,8 @@ export class OutboundPIIScreener {
     ]);
     this.#bulkThreshold = opts.bulkThreshold ?? 5;
     this.#cumulativeThreshold = opts.cumulativeThreshold ?? 20;
+    this.#checkEmail = opts.checkEmail ?? true;
+    this.#checkPhone = opts.checkPhone ?? true;
   }
 
   screen(content: Uint8Array, sessionId: string): PIIResult {
@@ -207,7 +218,7 @@ export class OutboundPIIScreener {
         candidates.push({ start: m.index ?? 0, end: (m.index ?? 0) + value.length, category, value, priority });
       }
     };
-    collect(text, EMAIL_RE, "pii:email", 0, () => true);
+    if (this.#checkEmail) collect(text, EMAIL_RE, "pii:email", 0, () => true);
     collect(text, IP_RE, "pii:ip", 1, validIp);
     collect(text, SSN_RE, "pii:ssn", 2, () => true);
     collect(text, CC_RE, "pii:credit_card", 3, (v) => luhnValid(v.replace(/[^0-9]/g, "")));
@@ -216,8 +227,10 @@ export class OutboundPIIScreener {
     // falls through as pii:phone, and PHONE_RE never greedily bridges across an IP into an adjacent
     // phone number (which would either collide with pii:ip and drop the phone warn, or pollute the
     // phone candidate's value/span with the preceding IP).
-    const phoneText = maskHashes(text.replace(IP_RE, (m) => (parseIpv4Octets(m) !== null ? "_".repeat(m.length) : m)));
-    collect(phoneText, PHONE_RE, "pii:phone", 4, isPlausiblePhone);
+    if (this.#checkPhone) {
+      const phoneText = maskHashes(text.replace(IP_RE, (m) => (parseIpv4Octets(m) !== null ? "_".repeat(m.length) : m)));
+      collect(phoneText, PHONE_RE, "pii:phone", 4, isPlausiblePhone);
+    }
 
     // Resolve overlaps: a higher-priority (more specific) match wins its character span.
     candidates.sort((a, b) => a.priority - b.priority || a.start - b.start);
