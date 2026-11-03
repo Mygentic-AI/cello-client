@@ -12,5 +12,4 @@ export default defineWorkspace([
   "core/daemon",
   "core/cli",
   "core/gateway",
-  "tools/cloud-doorbell",
 ]);
