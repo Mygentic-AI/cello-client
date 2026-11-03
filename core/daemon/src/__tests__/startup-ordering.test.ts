@@ -351,7 +351,9 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
     // 135 → 137 for M15D 001-DAEMON: `createAttendanceRoot` (attendance-root.ts) and
     // `createAttendanceGuard` (attendance-guard.ts). The root is called from daemon.ts and the guard
     // from the root; unwired, every agent would read unattended and no call would be guarded.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(137);
+    // 137 → 138 for `migrateRetiredRelayDomain` (retired-relay-domain.ts), called from session-schema.ts.
+    // Unwired, stored addresses keep naming the retired domain and every dial to them fails.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(138);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",
