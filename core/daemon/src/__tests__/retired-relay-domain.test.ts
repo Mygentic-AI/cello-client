@@ -11,7 +11,12 @@ import { join } from "node:path";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import type { DaemonDatabase } from "../sqlcipher-db.js";
 import type { Logger } from "../types.js";
+import { generateKeypair } from "@cello-protocol/crypto";
+import { encodeChannelRelayRecord, signChannelRelayRecord } from "@cello-protocol/protocol-types";
 import { migrateRetiredRelayDomain, rewriteRetiredRelayAddrs } from "../retired-relay-domain.js";
+import { CHANNEL_CONFIG_CREATE_SQL } from "../channel-config-store.js";
+import { createChannelJoiner, type ChannelJoinerDeps } from "../channel-join-exchange.js";
+import { ensureSessionSchema } from "../session-schema.js";
 
 const PEER = "12D3KooWFpvG5ksTBoiMCfyy3n126AtpFNYGXB14R2335DAf1BYt";
 const OLD = `/dns4/relay-euw1.cello.mygentic.ai/tcp/443/tls/ws/p2p/${PEER}`;
@@ -47,6 +52,48 @@ describe("rewriteRetiredRelayAddrs", () => {
   it("does not rewrite the domain when it appears outside the host segment", () => {
     const elsewhere = `/ip4/1.2.3.4/tcp/443/sni/x.cello.mygentic.ai/p2p/${PEER}`;
     expect(rewriteRetiredRelayAddrs([elsewhere])).toEqual([elsewhere]);
+  });
+});
+
+describe("a daemon starting on a database that holds old addresses", () => {
+  it("rewrites them as part of opening the schema", () => {
+    const dir = mkdtempSync(join(tmpdir(), "retired-relay-start-"));
+    const db = openTestDb(join(dir, "sessions.db"));
+    try {
+      db.exec(CHANNEL_CONFIG_CREATE_SQL);
+      db.prepare("INSERT INTO channel_config (channel_pubkey, access, relays, updated_at) VALUES ('c', 'open', ?, 1)")
+        .run(JSON.stringify([OLD]));
+
+      ensureSessionSchema(db, capturing().logger, () => undefined);
+
+      const stored = db.prepare("SELECT relays v FROM channel_config").get() as { v: string };
+      expect(JSON.parse(stored.v)).toEqual([NEW]);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("joining a channel whose admin has not upgraded", () => {
+  it("reaches the relays on the current domain, though the signed record still names the old one", async () => {
+    const channelKp = generateKeypair();
+    const channelHex = Buffer.from(await channelKp.getPublicKey()).toString("hex");
+    const record = await signChannelRelayRecord(channelKp, { relays: [OLD], signed_at: 1 });
+    const asked: string[][] = [];
+    const deps = {
+      logger: capturing().logger,
+      directory: {
+        lookup: () => Promise.resolve({ kind: "admin", adminPubkeyHex: "ab".repeat(32), relayRecord: encodeChannelRelayRecord(record) }),
+      },
+      relays: {
+        fetchInfo: (relays: string[]) => { asked.push(relays); return Promise.resolve(null); },
+      },
+    } as unknown as ChannelJoinerDeps;
+
+    await createChannelJoiner(deps).join("agent", "agent-id", channelHex);
+
+    expect(asked).toEqual([[NEW]]);
   });
 });
 

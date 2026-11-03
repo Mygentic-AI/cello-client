@@ -38,6 +38,7 @@ import type { Logger } from "./types.js";
 import type { ChannelMembershipStore } from "./channel-membership-store.js";
 import type { ChannelSubscriptionStore } from "./channel-subscription-store.js";
 import { extractErrorMessage } from "./error-message.js";
+import { rewriteRetiredRelayAddrs } from "./retired-relay-domain.js";
 
 const hexOf = (b: Uint8Array): string => Buffer.from(b).toString("hex");
 const bytesOf = (h: string): Uint8Array => new Uint8Array(Buffer.from(h, "hex"));
@@ -288,7 +289,8 @@ export function createChannelJoiner(deps: ChannelJoinerDeps) {
       logger.warn("channel.join.rejected", { channel_pubkey: channelHex, record: "relay_record", reason: rec.ok ? "signature_invalid" : rec.reason });
       return { ok: false, reason: "relay_record_invalid" };
     }
-    const relayList = rec.record.relays;
+    // After the signature check: an admin who has not upgraded still signs the retired relay domain.
+    const relayList = rewriteRetiredRelayAddrs(rec.record.relays);
     const facts = await channelFacts(deps.relays, relayList, channelHex);
     if (!facts) return { ok: false, reason: "channel_info_unavailable", detail: "no relay served a verified info record" };
 
